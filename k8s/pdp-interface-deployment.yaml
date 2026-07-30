@@ -22,7 +22,8 @@ data:
   # PLATFORM_SOURCE_CLIENTS is the comma-separated list of platform bypass
   # clients the inbound Rego admits without a user role.
   PLATFORM_SOURCE_CLIENTS: "rossoctl"
-  # NATS_URL is added to this ConfigMap in Phase 2 (Event Broker, issue 4.19).
+  # NATS_URL points the PDP services at the Event Broker (Phase 2, issue 4.19).
+  NATS_URL: "nats://aiac-event-broker-service:4222"
   # AIAC_RAG_INGEST_URL and AIAC_CHROMADB_URL are added in Phase 3 (RAG Pod, issue 4.20).
 
 ---
