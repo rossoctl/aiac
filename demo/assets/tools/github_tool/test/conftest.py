@@ -5,4 +5,4 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parents[1]))
 
 # scenario.py importable as `scenario`
-sys.path.insert(0, str(Path(__file__).parents[4] / "test" / "integration"))
+sys.path.insert(0, str(Path(__file__).parents[5] / "test" / "integration"))

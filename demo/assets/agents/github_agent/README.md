@@ -20,8 +20,8 @@ Deploy it before starting the agent:
 authbridge/demos/github-issue/k8s/github-tool-deployment.yaml
 ```
 
-> **Not the same as `demo/tools/github_tool/`.**
-> `demo/tools/github_tool/` is a simplified 4-tool stub (`source-read`, `source-write`, `issues-read`,
+> **Not the same as `demo/assets/tools/github_tool/`.**
+> `demo/assets/tools/github_tool/` is a simplified 4-tool stub (`source-read`, `source-write`, `issues-read`,
 > `issues-write`) deployed as Service `github-tool` for **UC-1 onboarding discovery** only.
 > The agent never connects to it — it connects to the production `github-tool-mcp` server which
 > exposes the 44-tool GitHub API federation.
@@ -58,7 +58,7 @@ All settings are read from environment variables (or a `.env` file). Copy one of
 ## Running locally
 
 ```bash
-cd aiac/demo/agents/github_agent
+cd aiac/demo/assets/agents/github_agent
 cp .env.ollama .env          # or another preset
 uv sync
 uv run server
@@ -70,38 +70,8 @@ Optionally, run `expect -f test_startup.exp` instead to check startup automatica
 
 ## Deploying to Kagenti (Kind cluster)
 
-Prerequisites: a running Kagenti cluster (Keycloak realm `kagenti`, namespace `team1`) with `github-tool-mcp` already deployed.
-
-1. **Build the image:**
-   ```bash
-   cd aiac/demo/agents/github_agent
-   podman build -t github-agent:latest .
-   # or: docker build -t github-agent:latest .
-   ```
-
-2. **Load into the Kind cluster:**
-   ```bash
-   kind load docker-image github-agent:latest --name kagenti
-   ```
-
-3. **Apply manifests:**
-   ```bash
-   kubectl apply -f k8s/configmaps.yaml
-   kubectl apply -f k8s/github-agent-deployment.yaml
-   ```
-
-4. **Confirm AuthBridge injection:**
-   ```bash
-   kubectl get pod -n team1 -l app.kubernetes.io/name=github-agent -o jsonpath='{.items[0].spec.containers[*].name}'
-   ```
-   You should see the `authbridge-proxy` (or `envoy-proxy`) sidecar alongside `agent`.
-
-5. **Port-forward and send a message:**
-   ```bash
-   kubectl port-forward svc/github-agent 8080:8080 -n team1 &
-   # Send an A2A message/send request:
-   curl -s http://localhost:8080/.well-known/agent-card.json | python3 -m json.tool
-   ```
+See [`../../INSTALL.md`](../../INSTALL.md) — the single install guide for this agent and the
+`github_tool` stub together (build, `kind load`, manifests, invariants, verification).
 
 ## Architecture
 

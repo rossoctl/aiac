@@ -195,7 +195,7 @@ Config via `github_agent/config.py` (`pydantic-settings`), adapted from the refe
 
 ## 7. Deployment (aiac level)
 
-Manifests live under `aiac/demo/agents/github_agent/k8s/`, adapted from the github-issue demo. Namespace
+Manifests live under `aiac/demo/assets/agents/github_agent/k8s/`, adapted from the github-issue demo. Namespace
 `team1` (installer-provided ConfigMaps/secrets assumed present).
 
 - **`github-agent-deployment.yaml`** — `ServiceAccount` + `Deployment` + `Service` + `AgentRuntime`:
@@ -218,7 +218,7 @@ Manifests live under `aiac/demo/agents/github_agent/k8s/`, adapted from the gith
   (`authbridge/demos/github-issue/k8s/github-tool-deployment.yaml`, Service name `github-tool-mcp`) +
   `github-tool-secrets`, a running Kagenti cluster (Keycloak realm `kagenti`, namespace `team1` —
   installer-provided and enrolled for AuthBridge injection).
-  The sibling UC-1 stub at `demo/tools/github_tool/` (Service `github-tool`) is a separate deployment
+  The sibling UC-1 stub at `demo/assets/tools/github_tool/` (Service `github-tool`) is a separate deployment
   for AIAC onboarding discovery and is **not** a runtime dependency of this agent.
 
 **Wiring invariant:** agent `MCP_URL` host (`github-tool-mcp`) == `authproxy-routes` host == tool
@@ -229,7 +229,7 @@ Service name; exchanged audience (`github-tool`) == tool `AUDIENCE`.
 ## 8. Verification
 
 **Local (no cluster — primary gate):**
-1. `cd aiac/demo/agents/github_agent && uv lock && uv sync`.
+1. `cd aiac/demo/assets/agents/github_agent && uv lock && uv sync`.
 2. `podman build -t github-agent:latest .`.
 3. Startup + card: run `uv run --no-sync server` (or `test_startup.exp`), then
    `curl -s localhost:8000/.well-known/agent-card.json | jq '.name, .skills[].id'` →
