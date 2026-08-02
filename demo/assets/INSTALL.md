@@ -34,6 +34,13 @@ These each fail far from their cause — read before editing the manifests or in
   committed manifest; don't drop it when editing.
 - **`kagenti.io/type` is applied by the operator** from the `AgentRuntime` CR. Don't hand-set it
   on the pod.
+- **The tool's declared `PORT` must not be `9090`.** The AuthBridge sidecar reuses the declared
+  `PORT` as its own reverse-proxy listener and shifts the app's real listen port to `PORT+1`.
+  AuthBridge also has a *fixed* health-check listener hardcoded to `9091`. `PORT: 9090` shifts the
+  app to `9091`, colliding with that fixed listener — the container crash-loops fighting the
+  sidecar for the port. The manifest uses `PORT: 9095` (shifted: `9096`), which clears every
+  AuthBridge-fixed port (`8080`, `8081`, `9091`, `9093`, `9094`); the Service's external port stays
+  `9090`.
 - **Keycloak client registration is asynchronous.** The operator registers each workload as a
   client named `team1/<workload>` *after* the pods come up, so "rollout complete" is **not**
   "ready to onboard". Anything that needs the client must poll for it (the UC-1 onboarding demo

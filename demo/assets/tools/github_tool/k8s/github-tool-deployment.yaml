@@ -12,6 +12,16 @@
 #
 # kagenti.io/type=tool is applied by the kagenti-operator when it reconciles
 # the AgentRuntime below; do not hand-set it here.
+#
+# In-cluster PORT override (9095, not the image's default 9090): the
+# AuthBridge sidecar shifts the app's real listen port to (declared PORT)+1
+# and reuses the declared PORT itself for its own reverse-proxy listener.
+# AuthBridge also has a *fixed* health-check listener hardcoded to 9091. If
+# the declared PORT is 9090, the app's shifted port (9091) collides with that
+# fixed health listener and the container crash-loops. 9095 (shifted: 9096)
+# clears every AuthBridge-fixed port (8080, 8081, 9091, 9093, 9094). The
+# Service keeps its external port at 9090 — only containerPort/PORT/probes/
+# targetPort move to 9095.
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -49,7 +59,7 @@ spec:
           image: localhost/github-tool:latest
           imagePullPolicy: IfNotPresent
           ports:
-            - containerPort: 9090
+            - containerPort: 9095
           # readOnlyRootFilesystem is on; temp writes go to the /tmp emptyDir.
           securityContext:
             allowPrivilegeEscalation: false
@@ -59,7 +69,7 @@ spec:
                 - ALL
           env:
             - name: PORT
-              value: "9090"
+              value: "9095"
             - name: LOG_LEVEL
               value: "INFO"
           resources:
@@ -73,12 +83,12 @@ spec:
           # MCP port accepting TCP connections.
           readinessProbe:
             tcpSocket:
-              port: 9090
+              port: 9095
             initialDelaySeconds: 5
             periodSeconds: 10
           livenessProbe:
             tcpSocket:
-              port: 9090
+              port: 9095
             initialDelaySeconds: 10
             periodSeconds: 20
           volumeMounts:
@@ -105,7 +115,7 @@ spec:
   ports:
     - name: mcp
       port: 9090
-      targetPort: 9090
+      targetPort: 9095
   type: ClusterIP
 ---
 # AgentRuntime — enrolls the workload so the kagenti-operator:

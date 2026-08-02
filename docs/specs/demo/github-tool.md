@@ -204,15 +204,25 @@ github-issue demo's `github-tool-deployment.yaml`. Namespace **`team1`** (instal
 ConfigMaps/secrets assumed present), consistent with the agent spec.
 
 - **`github-tool-deployment.yaml`** — `Deployment` + `Service` + `AgentRuntime`:
-  - **`Deployment`** named `github-tool`. Container port serves `/mcp` (default `9090`). Env `PORT`,
-    `LOG_LEVEL`. Image `github-tool:latest`, `imagePullPolicy: IfNotPresent` (kind-load; name is a
-    documented knob). No GitHub PAT / issuer / JWKS / audience env (unlike the github-issue tool).
+  - **`Deployment`** named `github-tool`. Container port serves `/mcp`; the image's own default is
+    `9090`, but the in-cluster manifest overrides `PORT` to **`9095`** (see the port-shift invariant
+    below). Env `PORT`, `LOG_LEVEL`. Image `github-tool:latest`, `imagePullPolicy: IfNotPresent`
+    (kind-load; name is a documented knob). No GitHub PAT / issuer / JWKS / audience env (unlike the
+    github-issue tool).
   - **Pod label `kagenti.io/type: tool`** — this is what `classify_service` reads. Applied by the
     operator via the `AgentRuntime` (see below); relying on the operator to stamp it, rather than
     hand-setting it, keeps it consistent with the operator's own discriminator.
   - **`Service`** named `github-tool` (ClusterIP), selecting the Deployment's pods. Its **first port**
-    maps to the container's `/mcp` port (e.g. `port: 9090 → targetPort: 9090`). `analyze_tool` uses the
-    Service's **first** port, so keep `/mcp`'s port first.
+    maps to the container's `/mcp` port (`port: 9090 → targetPort: 9095` — see below for why these
+    differ). `analyze_tool` uses the Service's **first** port, so keep `/mcp`'s port first.
+  - **AuthBridge port-shift invariant — declared `PORT` must not be `9090`.** The AuthBridge sidecar
+    reuses the declared `PORT` value as its own reverse-proxy listener and shifts the app's real
+    listen port to `PORT+1`. AuthBridge also has a *fixed* health-check listener hardcoded to `9091`.
+    Declaring `PORT: 9090` shifts the app to `9091`, colliding with that fixed health listener — the
+    `github-tool` container crash-loops fighting the sidecar for the port. `PORT: 9095` (shifted:
+    `9096`) clears every AuthBridge-fixed port (`8080`, `8081`, `9091`, `9093`, `9094`). The Service's
+    **external** port stays `9090` (unaffected — `analyze_tool` and the `kubectl port-forward`
+    examples below are unchanged); only `containerPort`/`PORT`/the probes/`targetPort` moved to `9095`.
   - **Service label `protocol.kagenti.io/mcp` MUST be present** — a **deploy-time prerequisite** for
     `analyze_tool` (the operator does **not** stamp it; `analyze_tool` returns `502` if absent). Set it
     explicitly on the Service metadata (e.g. `protocol.kagenti.io/mcp: "true"`).
