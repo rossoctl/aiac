@@ -108,6 +108,38 @@ Docker images:
 | `aiac-policy-store` | `src/aiac/policy/store/service/Dockerfile` |
 | `aiac-rag-ingest` | `rag-ingest/` (separate directory) |
 
+### Non-root container / volume-ownership pattern
+
+All AIAC service images run as **non-root UID 10001**. Each service Dockerfile
+adds the user before `CMD`, matching the `authbridge/sparc-service` pattern:
+
+```dockerfile
+# Drop privileges.
+RUN useradd --no-create-home --uid 10001 aiac
+USER 10001
+```
+
+A Dockerfile `chown` of a directory is **masked once a volume is mounted over
+it** (the mounted volume, not the image layer, is what the container sees), and
+the kubelet leaves emptyDir/PVC volumes root-owned by default. So any service
+that writes to a mounted volume also needs pod-level `securityContext` in its
+k8s manifest so the kubelet chowns the volume to the non-root user:
+
+```yaml
+spec:
+  securityContext:
+    runAsUser: 10001
+    runAsGroup: 10001
+    fsGroup: 10001   # makes the mounted volume group-writable by UID 10001
+```
+
+Services requiring this today:
+- **Policy store** — PVC at `/data` (SQLite backend), `policy-store-statefulset.yaml`
+- **PDP policy OPA writer** — emptyDir at `/rego` (`REGO_OUTPUT_DIR`), `pdp-interface-deployment.yaml`
+
+Services that mount no volumes (agent controller, idp/pdp Keycloak proxies) need
+only the Dockerfile `USER` directive — no manifest `securityContext` change.
+
 ## External references
 
 - [Kagenti Developer Guide](https://github.com/kagenti/kagenti/blob/main/docs/dev-guide.md) — upstream Kagenti dev guide: per-persona workflows (agent, tool, extensions developers, MCP gateway operators), Git/PR process, pre-commit hooks, feature flags, local Kagenti UI v2 development (React frontend + FastAPI backend, building/deploying images to Kubernetes), and HyperShift-based testing on ephemeral OpenShift clusters (cluster lifecycle, cost management, troubleshooting).
