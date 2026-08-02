@@ -44,14 +44,54 @@ metadata:
   labels:
     app: idp-configuration-keycloak-pod
 spec:
+  # The image runs as non-root UID 10001 (see the idp-configuration Dockerfile).
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    runAsGroup: 10001
+    fsGroup: 10001
+    seccompProfile:
+      type: RuntimeDefault
   containers:
     - name: aiac-pdp-config
       image: localhost/aiac-pdp-config:local
       imagePullPolicy: Never
       ports:
         - containerPort: 7071
+      # readOnlyRootFilesystem is on; temp writes go to the /tmp emptyDir.
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop:
+            - ALL
+      resources:
+        requests:
+          cpu: 50m
+          memory: 64Mi
+        limits:
+          cpu: 250m
+          memory: 128Mi
+      readinessProbe:
+        httpGet:
+          path: /health
+          port: 7071
+        initialDelaySeconds: 5
+        periodSeconds: 10
+      livenessProbe:
+        httpGet:
+          path: /health
+          port: 7071
+        initialDelaySeconds: 10
+        periodSeconds: 20
       envFrom:
         - configMapRef:
             name: aiac-pdp-config-standalone
         - secretRef:
             name: keycloak-admin-secret
+      volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+  volumes:
+    - name: tmp
+      emptyDir: {}

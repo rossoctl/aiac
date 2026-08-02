@@ -137,8 +137,43 @@ Services requiring this today:
 - **Policy store** — PVC at `/data` (SQLite backend), `policy-store-statefulset.yaml`
 - **PDP policy OPA writer** — emptyDir at `/rego` (`REGO_OUTPUT_DIR`), `pdp-interface-deployment.yaml`
 
-Services that mount no volumes (agent controller, idp/pdp Keycloak proxies) need
-only the Dockerfile `USER` directive — no manifest `securityContext` change.
+Services that mount no volumes still need the Dockerfile `USER` directive; the
+pod-level `fsGroup`/volume-chown block above is only required for those that
+write to a mounted volume.
+
+### Pod-security hardening baseline
+
+Beyond non-root, every workload in `k8s/` and the demo manifests carries a
+hardened `securityContext`. Pod level (omitted on the demo `github-agent`, whose
+injected AuthBridge sidecar runs as UID 1337 — hardening there is set per
+container instead so a pod-level `runAsUser` can't clobber the sidecar):
+
+```yaml
+spec:
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10001        # 1001 for the demo github-agent
+    seccompProfile:
+      type: RuntimeDefault
+```
+
+Container level, on each app container:
+
+```yaml
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+```
+
+With `readOnlyRootFilesystem: true` the container gets a writable `/tmp`
+`emptyDir` (and its real data mount — `/data`, `/rego`) so runtime temp writes
+have somewhere to land. The demo `github-agent` **omits** `readOnlyRootFilesystem`
+because its runtime (`uv` / `litellm` / `crewai`) writes caches under `HOME=/app`.
+All core workloads also carry both readiness **and** liveness probes (`httpGet
+/health` where the service exposes one; `tcpSocket` for the Controller and the
+demo workloads, which don't) and CPU/memory requests + limits.
 
 ## External references
 

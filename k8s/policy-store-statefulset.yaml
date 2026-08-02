@@ -28,27 +28,56 @@ spec:
       # (/data, the SQLite backend) group-writable by that user; the image's
       # own chown of /data is masked once the volume is mounted over it.
       securityContext:
+        runAsNonRoot: true
         runAsUser: 10001
         runAsGroup: 10001
         fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: aiac-policy-store
           image: localhost/aiac-policy-store:local
           imagePullPolicy: Never
           ports:
             - containerPort: 7074
+          # SQLite lives on the writable /data PVC; the rest of the root
+          # filesystem is read-only, so temp writes go to the /tmp emptyDir.
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
           readinessProbe:
             httpGet:
               path: /health
               port: 7074
             initialDelaySeconds: 5
             periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 7074
+            initialDelaySeconds: 10
+            periodSeconds: 20
           envFrom:
             - configMapRef:
                 name: aiac-policy-store-config
           volumeMounts:
             - name: policy-store-data
               mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
   volumeClaimTemplates:
     - metadata:
         name: policy-store-data

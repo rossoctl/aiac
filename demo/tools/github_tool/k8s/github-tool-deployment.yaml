@@ -36,12 +36,27 @@ spec:
         app: github-tool
     spec:
       serviceAccountName: github-tool
+      # The image runs as non-root UID 10001 (see the github_tool Dockerfile).
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: github-tool
           image: localhost/github-tool:latest
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 9090
+          # readOnlyRootFilesystem is on; temp writes go to the /tmp emptyDir.
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
           env:
             - name: PORT
               value: "9090"
@@ -54,6 +69,24 @@ spec:
             requests:
               cpu: 50m
               memory: 64Mi
+          # FastMCP exposes no /health endpoint, so both probes are gated on the
+          # MCP port accepting TCP connections.
+          readinessProbe:
+            tcpSocket:
+              port: 9090
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 9090
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
 ---
 # Service — exposes /mcp as the first (and only) port.
 # The protocol.kagenti.io/mcp label is a deploy-time prerequisite:

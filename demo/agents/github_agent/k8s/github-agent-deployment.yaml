@@ -79,6 +79,20 @@ spec:
           ports:
             - containerPort: 8000
               name: http
+          # Hardening is set at the CONTAINER level (not pod level) on purpose:
+          # the operator injects an AuthBridge sidecar that runs as UID 1337, so
+          # a pod-level runAsUser would clobber it. readOnlyRootFilesystem is
+          # intentionally omitted here — the agent runtime (uv / litellm /
+          # crewai) writes caches under HOME=/app at runtime.
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1001
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault
           env:
             # LLM configuration - Ollama (local LLM)
             # Matches upstream .env.ollama from agent-examples repo
@@ -135,6 +149,20 @@ spec:
             requests:
               cpu: 100m
               memory: 128Mi
+          # The A2A agent exposes no /health endpoint, so both probes are gated
+          # on the port accepting TCP connections. (The operator may relocate
+          # the agent via proxy-sidecar port-stealing; the probe targets the
+          # container's declared port either way.)
+          readinessProbe:
+            tcpSocket:
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 8000
+            initialDelaySeconds: 20
+            periodSeconds: 20
           volumeMounts:
             - name: shared-data
               mountPath: /shared

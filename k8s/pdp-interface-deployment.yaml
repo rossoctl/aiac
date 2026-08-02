@@ -55,26 +55,54 @@ spec:
       # user; without it the kubelet leaves the emptyDir root-owned and the
       # writer's /health check fails on the non-writable mount.
       securityContext:
+        runAsNonRoot: true
         runAsUser: 10001
         runAsGroup: 10001
         fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: aiac-pdp-config
           image: localhost/aiac-pdp-config:local
           imagePullPolicy: Never
           ports:
             - containerPort: 7071
+          # readOnlyRootFilesystem is on, so anything that writes to the
+          # container filesystem (temp files, etc.) must land on a writable
+          # mount — the emptyDir at /tmp below.
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
           readinessProbe:
             httpGet:
               path: /health
               port: 7071
             initialDelaySeconds: 5
             periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 7071
+            initialDelaySeconds: 10
+            periodSeconds: 20
           envFrom:
             - configMapRef:
                 name: aiac-pdp-config
             - secretRef:
                 name: keycloak-admin-secret
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
         # Phase 1 PDP Policy Writer: OPA rego-file mock. Generates Rego
         # packages and writes them as .rego files to REGO_OUTPUT_DIR. It is a
         # pure filesystem stub — no Keycloak, no k8s API — so it mounts neither
@@ -85,12 +113,33 @@ spec:
           imagePullPolicy: Never
           ports:
             - containerPort: 7072
+          # Writes Rego to the /rego mount (writable); the rest of the root
+          # filesystem is read-only, so temp writes go to the /tmp emptyDir.
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
           readinessProbe:
             httpGet:
               path: /health
               port: 7072
             initialDelaySeconds: 5
             periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 7072
+            initialDelaySeconds: 10
+            periodSeconds: 20
           envFrom:
             - configMapRef:
                 name: aiac-pdp-config
@@ -100,8 +149,14 @@ spec:
           volumeMounts:
             - name: rego-output
               mountPath: /rego
+            - name: tmp-opa
+              mountPath: /tmp
       volumes:
         - name: rego-output
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+        - name: tmp-opa
           emptyDir: {}
 
 ---
