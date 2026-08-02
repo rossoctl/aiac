@@ -180,4 +180,3 @@ See [library-policy-store.md](library-policy-store.md) for the companion library
 - `spec` fields use snake_case (matching Pydantic's `model_dump()`) — consistent with the `AuthorizationPolicy` CR convention. The JSON column avoids a translation layer.
 - `service_id` is the SQLite `PRIMARY KEY`. The `aiac.apply.service.{id}` naming convention (lowercase alphanumeric + hyphens) should be maintained for consistency with trigger events.
 - K8s resource names: StatefulSet `aiac-policy-store`, ClusterIP Service `aiac-policy-store-service:7074`, env var `AIAC_POLICY_STORE_URL`.
-</parameter>

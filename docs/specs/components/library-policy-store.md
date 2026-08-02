@@ -152,5 +152,3 @@ Key behaviors to assert:
 - `delete_service_policy(id)` issues `DELETE /policy/services/{id}`; returns `None` on success.
 - Any unexpected non-2xx response raises `RuntimeError`.
 - `AIAC_POLICY_STORE_URL` is read from env; falls back to `http://127.0.0.1:7074`.
-</parameter>
-</invoke>

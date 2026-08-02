@@ -264,5 +264,3 @@ Key behaviors to assert:
 
 - The PCE is the **only** caller of `aiac.pdp.policy.library.apply_policy` from AIAC Agent sub-agents. Sub-agents call `compute_and_apply`, not the PDP Policy Library directly.
 - `aiac/src/aiac/agent/policy/api.py` retains `role_to_scopes` / `roles_to_scope` helpers used by AIAC Agent sub-UC agents; they now carry `scope.serviceId` / `role.kind` / `role.actorIds` through on each `PolicyRule` (input contract above). These helpers are not used by the PCE.
-</content>
-</invoke>

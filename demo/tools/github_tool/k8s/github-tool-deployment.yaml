@@ -47,6 +47,13 @@ spec:
               value: "9090"
             - name: LOG_LEVEL
               value: "INFO"
+          resources:
+            limits:
+              cpu: 250m
+              memory: 256Mi
+            requests:
+              cpu: 50m
+              memory: 64Mi
 ---
 # Service — exposes /mcp as the first (and only) port.
 # The protocol.kagenti.io/mcp label is a deploy-time prerequisite:
