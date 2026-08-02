@@ -10,3 +10,6 @@ test/pdp/policy/rego_out/
 # regenerated per run, left on disk for eyeballing — not source of truth. probe.rego is a
 # committed fixture and is not under rego_out/, so it stays tracked.
 test/integration/rego_out/
+
+# uc1-onboarding demo's captured .rego snapshots — regenerated per run, not source of truth.
+demo/use-cases/uc1-onboarding/generated/
