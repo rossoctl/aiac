@@ -9,6 +9,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . /app/src
 ENV PYTHONPATH=/app/src
 
+# Drop privileges.
+RUN useradd --no-create-home --uid 10001 aiac
+USER 10001
+
 EXPOSE 7070
 
 CMD ["uvicorn", "aiac.agent.controller.routes:app", "--host", "0.0.0.0", "--port", "7070"]

@@ -50,6 +50,14 @@ spec:
       labels:
         app: aiac-interface
     spec:
+      # Both images run as non-root UID 10001. fsGroup makes the /rego emptyDir
+      # (written by the aiac-pdp-policy-opa container) group-writable by that
+      # user; without it the kubelet leaves the emptyDir root-owned and the
+      # writer's /health check fails on the non-writable mount.
+      securityContext:
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
       containers:
         - name: aiac-pdp-config
           image: localhost/aiac-pdp-config:local

@@ -24,6 +24,13 @@ spec:
       labels:
         app: aiac-policy-store
     spec:
+      # The image runs as non-root UID 10001. fsGroup makes the mounted PVC
+      # (/data, the SQLite backend) group-writable by that user; the image's
+      # own chown of /data is masked once the volume is mounted over it.
+      securityContext:
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
       containers:
         - name: aiac-policy-store
           image: localhost/aiac-policy-store:local
