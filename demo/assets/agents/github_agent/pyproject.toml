@@ -6,6 +6,7 @@ description = "Github Agent module"
 dependencies = [
     "python-dotenv>=1.2.2",
     "a2a-sdk>=1.1.0,<2",
+    "aiohttp>=3.14.3",          # Indirect; prevents GHSA-cq5v-8q36-5273 / GHSA-mfx4-hv73-q22v / GHSA-mq44-7p77-q5h7
     # We use 1.6.1 instead of the latest because
     # crewai requires openai>=2.30.0
     # but litellm requires openai==2.24.0
