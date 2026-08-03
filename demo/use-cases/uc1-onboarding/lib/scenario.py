@@ -20,7 +20,7 @@ DEMO_NAMESPACE_DEFAULT = "team1"
 AGENT_WORKLOAD = "github-agent"
 TOOL_WORKLOAD = "github-tool"
 
-# Public ROPC client the demo's run-*.py drivers log the demo users in with (see init/setup_keycloak.py).
+# Public ROPC client the demo's run-*.py drivers log the demo users in with (see lib/setup_keycloak.py).
 ROPC_CLIENT_ID = "aiac-demo-cli"
 
 # username -> the realm role the user holds
