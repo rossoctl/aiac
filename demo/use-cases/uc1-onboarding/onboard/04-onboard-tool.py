@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 
 import scenario as scn
 import setup_keycloak
-from _lib import GENERATED, capture_rego, connect_admin, load_config, note, ok, onboard, port_forward, resolve_service_id, say, writer_pod
+from _lib import GENERATED, abort, capture_rego, connect_admin, load_config, note, ok, onboard, port_forward, resolve_service_id, say, writer_pod
 
 
 def main() -> None:
@@ -43,7 +43,13 @@ def main() -> None:
     say("4", "4", "Assign the tool-audience default scope to the agent client")
     agent_uuid = resolve_service_id(admin, cfg, f"{cfg.namespace}/{scn.AGENT_WORKLOAD}")
     tool_aud_scope = f"agent-{cfg.namespace}-{scn.TOOL_WORKLOAD}-aud"
-    setup_keycloak.ensure_default_audience_scope(admin, cfg, agent_uuid, scn.AGENT_WORKLOAD, tool_aud_scope)
+    # Unlike 02-setup.py (which runs before the tool exists, so a missing scope is expected), here the
+    # tool has just been onboarded — the ``*-aud`` scope must exist now. If it doesn't, the exchanged
+    # token would lack the tool audience and downstream calls would silently fail, so abort rather
+    # than report a success the token exchange can't back up.
+    if not setup_keycloak.ensure_default_audience_scope(admin, cfg, agent_uuid, scn.AGENT_WORKLOAD, tool_aud_scope):
+        abort(f"tool-audience scope {tool_aud_scope!r} not found after onboarding {scn.TOOL_WORKLOAD} — "
+              "the agent's exchanged tokens would lack the tool audience; check the onboarding call above")
 
     print(f"\nTool onboarded. Snapshot: {rego_dir}")
     print("Next: make show   (or: make dev / make test / make devops)")
