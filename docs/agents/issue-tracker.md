@@ -7,6 +7,12 @@ operations, always scoped with `-R s-and-p-team/cortex` (this repo's `origin`
 remote points here, but explicit `-R` avoids ambiguity since `upstream` also
 exists).
 
+**This is deliberate:** `s-and-p-team/cortex` is the AIAC team's fork of the
+canonical upstream `rossoctl/cortex`. AIAC work is tracked on the fork (and its
+org-level AIAC Project) even though PRs are opened against upstream — so the
+`-R s-and-p-team/cortex` scoping on every command below is intentional, not a
+copy-paste of the upstream slug.
+
 This is the same convention already documented in `CLAUDE.md` under "Issue
 tracking" — this file exists so the engineering skills (`to-issues`, `triage`,
 `to-prd`, `qa`) have a single place to read it from.

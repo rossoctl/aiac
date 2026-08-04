@@ -20,6 +20,11 @@ organized in the org-level **AIAC** Project (Projects v2):
 <https://github.com/orgs/s-and-p-team/projects/1>. Use `gh` to read and manage
 them.
 
+Note: `s-and-p-team/cortex` is the AIAC team's fork of the canonical upstream
+`rossoctl/cortex`. Tracking issues on the fork (not upstream) is deliberate —
+PRs still target upstream, but issue tracking stays on the team fork, so the
+`-R s-and-p-team/cortex` scoping below is intentional.
+
 Hierarchy: the Project groups **Feature**-typed container issues — one per
 component area, nested via GitHub **native sub-issues** to form the tree — over
 **Task**-typed leaf issues. Every issue carries the `aiac` label plus cumulative

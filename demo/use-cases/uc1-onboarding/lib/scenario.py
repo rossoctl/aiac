@@ -30,6 +30,8 @@ USERS: dict[str, str] = {
     "devops-user": "devops",
 }
 
+# Demo-only shared credential for the ephemeral Keycloak users; never used outside
+# local/CI throwaway clusters. Not a production or secret value.
 USER_PASSWORD = "password"
 
 # Keycloak 26's declarative user profile requires email/firstName/lastName for role "user" before
