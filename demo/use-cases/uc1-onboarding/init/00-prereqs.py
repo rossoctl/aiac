@@ -150,6 +150,11 @@ def ensure_workloads_deployed(namespace: str) -> None:
 
     if {scn.AGENT_WORKLOAD, scn.TOOL_WORKLOAD} <= names:
         note(f"demo workloads already deployed in {namespace!r} — skipping install.sh")
+        # A Deployment object existing is not the same as it being available; a partial or failed
+        # prior install would otherwise skip repair and fail later at client registration. Wait for
+        # both to roll out so "already deployed" also means "actually up".
+        for workload in (scn.AGENT_WORKLOAD, scn.TOOL_WORKLOAD):
+            kubectl_rollout_status(f"deployment/{workload}", namespace=namespace)
         return
 
     note("demo workloads not found — running demo/assets/install.sh")

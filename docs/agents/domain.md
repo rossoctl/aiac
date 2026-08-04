@@ -18,7 +18,7 @@ resolved.
 
 ## File structure
 
-```
+```text
 aiac/
 ├── CONTEXT.md
 ├── docs/
