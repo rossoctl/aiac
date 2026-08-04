@@ -20,7 +20,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
 
 import scenario as scn
-from _lib import GENERATED, connect_admin, load_config, note, opa_eval, rule, say, table
+from _lib import GENERATED, abort, connect_admin, load_config, note, opa_eval, rule, say, table
 
 
 def latest_snapshot() -> Path | None:
@@ -86,8 +86,13 @@ def show_snapshot(cfg, rego_dir: Path) -> None:
 
 def show_diff(cfg, prior_name: str, current_dir: Path) -> None:
     prior_dir = GENERATED / prior_name
+    if not (prior_dir / cfg.inbound_rego).is_file():
+        abort(
+            f"prior snapshot {prior_name!r} has no {cfg.inbound_rego} under {prior_dir} — "
+            "run the earlier onboarding step first, or pass a snapshot that exists"
+        )
     say("B", "B", f"Diff: {prior_dir.name} -> {current_dir.name}")
-    prior_in, prior_out = grant_sets(cfg, prior_dir) if (prior_dir / cfg.inbound_rego).is_file() else (set(), set())
+    prior_in, prior_out = grant_sets(cfg, prior_dir)
     cur_in, cur_out = grant_sets(cfg, current_dir) if (current_dir / cfg.inbound_rego).is_file() else (set(), set())
 
     print("  inbound:")

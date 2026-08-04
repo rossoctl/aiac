@@ -80,7 +80,7 @@ make onboard-tool    # AIAC discovers github-tool's capabilities and completes t
 make show
 ```
 
-**Pause 3 — both onboarded.** `make show --diff 01-after-agent` (or `make diff PRIOR=01-after-agent`)
+**Pause 3 — both onboarded.** `make diff PRIOR=01-after-agent`
 shows the outbound gate's maps filling in: `target_scopes` keyed by the tool's SPIFFE identity, and
 per-role grants for every discovered tool scope. This is the moment least-privilege access to a
 downstream tool exists — generated, not hand-written.

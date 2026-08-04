@@ -195,20 +195,20 @@ def verify_mcp_label(namespace: str) -> None:
 def main() -> None:
     cfg = load_config()
 
-    say("1", "8", "Verify: cluster + CRDs + namespace + SPIRE + Keycloak")
+    say("1", "4", "Verify: cluster + CRDs + namespace + SPIRE + Keycloak")
     verify_cluster_reachable()
     verify_crds()
     verify_namespace(cfg.namespace)
     verify_spire()
     verify_keycloak(cfg)
 
-    say("2", "8", "Verify/install: AIAC stack")
+    say("2", "4", "Verify/install: AIAC stack")
     ensure_aiac_deployed(cfg)
 
-    say("3", "8", "Verify/install: demo workloads (github-agent, github-tool)")
+    say("3", "4", "Verify/install: demo workloads (github-agent, github-tool)")
     ensure_workloads_deployed(cfg.namespace)
 
-    say("4", "8", "Wait: Keycloak client registration + MCP service label")
+    say("4", "4", "Wait: Keycloak client registration + MCP service label")
     wait_for_client_registration(cfg)
     verify_mcp_label(cfg.namespace)
 

@@ -44,7 +44,10 @@ def ensure_token_exchange_enabled(admin, cfg: Config, client_uuid: str, client_n
         note(f"token exchange already enabled on {client_name!r}")
         return
     attrs["standard.token.exchange.enabled"] = "true"
-    admin.update_client(client_uuid, {"attributes": attrs})
+    # update_client issues a PUT that replaces the whole client representation, so send the full
+    # fetched client with only ``attributes`` overridden — a bare {"attributes": ...} would clobber
+    # the client's other fields.
+    admin.update_client(client_uuid, {**client, "attributes": attrs})
     ok(f"enabled standard.token.exchange.enabled on {client_name!r}")
 
 

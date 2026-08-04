@@ -119,7 +119,7 @@ Grant access on a least-privilege basis: allow only what this policy states; den
 @dataclass(frozen=True)
 class Intent:
     label: str  # what the driver script prints before asking the tool
-    function_name: str  # the tool scope this intent maps to
+    function_name: str | None  # the tool scope this intent maps to (None = inbound-only denial case)
 
 
 INTENTS: dict[str, list[Intent]] = {

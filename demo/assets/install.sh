@@ -13,8 +13,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 CLUSTER_NAME="${CLUSTER_NAME:-kagenti}"
 NAMESPACE="${NAMESPACE:-team1}"
-TOOL_IMAGE="${TOOL_IMAGE:-github-tool:latest}"
-AGENT_IMAGE="${AGENT_IMAGE:-github-agent:latest}"
+# Tags must carry the localhost/ prefix to match the Deployment manifests' image refs
+# (image: localhost/github-*:latest, imagePullPolicy: IfNotPresent). docker does not auto-prefix
+# built tags, so a bare github-*:latest would load into the kind node under a different repository
+# name and the IfNotPresent pods would try to pull localhost/github-*:latest → ImagePullBackOff.
+TOOL_IMAGE="${TOOL_IMAGE:-localhost/github-tool:latest}"
+AGENT_IMAGE="${AGENT_IMAGE:-localhost/github-agent:latest}"
 
 DO_TOOL=1
 DO_AGENT=1
