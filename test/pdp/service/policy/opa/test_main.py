@@ -48,10 +48,16 @@ def _agent(agent_id: str) -> dict:
         "agent_scopes": [],
         "subject_roles": {},
         "source_roles": {},
-        "target_scopes": {},
-        "inbound_rules": [],
-        "outbound_rules": [],
-        "outbound_subject_rules": [],
+        "target_allow_scopes": {},
+        "target_deny_scopes": {},
+        "inbound_subject_allow_rules": [],
+        "inbound_subject_deny_rules": [],
+        "inbound_source_allow_rules": [],
+        "inbound_source_deny_rules": [],
+        "outbound_target_allow_rules": [],
+        "outbound_target_deny_rules": [],
+        "outbound_subject_allow_rules": [],
+        "outbound_subject_deny_rules": [],
     }
 
 
