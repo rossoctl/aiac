@@ -46,6 +46,7 @@ from aiac.policy.model.models import (
     AgentPolicyModel,
     PolicyModel,
     PolicyRule,
+    RuleEffect,
     ServicePolicyModel,
 )
 from aiac.policy.model_store.library.api import (
@@ -61,8 +62,14 @@ _Entity = TypeVar("_Entity", Role, Scope)
 
 
 def _add_rule(rules: list[PolicyRule], rule: PolicyRule) -> None:
-    """Append ``rule`` unless one with the same ``role.id`` + ``scope.id`` is present."""
-    if any(r.role.id == rule.role.id and r.scope.id == rule.scope.id for r in rules):
+    """Append ``rule`` unless one with the same dedup identity ``(role.id, scope.id, effect)`` is
+    present. Each list this is called on is single-effect (routing splits by ``effect`` first), so
+    within a list the check reduces to ``(role.id, scope.id)``; carrying ``effect`` keeps the
+    identity aligned with the model's canonical dedup key."""
+    if any(
+        r.role.id == rule.role.id and r.scope.id == rule.scope.id and r.effect == rule.effect
+        for r in rules
+    ):
         return
     rules.append(rule)
 
@@ -72,6 +79,38 @@ def _add_by_id(items: list[_Entity], item: _Entity) -> None:
     if any(existing.id == item.id for existing in items):
         return
     items.append(item)
+
+
+def _inbound_list(model: ServicePolicyModel, effect: RuleEffect) -> list[PolicyRule]:
+    """The inbound list on ``model`` matching ``effect`` — the deny list for ``Deny``, else allow."""
+    return model.inbound_deny_rules if effect == RuleEffect.DENY else model.inbound_allow_rules
+
+
+def _all_inbound(model: ServicePolicyModel) -> list[PolicyRule]:
+    """A read-only concatenation of both inbound lists — every edge touching ``model``'s scopes,
+    ``Allow`` and ``Deny`` alike. For scanning (classification, targeter discovery); never mutate."""
+    return model.inbound_allow_rules + model.inbound_deny_rules
+
+
+def _route(model: ServicePolicyModel, rule: PolicyRule) -> bool:
+    """Append ``rule`` to ``model``'s effect-matching inbound list (append-dedup). True iff added."""
+    target = _inbound_list(model, rule.effect)
+    before = len(target)
+    _add_rule(target, rule)
+    return len(target) != before
+
+
+def _purge_role(model: ServicePolicyModel, role_id: str) -> bool:
+    """Drop every inbound edge whose role is ``role_id`` from **both** lists (allow and deny) — the
+    role-level revocation / footprint-purge primitive. Returns ``True`` iff any edge was removed."""
+    removed = False
+    for attr in ("inbound_allow_rules", "inbound_deny_rules"):
+        rules: list[PolicyRule] = getattr(model, attr)
+        kept = [r for r in rules if r.role.id != role_id]
+        if len(kept) != len(rules):
+            setattr(model, attr, kept)
+            removed = True
+    return removed
 
 
 def _reconcile(
@@ -100,43 +139,52 @@ def _reconcile(
        this batch carries a *different* id for that same ``(scope, name)`` — the fresh batch's
        current-generation id supersedes the old one.
 
-    Skips pruning entirely when ``X`` is absent from the catalog (a transient miss must never wipe an
-    SPM). Returns ``True`` iff it removed at least one edge.
+    Runs over **both** inbound lists (allow and deny) independently: the churn collapse is computed
+    per list, so a live ``Deny`` edge is never dropped because an unrelated ``Allow`` edge in the
+    batch shares its ``(scope, name)``. Skips pruning entirely when ``X`` is absent from the catalog
+    (a transient miss must never wipe an SPM). Returns ``True`` iff it removed at least one edge.
     """
     if catalog.get(model.service_id) is None:
         return False
 
     owner_scope_ids = {s.id for s in model.owned_scopes}
 
-    # (1)+(2) existence prune.
-    survivors = [
-        edge
-        for edge in model.inbound_rules
-        if edge.scope.id in owner_scope_ids
-        and not (edge.role.kind == RoleKind.AGENT and edge.role.id not in catalog_agent_role_ids)
-    ]
+    def _prune(edges: list[PolicyRule]) -> list[PolicyRule]:
+        # (1)+(2) existence prune.
+        survivors = [
+            edge
+            for edge in edges
+            if edge.scope.id in owner_scope_ids
+            and not (
+                edge.role.kind == RoleKind.AGENT and edge.role.id not in catalog_agent_role_ids
+            )
+        ]
 
-    # (3) user-role churn collapse: a stale generation is dropped only when this batch carries a
-    # different id for the same (scope, name).
-    batch_ids_by_key: dict[tuple[str, str], set[str]] = {}
-    for edge in survivors:
-        if edge.role.kind == RoleKind.USER and edge.role.id in batch_user_role_ids:
-            batch_ids_by_key.setdefault((edge.scope.id, edge.role.name), set()).add(edge.role.id)
+        # (3) user-role churn collapse: a stale generation is dropped only when this batch carries a
+        # different id for the same (scope, name).
+        batch_ids_by_key: dict[tuple[str, str], set[str]] = {}
+        for edge in survivors:
+            if edge.role.kind == RoleKind.USER and edge.role.id in batch_user_role_ids:
+                batch_ids_by_key.setdefault((edge.scope.id, edge.role.name), set()).add(edge.role.id)
 
-    kept = [
-        edge
-        for edge in survivors
-        if not (
-            edge.role.kind == RoleKind.USER
-            and edge.role.id not in batch_ids_by_key.get((edge.scope.id, edge.role.name), set())
-            and batch_ids_by_key.get((edge.scope.id, edge.role.name))
-        )
-    ]
+        return [
+            edge
+            for edge in survivors
+            if not (
+                edge.role.kind == RoleKind.USER
+                and edge.role.id not in batch_ids_by_key.get((edge.scope.id, edge.role.name), set())
+                and batch_ids_by_key.get((edge.scope.id, edge.role.name))
+            )
+        ]
 
-    if len(kept) != len(model.inbound_rules):
-        model.inbound_rules = kept
-        return True
-    return False
+    changed = False
+    for attr in ("inbound_allow_rules", "inbound_deny_rules"):
+        edges: list[PolicyRule] = getattr(model, attr)
+        kept = _prune(edges)
+        if len(kept) != len(edges):
+            setattr(model, attr, kept)
+            changed = True
+    return changed
 
 
 def _spm_cache(catalog: dict[str, Service]):
@@ -175,16 +223,14 @@ def _spm_cache(catalog: dict[str, Service]):
 
 
 def _fresh_apm(agent_id: str) -> AgentPolicyModel:
+    # Identity/aggregate maps are the only required fields; the split target maps and the eight
+    # entity x effect rule lists default to empty and are filled by ``_derive``.
     return AgentPolicyModel(
         agent_id=agent_id,
         agent_roles=[],
         agent_scopes=[],
         source_roles={},
         subject_roles={},
-        target_scopes={},
-        inbound_rules=[],
-        outbound_rules=[],
-        outbound_subject_rules=[],
     )
 
 
@@ -192,10 +238,11 @@ def compute_and_apply(rules: list[PolicyRule], override: bool = False) -> None:
     """Route, persist, derive, and apply ``rules`` — fire-and-forget.
 
     ``override`` selects the merge mode at the SPM layer. ``False`` (default) appends each rule
-    additively to ``SPM(scope.serviceId).inbound_rules`` (dedup by ``role.id`` + ``scope.id``).
-    ``True`` authoritatively replaces every input role's mappings: the distinct input-role set is
-    purged from **every** SPM containing it, once, up-front, before the fresh rules are appended
-    (role-level revocation).
+    additively to the effect-matching inbound list on ``SPM(scope.serviceId)`` (``Deny`` →
+    ``inbound_deny_rules``, else ``inbound_allow_rules``; dedup by ``role.id`` + ``scope.id`` +
+    ``effect``). ``True`` authoritatively replaces every input role's mappings: the distinct
+    input-role set is purged from **both** inbound lists of **every** SPM containing it, once,
+    up-front, before the fresh rules are appended (role-level revocation).
 
     Exceptions from any dependency (IdP, Policy Store, PDP) are logged and **re-raised** so the
     caller (the Controller) surfaces the failure — e.g. as a 500 — instead of returning success
@@ -259,18 +306,15 @@ def _run(rules: list[PolicyRule], override: bool) -> None:
         for role in distinct_roles.values():
             for stored in get_service_policies_by_role(role):
                 model = spm(stored.service_id)
-                kept = [r for r in model.inbound_rules if r.role.id != role.id]
-                if len(kept) != len(model.inbound_rules):
-                    model.inbound_rules = kept
+                if _purge_role(model, role.id):
                     changed.add(model.service_id)
 
-    # (2) Route each rule to the SPM of the service that owns its scope. Append-dedup by
-    # role.id + scope.id. No write-time classification — kind only matters at derive time.
+    # (2) Route each rule to the SPM of the service that owns its scope, into the inbound list
+    # matching its ``effect`` (Deny → inbound_deny_rules, else inbound_allow_rules). Append-dedup by
+    # role.id + scope.id + effect. No role-kind classification here — kind only matters at derive.
     for rule in rules:
         model = spm(rule.scope.serviceId)
-        before = len(model.inbound_rules)
-        _add_rule(model.inbound_rules, rule)
-        if len(model.inbound_rules) != before or override:
+        if _route(model, rule) or override:
             changed.add(model.service_id)
 
     # (3.5) Reconcile touched SPMs against current IdP truth (get_services()-only — no extra IdP
@@ -303,8 +347,9 @@ def _run(rules: list[PolicyRule], override: bool) -> None:
         if is_agent(owner):
             affected.add(owner)  # the touched owner is an agent — its inbound changed
         # every agent targeting a scope on this touched SPM: owners of its Agent-kind inbound
-        # rules (a superset of the exact-scope match — re-deriving is idempotent, so safe).
-        for edge in spm(owner).inbound_rules:
+        # edges (allow AND deny — a deny edge also changed that agent's outbound), a superset of
+        # the exact-scope match (re-deriving is idempotent, so safe).
+        for edge in _all_inbound(spm(owner)):
             if edge.role.kind == RoleKind.AGENT:
                 affected.update(edge.role.actorIds)
 
@@ -327,29 +372,30 @@ def _decommission(service_id: str) -> None:
     # carries the roles/scopes X owned when it was onboarded. Content guard: a 404 fresh-empty SPM
     # (never onboarded / already removed) is a no-op — no spurious PDP delete.
     spm_x = spm(service_id)
-    if not (spm_x.owned_roles or spm_x.owned_scopes or spm_x.inbound_rules):
+    if not (
+        spm_x.owned_roles or spm_x.owned_scopes or spm_x.inbound_allow_rules or spm_x.inbound_deny_rules
+    ):
         return
 
-    # (3) Targeters — agents whose outbound loses X: they hold an Agent-kind inbound edge on SPM(X)
-    # (their_role → X_scope), which vanishes when SPM(X) is deleted in step 5.
+    # (3) Targeters — agents whose outbound loses X: they hold an Agent-kind inbound edge (allow or
+    # deny) on SPM(X) (their_role → X_scope), which vanishes when SPM(X) is deleted in step 5.
     affected: set[str] = {
         actor
-        for edge in spm_x.inbound_rules
+        for edge in _all_inbound(spm_x)
         if edge.role.kind == RoleKind.AGENT
         for actor in edge.role.actorIds
     }
 
     changed: set[str] = set()
 
-    # (4) Purge X's outbound footprint — X_role → other_scope edges stored on OTHER services' SPMs.
+    # (4) Purge X's outbound footprint — X_role → other_scope edges (allow AND deny) stored on OTHER
+    # services' SPMs.
     for role in spm_x.owned_roles:
         for stored in get_service_policies_by_role(role):
             if stored.service_id == service_id:
                 continue
             model = spm(stored.service_id)
-            kept = [e for e in model.inbound_rules if e.role.id != role.id]
-            if len(kept) != len(model.inbound_rules):
-                model.inbound_rules = kept
+            if _purge_role(model, role.id):
                 changed.add(model.service_id)
                 if is_agent(model.service_id):
                     affected.add(model.service_id)  # its inbound source_roles[X] vanished
@@ -376,8 +422,24 @@ def _decommission(service_id: str) -> None:
         apply_policy(PolicyModel(agents=derived))
 
 
+def _register_identity(apm: AgentPolicyModel, edge: PolicyRule) -> None:
+    """Register an inbound edge's role into the **effect-agnostic** identity maps — ``subject_roles``
+    for a User role, ``source_roles`` for an Agent role. Called for allow AND deny edges alike: a
+    role/subject that appears **only** in a DENY edge must still land here, or the generated deny
+    lookup cannot resolve the role at request time and the prohibition silently never fires."""
+    target = apm.subject_roles if edge.role.kind == RoleKind.USER else apm.source_roles
+    for actor in edge.role.actorIds:
+        _add_by_id(target.setdefault(actor, []), edge.role)
+
+
 def _derive(agent_id, spm) -> AgentPolicyModel:
-    """Build ``APM(agent_id)`` entirely from the persisted SPMs (zero IdP)."""
+    """Build ``APM(agent_id)`` entirely from the persisted SPMs (zero IdP).
+
+    Each inbound edge on ``SPM(A)`` is classified by ``role.kind`` (User → subject, Agent → source)
+    **and** ``effect`` (allow/deny) into one of four inbound buckets; each outbound edge (one of A's
+    own roles referenced on another SPM) is classified by ``effect`` into the target allow/deny
+    bucket and grows ``target_allow_scopes`` / ``target_deny_scopes``. Identity/aggregate maps stay
+    effect-agnostic — a deny-only role or subject still registers into them."""
     sa = spm(agent_id)
     apm = _fresh_apm(agent_id)
 
@@ -385,33 +447,56 @@ def _derive(agent_id, spm) -> AgentPolicyModel:
     apm.agent_roles = list(sa.owned_roles)
     apm.agent_scopes = list(sa.owned_scopes)
 
-    # Inbound — every edge on SPM(A), split by role.kind.
-    for edge in sa.inbound_rules:
-        _add_rule(apm.inbound_rules, edge)
-        if edge.role.kind == RoleKind.USER:
-            for username in edge.role.actorIds:
-                _add_by_id(apm.subject_roles.setdefault(username, []), edge.role)
-        else:  # Agent
-            for source_id in edge.role.actorIds:
-                _add_by_id(apm.source_roles.setdefault(source_id, []), edge.role)
+    # Inbound — every edge on SPM(A), split by (role.kind, effect). Identity maps effect-agnostic.
+    for effect, subject_bucket, source_bucket in (
+        (RuleEffect.ALLOW, apm.inbound_subject_allow_rules, apm.inbound_source_allow_rules),
+        (RuleEffect.DENY, apm.inbound_subject_deny_rules, apm.inbound_source_deny_rules),
+    ):
+        for edge in _inbound_list(sa, effect):
+            bucket = subject_bucket if edge.role.kind == RoleKind.USER else source_bucket
+            _add_rule(bucket, edge)
+            _register_identity(apm, edge)
 
-    # Outbound — for each of A's own roles, the edges on other services' SPMs that reference it.
-    # Relevance is directional: only A's *agent* roles confer an outbound edge, so a merely
-    # shared user role never creates a false edge to a service A does not target.
+    # Outbound — for each of A's own roles, the edges on other services' SPMs that reference it,
+    # split by effect. Relevance is directional: only A's *agent* roles confer an outbound edge, so
+    # a merely shared user role never creates a false edge to a service A does not target.
     for role in sa.owned_roles:
         for stored in get_service_policies_by_role(role):
-            for edge in stored.inbound_rules:
-                if edge.role.id != role.id:
-                    continue
-                scope = edge.scope
-                _add_rule(apm.outbound_rules, edge)
-                _add_by_id(apm.target_scopes.setdefault(scope.serviceId, []), scope)
-                # Outbound subject gate — the User-kind inbound rules on the SAME owning SPM
-                # whose scope is this target scope (the users allowed to reach it through A).
-                for user_edge in stored.inbound_rules:
-                    if user_edge.scope.id == scope.id and user_edge.role.kind == RoleKind.USER:
-                        _add_rule(apm.outbound_subject_rules, user_edge)
-                        for username in user_edge.role.actorIds:
-                            _add_by_id(apm.subject_roles.setdefault(username, []), user_edge.role)
+            _derive_outbound(apm, role, stored)
 
     return apm
+
+
+def _derive_outbound(apm: AgentPolicyModel, role: Role, stored: ServicePolicyModel) -> None:
+    """Project A's own ``role`` edges on ``stored`` into the outbound target + subject buckets,
+    split by effect: an ``Allow`` target edge grows ``outbound_target_allow_rules`` /
+    ``target_allow_scopes``; a ``Deny`` one grows the deny counterparts."""
+    for effect, target_rules, target_scopes in (
+        (RuleEffect.ALLOW, apm.outbound_target_allow_rules, apm.target_allow_scopes),
+        (RuleEffect.DENY, apm.outbound_target_deny_rules, apm.target_deny_scopes),
+    ):
+        for edge in _inbound_list(stored, effect):
+            if edge.role.id != role.id:
+                continue
+            scope = edge.scope
+            _add_rule(target_rules, edge)
+            _add_by_id(target_scopes.setdefault(scope.serviceId, []), scope)
+            # Outbound subject gate — the User-kind edges on the SAME owning SPM whose scope is this
+            # target scope (which users may / must not reach it through A).
+            _derive_outbound_subject(apm, stored, scope)
+
+
+def _derive_outbound_subject(
+    apm: AgentPolicyModel, stored: ServicePolicyModel, scope: Scope
+) -> None:
+    """Gather ``stored``'s User-kind edges for ``scope`` into the outbound subject buckets (allow /
+    deny), and register each such user into the effect-agnostic ``subject_roles`` map."""
+    for effect, subject_rules in (
+        (RuleEffect.ALLOW, apm.outbound_subject_allow_rules),
+        (RuleEffect.DENY, apm.outbound_subject_deny_rules),
+    ):
+        for user_edge in _inbound_list(stored, effect):
+            if user_edge.scope.id == scope.id and user_edge.role.kind == RoleKind.USER:
+                _add_rule(subject_rules, user_edge)
+                for username in user_edge.role.actorIds:
+                    _add_by_id(apm.subject_roles.setdefault(username, []), user_edge.role)
