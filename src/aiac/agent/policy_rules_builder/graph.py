@@ -18,7 +18,7 @@ from pydantic import BaseModel, SecretStr
 from tenacity import Retrying, retry_if_exception, stop_after_attempt, wait_exponential
 
 from aiac.idp.configuration.models import Role, Scope
-from aiac.policy.model.models import PolicyRule
+from aiac.policy.model.models import PolicyRule, RuleEffect
 from aiac.shared.upstream import is_transient, max_retries
 
 from .policy_source import get_policy_source
@@ -216,7 +216,14 @@ def build_role_graph():
 
     def build(s: RoleRulesState) -> dict[str, Any]:
         granted = set(s["selected_names"])
-        return {"rules": [PolicyRule(role=s["role"], scope=sc) for sc in s["scopes"] if sc.name in granted]}
+        # PRB is allow-only: every emitted rule is an explicit ALLOW (no deny extraction).
+        return {
+            "rules": [
+                PolicyRule(role=s["role"], scope=sc, effect=RuleEffect.ALLOW)
+                for sc in s["scopes"]
+                if sc.name in granted
+            ]
+        }
 
     return _assemble(RoleRulesState, propose, precheck, audit, build)
 
@@ -240,7 +247,14 @@ def build_scope_graph():
 
     def build(s: ScopeRulesState) -> dict[str, Any]:
         granted = set(s["selected_names"])
-        return {"rules": [PolicyRule(role=r, scope=s["scope"]) for r in s["roles"] if r.name in granted]}
+        # PRB is allow-only: every emitted rule is an explicit ALLOW (no deny extraction).
+        return {
+            "rules": [
+                PolicyRule(role=r, scope=s["scope"], effect=RuleEffect.ALLOW)
+                for r in s["roles"]
+                if r.name in granted
+            ]
+        }
 
     return _assemble(ScopeRulesState, propose, precheck, audit, build)
 

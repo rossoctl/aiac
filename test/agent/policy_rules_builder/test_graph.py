@@ -22,7 +22,7 @@ from aiac.agent.policy_rules_builder.graph import (
     build_scope_rules,
 )
 from aiac.idp.configuration.models import Role, Scope
-from aiac.policy.model.models import PolicyRule
+from aiac.policy.model.models import PolicyRule, RuleEffect
 from aiac.shared.upstream import is_transient
 
 
@@ -290,3 +290,40 @@ def test_build_llm_defaults_timeout_on_bad_env(monkeypatch):
         _build_llm()
 
     assert mk.call_args.kwargs["timeout"] == 120
+
+
+# --------------------------------------------------------------------------- #
+# #122 — keep-green under the ALLOW/DENY model. The PRB is allow-only: every    #
+# PolicyRule it emits (both the role and scope directions) carries              #
+# effect == RuleEffect.ALLOW, and it NEVER emits a DENY rule (deny extraction   #
+# from natural-language policy is deliberately out of scope). This locks the    #
+# allow-only intent against the new RuleEffect field.                          #
+# --------------------------------------------------------------------------- #
+def test_prb_emits_only_allow_effect_rules_both_directions():
+    role = _role()  # id=r-edit, name=editor
+    write = _scope("s-write", "write")
+
+    with ExitStack() as stack:
+        stack.enter_context(patch("aiac.agent.policy_rules_builder.graph.get_policy_source", return_value=_Source()))
+        stack.enter_context(
+            patch(
+                "aiac.agent.policy_rules_builder.graph._structured_call",
+                side_effect=[
+                    # role direction: propose + audit
+                    RoleSelection(granted_scope_names=["write"], reasoning="r"),
+                    AuditVerdict(approved=True),
+                    # scope direction: propose + audit
+                    ScopeSelection(roles_with_access_names=["editor"], reasoning="r"),
+                    AuditVerdict(approved=True),
+                ],
+            )
+        )
+        role_rules = build_role_rules(role, [write])
+        scope_rules = build_scope_rules([role], write)
+
+    # Both directions produce exactly one rule, and every rule is an ALLOW.
+    assert [r.effect for r in role_rules] == [RuleEffect.ALLOW]
+    assert [r.effect for r in scope_rules] == [RuleEffect.ALLOW]
+    assert all(r.effect is RuleEffect.ALLOW for r in role_rules + scope_rules)
+    # Allow-only invariant: the builder never emits a DENY rule.
+    assert not any(r.effect is RuleEffect.DENY for r in role_rules + scope_rules)
