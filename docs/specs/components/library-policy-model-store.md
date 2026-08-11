@@ -71,8 +71,9 @@ def get_service_policy_by_scope(scope: Scope) -> ServicePolicyModel | None
 def get_service_policies_by_role(role: Role) -> list[ServicePolicyModel]
     # GET /policy/services?role={role.id}  (the one genuinely new route)
     # Plural: a role (especially a user role) appears across many SPMs.
-    # Returns every SPM whose inbound_rules contains a rule referencing
-    # role.id. Empty list when none match.
+    # Returns every SPM whose inbound_allow_rules or inbound_deny_rules
+    # contains a rule referencing role.id (both effect lists are scanned).
+    # Empty list when none match.
 
 def apply_service_policy(service_id: str, spm: ServicePolicyModel) -> None
     # POST /policy/services/{service_id}  — upsert.

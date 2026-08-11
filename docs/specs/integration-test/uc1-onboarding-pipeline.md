@@ -196,7 +196,7 @@ baked-in reasons in UC-1 provisioning:
 
 1. **Workload-prefixed names.** UC-1 names every scope `{workload}.{name}`, so the data maps hold
    `github-tool.source-read` / `github-agent.source_operations` where `policy-pipeline` holds bare names.
-2. **Capability-matched `target_ok`.** UC-1 provisions one **operator role per skill**
+2. **Capability-matched `target_allow_ok`.** UC-1 provisions one **operator role per skill**
    (`github-agent.source_operations` / `github-agent.issue_operations`), which the PRB maps to the tool
    scopes by domain (capability-match), so the agent→tool gate is populated over all four tool scopes.
 
@@ -207,9 +207,9 @@ The tests therefore assert **same file set + same decisions + equivalent grant s
 Phase-1 states outbound access is the **per-scope intersection** of the user→tool gate and the
 agent→tool gate. UC-1 provisions **one operator role per skill**
 (`github-agent.source_operations` / `github-agent.issue_operations`), and the PRB maps those operator
-roles to the tool scopes by domain (capability-match under `generic_policy.md`), so `target_ok` is
+roles to the tool scopes by domain (capability-match under `generic_policy.md`), so `target_allow_ok` is
 **populated over all four tool scopes**. Because the agent reaches every tool scope, the **user gate
-discriminates** — the probe binds the real per-scope AND (`subject_ok AND target_ok` on the same
+discriminates** — the probe binds the real per-scope AND (`subject_allow_ok AND target_allow_ok` on the same
 `input.function_name`) and, for this scenario, its verdicts equal the user-gate slice. The AND is
 genuine, not degenerate: if the agent reached only a subset of the tool's scopes, the request would be
 denied for the scopes it does not reach.
@@ -279,8 +279,8 @@ The suite `pytest.skip`s when no `opa` binary is found.
   `/rego` output is what makes the pipeline observable.
 - **Onboarding-order-independence is asserted, not assumed** (rungs 2 vs 3). A divergence is a bug.
 - **Per-scope two-gate AND.** UC-1's per-skill operator roles are mapped to the tool scopes by
-  capability-match, so `target_ok` is populated; the outbound probe binds the real per-scope AND
-  (`subject_ok AND target_ok` on the same `input.function_name`). The agent reaches all four tool
+  capability-match, so `target_allow_ok` is populated; the outbound probe binds the real per-scope AND
+  (`subject_allow_ok AND target_allow_ok` on the same `input.function_name`). The agent reaches all four tool
   scopes, so the user gate discriminates.
 - **Grant sets, semantic.** Equivalence is re-derived from the Rego data maps and compared as sets — the
   semantic-similarity guarantee, not byte-identity.

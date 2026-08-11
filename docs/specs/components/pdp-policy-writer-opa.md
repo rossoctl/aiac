@@ -26,8 +26,9 @@ A single access rule pairing a typed role with a typed scope. Used in both inbou
 |-------|------|
 | `role` | `Role` |
 | `scope` | `Scope` |
+| `effect` | `RuleEffect` (`Allow` default / `Deny`) |
 
-`Role` and `Scope` are the typed models from `aiac.idp.configuration.models`. The Rego generator emits their `.name` as the string literal OPA matches against.
+`Role` and `Scope` are the typed models from `aiac.idp.configuration.models`. The Rego generator emits their `.name` as the string literal OPA matches against. `effect` selects whether the rule contributes to an `*_allow_scopes` or `*_deny_scopes` map (see below).
 
 ### `AgentPolicyModel`
 
@@ -36,24 +37,26 @@ Complete policy definition for a single agent (service). Contains two sets of `P
 | Field | Type | Description |
 |-------|------|-------------|
 | `agent_id` | `str` | Service ID from the AIAC trigger event (`aiac.apply.service.{id}`) |
-| `agent_roles` | `list[Role]` | Realm roles assigned to this agent |
-| `agent_scopes` | `list[Scope]` | Scopes this agent exposes |
-| `source_roles` | `dict[str, list[Role]]` | Inbound: source (calling service) **id** → roles held. Keyed by the inbound `input.identity.client_id`. **Optional** gate input — an absent `client_id`, or a platform bypass client, passes. |
-| `subject_roles` | `dict[str, list[Role]]` | Inbound + outbound: subject (end-user) **id** → roles held. Keyed by `input.identity.subject`. Inbound gate: **mandatory**. |
-| `target_scopes` | `dict[str, list[Scope]]` | Outbound: target service **id** → scopes this agent may request on it. Keys stay the **full** target service id (matching `input.identity.service_id`, a full SPIFFE ID); the scope **values** are de-prefixed to the bare MCP tool names carried in `input.mcp.params.name` (Q9). |
-| `inbound_rules` | `list[PolicyRule]` | Who may call this agent: `(subject_role, agent_scope)` tuples |
-| `outbound_rules` | `list[PolicyRule]` | What this agent may call: `(this_agent_role, target_scope)` tuples |
-| `outbound_subject_rules` | `list[PolicyRule]` | Which users may reach the agent's targets: `(user_role, tool_scope)` tuples. Defaults to `[]`. |
+| `agent_roles` | `list[Role]` | Realm roles assigned to this agent. Effect-agnostic identity. |
+| `agent_scopes` | `list[Scope]` | Scopes this agent exposes. Effect-agnostic identity. |
+| `source_roles` | `dict[str, list[Role]]` | Inbound: source (calling service) **id** → roles held. Keyed by the inbound `input.identity.client_id`. **Optional** gate input — an absent `client_id`, or a platform bypass client, passes. Effect-agnostic; **includes deny-edge roles**. |
+| `subject_roles` | `dict[str, list[Role]]` | Inbound + outbound: subject (end-user) **id** → roles held. Keyed by `input.identity.subject`. Inbound gate: **mandatory**. Effect-agnostic; **includes deny-edge roles**. |
+| `target_allow_scopes` | `dict[str, list[Scope]]` | Outbound: target service **id** → scopes this agent **may** request on it. Keys stay the **full** target service id (matching `input.identity.service_id`, a full SPIFFE ID); the scope **values** are de-prefixed to the bare MCP tool names carried in `input.mcp.params.name` (Q9). |
+| `target_deny_scopes` | `dict[str, list[Scope]]` | Outbound: target service **id** → scopes this agent **must not** request on it. Same key/value shape as `target_allow_scopes` (full target service id keys, de-prefixed scope values). |
+| `inbound_subject_allow_rules` / `inbound_subject_deny_rules` | `list[PolicyRule]` | Who may / must-not call this agent: `(subject_role, agent_scope)` tuples |
+| `inbound_source_allow_rules` / `inbound_source_deny_rules` | `list[PolicyRule]` | Which calling services may / must-not call this agent: `(source_role, agent_scope)` tuples |
+| `outbound_target_allow_rules` / `outbound_target_deny_rules` | `list[PolicyRule]` | What this agent may / must-not call: `(this_agent_role, target_scope)` tuples |
+| `outbound_subject_allow_rules` / `outbound_subject_deny_rules` | `list[PolicyRule]` | Which users may / must-not reach the agent's targets: `(user_role, tool_scope)` tuples. Default `[]`. |
 
-**`agent_roles` / `agent_scopes` provenance:** these carry the agent's **own** identity — the service-account realm roles it holds and the scopes it exposes. The Policy Computation Engine resolves them from the agent's IdP `Service` record (P2) and embeds them on every agent model it writes; a realm-level agent with no owning service keeps `[]`.
+**`agent_roles` / `agent_scopes` provenance:** these carry the agent's **own** identity — the service-account realm roles it holds and the scopes it exposes. The Policy Computation Engine resolves them from the agent's IdP `Service` record (P2) and embeds them on every agent model it writes; a realm-level agent with no owning service keeps `[]`. Together with `subject_roles` / `source_roles` they are **effect-agnostic**: a role appearing only in a DENY rule is still listed here, so the Rego deny lookup can resolve it.
 
-**Inbound rule semantics:** a subject holding realm role `role` is permitted to invoke this agent for the agent scope `scope`. Grouped by role, these rules become the `role_scopes` map (role → agent scopes) that the inbound package evaluates.
+**Inbound rule semantics (deny-overrides):** a subject holding realm role `role` may invoke this agent for agent scope `scope` iff an allow edge grants it and no deny edge prohibits it. Grouped by role, the allow/deny lists become `subject_role_allow_scopes` / `subject_role_deny_scopes` (and `source_role_allow_scopes` / `source_role_deny_scopes`) that the inbound package evaluates.
 
-**Outbound rule semantics:** this agent acting as realm role `role` is permitted to request the target scope `scope`. Grouped by role, these rules become the `agent_role_scopes` map (agent role → target scopes) that the outbound package evaluates.
+**Outbound target rule semantics (deny-overrides):** this agent acting as realm role `role` may request target scope `scope` iff an allow edge grants it and no deny edge prohibits it. Grouped by role, the lists become `agent_role_allow_scopes` / `agent_role_deny_scopes` (informational) and materialize into `target_allow_scopes` / `target_deny_scopes`.
 
-**Outbound subject rule semantics:** a subject holding realm role `role` (a **user** role) is permitted to reach a **tool** exposing scope `scope`. Grouped by role, these rules become the `subject_role_scopes` map (user role → tool scopes) that the **outbound** package's subject gate evaluates as `input.mcp.params.name in subject_role_scopes[role]`; its scope **values** are **de-prefixed** to the bare MCP tool name (Q9). This is distinct from `inbound_rules` (user → *agent* scope): the outbound subject gate answers "may this user reach the tool?", not "may this user call the agent?".
+**Outbound subject rule semantics (deny-overrides):** a subject holding realm role `role` (a **user** role) may reach a **tool** exposing scope `scope` iff an allow edge grants it and no deny edge prohibits it. Grouped by role, the lists become `subject_role_allow_scopes` / `subject_role_deny_scopes` (user role → tool scopes) that the **outbound** package's subject gate evaluates as `input.mcp.params.name in subject_role_allow_scopes[role]` (mirrored against `subject_role_deny_scopes`); their scope **values** are **de-prefixed** to the bare MCP tool name (Q9). This is distinct from the inbound subject rules (user → *agent* scope): the outbound subject gate answers "may this user reach the tool?", not "may this user call the agent?".
 
-**Note on `target_scopes` direction:** the map is keyed by **target service id → allowed scopes** (the inverse of the former `scope_targets`, which was `scope → targets`). The outbound Rego generator emits the **full** target service id as the map key and evaluates `target_scopes[input.identity.service_id]` directly — there is no inversion (see below). Only the scope **values** are de-prefixed to bare MCP tool names; the **keys** stay the full target service id (Q9).
+**Note on target-map direction:** `target_allow_scopes` / `target_deny_scopes` are keyed by **target service id → scopes** (the inverse of the former `scope_targets`, which was `scope → targets`). The outbound Rego generator emits the **full** target service id as the map key and evaluates `target_allow_scopes[input.identity.service_id]` / `target_deny_scopes[input.identity.service_id]` directly — there is no inversion (see below). Only the scope **values** are de-prefixed to bare MCP tool names; the **keys** stay the full target service id (Q9).
 
 ### `PolicyModel`
 
@@ -131,22 +134,24 @@ On the outbound leg there is no validated JWT; the plugin synthesizes `input.ide
 
 The generator embeds these symbols, derived from the `AgentPolicyModel`:
 
+**Symmetric rename — no alias, no back-compat.** The single inbound `role_scopes` map splits into `subject_role_allow_scopes` / `subject_role_deny_scopes` / `source_role_allow_scopes` / `source_role_deny_scopes`; the outbound `subject_role_scopes` splits into `subject_role_allow_scopes` / `subject_role_deny_scopes`; `target_scopes` splits into `target_allow_scopes` / `target_deny_scopes`. Identity maps `subject_roles` / `source_roles` / `agent_roles` keep their names.
+
 | Rego symbol | Source | Shape | De-prefixed? |
 |-------------|--------|-------|--------------|
 | `agent_scopes` | `model.agent_scopes` | `[scope.name, …]` — **inbound only** (the audience gate) | no — full scope names |
-| `subject_roles` | `model.subject_roles` | subject id → `[role.name, …]` | n/a (roles) |
-| `source_roles` | `model.source_roles` | source client id → `[role.name, …]` — **inbound only** | n/a (roles) |
-| `role_scopes` | grouped `model.inbound_rules` | role → `[agent scope name, …]` — **inbound only** | no — full scope names |
+| `subject_roles` | `model.subject_roles` | subject id → `[role.name, …]` (effect-agnostic; includes deny-edge roles) | n/a (roles) |
+| `source_roles` | `model.source_roles` | source client id → `[role.name, …]` — **inbound only** (effect-agnostic; includes deny-edge roles) | n/a (roles) |
+| `subject_role_allow_scopes` / `subject_role_deny_scopes` | grouped `inbound_subject_{allow,deny}_rules` (inbound) / `outbound_subject_{allow,deny}_rules` (outbound) | role → `[scope name, …]` — inbound: agent scopes; outbound: tool names | inbound no; outbound **yes** |
+| `source_role_allow_scopes` / `source_role_deny_scopes` | grouped `inbound_source_{allow,deny}_rules` | role → `[agent scope name, …]` — **inbound only** | no — full scope names |
 | `agent_roles` | `model.agent_roles` | `[role.name, …]` — **outbound only** (informational) | n/a (roles) |
-| `subject_role_scopes` | grouped `model.outbound_subject_rules` | user role → `[tool name, …]` — **outbound only** | **yes** — bare tool names |
-| `agent_role_scopes` | grouped `model.outbound_rules` | agent role → `[tool name, …]` — **outbound only** (informational) | **yes** — bare tool names |
-| `target_scopes` | `model.target_scopes` | full target service id → `[tool name, …]` — **outbound only** | **values yes, keys no** |
+| `agent_role_allow_scopes` / `agent_role_deny_scopes` | grouped `outbound_target_{allow,deny}_rules` | agent role → `[tool name, …]` — **outbound only** (informational) | **yes** — bare tool names |
+| `target_allow_scopes` / `target_deny_scopes` | `model.target_allow_scopes` / `model.target_deny_scopes` | full target service id → `[tool name, …]` — **outbound only** | **values yes, keys no** |
 
-De-prefixing (Q9) is **outbound-only**: provisioned scope names are prefixed with their owning workload (`github-tool.source-read`), but the value that arrives in `input.mcp.params.name` at runtime is the bare tool name (`source-read`), so the outbound map **values** are stripped of a leading `"<owner>."` (where `owner = identity_ref(scope.serviceId).name`). The **keys** of `target_scopes` stay the full target service id (they match `input.identity.service_id`). Inbound `agent_scopes` / `role_scopes` keep their **full** names — the inbound gate compares scopes internally, never against `input.mcp.params.name`.
+De-prefixing (Q9) is **outbound-only**: provisioned scope names are prefixed with their owning workload (`github-tool.source-read`), but the value that arrives in `input.mcp.params.name` at runtime is the bare tool name (`source-read`), so the outbound map **values** are stripped of a leading `"<owner>."` (where `owner = identity_ref(scope.serviceId).name`). The **keys** of `target_allow_scopes` / `target_deny_scopes` stay the full target service id (they match `input.identity.service_id`). Inbound `agent_scopes` and the `*_role_allow_scopes` / `*_role_deny_scopes` maps keep their **full** names — the inbound gate compares scopes internally, never against `input.mcp.params.name`.
 
 ### Inbound package: `authbridge.client.inbound.request`
 
-Evaluated by the AuthBridge OPA plugin in the **inbound pipeline** — "who may call this agent". `allow` requires `subject_ok` **and** `source_ok`. `subject_ok` passes when the subject (`input.identity.subject`) holds a role granting at least one of the agent's own `agent_scopes`. `source_ok` passes when (a) there is no calling `input.identity.client_id` (pure end-user traffic), (b) the `client_id` is one of the **platform bypass clients** — `rossoctl` by default, from `PLATFORM_SOURCE_CLIENTS` (Q5); this bypass is **mandatory**, since end-user traffic carries the platform client and would otherwise be denied — or (c) that client holds a role granting an agent scope.
+Evaluated by the AuthBridge OPA plugin in the **inbound pipeline** — "who may call this agent". `allow` requires `subject_allow_ok` **and** `source_allow_ok` and **neither** `subject_deny_ok` **nor** `source_deny_ok` (deny-overrides). `subject_allow_ok` passes when the subject (`input.identity.subject`) holds a role granting at least one of the agent's own `agent_scopes` via `subject_role_allow_scopes`; `subject_deny_ok` mirrors it against `subject_role_deny_scopes`. `source_allow_ok` passes when (a) there is no calling `input.identity.client_id` (pure end-user traffic), (b) the `client_id` is one of the **platform bypass clients** — `rossoctl` by default, from `PLATFORM_SOURCE_CLIENTS` (Q5); this bypass is **mandatory**, since end-user traffic carries the platform client and would otherwise be denied — or (c) that client holds a role granting an agent scope via `source_role_allow_scopes`; `source_deny_ok` mirrors it against `source_role_deny_scopes`.
 
 The block below is reproduced **verbatim** from `docs/examples/opa-team1-policy.yaml` (`inbound/request.rego`):
 
@@ -163,32 +168,47 @@ subject_roles := {
 
 source_roles := {}
 
-role_scopes := {
+subject_role_allow_scopes := {
     "developer": ["github-agent.issue_operations", "github-agent.source_operations"],
     "tester": ["github-agent.issue_operations"],
 }
+subject_role_deny_scopes := {}
+source_role_allow_scopes := {}
+source_role_deny_scopes := {}
 
-subject_ok if {
+subject_allow_ok if {
     some role in subject_roles[input.identity.subject]
-    some scope in role_scopes[role]
+    some scope in subject_role_allow_scopes[role]
+    scope in agent_scopes
+}
+subject_deny_ok if {
+    some role in subject_roles[input.identity.subject]
+    some scope in subject_role_deny_scopes[role]
     scope in agent_scopes
 }
 
-source_ok if { not input.identity.client_id }
-source_ok if { input.identity.client_id == "rossoctl"}
-source_ok if {
+source_allow_ok if { not input.identity.client_id }
+source_allow_ok if { input.identity.client_id == "rossoctl" }
+source_allow_ok if {
     some role in source_roles[input.identity.client_id]
-    some scope in role_scopes[role]
+    some scope in source_role_allow_scopes[role]
+    scope in agent_scopes
+}
+source_deny_ok if {
+    some role in source_roles[input.identity.client_id]
+    some scope in source_role_deny_scopes[role]
     scope in agent_scopes
 }
 
 default allow := false
-allow if { subject_ok; source_ok }
+allow if { subject_allow_ok; source_allow_ok; not subject_deny_ok; not source_deny_ok }
 ```
+
+**Deny-overrides:** `allow` fires only when both allow gates pass **and** neither deny gate matches. A subject or source barred by a deny edge is rejected even when an allow edge would otherwise admit it. (An absent `input.identity.client_id` makes `source_allow_ok` true and — because `source_roles[input.identity.client_id]` is undefined — leaves `source_deny_ok` false, so an absent source still passes.)
 
 ### Outbound package: `authbridge.client.outbound.request`
 
-Evaluated by the AuthBridge OPA plugin in the **outbound pipeline** — "what this agent may call", **per invoked tool**. `allow` is an AND on the **same** `input.mcp.params.name`: `subject_ok` (the delegated user's role admits the tool — `input.mcp.params.name in subject_role_scopes[role]`, de-prefixed values) AND `target_ok` (the target service, keyed by the full `input.identity.service_id`, admits the tool — `input.mcp.params.name in target_scopes[input.identity.service_id]`). `agent_roles` / `agent_role_scopes` are emitted for debugging but are **not** referenced by `allow` — `target_scopes[input.identity.service_id]` already *is* the per-scope capability gate. This package emits neither `agent_scopes` nor the inbound `role_scopes` gate: outbound decisions never consider the agent's own audience scopes.
+Evaluated by the AuthBridge OPA plugin in the **outbound pipeline** — "what this agent may call", **per invoked tool**. `allow` is an AND on the **same** `input.mcp.params.name`, requiring **both** allow gates to pass and **neither** deny gate to match (deny-overrides): `subject_allow_ok` (the delegated user's role admits the tool — `input.mcp.params.name in subject_role_allow_scopes[role]`, de-prefixed values) AND `target_allow_ok` (the target service, keyed by the full `input.identity.service_id`, admits the tool — `input.mcp.params.name in target_allow_scopes[input.identity.service_id]`), with `subject_deny_ok` / `target_deny_ok` mirroring them against `subject_role_deny_scopes` / `target_deny_scopes`. `agent_roles` / `agent_role_allow_scopes` / `agent_role_deny_scopes` are emitted for debugging but are **not** referenced by `allow` — `target_allow_scopes[input.identity.service_id]` already *is* the per-scope capability gate. This package emits neither `agent_scopes` nor the inbound subject gate: outbound decisions never consider the agent's own audience scopes.
 
 The block below is reproduced **verbatim** from `docs/examples/opa-team1-policy.yaml` (`outbound/request.rego`):
 
@@ -206,26 +226,38 @@ subject_roles := {
 # issues-write — one per skill. These names ARE the values that arrive in
 # input.mcp.params.name when a specific tool is invoked, so the maps
 # below key on them.
-subject_role_scopes := {
+subject_role_allow_scopes := {
     "developer": ["issues-read", "source-write", "source-read"],
     "tester": ["issues-read", "issues-write"],
 }
-agent_role_scopes := {
+subject_role_deny_scopes := {}
+agent_role_allow_scopes := {
     "github-agent.issue_operations": ["issues-read", "issues-write"],
     "github-agent.source_operations": ["source-write", "source-read"],
 }
-target_scopes := {
+agent_role_deny_scopes := {}
+target_allow_scopes := {
     "spiffe://localtest.me/ns/team1/sa/github-tool": ["source-read", "source-write", "issues-read", "issues-write"],
 }
-subject_ok if {
+target_deny_scopes := {}
+# user may reach the tool: holds a role granted the invoked tool (input.mcp.params.name)
+subject_allow_ok if {
     some role in subject_roles[input.identity.subject]
-    input.mcp.params.name in subject_role_scopes[role]
+    input.mcp.params.name in subject_role_allow_scopes[role]
 }
-target_ok if {
-    input.mcp.params.name in target_scopes[input.identity.service_id]
+subject_deny_ok if {
+    some role in subject_roles[input.identity.subject]
+    input.mcp.params.name in subject_role_deny_scopes[role]
+}
+# agent may reach the tool: the invoked tool is one the target accepts (direct, per-scope)
+target_allow_ok if {
+    input.mcp.params.name in target_allow_scopes[input.identity.service_id]
+}
+target_deny_ok if {
+    input.mcp.params.name in target_deny_scopes[input.identity.service_id]
 }
 default allow := false
-allow if { subject_ok; target_ok }
+allow if { subject_allow_ok; target_allow_ok; not subject_deny_ok; not target_deny_ok }
 ```
 
 A worked example (agent `github-agent`, users `developer`/`tester`, tool `github-tool`) is maintained alongside the tests, and mirrored in `docs/examples/opa-team1-policy.yaml`.
@@ -310,7 +342,7 @@ apply_policy(full_model)
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `PLATFORM_SOURCE_CLIENTS` | No | `rossoctl` | Comma-separated platform bypass clients, sourced from the `aiac-pdp-config` ConfigMap. Drives the inbound package's `source_ok if { input.identity.client_id == "<c>" }` bypass rules (Q5). Blanks are dropped; an unset or all-blank value falls back to `rossoctl` (dropping the bypass would deny end-user traffic, which carries the platform client). |
+| `PLATFORM_SOURCE_CLIENTS` | No | `rossoctl` | Comma-separated platform bypass clients, sourced from the `aiac-pdp-config` ConfigMap. Drives the inbound package's `source_allow_ok if { input.identity.client_id == "<c>" }` bypass rules (Q5). Blanks are dropped; an unset or all-blank value falls back to `rossoctl` (dropping the bypass would deny end-user traffic, which carries the platform client). |
 | `POLICY_WRITER_DUMP_REGO` | No | off | When truthy (`1`/`true`/`yes`/`on`) enables the **additive** local rego dump (see below). Never gates the CR write. |
 | `REGO_OUTPUT_DIR` | No | `/rego` | Destination for the additive dump — only consulted when `POLICY_WRITER_DUMP_REGO` is on. |
 
@@ -383,7 +415,9 @@ docker build -f aiac/src/aiac/pdp/service/policy/opa/Dockerfile \
 - **Kube config at import:** `_load_kube_config()` tries `config.load_incluster_config()`, falling back to `config.load_kube_config()` (local dev). Both failing is non-fatal — the module stays importable and API calls surface as 502/503 until real config exists. A module-level `client.CustomObjectsApi` handles all CR operations.
 - **Code constants (never env vars):** `_GROUP = "agent.rossoctl.dev"`, `_VERSION = "v1alpha1"`, `_PLURAL = "authorizationpolicies"`, `_MANAGED_BY_LABEL = {"app.kubernetes.io/managed-by": "aiac-pdp-policy-writer"}`, `_FIELD_MANAGER = "aiac-pdp-policy-writer"` (Q8).
 - **`identity_ref(agent_id) -> (namespace, name)`** (in `rego.py`): SPIFFE or `<ns>/<name>` → DNS-1123-validated `(namespace, name)`; raises `ValueError` (→ 400) when no namespace is derivable or a segment is an invalid label — no fallback.
-- **`generate_inbound_rego(model, platform_clients)` / `generate_outbound_rego(model)`** (in `rego.py`): render the two fixed-package strings. The inbound generator emits one `source_ok` bypass rule per `platform_clients` entry (plus the no-`client_id` and role-based rules); the outbound generator de-prefixes its map values.
+- **`generate_inbound_rego(model, platform_clients)` / `generate_outbound_rego(model)`** (in `rego.py`): render the two fixed-package strings under the ALLOW/DENY model. The inbound generator emits `subject_roles` / `source_roles` (effect-agnostic) plus the grouped `subject_role_allow_scopes` / `subject_role_deny_scopes` (from `inbound_subject_{allow,deny}_rules`) and `source_role_allow_scopes` / `source_role_deny_scopes` (from `inbound_source_{allow,deny}_rules`), one `source_allow_ok` bypass rule per `platform_clients` entry (plus the no-`client_id` and role-based rules), and the mirrored `subject_deny_ok` / `source_deny_ok` gates; `allow` applies deny-overrides. The outbound generator emits `subject_role_allow_scopes` / `subject_role_deny_scopes` (from `outbound_subject_{allow,deny}_rules`), `agent_role_allow_scopes` / `agent_role_deny_scopes` (from `outbound_target_{allow,deny}_rules`, informational), and `target_allow_scopes` / `target_deny_scopes`, de-prefixing its map values; `allow` is a per-scope AND with deny-overrides.
+
+> **Rollout impact.** These identifier renames are symmetric with **no alias / no back-compat**. All generated `.rego` **golden fixtures must be regenerated** to match the split gates. The demo helper `demo/use-cases/uc1-onboarding/lib/_lib.py` (which reads the `target_scopes` Rego map) must **retarget to `target_allow_scopes`**.
 - **`_build_cr(model)`:** assemble the CR body — `metadata.name`/`.namespace` from `identity_ref`, the managed-by label, `spec.scope: client`, `spec.clientID` = the display name, and `policies[]` = the two rendered packages. Raises `ValueError` (via `identity_ref`) on a malformed `agent_id`.
 - **`_upsert_agent(model)`:** server-side apply via `patch_namespaced_custom_object` (`_content_type="application/apply-patch+yaml"`, `field_manager=_FIELD_MANAGER`, `force=True`); then, if the dump is enabled, `_dump_cr`.
 - **`_delete_agent(agent_id)`:** `delete_namespaced_custom_object` for the single `(name, namespace)`; a k8s **404 is swallowed** (idempotent → 204); then dump-clear the agent's tree if enabled.

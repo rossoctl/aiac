@@ -97,7 +97,7 @@ scenario truth table against **each** variant's Rego (step 7). Steps 1–6 below
    Concatenate into a single `list[PolicyRule]` and call
    `aiac.policy.computation.engine.compute_and_apply(rules, override=False)` against a **fresh** Policy
    Store. The PCE resolves the IdP relationships, builds the `github-agent` model (with `agent_roles` /
-   `agent_scopes`; mapping (b) routed into `outbound_subject_rules`; and **no** `github-tool` model),
+   `agent_scopes`; mapping (b) routed into `outbound_subject_allow_rules`; and **no** `github-tool` model),
    writes it to the store, and pushes it to the OPA stub.
 6. **Terminate the three subprocesses in `finally`.** The realm and the `.rego` files are left in
    place for eyeballing.
@@ -107,11 +107,11 @@ scenario truth table against **each** variant's Rego (step 7). Steps 1–6 below
    - **`opa` discovery** — `$OPA_BIN` → else `shutil.which("opa")` → else `pytest.skip("opa not
      found")`. Missing `opa` skips (does not fail) the suite.
    - **Inbound** — one node per `(variant × subject)`. Request `{"subject": <id>}` (source omitted, so
-     the generated `source_ok` passes) is evaluated against the real
+     the generated `source_allow_ok` passes) is evaluated against the real
      `data.authz.github_agent.inbound.allow`. Coarse "can this user reach the agent at all" — there is
      no intent field.
    - **Outbound** — one node per `(variant × subject × function_name)`, where `function_name` is the
-     agent's operation (a tool scope). Because the generated `allow` / `subject_ok` are existential and
+     agent's operation (a tool scope). Because the generated `allow` / `subject_allow_ok` are existential and
      ignore any scope, the outbound decision is evaluated by a **probe query**,
      `data.probe.outbound.allow` (defined in `test/integration/probe.rego`), which binds
      `input.function_name` against the generated data maps and requires **both** the user→tool gate and
@@ -166,11 +166,14 @@ Alongside the assertions, each variant leaves exactly **two** files on disk in i
   `subject_roles` = `{dev-user: [developer], test-user: [tester]}`; `agent_scopes` populated.
   (`devops-user` holds `devops`, which maps to no agent scope, so it is absent from `subject_roles` and
   denied inbound.)
-- `github_agent.outbound.rego` — package `authz.github_agent.outbound`; `allow if { subject_ok;
-  target_ok }`. Its **`subject_ok`** is the new **user→tool** gate (mapping (b), grouped from
-  `outbound_subject_rules` into `subject_role_scopes`, matched against
-  `target_scopes[input.target]`); its **`target_ok`** is the **agent→tool** gate (mapping (c), over
-  `agent_roles` × `agent_role_scopes`). `agent_roles` and `target_scopes` are populated.
+- `github_agent.outbound.rego` — package `authz.github_agent.outbound`; `allow if { subject_allow_ok;
+  target_allow_ok; not subject_deny_ok; not target_deny_ok }`. Its **`subject_allow_ok`** is the new
+  **user→tool** gate (mapping (b), grouped from `outbound_subject_allow_rules` into
+  `subject_role_allow_scopes`, matched against `target_allow_scopes[input.target]`); its
+  **`target_allow_ok`** is the **capability** gate (`input.function_name in
+  target_allow_scopes[input.target]`), with `agent_roles` × `agent_role_allow_scopes` emitted
+  informationally (mapping (c)). `agent_roles` and `target_allow_scopes` are populated. This fixture is
+  allow-only, so the deny gates are vacuous (empty `*_deny_scopes` maps).
 
 Explicitly **no** `github_tool.*.rego` — the pipeline emits no tool model. Eyeball both files against
 the **ID-only** package shapes in
@@ -261,7 +264,7 @@ Policy Model Store DB and the provisioned Keycloak realm.
   might be wrong, so the expected verdicts are **computed from** the scenario pair-lists
   (`INBOUND_PAIRS` / `OUTBOUND_SUBJECT_PAIRS` / `OUTBOUND_PAIRS`), not from a second hand-maintained
   copy or from the Rego itself. A wrong role→scope mapping therefore fails the test at the exact cell.
-- **Outbound needs a probe.** The generated `allow` / `subject_ok` are existential and ignore any
+- **Outbound needs a probe.** The generated `allow` / `subject_allow_ok` are existential and ignore any
   scope, so a raw query cannot answer "may this subject invoke *this* function." A small
   `test/integration/probe.rego` (`data.probe.outbound.allow`) binds `input.function_name` against the
   generated data maps and requires **both** the user→tool and agent→tool gates to admit it. Names are

@@ -102,6 +102,8 @@ class AuditVerdict(BaseModel):
 The PRB rebuilds rules from the typed inputs, e.g.
 `[PolicyRule(role=role, scope=s) for s in scopes if s.name in granted_scope_names]`.
 
+> **Allow-only for now (ALLOW/DENY model).** With two-sided rules landing in the policy model (`PolicyRule.effect`, `RuleEffect.ALLOW` / `DENY` — see [`../policy-model.md`](../policy-model.md)), the PRB continues to emit **allow-only** rules: it constructs `PolicyRule` without an `effect`, relying on the `ALLOW` default, so every rule it produces is a grant. The minimal change the PRB needs is only to keep compiling/constructing against the updated `PolicyRule` shape. **Extracting `Deny` rules from natural-language policy text is an explicit follow-up** and is out of scope here; the proposer/auditor nodes and the structured-output schemas above judge grants only.
+
 ### State fields
 
 ```python
