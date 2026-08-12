@@ -162,6 +162,8 @@ except Exception:
 # admin_token  — realm master admin token for Keycloak admin API (B.2)
 admin_token() {
   local tok
+  # DEV ONLY: admin/admin is the seeded Kind cluster default — never copy into
+  # staging/production scripts; real deployments do not have password == username.
   tok=$(curl -s -X POST "${KC}/realms/master/protocol/openid-connect/token" \
           -d client_id=admin-cli -d username=admin -d password=admin -d grant_type=password \
         | python3 -c 'import sys,json;print(json.load(sys.stdin).get("access_token",""))' 2>/dev/null || true)
