@@ -147,9 +147,14 @@ return allows + denies   # allows-then-denies, each in candidate order
 >   may access source"* → `DENY(role, source)` for every other candidate role).
 >
 > A single statement may thus yield **both** an ALLOW and one or more DENYs; a **non-exclusive** grant
-> imposes nothing on the complement (ALLOW only). Deny/exclusivity extraction applies to the **scenario
-> policy text only** — the generic baseline contributes **grants only** and is never a source of
-> denials. The exclusivity complement is **derived** from the typed candidate set (never LLM-enumerated:
+> imposes nothing on the complement (ALLOW only). Deny/exclusivity extraction is bound by **layer, not by
+> source**: it draws on the **scenario layer** — both the scenario `policy.md` prose **and** the
+> focal/candidate entity **descriptions** — exactly **symmetric** with the grant side, which already
+> reads descriptions (capability projection, Rule 3). A prohibition stated in a role/scope description
+> (e.g. *"works … not in source"*, *"does not manage the issue tracker"*) is a valid DENY trigger just
+> as a positive description is a valid grant signal. The generic **baseline** (`generic_policy.md`)
+> contributes **grants only** and is never a source of denials. The exclusivity complement is
+> **derived** from the typed candidate set (never LLM-enumerated:
 > an incomplete enumeration would silently re-open the very paths DENY exists to close) and is bounded
 > strictly to the current call's candidates — the PRB can only deny what it was handed. A DENY's whole
 > purpose is to be a **durable prohibition** that survives a later, broader grant under deny-overrides.
@@ -191,8 +196,9 @@ exclusive-language trigger.
 **Deny / exclusivity rules** (shared by proposer AND auditor — see share note below):
 
 - **Direct-prohibition** and **exclusivity ("only")** triggers as in the deny-extraction callout
-  above; deny extraction is **scenario-only**; silence and a non-exclusive grant impose nothing on
-  the complement.
+  above; deny extraction is bound to the **scenario layer** (scenario `policy.md` **and** focal/candidate
+  descriptions — symmetric with grants; the **baseline** contributes grants only), never source-restricted
+  to the policy prose; silence and a non-exclusive grant impose nothing on the complement.
 - The two name lists (granted / denied) are **mutually exclusive except** when the policy genuinely
   establishes both a grant and a prohibition for the same candidate (direct conflict or coarse-scope)
   — that overlap is the **contradiction signal**, not a normal proposal.

@@ -29,9 +29,15 @@ _GENERIC_POLICY = (Path(__file__).parent / "generic_policy.md").read_text(encodi
 
 
 def _policy_block(policy_text: str) -> str:
-    """Compose the POLICY block: least-privilege directive, then the generic baseline, then the
-    scenario policy."""
-    return f"{_GRANT_ACCESS}\n\n{_GENERIC_POLICY}\n\n{policy_text}"
+    """Compose the POLICY block in three labeled layers: the least-privilege directive, then the
+    generic baseline (explicitly grants-only — never a source of denials), then the scenario policy.
+    The labels let the deny/exclusivity rules bind to the SCENARIO layer only."""
+    return (
+        f"{_GRANT_ACCESS}\n\n"
+        f"BASELINE POLICY (grants only — never a source of denials):\n{_GENERIC_POLICY}\n\n"
+        f"SCENARIO POLICY:\n{policy_text}"
+    )
+
 
 _SAFETY = (
     "Rules:\n"
@@ -40,7 +46,8 @@ _SAFETY = (
     "establishing that the candidate performs an operation the scope covers (see rule 3). Policy "
     "silence is not by itself a reason to deny a pair the descriptions already establish, nor a "
     "license to grant one they do not; when neither the policy nor those descriptions support the "
-    "pair, do not grant. A statement about any OTHER entity is never support (see rule 4).\n"
+    "pair, do not grant. Silence is a silent non-grant (no rule at all) — NOT an explicit "
+    "prohibition (see rule 5). A statement about any OTHER entity is never support (see rule 4).\n"
     "2) Stay strictly scoped to the single focal entity described below; ignore anything else."
 )
 
@@ -62,23 +69,62 @@ _SAFETY = (
 #   appears in two relationships bleeds across them — wrongly rejecting a single-subject grant, or
 #   inventing an agent-role grant from an unrelated subject statement.
 _MAPPING_RULES = (
-    "\n3) A scope or capability names a set of operations (see its description). Grant it to a "
-    "candidate when the policy — or the focal entity's and the candidate's own descriptions — shows "
-    "that candidate performs ANY operation the scope covers; partial access (e.g. read-only) still "
-    "grants the scope. A candidate shown to perform no covered operation is denied (rule 1).\n"
+    "\n3) A scope or capability names a set of operations (see its description). CAPABILITY "
+    "PROJECTION IS SYMMETRIC: grant it to a candidate when the policy — or the focal entity's and "
+    "the candidate's own descriptions — shows that candidate performs ANY operation the scope "
+    "covers (partial access, e.g. read-only, still grants the whole scope); conversely, when a "
+    "covered operation is explicitly PROHIBITED for a candidate, deny the whole scope. A candidate "
+    "shown to perform no covered operation is simply not granted (rule 1), which is not the same as "
+    "an explicit prohibition. If a coarse scope is BOTH partly permitted AND partly prohibited for "
+    "the same pair (e.g. 'may read issues but must not modify them' where the scope covers read and "
+    "write), the candidate legitimately lands in BOTH lists — surface it as a contradiction (rule "
+    "7); do NOT silently resolve it.\n"
     "4) A policy may describe several different access relationships over the same entities. Judge "
     "each candidate independently, by what the policy or the descriptions establish for THAT candidate "
     "in relation to the focal entity. Base each grant only on evidence about that specific candidate "
     "and the focal entity; a statement about any OTHER entity — even one sharing the same domain or "
     "theme (e.g. a differently-named role or subject with related access) — concerns a different "
     "relationship and is never evidence for or against the grant, even when it names the focal entity "
-    "or the scope."
+    "or the scope. ONE SANCTIONED EXCEPTION: exclusive/restrictive scoping ABOUT THE FOCAL ENTITY "
+    "(rule 6) is legitimate evidence to deny the complement — that is the only cross-candidate "
+    "inference allowed."
 )
 
-_PROPOSER_SYSTEM = "You map access policy to concrete grants.\n" + _SAFETY + _MAPPING_RULES
+# Deny / exclusivity contract — appended to BOTH the proposer and auditor system messages so the
+# two halves of the LLM contract cannot diverge. Deny extraction is SCENARIO-only; the baseline
+# is grants-only.
+_DENY_RULES = (
+    "\n5) EXPLICIT PROHIBITIONS -> deny. Prohibitive language in the SCENARIO policy about a "
+    "specific pair — 'must not', 'cannot', 'may not', 'is forbidden', 'never', 'except', 'but not', "
+    "'read-only' / 'may read but not write' — records that candidate as a PROHIBITION (a durable "
+    "DENY), not merely a non-grant. This applies to the scenario policy ONLY: the baseline policy is "
+    "grants-only and is NEVER a source of prohibitions. Silence about a pair, and a plain "
+    "non-exclusive grant, impose NOTHING on anything else — they never deny.\n"
+    "6) EXCLUSIVITY ('only'). Restrictive/exclusive language about the FOCAL entity — 'only', 'solely', "
+    "'exclusively', 'nothing else' — means the focal entity's access is closed to EXACTLY the granted "
+    "set. Signal this by setting the exclusivity flag true; do NOT enumerate the other candidates "
+    "yourself (the builder derives the complete complement from the candidate set). A non-exclusive "
+    "grant leaves the flag false and denies nothing.\n"
+    "7) The grant list and the prohibition list are MUTUALLY EXCLUSIVE, except when the scenario "
+    "policy genuinely establishes BOTH a grant and a prohibition for the same candidate (a direct "
+    "conflict, or a coarse scope partly permitted and partly forbidden) — then, and only then, list "
+    "that candidate in both. That overlap is the contradiction signal; never invent it to hedge."
+)
+
+_PROPOSER_SYSTEM = (
+    "You map access policy to concrete grants AND prohibitions. Return the granted candidates, the "
+    "explicitly-prohibited candidates, and whether the focal entity's access is exclusive.\n"
+    + _SAFETY
+    + _MAPPING_RULES
+    + _DENY_RULES
+)
 _AUDITOR_SYSTEM = (
-    "You audit a proposed set of grants. Approve only if every granted pair is "
-    "policy-supported and nothing unsupported slipped in.\n" + _SAFETY + _MAPPING_RULES
+    "You audit a proposed set of grants and prohibitions. Approve only if every granted pair is "
+    "policy-supported, every prohibited pair is a genuine explicit-prohibition or exclusivity deny, "
+    "the exclusivity flag is truly asserted by the SCENARIO policy, and nothing unsupported slipped "
+    "in. When a candidate is named in BOTH lists (a conflict), adjudicate it: a genuine "
+    "grant-and-prohibit collision is a contradiction (report it), a mere proposer slip is an "
+    "ordinary rejection.\n" + _SAFETY + _MAPPING_RULES + _DENY_RULES
 )
 
 
@@ -100,9 +146,20 @@ def build_auditor_messages(
     focal: str,
     candidates: str,
     selected_names: list[str],
+    denied_names: list[str],
+    conflict_names: list[str],
 ) -> list[BaseMessage]:
     body = (
         f"POLICY:\n{_policy_block(policy_text)}\n\nFOCAL ENTITY:\n{focal}\n\nCANDIDATES:\n{candidates}\n\n"
-        f"PROPOSED SELECTION (names): {selected_names}"
+        f"PROPOSED GRANTS (names): {selected_names}\n"
+        f"PROPOSED PROHIBITIONS (names): {denied_names}"
     )
+    if conflict_names:
+        body += (
+            f"\n\nCONFLICT (named in BOTH lists): {conflict_names}. For each, decide whether the "
+            "policy GENUINELY both grants and prohibits it -- a direct conflict, or a coarse scope "
+            "partly permitted and partly forbidden -- versus a mere proposer error. Report genuine "
+            "ones in `contradictions` (name the kind in each description); if it is just a proposer "
+            "mistake, leave `contradictions` empty and reject with a reason so it can re-propose."
+        )
     return [SystemMessage(content=_AUDITOR_SYSTEM), HumanMessage(content=body)]
