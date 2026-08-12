@@ -173,7 +173,13 @@ Alongside the assertions, each variant leaves exactly **two** files on disk in i
   **`target_allow_ok`** is the **capability** gate (`input.function_name in
   target_allow_scopes[input.target]`), with `agent_roles` × `agent_role_allow_scopes` emitted
   informationally (mapping (c)). `agent_roles` and `target_allow_scopes` are populated. This fixture is
-  allow-only, so the deny gates are vacuous (empty `*_deny_scopes` maps).
+  **ALLOW-only** (both variants), so the deny gates are vacuous (empty `*_deny_scopes` maps): each
+  `policy.md` variant carries only positive fine-grained grants and no exclusivity / prohibition prose,
+  and the entity/role descriptions stay deny-neutral, so the DENY-aware PRB emits **no** `DENY` rules.
+  Extending the fixture to exercise the PRB's ALLOW+DENY path (explicit-prohibition prose and/or
+  description-driven denies, plus a step-8 grant-set assertion that also compares **deny** sets) is
+  deferred to the sibling "for later" issue (#142, ALLOW+DENY policy support); see the *Deny-extraction
+  interaction* note under *[Further Notes](#further-notes)*.
 
 Explicitly **no** `github_tool.*.rego` — the pipeline emits no tool model. Eyeball both files against
 the **ID-only** package shapes in
@@ -280,8 +286,9 @@ Policy Model Store DB and the provisioned Keycloak realm.
   (7072) as `uvicorn` subprocesses, polls each `GET /health` before use, and tears them all down in
   `finally`. Keycloak and the LLM are **external** (reached via env); `opa` is an external binary.
 - **LLM nondeterminism, contained.** The PRB LLM is pinned to `temperature=0`, and the **explicit**
-  `policy.md` variant states each `(role, scope)` grant outright, so its mapping is stable. The
-  **abstract** variant leans on the LLM to expand prose + descriptions into concrete scopes; both
+  `policy.md` variant states each fine-grained `(role, scope)` grant outright (inbound is derived, as in
+  the abstract variant), so its mapping is stable. The **abstract** variant leans on the LLM to expand
+  prose + descriptions into concrete scopes; both
   variants are asserted not only cell-by-cell via `opa eval` (step 7) but at the **grant-set** level
   (step 8) — each variant's `(role, scope)` set must equal the truth table *and* the other variant's.
   Grant-set equivalence catches the verdict-neutral under/over-grants the decision oracle hides. Some
@@ -329,6 +336,25 @@ Tracking issue for this test: `testing/5.3-policy-pipeline-integration-test.md`.
 
 ## Further Notes
 
+> **Note — ALLOW-only fixture for now (deny-extraction deferred to #142).** The Policy Rules Builder now
+> emits explicit `DENY` rules from direct-prohibition / exclusivity prose (see
+> [../components/aiac-agent/policy-rules-builder.md](../components/aiac-agent/policy-rules-builder.md),
+> § *Deny extraction*). This fixture is deliberately kept **ALLOW-only for now** so the suite builds and
+> passes under the DENY-aware PRB (split from #140; the ALLOW+DENY half is the sibling "for later"
+> issue #142). Both `policy.md` variants therefore carry only positive grants — no `exclusively`, no
+> `read-only`, no `no access to source` — and the entity/role descriptions stay deny-neutral, so the PRB
+> emits **no** `DENY` rules and both variants' Rego is allow-only (empty `*_deny_scopes` maps). This keeps
+> the two claims below intact: the descriptions stay generic and drop out of the fact triad, and `devops`
+> stays the pure **deny-by-default / silence** exemplar.
+>
+> Exercising the PRB's ALLOW+DENY path against this fixture — explicit-prohibition prose in Version 1,
+> the description-driven denies the `tester` (*"…not in source"*) and `devops` descriptions would supply
+> under the PRB's symmetric rule, and a step-8 grant-set assertion that compares **deny** sets as well as
+> allow sets — is out of scope here and tracked by #142. Note that the step-7 `opa eval` **verdicts** (the
+> truth table) are the same either way: `tester` is denied source and `devops` is denied everywhere
+> whether by explicit `DENY` or by deny-by-default; only the generated Rego's **deny-map content** would
+> differ.
+
 - The scenario is deliberately fixed. The role→access facts are owned by **three** artefacts that must
   agree: the *Scenario* table, **both** `policy.md` versions in *Scenario inputs*, and the
   `scenario.py` pair-lists (`INBOUND_PAIRS` / `OUTBOUND_SUBJECT_PAIRS` / `OUTBOUND_PAIRS`). The
@@ -344,10 +370,13 @@ Tracking issue for this test: `testing/5.3-policy-pipeline-integration-test.md`.
   variant relies on the prompt and does not restate it — do not re-add it to the abstract variant.
 - Two `policy.md` variants are shipped on purpose (see *Scenario inputs*): an **explicit** one and an
   **abstract** one. `AIAC_POLICY_FILE` selects which the PRB reads, so a reviewer can compare the PRB's
-  output on explicit vs. abstract policy text against the same expected Rego. The abstract variant
-  carries **no** agent-capability bullet; it relies on the elaborated `source_operations` /
-  `issue_operations` role descriptions (provisioned into Keycloak) for mapping (c), so it survives
-  deny-by-default and both variants reproduce the same Rego.
+  output on explicit vs. abstract policy text against the same expected Rego. **Neither** variant carries
+  a coarse `## Users → agent capabilities` bullet (matching the UC-1 demo policy); both rely on the
+  elaborated `source_operations` / `issue_operations` role descriptions (provisioned into Keycloak) for
+  mapping (c) and derive the inbound mapping (a) from their fine-grained grants, so both survive
+  deny-by-default and reproduce the same Rego. Keeping the policy purely fine-grained and positive is
+  also what keeps the fixture ALLOW-only: a coarse read+write `issues-access` grant next to a fine
+  read-only intent is exactly the coarse-scope contradiction the DENY-aware PRB fails closed on.
 - Descriptions are ≤255 characters and written **verbatim** into Keycloak; there is no shortened /
   verbatim split. (Keycloak caps role and client descriptions at 255 chars, and the generic descriptions
   are authored to stay within that cap.)
@@ -440,18 +469,19 @@ tags each client from the attribute without touching the TEMP description-keywor
 
 ### `policy.md` — Version 1 (explicit)
 
-Each granted `(role, scope)` pair is spelled out; the three sections map 1:1 to PRB mappings (a)/(b)/(c)
-and to the expected Rego gates.
+Each granted `(role, scope)` pair is spelled out at the **fine tool layer**; the two sections map 1:1 to
+PRB mappings (b)/(c) and to the expected Rego gates. Like the UC-1 demo policy, it carries **no** coarse
+`## Users → agent capabilities` bullet — the inbound mapping (a) (user-role→agent-scope) is derived from
+the fine-grained grants, not stated outright. Dropping the coarse bullet is deliberate: a coarse
+`issues-access` grant (which bundles read+write) alongside a fine read-only `issues-read` intent is
+exactly what the DENY-aware PRB reads as a coarse-scope contradiction and fails closed on — so the
+ALLOW-only fixture keeps the policy purely fine-grained and positive.
 
 ```markdown
 # Access Control Policy — github-agent / github-tool
 
 Grant access on a least-privilege basis. Only grant a (role, scope) pair when this
 policy supports it; deny by default.
-
-## Users → agent capabilities (inbound; user may call the agent)
-- developer may use source-access and issues-access.
-- tester may use issues-access.
 
 ## Users → tool operations (outbound subject; user may reach the tool)
 - developer may perform source-read, source-write, and issues-read.
@@ -465,12 +495,15 @@ policy supports it; deny by default.
 ### `policy.md` — Version 2 (abstract)
 
 Relies on the PRB / LLM to expand "read and modify source" into the concrete scopes. Encodes the same
-role→access facts as Version 1. It carries **no** agent-capability bullet; mapping (c)
+role→access facts as Version 1. Like Version 1 it carries **no** agent-capability bullet; mapping (c)
 (agent-role→tool-scope) is instead derived from the elaborated `source_operations` / `issue_operations`
 role descriptions (see *Role & scope descriptions*), so it survives the PRB's deny-by-default-on-silence
-rule and both variants reproduce the same Rego.
+rule and both variants reproduce the same Rego. It is phrased **purely positively** — no `exclusively`,
+`read-only`, or `no access to source` prose — so absences (developer's lack of issues-write, tester's
+lack of source access) are conveyed by **silence + deny-by-default**, not by prohibition triggers that
+would drive the DENY-aware PRB to emit `DENY` rules (kept ALLOW-only for now; see *Further Notes*).
 
 ```markdown
-- Developers work primarily in source — writing and maintaining code — and consult the issue tracker only to follow defect reports; grant them full read and write access to source contents, and read-only access to issues.
-- Testers work exclusively in the issue tracker — filing, triaging, and updating defect reports — and do not work in source; grant them full read and write access to issues, and no access to source.
+- Developers work primarily in source — writing and maintaining code — and consult the issue tracker to follow defect reports; grant them full read and write access to source contents, and read access to issues.
+- Testers work in the issue tracker — filing, triaging, and updating defect reports; grant them full read and write access to issues.
 ```
