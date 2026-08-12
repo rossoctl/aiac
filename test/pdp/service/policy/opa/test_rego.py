@@ -561,6 +561,46 @@ def test_inbound_deny_overrides_behavioural(subject: str, allowed: bool):
     )
 
 
+def _inbound_source_deny_model() -> AgentPolicyModel:
+    """A fully-allowed subject paired with a source that both allows and denies the audience scope.
+    The colliding source ALLOW+DENY must resolve deny-overrides via the ``source_deny_ok`` gate,
+    barring the request even though the subject and the source's allow role both pass."""
+    good = _role("good")
+    src_ok = _role("src-ok")
+    src_bad = _role("src-bad")
+    access = _scope("access")
+    return _model(
+        agent_id="github-agent",
+        agent_scopes=[access],
+        subject_roles={"user1": [good]},
+        source_roles={"clean-src": [src_ok], "tainted-src": [src_ok, src_bad]},
+        inbound_subject_allow_rules=[_rule(good, access)],
+        inbound_source_allow_rules=[_rule(src_ok, access)],
+        inbound_source_deny_rules=[_rule(src_bad, access, RuleEffect.DENY)],
+    )
+
+
+@pytest.mark.skipif(not shutil.which("opa"), reason="opa binary not on PATH")
+@pytest.mark.parametrize(
+    "source, allowed",
+    [
+        ("clean-src", True),  # source holds only the allow role -> passes
+        ("tainted-src", False),  # source holds a colliding deny role -> source deny-overrides
+    ],
+)
+def test_inbound_source_deny_overrides_behavioural(source: str, allowed: bool):
+    """Behavioural: a denied SOURCE wins over a colliding source ALLOW (and an allowed subject),
+    exercising the ``source_allow_ok`` / ``source_deny_ok`` split on the source dimension — a path
+    the other behavioural deny tests (subject inbound / subject outbound) do not cover."""
+    rego = generate_inbound_rego(_inbound_source_deny_model())
+    _assert_opa_allow(
+        rego,
+        "data.authz.github_agent.inbound.allow",
+        {"subject": "user1", "source": source},
+        allowed,
+    )
+
+
 def _assert_opa_allow(rego: str, query: str, input_doc: dict, expected: bool) -> None:
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "policy.rego"
