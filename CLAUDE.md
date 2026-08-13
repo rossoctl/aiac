@@ -70,7 +70,7 @@ ls src/aiac/<subsystem>/               # drill into any layer
 **Unit test command:**
 
 ```bash
-.venv/bin/pytest test/ -m "not integration"
+.venv/bin/pytest test/ -m "not integration and not llm"
 ```
 
 The whole `test/` tree collects and runs green — no `--ignore` flags are needed.
@@ -78,7 +78,28 @@ The whole `test/` tree collects and runs green — no `--ignore` flags are neede
 store surface in Wave 3, which resolved the earlier PCE-chain collection
 failures.)
 
+The default expression excludes both `integration` (needs a live cluster) and
+`llm` (needs a live LLM endpoint) so a routine unit run needs no external
+services. Plain `-m "not integration"` also stays green — the `llm` suite
+**skips cleanly** when its env is unset — but excluding `llm` keeps it out of
+the default collection entirely.
+
 Use `ls test/` / `find test -type d` to discover current test directories.
+
+**Live-LLM PRB tests** (`-m llm`) run the **real** LLM end-to-end through the
+Policy Rules Builder (`test/agent/policy_rules_builder/test_graph_live_llm.py`)
+and assert the emitted `(name, effect)` rule set matches the policy text — for
+allow-only policies and for policies with explicit / description-driven /
+exclusivity denies. Only the role/scope **descriptions** and the **policy
+source** are mocked in-process (the `_structured_call` LLM seam is left live), so
+the suite needs **no Kubernetes and no Keycloak** — only an LLM endpoint. It
+reuses the same `LLM_BASE_URL` / `LLM_MODEL` / `LLM_API_KEY` env as the
+integration suite and **skips cleanly** when they are unset. Run it opt-in:
+
+```bash
+set -a; . test/integration/.env; set +a   # or export LLM_BASE_URL / LLM_MODEL / LLM_API_KEY
+.venv/bin/pytest test/ -m llm
+```
 
 **Integration tests** (`-m integration`) now close the **real OPA evaluation loop** — they onboard
 through the in-cluster Controller, then drive real HTTP requests **through AuthBridge** and assert the
