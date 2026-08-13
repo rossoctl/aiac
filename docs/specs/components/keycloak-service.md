@@ -1,8 +1,6 @@
 # ~~Component PRD: Keycloak Configuration Service~~
 
-> **Superseded.** This component has been replaced by two separate services:
-> - **IdP Configuration Service** (read endpoints) — see [idp-configuration-service.md](idp-configuration-service.md)
-> - **PDP Policy Writer — Keycloak Implementation** (write endpoints) — see [pdp-policy-keycloak-service.md](pdp-policy-keycloak-service.md)
+> **Superseded.** This component's read endpoints have been replaced by the **IdP Configuration Service** — see [idp-configuration-service.md](idp-configuration-service.md).
 >
 > The content below is retained for reference only.
 >
@@ -41,7 +39,7 @@ Environment variables (injected via Kubernetes Deployment manifest):
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `KEYCLOAK_URL` | Yes | Keycloak base URL, e.g. `http://keycloak-service.keycloak.svc:8080` |
-| `KEYCLOAK_REALM` | Yes | Realm name, e.g. `kagenti` |
+| `KEYCLOAK_REALM` | Yes | Realm name, e.g. `rossoctl` |
 | `KEYCLOAK_ADMIN_USERNAME` | Yes | Admin username (from `keycloak-admin-secret`) |
 | `KEYCLOAK_ADMIN_PASSWORD` | Yes | Admin password (from `keycloak-admin-secret`) |
 
