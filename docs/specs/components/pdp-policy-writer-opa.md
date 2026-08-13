@@ -153,7 +153,7 @@ De-prefixing (Q9) is **outbound-only**: provisioned scope names are prefixed wit
 
 Evaluated by the AuthBridge OPA plugin in the **inbound pipeline** — "who may call this agent". `allow` requires `subject_allow_ok` **and** `source_allow_ok` and **neither** `subject_deny_ok` **nor** `source_deny_ok` (deny-overrides). `subject_allow_ok` passes when the subject (`input.identity.subject`) holds a role granting at least one of the agent's own `agent_scopes` via `subject_role_allow_scopes`; `subject_deny_ok` mirrors it against `subject_role_deny_scopes`. `source_allow_ok` passes when (a) there is no calling `input.identity.client_id` (pure end-user traffic), (b) the `client_id` is one of the **platform bypass clients** — `rossoctl` by default, from `PLATFORM_SOURCE_CLIENTS` (Q5); this bypass is **mandatory**, since end-user traffic carries the platform client and would otherwise be denied — or (c) that client holds a role granting an agent scope via `source_role_allow_scopes`; `source_deny_ok` mirrors it against `source_role_deny_scopes`.
 
-The block below is reproduced **verbatim** from `docs/examples/opa-team1-policy.yaml` (`inbound/request.rego`):
+The block below is the current `generate_inbound_rego` output (`inbound/request.rego`). (The `docs/examples/opa-team1-policy.yaml` golden fixture still carries the pre-split allow-only form and is **pending regeneration** to these split gates — see the **Rollout impact** note below.)
 
 ```rego
 package authbridge.client.inbound.request
@@ -210,7 +210,7 @@ allow if { subject_allow_ok; source_allow_ok; not subject_deny_ok; not source_de
 
 Evaluated by the AuthBridge OPA plugin in the **outbound pipeline** — "what this agent may call", **per invoked tool**. `allow` is an AND on the **same** `input.mcp.params.name`, requiring **both** allow gates to pass and **neither** deny gate to match (deny-overrides): `subject_allow_ok` (the delegated user's role admits the tool — `input.mcp.params.name in subject_role_allow_scopes[role]`, de-prefixed values) AND `target_allow_ok` (the target service, keyed by the full `input.identity.service_id`, admits the tool — `input.mcp.params.name in target_allow_scopes[input.identity.service_id]`), with `subject_deny_ok` / `target_deny_ok` mirroring them against `subject_role_deny_scopes` / `target_deny_scopes`. `agent_roles` / `agent_role_allow_scopes` / `agent_role_deny_scopes` are emitted for debugging but are **not** referenced by `allow` — `target_allow_scopes[input.identity.service_id]` already *is* the per-scope capability gate. This package emits neither `agent_scopes` nor the inbound subject gate: outbound decisions never consider the agent's own audience scopes.
 
-The block below is reproduced **verbatim** from `docs/examples/opa-team1-policy.yaml` (`outbound/request.rego`):
+The block below is the current `generate_outbound_rego` output (`outbound/request.rego`). (As above, the `docs/examples/opa-team1-policy.yaml` golden fixture is **pending regeneration** to these split gates — see the **Rollout impact** note below.)
 
 ```rego
 package authbridge.client.outbound.request
@@ -260,7 +260,7 @@ default allow := false
 allow if { subject_allow_ok; target_allow_ok; not subject_deny_ok; not target_deny_ok }
 ```
 
-A worked example (agent `github-agent`, users `developer`/`tester`, tool `github-tool`) is maintained alongside the tests, and mirrored in `docs/examples/opa-team1-policy.yaml`.
+A worked example (agent `github-agent`, users `developer`/`tester`, tool `github-tool`) is maintained alongside the tests. The `docs/examples/opa-team1-policy.yaml` mirror still shows the pre-split allow-only form and is **pending regeneration** to the split ALLOW/DENY gates (see **Rollout impact**).
 
 ### `AuthorizationPolicy` Custom Resource (Q6)
 
