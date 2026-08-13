@@ -210,6 +210,10 @@ def generate_inbound_rego(
     scope. Inbound values are **not** de-prefixed — the gate compares scopes
     internally, never against ``input.mcp.params.name``.
     """
+    # This first rule is inbound-only in practice: it fires for unauthenticated
+    # callers (no validated JWT, so input.identity.client_id is unset). It never
+    # fires on the outbound leg, where buildOutboundIdentity always populates
+    # client_id (as "" when agent_id is unset), so `not ...` is never true there.
     source_ok_rules = ["source_ok if { not input.identity.client_id }"]
     for client in platform_clients:
         source_ok_rules.append(
