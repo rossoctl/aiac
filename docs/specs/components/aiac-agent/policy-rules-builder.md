@@ -276,6 +276,42 @@ to a human, partial-apply, re-author the policy, split the scope) is a **separat
 
 ---
 
+## Testing
+
+Two layers, distinguished by whether the LLM is real:
+
+- **Mocked-boundary unit tests** (default `pytest`, no marker) — patch `graph._structured_call`
+  (the sole LLM seam) and stub `graph.get_policy_source`, so no endpoint is touched. These pin the
+  deterministic mechanics: candidate-set precheck/drop, `conflict_names` computation, the three-way
+  audit route, the derived exclusivity complement, and allows-then-denies rebuild order. They are the
+  fast, hermetic regression net and must stay green with no environment.
+
+- **Live-LLM verification tests** (new **`llm`** marker) — run the **real** LLM defined in the
+  environment (`LLM_BASE_URL`, `LLM_MODEL`, `LLM_API_KEY`) end-to-end through `build_role_rules` /
+  `build_scope_rules`, and assert the emitted rule set matches the policy text. These verify the
+  **prompt engineering itself** (that grants, direct-prohibition denies, description-driven denies,
+  and the exclusivity complement are extracted correctly), which the mocked tests — feeding canned
+  proposer output — cannot.
+  - **Only the LLM is real.** Descriptions and policy are **mocked in-process**: inline `Role`/`Scope`
+    objects carry the descriptions, and the `PolicySource` seam is stubbed to return an inline policy
+    string. No Kubernetes, no Keycloak, no cluster — the `llm` marker gates on the three `LLM_*` vars
+    only and **skips cleanly** when they are unset (same pattern as `require_env_or_skip`), so it never
+    false-passes and never requires the integration stack.
+  - **Assertion:** exact set equality of the emitted `(candidate_name, effect)` pairs against the
+    hand-verified expected set for each fixture (not a subset check — an over- or under-grant fails).
+  - **Fixture matrix** (minimal but representative): allow-only in **both** directions
+    (`build_role_rules`, `build_scope_rules`); a **direct-prohibition** deny ("must not" / "read-only");
+    a **description-driven** deny (a prohibition stated only in an entity description, e.g. "does not
+    manage the issue tracker"); and an **exclusivity** case ("only …") asserting the derived complement.
+    The **contradiction** path (`PolicyContradictionError`) is **excluded** — a real LLM's adjudication
+    of a genuine grant/deny collision is non-deterministic and belongs to focused mocked tests.
+
+The `llm` marker is registered in `pyproject.toml` alongside `integration`; unlike `integration` (which
+needs the full onboarding stack), `llm` needs only an LLM endpoint. Both are deselected by the default
+`-m "not integration"` unit run — the `llm` suite is opt-in via `-m llm` with the `LLM_*` env sourced.
+
+---
+
 ## Use-case dispatch
 
 | Use Case | Caller | Function(s) called |
