@@ -18,6 +18,15 @@ from the operator-role **descriptions** by the PRB (capability-match under ``gen
 UC-1 the agent reaches all four tool scopes, so the AND reduces to the subject gate for the verdicts
 but both gates are populated and probed.
 
+**Prefixed provisioned names vs. bare runtime names.** The pair-lists above hold the **prefixed**
+names UC-1 provisions and the PCE writes into the CR's data maps (``github-tool.source-read`` …).
+But the writer **de-prefixes** those into the generated Rego (handoff 01), and at runtime AuthBridge's
+``mcp-parser`` puts the **bare** invoked tool name into ``input.mcp.params.name`` (``source-read``).
+So the *provisioned* truth stays prefixed here, while the *request the test crafts and the outcome
+it expects* are keyed on the bare names. ``bare()`` and the ``*_BARE`` sets below derive those bare
+forms from the prefixed truth (a single split on the first ``.``, matching ``rego.py``'s ``_deprefix``)
+so there is still exactly one source of truth — the prefixed pair-lists.
+
 This module is **pure data**: it imports nothing (no ``aiac``, no stdlib beyond the language) so the
 test can import it before its env-before-import step, just like ``scenario.py``.
 
@@ -33,10 +42,10 @@ from __future__ import annotations
 # --- Realm + deployment identifiers ---------------------------------------------------------
 
 # The realm the deployed AIAC stack operates on (the cluster's ``aiac-pdp-config`` ConfigMap sets
-# ``KEYCLOAK_REALM=kagenti`` on the Controller + IdP-config pods, so the UC-1 harness must resolve
+# ``KEYCLOAK_REALM=rossoctl`` on the Controller + IdP-config pods, so the UC-1 harness must resolve
 # and provision against the same realm). Never deleted/recreated; the operator registers the demo
 # namespace's clients into it. Override with ``AIAC_TEST_REALM`` if the stack runs on another realm.
-REALM_DEFAULT = "kagenti"
+REALM_DEFAULT = "rossoctl"
 
 # Namespace the demo workloads deploy into (operator registers clients as "{ns}/{workload}").
 DEMO_NAMESPACE_DEFAULT = "team1"
@@ -146,6 +155,34 @@ OUTBOUND_TARGET_PAIRS: list[tuple[str, str]] = [
     ("github-agent.issue_operations", "github-tool.issues-read"),
     ("github-agent.issue_operations", "github-tool.issues-write"),
 ]
+
+
+# --- Bare runtime tool names (what AuthBridge sends; what the test crafts + expects) ---------
+#
+# The prefixed pair-lists above are the single source of truth (what UC-1 provisions and the PCE
+# writes into the CR maps). At runtime the writer de-prefixes the tool scopes into the Rego and
+# AuthBridge's mcp-parser puts the **bare** invoked name in ``input.mcp.params.name``. These derive
+# the bare forms so a crafted ``tools/call`` names ``source-read`` (not ``github-tool.source-read``)
+# and the outbound oracle is keyed on the same bare names the live plugin compares against.
+
+
+def bare(scope_name: str) -> str:
+    """Strip a leading ``<owner>.`` prefix -> the bare MCP tool name (``github-tool.source-read`` ->
+    ``source-read``). One split on the first ``.``; mirrors ``rego.py``'s ``_deprefix`` for our
+    single-owner tool scopes. A name with no ``.`` is returned unchanged."""
+    return scope_name.split(".", 1)[1] if "." in scope_name else scope_name
+
+
+# The four bare tool names AuthBridge can carry in ``input.mcp.params.name`` — the request universe
+# the outbound matrix is crafted + probed over (order preserved from ``TOOL_SCOPES``).
+TOOL_REQUEST_NAMES: list[str] = [bare(name) for name in TOOL_SCOPES]
+
+# Outbound subject gate as ``(user-role, bare-tool-name)`` — the user->tool truth, bare.
+OUTBOUND_SUBJECT_BARE: set[tuple[str, str]] = {(role, bare(scope)) for role, scope in OUTBOUND_SUBJECT_PAIRS}
+
+# Outbound capability gate as the set of bare tool names the agent's operator roles reach.
+OUTBOUND_TARGET_BARE: set[str] = {bare(scope) for _, scope in OUTBOUND_TARGET_PAIRS}
+
 
 # --- The single abstract policy.md (baked into the AIAC stack out of band) ------------------
 #

@@ -18,56 +18,75 @@ Grant access on a least-privilege basis: allow only what this policy states; den
 
 ## What comes out the other side
 
-AIAC turns that into two Rego files per agent — one gating who may call it, one gating what it may
-do downstream — derived from the policy text plus the realm-role descriptions already in Keycloak
-and the tool's own discovered capabilities. An excerpt of the generated outbound gate:
+AIAC turns that into two Rego policies per agent — one gating who may call it, one gating what it
+may do downstream — derived from the policy text plus the realm-role descriptions already in
+Keycloak and the tool's own discovered capabilities. Both use the fixed AuthBridge packages
+(`authbridge.client.{inbound,outbound}.request`) the live OPA plugin evaluates, keyed on the
+plugin's real input shape (`input.identity.subject`, `input.identity.service_id`,
+`input.mcp.params.name`). An excerpt of the generated outbound gate:
 
 ```rego
-package authz.team1_github_agent.outbound
+package authbridge.client.outbound.request
+import rego.v1
 
 subject_role_scopes := {
-    "developer": ["github-tool.issues-read", "github-tool.source-write", "github-tool.source-read"],
-    "tester": ["github-tool.issues-write", "github-tool.issues-read"],
+    "developer": ["issues-read", "source-write", "source-read"],
+    "tester": ["issues-read", "issues-write"],
+}
+target_scopes := {
+    "spiffe://localtest.me/ns/team1/sa/github-tool": ["source-read", "source-write", "issues-read", "issues-write"],
 }
 
 subject_ok if {
-    some role in subject_roles[input.subject]
-    input.function_name in subject_role_scopes[role]
+    some role in subject_roles[input.identity.subject]
+    input.mcp.params.name in subject_role_scopes[role]
 }
 
 target_ok if {
-    input.function_name in target_scopes[input.target]
+    input.mcp.params.name in target_scopes[input.identity.service_id]
 }
 
 default allow := false
 allow if { subject_ok; target_ok }
 ```
 
-Every access decision is a two-gate AND: the calling user's role must be granted the scope
-(`subject_ok`), *and* the agent's own discovered capabilities must reach it (`target_ok`). A
-developer can read and write source and read issues; a tester can read and write issues but never
-touches source — exactly the two-line policy, and nothing it didn't say.
+Every access decision is a two-gate AND on the same invoked tool (`input.mcp.params.name`, the
+**bare** MCP tool name such as `source-read`): the calling user's role must be granted the scope
+(`subject_ok`), *and* the target service the exchanged token was minted for must expose it
+(`target_ok`, keyed by the full `input.identity.service_id` SPIFFE id). A developer can read and
+write source and read issues; a tester can read and write issues but never touches source — exactly
+the two-line policy, and nothing it didn't say.
 
 ## Running it
 
 Everything below is a real cluster, a real Keycloak, a real LLM call, and a real RFC 8693 token
-exchange — there is no offline mode. Bring up a Kagenti cluster with SPIRE + Keycloak + the
-kagenti operator first (see [../../assets/INSTALL.md](../../assets/INSTALL.md) and
+exchange — there is no offline mode. Bring up a rossoctl cluster with SPIRE + Keycloak + the
+rossoctl operator first (see [../../assets/INSTALL.md](../../assets/INSTALL.md) and
 [../../../k8s/aiac-deployment-guide.md](../../../k8s/aiac-deployment-guide.md) for reference, not as a
-manual checklist — `make prereqs` below verifies and, where safe, installs what's missing) and
-export `KEYCLOAK_URL` / `KEYCLOAK_ADMIN_USERNAME` / `KEYCLOAK_ADMIN_PASSWORD`.
+manual checklist — `make prereqs` below verifies and, where safe, installs what's missing).
+
+You do **not** need to export the Keycloak variables by hand. `make keycloak`
+(`init/00-discover-keycloak.sh`) port-forwards the in-cluster Keycloak to a local port and reads the
+admin credentials from the `keycloak-admin-secret`, exporting `KEYCLOAK_URL` /
+`KEYCLOAK_ADMIN_USERNAME` / `KEYCLOAK_ADMIN_PASSWORD` for the step that runs it. Every
+Keycloak-touching target self-runs it first, so you rarely call it directly — the forward is set up
+once and reused across the run. If you already export those three variables (e.g. to point at a
+Keycloak this can't reach), your values win.
 
 ```bash
+make keycloak  # (optional) port-forward Keycloak + discover admin creds; the targets below self-run it
 make prereqs   # verify/install cluster + AIAC stack + demo workloads; wait for Keycloak registration
 make clear     # reset to a clean slate
 make setup     # provision demo users/roles, mount policy.md, configure token exchange
 ```
 
+To tear down the port-forward afterwards: `pkill -f 'port-forward .*keycloak-service'`.
+
 **Pause 1 — baseline.** `make show` reports three users with roles, no `github-*` roles or scopes
 yet, and no generated `.rego` at all. Nothing has been onboarded; there is nothing to enforce yet.
 
 ```bash
-make onboard-agent   # AIAC discovers github-agent, reads policy.md, generates the inbound gate
+make agent   # AIAC discovers github-agent, reads policy.md, generates the inbound gate
 make show
 ```
 
@@ -76,7 +95,7 @@ the agent's discovered scopes. The outbound gate exists but every map in it is s
 there's no tool yet for the agent to act on.
 
 ```bash
-make onboard-tool    # AIAC discovers github-tool's capabilities and completes the agent's outbound gate
+make tool    # AIAC discovers github-tool's capabilities and completes the agent's outbound gate
 make show
 ```
 
@@ -98,8 +117,31 @@ Each target does a real `grant_type=password` login, checks the inbound gate, pe
 result table. `devops-user`'s inbound denial is the intended story, not a failure: nothing in the
 policy grants devops-user access to the agent at all.
 
-Run `make demo` for the whole provisioning ladder (`prereqs` through the second `show`) in one
-shot, then drive the three users separately.
+### One-shot: `make demo`
+
+The individual targets above are grouped into three phase aggregates, so you can run a whole phase
+at once or the entire demo end to end:
+
+| Phase target | Steps | What it does |
+|--------------|-------|--------------|
+| `make init`    | `00`–`03` | discover Keycloak → verify prereqs → clear → setup |
+| `make onboard` | `04`–`05` | onboard the agent, then the tool |
+| `make run`     | —         | drive all three users (developer, tester, devops) |
+
+`make demo` chains all three (`init → onboard → run`) with no narrated pauses — use it when you just
+want the full run:
+
+```bash
+make demo     # init (00-03) -> onboard (04-05) -> run (dev/test/devops)
+```
+
+Or drive one phase — or one user — at a time:
+
+```bash
+make init     # or step-by-step: make prereqs / clear / setup
+make onboard  # or: make agent / make tool
+make run      # or a single user: make dev / make test / make devops
+```
 
 ## Architecture
 
@@ -119,23 +161,51 @@ shot, then drive the three users separately.
         └──────────────────────────────────┴──► github-tool
 ```
 
-The gates are plain Rego, evaluated with `opa eval` against the files AIAC's Policy Computation
-Engine writes — this demo runs them the same way a live enforcement point would query them, but
-does not itself sit in the request path (see the appendix).
+The gates are plain Rego, evaluated with `opa eval` against the policy content AIAC's writer
+produces — this demo runs them the same way a live enforcement point would query them, but does
+not itself sit in the request path (see the appendix).
+
+### How the demo sources the generated Rego
+
+The reworked PDP Policy Writer is **CR-backed**: for each onboarded agent it server-side-applies a
+single `AuthorizationPolicy` custom resource (`agent.rossoctl.dev/v1alpha1`, named
+`<name>` in namespace `<ns>` — here `github-agent` in `team1`) whose `spec.policies[]` carry the
+inbound and outbound Rego as `content`. In production it writes **CRs only** — no `.rego` files on
+disk (`k8s/pdp-interface-deployment.yaml` keeps `POLICY_WRITER_DUMP_REGO` off and mounts no
+`/rego`).
+
+So this demo reads its Rego **straight from the CR** — the same artifact a live enforcement point
+consumes — rather than from a debug file dump:
+
+```bash
+kubectl get authorizationpolicies.agent.rossoctl.dev github-agent -n team1 -o json
+```
+
+`onboard/04`/`05` fetch that CR and write each `spec.policies[].content` into
+`generated/<snapshot>/team1/github-agent/{inbound,outbound}/request.rego` (mirroring the CR's
+`policies[].path`), then `opa eval` those files. `make clear` deletes the CR (a re-onboard
+server-side-applies a fresh one). This keeps the demo honest against the real artifact and needs no
+demo-only deployment overlay to re-enable the optional `.rego` dump.
+
+> The committed snapshots under `generated/` are produced from the **real** reworked generator
+> (`src/aiac/pdp/service/policy/opa/rego.py`) against a hand-built model of this scenario, so they
+> match the CR content the live writer emits (byte-for-byte with `docs/examples/opa-team1-policy.yaml`
+> for the after-tool state, modulo the cluster's actual trust domain). A live `make onboard` against
+> a cluster running the reworked writer overwrites them and is the authoritative source of truth.
 
 ## Troubleshooting
 
 - **`make prereqs` hangs waiting on client registration** — Keycloak client registration is async
   after the operator injects a workload; give it a couple of minutes, then check the operator's
   webhook logs.
-- **`make onboard-agent`/`make onboard-tool` times out** — onboarding drives the Policy Rules
+- **`make agent`/`make tool` times out** — onboarding drives the Policy Rules
   Builder's LLM calls and can genuinely take minutes; re-run with a larger `AIAC_ONBOARD_TIMEOUT` if
   your LLM endpoint is slow.
 - **`make setup` / `make dev` fails with a Keycloak profile error** — Keycloak 26's declarative user
-  profile requires `email`/`firstName`/`lastName` before `grant_type=password` succeeds; `02-setup.py`
+  profile requires `email`/`firstName`/`lastName` before `grant_type=password` succeeds; `03-setup.py`
   sets these, so this points at a realm that was provisioned some other way.
 - **A `run-*` target aborts with "no policy found"** — the drivers always run against
-  `generated/02-after-tool/`; run `make onboard-agent && make onboard-tool` first.
+  `generated/02-after-tool/`; run `make agent && make tool` first.
 
 ## Appendix: known gaps
 
