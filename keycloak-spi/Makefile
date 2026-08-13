@@ -1,5 +1,5 @@
 SPI_VERSION      := 0.1.0
-KEYCLOAK_VERSION := 26.5.2
+KEYCLOAK_VERSION := 26.6.3
 
 JAR := target/aiac-event-listener-$(SPI_VERSION).jar
 
