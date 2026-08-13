@@ -595,8 +595,8 @@ def test_inbound_source_deny_overrides_behavioural(source: str, allowed: bool):
     rego = generate_inbound_rego(_inbound_source_deny_model())
     _assert_opa_allow(
         rego,
-        "data.authz.github_agent.inbound.allow",
-        {"subject": "user1", "source": source},
+        "data.authbridge.client.inbound.request.allow",
+        {"identity": {"subject": "user1", "client_id": source}},
         allowed,
     )
 
