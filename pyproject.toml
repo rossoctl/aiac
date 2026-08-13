@@ -27,6 +27,12 @@ test = [
     "pytest",
 ]
 
+[tool.uv]
+# cryptography is a transitive dep (jwcrypto -> python-keycloak). Floor it at
+# 50.0.0 to clear GHSA-g6cj-pr64-35w5 (Bleichenbacher oracle, high) flagged by
+# dependency-review against 49.0.0.
+constraint-dependencies = ["cryptography>=50.0.0"]
+
 [tool.ruff]
 line-length = 120
 target-version = "py312"
