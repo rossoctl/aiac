@@ -121,6 +121,7 @@ def test_inbound(pipeline: dict, subject: str) -> None:
     assert uc1.inbound_decision(pipeline, subject) == uc1.expected_inbound_decision(subject), subject
 
 
+@pytest.mark.parametrize("subject", list(scn.USERS))
 @pytest.mark.parametrize("tool_bare", scn.TOOL_REQUEST_NAMES)
 def test_outbound(pipeline: dict, subject: str, tool_bare: str) -> None:
     """The enforced outbound gate — a real MCP ``tools/call`` for the **bare** tool through
