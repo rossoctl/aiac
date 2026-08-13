@@ -89,7 +89,7 @@ Resolved in this order, in `AiacEventListenerProviderFactory.init()`:
 
 Setting either on the live Keycloak pod is the separate Helm chart's responsibility, not this
 repo's — this code is ready for it either way. Verify the exact SPI env var naming against a
-running Keycloak 26.5.2 instance before relying on it in a deploy runbook; it's inferred from
+running Keycloak 26.6.3 instance before relying on it in a deploy runbook; it's inferred from
 Keycloak's documented CLI-flag-to-env-var convention, not confirmed here.
 
 ## Testing
