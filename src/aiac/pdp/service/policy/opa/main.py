@@ -249,7 +249,11 @@ app = FastAPI()
 def upsert_policy(policy: PolicyModel):
     def _op():
         # A malformed agent_id aborts the batch with a 400 naming it; agents
-        # already applied before that point stay written (no rollback).
+        # already applied before that point stay written (no rollback). The
+        # batch is also unbounded in size. This partial-write semantic is
+        # acceptable for the current caller (store-derived, pre-validated ids;
+        # SSA is idempotent so a retry re-applies the whole set) and is tracked
+        # for hardening in s-and-p-team/cortex#143.
         for agent in policy.agents:
             _upsert_agent(agent)
 
@@ -258,6 +262,12 @@ def upsert_policy(policy: PolicyModel):
 
 @app.post("/policy/agents/{agent_id}", status_code=204)
 def upsert_agent(agent_id: str, model: AgentPolicyModel):
+    # The ``{agent_id}`` path segment is intentionally ignored: the request
+    # body is authoritative. ``_upsert_agent`` derives namespace/name from
+    # ``model.agent_id`` (via ``identity_ref``), the single source of truth, so
+    # a mismatched or placeholder URL segment (e.g. ``/policy/agents/ignored``)
+    # never affects which CR is written. The segment is kept only to give the
+    # route a RESTful shape.
     return _run_write(lambda: _upsert_agent(model))
 
 
