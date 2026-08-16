@@ -18,5 +18,10 @@ RUN /opt/keycloak/bin/kc.sh build
 # Stage 3: final runtime image — copy the augmented Keycloak from stage 2.
 FROM ${KEYCLOAK_IMAGE}
 COPY --from=keycloak-builder /opt/keycloak/ /opt/keycloak/
+# Match the AIAC non-root UID convention (10001) used by every other service container in this
+# repo, instead of the base image's default UID 1000. /opt/keycloak is group-writable by GID 0
+# (the base image's own "arbitrary UID" convention), so UID 10001 in group 0 already has the
+# access it needs — no useradd/chown required.
+USER 10001:0
 ENTRYPOINT ["/opt/keycloak/bin/kc.sh"]
 CMD ["start"]

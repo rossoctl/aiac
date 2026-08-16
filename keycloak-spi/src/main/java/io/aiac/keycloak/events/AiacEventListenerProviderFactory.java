@@ -33,7 +33,7 @@ public class AiacEventListenerProviderFactory implements EventListenerProviderFa
 
     @Override
     public EventListenerProvider create(KeycloakSession session) {
-        return new AiacEventListenerProvider(natsConnection);
+        return new AiacEventListenerProvider(connection());
     }
 
     @Override
@@ -46,14 +46,34 @@ public class AiacEventListenerProviderFactory implements EventListenerProviderFa
 
     @Override
     public void postInit(KeycloakSessionFactory factory) {
+        // Best-effort — never fail Keycloak startup over a missing/unreachable Event Broker.
+        // If this fails, connection() retries on the next request instead of leaving every
+        // future provider stuck with a permanently null connection.
+        connection();
+    }
+
+    /**
+     * Retry-on-use: {@link #postInit} can run before the Event Broker is reachable, and the
+     * client itself moves to {@code CLOSED} once its own reconnect budget is exhausted — either
+     * way {@code natsConnection} can go dead for good, and without this every later provider
+     * would keep getting that dead connection and silently drop events until Keycloak is
+     * restarted. Providers are created per request, so that's a natural, bounded retry point;
+     * no background thread needed.
+     */
+    private synchronized Connection connection() {
+        if (natsConnection != null && natsConnection.getStatus() != Connection.Status.CLOSED) {
+            return natsConnection;
+        }
         try {
             natsConnection = Nats.connect(natsUrl);
-        } catch (IOException | InterruptedException e) {
-            // Never fail Keycloak startup over a missing/unreachable Event Broker — the provider
-            // tolerates a null connection and drops events with a warning instead.
-            log.warnf(e, "could not connect to NATS at %s; %s will drop events until this is fixed", natsUrl,
+        } catch (IOException e) {
+            log.warnf(e, "could not connect to NATS at %s; %s will drop this event", natsUrl, PROVIDER_ID);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            log.warnf(e, "interrupted while connecting to NATS at %s; %s will drop this event", natsUrl,
                     PROVIDER_ID);
         }
+        return natsConnection;
     }
 
     @Override

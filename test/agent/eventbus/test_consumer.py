@@ -24,6 +24,14 @@ def _fake_msg(subject: str, num_delivered: int = 1) -> MagicMock:
     return msg
 
 
+def _fake_nc() -> MagicMock:
+    # .jetstream() is sync in the real client and returns a context whose .publish() is
+    # async — a plain AsyncMock would make jetstream() itself async, unlike the real client.
+    nc = MagicMock()
+    nc.jetstream.return_value = AsyncMock()
+    return nc
+
+
 def test_handle_routes_service_subject_to_onboard_service():
     with patch("aiac.agent.eventbus.consumer.onboard_service", return_value=([], False)) as onboard:
         result = _handle("aiac.apply.service.svc-1")
@@ -37,6 +45,16 @@ def test_handle_routes_role_subject_to_update_role():
         result = _handle("aiac.apply.role.role-1")
 
     role.assert_called_once_with("role-1")
+    assert result == ([], True)
+
+
+def test_handle_decodes_percent_encoded_dotted_role_name():
+    # Mirrors SubjectMapper.encodeSubjectToken on the Keycloak SPI side: a role name
+    # containing '.' (e.g. "team.admin") is percent-encoded into one NATS subject token.
+    with patch("aiac.agent.eventbus.consumer.update_role", return_value=([], True)) as role:
+        result = _handle("aiac.apply.role.team%2Eadmin")
+
+    role.assert_called_once_with("team.admin")
     assert result == ([], True)
 
 
@@ -71,7 +89,7 @@ def test_dispatch_acks_on_success():
 
 def test_dispatch_leaves_message_unacked_before_max_deliver():
     consumer = AiacEventConsumer()
-    consumer._nc = AsyncMock()
+    consumer._nc = _fake_nc()
     msg = _fake_msg("aiac.apply.service.svc-1", num_delivered=MAX_DELIVER - 1)
 
     with patch("aiac.agent.eventbus.consumer.onboard_service", side_effect=RuntimeError("boom")):
@@ -79,12 +97,12 @@ def test_dispatch_leaves_message_unacked_before_max_deliver():
 
     msg.ack.assert_not_called()
     msg.term.assert_not_called()
-    consumer._nc.publish.assert_not_called()
+    consumer._nc.jetstream.assert_not_called()
 
 
 def test_dispatch_routes_to_dlq_after_max_deliver():
     consumer = AiacEventConsumer()
-    consumer._nc = AsyncMock()
+    consumer._nc = _fake_nc()
     msg = _fake_msg("aiac.apply.service.svc-1", num_delivered=MAX_DELIVER)
 
     with patch("aiac.agent.eventbus.consumer.onboard_service", side_effect=RuntimeError("boom")):
@@ -92,4 +110,34 @@ def test_dispatch_routes_to_dlq_after_max_deliver():
 
     msg.ack.assert_not_called()
     msg.term.assert_called_once()
-    consumer._nc.publish.assert_called_once_with(DLQ_SUBJECT, msg.data)
+    consumer._nc.jetstream.return_value.publish.assert_called_once_with(DLQ_SUBJECT, msg.data)
+
+
+def test_start_with_retry_retries_on_failure_then_succeeds():
+    consumer = AiacEventConsumer()
+    attempts = AsyncMock(side_effect=[RuntimeError("connect failed"), RuntimeError("connect failed"), None])
+
+    with (
+        patch.object(consumer, "start", attempts),
+        patch("aiac.agent.eventbus.consumer.asyncio.sleep", new=AsyncMock()) as sleep,
+    ):
+        asyncio.run(consumer.start_with_retry())
+
+    assert attempts.call_count == 3
+    assert sleep.call_count == 2
+
+
+def test_dispatch_does_not_term_when_dlq_publish_fails():
+    consumer = AiacEventConsumer()
+    consumer._nc = _fake_nc()
+    consumer._nc.jetstream.return_value.publish.side_effect = RuntimeError("dlq publish failed")
+    msg = _fake_msg("aiac.apply.service.svc-1", num_delivered=MAX_DELIVER)
+
+    with (
+        patch("aiac.agent.eventbus.consumer.onboard_service", side_effect=RuntimeError("boom")),
+        pytest.raises(RuntimeError, match="dlq publish failed"),
+    ):
+        asyncio.run(consumer._dispatch(msg))
+
+    msg.ack.assert_not_called()
+    msg.term.assert_not_called()

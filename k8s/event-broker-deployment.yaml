@@ -14,6 +14,15 @@ spec:
       labels:
         app: aiac-event-broker
     spec:
+      # The stock image runs as root by default. fsGroup makes the mounted JetStream data
+      # volume group-writable by UID 10001, matching the rest of AIAC's non-root convention.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: nats
           image: nats:2.14-alpine
@@ -21,11 +30,46 @@ spec:
           args: ["-js", "-sd", "/data/jetstream"]
           ports:
             - containerPort: 4222
+          # JetStream data lives on its own volume; the rest of the root filesystem is
+          # read-only, so temp writes go to the /tmp emptyDir.
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+          # No HTTP health endpoint on a plain "-js" NATS server (no -m monitoring port), so
+          # this uses tcpSocket like the repo's other non-HTTP workloads.
+          readinessProbe:
+            tcpSocket:
+              port: 4222
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 4222
+            initialDelaySeconds: 10
+            periodSeconds: 20
           volumeMounts:
             - name: jetstream-data
               mountPath: /data/jetstream
+            - name: tmp
+              mountPath: /tmp
       volumes:
+        # Dev-only: emptyDir means a pod restart or eviction drops the aiac-events stream and
+        # any unacked messages. aiac-init recreates the stream, but in-flight messages are lost.
+        # Fine while this broker is opt-in/inactive; switch to a PersistentVolumeClaim before
+        # this is wired live.
         - name: jetstream-data
+          emptyDir: {}
+        - name: tmp
           emptyDir: {}
 
 ---
