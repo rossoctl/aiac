@@ -51,7 +51,50 @@ public final class SubjectMapper {
 
     /** Minimal JSON payload — the event is a trigger, not a data carrier (see event-broker.md). */
     public static String payloadFor(String entityId) {
-        return "{\"id\":\"" + entityId + "\"}";
+        return "{\"id\":\"" + escapeJson(entityId) + "\"}";
+    }
+
+    /**
+     * Minimal JSON string escaping (RFC 8259) for the one field this class ever serializes.
+     * Hand-rolled rather than pulling in a JSON library, to keep this class dependency-free
+     * (see the class javadoc) — {@code entityId} is normally a Keycloak UUID or resource name,
+     * but nothing stops it containing a quote, backslash, or control character.
+     */
+    private static String escapeJson(String raw) {
+        StringBuilder out = new StringBuilder(raw.length());
+        for (int i = 0; i < raw.length(); i++) {
+            char c = raw.charAt(i);
+            switch (c) {
+                case '"':
+                    out.append("\\\"");
+                    break;
+                case '\\':
+                    out.append("\\\\");
+                    break;
+                case '\n':
+                    out.append("\\n");
+                    break;
+                case '\r':
+                    out.append("\\r");
+                    break;
+                case '\t':
+                    out.append("\\t");
+                    break;
+                case '\b':
+                    out.append("\\b");
+                    break;
+                case '\f':
+                    out.append("\\f");
+                    break;
+                default:
+                    if (c < 0x20) {
+                        out.append(String.format("\\u%04x", (int) c));
+                    } else {
+                        out.append(c);
+                    }
+            }
+        }
+        return out.toString();
     }
 
     /**

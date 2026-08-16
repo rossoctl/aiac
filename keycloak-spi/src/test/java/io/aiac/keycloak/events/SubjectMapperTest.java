@@ -84,4 +84,16 @@ class SubjectMapperTest {
     void payloadIsMinimalJsonWithId() {
         assertEquals("{\"id\":\"abc-123\"}", SubjectMapper.payloadFor("abc-123"));
     }
+
+    @Test
+    void payloadEscapesQuotesAndBackslashes() {
+        // Without escaping, a quote or backslash in entityId would produce malformed or
+        // injected JSON (e.g. a crafted id could inject extra fields into the payload).
+        assertEquals("{\"id\":\"a\\\"b\\\\c\"}", SubjectMapper.payloadFor("a\"b\\c"));
+    }
+
+    @Test
+    void payloadEscapesControlCharacters() {
+        assertEquals("{\"id\":\"a\\nb\\u0001c\"}", SubjectMapper.payloadFor("a\nb\u0001c"));
+    }
 }

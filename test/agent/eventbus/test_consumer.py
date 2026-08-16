@@ -10,8 +10,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from aiac.agent.eventbus.consumer import AiacEventConsumer, _handle
-from aiac.agent.eventbus.stream import DLQ_SUBJECT, MAX_DELIVER
+from aiac.agent.eventbus.consumer import AiacEventConsumer, _handle, lifespan
+from aiac.agent.eventbus.stream import (
+    ACK_WAIT_SECONDS,
+    CONSUMER_FILTER_SUBJECTS,
+    CONSUMER_NAME,
+    DLQ_SUBJECT,
+    MAX_DELIVER,
+    STREAM_NAME,
+)
 
 
 def _fake_msg(subject: str, num_delivered: int = 1) -> MagicMock:
@@ -125,6 +132,62 @@ def test_start_with_retry_retries_on_failure_then_succeeds():
 
     assert attempts.call_count == 3
     assert sleep.call_count == 2
+
+
+def test_start_connects_and_subscribes_with_expected_config():
+    consumer = AiacEventConsumer()
+    fake_js = AsyncMock()
+    fake_nc = MagicMock()
+    fake_nc.jetstream.return_value = fake_js
+
+    with (
+        patch("aiac.agent.eventbus.consumer.nats.connect", AsyncMock(return_value=fake_nc)) as connect,
+        patch("aiac.agent.eventbus.consumer.ensure_stream", AsyncMock()) as ensure_stream_mock,
+    ):
+        asyncio.run(consumer.start())
+
+    connect.assert_called_once_with(consumer._nats_url, max_reconnect_attempts=-1)
+    ensure_stream_mock.assert_called_once_with(fake_js)
+    _, kwargs = fake_js.subscribe.call_args
+    assert kwargs["subject"] == "aiac.apply.>"
+    assert kwargs["queue"] == CONSUMER_NAME
+    assert kwargs["durable"] == CONSUMER_NAME
+    assert kwargs["stream"] == STREAM_NAME
+    assert kwargs["manual_ack"] is True
+    assert kwargs["cb"] == consumer._dispatch
+    config = kwargs["config"]
+    assert config.filter_subjects == CONSUMER_FILTER_SUBJECTS
+    assert config.max_deliver == MAX_DELIVER
+    assert config.ack_wait == ACK_WAIT_SECONDS
+    assert consumer._nc is fake_nc
+    assert consumer._sub is fake_js.subscribe.return_value
+
+
+def test_lifespan_awaits_cancelled_task_before_stopping_consumer():
+    # Regression test for the shutdown race: task.cancel() alone doesn't wait for the
+    # task to actually finish, so consumer.stop() could previously run while
+    # start_with_retry (or _dispatch, mid-message) was still executing.
+    events = []
+
+    class FakeConsumer:
+        async def start_with_retry(self):
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                events.append("task_cancelled")
+                raise
+
+        async def stop(self):
+            events.append("stopped")
+
+    async def run():
+        with patch("aiac.agent.eventbus.consumer.AiacEventConsumer", return_value=FakeConsumer()):
+            async with lifespan(MagicMock()):
+                await asyncio.sleep(0)  # let the background task actually start
+
+    asyncio.run(run())
+
+    assert events == ["task_cancelled", "stopped"]
 
 
 def test_dispatch_does_not_term_when_dlq_publish_fails():

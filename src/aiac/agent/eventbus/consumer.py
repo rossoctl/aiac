@@ -68,7 +68,11 @@ class AiacEventConsumer:
         self._sub = None
 
     async def start(self) -> None:
-        self._nc = await nats.connect(self._nats_url)
+        # max_reconnect_attempts=-1: once connected, never give up on a dropped connection
+        # (nats-py's own default is a bounded 60 attempts at a fixed reconnect_time_wait, not
+        # indefinite). This only covers post-connect drops — the exponential backoff is
+        # start_with_retry's, for retrying this initial connect/subscribe sequence itself.
+        self._nc = await nats.connect(self._nats_url, max_reconnect_attempts=-1)
         js = self._nc.jetstream()
         await ensure_stream(js)
         self._sub = await js.subscribe(
