@@ -12,6 +12,7 @@ import pytest
 
 from aiac.agent.eventbus.consumer import AiacEventConsumer, _handle
 from aiac.agent.eventbus.stream import DLQ_SUBJECT, MAX_DELIVER
+from aiac.policy.model.models import RuleEffect
 
 
 def _fake_msg(subject: str, num_delivered: int = 1) -> MagicMock:
@@ -25,19 +26,23 @@ def _fake_msg(subject: str, num_delivered: int = 1) -> MagicMock:
 
 
 def test_handle_routes_service_subject_to_onboard_service():
-    with patch("aiac.agent.eventbus.consumer.onboard_service", return_value=([], False)) as onboard:
+    with patch(
+        "aiac.agent.eventbus.consumer.onboard_service",
+        return_value=([], False, RuleEffect.DENY),
+    ) as onboard:
         result = _handle("aiac.apply.service.svc-1")
 
     onboard.assert_called_once_with("svc-1")
-    assert result == ([], False)
+    assert result == ([], False, RuleEffect.DENY)
 
 
 def test_handle_routes_role_subject_to_update_role():
+    # Non-onboard handlers return a 2-tuple; _handle normalizes them to least-privilege DENY.
     with patch("aiac.agent.eventbus.consumer.update_role", return_value=([], True)) as role:
         result = _handle("aiac.apply.role.role-1")
 
     role.assert_called_once_with("role-1")
-    assert result == ([], True)
+    assert result == ([], True, RuleEffect.DENY)
 
 
 def test_handle_routes_policy_build_subject():
@@ -45,7 +50,7 @@ def test_handle_routes_policy_build_subject():
         result = _handle("aiac.apply.policy.build")
 
     build.assert_called_once_with()
-    assert result == ([], False)
+    assert result == ([], False, RuleEffect.DENY)
 
 
 def test_handle_raises_for_unknown_subject():
@@ -59,12 +64,15 @@ def test_dispatch_acks_on_success():
     msg = _fake_msg("aiac.apply.service.svc-1")
 
     with (
-        patch("aiac.agent.eventbus.consumer.onboard_service", return_value=([], False)),
+        patch(
+            "aiac.agent.eventbus.consumer.onboard_service",
+            return_value=([], False, RuleEffect.DENY),
+        ),
         patch("aiac.agent.eventbus.consumer.compute_and_apply") as pce,
     ):
         asyncio.run(consumer._dispatch(msg))
 
-    pce.assert_called_once_with([], False)
+    pce.assert_called_once_with([], False, RuleEffect.DENY)
     msg.ack.assert_called_once()
     msg.term.assert_not_called()
 

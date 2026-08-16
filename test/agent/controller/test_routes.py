@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 
 from aiac.agent.controller.routes import app
 from aiac.idp.configuration.models import Role, Scope
-from aiac.policy.model.models import PolicyRule
+from aiac.policy.model.models import PolicyRule, RuleEffect
 
 client = TestClient(app)
 
@@ -40,14 +40,18 @@ def test_health_returns_ok_without_touching_handlers_or_pce():
 
 def test_apply_service_dispatches_to_orchestrator_and_calls_pce_once():
     with (
-        patch("aiac.agent.controller.routes.onboard_service", return_value=([], False)) as orch,
+        patch(
+            "aiac.agent.controller.routes.onboard_service",
+            return_value=([], False, RuleEffect.DENY),
+        ) as orch,
         patch("aiac.agent.controller.routes.compute_and_apply") as pce,
     ):
         resp = client.post("/apply/service/svc-123")
 
     assert resp.status_code == 200
     orch.assert_called_once_with("svc-123")
-    pce.assert_called_once_with([], False)
+    # The onboard route forwards the orchestrator's default_effect to the PCE (least-privilege here).
+    pce.assert_called_once_with([], False, RuleEffect.DENY)
 
 
 def test_apply_policy_build_dispatches_to_build_subagent():
@@ -118,17 +122,21 @@ def test_apply_offboard_carries_slash_bearing_spiffe_client_id():
 def test_controller_forwards_handler_rules_and_override_verbatim():
     rules = [_rule("r-a"), _rule("r-b")]
     with (
-        patch("aiac.agent.controller.routes.onboard_service", return_value=(rules, False)),
+        patch(
+            "aiac.agent.controller.routes.onboard_service",
+            return_value=(rules, False, RuleEffect.DENY),
+        ),
         patch("aiac.agent.controller.routes.compute_and_apply") as pce,
     ):
         resp = client.post("/apply/service/svc-9")
 
     assert resp.status_code == 200
     # Exactly one PCE call, with the handler's own rules object and flag — not a rebuilt/empty one.
-    pce.assert_called_once_with(rules, False)
-    forwarded_rules, forwarded_override = pce.call_args.args
+    pce.assert_called_once_with(rules, False, RuleEffect.DENY)
+    forwarded_rules, forwarded_override, forwarded_default_effect = pce.call_args.args
     assert forwarded_rules is rules
     assert forwarded_override is False
+    assert forwarded_default_effect is RuleEffect.DENY
 
 
 def test_handler_upstream_error_surfaces_status_and_skips_pce():

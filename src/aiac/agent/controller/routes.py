@@ -46,8 +46,8 @@ def health() -> dict[str, str]:
 
 @app.post("/apply/service/{service_id}")
 def apply_service(service_id: str) -> Response:
-    rules, override = onboard_service(service_id)
-    compute_and_apply(rules, override)
+    rules, override, default_effect = onboard_service(service_id)
+    compute_and_apply(rules, override, default_effect)
     return Response(status_code=200)
 
 
