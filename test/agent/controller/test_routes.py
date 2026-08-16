@@ -11,6 +11,10 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from aiac.agent.controller.routes import app
+from aiac.agent.policy_rules_builder.graph import (
+    PolicyContradictionError,
+    PolicyRulesBuilderError,
+)
 from aiac.idp.configuration.models import Role, Scope
 from aiac.policy.model.models import PolicyRule, RuleEffect
 
@@ -190,6 +194,38 @@ def test_handler_upstream_error_surfaces_status_and_skips_pce():
         resp = client.post("/apply/service/svc-boom")
 
     assert resp.status_code == 502
+    pce.assert_not_called()
+
+
+def test_policy_rules_builder_error_surfaces_422_and_skips_pce():
+    # The PRB auditor rejecting the proposed rules after its retry budget is a policy-input
+    # problem, not a server fault — the Controller maps it to 422, not an uncaught 500, and the
+    # PCE is never reached (the raise fires during rule construction inside the handler).
+    with (
+        patch(
+            "aiac.agent.controller.routes.onboard_service",
+            side_effect=PolicyRulesBuilderError("Auditor rejected after 3 retries: no grants"),
+        ),
+        patch("aiac.agent.controller.routes.compute_and_apply") as pce,
+    ):
+        resp = client.post("/apply/service/svc-reject")
+
+    assert resp.status_code == 422
+    pce.assert_not_called()
+
+
+def test_policy_contradiction_error_surfaces_422_and_skips_pce():
+    # A genuine grant/deny contradiction is likewise a policy finding surfaced as 422.
+    with (
+        patch(
+            "aiac.agent.controller.routes.onboard_service",
+            side_effect=PolicyContradictionError("focal-svc", []),
+        ),
+        patch("aiac.agent.controller.routes.compute_and_apply") as pce,
+    ):
+        resp = client.post("/apply/service/svc-conflict")
+
+    assert resp.status_code == 422
     pce.assert_not_called()
 
 
