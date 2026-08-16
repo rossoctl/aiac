@@ -839,3 +839,174 @@ def _assert_opa_allow(rego: str, query: str, input_doc: dict, expected: bool) ->
         ).stdout
         result = json.loads(out)["result"][0]["expressions"][0]["value"]
     assert result is expected, f"input={input_doc!r}"
+
+
+def _opa_verdict(rego: str, query: str, input_doc: dict) -> bool:
+    """Evaluate ``query`` against ``rego`` for ``input_doc`` and return the bool.
+
+    The value-returning sibling of ``_assert_opa_allow`` — used by the toggle
+    differential below, which must *compare* the two defaults' verdicts cell by
+    cell rather than pin each to a literal."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "policy.rego"
+        path.write_text(rego)
+        cmd = [
+            shutil.which("opa"), "eval", "-f", "json", "-d", str(path),
+            "--stdin-input", query,
+        ]
+        out = subprocess.run(
+            cmd,
+            input=json.dumps(input_doc),
+            capture_output=True, text=True, check=True,
+        ).stdout
+    return json.loads(out)["result"][0]["expressions"][0]["value"]
+
+
+# --- default_effect toggle isolation (issue #150) ---------------------------
+#
+# The clean controlled experiment the cross-policy live full-deployment test
+# (test/integration/test_policy_pipeline_denyworld.py) cannot give on its own:
+# it can only run default=ALLOW, so it never *directly* compares the two defaults
+# on one policy. Here we build ONE Policy-B outbound APM by hand (the hand-built
+# analogue of what the PRB emits — NOT a PRB re-run), generate its Rego twice
+# from the SAME model — once default_effect=DENY, once ALLOW — and opa-eval the
+# full {developer,tester,devops} × {source,issues}-{read,write} matrix against
+# each bundle. With the APM, the generator, and the inputs all pinned, the toggle
+# is the only variable: it must flip ONLY the unmentioned (devops, issues-*) cell
+# and leave every explicit-rule cell (the 4 allow, the 6 deny) invariant. That
+# isolates "the toggle changed the base" from "an explicit rule fired".
+#
+# Policy B, subject side only (mirrors handoff 02 §5's corrected PRB emission):
+#   ALLOW  developer -> source-read, source-write ; tester -> issues-read, issues-write
+#   DENY   developer -> issues-*  ; tester -> source-*  ; devops -> source-*
+# devops -> issues-* is mentioned by NO rule, so it resolves to default_effect:
+# deny under DENY (least-privilege), allow under ALLOW (permissive default).
+#
+# The prose emits no target-side DENY, but the capability gate (target_allow_scopes)
+# still provisions all four tool scopes wide-open — exactly as a real github-tool
+# deployment does. That open capability gate is what makes the two-gate AND under
+# default=DENY reduce to the subject side, so the 4 allow cells read allow under
+# BOTH defaults; without it default=DENY would deny every cell (target gate never
+# passing) and the explicit allow cells would not be invariant across the toggle.
+
+_POLICY_B_ROLES = ("developer", "tester", "devops")
+_POLICY_B_TOOLS = ("source-read", "source-write", "issues-read", "issues-write")
+_POLICY_B_FLIP_CELLS = {("devops", "issues-read"), ("devops", "issues-write")}
+
+# Oracle verdicts (allow=True / deny=False) under default=DENY, computed from the
+# rule lists by hand — NEVER read back from the Rego under test.
+_POLICY_B_DENY_MATRIX: dict[tuple[str, str], bool] = {
+    ("developer", "source-read"): True,   # explicit ALLOW + capability gate open
+    ("developer", "source-write"): True,  # explicit ALLOW
+    ("developer", "issues-read"): False,  # explicit DENY
+    ("developer", "issues-write"): False, # explicit DENY
+    ("tester", "source-read"): False,     # explicit DENY
+    ("tester", "source-write"): False,    # explicit DENY
+    ("tester", "issues-read"): True,      # explicit ALLOW
+    ("tester", "issues-write"): True,     # explicit ALLOW
+    ("devops", "source-read"): False,     # explicit DENY
+    ("devops", "source-write"): False,    # explicit DENY
+    ("devops", "issues-read"): False,     # UNMENTIONED -> least-privilege deny
+    ("devops", "issues-write"): False,    # UNMENTIONED -> least-privilege deny
+}
+# Under default=ALLOW only the two unmentioned cells flip to allow.
+_POLICY_B_ALLOW_MATRIX: dict[tuple[str, str], bool] = {
+    **_POLICY_B_DENY_MATRIX,
+    ("devops", "issues-read"): True,      # UNMENTIONED -> permissive default (flip)
+    ("devops", "issues-write"): True,     # UNMENTIONED -> permissive default (flip)
+}
+
+
+def _policy_b_outbound_model() -> AgentPolicyModel:
+    """One hand-built Policy-B outbound APM (see the section header)."""
+    developer = _role("developer")
+    tester = _role("tester")
+    devops = _role("devops")
+    source_read = _scope("github-tool.source-read", GH_TOOL)
+    source_write = _scope("github-tool.source-write", GH_TOOL)
+    issues_read = _scope("github-tool.issues-read", GH_TOOL)
+    issues_write = _scope("github-tool.issues-write", GH_TOOL)
+    return _model(
+        agent_id=GH_AGENT,
+        subject_roles={
+            "developer": [developer],
+            "tester": [tester],
+            "devops": [devops],
+        },
+        # Capability gate provisioned wide-open (the tool exposes all four scopes);
+        # NO target-side DENY. This makes the outbound two-gate AND reduce to the
+        # subject side, so the matrix is driven purely by the subject allow/deny.
+        target_allow_scopes={
+            GH_TOOL: [source_read, source_write, issues_read, issues_write]
+        },
+        outbound_subject_allow_rules=[
+            _rule(developer, source_read),
+            _rule(developer, source_write),
+            _rule(tester, issues_read),
+            _rule(tester, issues_write),
+        ],
+        outbound_subject_deny_rules=[
+            _rule(developer, issues_read, RuleEffect.DENY),
+            _rule(developer, issues_write, RuleEffect.DENY),
+            _rule(tester, source_read, RuleEffect.DENY),
+            _rule(tester, source_write, RuleEffect.DENY),
+            _rule(devops, source_read, RuleEffect.DENY),
+            _rule(devops, source_write, RuleEffect.DENY),
+        ],
+    )
+
+
+def test_policy_b_only_decision_block_differs_between_defaults():
+    """Cluster-free: flipping default_effect on the SAME model changes ONLY the
+    trailing decision block — every declaration map and every ``*_allow_ok`` /
+    ``*_deny_ok`` gate is emitted identically. Split on the ``default allow`` line;
+    the whole prefix (declarations + gates) must be byte-equal across both."""
+    model = _policy_b_outbound_model()
+    deny_rego = generate_outbound_rego(model)  # default_effect defaults to DENY
+    allow_rego = generate_outbound_rego(
+        model.model_copy(update={"default_effect": RuleEffect.ALLOW})
+    )
+    assert deny_rego != allow_rego
+    assert "default allow := false" in deny_rego
+    assert "default allow := true" in allow_rego
+    marker = "default allow"
+    assert deny_rego.split(marker)[0] == allow_rego.split(marker)[0]
+
+
+@pytest.mark.skipif(not shutil.which("opa"), reason="opa binary not on PATH")
+def test_policy_b_default_effect_toggle_flips_only_unmentioned_cell():
+    """Behavioural differential: generate Policy B twice from the SAME model
+    (default=DENY vs default=ALLOW) and opa-eval the full 3x4 matrix against each.
+
+    Asserts, cell by cell: each verdict matches the hand-computed oracle for its
+    default, every explicit-rule cell (the 4 allow, the 6 deny) is IDENTICAL under
+    both defaults, and ONLY the unmentioned devops -> issues-read / issues-write
+    cell flips (deny under DENY, allow under ALLOW). This is the toggle-isolation
+    the ALLOW-only live test cannot give."""
+    model = _policy_b_outbound_model()
+    deny_rego = generate_outbound_rego(model)  # default_effect defaults to DENY
+    allow_rego = generate_outbound_rego(
+        model.model_copy(update={"default_effect": RuleEffect.ALLOW})
+    )
+    query = "data.authbridge.client.outbound.request.allow"
+    flipped: set[tuple[str, str]] = set()
+    for role in _POLICY_B_ROLES:
+        for tool in _POLICY_B_TOOLS:
+            cell = (role, tool)
+            input_doc = {
+                "identity": {"subject": role, "service_id": GH_TOOL},
+                "mcp": {"params": {"name": tool}},
+            }
+            deny_v = _opa_verdict(deny_rego, query, input_doc)
+            allow_v = _opa_verdict(allow_rego, query, input_doc)
+            # 1. Each verdict matches the hand-computed oracle for its default.
+            assert deny_v is _POLICY_B_DENY_MATRIX[cell], f"DENY mode {cell}"
+            assert allow_v is _POLICY_B_ALLOW_MATRIX[cell], f"ALLOW mode {cell}"
+            # 2. Invariance vs flip: explicit cells hold, only the unmentioned flips.
+            if cell in _POLICY_B_FLIP_CELLS:
+                assert deny_v is False and allow_v is True, f"flip cell {cell}"
+                flipped.add(cell)
+            else:
+                assert deny_v is allow_v, f"explicit cell not invariant: {cell}"
+    # 3. Exactly the two unmentioned cells flipped — no explicit cell moved.
+    assert flipped == _POLICY_B_FLIP_CELLS
