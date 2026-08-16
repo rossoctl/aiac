@@ -9,6 +9,7 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from nats.js.api import AckPolicy
 
 from aiac.agent.eventbus.consumer import AiacEventConsumer, _handle, lifespan
 from aiac.agent.eventbus.stream import (
@@ -157,6 +158,7 @@ def test_start_connects_and_subscribes_with_expected_config():
     assert kwargs["cb"] == consumer._dispatch
     config = kwargs["config"]
     assert config.filter_subjects == CONSUMER_FILTER_SUBJECTS
+    assert config.ack_policy == AckPolicy.EXPLICIT
     assert config.max_deliver == MAX_DELIVER
     assert config.ack_wait == ACK_WAIT_SECONDS
     assert consumer._nc is fake_nc
