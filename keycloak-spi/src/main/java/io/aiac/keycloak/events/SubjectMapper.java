@@ -106,7 +106,15 @@ public final class SubjectMapper {
      * operation (Python's {@code urllib.parse.unquote}) before using the role name.
      */
     private static final Map<Character, String> SUBJECT_TOKEN_ESCAPES =
-            Map.of('%', "%25", '.', "%2E", '*', "%2A", '>', "%3E", ' ', "%20");
+            Map.of(
+                    '%', "%25",
+                    '.', "%2E",
+                    '*', "%2A",
+                    '>', "%3E",
+                    ' ', "%20",
+                    '\t', "%09",
+                    '\r', "%0D",
+                    '\n', "%0A");
 
     private static String encodeSubjectToken(String raw) {
         StringBuilder out = new StringBuilder();

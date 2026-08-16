@@ -61,6 +61,13 @@ class SubjectMapperTest {
     }
 
     @Test
+    void roleNameWithTabCarriageReturnAndNewlineIsEncoded() {
+        Optional<String> subject =
+                SubjectMapper.subjectFor(SubjectMapper.ResourceKind.REALM_ROLE, "CREATE", "roles/a\tb\rc\nd");
+        assertEquals(Optional.of("aiac.apply.role.a%09b%0Dc%0Ad"), subject);
+    }
+
+    @Test
     void otherResourceKindsAreDropped() {
         Optional<String> subject =
                 SubjectMapper.subjectFor(SubjectMapper.ResourceKind.OTHER, "CREATE", "users/some-user");
