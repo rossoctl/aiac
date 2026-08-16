@@ -80,7 +80,7 @@ subject and target capability to pass, but its **subject** gate is now user→**
 `target_allow_scopes[input.target]`, distinct from the inbound user→agent gate — while `target_allow_ok`
 (the capability gate, `input.function_name in target_allow_scopes[input.target]`) is unchanged; and
 `target_allow_scopes` is emitted verbatim (target id → scopes, no inversion). The `agent_roles` ×
-`agent_role_allow_scopes` maps are still emitted (informational). All rule lists here are allow-only, so no
+`agent_role_scopes` maps are still emitted (informational — a single map, no allow/deny split). All rule lists here are allow-only, so no
 deny maps (`*_deny_scopes`) appear; the generated `allow` still applies deny-overrides, which is vacuous when
 the deny lists are empty. Because the input carries no per-request scope on the inbound side, that decision is
 coarse — a principal passes on having access to **at least one** relevant scope.

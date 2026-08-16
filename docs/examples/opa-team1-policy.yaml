@@ -4,8 +4,11 @@
 # namespace — the github-agent. It carries one rego file per tier
 # (inbound/request + outbound/request), server-side-applied by the PDP Policy
 # Writer (OPA). This file mirrors the current `generate_inbound_rego` /
-# `generate_outbound_rego` output (the ALLOW/DENY split gates), so it doubles
-# as documentation of the generated shape.
+# `generate_outbound_rego` output (the ALLOW/DENY split gates) — annotated with
+# explanatory comments and blank-line spacing for readability, so it doubles as
+# documentation of the generated shape. The declaration maps, gates, and
+# decision blocks are identical to the generator's output; only the added
+# comments and spacing differ.
 #
 # TWO-SIDED MODEL (ALLOW / DENY). Each tier evaluates *_allow_ok gates and
 # mirrored *_deny_ok gates and applies DENY-OVERRIDES: a request is permitted
