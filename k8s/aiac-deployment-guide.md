@@ -43,7 +43,8 @@ docker build -f aiac/src/aiac/agent/controller/Dockerfile \
   -t localhost/aiac-agent:local aiac/src/
 ```
 
-The Event Broker uses the stock `nats:latest` image — no build step.
+The Event Broker uses the stock `nats:2.14-alpine` image (pinned in
+`event-broker-deployment.yaml`) — no build step.
 
 ## 2 — Load images into the cluster
 
@@ -61,8 +62,8 @@ NATS image; `event-broker-deployment.yaml` uses `imagePullPolicy: IfNotPresent`,
 networked cluster can skip this and pull it directly:
 
 ```bash
-docker pull nats:latest
-kind load docker-image nats:latest --name <cluster-name>
+docker pull nats:2.14-alpine
+kind load docker-image nats:2.14-alpine --name <cluster-name>
 ```
 
 **Remote registry** — tag, push, then update the `image:` fields in the manifests to match.
@@ -149,7 +150,8 @@ kubectl apply -f aiac/k8s/event-broker-deployment.yaml
 # 3. Policy Model Store — needs the aiac-system namespace
 kubectl apply -f aiac/k8s/policy-model-store-statefulset.yaml
 
-# 4. Agent — aiac-init waits for NATS + Interface Pod + Policy Model Store to be healthy
+# 4. Agent — aiac-init waits for NATS + Interface Pod to be healthy (it does not
+#    currently gate on Policy Model Store readiness)
 kubectl apply -f aiac/k8s/agent-deployment.yaml
 ```
 
@@ -169,26 +171,30 @@ Port-forward each service and check its health endpoint:
 ```bash
 # IdP Configuration Service
 kubectl port-forward svc/aiac-pdp-config-service 7071:7071 -n aiac-system &
+pf_pids=$!
 curl http://localhost:7071/health
 # {"status":"ok"}
 
 # PDP Policy Writer
 kubectl port-forward svc/aiac-pdp-policy-service 7072:7072 -n aiac-system &
+pf_pids="$pf_pids $!"
 curl http://localhost:7072/health
 # {"status":"ok"}
 
 # Policy Model Store
 kubectl port-forward svc/aiac-policy-model-store-service 7074:7074 -n aiac-system &
+pf_pids="$pf_pids $!"
 curl http://localhost:7074/health
 # {"status":"ok"}
 
 # AIAC Agent
 kubectl port-forward svc/aiac-agent-service 7070:7070 -n aiac-system &
+pf_pids="$pf_pids $!"
 curl http://localhost:7070/health
 # {"status":"ok"}
 
-#cleanup all the tunnels that were opended to the cluster
-pkill -f "port-forward"
+# cleanup only the tunnels started above (not unrelated port-forward sessions)
+kill $pf_pids
 ```
 
 ### NATS Event Broker — end-to-end check
@@ -197,6 +203,19 @@ Requires the [`nats` CLI](https://github.com/nats-io/natscli).
 
 ```bash
 kubectl port-forward svc/aiac-event-broker-service 4222:4222 -n aiac-system &
+pf_pid=$!
+
+# Wait for the tunnel to accept connections before publishing through it — port-forward
+# starts in the background and needs a moment; fail fast if it exits instead of connecting.
+for i in $(seq 1 30); do
+  if ! kill -0 "$pf_pid" 2>/dev/null; then
+    echo "port-forward exited before becoming ready" >&2
+    exit 1
+  fi
+  (exec 3<>/dev/tcp/localhost/4222) 2>/dev/null && exec 3>&- && break
+  sleep 0.5
+done
+
 nats context save aiac --server nats://localhost:4222
 nats context select aiac
 
@@ -207,7 +226,7 @@ nats pub aiac.apply.service.<test-uuid> '{"id":"<test-uuid>"}'
 # Confirm the Agent processed and acked it (no redelivery):
 kubectl logs deployment/aiac-agent -n aiac-system -c aiac-agent --tail=50
 
-pkill -f "port-forward.*4222"
+kill "$pf_pid"
 ```
 
 Run the IdP data smoke test:

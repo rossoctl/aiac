@@ -45,6 +45,22 @@ class SubjectMapperTest {
     }
 
     @Test
+    void dottedRealmRoleNameIsEncodedToASingleSubjectToken() {
+        Optional<String> subject =
+                SubjectMapper.subjectFor(SubjectMapper.ResourceKind.REALM_ROLE, "CREATE", "roles/team.admin");
+        // "%2E" keeps "team.admin" as one NATS token so "aiac.apply.role.*" still matches it —
+        // a literal "." would split it into two tokens and the consumer's filter would miss it.
+        assertEquals(Optional.of("aiac.apply.role.team%2Eadmin"), subject);
+    }
+
+    @Test
+    void roleNameWithReservedSubjectCharactersIsEncoded() {
+        Optional<String> subject =
+                SubjectMapper.subjectFor(SubjectMapper.ResourceKind.CLIENT_ROLE, "UPDATE", "clients/abc-123/roles/a*b>c d%e");
+        assertEquals(Optional.of("aiac.apply.role.a%2Ab%3Ec%20d%25e"), subject);
+    }
+
+    @Test
     void otherResourceKindsAreDropped() {
         Optional<String> subject =
                 SubjectMapper.subjectFor(SubjectMapper.ResourceKind.OTHER, "CREATE", "users/some-user");

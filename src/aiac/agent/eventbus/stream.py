@@ -32,6 +32,12 @@ CONSUMER_FILTER_SUBJECTS = [
 DLQ_SUBJECT = "aiac.apply.dlq"
 MAX_DELIVER = 5
 
+# Onboarding's LLM calls run synchronously inside the dispatch callback, each bounded by
+# LLM_REQUEST_TIMEOUT (default 120s) and retried up to UPSTREAM_MAX_RETRIES times (default 3),
+# across multiple structured calls (propose/audit). JetStream's own 30s default ack_wait would
+# redeliver a message that's still being processed, so this is sized well above the worst case.
+ACK_WAIT_SECONDS = 600.0
+
 # JetStream's "stream name already in use with a different configuration" error code.
 _STREAM_CONFIG_MISMATCH_ERR_CODE = 10058
 
@@ -55,6 +61,6 @@ async def ensure_stream(js: JetStreamContext) -> None:
         )
         logger.info("aiac-events stream ready (name=%s, subjects=%s)", STREAM_NAME, STREAM_SUBJECTS)
     except BadRequestError as e:
-        if e.err_code == _STREAM_CONFIG_MISMATCH_ERR_CODE:
+        if e.err_code != _STREAM_CONFIG_MISMATCH_ERR_CODE:
             raise
-        logger.info("aiac-events stream already exists: %s", e)
+        logger.info("aiac-events stream already exists with a different configuration: %s", e)
