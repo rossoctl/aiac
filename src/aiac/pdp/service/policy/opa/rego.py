@@ -39,7 +39,7 @@ prohibition fires.
 import json
 import re
 
-from aiac.policy.model.models import AgentPolicyModel, PolicyRule
+from aiac.policy.model.models import AgentPolicyModel, PolicyRule, RuleEffect
 
 __all__ = ["identity_ref", "generate_inbound_rego", "generate_outbound_rego"]
 
@@ -267,6 +267,40 @@ def _outbound_target_gate(gate: str, scope_map: str) -> str:
     )
 
 
+# --- trailing decision block (the only thing default_effect changes) --------
+#
+# CRITICAL: the generator assumes disjoint ALLOW/DENY per (role, scope). A
+# genuine grant/deny overlap on the same pair is an upstream policy conflict
+# surfaced as HTTP 422 (PRB ``PolicyContradictionError``) and is NEVER
+# reconciled here. The ``allow := false if { <deny> }`` rules below are not
+# conflict reconciliation: they give an explicit deny precedence over a
+# permissive default, and resolve co-occurring-but-disjoint denies at request
+# time (a subject holding multiple roles; the outbound two-gate decision) —
+# each individual (role, scope) stays allow-XOR-deny.
+
+
+def _decision_block(
+    default_effect: RuleEffect, allow_body: str, deny_gates: tuple[str, ...]
+) -> str:
+    """Render the trailing ``allow`` decision — the *only* part that varies by mode.
+
+    ``DENY`` (least-privilege) reproduces today's output byte-for-byte:
+    ``default allow := false`` plus the single ``allow if { <allow_body> }`` rule
+    (an allow-conjunction with inline ``not …_deny_ok`` guards).
+
+    ``ALLOW`` opens the default and lets explicit denies override: ``default
+    allow := true`` plus one ``allow := false if { <gate> }`` rule per deny gate.
+    A literal flip of the constant alone is insufficient — an incremental
+    ``allow if { … }`` body can only push ``allow`` toward ``true``, so the deny
+    guards must become separate ``allow := false if`` rules to pull it back down
+    (deny-overrides over a permissive default)."""
+    if default_effect == RuleEffect.ALLOW:
+        lines = ["default allow := true"]
+        lines += [f"allow := false if {{ {gate} }}" for gate in deny_gates]
+        return "\n".join(lines)
+    return "default allow := false\n" + f"allow if {{ {allow_body} }}"
+
+
 def generate_inbound_rego(
     model: AgentPolicyModel, platform_clients: tuple[str, ...] = ("rossoctl",)
 ) -> str:
@@ -311,10 +345,15 @@ def generate_inbound_rego(
             _inbound_subject_gate("subject_deny_ok", "subject_role_deny_scopes"),
             _inbound_source_allow_gate(platform_clients),
             _inbound_source_deny_gate(),
-            (
-                "default allow := false\n"
-                "allow if { subject_allow_ok; source_allow_ok; "
-                "not subject_deny_ok; not source_deny_ok }"
+            # Branch ONLY the trailing decision block on model.default_effect. Under
+            # ALLOW the allow gates / allow scope maps above are inert-but-emitted
+            # (kept for structural symmetry and downstream tooling); the decision
+            # is deny-if-either-side.
+            _decision_block(
+                model.default_effect,
+                "subject_allow_ok; source_allow_ok; "
+                "not subject_deny_ok; not source_deny_ok",
+                ("subject_deny_ok", "source_deny_ok"),
             ),
         ]
     )
@@ -377,10 +416,17 @@ def generate_outbound_rego(model: AgentPolicyModel) -> str:
             _outbound_subject_gate("subject_deny_ok", "subject_role_deny_scopes"),
             _outbound_target_gate("target_allow_ok", "target_allow_scopes"),
             _outbound_target_gate("target_deny_ok", "target_deny_scopes"),
-            (
-                "default allow := false\n"
-                "allow if { subject_allow_ok; target_allow_ok; "
-                "not subject_deny_ok; not target_deny_ok }"
+            # Branch ONLY the trailing decision block on model.default_effect.
+            # Under ALLOW this drops the old subject_allow_ok AND target_allow_ok
+            # conjunction (deny-if-either-side): a negated allow-gate AND would
+            # wrongly DENY every unmentioned pair. An unmentioned (role, tool)
+            # pair falls through to the permissive default; an explicit deny on
+            # EITHER gate overrides it.
+            _decision_block(
+                model.default_effect,
+                "subject_allow_ok; target_allow_ok; "
+                "not subject_deny_ok; not target_deny_ok",
+                ("subject_deny_ok", "target_deny_ok"),
             ),
         ]
     )

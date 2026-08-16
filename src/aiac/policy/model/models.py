@@ -67,6 +67,13 @@ class AgentPolicyModel(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     agent_id: str
+    # How the deployed Rego treats a (role, scope) pair that NO rule mentions.
+    # DENY (default) reproduces today's least-privilege `default allow := false`.
+    # ALLOW opens the default while explicit denies still override (see the OPA
+    # generator). Effect-agnostic maps and the 8 rule lists are unchanged.
+    # Defaulting to DENY keeps every existing caller and serialized model
+    # byte-for-byte compatible (no required-field break).
+    default_effect: RuleEffect = RuleEffect.DENY
     # Identity / aggregate maps — effect-agnostic (no allow/deny split). A role or subject that
     # appears **only** in a DENY edge must still be registered here, or the Rego deny lookup
     # cannot resolve it and the prohibition silently fails to fire. Relationship maps are keyed

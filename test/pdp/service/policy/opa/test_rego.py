@@ -601,6 +601,229 @@ def test_inbound_source_deny_overrides_behavioural(source: str, allowed: bool):
     )
 
 
+# --- per-policy default_effect (issue #145) ---------------------------------
+#
+# default_effect decides how a (role, scope) pair that NO rule mentions
+# resolves: DENY (the default, least-privilege) reproduces today's
+# `default allow := false` byte-for-byte; ALLOW opens the default while explicit
+# denies still override. Only the trailing decision block changes — every
+# declaration map and every *_allow_ok / *_deny_ok gate is emitted identically.
+
+
+def test_inbound_default_effect_omitted_is_deny_byte_for_byte():
+    """Omitting default_effect (→ DENY) reproduces today's inbound decision block
+    verbatim, and is byte-for-byte identical to an explicit DENY."""
+    omitted = generate_inbound_rego(_github_agent())
+    assert "default allow := false" in omitted
+    assert (
+        "allow if { subject_allow_ok; source_allow_ok; "
+        "not subject_deny_ok; not source_deny_ok }" in omitted
+    )
+    explicit_deny = generate_inbound_rego(
+        _github_agent_with_effect(RuleEffect.DENY)
+    )
+    assert omitted == explicit_deny
+
+
+def test_outbound_default_effect_omitted_is_deny_byte_for_byte():
+    """Omitting default_effect (→ DENY) reproduces today's outbound decision block
+    verbatim, and is byte-for-byte identical to an explicit DENY."""
+    omitted = generate_outbound_rego(_github_agent())
+    assert "default allow := false" in omitted
+    assert (
+        "allow if { subject_allow_ok; target_allow_ok; "
+        "not subject_deny_ok; not target_deny_ok }" in omitted
+    )
+    explicit_deny = generate_outbound_rego(
+        _github_agent_with_effect(RuleEffect.DENY)
+    )
+    assert omitted == explicit_deny
+
+
+def _github_agent_with_effect(effect: RuleEffect) -> AgentPolicyModel:
+    model = _github_agent()
+    return model.model_copy(update={"default_effect": effect})
+
+
+def test_inbound_allow_default_shape():
+    """ALLOW mode: default flips to true, deny gates become separate
+    `allow := false if` rules, and the DENY-mode allow-conjunction is gone."""
+    rego = generate_inbound_rego(_github_agent_with_effect(RuleEffect.ALLOW))
+    assert "default allow := true" in rego
+    assert "allow := false if { subject_deny_ok }" in rego
+    assert "allow := false if { source_deny_ok }" in rego
+    # The DENY-mode allow-conjunction must not appear.
+    assert "default allow := false" not in rego
+    assert (
+        "allow if { subject_allow_ok; source_allow_ok; "
+        "not subject_deny_ok; not source_deny_ok }" not in rego
+    )
+
+
+def test_outbound_allow_default_shape_is_deny_if_either_side():
+    """ALLOW mode outbound: deny-if-either-side, NOT a negated allow-gate AND.
+
+    Guards §3d — a `not subject_allow_ok` / `not target_allow_ok` flip would
+    wrongly DENY every unmentioned (role, tool) pair."""
+    rego = generate_outbound_rego(_github_agent_with_effect(RuleEffect.ALLOW))
+    assert "default allow := true" in rego
+    assert "allow := false if { subject_deny_ok }" in rego
+    assert "allow := false if { target_deny_ok }" in rego
+    # The DENY-mode allow-conjunction must not appear.
+    assert "default allow := false" not in rego
+    assert (
+        "allow if { subject_allow_ok; target_allow_ok; "
+        "not subject_deny_ok; not target_deny_ok }" not in rego
+    )
+    # The wrong "unmentioned → deny" flip must NOT be emitted.
+    assert "not subject_allow_ok" not in rego
+    assert "not target_allow_ok" not in rego
+
+
+def test_allow_mode_still_emits_inert_allow_maps_and_gates():
+    """Under ALLOW the allow-side machinery is still emitted (inert but
+    structurally symmetric, expected by downstream tooling)."""
+    inbound = generate_inbound_rego(_github_agent_with_effect(RuleEffect.ALLOW))
+    assert "subject_role_allow_scopes := {" in inbound
+    assert "source_role_allow_scopes := {" in inbound
+    assert "subject_allow_ok if {" in inbound
+    assert "source_allow_ok if {" in inbound
+    outbound = generate_outbound_rego(_github_agent_with_effect(RuleEffect.ALLOW))
+    assert "subject_role_allow_scopes := {" in outbound
+    assert "target_allow_scopes := {" in outbound
+    assert "agent_role_scopes := {" in outbound
+    assert "subject_allow_ok if {" in outbound
+    assert "target_allow_ok if {" in outbound
+
+
+# --- behavioural: default_effect decides the unmentioned pair ----------------
+
+
+def _inbound_unmentioned_model() -> AgentPolicyModel:
+    """A subject holding a role that NO allow/deny rule mentions — the unmentioned
+    (role, scope) case that resolves to default_effect."""
+    lonely = _role("lonely")
+    access = _scope("github-agent.access")
+    return _model(
+        agent_id=GH_AGENT,
+        agent_scopes=[access],
+        subject_roles={"some-user": [lonely]},
+    )
+
+
+@pytest.mark.skipif(not shutil.which("opa"), reason="opa binary not on PATH")
+@pytest.mark.parametrize(
+    "effect, allowed",
+    [
+        (RuleEffect.DENY, False),  # unmentioned → least-privilege deny
+        (RuleEffect.ALLOW, True),  # unmentioned → permissive default
+    ],
+)
+def test_inbound_unmentioned_resolves_to_default_effect(
+    effect: RuleEffect, allowed: bool
+):
+    model = _inbound_unmentioned_model().model_copy(
+        update={"default_effect": effect}
+    )
+    rego = generate_inbound_rego(model)
+    _assert_opa_allow(
+        rego,
+        "data.authbridge.client.inbound.request.allow",
+        {"identity": {"subject": "some-user"}},
+        allowed,
+    )
+
+
+def _outbound_unmentioned_model() -> AgentPolicyModel:
+    """A (subject role, tool) that NO outbound rule mentions and no target scope
+    grants — the unmentioned outbound case resolving to default_effect."""
+    lonely = _role("lonely")
+    return _model(
+        agent_id=GH_AGENT,
+        subject_roles={"some-user": [lonely]},
+    )
+
+
+@pytest.mark.skipif(not shutil.which("opa"), reason="opa binary not on PATH")
+@pytest.mark.parametrize(
+    "effect, allowed",
+    [
+        (RuleEffect.DENY, False),
+        (RuleEffect.ALLOW, True),
+    ],
+)
+def test_outbound_unmentioned_resolves_to_default_effect(
+    effect: RuleEffect, allowed: bool
+):
+    model = _outbound_unmentioned_model().model_copy(
+        update={"default_effect": effect}
+    )
+    rego = generate_outbound_rego(model)
+    _assert_opa_allow(
+        rego,
+        "data.authbridge.client.outbound.request.allow",
+        {
+            "identity": {"subject": "some-user", "service_id": GH_TOOL},
+            "mcp": {"params": {"name": "anything"}},
+        },
+        allowed,
+    )
+
+
+@pytest.mark.skipif(not shutil.which("opa"), reason="opa binary not on PATH")
+@pytest.mark.parametrize("effect", [RuleEffect.DENY, RuleEffect.ALLOW])
+def test_inbound_deny_overrides_holds_under_both_defaults(effect: RuleEffect):
+    """A subject holding both an allow and a deny role on the same audience scope
+    is barred regardless of default_effect (deny-overrides)."""
+    model = _inbound_deny_model().model_copy(update={"default_effect": effect})
+    rego = generate_inbound_rego(model)
+    _assert_opa_allow(
+        rego,
+        "data.authbridge.client.inbound.request.allow",
+        {"identity": {"subject": "bad-user"}},
+        False,
+    )
+
+
+@pytest.mark.skipif(not shutil.which("opa"), reason="opa binary not on PATH")
+@pytest.mark.parametrize(
+    "tool_name, deny_allowed, allow_allowed",
+    [
+        # tool_name          DENY   ALLOW
+        ("scope-c", True, True),   # both allow gates, not denied → allowed either way
+        ("scope-a", False, True),  # user-only: AND fails under DENY, unmentioned→allow under ALLOW
+        ("scope-b", False, True),  # agent-only: AND fails under DENY, unmentioned→allow under ALLOW
+        ("scope-d", False, False),  # subject-denied: deny-overrides under BOTH
+    ],
+)
+def test_outbound_gate_flip_under_allow_keeps_deny_override(
+    tool_name: str, deny_allowed: bool, allow_allowed: bool
+):
+    """The outbound gate-shape flip: under DENY the two allow gates AND (A user-only
+    and B agent-only both denied); under ALLOW that AND drops so A and B become
+    allowed (unmentioned by any deny), while the subject-denied D stays denied."""
+    input_doc = {
+        "identity": {"subject": "user1", "service_id": GH_TOOL},
+        "mcp": {"params": {"name": tool_name}},
+    }
+    deny_model = _outbound_and_model()  # default_effect defaults to DENY
+    _assert_opa_allow(
+        generate_outbound_rego(deny_model),
+        "data.authbridge.client.outbound.request.allow",
+        input_doc,
+        deny_allowed,
+    )
+    allow_model = _outbound_and_model().model_copy(
+        update={"default_effect": RuleEffect.ALLOW}
+    )
+    _assert_opa_allow(
+        generate_outbound_rego(allow_model),
+        "data.authbridge.client.outbound.request.allow",
+        input_doc,
+        allow_allowed,
+    )
+
+
 def _assert_opa_allow(rego: str, query: str, input_doc: dict, expected: bool) -> None:
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "policy.rego"
