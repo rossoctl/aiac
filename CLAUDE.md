@@ -70,7 +70,7 @@ ls src/aiac/<subsystem>/               # drill into any layer
 **Unit test command:**
 
 ```bash
-.venv/bin/pytest test/ -m "not integration and not llm"
+.venv/bin/pytest test/ -m "not integration"
 ```
 
 The whole `test/` tree collects and runs green — no `--ignore` flags are needed.
@@ -78,11 +78,11 @@ The whole `test/` tree collects and runs green — no `--ignore` flags are neede
 store surface in Wave 3, which resolved the earlier PCE-chain collection
 failures.)
 
-The default expression excludes both `integration` (needs a live cluster) and
-`llm` (needs a live LLM endpoint) so a routine unit run needs no external
-services. Plain `-m "not integration"` also stays green — the `llm` suite
-**skips cleanly** when its env is unset — but excluding `llm` keeps it out of
-the default collection entirely.
+The `-m "not integration"` expression needs no external services. The live-LLM
+PRB suite (below) is marked **both** `integration` and `llm` — `integration`
+because it calls a real LLM endpoint, so `-m "not integration"` already deselects
+it (the routine collected count is unchanged by it); `llm` so it can be selected
+on its own, cluster-free, via `-m llm`.
 
 Use `ls test/` / `find test -type d` to discover current test directories.
 

@@ -10,10 +10,15 @@ point is to exercise the real proposer/auditor prompts, so a prompt-engineering
 regression (an over-grant, a missed deny, a hallucinated deny, a wrong effect) fails a
 fixture here where the mocked suite cannot see it.
 
-Gating: the module is marked ``llm`` and every test first calls
-``require_env_or_skip("LLM_BASE_URL", "LLM_MODEL", "LLM_API_KEY")`` so the suite **skips
-cleanly** (never crashes, never false-passes) when the endpoint is not configured. Run it
-opt-in with ``-m llm`` (env sourced); the default unit expression excludes it.
+Gating: the module is marked **both** ``integration`` and ``llm``. It is ``integration``
+because it calls a real LLM endpoint — that is exactly what the ``integration`` marker
+means — so the routine unit run (``-m "not integration"``) deselects it and its collected
+count is unchanged by this suite. It is additionally ``llm`` so it can be selected on its
+own (``-m llm``) without a cluster or Keycloak, unlike the cluster-bound integration
+suite. Every test also first calls
+``require_env_or_skip("LLM_BASE_URL", "LLM_MODEL", "LLM_API_KEY")`` so it **skips cleanly**
+(never crashes, never false-passes) when the endpoint is not configured. Run it opt-in
+with ``-m llm`` (env sourced).
 
 Each fixture asserts **exact set equality** of the emitted ``{(counterpart.name, effect)}``
 pairs against a hand-verified expected set — a subset check would let over-/under-grants
@@ -32,7 +37,7 @@ from aiac.idp.configuration.models import Role, Scope
 from aiac.policy.model.models import PolicyRule, RuleEffect
 from test.integration.launcher import require_env_or_skip
 
-pytestmark = pytest.mark.llm
+pytestmark = [pytest.mark.integration, pytest.mark.llm]
 
 ALLOW = RuleEffect.ALLOW
 DENY = RuleEffect.DENY
