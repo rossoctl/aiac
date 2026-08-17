@@ -147,8 +147,16 @@ def build_proposer_messages(
     candidates: str,
     contract: str,
     audit_feedback: str | None,
+    *,
+    direction: str,
 ) -> list[BaseMessage]:
-    body = f"POLICY:\n{_policy_block(policy_text)}\n\nFOCAL ENTITY:\n{focal}\n\nCANDIDATES:\n{candidates}\n\n{contract}"
+    # ``direction`` leads the body so the gate axis (what the focal is, what the candidates are, and
+    # that entities named only in the policy prose are NOT candidates) frames how the policy is read
+    # — without it a focal whose name echoes a policy domain drags the model onto the wrong axis.
+    body = (
+        f"{direction}\n\nPOLICY:\n{_policy_block(policy_text)}\n\n"
+        f"FOCAL ENTITY:\n{focal}\n\nCANDIDATES:\n{candidates}\n\n{contract}"
+    )
     if audit_feedback:
         body += f"\n\nA prior proposal was REJECTED. Fix per this feedback:\n{audit_feedback}"
     return [SystemMessage(content=_PROPOSER_SYSTEM), HumanMessage(content=body)]
@@ -161,9 +169,14 @@ def build_auditor_messages(
     selected_names: list[str],
     denied_names: list[str],
     conflict_names: list[str],
+    *,
+    direction: str,
 ) -> list[BaseMessage]:
+    # Same ``direction`` framing as the proposer: the auditor previously got NO axis hint (the
+    # proposer alone received the contract), which let it adjudicate against the wrong candidate set.
     body = (
-        f"POLICY:\n{_policy_block(policy_text)}\n\nFOCAL ENTITY:\n{focal}\n\nCANDIDATES:\n{candidates}\n\n"
+        f"{direction}\n\nPOLICY:\n{_policy_block(policy_text)}\n\n"
+        f"FOCAL ENTITY:\n{focal}\n\nCANDIDATES:\n{candidates}\n\n"
         f"PROPOSED GRANTS (names): {selected_names}\n"
         f"PROPOSED PROHIBITIONS (names): {denied_names}"
     )

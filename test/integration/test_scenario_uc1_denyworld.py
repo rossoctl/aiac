@@ -8,7 +8,10 @@ silently validate the live denyworld test — if these are wrong, every live ass
 Policy B is permissive-default prose that constrains **user roles only**, deployed under
 ``default_effect=ALLOW`` so every deny in its matrix is a load-bearing explicit ``DENY``. The
 ``devops → issues-*`` = ✅ cells are the signature that ``default=ALLOW`` is live (they are **deny**
-under Policy A). Source of truth: ``aiac/docs/handoffs/02-policy-b-deny-full-deployment.md`` §5-§7.1.
+under Policy A). Every prohibition targets a pair the role's own description does not support, so no
+DENY contradicts a description-derived capability grant — the developer (whose description consults
+issues) is therefore left unconstrained and fully allowed. Source of truth:
+``aiac/docs/handoffs/02-policy-b-deny-full-deployment.md`` §5-§7.1.
 """
 
 from __future__ import annotations
@@ -43,11 +46,12 @@ def test_inbound_oracle(subject: str, allowed: bool) -> None:
 @pytest.mark.parametrize(
     "subject, tool_bare, allowed",
     [
-        # developer → source ✅✅ / issues ❌❌ (exclusivity)
+        # developer → source ✅✅ / issues ✅✅ (unconstrained — no developer prohibition; its
+        # description consults issues, so a prohibition would contradict the capability grant)
         ("dev-user", "source-read", True),
         ("dev-user", "source-write", True),
-        ("dev-user", "issues-read", False),
-        ("dev-user", "issues-write", False),
+        ("dev-user", "issues-read", True),
+        ("dev-user", "issues-write", True),
         # tester → source ❌❌ / issues ✅✅ (exclusivity)
         ("test-user", "source-read", False),
         ("test-user", "source-write", False),
@@ -80,18 +84,18 @@ def test_no_inbound_or_target_denies() -> None:
     assert scn_b.OUTBOUND_TARGET_DENY_PAIRS == []
 
 
-def test_outbound_subject_deny_pairs_are_the_six_expected() -> None:
-    """The subject-gate DENY pair-list is exactly the six prefixed (role, tool-scope) entries from
-    §6: developer→issues-*, tester→source-*, devops→source-*."""
+def test_outbound_subject_deny_pairs_are_the_four_expected() -> None:
+    """The subject-gate DENY pair-list is exactly the four prefixed (role, tool-scope) entries from
+    §6: tester→source-*, devops→source-*. There is no developer prohibition — the developer
+    description consults the issue tracker, so denying developer→issues would contradict a
+    description-derived capability grant (a precedence conflict deferred to future work)."""
     assert set(scn_b.OUTBOUND_SUBJECT_DENY_PAIRS) == {
-        ("developer", "github-tool.issues-read"),
-        ("developer", "github-tool.issues-write"),
         ("tester", "github-tool.source-read"),
         ("tester", "github-tool.source-write"),
         ("devops", "github-tool.source-read"),
         ("devops", "github-tool.source-write"),
     }
-    assert len(scn_b.OUTBOUND_SUBJECT_DENY_PAIRS) == 6
+    assert len(scn_b.OUTBOUND_SUBJECT_DENY_PAIRS) == 4
 
 
 def test_bare_deny_set_is_derived_from_the_prefixed_pairs_via_shared_bare() -> None:
@@ -101,8 +105,6 @@ def test_bare_deny_set_is_derived_from_the_prefixed_pairs_via_shared_bare() -> N
         (role, scn.bare(scope)) for role, scope in scn_b.OUTBOUND_SUBJECT_DENY_PAIRS
     }
     assert scn_b.OUTBOUND_SUBJECT_DENY_BARE == {
-        ("developer", "issues-read"),
-        ("developer", "issues-write"),
         ("tester", "source-read"),
         ("tester", "source-write"),
         ("devops", "source-read"),

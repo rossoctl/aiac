@@ -158,12 +158,15 @@ def _propose(
     focal: str,
     candidates: str,
     contract: str,
+    direction: str,
     schema: type[_Selection],
     names_field: str,
     denied_names_field: str,
     exclusive_field: str,
 ) -> dict[str, Any]:
-    msgs = build_proposer_messages(state["policy_text"], focal, candidates, contract, state["audit_feedback"])
+    msgs = build_proposer_messages(
+        state["policy_text"], focal, candidates, contract, state["audit_feedback"], direction=direction
+    )
     sel = _structured_call(schema, msgs)
     return {
         "selected_names": list(getattr(sel, names_field)),
@@ -190,7 +193,7 @@ def _precheck(state: _PRBWorking, *, candidate_names: set[str]) -> dict[str, Any
     return {"selected_names": keep, "denied_names": keep_denied, "conflict_names": conflict}
 
 
-def _audit(state: _PRBWorking, *, focal: str, candidates: str) -> dict[str, Any]:
+def _audit(state: _PRBWorking, *, focal: str, candidates: str, direction: str) -> dict[str, Any]:
     verdict = _structured_call(
         AuditVerdict,
         build_auditor_messages(
@@ -200,6 +203,7 @@ def _audit(state: _PRBWorking, *, focal: str, candidates: str) -> dict[str, Any]
             state["selected_names"],
             state["denied_names"],
             state["conflict_names"],
+            direction=direction,
         ),
     )
     # Three-way routing. A genuine contradiction short-circuits past retry (retrying can't fix a
@@ -244,6 +248,30 @@ _SCOPE_CONTRACT = (
     "(explicit prohibitions, subset of candidates), access_is_exclusive + reasoning."
 )
 
+# Explicit gate-direction framing, passed to BOTH the proposer and the auditor (the auditor
+# previously got NO axis hint, so a focal whose name echoes a policy domain -- e.g. an agent
+# ``*.source_operations`` role -- dragged it onto the SUBJECT axis and it adjudicated the
+# proposal against user roles that are not candidates at all). Each string names what the focal
+# is, what the candidates are, and that entities named only in the policy prose are NOT candidates.
+_ROLE_DIRECTION = (
+    "GATE DIRECTION -- capability gate. The FOCAL ENTITY is a ROLE; every CANDIDATE is a SCOPE. "
+    "Decide which candidate SCOPES the focal role is granted (and, only if the SCENARIO policy "
+    "prohibits or restricts this role, which it is denied). A grant rests on the focal role's OWN "
+    "capability description matched to a candidate scope's description (rule 3) plus any scenario-"
+    "policy statement about THIS role. Every name you output MUST be one of the candidate SCOPES "
+    "listed below: any other entity -- a user role, a subject, anything named only in the policy "
+    "prose -- is NOT a candidate in this gate, must never appear in your grant or prohibition lists, "
+    "and is not by itself a basis to grant or deny the focal role."
+)
+_SCOPE_DIRECTION = (
+    "GATE DIRECTION -- subject gate. The FOCAL ENTITY is a SCOPE; every CANDIDATE is a ROLE. "
+    "Decide which candidate ROLES are granted access to the focal scope (and, only if the SCENARIO "
+    "policy prohibits or restricts, which are denied). Every name you output MUST be one of the "
+    "candidate ROLES listed below: any other entity -- a scope, a capability, anything named only in "
+    "the policy prose -- is NOT a candidate in this gate and must never appear in your grant or "
+    "prohibition lists."
+)
+
 
 def _denied_names(explicit: list[str], exclusive: bool, candidate_order: list[str], granted: set[str]) -> set[str]:
     """The set of candidate names to DENY: the explicit prohibitions, plus -- when the grant is
@@ -281,6 +309,7 @@ def build_role_graph():
             focal=_role_focal(s["role"]),
             candidates=_scope_cands(s["scopes"]),
             contract=_ROLE_CONTRACT,
+            direction=_ROLE_DIRECTION,
             schema=RoleSelection,
             names_field="granted_scope_names",
             denied_names_field="denied_scope_names",
@@ -291,7 +320,9 @@ def build_role_graph():
         return _precheck(s, candidate_names={sc.name for sc in s["scopes"]})
 
     def audit(s: RoleRulesState) -> dict[str, Any]:
-        return _audit(s, focal=_role_focal(s["role"]), candidates=_scope_cands(s["scopes"]))
+        return _audit(
+            s, focal=_role_focal(s["role"]), candidates=_scope_cands(s["scopes"]), direction=_ROLE_DIRECTION
+        )
 
     def build(s: RoleRulesState) -> dict[str, Any]:
         # ALLOW from granted names, DENY from explicit prohibitions -- every rule rebuilt from the
@@ -318,6 +349,7 @@ def build_scope_graph():
             focal=_scope_focal(s["scope"]),
             candidates=_role_cands(s["roles"]),
             contract=_SCOPE_CONTRACT,
+            direction=_SCOPE_DIRECTION,
             schema=ScopeSelection,
             names_field="roles_with_access_names",
             denied_names_field="roles_denied_access_names",
@@ -328,7 +360,9 @@ def build_scope_graph():
         return _precheck(s, candidate_names={r.name for r in s["roles"]})
 
     def audit(s: ScopeRulesState) -> dict[str, Any]:
-        return _audit(s, focal=_scope_focal(s["scope"]), candidates=_role_cands(s["roles"]))
+        return _audit(
+            s, focal=_scope_focal(s["scope"]), candidates=_role_cands(s["roles"]), direction=_SCOPE_DIRECTION
+        )
 
     def build(s: ScopeRulesState) -> dict[str, Any]:
         # ALLOW from granted names, DENY from explicit prohibitions -- every rule rebuilt from the

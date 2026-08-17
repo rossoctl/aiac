@@ -136,7 +136,7 @@ def test_outbound(pipeline: dict, subject: str, tool_bare: str) -> None:
     """The enforced outbound gate — a real MCP ``tools/call`` for the **bare** tool through AuthBridge's
     forward proxy (token-exchange → OPA). Under ``default=ALLOW`` a pair is allowed unless the
     subject gate explicitly denies it: every ❌ in Policy B's §6 matrix is a load-bearing explicit
-    ``DENY`` (developer→issues-*, tester→source-*, devops→source-*), and the ``devops → issues-*`` ✅
+    ``DENY`` (tester→source-*, devops→source-*), and the ``devops → issues-*`` ✅
     cells are the default-flip tracer. ``mcp-parser`` surfaces ``input.mcp.params.name`` (no hand-built
     input); a denial is a JSON-RPC error frame the harness classifies."""
     assert uc1.outbound_decision(pipeline, subject, tool_bare) == _expected_outbound(
@@ -156,7 +156,7 @@ def test_outbound(pipeline: dict, subject: str, tool_bare: str) -> None:
 # ``_decision_block``). An unrecognized name is in **no** deny map, so no DENY gate matches and the
 # request falls through to the **permissive default = allow**. This is the resolved answer to the
 # handoff §7.3 question ("does an unmatched tool fall to the permissive default or is it denied?"): it
-# is **allowed**. The oracle agrees — ``expected_outbound_denyworld_bare`` denies only the six explicit
+# is **allowed**. The oracle agrees — ``expected_outbound_denyworld_bare`` denies only the four explicit
 # subject-DENY pairs, so any name outside them is allow.
 
 

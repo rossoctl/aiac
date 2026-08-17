@@ -20,15 +20,24 @@ becomes fully **observable**. Every ❌ in the §6 matrix is therefore a load-be
 if any DENY is dropped anywhere in the chain (PRB → PCE → Rego → bundle → OPA) the corresponding cell
 flips back to allow and the live test fails.
 
-**Both PRB deny idioms are exercised** (handoff §5):
-  - *exclusivity* — "developers may access only source" ⇒ ALLOW developer→source-* **and DENY**
-    developer→issues-*; likewise "testers may access only issues" ⇒ ALLOW tester→issues-* **and DENY**
-    tester→source-*. (The ALLOW halves are **inert** under ``default=ALLOW`` — everything not denied is
-    already allowed — so the enforced matrix and this oracle depend only on the DENY halves.)
+**Every prohibition targets a pair the role's own description does NOT support** — so no DENY
+contradicts a description-derived capability grant. (Resolving a prohibition that *does* contradict a
+capability grant — e.g. denying the developer, whose description "consults issues", from issues — is
+deferred future work; this scenario avoids it by leaving the developer **unconstrained**: its
+description spans source and reading issues, so under the permissive default it is fully allowed and
+carries no DENY at all.)
+
+**Both PRB deny idioms are exercised** (handoff §5), over conflict-free pairs:
+  - *exclusivity* — "testers may access only issues" ⇒ ALLOW tester→issues-* **and DENY** tester→source-*
+    (the tester description works "in the issue tracker, not in source", so the DENY contradicts nothing).
+    The ALLOW half is **inert** under ``default=ALLOW`` — everything not denied is already allowed — so
+    the enforced matrix and this oracle depend only on the DENY half.
   - *direct prohibition* — "DevOps may not access source" ⇒ **DENY** devops→source-* only (no ALLOW
-    derived). DevOps is **not** prohibited from issues and derives no ALLOW there, so ``devops→issues-*``
-    carries **no explicit rule at all** and is allowed **purely by the permissive default** — the
-    signature that ``default=ALLOW`` is live (these cells are **deny** under Policy A).
+    derived; the devops description "does not author source code"). DevOps is **not** prohibited from
+    issues and derives no ALLOW there, so ``devops→issues-*`` carries **no explicit rule at all** and is
+    allowed **purely by the permissive default** — the signature that ``default=ALLOW`` is live (these
+    cells are **deny** under Policy A). ``developer→*`` is likewise unconstrained and allowed by the
+    default; ``developer→issues-write`` (deny under Policy A) is a second such default-flip tracer.
 
 **Prefixed provisioned names vs. bare runtime names** (same convention as ``scenario_uc1``): the DENY
 pair-lists hold the **prefixed** names the PCE writes into the CR data maps (``github-tool.source-read``
@@ -71,7 +80,6 @@ POLICY_DENYWORLD = """\
 Grant access on a permissive basis: allow by default; state only the prohibitions and the
 exclusive scoping that narrow access.
 
-- Developers may access only source; they may not access issues.
 - Testers may access only issues; they may not access source.
 - DevOps may not access source.
 """
@@ -80,12 +88,12 @@ exclusive scoping that narrow access.
 # --- DENY pair-lists over the DISCOVERED, PREFIXED names (the single source of truth) --------
 #
 # Mirrors ``scenario_uc1``'s prefixed convention (``github-tool.<scope>``). Each maps 1:1 to a
-# generated Rego DENY gate. The subject gate carries the six denies from the §6 matrix; there are no
-# inbound denies and no target/capability-gate denies under this prose (§6, §7.1).
+# generated Rego DENY gate. The subject gate carries the four denies from the §6 matrix; there are no
+# inbound denies and no target/capability-gate denies under this prose (§6, §7.1). Every deny targets a
+# (role, scope) pair the role's own description does NOT support, so none contradicts a capability grant
+# (the developer, whose description consults issues, carries no prohibition — it is left unconstrained).
 
 OUTBOUND_SUBJECT_DENY_PAIRS: list[tuple[str, str]] = [
-    ("developer", "github-tool.issues-read"),   # exclusivity complement (dev → source only)
-    ("developer", "github-tool.issues-write"),
     ("tester", "github-tool.source-read"),       # exclusivity complement (tester → issues only)
     ("tester", "github-tool.source-write"),
     ("devops", "github-tool.source-read"),        # direct prohibition (DevOps may not access source)
