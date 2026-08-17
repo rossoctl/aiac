@@ -57,7 +57,8 @@ def _handle(subject: str) -> tuple[list[PolicyRule], bool, RuleEffect]:
         # contain '.', which NATS treats as a token separator, so the SPI percent-encodes them
         # into a single token before publishing. unquote() is the general-purpose inverse; safe
         # here because every literal '%' in the original name was itself escaped to "%25".
-        return update_role(unquote(subject[len(_ROLE_PREFIX) :]))
+        rules, override = update_role(unquote(subject[len(_ROLE_PREFIX) :]))
+        return rules, override, RuleEffect.DENY
     if subject == _POLICY_BUILD_SUBJECT:
         rules, override = build_policy()
         return rules, override, RuleEffect.DENY

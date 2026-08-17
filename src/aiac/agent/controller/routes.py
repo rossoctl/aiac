@@ -59,6 +59,15 @@ def _default_effect_from_env() -> RuleEffect:
         return RuleEffect.DENY
 
 
+@app.get("/health")
+def health() -> dict[str, str]:
+    # The Controller is stateless — it holds no local state and opens no
+    # connection at rest — so /health is a bare liveness/readiness signal:
+    # if the process is accepting requests it is ready. Upstream reachability
+    # (IdP, PCE, NATS) is validated per-request by the handlers, not here.
+    return {"status": "ok"}
+
+
 @app.post("/apply/service/{service_id}")
 def apply_service(service_id: str) -> Response:
     rules, override, default_effect = onboard_service(service_id, _default_effect_from_env())
