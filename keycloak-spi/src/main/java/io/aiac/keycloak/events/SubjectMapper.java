@@ -1,5 +1,6 @@
 package io.aiac.keycloak.events;
 
+import java.util.Map;
 import java.util.Optional;
 
 /**
@@ -40,7 +41,7 @@ public final class SubjectMapper {
             case REALM_ROLE:
             case CLIENT_ROLE:
                 if ("CREATE".equals(operationType) || "UPDATE".equals(operationType)) {
-                    return lastSegment(resourcePath).map(name -> "aiac.apply.role." + name);
+                    return lastSegment(resourcePath).map(name -> "aiac.apply.role." + encodeSubjectToken(name));
                 }
                 return Optional.empty();
             default:
@@ -50,7 +51,78 @@ public final class SubjectMapper {
 
     /** Minimal JSON payload — the event is a trigger, not a data carrier (see event-broker.md). */
     public static String payloadFor(String entityId) {
-        return "{\"id\":\"" + entityId + "\"}";
+        return "{\"id\":\"" + escapeJson(entityId) + "\"}";
+    }
+
+    /**
+     * Minimal JSON string escaping (RFC 8259) for the one field this class ever serializes.
+     * Hand-rolled rather than pulling in a JSON library, to keep this class dependency-free
+     * (see the class javadoc) — {@code entityId} is normally a Keycloak UUID or resource name,
+     * but nothing stops it containing a quote, backslash, or control character.
+     */
+    private static String escapeJson(String raw) {
+        StringBuilder out = new StringBuilder(raw.length());
+        for (int i = 0; i < raw.length(); i++) {
+            char c = raw.charAt(i);
+            switch (c) {
+                case '"':
+                    out.append("\\\"");
+                    break;
+                case '\\':
+                    out.append("\\\\");
+                    break;
+                case '\n':
+                    out.append("\\n");
+                    break;
+                case '\r':
+                    out.append("\\r");
+                    break;
+                case '\t':
+                    out.append("\\t");
+                    break;
+                case '\b':
+                    out.append("\\b");
+                    break;
+                case '\f':
+                    out.append("\\f");
+                    break;
+                default:
+                    if (c < 0x20) {
+                        out.append(String.format("\\u%04x", (int) c));
+                    } else {
+                        out.append(c);
+                    }
+            }
+        }
+        return out.toString();
+    }
+
+    /**
+     * Characters significant to NATS subject tokenization: {@code .} separates tokens, {@code *}
+     * and {@code >} are wildcards, and whitespace is disallowed in a token. Role names (unlike the
+     * client UUIDs used for {@code aiac.apply.service.*}) are free-form and may contain any of
+     * these, so they are percent-encoded here into a single token. {@code %} itself is escaped too
+     * so the mapping stays reversible. The Agent consumer decodes this with the mirror-image
+     * operation (Python's {@code urllib.parse.unquote}) before using the role name.
+     */
+    private static final Map<Character, String> SUBJECT_TOKEN_ESCAPES =
+            Map.of(
+                    '%', "%25",
+                    '.', "%2E",
+                    '*', "%2A",
+                    '>', "%3E",
+                    ' ', "%20",
+                    '\t', "%09",
+                    '\r', "%0D",
+                    '\n', "%0A");
+
+    private static String encodeSubjectToken(String raw) {
+        StringBuilder out = new StringBuilder();
+        for (int i = 0; i < raw.length(); i++) {
+            char c = raw.charAt(i);
+            out.append(SUBJECT_TOKEN_ESCAPES.getOrDefault(c, String.valueOf(c)));
+        }
+        return out.toString();
     }
 
     private static Optional<String> lastSegmentAfter(String path, String prefix) {

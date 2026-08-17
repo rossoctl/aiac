@@ -18,13 +18,12 @@ dependencies = [
     "langchain-openai",
     "chromadb",
     "tenacity",
-    "pytest>=9.1.1",
 ]
 
 [project.optional-dependencies]
 # Test/dev tooling — install with: uv pip install -e ".[test]"
 test = [
-    "pytest",
+    "pytest>=9.1.1",
 ]
 
 [tool.uv]
