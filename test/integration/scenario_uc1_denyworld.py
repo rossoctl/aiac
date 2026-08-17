@@ -39,6 +39,17 @@ carries no DENY at all.)
     cells are **deny** under Policy A). ``developer→*`` is likewise unconstrained and allowed by the
     default; ``developer→issues-write`` (deny under Policy A) is a second such default-flip tracer.
 
+**Both source prohibitions also project onto the INBOUND gate.** The prohibitions are *subject* facts,
+and the inbound gate (user→agent) keys on **agent scopes** — and the deployed ``github-agent`` exposes a
+``source_operations`` skill. So the PRB emits an inbound DENY for ``tester→source_operations`` and
+``devops→source_operations`` as well. The inbound gate is **coarse deny-overrides**: a role denied *any*
+agent scope in ``agent_scopes`` is denied the agent **entirely** (even the issue skill it is not
+prohibited from). Hence inbound: ``developer`` = allow (unconstrained), ``tester`` = **deny**, ``devops``
+= **deny**. ``tester`` inbound is the inbound default-flip tracer — **allow** under Policy A (which grants
+``tester→issue_operations``) but **deny** here — a load-bearing observable DENY, the inbound analogue of
+the ``devops→issues-*`` outbound tracer. (An earlier draft assumed Policy B produced *no* inbound denies;
+the live pipeline corrected that — the source prohibition bites on the inbound axis too.)
+
 **Prefixed provisioned names vs. bare runtime names** (same convention as ``scenario_uc1``): the DENY
 pair-lists hold the **prefixed** names the PCE writes into the CR data maps (``github-tool.source-read``
 …), while AuthBridge's ``mcp-parser`` puts the **bare** invoked tool name into
@@ -87,11 +98,26 @@ exclusive scoping that narrow access.
 
 # --- DENY pair-lists over the DISCOVERED, PREFIXED names (the single source of truth) --------
 #
-# Mirrors ``scenario_uc1``'s prefixed convention (``github-tool.<scope>``). Each maps 1:1 to a
-# generated Rego DENY gate. The subject gate carries the four denies from the §6 matrix; there are no
-# inbound denies and no target/capability-gate denies under this prose (§6, §7.1). Every deny targets a
-# (role, scope) pair the role's own description does NOT support, so none contradicts a capability grant
-# (the developer, whose description consults issues, carries no prohibition — it is left unconstrained).
+# Mirrors ``scenario_uc1``'s prefixed convention. Each maps 1:1 to a generated Rego DENY gate. Every
+# deny targets a (role, scope) pair the role's own description does NOT support, so none contradicts a
+# capability grant (the developer, whose description consults issues, carries no prohibition — it is
+# left unconstrained).
+#
+# The prose's two source prohibitions ("testers may not access source", "DevOps may not access
+# source") project onto BOTH enforced gates, because the deployed ``github-agent`` exposes a
+# source-domain skill (``source_operations``) *and* the ``github-tool`` exposes source scopes:
+#   - OUTBOUND (agent→tool, keyed on TOOL scopes): tester/devops → ``github-tool.source-*``.
+#   - INBOUND  (user→agent, keyed on AGENT scopes): tester/devops → ``github-agent.source_operations``.
+# The inbound gate is coarse deny-overrides — a role denied ANY agent scope present in ``agent_scopes``
+# is denied the agent ENTIRELY (even the issue skill it is not prohibited from) — so tester and devops
+# are denied inbound outright, while the unconstrained developer is allowed. There are no
+# target/capability-gate denies (the prose names no agent-operator prohibition), so the outbound
+# *target* gate stays empty.
+#
+# (An earlier draft of this oracle assumed the prose produced NO inbound denies — conflating "no
+# target/capability-gate denies" with "no inbound-subject denies". The live pipeline disproves that:
+# the source prohibition is a *subject* fact and the inbound gate keys on the agent's source-domain
+# scope, so it fires there too. Corrected against the deployed Rego — see the module docstring.)
 
 OUTBOUND_SUBJECT_DENY_PAIRS: list[tuple[str, str]] = [
     ("tester", "github-tool.source-read"),       # exclusivity complement (tester → issues only)
@@ -100,9 +126,18 @@ OUTBOUND_SUBJECT_DENY_PAIRS: list[tuple[str, str]] = [
     ("devops", "github-tool.source-write"),
 ]
 
-# No inbound denies and no target-side denies under this prose (§6): the PRB emits denies only at the
-# fine tool-scope layer, and the prose constrains user roles only (not the agent's operator roles).
-INBOUND_SUBJECT_DENY_PAIRS: list[tuple[str, str]] = []
+# The same two source prohibitions on the INBOUND axis, keyed on the agent's source-domain scope. Under
+# the coarse deny-overrides inbound gate each denies its role from the agent entirely. LOAD-BEARING
+# under ``default=ALLOW``: ``tester`` inbound FLIPS allow (Policy A grants ``tester→issue_operations``,
+# ``scenario_uc1.INBOUND_PAIRS``) → **deny** here — the inbound analogue of the outbound
+# ``devops→issues-*`` default-flip tracer, and a genuine observable DENY. (``devops`` is deny inbound
+# under both policies — no grant under A, explicit deny under B — so only its *reason* changes.)
+INBOUND_SUBJECT_DENY_PAIRS: list[tuple[str, str]] = [
+    ("tester", "github-agent.source_operations"),
+    ("devops", "github-agent.source_operations"),
+]
+# No target/capability-gate denies: the prose constrains user roles only (not the agent's operator
+# roles), so the outbound target gate emits nothing.
 OUTBOUND_TARGET_DENY_PAIRS: list[tuple[str, str]] = []
 
 
@@ -125,10 +160,12 @@ _INBOUND_DENY_ROLES: set[str] = {role for role, _ in INBOUND_SUBJECT_DENY_PAIRS}
 
 
 def expected_inbound_denyworld(subject: str) -> bool:
-    """Inbound verdict for ``subject`` under ``default=ALLOW``. A subject is denied inbound only if an
-    explicit inbound DENY removes its reach to the agent. Policy B emits **no** inbound denies
-    (``INBOUND_SUBJECT_DENY_PAIRS`` is empty), so all three roles reach the agent — including devops,
-    which is **deny** under Policy A's ``default=DENY``."""
+    """Inbound verdict for ``subject`` under ``default=ALLOW``. A subject is denied inbound iff an
+    explicit inbound DENY removes its reach to the agent. Policy B's source prohibitions project onto
+    the agent's ``source_operations`` scope, so ``tester`` and ``devops`` carry an inbound DENY and —
+    under the coarse deny-overrides inbound gate — are denied the agent **entirely**; the unconstrained
+    ``developer`` is allowed. ``tester`` inbound thus flips **allow → deny** vs. Policy A (a load-bearing
+    observable DENY); ``devops`` is deny under both."""
     return scn.USERS[subject] not in _INBOUND_DENY_ROLES
 
 

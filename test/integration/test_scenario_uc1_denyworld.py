@@ -35,11 +35,13 @@ from test.integration import scenario_uc1_denyworld as scn_b  # noqa: E402
 
 @pytest.mark.parametrize(
     "subject, allowed",
-    [("dev-user", True), ("test-user", True), ("devops-user", True)],
+    [("dev-user", True), ("test-user", False), ("devops-user", False)],
 )
 def test_inbound_oracle(subject: str, allowed: bool) -> None:
-    """Inbound (§6): all three roles ✅. Policy B emits no inbound denies, so under
-    ``default=ALLOW`` every subject reaches the agent — including devops (deny under Policy A)."""
+    """Inbound: developer ✅, tester ❌, devops ❌. The source prohibitions project onto the agent's
+    ``source_operations`` scope, so under the coarse deny-overrides inbound gate tester and devops are
+    denied the agent entirely; the unconstrained developer is allowed. ``tester`` inbound flips
+    allow→deny vs. Policy A (a load-bearing observable DENY under ``default=ALLOW``)."""
     assert scn_b.expected_inbound_denyworld(subject) is allowed
 
 
@@ -77,10 +79,14 @@ def test_outbound_oracle(subject: str, tool_bare: str, allowed: bool) -> None:
 # ======================================================================================
 
 
-def test_no_inbound_or_target_denies() -> None:
-    """Policy B's prose constrains user roles only and phrases no agent-access prohibition, so the
-    PRB emits no inbound denies and no target/capability-gate denies (§6, §7.1)."""
-    assert scn_b.INBOUND_SUBJECT_DENY_PAIRS == []
+def test_inbound_denies_are_the_two_source_prohibitions_and_no_target_denies() -> None:
+    """The source prohibitions project onto the INBOUND gate via the agent's ``source_operations``
+    scope, so the inbound subject-deny list is exactly tester/devops → ``github-agent.source_operations``.
+    There are still no target/capability-gate denies (the prose names no agent-operator prohibition)."""
+    assert set(scn_b.INBOUND_SUBJECT_DENY_PAIRS) == {
+        ("tester", "github-agent.source_operations"),
+        ("devops", "github-agent.source_operations"),
+    }
     assert scn_b.OUTBOUND_TARGET_DENY_PAIRS == []
 
 
@@ -113,11 +119,15 @@ def test_bare_deny_set_is_derived_from_the_prefixed_pairs_via_shared_bare() -> N
 
 
 def test_deny_pairs_reference_only_known_roles_and_tool_scopes() -> None:
-    """Every deny pair keys on a provisioned realm role and a discovered, prefixed tool scope reused
-    from ``scenario_uc1`` — guarding against a typo forking the shared deployment truth."""
+    """Every deny pair keys on a provisioned realm role and a discovered, prefixed scope reused from
+    ``scenario_uc1`` — guarding against a typo forking the shared deployment truth. Outbound subject
+    denies reference tool scopes; inbound subject denies reference agent scopes."""
     for role, scope in scn_b.OUTBOUND_SUBJECT_DENY_PAIRS:
         assert role in scn.USER_ROLES, role
         assert scope in scn.TOOL_SCOPES, scope
+    for role, scope in scn_b.INBOUND_SUBJECT_DENY_PAIRS:
+        assert role in scn.USER_ROLES, role
+        assert scope in scn.AGENT_SCOPES, scope
 
 
 def test_reuses_deployment_fixed_constants_from_scenario_uc1() -> None:

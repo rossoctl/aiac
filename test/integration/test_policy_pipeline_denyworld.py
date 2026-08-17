@@ -90,12 +90,14 @@ def pipeline() -> dict:
     harness resets ``default_effect`` to ``Deny`` on teardown so the shared stack returns to the shipped
     default for the Policy-A suite. Skips cleanly if the pipeline is not wired or the env is unset.
 
-    The convergence signal set is Policy-B-aware (the Policy-A default would never converge here, since
-    ``devops-user`` is *allow* inbound under Policy B, not *deny*). Each signal is polled to a
-    **definitive** allow/deny (never ``error``), which also waits out the post-restart token-exchange
-    503 window:
+    The convergence signal set is Policy-B-aware — its default-flip tracer (``outbound(devops-user,
+    issues-read) == allow``) is *deny* under Policy A, so a stale Policy-A bundle can never satisfy it.
+    (The tracer rides the **outbound** leg, not inbound: ``devops-user`` is *deny* inbound under **both**
+    policies — no grant under A, an explicit source-prohibition deny under B — so an inbound devops
+    signal would not distinguish the two defaults.) Each signal is polled to a **definitive** allow/deny
+    (never ``error``), which also waits out the post-restart token-exchange 503 window:
 
-      * ``inbound(dev-user) == allow`` — the agent is reachable;
+      * ``inbound(dev-user) == allow`` — the agent is reachable (developer is unconstrained);
       * ``outbound(devops-user, issues-read) == allow`` — **the default-flip tracer**: this pair is
         *deny* under Policy A and *allow* here purely by the permissive default, so it proves *this*
         run's ``default=ALLOW`` CR is live, not a stale Policy-A bundle;
@@ -123,9 +125,11 @@ def pipeline() -> dict:
 
 @pytest.mark.parametrize("subject", list(scn.USERS))
 def test_inbound(pipeline: dict, subject: str) -> None:
-    """The enforced inbound gate — a real request through AuthBridge as ``subject``. Policy B emits no
-    inbound denies, so under ``default=ALLOW`` **all three** roles reach the agent (including devops,
-    which is *deny* under Policy A). The real OPA plugin decides; ``jwt-validation`` builds
+    """The enforced inbound gate — a real request through AuthBridge as ``subject``. Policy B's source
+    prohibitions project onto the agent's ``source_operations`` scope, so under ``default=ALLOW`` the
+    coarse deny-overrides inbound gate denies ``tester`` and ``devops`` the agent entirely while the
+    unconstrained ``developer`` is allowed; ``tester`` inbound flips allow→deny vs. Policy A (a
+    load-bearing observable DENY). The real OPA plugin decides; ``jwt-validation`` builds
     ``input.identity`` (no hand-built input)."""
     assert uc1.inbound_decision(pipeline, subject) == _expected_inbound(subject), subject
 
