@@ -543,6 +543,18 @@ def inbound_decision(ctx: dict, user: str) -> str:
     return inbound_outcome(code)
 
 
+def resolve_controller_pod() -> str:
+    """Resolve the **current** live Controller pod (newest Running+Ready, non-terminating — see
+    ``resolve_pod``). The onboard leg port-forwards to this resolved pod rather than
+    ``svc/aiac-agent-service`` because both ``_set_controller_default_effect`` and
+    ``ensure_agent_policy`` may roll the Controller Deployment right before onboarding: with
+    ``replicas=1``/``maxUnavailable=0`` the old pod lingers ``Terminating`` (up to its grace period)
+    and the Service can still route a fresh connection to it. Its ``/health`` answers 200 right up
+    until it drops the long onboard POST mid-flight — the ``RemoteDisconnected`` race, the onboard-leg
+    analogue of issue #139. Binding the resolved live pod avoids the doomed endpoint."""
+    return resolve_pod(f"app={CONTROLLER_DEPLOYMENT}", namespace=CONTROLLER_NAMESPACE)
+
+
 def resolve_agent_pod() -> str:
     """Resolve the **current** live agent pod (newest Running+Ready, non-terminating — see
     ``resolve_pod``). Re-resolved per outbound probe rather than pinned once at fixture setup: the
@@ -693,8 +705,15 @@ def onboarded_stack(
         service_ids = [
             resolve_service_id(admin, TEST_REALM, f"{NAMESPACE}/{workload}") for workload in workloads
         ]
+        # Bind the onboard port-forward to the resolved **live** Controller pod, not the Service:
+        # the rollouts above can leave an old pod ``Terminating`` that the Service still routes to,
+        # dropping the long onboard POST mid-flight (see ``resolve_controller_pod``). An explicit
+        # ``AIAC_CONTROLLER_TARGET`` override is still honored verbatim for non-default topologies.
+        controller_target = (
+            CONTROLLER_TARGET if os.environ.get("AIAC_CONTROLLER_TARGET") else f"pod/{resolve_controller_pod()}"
+        )
         with port_forward(
-            CONTROLLER_TARGET,
+            controller_target,
             namespace=CONTROLLER_NAMESPACE,
             local_port=CONTROLLER_LOCAL_PORT,
             remote_port=CONTROLLER_REMOTE_PORT,
