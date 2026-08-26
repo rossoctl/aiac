@@ -267,6 +267,31 @@ An unmentioned subject/source (matched by no deny gate) falls through to `defaul
 
 **Deny-overrides:** `allow` fires only when both allow gates pass **and** neither deny gate matches. A subject or source barred by a deny edge is rejected even when an allow edge would otherwise admit it. (An absent `input.identity.client_id` makes `source_allow_ok` true and — because `source_roles[input.identity.client_id]` is undefined — leaves `source_deny_ok` false, so an absent source still passes.)
 
+> **Security property — source-side deny reach.** The `source_allow_ok`
+> bypass sets only the *allow* gate; `allow` still requires `not
+> source_deny_ok` **and** `not subject_deny_ok`, so a bypassed source is
+> **not** immune to a deny — a subject-side deny still applies, and a
+> source-side deny applies too *when it can fire*. The limit is on the
+> source deny gate specifically:
+> - **Pure end-user traffic (no `client_id`)** is structurally
+>   un-revokable on the **source** side: `source_roles[input.identity.client_id]`
+>   is undefined, so `source_deny_ok` can never fire against it. Such
+>   traffic can still be denied by a **subject**-side deny (it always
+>   carries `input.identity.subject`).
+> - A **platform bypass client** (`rossoctl` et al.) keeps
+>   `source_allow_ok` unconditionally, but `source_deny_ok` *does* fire
+>   if an explicit deny edge names a role that client holds. In normal
+>   operation platform clients carry no authored rules, so their source
+>   trust is effectively un-revokable — but it is not structurally
+>   un-revokable, and no separate exemption shields them from a deny that
+>   is actually authored against their role.
+>
+> Net: **DENY cannot revoke *source-side* trust for a caller that presents
+> no `client_id`.** This is deliberate — dropping the bypass would deny
+> the platform-fronted end-user traffic the mesh depends on (see
+> `PLATFORM_SOURCE_CLIENTS`, Q5) — and is a property of the source gate,
+> not a global "platform clients are always allowed" carve-out.
+
 ### Outbound package: `authbridge.client.outbound.request`
 
 Evaluated by the AuthBridge OPA plugin in the **outbound pipeline** — "what this agent may call", **per invoked tool**. `allow` is an AND on the **same** `input.mcp.params.name`, requiring **both** allow gates to pass and **neither** deny gate to match (deny-overrides): `subject_allow_ok` (the delegated user's role admits the tool — `input.mcp.params.name in subject_role_allow_scopes[role]`, de-prefixed values) AND `target_allow_ok` (the target service, keyed by the full `input.identity.service_id`, admits the tool — `input.mcp.params.name in target_allow_scopes[input.identity.service_id]`), with `subject_deny_ok` / `target_deny_ok` mirroring them against `subject_role_deny_scopes` / `target_deny_scopes`. `agent_roles` / `agent_role_scopes` are emitted for debugging but are **not** referenced by `allow` — `target_allow_scopes[input.identity.service_id]` already *is* the per-scope capability gate. This package emits neither `agent_scopes` nor the inbound subject gate: outbound decisions never consider the agent's own audience scopes.
