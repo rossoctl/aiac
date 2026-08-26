@@ -46,4 +46,5 @@ testpaths = ["test"]
 pythonpath = ["src"]
 markers = [
     "integration: tests that call real LLM endpoints",
+    "llm: tests that call the real LLM but mock descriptions/policy (no cluster)",
 ]
