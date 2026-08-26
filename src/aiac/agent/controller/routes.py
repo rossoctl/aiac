@@ -114,7 +114,12 @@ class PolicyCheckRequest(BaseModel):
     """Body for ``POST /policy/check``: candidate ``policy_text`` to survey against the focal
     entities of ``service_id`` (the Keycloak internal client UUID, matching
     ``/apply/service/{service_id}``). ``policy_text`` is required — its absence is a FastAPI
-    validation 422 with no report body."""
+    validation 422 with no report body.
+
+    An *empty* ``policy_text`` (``""``) is a well-formed request, not a 422: it is surveyed like
+    any other prose. With no grants or prohibitions to collide, the report lands on
+    ``no_conflict`` (or ``incomplete`` when zero focal entities could be evaluated), never
+    ``conflicts_found`` — an honest "nothing to conflict" result rather than a boundary error."""
 
     policy_text: str
     service_id: str

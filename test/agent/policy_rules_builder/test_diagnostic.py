@@ -181,6 +181,45 @@ def test_retry_budget_exhaustion_marks_unevaluated_no_raise():
 
 
 # --------------------------------------------------------------------------- #
+# 4b — the auditor CONFIRMS a contradiction against an UNJOINABLE candidate      #
+#      name (one not in this run's typed candidate set). The conflict cannot be  #
+#      emitted with a real id, but it must NOT be dropped silently: the focal    #
+#      entity is marked unevaluated (unjoinable_candidate) so a confirmed        #
+#      contradiction can never let the survey report no_conflict.                #
+# --------------------------------------------------------------------------- #
+def test_unjoinable_auditor_candidate_is_marked_unevaluated_not_clean():
+    role = _role("r-dev", "developer")
+    issues = _scope("s-iss", "issues")
+
+    def se(schema, messages):
+        if schema is AuditVerdict:
+            # candidate_name the precheck never saw (precheck filters the PROPOSER's names, not
+            # the auditor's) and which does not join to the candidate scope set {"issues"}.
+            return AuditVerdict(
+                approved=False,
+                contradictions=[Contradiction(candidate_name="ghost", description="phantom collision")],
+            )
+        return RoleSelection(
+            granted_scope_names=["issues"], denied_scope_names=["issues"], reasoning="r"
+        )
+
+    with ExitStack() as stack:
+        _patch_calls(stack, se)
+        result = run_role_diagnostic("Developers policy about issues.", role, [issues])
+
+    # No conflict with a fabricated id is emitted ...
+    assert result.conflicts == []
+    # ... but the confirmed-yet-unjoinable contradiction is surfaced as unevaluated, so the
+    # survey cannot classify this entity clean (status is forced away from no_conflict).
+    assert len(result.unevaluated) == 1
+    u = result.unevaluated[0]
+    assert u.reason.value == "unjoinable_candidate"
+    assert u.focal.type is FocalType.ROLE
+    assert (u.focal.name, u.focal.id) == ("developer", "r-dev")
+    assert "ghost" in u.detail
+
+
+# --------------------------------------------------------------------------- #
 # 5 — substring-validation FAILURE: the explain call returns a non-substring    #
 #     granting quote, so the conflict is KEPT with quotes_verified=False and    #
 #     the explanation falls back to the auditor description.                    #

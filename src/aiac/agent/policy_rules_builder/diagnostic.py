@@ -229,11 +229,25 @@ def _explain(
     policy_text = state["policy_text"]
     focal_ref = FocalRef(name=focal_obj.name, id=focal_obj.id, type=focal_type)
     out: list[Conflict] = []
+    dropped: list[Unevaluated] = []
     for contradiction in state["recorded_contradictions"]:
         candidate = candidate_by_name.get(contradiction.candidate_name)
         if candidate is None:
-            # Defensive: precheck already filtered names to the candidate set, so an unjoinable
-            # name should not occur. Skip rather than emit a conflict with a fabricated id.
+            # precheck filters the PROPOSER's name lists, not the AUDITOR's free-form
+            # candidate_name, so an unjoinable name can still reach here. Never emit a conflict
+            # with a fabricated id — but never lose the signal either: mark the focal entity
+            # unevaluated so a confirmed-but-unjoinable contradiction cannot let the survey
+            # report no_conflict (its presence forces status to incomplete).
+            dropped.append(
+                Unevaluated(
+                    focal=focal_ref,
+                    reason=UnevaluatedReason.UNJOINABLE_CANDIDATE,
+                    detail=(
+                        f"auditor confirmed a contradiction for candidate "
+                        f"{contradiction.candidate_name!r} not in this run's candidate set"
+                    ),
+                )
+            )
             continue
         if focal_type is FocalType.ROLE:
             role_obj, scope_obj = focal_obj, candidate
@@ -268,7 +282,7 @@ def _explain(
                 quotes_verified=verified,
             )
         )
-    return {"conflicts": out}
+    return {"conflicts": out, "unevaluated": dropped}
 
 
 def _route_diagnostic(state: DiagnosticState) -> str:

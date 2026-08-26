@@ -23,8 +23,8 @@ report. It does **not** replace or modify the live `/apply` → 422 path.
 
 ## Interface
 
-- **New Controller route** — `POST /policy/check` (**recommended**; the exact path is a #154 open item,
-  `/policy/check` vs `/policy/conflicts`). The route is a **thin serialization shell** over a testable
+- **New Controller route** — `POST /policy/check` (**final** — shipped path; the earlier
+  `/policy/check` vs `/policy/conflicts` open item is settled). The route is a **thin serialization shell** over a testable
   plain function:
 
   ```python
@@ -255,7 +255,6 @@ seam; the opt-in `-m llm` suite runs the real model — see [`policy-rules-build
   per-service check** — a **separate effort**, not this work.
 - **Survey concurrency:** assume **sequential** (matches `builder.py`); parallelize only if latency
   demands.
-- **Route path name:** decide at implementation (`/policy/check` vs `/policy/conflicts`).
 - **Subtle-prose robustness / PRB precedence tuning** (explicit prohibition vs description-derived
   grant): a separate PRB-quality concern, not a correctness gate for this feature.
 - **ALLOW-vs-DENY precedence / tie-break at enforcement time:** a distinct PCE/Rego concern (tracked in

@@ -48,11 +48,15 @@ class ConflictStatus(str, Enum):
 
 
 class UnevaluatedReason(str, Enum):
-    """Why a focal entity could not be evaluated. Currently a single value: ``nonconvergence``
-    (the entity exhausted the audit retry budget without a verdict). Kept as an enum so callers
-    switch on a stable token, with the free-text ``detail`` carrying specifics."""
+    """Why a focal entity could not be evaluated. ``nonconvergence`` — the entity exhausted the
+    audit retry budget without a verdict. ``unjoinable_candidate`` — the auditor confirmed a
+    contradiction against a ``candidate_name`` that does not join to this run's typed candidate
+    set, so the conflict cannot be emitted with a real id yet must not be dropped (else a
+    confirmed contradiction could let the report reach ``no_conflict``). Kept as an enum so
+    callers switch on a stable token, with the free-text ``detail`` carrying specifics."""
 
     NONCONVERGENCE = "nonconvergence"
+    UNJOINABLE_CANDIDATE = "unjoinable_candidate"
 
 
 class EntityRef(BaseModel):

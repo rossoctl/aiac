@@ -34,7 +34,7 @@ def test_status_values_exactly():
 
 
 def test_unevaluated_reason_values():
-    assert [m.value for m in UnevaluatedReason] == ["nonconvergence"]
+    assert [m.value for m in UnevaluatedReason] == ["nonconvergence", "unjoinable_candidate"]
 
 
 # --- ref models -------------------------------------------------------------------------------
