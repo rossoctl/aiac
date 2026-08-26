@@ -24,9 +24,9 @@ from aiac.agent.policy_rules_builder.graph import (
     PolicyContradictionError,
     PolicyRulesBuilderError,
 )
-from aiac.agent.uc.policy_check.check import check_policy_conflicts
 from aiac.agent.uc.offboarding.offboard import offboard_service
 from aiac.agent.uc.onboarding.orchestrator import onboard_service
+from aiac.agent.uc.policy_check.check import check_policy_conflicts
 from aiac.agent.uc.policy_update.build import build_policy
 from aiac.agent.uc.policy_update.rebuild import rebuild_policy
 from aiac.agent.uc.role_update.role import update_role
