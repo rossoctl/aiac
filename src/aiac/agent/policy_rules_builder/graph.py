@@ -132,7 +132,9 @@ def _propose(
 ) -> dict[str, Any]:
     msgs = build_proposer_messages(state["policy_text"], focal, candidates, contract, state["audit_feedback"])
     sel = _structured_call(schema, msgs)
-    return {"selected_names": list(getattr(sel, names_field)), "reasoning": sel.reasoning}
+    selected = list(getattr(sel, names_field))
+    logger.info("PRB propose focal=%r candidates=%r -> selected=%r reasoning=%r", focal, candidates, selected, sel.reasoning)
+    return {"selected_names": selected, "reasoning": sel.reasoning}
 
 
 def _precheck(state: _PRBWorking, *, candidate_names: set[str]) -> dict[str, Any]:
@@ -147,6 +149,10 @@ def _audit(state: _PRBWorking, *, focal: str, candidates: str) -> dict[str, Any]
     verdict = _structured_call(
         AuditVerdict,
         build_auditor_messages(state["policy_text"], focal, candidates, state["selected_names"]),
+    )
+    logger.info(
+        "PRB audit focal=%r selected=%r -> approved=%s reason=%r (retry %d/%d)",
+        focal, state["selected_names"], verdict.approved, verdict.reason, state["retry_count"], MAX_AUDIT_RETRIES,
     )
     if verdict.approved:
         return {"approved": True}

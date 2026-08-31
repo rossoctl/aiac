@@ -11,9 +11,13 @@ failures are raised as FastAPI ``HTTPException``s by the handlers; the status
 code is authoritative (the accompanying default JSON error body is incidental).
 """
 
+import logging
+import os
+
 import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import Response
+from langchain_core.globals import set_debug, set_verbose
 
 from aiac.agent.eventbus.consumer import lifespan
 from aiac.agent.uc.offboarding.offboard import offboard_service
@@ -22,6 +26,17 @@ from aiac.agent.uc.policy_update.build import build_policy
 from aiac.agent.uc.policy_update.rebuild import rebuild_policy
 from aiac.agent.uc.role_update.role import update_role
 from aiac.policy.computation import compute_and_apply, decommission
+
+# Verbose-logging seam: LOG_LEVEL controls the root logger (default DEBUG), so every module's
+# `logging.getLogger(__name__)` call — and third-party loggers like httpx, which log each
+# outbound request line — becomes visible. set_debug additionally makes LangChain/LangGraph
+# print each chain step (including the full LLM prompt/response) to stdout.
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "DEBUG"),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+set_verbose(True)
+set_debug(True)
 
 app = FastAPI(lifespan=lifespan)
 

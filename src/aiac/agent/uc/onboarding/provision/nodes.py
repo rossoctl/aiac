@@ -11,6 +11,8 @@ as an `HTTPException(502, ...)` whose message names the workload and the specifi
 missing/invalid label — actionable, never silent.
 """
 
+import logging
+
 from fastapi import HTTPException
 
 from aiac.idp.configuration.api import Configuration
@@ -20,6 +22,8 @@ from aiac.shared.upstream import run_upstream
 from .kube import list_agentcards, list_pods, read_service
 from .state import OnboardingProvisionState
 from .types import RoleDefinition, ScopeDefinition, ServiceProvision
+
+logger = logging.getLogger(__name__)
 
 _TYPE_LABEL = "rossoctl.io/type"
 _MCP_LABEL = "protocol.rossoctl.io/mcp"
@@ -122,6 +126,10 @@ def classify_service(state: OnboardingProvisionState) -> dict:
             f"(got {label!r}, expected 'agent' or 'tool')",
         )
 
+    logger.info(
+        "classify_service service_id=%r -> namespace=%r workload=%r type=%s",
+        service_id, namespace, workload_name, service_type,
+    )
     return {
         "service_id": service_id,
         "namespace": namespace,
@@ -195,6 +203,7 @@ def analyze_agent(state: OnboardingProvisionState) -> dict:
         scopes=scopes,
         reasoning=f"derived from AgentCard: {len(skills)} skills",
     )
+    logger.info("analyze_agent workload=%r -> scopes=%r", workload, [s.name for s in scopes])
     return {"service_provision": provision}
 
 
@@ -263,6 +272,7 @@ def analyze_tool(state: OnboardingProvisionState) -> dict:
         scopes=scopes,
         reasoning=f"derived from MCP manifest: {len(tools)} tools",
     )
+    logger.info("analyze_tool workload=%r endpoint=%r -> scopes=%r", workload, endpoint, [s.name for s in scopes])
     return {"service_provision": provision}
 
 
@@ -286,4 +296,9 @@ def provision_service(state: OnboardingProvisionState) -> dict:
     except Exception as e:
         raise HTTPException(502, f"IdP Configuration Service unavailable provisioning {service_id!r}: {e}")
 
+    logger.info(
+        "provision_service service_id=%r type=%s wrote roles=%r scopes=%r (%s)",
+        service_id, state.service_type, [r.name for r in provision.roles],
+        [s.name for s in provision.scopes], provision.reasoning,
+    )
     return {"service_provision": provision, "service_type": state.service_type}

@@ -311,8 +311,14 @@ def _run(rules: list[PolicyRule], override: bool) -> None:
     # (6) Derive each affected agent's APM (zero IdP) and partial-upsert once. Tools get an SPM
     # but no APM (P4).
     derived = [_derive(agent_id, spm) for agent_id in sorted(affected) if is_agent(agent_id)]
+    logger.info(
+        "compute_and_apply rules=%d changed_spms=%r affected=%r derived_agents=%r",
+        len(rules), sorted(changed), sorted(affected), [a.agent_id for a in derived],
+    )
     if derived:
         apply_policy(PolicyModel(agents=derived))
+    else:
+        logger.warning("compute_and_apply: no agent APM derived — PDP Policy Writer not called")
 
 
 def _decommission(service_id: str) -> None:

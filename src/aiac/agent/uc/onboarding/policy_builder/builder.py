@@ -22,6 +22,8 @@ services' ``aiac.managed`` roles carry ``kind=Agent``; realm roles held by at le
 ``subject_roles``/``source_roles`` routing correct downstream in the PCE.
 """
 
+import logging
+
 from fastapi import HTTPException
 
 from aiac.agent.policy_rules_builder.graph import build_role_rules, build_scope_rules
@@ -29,6 +31,8 @@ from aiac.agent.shared.roles import flatten_role
 from aiac.idp.configuration.api import Configuration
 from aiac.idp.configuration.models import Role, ServiceType
 from aiac.policy.model.models import PolicyRule
+
+logger = logging.getLogger(__name__)
 
 
 def _config() -> Configuration:
@@ -107,6 +111,11 @@ class ServicePolicyBuilder:
         ]
 
         candidate_roles = _flatten_dedup(user_roles + other_agent_roles)
+        logger.info(
+            "ServicePolicyBuilder.build service_id=%r type=%s own_scopes=%r own_roles=%r candidates=%r",
+            service_id, service_type, [s.name for s in own_scopes], [r.name for r in own_roles],
+            [r.name for r in candidate_roles],
+        )
 
         rules: list[PolicyRule] = []
         for scope in own_scopes:
@@ -115,4 +124,8 @@ class ServicePolicyBuilder:
             for own_role in own_roles:
                 for role in flatten_role(own_role):
                     rules.extend(build_role_rules(role, other_scopes))
+        logger.info(
+            "ServicePolicyBuilder.build service_id=%r -> %d rule(s): %r",
+            service_id, len(rules), [(r.role.name, r.scope.name) for r in rules],
+        )
         return rules

@@ -11,6 +11,7 @@ The CR write is **always active** — it is never gated by an env var. Setting
 disables, replaces, or gates the CR write.
 """
 
+import logging
 import os
 import shutil
 from pathlib import Path
@@ -26,6 +27,16 @@ from aiac.pdp.service.policy.opa.rego import (
     identity_ref,
 )
 from aiac.policy.model.models import AgentPolicyModel, PolicyModel
+
+# Verbose-logging seam: LOG_LEVEL controls the root logger (default DEBUG), so the `kubernetes`
+# client's underlying HTTP layer surfaces the literal PATCH/DELETE/GET against the K8s API
+# (method, path, status) without per-module config. Mirrors `agent/controller/routes.py`'s
+# convention.
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "DEBUG"),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------- #
 # CR coordinates & write identity — code constants, never env vars (Q6, Q8a). #
@@ -153,6 +164,8 @@ def _upsert_agent(model: AgentPolicyModel) -> None:
     """Server-side-apply the agent's CR (idempotent), then dump if enabled (Q6b)."""
     namespace, name = identity_ref(model.agent_id)
     body = _build_cr(model)
+    paths = [p["path"] for p in body["spec"]["policies"]]
+    logger.info("upserting AuthorizationPolicy %s/%s: policies=%s", namespace, name, paths)
     _api.patch_namespaced_custom_object(
         group=_GROUP,
         version=_VERSION,
@@ -171,6 +184,7 @@ def _upsert_agent(model: AgentPolicyModel) -> None:
 def _delete_agent(agent_id: str) -> None:
     """Delete the agent's CR (idempotent: k8s 404 == success), then dump-clear (Q6c)."""
     namespace, name = identity_ref(agent_id)
+    logger.info("deleting AuthorizationPolicy %s/%s", namespace, name)
     try:
         _api.delete_namespaced_custom_object(
             group=_GROUP,
@@ -195,7 +209,9 @@ def _delete_all() -> None:
     listing = _api.list_cluster_custom_object(
         _GROUP, _VERSION, _PLURAL, label_selector=_MANAGED_BY_SELECTOR
     )
-    for item in listing.get("items", []):
+    items = listing.get("items", [])
+    logger.info("deleting %d AuthorizationPolicy CR(s) cluster-wide", len(items))
+    for item in items:
         meta = item["metadata"]
         try:
             _api.delete_namespaced_custom_object(

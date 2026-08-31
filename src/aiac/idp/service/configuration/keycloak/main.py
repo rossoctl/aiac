@@ -1,5 +1,6 @@
 import base64
 import json
+import logging
 import os
 import threading
 from contextlib import asynccontextmanager
@@ -12,6 +13,17 @@ from keycloak import KeycloakAdmin, KeycloakOpenID
 from keycloak.exceptions import KeycloakError
 from pydantic import BaseModel
 from starlette.responses import JSONResponse
+
+# Verbose-logging seam: LOG_LEVEL controls the root logger (default DEBUG), so every module's
+# `logging.getLogger(__name__)` call — and `urllib3`, which `python-keycloak`'s underlying
+# `requests` session logs through — surfaces without per-module config. Mirrors
+# `agent/controller/routes.py`'s convention so the real Keycloak Admin REST call (method, URL,
+# status) for every route below is visible in this container's stdout.
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "DEBUG"),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 _cache: dict[str, KeycloakAdmin] = {}
 _lock = threading.Lock()
@@ -248,6 +260,7 @@ def mint_discovery_token(
     reject — ``aud`` missing the clientId, or (when ``AIAC_KEYCLOAK_ISSUER`` is set) a mismatched
     ``iss`` — so discovery fails loud here rather than with an opaque 401 at the tool.
     """
+    logger.info("minting discovery token: service_id=%s realm=%s", service_id, realm)
     try:
         client = admin.get_client(service_id)
         client_id = client["clientId"]
@@ -299,6 +312,7 @@ def mint_discovery_token(
 def set_service_type(
     service_id: str, body: _ServiceTypeUpdate, admin: KeycloakAdmin = Depends(get_admin)
 ):
+    logger.info("setting service type: service_id=%s type=%s", service_id, body.type)
     try:
         client = admin.get_client(service_id)
         # Merge into the existing attributes so we don't clobber other client attributes;
@@ -355,6 +369,7 @@ def list_service_roles(service_id: str, admin: KeycloakAdmin = Depends(get_admin
             if getattr(e, "response_code", None) not in (400, 404):
                 raise
 
+        logger.info("service_id=%s roles=%d", service_id, len(roles))
         return roles
     except KeycloakError as e:
         if e.response_code == 400:
@@ -364,6 +379,7 @@ def list_service_roles(service_id: str, admin: KeycloakAdmin = Depends(get_admin
 
 @app.post("/services/{service_id}/roles/{role_id}", status_code=201)
 def assign_role_to_service(service_id: str, role_id: str, admin: KeycloakAdmin = Depends(get_admin)):
+    logger.info("assigning role to service: service_id=%s role_id=%s", service_id, role_id)
     try:
         sa_user = admin.get_client_service_account_user(service_id)
         user_id = sa_user["id"]
@@ -397,6 +413,7 @@ def list_service_scopes(service_id: str, admin: KeycloakAdmin = Depends(get_admi
                         owner_index = _build_scope_owner_index(admin)
                     _assert_single_owner(scope, owner_index)  # Assumption 2, fail loud
                 scope["serviceId"] = owner
+        logger.info("service_id=%s scopes=%d", service_id, len(scopes))
         return scopes
     except _InvariantViolation as e:
         return JSONResponse(status_code=409, content={"error": str(e)})
@@ -406,6 +423,7 @@ def list_service_scopes(service_id: str, admin: KeycloakAdmin = Depends(get_admi
 
 @app.post("/services/{service_id}/scopes", status_code=201)
 def create_scope(service_id: str, body: _ScopeCreate, admin: KeycloakAdmin = Depends(get_admin)):
+    logger.info("creating scope %r for service_id=%s", body.name, service_id)
     try:
         scope_id = admin.create_client_scope({
             "name": body.name,
@@ -421,6 +439,7 @@ def create_scope(service_id: str, body: _ScopeCreate, admin: KeycloakAdmin = Dep
 
 @app.post("/services/{service_id}/scopes/{scope_id}", status_code=201)
 def assign_scope_to_service(service_id: str, scope_id: str, admin: KeycloakAdmin = Depends(get_admin)):
+    logger.info("assigning scope to service: service_id=%s scope_id=%s", service_id, scope_id)
     try:
         admin.add_client_default_client_scope(service_id, scope_id, {})
         return JSONResponse(status_code=201, content={})
@@ -460,6 +479,7 @@ def list_roles(realm: str = Query(...), admin: KeycloakAdmin = Depends(get_admin
 
 @app.post("/roles", status_code=201)
 def create_role(body: _RoleCreate, admin: KeycloakAdmin = Depends(get_admin)):
+    logger.info("creating realm role %r", body.name)
     try:
         admin.create_realm_role({
             "name": body.name,
