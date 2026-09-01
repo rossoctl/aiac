@@ -29,6 +29,7 @@ the exact same entity set. This module keeps only the fan-out loop over that set
 before.
 """
 
+from aiac.agent.policy_rules_builder.conflict_detection import PolicyConflictError, detect_conflicts
 from aiac.agent.policy_rules_builder.graph import build_role_denies, build_role_rules, build_scope_rules
 from aiac.agent.shared.focal_entities import resolve_focal_entities
 from aiac.agent.shared.roles import flatten_role
@@ -66,4 +67,13 @@ class ServicePolicyBuilder:
             for own_role in focal.own_roles:
                 for role in flatten_role(own_role):
                     rules.extend(build_role_rules(role, focal.other_scopes))
+        # Inline, deterministic (non-LLM) cross-pass conflict detection over the fully assembled
+        # rule list (scope-focal grants + Door B denies). Per ADR 0001 we surface, never reconcile:
+        # a (role, scope) carrying both an Allow and a Deny raises HERE -- before the Orchestrator/
+        # Controller reach ``compute_and_apply`` -- so a conflict leaves persisted state untouched
+        # (atomic-by-construction). detection is order-independent (keyed on ids), so tool-first vs
+        # agent-first onboarding yields the identical outcome.
+        report = detect_conflicts(rules)
+        if report.conflicts:
+            raise PolicyConflictError(report)
         return rules
