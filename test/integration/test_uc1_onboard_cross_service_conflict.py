@@ -157,15 +157,18 @@ def test_cross_service_conflict_is_surfaced_as_422_conflict_report() -> None:
     keycloak_url = creds["KEYCLOAK_URL"]
 
     admin = uc1.connect_admin()
-    uc1.delete_agent_cr()  # clean policy slate (drop any prior run's CR)
-    uc1.cleanup_provisioned(admin, TEST_REALM)  # clean slate (Keycloak)
-    uc1.clear_policy_store()  # clean slate ONCE — NOT between phases (the agent must see the tool's rule)
-    uc1.provision_realm_and_users(admin, TEST_REALM)  # PRB reads the role universe
-    uc1.verify_subject_mapper(
-        keycloak_url=keycloak_url, realm=TEST_REALM, user="test-user", password=scn.USER_PASSWORD
-    )
-
+    # Open the cleanup guard BEFORE the first shared-state mutation: the clean-slate steps below
+    # (Agent CR delete, Keycloak cleanup, Policy Store clear, provisioning) already mutate shared
+    # cluster state, so a failure mid-setup must still hit the ``finally`` teardown.
     try:
+        uc1.delete_agent_cr()  # clean policy slate (drop any prior run's CR)
+        uc1.cleanup_provisioned(admin, TEST_REALM)  # clean slate (Keycloak)
+        uc1.clear_policy_store()  # clean slate ONCE — NOT between phases (the agent must see the tool's rule)
+        uc1.provision_realm_and_users(admin, TEST_REALM)  # PRB reads the role universe
+        uc1.verify_subject_mapper(
+            keycloak_url=keycloak_url, realm=TEST_REALM, user="test-user", password=scn.USER_PASSWORD
+        )
+
         # Phase 1 — tool onboarding under the exclusivity policy: clean (200), persists the tool-side
         # DENY(tester -> github-tool.source-*) on SPM(github-tool).
         _onboard_via_fresh_controller(POLICY_TOOL_EXCLUSIVE, scn.TOOL_WORKLOAD, expect_conflict=False)
@@ -179,6 +182,9 @@ def test_cross_service_conflict_is_surfaced_as_422_conflict_report() -> None:
     finally:
         uc1.delete_agent_cr()  # after — drop any CR (there should be none on the raising path)
         uc1.cleanup_provisioned(admin, TEST_REALM)  # restore the pre-run Keycloak state
+        # Phase 1 persisted a tool-side deny; clear it so later integration tests don't read stale
+        # inbound rules and become order-dependent.
+        uc1.clear_policy_store()
 
     # The 422 body is the shared ConflictReport shape (same as the deterministic routes test), carrying
     # at least one cross-service conflict with a real role + scope. Structural (not id-pinned) so it is

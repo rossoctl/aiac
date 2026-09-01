@@ -94,7 +94,16 @@ class ServicePolicyBuilder:
             # passed so enrichment can resolve the typed Role/Scope of a pair whose sides came from
             # different services (a conflict may join a new rule to a stored one). Policy source is
             # read only on this path.
-            report = enrich_report(report, combined, get_policy_source().fetch())
+            #
+            # Enrichment (policy fetch + LLM explain/quote) is best-effort: if the policy source is
+            # unreadable/missing or the explain pass errors, we still raise with the STRUCTURAL
+            # report (ADR 0001: surface, never drop). Letting the error escape here would bypass the
+            # controller's PolicyConflictError handler and return a 500 instead of the required 422
+            # ConflictReport.
+            try:
+                report = enrich_report(report, combined, get_policy_source().fetch())
+            except Exception:
+                pass
             raise PolicyConflictError(report)
         # Only this build's own rules are applied; the OTHER services' rules read above are already
         # persisted and are used solely to widen detection, never re-emitted.

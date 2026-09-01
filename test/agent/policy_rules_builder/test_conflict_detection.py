@@ -69,7 +69,8 @@ def test_detection_is_order_independent():
     rules = [_allow(_TESTER, _ISSUES), _deny(_TESTER, _ISSUES), _allow(_DEV, _SOURCE)]
     forward = detect_conflicts(rules)
     reverse = detect_conflicts(list(reversed(rules)))
-    key = lambda rep: sorted((c.role.id, c.scope.id) for c in rep.conflicts)
+    def key(rep):
+        return sorted((c.role.id, c.scope.id) for c in rep.conflicts)
     assert key(forward) == key(reverse) == [("r-tester", "s-iss")]
 
 
@@ -146,6 +147,7 @@ def test_combined_detection_is_order_independent_across_sides():
     # conflict set (keyed on ids) — onboarding order / read order cannot change the outcome.
     build_rules = [_allow(_TESTER, _ISSUES)]
     applied = [_deny(_TESTER, _ISSUES), _allow(_DEV, _SOURCE)]
-    key = lambda rep: sorted((c.role.id, c.scope.id) for c in rep.conflicts)
+    def key(rep):
+        return sorted((c.role.id, c.scope.id) for c in rep.conflicts)
     assert key(detect_conflicts(build_rules + applied)) == key(detect_conflicts(applied + build_rules))
     assert key(detect_conflicts(build_rules + applied)) == [("r-tester", "s-iss")]

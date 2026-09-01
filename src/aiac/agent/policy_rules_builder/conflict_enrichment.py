@@ -55,7 +55,9 @@ def enrich_report(report: ConflictReport, rules: list[PolicyRule], policy_text: 
         result = _explain_pair(policy_text, role, scope, c.explanation)
         granting = list(result.granting_quotes)
         prohibiting = list(result.prohibiting_quotes)
-        verified = bool(granting or prohibiting) and all(_verify_quote(q, policy_text) for q in granting + prohibiting)
+        verified = bool(granting or prohibiting) and all(
+            q.strip() and _verify_quote(q, policy_text) for q in granting + prohibiting
+        )
         enriched.append(
             c.model_copy(
                 update={

@@ -265,9 +265,11 @@ def _explain(
         )
         granting = list(result.granting_quotes)
         prohibiting = list(result.prohibiting_quotes)
-        # Verified only when there is at least one quote AND every quote is a verbatim substring.
+        # Verified only when there is at least one non-empty quote AND every quote is a verbatim
+        # substring. A blank/whitespace-only quote must NOT verify (``_verify_quote("", ...)`` is
+        # trivially true), so guard it with ``q.strip()`` before the substring check.
         verified = bool(granting or prohibiting) and all(
-            _verify_quote(q, policy_text) for q in granting + prohibiting
+            q.strip() and _verify_quote(q, policy_text) for q in granting + prohibiting
         )
         explanation = result.explanation if verified else contradiction.description
         out.append(

@@ -23,7 +23,8 @@ accepted
   mapped to HTTP 422 with the structured report as the body.
 - Scope is **within one service's build** (Q13). Cross-service conflicts — rules
   written by different `build()` calls colliding only in the persisted store —
-  are a pre-existing gap left as a follow-up, not reconciled here.
+  were originally left as a follow-up gap here; they are now detected (still
+  identify-never-reconcile) — see the `#2504` addendum below.
 - The intra-pass `PolicyContradictionError` (the LLM auditor's grant∩deny within
   one pass) is a separate, disjoint mechanism and keeps failing that pass closed;
   it is not merged into the cross-pass detector, only re-shaped to the same 422
@@ -59,3 +60,24 @@ never-reconcile principle above, and Q15's *shape* unification — both
 shallow, still **no LLM** at the boundary, `quotes_verified=false`) yield one 422
 `ConflictReport` body. On any quote-validation failure the conflict is **kept**
 with `quotes_verified=false` and a description fallback — never dropped.
+
+## Addendum (#2504): cross-service conflicts are detected (closing the Q13 gap)
+
+The Q13 consequence above scoped detection to **one service's build** and left
+cross-service conflicts — an `Allow` in the current build colliding with a `Deny`
+another service already persisted (or vice versa) on the same `(role.id,
+scope.id)` — as a follow-up gap. `#2504` closes that gap **without** changing the
+principle: still identify-never-reconcile, still no precedence/merge.
+
+`ServicePolicyBuilder.build` now widens the detector's input to the **combined**
+state — this build's assembled rules **plus** the already-applied inbound rules of
+the other services that own the touched scopes, read from the Policy Store
+(`applied_rules_for_scopes`). The **same** `#2502` `(role.id, scope.id)`
+allow∩deny intersection then surfaces an overlap that a single build's own rules
+could never reveal. The store read is **read-only** and the raise still happens
+**before** `compute_and_apply`, so the atomic-by-construction guarantee holds: a
+cross-service conflict leaves persisted state untouched. Detection stays
+order-independent (keyed on ids), so tool-first vs agent-first onboarding yields
+the identical outcome, and the result is emitted in the same 422 `ConflictReport`
+shape. (The single-writer basis of "atomic-by-construction" is unchanged;
+transactional safety across *concurrent* applies remains a separate follow-up.)

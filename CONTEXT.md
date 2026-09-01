@@ -47,8 +47,8 @@ _Avoid_: using "contradiction" for this.
 **Within-batch conflict**:
 A **conflict** whose two rules are produced in one `build()` call — i.e. one
 `/apply` request. This is the Door B case: at the focus service's own-scope
-onboarding, both the scope-focal deny and the Door B deny (and any collision
-with a grant) are in hand in the same build. In scope.
+onboarding, both the scope-focal grant and the Door B deny (and any collision
+between them) are in hand in the same build. In scope.
 _Avoid_: intra-request conflict.
 
 **Cross-run conflict** (a.k.a. **cross-service conflict**):

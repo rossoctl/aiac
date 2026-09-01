@@ -1,5 +1,15 @@
 # Sub-PRD: AIAC Agent — Policy Conflict Check (pre-commit diagnostic)
 
+> **⚠️ RETIRED / SUPERSEDED (#2500, #2503).** The standalone read-only `POST /policy/check`
+> route described below **no longer exists**. `/apply` is now the **sole** policy entry point:
+> the rich conflict diagnostic (verbatim-quoted `ConflictReport`) is folded directly into the
+> apply path and returned as an HTTP 422 body when — and only when — a structural conflict is
+> detected. The `PolicyCheckRequest` model and the `check_policy_conflicts(...)` function are
+> removed; the survey orchestrator was re-homed into `policy_rules_builder/diagnostic_survey.py`
+> and reused by the apply path. See [`../../../adr/0001-identify-never-reconcile.md`](../../../adr/0001-identify-never-reconcile.md)
+> (the `#2503` addendum). This document is kept for historical context only — treat the
+> interface section below as describing a retired route, not a shipped contract.
+
 > **Depends on:** [`../aiac-agent.md`](../aiac-agent.md) — Controller, Shared Module, Configuration, Error Handling, Runtime.
 
 > **Sits next to the live PRB contradiction path.** This diagnostic reuses the Policy Rules Builder machinery specified in [`policy-rules-builder.md`](policy-rules-builder.md), but is a **separate, read-only** path. The live `/apply` → `PolicyContradictionError` → HTTP 422 contract documented there is **UNCHANGED** by this feature.
