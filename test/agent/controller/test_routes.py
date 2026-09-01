@@ -11,7 +11,13 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from aiac.agent.controller.routes import app
+from aiac.agent.policy_rules_builder.conflict_detection import (
+    PolicyConflictError,
+    detect_conflicts,
+)
+from aiac.agent.policy_rules_builder.diagnostic_models import ConflictStatus, FocalType
 from aiac.agent.policy_rules_builder.graph import (
+    Contradiction,
     PolicyContradictionError,
     PolicyRulesBuilderError,
 )
@@ -214,12 +220,22 @@ def test_policy_rules_builder_error_surfaces_422_and_skips_pce():
     pce.assert_not_called()
 
 
-def test_policy_contradiction_error_surfaces_422_and_skips_pce():
-    # A genuine grant/deny contradiction is likewise a policy finding surfaced as 422.
+def test_policy_conflict_error_surfaces_422_with_conflict_report_body_and_skips_pce():
+    # A structural PolicyConflictError (the cross-pass detector, already enriched) surfaces as 422
+    # whose BODY IS the structured ConflictReport (not a bare {"detail": ...}), and the PCE is never
+    # reached. onboard_service raises the carrier exception so the route handler is exercised.
+    tester = Role(id="r-tester", name="tester", composite=False)
+    issues = Scope(id="s-iss", name="issues")
+    report = detect_conflicts(
+        [
+            PolicyRule(role=tester, scope=issues, effect=RuleEffect.ALLOW),
+            PolicyRule(role=tester, scope=issues, effect=RuleEffect.DENY),
+        ]
+    )
     with (
         patch(
             "aiac.agent.controller.routes.onboard_service",
-            side_effect=PolicyContradictionError("focal-svc", []),
+            side_effect=PolicyConflictError(report),
         ),
         patch("aiac.agent.controller.routes.compute_and_apply") as pce,
     ):
@@ -227,6 +243,34 @@ def test_policy_contradiction_error_surfaces_422_and_skips_pce():
 
     assert resp.status_code == 422
     pce.assert_not_called()
+    body = resp.json()
+    assert body["status"] == ConflictStatus.CONFLICTS_FOUND.value
+    assert len(body["conflicts"]) == 1
+    c = body["conflicts"][0]
+    assert (c["role"]["id"], c["scope"]["id"]) == ("r-tester", "s-iss")
+    assert c["focal"]["type"] == FocalType.SCOPE.value
+
+
+def test_policy_contradiction_error_surfaces_422_conflict_report_and_skips_pce():
+    # A genuine intra-pass grant/deny contradiction (the LLM auditor) is likewise a policy finding
+    # surfaced as 422 — and mapped into the SAME ConflictReport body shape (Q15), with no LLM at the
+    # boundary (lower fidelity: no ids, quotes_verified=False, auditor description as explanation).
+    err = PolicyContradictionError(
+        "scope name=issues: the issue tracker",
+        [Contradiction(candidate_name="tester", description="granted and prohibited")],
+    )
+    with (
+        patch("aiac.agent.controller.routes.onboard_service", side_effect=err),
+        patch("aiac.agent.controller.routes.compute_and_apply") as pce,
+    ):
+        resp = client.post("/apply/service/svc-conflict")
+
+    assert resp.status_code == 422
+    pce.assert_not_called()
+    body = resp.json()
+    assert body["status"] == ConflictStatus.CONFLICTS_FOUND.value
+    assert body["conflicts"][0]["scope"]["name"] == "issues"
+    assert body["conflicts"][0]["quotes_verified"] is False
 
 
 # --------------------------------------------------------------------------- #

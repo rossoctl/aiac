@@ -28,7 +28,8 @@ from fastapi.testclient import TestClient
 
 from aiac.agent.controller.routes import app
 from aiac.agent.policy_rules_builder.conflict_detection import PolicyConflictError
-from aiac.agent.policy_rules_builder.diagnostic_models import ConflictStatus, FocalType
+from aiac.agent.policy_rules_builder.diagnostic import ExplainResult
+from aiac.agent.policy_rules_builder.diagnostic_models import ConflictKind, ConflictStatus, FocalType
 from aiac.agent.policy_rules_builder.graph import (
     AuditVerdict,
     Contradiction,
@@ -36,9 +37,9 @@ from aiac.agent.policy_rules_builder.graph import (
     RoleSelection,
     build_role_rules,
 )
+from aiac.agent.shared.focal_entities import FocalEntitySet
 from aiac.agent.uc.onboarding.policy_builder.builder import ServicePolicyBuilder
 from aiac.idp.configuration.models import Role, RoleKind, Scope, ServiceType
-from aiac.agent.shared.focal_entities import FocalEntitySet
 from aiac.policy.model.models import PolicyRule, RuleEffect
 
 client = TestClient(app)
@@ -47,6 +48,9 @@ client = TestClient(app)
 tolerant_client = TestClient(app, raise_server_exceptions=False)
 
 _BUILDER = "aiac.agent.uc.onboarding.policy_builder.builder"
+# The explain/LLM seam the enrichment pass runs through — patched here so the deterministic suite
+# never touches a live endpoint, and asserted NEVER called on a clean apply.
+_EXPLAIN_SEAM = "aiac.agent.policy_rules_builder.conflict_enrichment._explain_pair"
 
 _TESTER = Role(id="r-tester", name="tester", composite=False, kind=RoleKind.USER)
 _ISSUES = Scope(id="s-iss", name="issues")
@@ -82,9 +86,7 @@ def test_live_build_role_rules_still_raises_policy_contradiction():
     issues = Scope(id="s-iss", name="issues")
 
     with ExitStack() as stack:
-        stack.enter_context(
-            patch("aiac.agent.policy_rules_builder.graph.get_policy_source", return_value=_Source())
-        )
+        stack.enter_context(patch("aiac.agent.policy_rules_builder.graph.get_policy_source", return_value=_Source()))
         stack.enter_context(
             patch(
                 "aiac.agent.policy_rules_builder.graph._structured_call",
@@ -115,21 +117,32 @@ def test_live_build_role_rules_still_raises_policy_contradiction():
     assert [c.candidate_name for c in exc.value.contradictions] == ["issues"]
 
 
-def test_apply_service_maps_policy_contradiction_to_422_and_skips_pce():
+def test_apply_service_maps_policy_contradiction_to_422_conflict_report_and_skips_pce():
     # The Controller maps a PolicyContradictionError raised inside the onboarding handler to HTTP 422
-    # (a policy finding, not a 500), and the PCE is never reached. onboard_service is patched to raise
-    # directly so the route mapping is exercised without a cluster or the LLM.
+    # (a policy finding, not a 500), and the PCE is never reached. The 422 body is now the SAME
+    # ConflictReport shape as the structural detector (Q15) — re-shaped from the auditor's name-string
+    # contradictions with NO LLM (lower fidelity: no ids, quotes_verified=False). onboard_service is
+    # patched to raise directly so the route mapping is exercised without a cluster or the LLM.
+    err = PolicyContradictionError(
+        "scope name=issues: the issue tracker",
+        [Contradiction(candidate_name="tester", description="granted and prohibited")],
+    )
     with (
-        patch(
-            "aiac.agent.controller.routes.onboard_service",
-            side_effect=PolicyContradictionError("focal-svc", []),
-        ),
+        patch("aiac.agent.controller.routes.onboard_service", side_effect=err),
         patch("aiac.agent.controller.routes.compute_and_apply") as pce,
     ):
         resp = client.post("/apply/service/svc-conflict")
 
     assert resp.status_code == 422
     pce.assert_not_called()
+    # Body is a structured ConflictReport, not a bare {"detail": ...}.
+    body = resp.json()
+    assert body["status"] == ConflictStatus.CONFLICTS_FOUND.value
+    assert len(body["conflicts"]) == 1
+    c = body["conflicts"][0]
+    assert c["focal"]["type"] == FocalType.SCOPE.value
+    assert c["scope"]["name"] == "issues" and c["role"]["name"] == "tester"
+    assert c["quotes_verified"] is False and c["explanation"] == "granted and prohibited"
 
 
 # --- Mechanism B: cross-pass structural PolicyConflictError (#2502) --------------------------
@@ -139,6 +152,8 @@ def test_build_raises_structural_conflict_from_assembled_passes():
     # The scope-focal pass grants (tester, issues) and the Door B deny pass prohibits the SAME
     # (tester, issues): the assembled list carries both an Allow and a Deny on one pair. build()
     # must run the inline detector and RAISE PolicyConflictError — never reconcile (ADR 0001).
+    # Enrichment is stubbed to identity here (the explain seam / policy source are exercised by the
+    # dedicated enrichment test below); this pins the STRUCTURAL raise + report shape.
     with (
         patch(f"{_BUILDER}._config", return_value=MagicMock()),
         patch(f"{_BUILDER}.resolve_focal_entities", return_value=_focal_own_scope()),
@@ -150,6 +165,8 @@ def test_build_raises_structural_conflict_from_assembled_passes():
             f"{_BUILDER}.build_role_denies",
             return_value=[PolicyRule(role=_TESTER, scope=_ISSUES, effect=RuleEffect.DENY)],
         ),
+        patch(f"{_BUILDER}.get_policy_source", return_value=_Source()),
+        patch(f"{_BUILDER}.enrich_report", side_effect=lambda report, rules, text: report),
     ):
         with pytest.raises(PolicyConflictError) as exc:
             ServicePolicyBuilder.build("svc-tool", ServiceType.TOOL)
@@ -163,43 +180,120 @@ def test_build_raises_structural_conflict_from_assembled_passes():
     assert c.quotes_verified is False
 
 
-def _drive_apply_with_passes(scope_rules, deny_rules) -> MagicMock:
+def test_conflicting_build_enriches_report_with_kind_and_verbatim_quotes():
+    # On a detected conflict, build() runs the enrichment pass over the structural report: the
+    # explain seam classifies the kind and returns quotes, which the engine substring-validates
+    # against the candidate policy text. The raised report carries the enriched conflict.
+    policy = "Testers may access issues. Testers must not access issues."
+    explained = ExplainResult(
+        kind=ConflictKind.COARSE_SCOPE,
+        granting_quotes=["Testers may access issues."],
+        prohibiting_quotes=["Testers must not access issues."],
+        explanation="issues is both granted and prohibited for tester",
+    )
+    with (
+        patch(f"{_BUILDER}._config", return_value=MagicMock()),
+        patch(f"{_BUILDER}.resolve_focal_entities", return_value=_focal_own_scope()),
+        patch(
+            f"{_BUILDER}.build_scope_rules",
+            return_value=[PolicyRule(role=_TESTER, scope=_ISSUES, effect=RuleEffect.ALLOW)],
+        ),
+        patch(
+            f"{_BUILDER}.build_role_denies",
+            return_value=[PolicyRule(role=_TESTER, scope=_ISSUES, effect=RuleEffect.DENY)],
+        ),
+        patch(f"{_BUILDER}.get_policy_source", return_value=_Source(policy)),
+        patch(_EXPLAIN_SEAM, return_value=explained) as explain,
+    ):
+        with pytest.raises(PolicyConflictError) as exc:
+            ServicePolicyBuilder.build("svc-tool", ServiceType.TOOL)
+
+    explain.assert_called_once()  # exactly one explain call for the one conflicting pair
+    c = exc.value.report.conflicts[0]
+    assert c.kind is ConflictKind.COARSE_SCOPE
+    assert c.granting_quotes == ["Testers may access issues."]
+    assert c.prohibiting_quotes == ["Testers must not access issues."]
+    assert c.quotes_verified is True
+    assert c.explanation == "issues is both granted and prohibited for tester"
+
+
+def test_conflicting_build_falls_back_when_quotes_not_verbatim():
+    # A non-verbatim quote (not a substring of the policy) fails validation: the conflict is KEPT
+    # with quotes_verified=False and the explanation falls back to the structural synthesized one.
+    policy = "Testers may access issues. Testers must not access issues."
+    explained = ExplainResult(
+        kind=ConflictKind.DIRECT,
+        granting_quotes=["Testers are allowed full access"],  # paraphrase — NOT in the policy
+        prohibiting_quotes=[],
+        explanation="fabricated wording",
+    )
+    with (
+        patch(f"{_BUILDER}._config", return_value=MagicMock()),
+        patch(f"{_BUILDER}.resolve_focal_entities", return_value=_focal_own_scope()),
+        patch(
+            f"{_BUILDER}.build_scope_rules",
+            return_value=[PolicyRule(role=_TESTER, scope=_ISSUES, effect=RuleEffect.ALLOW)],
+        ),
+        patch(
+            f"{_BUILDER}.build_role_denies",
+            return_value=[PolicyRule(role=_TESTER, scope=_ISSUES, effect=RuleEffect.DENY)],
+        ),
+        patch(f"{_BUILDER}.get_policy_source", return_value=_Source(policy)),
+        patch(_EXPLAIN_SEAM, return_value=explained),
+    ):
+        with pytest.raises(PolicyConflictError) as exc:
+            ServicePolicyBuilder.build("svc-tool", ServiceType.TOOL)
+
+    c = exc.value.report.conflicts[0]
+    assert c.quotes_verified is False
+    assert c.explanation != "fabricated wording"  # fell back to the structural description
+    assert "tester" in c.explanation and "issues" in c.explanation
+
+
+def _drive_apply_with_passes(scope_rules, deny_rules) -> tuple[MagicMock, MagicMock]:
     """Drive ``POST /apply/service/{id}`` through the REAL onboarding sequence (provision graph
     stubbed to a Tool, the two PRB passes stubbed to the given rule lists, LLM/cluster untouched)
-    and return the patched ``compute_and_apply`` mock so the caller can assert on the PCE seam."""
+    and return ``(compute_and_apply, explain_seam)`` mocks so the caller can assert on the PCE seam
+    AND that the explain/LLM enrichment seam fired only when a conflict was detected. The policy
+    source is stubbed and the explain seam returns a fixed ExplainResult, so no live endpoint or
+    on-disk policy file is touched even on the conflicting path."""
     provision = MagicMock()
     provision.invoke.return_value = {"service_type": ServiceType.TOOL}
+    explained = ExplainResult(kind=ConflictKind.DIRECT, granting_quotes=[], prohibiting_quotes=[])
     with (
-        patch(
-            "aiac.agent.uc.onboarding.orchestrator.build_provision_graph", return_value=provision
-        ),
+        patch("aiac.agent.uc.onboarding.orchestrator.build_provision_graph", return_value=provision),
         patch(f"{_BUILDER}._config", return_value=MagicMock()),
         patch(f"{_BUILDER}.resolve_focal_entities", return_value=_focal_own_scope()),
         patch(f"{_BUILDER}.build_scope_rules", return_value=scope_rules),
         patch(f"{_BUILDER}.build_role_denies", return_value=deny_rules),
+        patch(f"{_BUILDER}.get_policy_source", return_value=_Source()),
+        patch(_EXPLAIN_SEAM, return_value=explained) as explain,
         patch("aiac.agent.controller.routes.compute_and_apply") as pce,
     ):
         tolerant_client.post("/apply/service/svc-tool")
-    return pce
+    return pce, explain
 
 
 def test_conflict_raises_before_compute_and_apply_is_atomic():
     # ATOMIC PROOF: a conflicting build (Allow + Deny on the same pair) short-circuits inside
     # build() — the PCE (the persistence seam) is provably NEVER reached, so a conflict leaves
     # persisted state untouched. This exercises the real detect_conflicts, not a patched raise.
-    pce = _drive_apply_with_passes(
+    pce, explain = _drive_apply_with_passes(
         scope_rules=[PolicyRule(role=_TESTER, scope=_ISSUES, effect=RuleEffect.ALLOW)],
         deny_rules=[PolicyRule(role=_TESTER, scope=_ISSUES, effect=RuleEffect.DENY)],
     )
     pce.assert_not_called()
+    explain.assert_called_once()  # enrichment fired for the one conflicting pair
 
 
-def test_clean_build_reaches_compute_and_apply():
+def test_clean_build_reaches_compute_and_apply_without_touching_the_llm_seam():
     # Control: the SAME path with no allow∩deny overlap (Door B contributes no deny) is clean —
-    # the build returns and the PCE IS reached. Proves the raise is conditional on a real conflict
-    # and that clean policies still apply.
-    pce = _drive_apply_with_passes(
+    # the build returns and the PCE IS reached. Proves the raise is conditional on a real conflict,
+    # that clean policies still apply, AND that the explain/LLM enrichment seam is NEVER called on a
+    # clean apply (enrichment is gated strictly behind a detected structural conflict).
+    pce, explain = _drive_apply_with_passes(
         scope_rules=[PolicyRule(role=_TESTER, scope=_ISSUES, effect=RuleEffect.ALLOW)],
         deny_rules=[],
     )
     pce.assert_called_once()
+    explain.assert_not_called()

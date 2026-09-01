@@ -60,14 +60,56 @@ def detect_conflicts(rules: list[PolicyRule]) -> ConflictReport:
         key = (rule.role.id, rule.scope.id)
         (deny if rule.effect is RuleEffect.DENY else allow)[key] = rule
 
-    conflicts = [
-        _to_conflict(allow[key]) for key in sorted(allow.keys() & deny.keys())
-    ]
+    conflicts = [_to_conflict(allow[key]) for key in sorted(allow.keys() & deny.keys())]
     # evaluated_count = distinct (role, scope) pairs examined; non-zero when any pair exists so a
     # clean list derives NO_CONFLICT (not INCOMPLETE). The raise decision only reads ``conflicts``.
-    return ConflictReport.from_survey(
-        conflicts, [], evaluated_count=len(allow.keys() | deny.keys())
-    )
+    return ConflictReport.from_survey(conflicts, [], evaluated_count=len(allow.keys() | deny.keys()))
+
+
+def report_from_contradictions(focal: str, contradictions) -> ConflictReport:
+    """Map an intra-pass ``PolicyContradictionError`` (the LLM auditor, ``graph.py``) into the SAME
+    :class:`ConflictReport` shape the structural detector produces, so the 422 boundary has ONE
+    report shape for both mechanisms (settled design Q15). **No LLM** — a shallow, deterministic
+    re-shape at the handler.
+
+    Lower-fidelity by nature: an auditor :class:`Contradiction` carries only name-strings (no ids,
+    no quotes, no kind). So each colliding pair gets empty ids, ``kind=DIRECT``, empty quotes with
+    ``quotes_verified=False``, and the auditor ``description`` as the ``explanation``. ``focal`` is
+    parsed from the raise's focal string (``_role_focal`` / ``_scope_focal`` prefix) to recover the
+    axis and name; the candidate name goes on the opposite side."""
+    if focal.startswith("role name="):
+        focal_type = FocalType.ROLE
+        focal_name = focal[len("role name=") :].split(":", 1)[0].strip()
+    elif focal.startswith("scope name="):
+        focal_type = FocalType.SCOPE
+        focal_name = focal[len("scope name=") :].split(":", 1)[0].strip()
+    else:
+        # Unrecognized focal string (e.g. a bare service token in a degenerate raise): anchor on
+        # the SCOPE side (Q16) and use the whole string as the focal name.
+        focal_type = FocalType.SCOPE
+        focal_name = focal
+    focal_ref = FocalRef(name=focal_name, id="", type=focal_type)
+
+    conflicts: list[Conflict] = []
+    for c in contradictions:
+        candidate = EntityRef(name=c.candidate_name, id="")
+        focal_entity = EntityRef(name=focal_name, id="")
+        role, scope = (focal_entity, candidate) if focal_type is FocalType.ROLE else (candidate, focal_entity)
+        conflicts.append(
+            Conflict(
+                focal=focal_ref,
+                role=role,
+                scope=scope,
+                kind=ConflictKind.DIRECT,
+                granting_quotes=[],
+                prohibiting_quotes=[],
+                explanation=c.description,
+                quotes_verified=False,
+            )
+        )
+    # evaluated_count=1: the focal entity WAS evaluated (the auditor ruled on it), so a non-empty
+    # mapping derives CONFLICTS_FOUND (conflicts non-empty wins the precedence regardless).
+    return ConflictReport.from_survey(conflicts, [], evaluated_count=1)
 
 
 def _to_conflict(rule: PolicyRule) -> Conflict:

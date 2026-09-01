@@ -18,6 +18,10 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 
 from aiac.agent.eventbus.consumer import lifespan
+from aiac.agent.policy_rules_builder.conflict_detection import (
+    PolicyConflictError,
+    report_from_contradictions,
+)
 from aiac.agent.policy_rules_builder.graph import (
     PolicyContradictionError,
     PolicyRulesBuilderError,
@@ -34,15 +38,34 @@ app = FastAPI(lifespan=lifespan)
 
 
 # The Policy Rules Builder raises on a policy-input problem, not a server fault: the auditor
-# rejects the proposed rules after exhausting its retry budget (``PolicyRulesBuilderError``) or
-# finds a genuine grant/deny contradiction (``PolicyContradictionError``). Both are the caller's
-# policy prose failing to lift, so they surface as HTTP 422 (mirroring the contract documented in
-# the PRB spec + pdp-policy-writer-opa.md) rather than escaping as an uncaught 500. The PCE is
-# never reached — these fire during rule construction inside the use-case handlers.
+# rejects the proposed rules after exhausting its retry budget (``PolicyRulesBuilderError``). That
+# is a builder failure with no structured finding, so it surfaces as HTTP 422 with a bare
+# ``{"detail": ...}`` body rather than escaping as an uncaught 500. The PCE is never reached — it
+# fires during rule construction inside the use-case handlers.
 @app.exception_handler(PolicyRulesBuilderError)
-@app.exception_handler(PolicyContradictionError)
 def _policy_input_error(_request: Request, exc: Exception) -> JSONResponse:
     return JSONResponse(status_code=422, content={"detail": str(exc)})
+
+
+# The two grant/deny conflict mechanisms both surface as a 422 whose body IS a structured
+# ``ConflictReport`` (settled design Q15 — one report shape at the boundary):
+#   * ``PolicyConflictError`` (cross-pass structural detector, already enriched with verbatim quotes
+#     + classified kind before the raise) carries a rich ``ConflictReport`` directly.
+#   * ``PolicyContradictionError`` (intra-pass LLM auditor) carries only name-strings, so it is
+#     re-shaped into the SAME ``ConflictReport`` (lower-fidelity: no ids/quotes, ``kind=DIRECT``,
+#     ``quotes_verified=False``) with ``report_from_contradictions`` — no LLM at the boundary.
+# Both are policy findings, not server faults, and both fire before the PCE is reached
+# (atomic-by-construction: nothing is persisted).
+@app.exception_handler(PolicyConflictError)
+def _policy_conflict_error(_request: Request, exc: PolicyConflictError) -> JSONResponse:
+    return JSONResponse(status_code=422, content=exc.report.model_dump(mode="json"))
+
+
+@app.exception_handler(PolicyContradictionError)
+def _policy_contradiction_error(_request: Request, exc: PolicyContradictionError) -> JSONResponse:
+    report = report_from_contradictions(exc.focal, exc.contradictions)
+    return JSONResponse(status_code=422, content=report.model_dump(mode="json"))
+
 
 # Live on-ramp for the per-onboarding default_effect. The PCE-threading side (#146) exposes
 # default_effect as an onboard_service parameter; the integration harness (#149) requests a

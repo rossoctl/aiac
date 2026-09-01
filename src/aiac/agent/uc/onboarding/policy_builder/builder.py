@@ -30,7 +30,9 @@ before.
 """
 
 from aiac.agent.policy_rules_builder.conflict_detection import PolicyConflictError, detect_conflicts
+from aiac.agent.policy_rules_builder.conflict_enrichment import enrich_report
 from aiac.agent.policy_rules_builder.graph import build_role_denies, build_role_rules, build_scope_rules
+from aiac.agent.policy_rules_builder.policy_source import get_policy_source
 from aiac.agent.shared.focal_entities import resolve_focal_entities
 from aiac.agent.shared.roles import flatten_role
 from aiac.idp.configuration.api import Configuration
@@ -75,5 +77,11 @@ class ServicePolicyBuilder:
         # agent-first onboarding yields the identical outcome.
         report = detect_conflicts(rules)
         if report.conflicts:
+            # A conflict was found: NOW (and only now) run the LLM explain/quote survey over the
+            # exact pairs detect_conflicts surfaced -- classifying each kind and extracting verbatim,
+            # substring-validated quotes from the candidate policy text (#2503). Gating the LLM
+            # behind report.conflicts keeps a clean apply fully deterministic and LLM-free (the
+            # explain seam never fires). The policy source is read only on this path.
+            report = enrich_report(report, rules, get_policy_source().fetch())
             raise PolicyConflictError(report)
         return rules
