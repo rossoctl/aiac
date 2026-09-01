@@ -20,7 +20,7 @@ from aiac.agent.policy_rules_builder.graph import (
     RoleSelection,
     ScopeSelection,
     _build_llm,
-    _build_llm,
+    build_role_denies,
     build_role_rules,
     build_scope_rules,
 )
@@ -747,3 +747,99 @@ def test_policy_block_labels_baseline_grants_only_and_scenario():
     assert "SCENARIO POLICY" in human
     # The scenario text sits under the SCENARIO label, after the baseline.
     assert human.index("BASELINE POLICY") < human.index("SCENARIO POLICY") < human.index("SCEN-TEXT")
+
+
+# --------------------------------------------------------------------------- #
+# Door B — user-role-focal DENY-only pass (build_role_denies). Same graph as    #
+# build_role_rules (propose/precheck/audit), but the build node keeps ONLY the  #
+# DENY effects: the scope-focal pass stays the single grant authority, so Door  #
+# B never emits an ALLOW. These slices mirror the exclusivity/prohibition/       #
+# permissive fixtures above but assert the deny-only projection.                #
+# --------------------------------------------------------------------------- #
+def test_door_b_exclusivity_yields_complement_denies_only():
+    # "Testers may access only issues" -> grant issues (exclusive) over the focus's own
+    # scopes {issues, source-read, source-write}; Door B emits the DERIVED complement DENY on
+    # every other own scope and DROPS the ALLOW(issues) that the scope-focal pass owns.
+    tester = _role("r-tst", "tester")
+    issues = _scope("s-iss", "issues")
+    source_read = _scope("s-sr", "source-read")
+    source_write = _scope("s-sw", "source-write")
+
+    with ExitStack() as stack:
+        stack.enter_context(patch("aiac.agent.policy_rules_builder.graph.get_policy_source", return_value=_Source()))
+        stack.enter_context(
+            patch(
+                "aiac.agent.policy_rules_builder.graph._structured_call",
+                side_effect=[
+                    RoleSelection(
+                        granted_scope_names=["issues"],
+                        denied_scope_names=[],
+                        grant_is_exclusive=True,
+                        reasoning="testers may access only issues",
+                    ),
+                    AuditVerdict(approved=True),
+                ],
+            )
+        )
+        rules = build_role_denies(tester, [issues, source_read, source_write])
+
+    # DENY-only: no ALLOW(issues); the complement (source-read, source-write) in candidate order.
+    assert rules == [
+        PolicyRule(role=tester, scope=source_read, effect=RuleEffect.DENY),
+        PolicyRule(role=tester, scope=source_write, effect=RuleEffect.DENY),
+    ]
+
+
+def test_door_b_permissive_policy_is_noop():
+    # A non-exclusive grant with no explicit prohibition imposes nothing -> Door B returns [].
+    tester = _role("r-tst", "tester")
+    issues = _scope("s-iss", "issues")
+    source = _scope("s-src", "source")
+
+    with ExitStack() as stack:
+        stack.enter_context(patch("aiac.agent.policy_rules_builder.graph.get_policy_source", return_value=_Source()))
+        stack.enter_context(
+            patch(
+                "aiac.agent.policy_rules_builder.graph._structured_call",
+                side_effect=[
+                    RoleSelection(
+                        granted_scope_names=["issues"],
+                        denied_scope_names=[],
+                        grant_is_exclusive=False,
+                        reasoning="testers may access issues",
+                    ),
+                    AuditVerdict(approved=True),
+                ],
+            )
+        )
+        rules = build_role_denies(tester, [issues, source])
+
+    assert rules == []
+
+
+def test_door_b_explicit_prohibition_deny_only():
+    # An explicit prohibition ("DevOps may not access source") emits the DENY and, being
+    # deny-only, contributes no ALLOW even if the proposer also named a grant.
+    devops = _role("r-ops", "devops")
+    source = _scope("s-src", "source")
+    issues = _scope("s-iss", "issues")
+
+    with ExitStack() as stack:
+        stack.enter_context(patch("aiac.agent.policy_rules_builder.graph.get_policy_source", return_value=_Source()))
+        stack.enter_context(
+            patch(
+                "aiac.agent.policy_rules_builder.graph._structured_call",
+                side_effect=[
+                    RoleSelection(
+                        granted_scope_names=["issues"],
+                        denied_scope_names=["source"],
+                        grant_is_exclusive=False,
+                        reasoning="devops may not access source",
+                    ),
+                    AuditVerdict(approved=True),
+                ],
+            )
+        )
+        rules = build_role_denies(devops, [source, issues])
+
+    assert rules == [PolicyRule(role=devops, scope=source, effect=RuleEffect.DENY)]

@@ -29,11 +29,11 @@ the exact same entity set. This module keeps only the fan-out loop over that set
 before.
 """
 
-from aiac.agent.policy_rules_builder.graph import build_role_rules, build_scope_rules
+from aiac.agent.policy_rules_builder.graph import build_role_denies, build_role_rules, build_scope_rules
 from aiac.agent.shared.focal_entities import resolve_focal_entities
 from aiac.agent.shared.roles import flatten_role
 from aiac.idp.configuration.api import Configuration
-from aiac.idp.configuration.models import ServiceType
+from aiac.idp.configuration.models import RoleKind, ServiceType
 from aiac.policy.model.models import PolicyRule
 
 
@@ -51,6 +51,17 @@ class ServicePolicyBuilder:
         rules: list[PolicyRule] = []
         for scope in focal.own_scopes:
             rules.extend(build_scope_rules(focal.candidate_roles, scope))
+        # Door B -- user-role-focal DENY-only pass at the focus's OWN-scope onboarding, alongside
+        # the scope-focal pass above. Fan the kind=User subset of the (already flattened+deduped)
+        # candidate roles over the focus's own scopes to surface each user role's exclusivity
+        # ("Testers may access only issues") as the DENY rules the scope-focal pass structurally
+        # cannot express. Deny-only: the scope-focal pass stays the single grant authority. Placing
+        # it here -- own scopes always exist at the service's own onboarding -- keeps it
+        # order-independent (tool-first vs agent-first yields identical denies), and produces both
+        # the scope-focal (role, own-scope) grant and the Door B (role, own-scope) prohibition in
+        # the same build.
+        for user_role in (r for r in focal.candidate_roles if r.kind is RoleKind.USER):
+            rules.extend(build_role_denies(user_role, focal.own_scopes))
         if service_type is ServiceType.AGENT:
             for own_role in focal.own_roles:
                 for role in flatten_role(own_role):

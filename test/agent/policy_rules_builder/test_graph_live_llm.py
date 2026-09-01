@@ -32,7 +32,7 @@ from unittest.mock import patch
 
 import pytest
 
-from aiac.agent.policy_rules_builder.graph import build_role_rules, build_scope_rules
+from aiac.agent.policy_rules_builder.graph import build_role_denies, build_role_rules, build_scope_rules
 from aiac.idp.configuration.models import Role, Scope
 from aiac.policy.model.models import PolicyRule, RuleEffect
 from test.integration.launcher import require_env_or_skip
@@ -76,6 +76,13 @@ def _role_rules(policy: str, role: Role, scopes: list[Scope]) -> list[PolicyRule
     """Run build_role_rules against the real LLM with `policy` as the scenario text."""
     with patch("aiac.agent.policy_rules_builder.graph.get_policy_source", return_value=_Source(policy)):
         return build_role_rules(role, scopes)
+
+
+def _role_denies(policy: str, role: Role, scopes: list[Scope]) -> list[PolicyRule]:
+    """Run the Door B deny-only pass (build_role_denies) against the real LLM with `policy` as
+    the scenario text — the user-role-focal DENY-only projection of the role-focal graph."""
+    with patch("aiac.agent.policy_rules_builder.graph.get_policy_source", return_value=_Source(policy)):
+        return build_role_denies(role, scopes)
 
 
 def _scope_rules(policy: str, roles: list[Role], scope: Scope) -> list[PolicyRule]:
@@ -206,4 +213,31 @@ def test_exclusivity_derives_complement():
         ("source", ALLOW),
         ("issues", DENY),
         ("deploy", DENY),
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Slice 6 — Door B (build_role_denies): the user-role-focal DENY-only pass over  #
+# the focus's OWN scopes. Real "Testers may access only issues" prose closes the #
+# tester's set to issues, so the pass derives a DENY on every OTHER own scope    #
+# (source-read, source-write) and — being deny-only — emits NO ALLOW on issues   #
+# (the scope-focal pass owns that grant). This is the exclusivity-complement      #
+# prohibition the scope-focal pass structurally cannot express.                 #
+# --------------------------------------------------------------------------- #
+def test_door_b_exclusivity_complement_denies_only():
+    tester = _role(
+        "r-tst", "tester", "A QA tester who works in the issue tracker, not in the source repository."
+    )
+    issues = _scope("s-iss", "issues", "Access the issue tracker.")
+    source_read = _scope("s-sr", "source-read", "Read source code from the repository.")
+    source_write = _scope("s-sw", "source-write", "Write and modify source code in the repository.")
+
+    policy = "Testers may access only issues; they may not access source."
+
+    rules = _role_denies(policy, tester, [issues, source_read, source_write])
+
+    # DENY-only: the exclusivity complement over the focus's own scopes, no ALLOW(issues).
+    assert _scope_effects(rules) == {
+        ("source-read", DENY),
+        ("source-write", DENY),
     }
