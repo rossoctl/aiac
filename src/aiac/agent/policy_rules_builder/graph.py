@@ -223,12 +223,21 @@ def _route(state: _PRBWorking) -> str:
     return "approved" if state["approved"] else "rejected"
 
 
+# Focal-string format contract. The auditor raise carries the focal entity as a plain string
+# built here; ``conflict_detection.report_from_contradictions`` parses it back to recover the axis
+# and name. These prefixes are the single source of truth for both sides -- the producer here and
+# the consumer there import the SAME constants, so the coupling is explicit and a format change
+# cannot silently drift the parser into its SCOPE fallback.
+ROLE_FOCAL_PREFIX = "role name="
+SCOPE_FOCAL_PREFIX = "scope name="
+
+
 def _role_focal(r: Role) -> str:
-    return f"role name={r.name}: {r.description or ''}"
+    return f"{ROLE_FOCAL_PREFIX}{r.name}: {r.description or ''}"
 
 
 def _scope_focal(s: Scope) -> str:
-    return f"scope name={s.name}: {s.description or ''}"
+    return f"{SCOPE_FOCAL_PREFIX}{s.name}: {s.description or ''}"
 
 
 def _scope_cands(ss: list[Scope]) -> str:

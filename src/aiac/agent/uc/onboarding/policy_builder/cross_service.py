@@ -20,8 +20,14 @@ It never merges, dedupes, or picks a winner (ADR 0001 — *identify, never recon
 the builder still raises **before** ``compute_and_apply``.
 """
 
+import logging
+
+from fastapi import HTTPException
+
 from aiac.policy.model.models import PolicyRule
 from aiac.policy.model_store.library.api import get_service_policy
+
+logger = logging.getLogger(__name__)
 
 
 def applied_rules_for_scopes(rules: list[PolicyRule]) -> list[PolicyRule]:
@@ -43,7 +49,23 @@ def applied_rules_for_scopes(rules: list[PolicyRule]) -> list[PolicyRule]:
     owners = sorted({rule.scope.serviceId for rule in rules if rule.scope.serviceId})
     applied: list[PolicyRule] = []
     for owner in owners:
-        spm = get_service_policy(owner)
+        try:
+            spm = get_service_policy(owner)
+        except Exception as exc:
+            # Fail CLOSED, never best-effort. A store-read failure (network/auth/malformed row;
+            # a genuine 404 is already absorbed as a fresh empty SPM inside get_service_policy)
+            # means we are BLIND to this owner's already-applied rules. Silently treating that as
+            # "no other services applied" would suppress cross-service detection and let a real
+            # ALLOW∩DENY overlap persist -- a false-negative that defeats #2504's whole purpose.
+            # So we abort the apply instead. An unreachable Policy Store is a dependency fault, not
+            # a policy-input problem, so it surfaces as 502 (mirrors resolve_focal_entities' IdP
+            # boundary) rather than the 422 ConflictReport reserved for genuine conflicts, and never
+            # as an unhandled 500.
+            logger.warning("cross-service store read failed for owner %s; aborting apply (fail-closed)", owner)
+            raise HTTPException(
+                status_code=502,
+                detail=f"policy store unreachable while reading cross-service rules for {owner!r}: {exc}",
+            ) from exc
         applied.extend(spm.inbound_allow_rules)
         applied.extend(spm.inbound_deny_rules)
     return applied

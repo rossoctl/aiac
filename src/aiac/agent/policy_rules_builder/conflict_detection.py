@@ -26,6 +26,7 @@ from .diagnostic_models import (
     FocalRef,
     FocalType,
 )
+from .graph import ROLE_FOCAL_PREFIX, SCOPE_FOCAL_PREFIX
 
 
 class PolicyConflictError(Exception):
@@ -77,12 +78,14 @@ def report_from_contradictions(focal: str, contradictions) -> ConflictReport:
     ``quotes_verified=False``, and the auditor ``description`` as the ``explanation``. ``focal`` is
     parsed from the raise's focal string (``_role_focal`` / ``_scope_focal`` prefix) to recover the
     axis and name; the candidate name goes on the opposite side."""
-    if focal.startswith("role name="):
+    # Prefixes are imported from graph (the producer of this string) so the parse cannot silently
+    # drift from ``_role_focal`` / ``_scope_focal`` into the SCOPE fallback if the format changes.
+    if focal.startswith(ROLE_FOCAL_PREFIX):
         focal_type = FocalType.ROLE
-        focal_name = focal[len("role name=") :].split(":", 1)[0].strip()
-    elif focal.startswith("scope name="):
+        focal_name = focal[len(ROLE_FOCAL_PREFIX) :].split(":", 1)[0].strip()
+    elif focal.startswith(SCOPE_FOCAL_PREFIX):
         focal_type = FocalType.SCOPE
-        focal_name = focal[len("scope name=") :].split(":", 1)[0].strip()
+        focal_name = focal[len(SCOPE_FOCAL_PREFIX) :].split(":", 1)[0].strip()
     else:
         # Unrecognized focal string (e.g. a bare service token in a degenerate raise): anchor on
         # the SCOPE side (Q16) and use the whole string as the focal name.
