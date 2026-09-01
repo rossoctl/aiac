@@ -13,6 +13,9 @@ PRB stays store-free (``test_isolation``) — this test mirrors that source loca
 
 from unittest.mock import patch
 
+import pytest
+from fastapi import HTTPException
+
 from aiac.agent.uc.onboarding.policy_builder.cross_service import applied_rules_for_scopes
 from aiac.idp.configuration.models import Role, Scope
 from aiac.policy.model.models import PolicyRule, RuleEffect, ServicePolicyModel, ServiceType
@@ -92,3 +95,26 @@ def test_empty_rules_reads_nothing():
     with patch(f"{_CROSS}.get_service_policy") as get:
         assert applied_rules_for_scopes([]) == []
     get.assert_not_called()
+
+
+def test_store_read_failure_aborts_502_without_leaking_exception(caplog):
+    # A store-read failure fails CLOSED as 502 (never best-effort), but must NOT echo the raw
+    # exception into the client-facing detail (CWE-209): a store error can carry an internal URL,
+    # host, or credential fragment. The sensitive text is logged server-side only; the HTTP body
+    # is a stable, generic string.
+    secret = "postgres://admin:s3cr3t@internal-db.svc:5432 connection refused"
+    with patch(f"{_CROSS}.get_service_policy", side_effect=RuntimeError(secret)):
+        with caplog.at_level("WARNING"):
+            with pytest.raises(HTTPException) as ei:
+                applied_rules_for_scopes([_allow(_TESTER, _ISSUES)])
+
+    assert ei.value.status_code == 502
+    # Client-facing detail is stable and carries none of the exception / owner text.
+    assert secret not in str(ei.value.detail)
+    assert "s3cr3t" not in str(ei.value.detail)
+    assert "svc-tool" not in str(ei.value.detail)
+    assert ei.value.detail == "policy store unreachable while resolving cross-service rules"
+    # The cause is preserved for the server-side traceback (chained via ``from exc``).
+    assert isinstance(ei.value.__cause__, RuntimeError)
+    # And the sensitive detail IS captured server-side (exc_info logging), where operators need it.
+    assert secret in caplog.text

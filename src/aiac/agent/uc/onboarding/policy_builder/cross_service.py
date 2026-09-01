@@ -61,10 +61,17 @@ def applied_rules_for_scopes(rules: list[PolicyRule]) -> list[PolicyRule]:
             # a policy-input problem, so it surfaces as 502 (mirrors resolve_focal_entities' IdP
             # boundary) rather than the 422 ConflictReport reserved for genuine conflicts, and never
             # as an unhandled 500.
-            logger.warning("cross-service store read failed for owner %s; aborting apply (fail-closed)", owner)
+            # The exception (and the owner id) are logged server-side only. The client-facing 502
+            # detail is a STABLE, generic string with no ``exc`` text and no id -- a store error can
+            # carry an internal URL, host, or credential fragment, so echoing it into the HTTP body
+            # would be an information-disclosure leak (CWE-209). ``from exc`` keeps the cause in the
+            # server-side traceback without surfacing it to the caller.
+            logger.warning(
+                "cross-service store read failed for owner %s; aborting apply (fail-closed)", owner, exc_info=True
+            )
             raise HTTPException(
                 status_code=502,
-                detail=f"policy store unreachable while reading cross-service rules for {owner!r}: {exc}",
+                detail="policy store unreachable while resolving cross-service rules",
             ) from exc
         applied.extend(spm.inbound_allow_rules)
         applied.extend(spm.inbound_deny_rules)
