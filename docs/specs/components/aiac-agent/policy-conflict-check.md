@@ -3,8 +3,10 @@
 > **⚠️ RETIRED / SUPERSEDED (#2500, #2503).** The standalone read-only `POST /policy/check`
 > route described below **no longer exists**. `/apply` is now the **sole** policy entry point:
 > the rich conflict diagnostic (verbatim-quoted `ConflictReport`) is folded directly into the
-> apply path and returned as an HTTP 422 body when — and only when — a structural conflict is
-> detected. The `PolicyCheckRequest` model and the `check_policy_conflicts(...)` function are
+> apply path and returned as an HTTP 422 body on a genuine grant/deny conflict — whether a
+> cross-pass structural conflict (`PolicyConflictError`, quote-enriched) or the intra-pass LLM
+> auditor's `PolicyContradictionError` (re-shaped into the **same** `ConflictReport`). The
+> `PolicyCheckRequest` model and the `check_policy_conflicts(...)` function are
 > removed; the survey orchestrator was re-homed into `policy_rules_builder/diagnostic_survey.py`
 > and reused by the apply path. See [`../../../adr/0001-identify-never-reconcile.md`](../../../adr/0001-identify-never-reconcile.md)
 > (the `#2503` addendum). This document is kept for historical context only — treat the
