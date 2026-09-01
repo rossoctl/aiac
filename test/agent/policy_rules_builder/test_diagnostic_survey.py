@@ -31,7 +31,7 @@ from aiac.agent.policy_rules_builder.graph import (
     ScopeSelection,
 )
 from aiac.agent.shared import focal_entities
-from aiac.agent.uc.policy_check.check import check_policy_conflicts
+from aiac.agent.policy_rules_builder.diagnostic_survey import check_policy_conflicts
 from aiac.idp.configuration.models import RoleKind, Scope, Service, ServiceType, Subject
 from aiac.idp.configuration.models import Role as RoleModel
 

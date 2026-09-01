@@ -5,7 +5,8 @@ suite and under ``-m "not integration"``. Feature #154's design rests on D1/D8 -
 diagnostic is a *separate* assembly and the safety-critical live ``/apply`` graph stays
 byte-for-byte unchanged, still **raising** ``PolicyContradictionError`` -> HTTP 422 on a genuine
 grant/deny contradiction (the diagnostic *records* instead). This guard pins both ends of that live
-contract, independent of the #159 ``/policy/check`` route:
+contract; it stays valid after ``/policy/check`` was retired (#2500) and the diagnostic engine was
+re-homed as an internal library — the live ``/apply`` raise path is unaffected by that move:
 
   1. **Builder level** -- with ``graph._structured_call`` patched so the auditor returns a genuine
      ``Contradiction``, ``build_role_rules`` RAISES ``PolicyContradictionError`` and returns no rule

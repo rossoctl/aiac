@@ -1,4 +1,9 @@
-"""Policy Conflict Check survey use-case (feature #154, task #158).
+"""Policy Conflict Check survey orchestrator (feature #154, task #158).
+
+Re-homed (#2500) from the retired ``uc/policy_check`` use-case into the diagnostic library, next
+to the per-entity engine it drives (``diagnostic.py``). It is now a plain internal library
+function with no dependency on any route — the standalone ``/policy/check`` route was retired so
+``/apply`` is the sole policy entry point; a later ticket folds this orchestrator into ``/apply``.
 
 A **sequential, read-only** survey that runs EVERY focal entity of a target service through the
 Conflict-Check diagnostic graph (#157) to completion, accumulates every run's ``conflicts`` +

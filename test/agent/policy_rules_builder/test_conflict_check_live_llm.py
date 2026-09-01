@@ -35,7 +35,7 @@ import pytest
 from aiac.agent.policy_rules_builder.diagnostic import _verify_quote
 from aiac.agent.policy_rules_builder.diagnostic_models import ConflictStatus
 from aiac.idp.configuration.models import Role, Scope, Service, ServiceType, Subject
-from aiac.agent.uc.policy_check.check import check_policy_conflicts
+from aiac.agent.policy_rules_builder.diagnostic_survey import check_policy_conflicts
 from test.integration.launcher import require_env_or_skip
 
 pytestmark = [pytest.mark.integration, pytest.mark.llm]
