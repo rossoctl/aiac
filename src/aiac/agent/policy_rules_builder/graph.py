@@ -402,6 +402,8 @@ def build_role_rules(role: Role, scopes: list[Scope]) -> list[PolicyRule]:
     state: RoleRulesState = {
         "role": role,
         "scopes": scopes,
+        # placeholder: the graph's ``fetch`` node (START -> fetch -> propose) populates
+        # this via get_policy_source() before ``propose`` reads it -- do not fetch here.
         "policy_text": "",
         "selected_names": [],
         "denied_names": [],
@@ -428,6 +430,8 @@ def build_role_denies(role: Role, scopes: list[Scope]) -> list[PolicyRule]:
     state: RoleRulesState = {
         "role": role,
         "scopes": scopes,
+        # placeholder: the graph's ``fetch`` node (START -> fetch -> propose) populates
+        # this via get_policy_source() before ``propose`` reads it -- do not fetch here.
         "policy_text": "",
         "selected_names": [],
         "denied_names": [],
@@ -446,6 +450,8 @@ def build_scope_rules(roles: list[Role], scope: Scope) -> list[PolicyRule]:
     state: ScopeRulesState = {
         "roles": roles,
         "scope": scope,
+        # placeholder: the graph's ``fetch`` node (START -> fetch -> propose) populates
+        # this via get_policy_source() before ``propose`` reads it -- do not fetch here.
         "policy_text": "",
         "selected_names": [],
         "denied_names": [],

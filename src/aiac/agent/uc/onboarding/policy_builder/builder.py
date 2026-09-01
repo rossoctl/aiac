@@ -29,6 +29,8 @@ the exact same entity set. This module keeps only the fan-out loop over that set
 before.
 """
 
+import logging
+
 from aiac.agent.policy_rules_builder.conflict_detection import PolicyConflictError, detect_conflicts
 from aiac.agent.policy_rules_builder.conflict_enrichment import enrich_report
 from aiac.agent.policy_rules_builder.graph import build_role_denies, build_role_rules, build_scope_rules
@@ -39,6 +41,8 @@ from aiac.agent.uc.onboarding.policy_builder.cross_service import applied_rules_
 from aiac.idp.configuration.api import Configuration
 from aiac.idp.configuration.models import RoleKind, ServiceType
 from aiac.policy.model.models import PolicyRule
+
+logger = logging.getLogger(__name__)
 
 
 def _config() -> Configuration:
@@ -103,7 +107,11 @@ class ServicePolicyBuilder:
             try:
                 report = enrich_report(report, combined, get_policy_source().fetch())
             except Exception:
-                pass
+                # Best-effort only (ADR 0001: surface, never drop). Log at WARNING with the
+                # traceback so a genuine bug in enrich_report (TypeError/AttributeError) is
+                # distinguishable in production from an expected "policy source unavailable",
+                # rather than being silently swallowed. We still raise the STRUCTURAL report.
+                logger.warning("policy conflict enrichment failed; falling back to structural report", exc_info=True)
             raise PolicyConflictError(report)
         # Only this build's own rules are applied; the OTHER services' rules read above are already
         # persisted and are used solely to widen detection, never re-emitted.
