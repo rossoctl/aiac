@@ -51,6 +51,10 @@ _BUILDER = "aiac.agent.uc.onboarding.policy_builder.builder"
 # The explain/LLM seam the enrichment pass runs through — patched here so the deterministic suite
 # never touches a live endpoint, and asserted NEVER called on a clean apply.
 _EXPLAIN_SEAM = "aiac.agent.policy_rules_builder.conflict_enrichment._explain_pair"
+# The Policy-Store read #2504 added to widen detection across services. Patched to [] in the
+# within-service cases below (no other services applied) so they need no live store and their
+# structural assertions are unchanged; the cross-service cases patch it to return applied rules.
+_APPLIED_SEAM = f"{_BUILDER}.applied_rules_for_scopes"
 
 _TESTER = Role(id="r-tester", name="tester", composite=False, kind=RoleKind.USER)
 _ISSUES = Scope(id="s-iss", name="issues")
@@ -166,6 +170,7 @@ def test_build_raises_structural_conflict_from_assembled_passes():
             return_value=[PolicyRule(role=_TESTER, scope=_ISSUES, effect=RuleEffect.DENY)],
         ),
         patch(f"{_BUILDER}.get_policy_source", return_value=_Source()),
+        patch(_APPLIED_SEAM, return_value=[]),
         patch(f"{_BUILDER}.enrich_report", side_effect=lambda report, rules, text: report),
     ):
         with pytest.raises(PolicyConflictError) as exc:
@@ -203,6 +208,7 @@ def test_conflicting_build_enriches_report_with_kind_and_verbatim_quotes():
             return_value=[PolicyRule(role=_TESTER, scope=_ISSUES, effect=RuleEffect.DENY)],
         ),
         patch(f"{_BUILDER}.get_policy_source", return_value=_Source(policy)),
+        patch(_APPLIED_SEAM, return_value=[]),
         patch(_EXPLAIN_SEAM, return_value=explained) as explain,
     ):
         with pytest.raises(PolicyConflictError) as exc:
@@ -239,6 +245,7 @@ def test_conflicting_build_falls_back_when_quotes_not_verbatim():
             return_value=[PolicyRule(role=_TESTER, scope=_ISSUES, effect=RuleEffect.DENY)],
         ),
         patch(f"{_BUILDER}.get_policy_source", return_value=_Source(policy)),
+        patch(_APPLIED_SEAM, return_value=[]),
         patch(_EXPLAIN_SEAM, return_value=explained),
     ):
         with pytest.raises(PolicyConflictError) as exc:
@@ -250,11 +257,13 @@ def test_conflicting_build_falls_back_when_quotes_not_verbatim():
     assert "tester" in c.explanation and "issues" in c.explanation
 
 
-def _drive_apply_with_passes(scope_rules, deny_rules) -> tuple[MagicMock, MagicMock]:
+def _drive_apply_with_passes(scope_rules, deny_rules, applied=None) -> tuple[MagicMock, MagicMock]:
     """Drive ``POST /apply/service/{id}`` through the REAL onboarding sequence (provision graph
     stubbed to a Tool, the two PRB passes stubbed to the given rule lists, LLM/cluster untouched)
     and return ``(compute_and_apply, explain_seam)`` mocks so the caller can assert on the PCE seam
-    AND that the explain/LLM enrichment seam fired only when a conflict was detected. The policy
+    AND that the explain/LLM enrichment seam fired only when a conflict was detected. ``applied`` is
+    the OTHER services' already-applied rules the #2504 store read returns (default ``[]`` — a
+    single-service apply); pass a conflicting rule to exercise the cross-service path. The policy
     source is stubbed and the explain seam returns a fixed ExplainResult, so no live endpoint or
     on-disk policy file is touched even on the conflicting path."""
     provision = MagicMock()
@@ -267,6 +276,7 @@ def _drive_apply_with_passes(scope_rules, deny_rules) -> tuple[MagicMock, MagicM
         patch(f"{_BUILDER}.build_scope_rules", return_value=scope_rules),
         patch(f"{_BUILDER}.build_role_denies", return_value=deny_rules),
         patch(f"{_BUILDER}.get_policy_source", return_value=_Source()),
+        patch(_APPLIED_SEAM, return_value=applied or []),
         patch(_EXPLAIN_SEAM, return_value=explained) as explain,
         patch("aiac.agent.controller.routes.compute_and_apply") as pce,
     ):
@@ -294,6 +304,85 @@ def test_clean_build_reaches_compute_and_apply_without_touching_the_llm_seam():
     pce, explain = _drive_apply_with_passes(
         scope_rules=[PolicyRule(role=_TESTER, scope=_ISSUES, effect=RuleEffect.ALLOW)],
         deny_rules=[],
+    )
+    pce.assert_called_once()
+    explain.assert_not_called()
+
+
+# --- Cross-service structural conflict (#2504) -----------------------------------------------
+#
+# The SAME structural mechanism (B), but the colliding Deny comes from ANOTHER service's already-
+# applied rules (the store read the #2504 gatherer performs), not from this build's Door B pass.
+# This build grants (tester, issues); the store already carries a Deny another service applied on
+# the SAME (role.id, scope.id). Neither side alone reveals it — only the union that build() feeds
+# to detect_conflicts does. These pin that cross-service detection raises with the same shape,
+# fires enrichment on the joined pair, and stays atomic (PCE never reached), while a clean cross-
+# service apply reaches the PCE with the LLM seam untouched.
+
+# Another service's already-applied Deny on the same scope id (returned by the store read seam).
+_APPLIED_DENY = PolicyRule(role=_TESTER, scope=_ISSUES, effect=RuleEffect.DENY)
+
+
+def test_build_raises_cross_service_conflict_from_applied_store_rules():
+    # This build's ONLY rule is an Allow (Door B contributes no deny), so its own rule set is clean.
+    # The store read returns another service's applied Deny on the same (tester, issues): build()
+    # unions the two and the #2502 core surfaces the overlap and RAISES — proving detection sees
+    # across services, not just within one build. Enrichment fires over the joined pair.
+    policy = "Testers may access issues."
+    explained = ExplainResult(
+        kind=ConflictKind.DIRECT,
+        granting_quotes=["Testers may access issues."],
+        prohibiting_quotes=[],
+        explanation="issues is granted here but already prohibited for tester",
+    )
+    with (
+        patch(f"{_BUILDER}._config", return_value=MagicMock()),
+        patch(f"{_BUILDER}.resolve_focal_entities", return_value=_focal_own_scope()),
+        patch(
+            f"{_BUILDER}.build_scope_rules",
+            return_value=[PolicyRule(role=_TESTER, scope=_ISSUES, effect=RuleEffect.ALLOW)],
+        ),
+        patch(f"{_BUILDER}.build_role_denies", return_value=[]),
+        patch(f"{_BUILDER}.get_policy_source", return_value=_Source(policy)),
+        patch(_APPLIED_SEAM, return_value=[_APPLIED_DENY]),
+        patch(_EXPLAIN_SEAM, return_value=explained) as explain,
+    ):
+        with pytest.raises(PolicyConflictError) as exc:
+            ServicePolicyBuilder.build("svc-tool", ServiceType.TOOL)
+
+    explain.assert_called_once()  # enrichment fired for the one cross-service pair
+    report = exc.value.report
+    assert report.status is ConflictStatus.CONFLICTS_FOUND
+    assert len(report.conflicts) == 1
+    c = report.conflicts[0]
+    assert (c.role.id, c.scope.id) == ("r-tester", "s-iss")
+    assert c.focal.type is FocalType.SCOPE
+
+
+def test_cross_service_conflict_raises_before_compute_and_apply_is_atomic():
+    # ATOMIC PROOF (cross-service): build() grants (tester, issues) with no own deny, but the store
+    # already carries another service's Deny on the same pair. The union conflicts, so build() short-
+    # circuits and the PCE is provably NEVER reached — a cross-service conflict leaves persisted state
+    # untouched. Exercises the real detect_conflicts over the combined set, not a patched raise.
+    pce, explain = _drive_apply_with_passes(
+        scope_rules=[PolicyRule(role=_TESTER, scope=_ISSUES, effect=RuleEffect.ALLOW)],
+        deny_rules=[],
+        applied=[_APPLIED_DENY],
+    )
+    pce.assert_not_called()
+    explain.assert_called_once()  # enrichment fired for the one cross-service pair
+
+
+def test_clean_cross_service_apply_reaches_pce_without_touching_the_llm_seam():
+    # Control (cross-service): this build grants (tester, issues) and another service's applied rules
+    # are disjoint (a deny on a DIFFERENT role). The union has no allow∩deny overlap — the build
+    # returns, the PCE IS reached, and the explain/LLM seam is NEVER called. Proves a clean multi-
+    # service apply stays deterministic and LLM-free.
+    other_role = Role(id="r-dev", name="developer", composite=False, kind=RoleKind.USER)
+    pce, explain = _drive_apply_with_passes(
+        scope_rules=[PolicyRule(role=_TESTER, scope=_ISSUES, effect=RuleEffect.ALLOW)],
+        deny_rules=[],
+        applied=[PolicyRule(role=other_role, scope=_ISSUES, effect=RuleEffect.DENY)],
     )
     pce.assert_called_once()
     explain.assert_not_called()

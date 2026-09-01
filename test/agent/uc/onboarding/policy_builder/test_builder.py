@@ -101,6 +101,11 @@ def _invoke(
         patch.object(builder, "build_scope_rules") as bsr,
         patch.object(builder, "build_role_rules") as brr,
         patch.object(builder, "build_role_denies") as brd,
+        # #2504: build() now reads the OTHER services' already-applied rules from the Policy Store to
+        # widen cross-service conflict detection. These unit tests exercise a single build in
+        # isolation (no other services applied), so stub the store read to [] — no store required and
+        # the assembled-rule assertions below are unchanged. The cross-service path has its own tests.
+        patch.object(builder, "applied_rules_for_scopes", return_value=[]),
     ):
         conf = MagicMock()
         if get_services_exc is not None:

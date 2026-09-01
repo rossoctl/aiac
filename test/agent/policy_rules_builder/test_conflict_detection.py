@@ -102,3 +102,50 @@ def test_error_carries_report():
     err = PolicyConflictError(report)
     assert err.report is report
     assert "tester" in str(err) and "issues" in str(err)
+
+
+# --- Cross-service (#2504): the SAME core over a combined rule set -----------------------------
+#
+# Cross-service detection reuses this exact pure core (#2502): the builder simply widens the input
+# to ``this build's rules + the OTHER services' already-applied rules`` (see ``cross_service``) and
+# calls ``detect_conflicts`` over the union. These tests pin that the core surfaces an allow∩deny
+# that spans the two sides with the SAME ``ConflictReport`` shape (real ids, DIRECT, scope-focal) —
+# no new report type is needed for the cross-service case.
+
+
+def test_combined_ruleset_surfaces_cross_service_overlap():
+    # service_a's build grants (tester, issues); service_b already applied a deny on the SAME
+    # (role.id, scope.id). Neither build's own rules alone reveal it — only the union does. The core
+    # surfaces exactly one DIRECT, scope-focal Conflict with the real ids, identical to a within-
+    # service overlap: cross-service differs only in which side each rule came from.
+    service_a_rules = [_allow(_TESTER, _ISSUES)]
+    service_b_applied = [_deny(_TESTER, _ISSUES)]
+    report = detect_conflicts(service_a_rules + service_b_applied)
+
+    assert report.status is ConflictStatus.CONFLICTS_FOUND
+    assert len(report.conflicts) == 1
+    c = report.conflicts[0]
+    assert (c.role.id, c.scope.id) == ("r-tester", "s-iss")
+    assert c.focal.type is FocalType.SCOPE
+    assert c.kind is ConflictKind.DIRECT
+    assert c.quotes_verified is False
+
+
+def test_combined_ruleset_clean_when_sides_disjoint():
+    # A clean cross-service apply: service_b's applied rules touch different pairs, so the union has
+    # no allow∩deny — NO_CONFLICT, and the builder would never fire the LLM enrichment seam.
+    service_a_rules = [_allow(_TESTER, _ISSUES)]
+    service_b_applied = [_allow(_DEV, _SOURCE), _deny(_DEV, _ISSUES)]
+    report = detect_conflicts(service_a_rules + service_b_applied)
+    assert report.conflicts == []
+    assert report.status is ConflictStatus.NO_CONFLICT
+
+
+def test_combined_detection_is_order_independent_across_sides():
+    # Whether this build's rules or the applied rules come first, the union yields the identical
+    # conflict set (keyed on ids) — onboarding order / read order cannot change the outcome.
+    build_rules = [_allow(_TESTER, _ISSUES)]
+    applied = [_deny(_TESTER, _ISSUES), _allow(_DEV, _SOURCE)]
+    key = lambda rep: sorted((c.role.id, c.scope.id) for c in rep.conflicts)
+    assert key(detect_conflicts(build_rules + applied)) == key(detect_conflicts(applied + build_rules))
+    assert key(detect_conflicts(build_rules + applied)) == [("r-tester", "s-iss")]

@@ -35,6 +35,7 @@ from aiac.agent.policy_rules_builder.graph import build_role_denies, build_role_
 from aiac.agent.policy_rules_builder.policy_source import get_policy_source
 from aiac.agent.shared.focal_entities import resolve_focal_entities
 from aiac.agent.shared.roles import flatten_role
+from aiac.agent.uc.onboarding.policy_builder.cross_service import applied_rules_for_scopes
 from aiac.idp.configuration.api import Configuration
 from aiac.idp.configuration.models import RoleKind, ServiceType
 from aiac.policy.model.models import PolicyRule
@@ -69,19 +70,32 @@ class ServicePolicyBuilder:
             for own_role in focal.own_roles:
                 for role in flatten_role(own_role):
                     rules.extend(build_role_rules(role, focal.other_scopes))
-        # Inline, deterministic (non-LLM) cross-pass conflict detection over the fully assembled
-        # rule list (scope-focal grants + Door B denies). Per ADR 0001 we surface, never reconcile:
-        # a (role, scope) carrying both an Allow and a Deny raises HERE -- before the Orchestrator/
-        # Controller reach ``compute_and_apply`` -- so a conflict leaves persisted state untouched
-        # (atomic-by-construction). detection is order-independent (keyed on ids), so tool-first vs
+        # Inline, deterministic (non-LLM) conflict detection over the COMBINED state (#2504): this
+        # build's fully assembled rules (scope-focal grants + Door B denies) PLUS the already-applied
+        # inbound rules of the OTHER services on the scopes this build touches, read from the Policy
+        # Store. Widening the input this way lets the SAME #2502 allow∩deny intersection surface a
+        # cross-service overlap -- an Allow here and a Deny another service already applied on the
+        # same (role.id, scope.id) -- that a single build's own rules could never reveal. Onboarding
+        # appends (override=False), so ``combined`` is exactly the post-apply persisted state.
+        #
+        # Per ADR 0001 we surface, never reconcile: a (role, scope) carrying both an Allow and a Deny
+        # raises HERE -- before the Orchestrator/Controller reach ``compute_and_apply`` -- so a
+        # conflict leaves persisted state untouched (atomic-by-construction; the store read above is
+        # side-effect-free). Detection is order-independent (keyed on ids), so tool-first vs
         # agent-first onboarding yields the identical outcome.
-        report = detect_conflicts(rules)
+        combined = rules + applied_rules_for_scopes(rules)
+        report = detect_conflicts(combined)
         if report.conflicts:
             # A conflict was found: NOW (and only now) run the LLM explain/quote survey over the
             # exact pairs detect_conflicts surfaced -- classifying each kind and extracting verbatim,
             # substring-validated quotes from the candidate policy text (#2503). Gating the LLM
             # behind report.conflicts keeps a clean apply fully deterministic and LLM-free (the
-            # explain seam never fires). The policy source is read only on this path.
-            report = enrich_report(report, rules, get_policy_source().fetch())
+            # explain seam never fires) -- true for a clean cross-service apply too. ``combined`` is
+            # passed so enrichment can resolve the typed Role/Scope of a pair whose sides came from
+            # different services (a conflict may join a new rule to a stored one). Policy source is
+            # read only on this path.
+            report = enrich_report(report, combined, get_policy_source().fetch())
             raise PolicyConflictError(report)
+        # Only this build's own rules are applied; the OTHER services' rules read above are already
+        # persisted and are used solely to widen detection, never re-emitted.
         return rules
