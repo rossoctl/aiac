@@ -25,11 +25,19 @@ def _service(name="team-a/weather"):
     return Service.model_validate({"id": ENTITY, "clientId": ENTITY, "name": name, "enabled": True})
 
 
-def _pod(labels, owner_kind="ReplicaSet", owner_name="weather-abc123"):
+def _pod(
+    labels,
+    owner_kind="ReplicaSet",
+    owner_name="weather-abc123",
+    deletion_timestamp=None,
+    creation_timestamp="",
+):
     return SimpleNamespace(
         metadata=SimpleNamespace(
             labels=labels,
             owner_references=[SimpleNamespace(kind=owner_kind, name=owner_name)],
+            deletion_timestamp=deletion_timestamp,
+            creation_timestamp=creation_timestamp,
         )
     )
 
@@ -75,6 +83,38 @@ class TestClassifyServiceHappyPaths:
         pod = _pod({"rossoctl.io/type": "tool"}, owner_kind="StatefulSet", owner_name="weather")
         result = _run(service=_service(), pods=[pod])
         assert result["service_type"] is ServiceType.TOOL
+
+    def test_stale_terminating_pod_from_prior_replicaset_is_skipped(self):
+        # A rollout can leave an old ReplicaSet's pod (no rossoctl.io/type label yet, mid-
+        # deletion) listed ahead of the fresh one the operator just labeled — API list order
+        # is not creation order. The live, labeled pod must win regardless of list position.
+        stale = _pod(
+            {},
+            owner_name="weather-oldrs",
+            deletion_timestamp="2026-01-01T00:00:00Z",
+            creation_timestamp="2026-01-01T00:00:00Z",
+        )
+        fresh = _pod(
+            {"rossoctl.io/type": "agent"},
+            owner_name="weather-newrs",
+            creation_timestamp="2026-01-02T00:00:00Z",
+        )
+        result = _run(service=_service(), pods=[stale, fresh])
+        assert result["service_type"] is ServiceType.AGENT
+
+    def test_newest_live_pod_wins_when_none_carry_the_label_yet(self):
+        # Neither candidate has the label yet (label not stamped), but both are live — the
+        # newest one should be picked rather than an arbitrary/first one, so the 502's "got
+        # None" reflects the current rollout, not a pod already on its way out.
+        older = _pod(
+            {}, owner_name="weather-oldrs", creation_timestamp="2026-01-01T00:00:00Z"
+        )
+        newer = _pod(
+            {}, owner_name="weather-newrs", creation_timestamp="2026-01-02T00:00:00Z"
+        )
+        with pytest.raises(HTTPException) as ei:
+            _run(service=_service(), pods=[older, newer])
+        assert ei.value.status_code == 502
 
 
 class TestClassifyService502s:

@@ -115,6 +115,7 @@ class AiacEventConsumer:
             await self._nc.close()
 
     async def _dispatch(self, msg: Msg) -> None:
+        logger.info("received %s (delivery %d)", msg.subject, msg.metadata.num_delivered)
         try:
             rules, override = _handle(msg.subject)
             compute_and_apply(rules, override)
@@ -134,6 +135,7 @@ class AiacEventConsumer:
                 )
             return
         await msg.ack()
+        logger.info("acked %s", msg.subject)
 
 
 @asynccontextmanager

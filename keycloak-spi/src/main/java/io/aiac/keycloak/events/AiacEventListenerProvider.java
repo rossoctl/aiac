@@ -8,6 +8,7 @@ import org.keycloak.events.admin.AdminEvent;
 import org.keycloak.events.admin.ResourceType;
 
 import java.nio.charset.StandardCharsets;
+import java.util.Optional;
 
 /**
  * Thin publisher: on a matching admin event, publishes a minimal {@code {"id": "..."}} payload
@@ -37,7 +38,13 @@ public class AiacEventListenerProvider implements EventListenerProvider {
         SubjectMapper.ResourceKind kind = toResourceKind(event.getResourceType());
         String operationType = event.getOperationType() == null ? null : event.getOperationType().name();
 
-        SubjectMapper.subjectFor(kind, operationType, event.getResourcePath()).ifPresent(this::publish);
+        Optional<String> subject = SubjectMapper.subjectFor(kind, operationType, event.getResourcePath());
+        if (subject.isEmpty()) {
+            log.debugf("dropping admin event: resourceType=%s operationType=%s resourcePath=%s",
+                    kind, operationType, event.getResourcePath());
+            return;
+        }
+        publish(subject.get());
     }
 
     @Override
@@ -56,6 +63,7 @@ public class AiacEventListenerProvider implements EventListenerProvider {
         // the subject from.
         String entityId = subject.substring(subject.lastIndexOf('.') + 1);
         String payload = SubjectMapper.payloadFor(entityId);
+        log.infof("publishing to NATS: subject=%s payload=%s", subject, payload);
         natsConnection.publish(subject, payload.getBytes(StandardCharsets.UTF_8));
     }
 

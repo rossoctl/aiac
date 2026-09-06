@@ -12,12 +12,14 @@ missing/invalid label — actionable, never silent.
 """
 
 import logging
+import os
 
 from fastapi import HTTPException
+from tenacity import Retrying, retry_if_exception, stop_after_delay, wait_exponential
 
 from aiac.idp.configuration.api import Configuration
 from aiac.idp.configuration.models import ServiceType
-from aiac.shared.upstream import run_upstream
+from aiac.shared.upstream import is_transient
 
 from .kube import list_agentcards, list_pods, read_service
 from .state import OnboardingProvisionState
@@ -47,6 +49,25 @@ def _discovery_token(service_id: str) -> str:
 _MCP_TIMEOUT = (5, 30)
 
 
+_MCP_DISCOVERY_MAX_WAIT_SECS_DEFAULT = 60
+
+
+def _mcp_discovery_max_wait_secs() -> int:
+    """Retry budget (seconds), from `MCP_DISCOVERY_MAX_WAIT_SECS` (default 60), tolerant of an
+    unset or non-numeric value like `upstream.max_retries`. Deliberately its own, longer-lived
+    budget rather than the shared `run_upstream` one (~3-4s total): the onboarding CLIENT_CREATE
+    trigger fires the moment the operator stamps rossoctl.io/type onto the pod template, which is
+    *before* the fresh pod (proxy-init + AuthBridge sidecar + app) has had time to become
+    Ready — this call needs to outlast a cold start, not just a network blip."""
+    try:
+        value = int(
+            os.getenv("MCP_DISCOVERY_MAX_WAIT_SECS", str(_MCP_DISCOVERY_MAX_WAIT_SECS_DEFAULT))
+        )
+    except (TypeError, ValueError):
+        return _MCP_DISCOVERY_MAX_WAIT_SECS_DEFAULT
+    return value if value > 0 else _MCP_DISCOVERY_MAX_WAIT_SECS_DEFAULT
+
+
 def _mcp_tools_list(endpoint: str, token: str | None = None) -> list[dict]:
     """POST a JSON-RPC `tools/list` to an MCP endpoint and return the tool manifest list.
     Each tool is a dict with `name` and (optional) `description`. When `token` is provided it is
@@ -68,19 +89,45 @@ def _mcp_tools_list(endpoint: str, token: str | None = None) -> list[dict]:
         resp.raise_for_status()
         return (resp.json().get("result") or {}).get("tools", [])
 
-    return run_upstream(_do)
+    retryer = Retrying(
+        retry=retry_if_exception(is_transient),
+        stop=stop_after_delay(_mcp_discovery_max_wait_secs()),
+        wait=wait_exponential(multiplier=1, min=2, max=15),
+        reraise=True,
+    )
+    return retryer(_do)
 
 
 def _select_pod(pods, workload_name: str):
     """The pod owned by ``workload_name``: a Deployment's ReplicaSet (name prefix
-    ``{workload}-``), or a StatefulSet / Sandbox whose name equals ``workload``."""
+    ``{workload}-``), or a StatefulSet / Sandbox whose name equals ``workload``.
+
+    During a rollout a stale ReplicaSet's terminating pod can share the same name prefix as
+    the fresh one the operator just stamped rossoctl.io/type onto, and List API order is not
+    creation order — so among the owned candidates, prefer a non-terminating one, and among
+    those prefer one that already carries the type label (tie-broken by newest
+    creationTimestamp) rather than blindly returning the first match."""
+    candidates = []
     for pod in pods:
         for owner in getattr(pod.metadata, "owner_references", None) or []:
             if owner.kind == "ReplicaSet" and owner.name.startswith(f"{workload_name}-"):
-                return pod
+                candidates.append(pod)
+                break
             if owner.kind in ("StatefulSet", "Sandbox") and owner.name == workload_name:
-                return pod
-    return None
+                candidates.append(pod)
+                break
+    if not candidates:
+        return None
+
+    live = [p for p in candidates if getattr(p.metadata, "deletion_timestamp", None) is None]
+    pool = live or candidates
+
+    def _rank(pod):
+        has_type_label = _TYPE_LABEL in (getattr(pod.metadata, "labels", None) or {})
+        created = getattr(pod.metadata, "creation_timestamp", None)
+        return (has_type_label, created or "")
+
+    return max(pool, key=_rank)
 
 
 # --------------------------------------------------------------------------- #

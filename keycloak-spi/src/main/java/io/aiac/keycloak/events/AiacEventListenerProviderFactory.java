@@ -66,6 +66,7 @@ public class AiacEventListenerProviderFactory implements EventListenerProviderFa
         }
         try {
             natsConnection = Nats.connect(natsUrl);
+            log.infof("connected to NATS at %s", natsUrl);
         } catch (IOException e) {
             log.warnf(e, "could not connect to NATS at %s; %s will drop this event", natsUrl, PROVIDER_ID);
         } catch (InterruptedException e) {
