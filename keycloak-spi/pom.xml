@@ -33,7 +33,7 @@
         <!-- jboss-logging is Keycloak's logging facade, on its runtime classpath;
              provided-scope so it isn't shaded. Was previously pulled transitively
              via keycloak-services (dropped). -->
-        <jboss.logging.version>3.6.1.Final</jboss.logging.version>
+        <jboss.logging.version>3.6.3.Final</jboss.logging.version>
     </properties>
 
     <dependencies>
