@@ -64,10 +64,10 @@ These AIAC invariants (from the policy-model spec, handoff 01) are relied on by 
 
 **Namespace:** `aiac.policy.computation`
 
-**Location:** `aiac/src/aiac/policy/computation/`
+**Location:** `src/aiac/policy/computation/`
 
 ```
-aiac/src/aiac/policy/
+src/aiac/policy/
 └── computation/
     ├── __init__.py   # empty
     └── engine.py     # compute_and_apply
@@ -295,4 +295,4 @@ Key behaviors to assert:
 ## Further Notes
 
 - The PCE is the **only** caller of `aiac.pdp.policy.library.apply_policy` from AIAC Agent sub-agents. Sub-agents call `compute_and_apply`, not the PDP Policy Library directly.
-- `aiac/src/aiac/agent/policy/api.py` retains `role_to_scopes` / `roles_to_scope` helpers used by AIAC Agent sub-UC agents; they now carry `scope.serviceId` / `role.kind` / `role.actorIds` through on each `PolicyRule` (input contract above). These helpers are not used by the PCE.
+- `src/aiac/agent/policy/api.py` retains `role_to_scopes` / `roles_to_scope` helpers used by AIAC Agent sub-UC agents; they now carry `scope.serviceId` / `role.kind` / `role.actorIds` through on each `PolicyRule` (input contract above). These helpers are not used by the PCE.

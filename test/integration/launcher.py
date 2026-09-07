@@ -180,9 +180,7 @@ def kubectl(*args: str, input_text: str | None = None, timeout: float = 60.0) ->
         timeout=timeout,
     )
     if proc.returncode != 0:
-        raise subprocess.CalledProcessError(
-            proc.returncode, ["kubectl", *args], output=proc.stdout, stderr=proc.stderr
-        )
+        raise subprocess.CalledProcessError(proc.returncode, ["kubectl", *args], output=proc.stdout, stderr=proc.stderr)
     return proc.stdout
 
 
@@ -205,9 +203,7 @@ def kubectl_delete(manifest_path: Path, *, namespace: str | None = None, timeout
 
 def kubectl_rollout_status(resource: str, *, namespace: str, timeout: float = 180.0) -> None:
     """Block until ``resource`` (e.g. ``deployment/github-tool``) is rolled out, or raise."""
-    kubectl(
-        "rollout", "status", resource, "-n", namespace, f"--timeout={int(timeout)}s", timeout=timeout + 10
-    )
+    kubectl("rollout", "status", resource, "-n", namespace, f"--timeout={int(timeout)}s", timeout=timeout + 10)
 
 
 def kubectl_get_json(resource: str, *, namespace: str | None = None) -> dict:
@@ -223,9 +219,7 @@ def _pod_is_ready(pod: dict) -> bool:
     status = pod.get("status", {})
     if status.get("phase") != "Running":
         return False
-    return any(
-        c.get("type") == "Ready" and c.get("status") == "True" for c in status.get("conditions", [])
-    )
+    return any(c.get("type") == "Ready" and c.get("status") == "True" for c in status.get("conditions", []))
 
 
 def select_live_pod(items: list[dict]) -> str | None:
@@ -264,8 +258,15 @@ def resolve_pod(selector: str, *, namespace: str) -> str:
 
 
 @contextmanager
-def port_forward(target: str, *, namespace: str, local_port: int, remote_port: int,
-                 ready_url: str | None = None, timeout: float = 30.0) -> Iterator[str]:
+def port_forward(
+    target: str,
+    *,
+    namespace: str,
+    local_port: int,
+    remote_port: int,
+    ready_url: str | None = None,
+    timeout: float = 30.0,
+) -> Iterator[str]:
     """Run ``kubectl port-forward <target> <local>:<remote>`` for the duration of the block,
     yielding the local ``http://127.0.0.1:<local_port>`` base URL.
 
@@ -301,9 +302,7 @@ def port_forward(target: str, *, namespace: str, local_port: int, remote_port: i
         while time.time() < deadline:
             if proc.poll() is not None:
                 reader.join(timeout=1)
-                raise RuntimeError(
-                    f"port-forward to {target} exited early: {''.join(output).strip()}"
-                )
+                raise RuntimeError(f"port-forward to {target} exited early: {''.join(output).strip()}")
             if ready_url is None:
                 if forwarding.wait(timeout=0.3):  # tunnel announced it is up
                     ready = True
@@ -316,9 +315,7 @@ def port_forward(target: str, *, namespace: str, local_port: int, remote_port: i
                 except requests.RequestException:
                     time.sleep(0.3)
         if not ready:
-            raise RuntimeError(
-                f"port-forward to {target} not ready within {timeout}s: {''.join(output).strip()}"
-            )
+            raise RuntimeError(f"port-forward to {target} not ready within {timeout}s: {''.join(output).strip()}")
         yield base_url
     finally:
         terminate(proc)
@@ -426,17 +423,27 @@ def inbound_probe(
         "curl -s -m 15 -w '\\nHTTP_CODE:%{http_code}\\n' "
         f"-X POST {url} "
         "-H 'Content-Type: application/json' -H \"Authorization: Bearer $TOK\" "
-        "-d '{\"jsonrpc\":\"2.0\",\"id\":\"1\",\"method\":\"ping/nonexistent\",\"params\":{}}'"
+        '-d \'{"jsonrpc":"2.0","id":"1","method":"ping/nonexistent","params":{}}\''
     )
     pod_name = f"probe-inbound-{uuid.uuid4().hex[:8]}"
     try:
         out = kubectl(
-            "run", pod_name,
-            "-n", namespace,
-            "--image", _CURL_IMAGE,
-            "--restart=Never", "--rm", "--attach", "--quiet",
+            "run",
+            pod_name,
+            "-n",
+            namespace,
+            "--image",
+            _CURL_IMAGE,
+            "--restart=Never",
+            "--rm",
+            "--attach",
+            "--quiet",
             f"--env=TOK={token}",
-            "--command", "--", "sh", "-c", script,
+            "--command",
+            "--",
+            "sh",
+            "-c",
+            script,
             timeout=timeout,
         )
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
@@ -470,11 +477,11 @@ def outbound_probe(
         f"tok = {json.dumps(token)}\n"
         f"name = {json.dumps(tool_name)}\n"
         f"url = {json.dumps(tool_url)}\n"
-        'op = urllib.request.build_opener('
+        "op = urllib.request.build_opener("
         'urllib.request.ProxyHandler({"http": "http://127.0.0.1:8081"}))\n'
         'body = json.dumps({"jsonrpc": "2.0", "id": "1", "method": "tools/call",'
         ' "params": {"name": name, "arguments": {}}}).encode()\n'
-        'req = urllib.request.Request(url, data=body, headers={'
+        "req = urllib.request.Request(url, data=body, headers={"
         '"Content-Type": "application/json",'
         ' "Accept": "application/json, text/event-stream",'
         ' "Authorization": "Bearer " + tok})\n'
@@ -490,8 +497,16 @@ def outbound_probe(
     )
     try:
         out = kubectl(
-            "exec", "-i", "-n", namespace, agent_pod, "-c", container,
-            "--", "python3", "-",
+            "exec",
+            "-i",
+            "-n",
+            namespace,
+            agent_pod,
+            "-c",
+            container,
+            "--",
+            "python3",
+            "-",
             input_text=script,
             timeout=timeout,
         )
@@ -533,16 +548,12 @@ def outbound_outcome(code: int | None, body: str) -> str:
     err = doc.get("error") if isinstance(doc, dict) else None
     if isinstance(err, dict):
         data = err.get("data")
-        if isinstance(data, dict) and (
-            data.get("plugin") == "opa" or data.get("error") == "policy.forbidden"
-        ):
+        if isinstance(data, dict) and (data.get("plugin") == "opa" or data.get("error") == "policy.forbidden"):
             return "deny"
     return "allow"
 
 
-def poll_until(
-    predicate: Callable[[], bool], *, timeout: float, interval: float = 5.0
-) -> bool:
+def poll_until(predicate: Callable[[], bool], *, timeout: float, interval: float = 5.0) -> bool:
     """Poll ``predicate`` until it returns truthy or ``timeout`` seconds elapse; return whether it did.
 
     Exceptions from ``predicate`` (a probe against an ephemeral pod / a bundle still rebuilding) are
@@ -573,9 +584,7 @@ def require_env_or_skip(*names: str) -> dict[str, str]:
         import pytest
 
         pytest.skip(
-            "integration env not set: "
-            + ", ".join(missing)
-            + " — source test/integration/.env (see aiac/CLAUDE.md)."
+            "integration env not set: " + ", ".join(missing) + " — source test/integration/.env (see aiac/CLAUDE.md)."
         )
     return {name: os.environ[name] for name in names}
 
@@ -606,8 +615,14 @@ def pipeline_unwired_reason(*, namespace: str, workloads: list[str]) -> str | No
         return f"AuthorizationPolicy CRD not served / cluster unreachable ({err or 'no output'})"
 
     ok, out, err = _kubectl_try(
-        "get", "pods", "-n", "rossoctl-system", "-l", "app=bundle-service",
-        "-o", "jsonpath={.items[*].status.phase}",
+        "get",
+        "pods",
+        "-n",
+        "rossoctl-system",
+        "-l",
+        "app=bundle-service",
+        "-o",
+        "jsonpath={.items[*].status.phase}",
     )
     if not ok:
         return f"cannot query bundle-service in rossoctl-system ({err})"
@@ -615,22 +630,30 @@ def pipeline_unwired_reason(*, namespace: str, workloads: list[str]) -> str | No
         return "bundle-service is not Running in rossoctl-system"
 
     ok, out, err = _kubectl_try(
-        "get", "configmap", "authbridge-runtime-config", "-n", namespace,
-        "-o", r"jsonpath={.data.config\.yaml}",
+        "get",
+        "configmap",
+        "authbridge-runtime-config",
+        "-n",
+        namespace,
+        "-o",
+        r"jsonpath={.data.config\.yaml}",
     )
     if not ok:
         return f"authbridge-runtime-config not found in {namespace} ({err})"
     wired = out.count("name: opa")
     if wired < 2:
-        return (
-            f"OPA plugin not wired into both legs in {namespace} (found {wired} of 2) — "
-            "run k8s/opa-kind-enable.sh"
-        )
+        return f"OPA plugin not wired into both legs in {namespace} (found {wired} of 2) — run k8s/opa-kind-enable.sh"
 
     for workload in workloads:
         ok, out, err = _kubectl_try(
-            "get", "pods", "-n", namespace, "-l", f"app.kubernetes.io/name={workload}",
-            "-o", "jsonpath={.items[*].status.phase}",
+            "get",
+            "pods",
+            "-n",
+            namespace,
+            "-l",
+            f"app.kubernetes.io/name={workload}",
+            "-o",
+            "jsonpath={.items[*].status.phase}",
         )
         if not ok:
             return f"cannot query workload {workload!r} in {namespace} ({err})"

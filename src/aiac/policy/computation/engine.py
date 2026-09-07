@@ -66,10 +66,7 @@ def _add_rule(rules: list[PolicyRule], rule: PolicyRule) -> None:
     present. Each list this is called on is single-effect (routing splits by ``effect`` first), so
     within a list the check reduces to ``(role.id, scope.id)``; carrying ``effect`` keeps the
     identity aligned with the model's canonical dedup key."""
-    if any(
-        r.role.id == rule.role.id and r.scope.id == rule.scope.id and r.effect == rule.effect
-        for r in rules
-    ):
+    if any(r.role.id == rule.role.id and r.scope.id == rule.scope.id and r.effect == rule.effect for r in rules):
         return
     rules.append(rule)
 
@@ -155,9 +152,7 @@ def _reconcile(
             edge
             for edge in edges
             if edge.scope.id in owner_scope_ids
-            and not (
-                edge.role.kind == RoleKind.AGENT and edge.role.id not in catalog_agent_role_ids
-            )
+            and not (edge.role.kind == RoleKind.AGENT and edge.role.id not in catalog_agent_role_ids)
         ]
 
         # (3) user-role churn collapse: a stale generation is dropped only when this batch carries a
@@ -222,9 +217,7 @@ def _spm_cache(catalog: dict[str, Service]):
     return spms, spm, is_agent
 
 
-def _fresh_apm(
-    agent_id: str, default_effect: RuleEffect = RuleEffect.DENY
-) -> AgentPolicyModel:
+def _fresh_apm(agent_id: str, default_effect: RuleEffect = RuleEffect.DENY) -> AgentPolicyModel:
     # Identity/aggregate maps are the only required fields; the split target maps and the eight
     # entity x effect rule lists default to empty and are filled by ``_derive``. ``default_effect``
     # rides through onto the derived projection (see ``_derive``); it defaults to ``DENY`` so every
@@ -303,9 +296,7 @@ def decommission(service_id: str) -> None:
         raise
 
 
-def _run(
-    rules: list[PolicyRule], override: bool, default_effect: RuleEffect = RuleEffect.DENY
-) -> None:
+def _run(rules: list[PolicyRule], override: bool, default_effect: RuleEffect = RuleEffect.DENY) -> None:
     config = Configuration.for_default_realm()
 
     # (1) Catalog once — the only runtime IdP read. Carries each service's type (agent vs tool,
@@ -379,11 +370,7 @@ def _run(
 
     # (6) Derive each affected agent's APM (zero IdP) and partial-upsert once. Tools get an SPM
     # but no APM (P4).
-    derived = [
-        _derive(agent_id, spm, default_effect)
-        for agent_id in sorted(affected)
-        if is_agent(agent_id)
-    ]
+    derived = [_derive(agent_id, spm, default_effect) for agent_id in sorted(affected) if is_agent(agent_id)]
     if derived:
         apply_policy(PolicyModel(agents=derived))
 
@@ -400,18 +387,13 @@ def _decommission(service_id: str) -> None:
     # carries the roles/scopes X owned when it was onboarded. Content guard: a 404 fresh-empty SPM
     # (never onboarded / already removed) is a no-op — no spurious PDP delete.
     spm_x = spm(service_id)
-    if not (
-        spm_x.owned_roles or spm_x.owned_scopes or spm_x.inbound_allow_rules or spm_x.inbound_deny_rules
-    ):
+    if not (spm_x.owned_roles or spm_x.owned_scopes or spm_x.inbound_allow_rules or spm_x.inbound_deny_rules):
         return
 
     # (3) Targeters — agents whose outbound loses X: they hold an Agent-kind inbound edge (allow or
     # deny) on SPM(X) (their_role → X_scope), which vanishes when SPM(X) is deleted in step 5.
     affected: set[str] = {
-        actor
-        for edge in _all_inbound(spm_x)
-        if edge.role.kind == RoleKind.AGENT
-        for actor in edge.role.actorIds
+        actor for edge in _all_inbound(spm_x) if edge.role.kind == RoleKind.AGENT for actor in edge.role.actorIds
     }
 
     changed: set[str] = set()
@@ -520,9 +502,7 @@ def _derive_outbound(apm: AgentPolicyModel, role: Role, stored: ServicePolicyMod
             _derive_outbound_subject(apm, stored, scope)
 
 
-def _derive_outbound_subject(
-    apm: AgentPolicyModel, stored: ServicePolicyModel, scope: Scope
-) -> None:
+def _derive_outbound_subject(apm: AgentPolicyModel, stored: ServicePolicyModel, scope: Scope) -> None:
     """Gather ``stored``'s User-kind edges for ``scope`` into the outbound subject buckets (allow /
     deny), and register each such user into the effect-agnostic ``subject_roles`` map."""
     for effect, subject_rules in (

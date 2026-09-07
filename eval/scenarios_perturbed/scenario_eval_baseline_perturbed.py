@@ -47,8 +47,7 @@ AGENTS: dict[str, dict] = {
         ),
         "inbound_scopes": {
             "agent-scope-tracker-access": (
-                "Lets a holder use the tracker agent's issue-tracking abilities: reading and "
-                "updating issues."
+                "Lets a holder use the tracker agent's issue-tracking abilities: reading and updating issues."
             ),
         },
         "delegation_scopes": {},

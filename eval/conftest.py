@@ -101,7 +101,7 @@ def _detail(report: pytest.TestReport, category: str) -> str | None:
             reason = str(longrepr[2])
             for prefix in ("Skipped: ", "XFAIL: ", "XFAIL "):
                 if reason.startswith(prefix):
-                    reason = reason[len(prefix):]
+                    reason = reason[len(prefix) :]
             return reason
         return str(longrepr).strip()
     return None
@@ -128,9 +128,7 @@ def _render_entry(lines: list[str], nodeid: str, report: pytest.TestReport, cate
         description = props.get("description") or _docstrings.get(nodeid)
         if description:
             lines.append(f"- **What it tests:** {description}")
-        _render_field(
-            lines, "Expected output", f"{props['expected']} — {props.get('expected_explanation', '')}"
-        )
+        _render_field(lines, "Expected output", f"{props['expected']} — {props.get('expected_explanation', '')}")
         _render_field(lines, "Output", f"{props['output']} — {props.get('llm_reasoning', '')}")
     else:
         doc = _docstrings.get(nodeid)

@@ -1,7 +1,7 @@
 # Component PRD: IdP Configuration Service
 
 ## Location
-`aiac/src/aiac/idp/service/configuration/keycloak/`
+`src/aiac/idp/service/configuration/keycloak/`
 
 ## Description
 A FastAPI web service that proxies Keycloak Admin REST API endpoints. Returns IdP (Keycloak) entity state in generic form for consumption by the AIAC Agent and library clients. Consolidates all Keycloak interactions into a single container. Stateless — no caching. Backed exclusively by Keycloak.
@@ -222,7 +222,7 @@ python-keycloak
 ## File structure
 
 ```
-aiac/src/aiac/idp/service/
+src/aiac/idp/service/
 ├── __init__.py
 └── configuration/
     ├── __init__.py
@@ -235,8 +235,8 @@ aiac/src/aiac/idp/service/
 
 Build command:
 ```bash
-docker build -f aiac/src/aiac/idp/service/configuration/keycloak/Dockerfile \
-  -t aiac-pdp-config:latest aiac/src/
+docker build -f src/aiac/idp/service/configuration/keycloak/Dockerfile \
+  -t aiac-pdp-config:latest src/
 ```
 
 ## `main.py` behaviour notes

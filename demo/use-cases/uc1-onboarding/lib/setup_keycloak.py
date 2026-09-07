@@ -24,13 +24,15 @@ def ensure_ropc_client(admin, cfg: Config) -> None:
     if admin.get_client_id(scn.ROPC_CLIENT_ID) is not None:
         note(f"ROPC client {scn.ROPC_CLIENT_ID!r} already exists")
         return
-    admin.create_client({
-        "clientId": scn.ROPC_CLIENT_ID,
-        "publicClient": True,
-        "directAccessGrantsEnabled": True,
-        "standardFlowEnabled": False,
-        "enabled": True,
-    })
+    admin.create_client(
+        {
+            "clientId": scn.ROPC_CLIENT_ID,
+            "publicClient": True,
+            "directAccessGrantsEnabled": True,
+            "standardFlowEnabled": False,
+            "enabled": True,
+        }
+    )
     ok(f"created ROPC client {scn.ROPC_CLIENT_ID!r}")
 
 

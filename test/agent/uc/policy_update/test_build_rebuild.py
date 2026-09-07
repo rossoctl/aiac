@@ -84,6 +84,4 @@ def test_build_and_rebuild_modules_do_not_import_a_write_surface():
         "clear_service_policies",
     }
     for module in (build_module, rebuild_module):
-        assert forbidden.isdisjoint(vars(module)), (
-            f"{module.__name__} must not import a PDP/PCE/store write surface"
-        )
+        assert forbidden.isdisjoint(vars(module)), f"{module.__name__} must not import a PDP/PCE/store write surface"

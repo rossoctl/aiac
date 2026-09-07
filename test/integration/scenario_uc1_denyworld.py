@@ -120,9 +120,9 @@ exclusive scoping that narrow access.
 # scope, so it fires there too. Corrected against the deployed Rego — see the module docstring.)
 
 OUTBOUND_SUBJECT_DENY_PAIRS: list[tuple[str, str]] = [
-    ("tester", "github-tool.source-read"),       # exclusivity complement (tester → issues only)
+    ("tester", "github-tool.source-read"),  # exclusivity complement (tester → issues only)
     ("tester", "github-tool.source-write"),
-    ("devops", "github-tool.source-read"),        # direct prohibition (DevOps may not access source)
+    ("devops", "github-tool.source-read"),  # direct prohibition (DevOps may not access source)
     ("devops", "github-tool.source-write"),
 ]
 
@@ -145,9 +145,7 @@ OUTBOUND_TARGET_DENY_PAIRS: list[tuple[str, str]] = []
 #
 # Derived from the prefixed pair-list above via the shared ``bare()`` so the prefixed truth stays the
 # single source of truth (one split on the first ``.``, matching ``rego.py``'s ``_deprefix``).
-OUTBOUND_SUBJECT_DENY_BARE: set[tuple[str, str]] = {
-    (role, bare(scope)) for role, scope in OUTBOUND_SUBJECT_DENY_PAIRS
-}
+OUTBOUND_SUBJECT_DENY_BARE: set[tuple[str, str]] = {(role, bare(scope)) for role, scope in OUTBOUND_SUBJECT_DENY_PAIRS}
 
 # Set of role names that carry an explicit inbound DENY (empty here) — the inbound oracle keys on it.
 _INBOUND_DENY_ROLES: set[str] = {role for role, _ in INBOUND_SUBJECT_DENY_PAIRS}

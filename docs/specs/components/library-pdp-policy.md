@@ -3,12 +3,12 @@
 HTTP client module wrapping the PDP Policy Writer (OPA) REST API. These modules have no dependency on Keycloak — all IdP operations use `aiac.idp.configuration`.
 
 ## Location
-`aiac/src/aiac/pdp/policy/library/`
+`src/aiac/pdp/policy/library/`
 
 ## Package structure
 
 ```
-aiac/src/aiac/pdp/policy/
+src/aiac/pdp/policy/
 └── library/
     ├── __init__.py     # empty
     └── api.py          # apply_policy, apply_agent_policy, delete_agent_policy, delete_policy

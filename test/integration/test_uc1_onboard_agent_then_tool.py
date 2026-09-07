@@ -202,6 +202,6 @@ def test_outbound(onboarded: dict, subject: str, tool_bare: str) -> None:
     ``OUTBOUND_SUBJECT_BARE`` table — the gate tool onboarding completed on the agent. AuthBridge's
     ``mcp-parser`` surfaces ``input.mcp.params.name`` (no hand-built input); the real OPA plugin
     renders a denial as a JSON-RPC error frame the harness classifies."""
-    assert uc1.outbound_decision(onboarded, subject, tool_bare) == uc1.expected_outbound_decision(
-        subject, tool_bare
-    ), f"{subject} / {tool_bare}"
+    assert uc1.outbound_decision(onboarded, subject, tool_bare) == uc1.expected_outbound_decision(subject, tool_bare), (
+        f"{subject} / {tool_bare}"
+    )

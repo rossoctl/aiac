@@ -73,7 +73,7 @@ performs no further flattening.
 ## File structure
 
 ```
-aiac/src/aiac/agent/uc/
+src/aiac/agent/uc/
 └── role_update/
     ├── __init__.py
     ├── graph.py      ← Role sub-agent StateGraph (deterministic)

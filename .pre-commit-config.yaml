@@ -1,0 +1,29 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-added-large-files
+        args: ['--maxkb=1024']
+      - id: check-yaml
+        args: ['--allow-multiple-documents']
+      - id: check-json
+      - id: check-merge-conflict
+      - id: mixed-line-ending
+
+  # Rewrite AI Co-authored-by trailers to Assisted-By
+  - repo: local
+    hooks:
+      - id: ai-assisted-by-trailer
+        name: Replace Co-Authored-By with Assisted-By
+        entry: scripts/hooks/commit-msg
+        language: script
+        stages: [commit-msg]
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.14.8
+    hooks:
+      - id: ruff
+        args: ['--fix']
+      - id: ruff-format

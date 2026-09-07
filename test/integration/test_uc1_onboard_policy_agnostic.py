@@ -38,9 +38,7 @@ def test_ready_signal_inbound_dispatches_to_inbound_decision(monkeypatch) -> Non
 def test_ready_signal_outbound_dispatches_with_bare_tool(monkeypatch) -> None:
     """An ``outbound`` signal routes through ``outbound_decision(ctx, subject, tool_bare)``."""
     calls: list[tuple] = []
-    monkeypatch.setattr(
-        uc1, "outbound_decision", lambda ctx, user, tool: calls.append(("out", user, tool)) or "deny"
-    )
+    monkeypatch.setattr(uc1, "outbound_decision", lambda ctx, user, tool: calls.append(("out", user, tool)) or "deny")
     sig = uc1.ReadySignal("outbound", "tester-user", "deny", tool_bare="source-read")
     assert sig.decide({}) == "deny"
     assert calls == [("out", "tester-user", "source-read")]

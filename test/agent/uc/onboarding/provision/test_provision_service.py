@@ -55,9 +55,7 @@ class TestProvisionServiceWrites:
         ]
         _, conf = _run(_state(roles, []))
         assert conf.create_service_role.call_count == 2
-        conf.create_service_role.assert_has_calls(
-            [call(SERVICE_ID, roles[0]), call(SERVICE_ID, roles[1])]
-        )
+        conf.create_service_role.assert_has_calls([call(SERVICE_ID, roles[0]), call(SERVICE_ID, roles[1])])
 
     def test_create_service_scope_called_once_per_scope(self):
         scopes = [
@@ -66,9 +64,7 @@ class TestProvisionServiceWrites:
         ]
         _, conf = _run(_state([], scopes))
         assert conf.create_service_scope.call_count == 2
-        conf.create_service_scope.assert_has_calls(
-            [call(SERVICE_ID, scopes[0]), call(SERVICE_ID, scopes[1])]
-        )
+        conf.create_service_scope.assert_has_calls([call(SERVICE_ID, scopes[0]), call(SERVICE_ID, scopes[1])])
 
     def test_no_entries_makes_no_create_calls(self):
         _, conf = _run(_state([], []))

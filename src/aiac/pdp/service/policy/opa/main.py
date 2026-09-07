@@ -122,9 +122,7 @@ def _build_cr(model: AgentPolicyModel) -> dict:
             "policies": [
                 {
                     "path": "inbound/request.rego",
-                    "content": generate_inbound_rego(
-                        model, platform_clients=_platform_clients()
-                    ),
+                    "content": generate_inbound_rego(model, platform_clients=_platform_clients()),
                 },
                 {
                     "path": "outbound/request.rego",
@@ -192,9 +190,7 @@ def _delete_all() -> None:
     A per-item 404 (a concurrent delete race) is tolerated; other API failures
     propagate (mapped to 502). If the dump is on, clear the dumped tree too.
     """
-    listing = _api.list_cluster_custom_object(
-        _GROUP, _VERSION, _PLURAL, label_selector=_MANAGED_BY_SELECTOR
-    )
+    listing = _api.list_cluster_custom_object(_GROUP, _VERSION, _PLURAL, label_selector=_MANAGED_BY_SELECTOR)
     for item in listing.get("items", []):
         meta = item["metadata"]
         try:

@@ -1,0 +1,96 @@
+# CI - Lint, test, and build
+#
+# Runs on PRs and pushes to main/release branches.
+# Covers the Python package (uv/ruff/pytest) and the Java keycloak-spi module.
+#
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - main
+      - "release-*"
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      matrix:
+        # AIAC requires Python >= 3.12 (see pyproject.toml). rossoctl/rossoctl
+        # lints on 3.11 + 3.12; here 3.11 is below the floor, so 3.12 only.
+        python-version: ["3.12"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
+
+      - name: Lint with ruff
+        run: |
+          # Rule selection is in pyproject.toml [tool.ruff.lint]
+          uvx ruff@0.14.8 check .
+          uvx ruff@0.14.8 format --check .
+
+      - name: Run pre-commit hooks
+        env:
+          SKIP: ai-assisted-by-trailer
+        run: uvx pre-commit@4.6.0 run --all-files --show-diff-on-failure
+
+  python-tests:
+    name: Python Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
+
+      - name: Install dependencies
+        # This project has no build-system (src-layout wired via
+        # pyproject [tool.pytest.ini_options].pythonpath), so export the
+        # locked deps without the project itself and install those.
+        run: |
+          uv export --frozen --no-emit-project --all-extras --format requirements-txt > /tmp/requirements.txt
+          uv venv
+          uv pip install -r /tmp/requirements.txt
+
+      - name: Run tests
+        # pyproject addopts already deselect the live markers
+        # (integration / llm / eval_*), so this is the offline unit suite.
+        run: uv run --no-project pytest test
+
+  keycloak-spi:
+    name: Keycloak SPI (Java)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Set up Java
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3  # v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      - name: Test
+        run: mvn -B -f keycloak-spi/pom.xml test

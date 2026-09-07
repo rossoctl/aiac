@@ -154,8 +154,7 @@ def test_no_tool_scopes_provisioned(onboarded: dict) -> None:
     admin = onboarded["admin"]
     admin.change_current_realm(TEST_REALM)
     tool_scopes = [
-        s["name"] for s in admin.get_client_scopes()
-        if s.get("name", "").startswith(f"{scn.TOOL_WORKLOAD}.")
+        s["name"] for s in admin.get_client_scopes() if s.get("name", "").startswith(f"{scn.TOOL_WORKLOAD}.")
     ]
     assert not tool_scopes, f"unexpected tool scopes provisioned: {tool_scopes}"
 

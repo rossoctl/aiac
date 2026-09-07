@@ -42,7 +42,7 @@ RFC-8693 token exchange, and the `github-tool` MitM swaps the exchanged token fo
 - Existing (issue-only) agent card: [`../../analysis/github-agent-card.json`](../../analysis/github-agent-card.json)
 - `github-tool` MCP tool catalog (44 tools): [`../../analysis/github-mcp-tools-summary.json`](../../analysis/github-mcp-tools-summary.json)
 - Reference agent: `agent-examples/a2a/git_issue_agent/`
-- Reference deployment: `cortex/authbridge/demos/github-issue/k8s/`
+- Reference deployment: `authbridge/demos/github-issue/k8s/` in the `rossoctl/cortex` repo
 - **Sibling tool spec (UC-1 onboarding fixture):** [`github-tool.md`](github-tool.md) — a simplified
   4-tool stub (`source-read`, `source-write`, `issues-read`, `issues-write`) deployed as Service
   `github-tool`. **This is not the tool this agent connects to.** The agent connects to the production
@@ -195,7 +195,7 @@ Config via `github_agent/config.py` (`pydantic-settings`), adapted from the refe
 
 ## 7. Deployment (aiac level)
 
-Manifests live under `aiac/demo/assets/agents/github_agent/k8s/`, adapted from the github-issue demo. Namespace
+Manifests live under `demo/assets/agents/github_agent/k8s/`, adapted from the github-issue demo. Namespace
 `team1` (installer-provided ConfigMaps/secrets assumed present).
 
 - **`github-agent-deployment.yaml`** — `ServiceAccount` + `Deployment` + `Service` + `AgentRuntime`:
@@ -218,7 +218,7 @@ Manifests live under `aiac/demo/assets/agents/github_agent/k8s/`, adapted from t
   (`authbridge/demos/github-issue/k8s/github-tool-deployment.yaml`, Service name `github-tool-mcp`) +
   `github-tool-secrets`, a running rossoctl cluster (Keycloak realm `rossoctl`, namespace `team1` —
   installer-provided and enrolled for AuthBridge injection).
-  The sibling UC-1 stub at `aiac/demo/assets/tools/github_tool/` (Service `github-tool`) is a separate deployment
+  The sibling UC-1 stub at `demo/assets/tools/github_tool/` (Service `github-tool`) is a separate deployment
   for AIAC onboarding discovery and is **not** a runtime dependency of this agent.
 
 **Wiring invariant:** agent `MCP_URL` host (`github-tool-mcp`) == `authproxy-routes` host == tool
@@ -229,7 +229,7 @@ Service name; exchanged audience (`github-tool`) == tool `AUDIENCE`.
 ## 8. Verification
 
 **Local (no cluster — primary gate):**
-1. `cd aiac/demo/assets/agents/github_agent && uv lock && uv sync`.
+1. `cd demo/assets/agents/github_agent && uv lock && uv sync`.
 2. `podman build -t github-agent:latest .`.
 3. Startup + card: run `uv run --no-sync server` (or `test_startup.exp`), then
    `curl -s localhost:8000/.well-known/agent-card.json | jq '.name, .skills[].id'` →
@@ -249,5 +249,5 @@ Service name; exchanged audience (`github-tool`) == tool `AUDIENCE`.
 ## 9. Out of scope
 - Any changes to `github_tool` (reused as-is).
 - Any changes to the AIAC pipeline, `policy-pipeline.md`, or the integration test.
-- Wiring the agent into `agent-examples` CI (`build.yaml`) — aiac/demo images build independently.
+- Wiring the agent into `agent-examples` CI (`build.yaml`) — demo images build independently.
 - Onboarding this agent through the AIAC UC1 pipeline (separate activity; the card here is its input).

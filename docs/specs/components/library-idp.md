@@ -1,12 +1,12 @@
 # Component PRD: IdP Configuration Library (`aiac.idp.configuration`)
 
 ## Location
-`aiac/src/aiac/idp/configuration/`
+`src/aiac/idp/configuration/`
 
 ## Package structure
 
 ```
-aiac/src/aiac/idp/
+src/aiac/idp/
 └── configuration/
     ├── __init__.py     # empty
     ├── models.py       # Subject, Role, Service, Scope
@@ -390,7 +390,7 @@ class Configuration:
 
 ### Configuration
 
-Read from a `.env` file co-located with `api.py` (`aiac/src/aiac/idp/configuration/.env`) via `python-dotenv`. Falls back to the default if the file is absent or the key is not set.
+Read from a `.env` file co-located with `api.py` (`src/aiac/idp/configuration/.env`) via `python-dotenv`. Falls back to the default if the file is absent or the key is not set.
 
 | Variable | Default |
 |----------|---------|

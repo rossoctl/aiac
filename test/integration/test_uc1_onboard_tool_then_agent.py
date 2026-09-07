@@ -219,6 +219,6 @@ def test_outbound(onboarded: dict, subject: str, tool_bare: str) -> None:
     ``OUTBOUND_SUBJECT_BARE`` table — reconstructed from the durable ``SPM(github-tool)`` rules when the
     agent's APM was derived. This is the same bare matrix rung 2 drives; **both rungs passing it is the
     live order-independence proof** (the exact cell the original order-dependence bug corrupted)."""
-    assert uc1.outbound_decision(onboarded, subject, tool_bare) == uc1.expected_outbound_decision(
-        subject, tool_bare
-    ), f"{subject} / {tool_bare}"
+    assert uc1.outbound_decision(onboarded, subject, tool_bare) == uc1.expected_outbound_decision(subject, tool_bare), (
+        f"{subject} / {tool_bare}"
+    )

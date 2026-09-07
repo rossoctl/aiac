@@ -1,0 +1,56 @@
+# OpenSSF Scorecard - Security health metrics for Open Source
+#
+# Measures repository security posture and provides recommendations.
+# Results are uploaded to GitHub Security tab and OpenSSF Scorecard API.
+#
+# NOTE: Scorecard only works on 'schedule' and 'push' triggers, NOT 'pull_request'
+# See: https://github.com/ossf/scorecard-action#workflow-restrictions
+#
+name: OpenSSF Scorecard
+
+on:
+  schedule:
+    - cron: '30 6 * * 1'  # Weekly Monday 6:30 AM UTC
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  scorecard:
+    name: Scorecard Analysis
+    runs-on: ubuntu-latest
+    # publish_results and the SARIF upload to the Security tab need a public
+    # repo (OpenSSF API) / GitHub Advanced Security (private repos). lab-aiac
+    # is private, so this self-activates only when the repo is made public.
+    if: ${{ !github.event.repository.private }}
+    permissions:
+      security-events: write
+      id-token: write
+      contents: read
+      actions: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run Scorecard
+        uses: ossf/scorecard-action@2d1146689b8cda280b9bc96326124645441f03bc  # v2.4.4
+        with:
+          results_file: scorecard.sarif
+          results_format: sarif
+          publish_results: true
+
+      - name: Upload SARIF to Security tab
+        uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938  # v4
+        with:
+          sarif_file: scorecard.sarif
+
+      - name: Upload Scorecard results as artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: scorecard-results
+          path: scorecard.sarif
+          retention-days: 30

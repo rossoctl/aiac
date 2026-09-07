@@ -61,7 +61,6 @@ from test.integration import scenario_uc1 as scn  # noqa: E402
 from test.integration import scenario_uc1_denyworld as scn_b  # noqa: E402
 from test.integration import uc1_onboard as uc1  # noqa: E402
 
-
 # The expected verdicts come straight from the #148 Policy-B oracle (``scenario_uc1_denyworld``), keyed
 # on the **bare** runtime tool names AuthBridge sends (``source-read``). These thin adapters only turn
 # the oracle's bool into the ``"allow"``/``"deny"`` decision string the live probes return — they add
@@ -143,9 +142,9 @@ def test_outbound(pipeline: dict, subject: str, tool_bare: str) -> None:
     ``DENY`` (tester→source-*, devops→source-*), and the ``devops → issues-*`` ✅
     cells are the default-flip tracer. ``mcp-parser`` surfaces ``input.mcp.params.name`` (no hand-built
     input); a denial is a JSON-RPC error frame the harness classifies."""
-    assert uc1.outbound_decision(pipeline, subject, tool_bare) == _expected_outbound(
-        subject, tool_bare
-    ), f"{subject} / {tool_bare}"
+    assert uc1.outbound_decision(pipeline, subject, tool_bare) == _expected_outbound(subject, tool_bare), (
+        f"{subject} / {tool_bare}"
+    )
 
 
 # ======================================================================================

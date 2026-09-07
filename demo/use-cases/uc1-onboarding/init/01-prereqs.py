@@ -32,7 +32,11 @@ ASSETS_DIR = HERE.parents[2] / "assets"  # demo/assets/
 
 AIAC_NAMESPACE = "aiac-system"
 AIAC_IMAGES = [
-    ("localhost/aiac-pdp-config:local", "src/aiac/idp/service/configuration/keycloak/Dockerfile", "src/aiac/idp/service/configuration/keycloak"),
+    (
+        "localhost/aiac-pdp-config:local",
+        "src/aiac/idp/service/configuration/keycloak/Dockerfile",
+        "src/aiac/idp/service/configuration/keycloak",
+    ),
     ("localhost/aiac-pdp-policy-opa:local", "src/aiac/pdp/service/policy/opa/Dockerfile", "src"),
     ("localhost/aiac-policy-model-store:local", "src/aiac/policy/model_store/service/Dockerfile", "src"),
     ("localhost/aiac-agent:local", "src/aiac/agent/controller/Dockerfile", "src"),
@@ -70,8 +74,14 @@ def verify_namespace(namespace: str) -> None:
 
 def verify_spire() -> None:
     out = kubectl(
-        "get", "pods", "-A", "-l", "app.kubernetes.io/name=agent,app.kubernetes.io/instance=spire",
-        "-o", "jsonpath={.items[*].status.phase}", timeout=15,
+        "get",
+        "pods",
+        "-A",
+        "-l",
+        "app.kubernetes.io/name=agent,app.kubernetes.io/instance=spire",
+        "-o",
+        "jsonpath={.items[*].status.phase}",
+        timeout=15,
     )
     if not out.split() or any(phase != "Running" for phase in out.split()):
         abort(f"SPIRE agent not Running (got phases: {out or '<none>'}) — is SPIRE installed?")
@@ -136,7 +146,14 @@ def ensure_aiac_deployed(cfg: Config) -> None:
         kubectl("apply", "-f", str(AIAC_ROOT / "k8s" / manifest))
 
     kubectl("wait", "deployment/aiac-interface", "-n", AIAC_NAMESPACE, "--for=condition=Available", "--timeout=120s")
-    kubectl("wait", "statefulset/aiac-policy-model-store", "-n", AIAC_NAMESPACE, "--for=jsonpath={.status.readyReplicas}=1", "--timeout=120s")
+    kubectl(
+        "wait",
+        "statefulset/aiac-policy-model-store",
+        "-n",
+        AIAC_NAMESPACE,
+        "--for=jsonpath={.status.readyReplicas}=1",
+        "--timeout=120s",
+    )
     kubectl("wait", "deployment/aiac-agent", "-n", AIAC_NAMESPACE, "--for=condition=Available", "--timeout=120s")
     ok("AIAC stack deployed")
 
@@ -185,8 +202,13 @@ def wait_for_client_registration(cfg: Config, timeout: float = 180.0) -> None:
 
 def verify_mcp_label(namespace: str) -> None:
     label = kubectl(
-        "get", "service", scn.TOOL_WORKLOAD, "-n", namespace,
-        "-o", "jsonpath={.metadata.labels.protocol\\.rossoctl\\.io/mcp}",
+        "get",
+        "service",
+        scn.TOOL_WORKLOAD,
+        "-n",
+        namespace,
+        "-o",
+        "jsonpath={.metadata.labels.protocol\\.rossoctl\\.io/mcp}",
     ).strip()
     if label != "true":
         abort(

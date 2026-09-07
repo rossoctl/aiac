@@ -29,9 +29,7 @@ def _pod(type_value):
 
 
 def _service():
-    return Service.model_validate(
-        {"id": ENTITY, "clientId": ENTITY, "name": "team-a/weather", "enabled": True}
-    )
+    return Service.model_validate({"id": ENTITY, "clientId": ENTITY, "name": "team-a/weather", "enabled": True})
 
 
 class TestRoute:
@@ -51,9 +49,7 @@ class TestGraphCompiles:
 
 class TestEndToEnd:
     def _invoke(self):
-        return graph_mod.build_provision_graph().invoke(
-            OnboardingProvisionState(trigger=Trigger(entity_id=ENTITY))
-        )
+        return graph_mod.build_provision_graph().invoke(OnboardingProvisionState(trigger=Trigger(entity_id=ENTITY)))
 
     def test_agent_path_end_to_end(self):
         with (

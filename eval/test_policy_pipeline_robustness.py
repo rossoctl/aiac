@@ -125,9 +125,7 @@ def _reordered(scenario: ModuleType) -> SimpleNamespace:
 
 
 @pytest.mark.parametrize("scenario_name", sorted(SCENARIOS))
-def test_prb_robust_to_perturbation(
-    scenario_name: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_prb_robust_to_perturbation(scenario_name: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Check the PRB's grant decision is unchanged under (1) a mechanical perturbation of the
     policy text, candidate descriptions, and candidate-list order, and (2) a hand-reworded
     semantic-sibling scenario with identical meaning/structure — both compared against the
@@ -171,7 +169,4 @@ def test_prb_robust_to_perturbation(
         if diff:
             failures.append(f"semantic tier, gate={gate}: mismatching pairs={sorted(diff)}")
 
-    assert not failures, (
-        f"PRB was not robust to perturbation for scenario '{scenario_name}':\n"
-        + "\n".join(failures)
-    )
+    assert not failures, f"PRB was not robust to perturbation for scenario '{scenario_name}':\n" + "\n".join(failures)

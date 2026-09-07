@@ -35,8 +35,7 @@ AGENTS: dict[str, dict] = {
         ),
         "inbound_scopes": {
             "agent-scope-guest-access": (
-                "Scope granting use of the guest-services agent's reservation and guest-notes "
-                "read capability."
+                "Scope granting use of the guest-services agent's reservation and guest-notes read capability."
             ),
         },
         "delegation_scopes": {},
@@ -87,8 +86,7 @@ USER_ROLES: dict[str, str] = {
         "capability. Real access matches user-role-front-desk-staff."
     ),
     "user-role-front-desk-staff": (
-        "Front Desk Staff — authorized to read reservation details and guest notes through the "
-        "guest-services agent."
+        "Front Desk Staff — authorized to read reservation details and guest notes through the guest-services agent."
     ),
 }
 

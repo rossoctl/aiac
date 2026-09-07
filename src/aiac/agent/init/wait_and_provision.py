@@ -68,8 +68,7 @@ def main() -> None:
         _wait_for_http_health(rag_ingest_url)
     else:
         logger.info(
-            "AIAC_RAG_INGEST_URL not set; skipping RAG Ingest health check "
-            "(Phase 3 dependency not yet deployed)"
+            "AIAC_RAG_INGEST_URL not set; skipping RAG Ingest health check (Phase 3 dependency not yet deployed)"
         )
 
     logger.info("provisioning aiac-events JetStream stream")

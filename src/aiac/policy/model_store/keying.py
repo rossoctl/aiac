@@ -5,6 +5,7 @@ under SPIRE) and cannot be a single path segment. The library encodes it with UR
 (no ``/``, ``:``, or ``=`` padding) before putting it in the path; the service decodes it back.
 The decoded id stays the cache/DB key and the ``service_id`` in every SPM body.
 """
+
 import base64
 import re
 

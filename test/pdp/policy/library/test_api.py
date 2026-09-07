@@ -225,9 +225,7 @@ class TestApplyAgentPolicy:
 
 class TestDeleteAgentPolicy:
     def test_deletes_agent_path(self):
-        with patch(
-            "aiac.pdp.policy.library.api.requests.delete", return_value=_ok(204)
-        ) as m:
+        with patch("aiac.pdp.policy.library.api.requests.delete", return_value=_ok(204)) as m:
             from aiac.pdp.policy.library.api import delete_agent_policy
 
             result = delete_agent_policy("weather-agent")
@@ -236,9 +234,7 @@ class TestDeleteAgentPolicy:
         assert m.call_args.kwargs.get("params") is None
 
     def test_raises_on_non_2xx(self):
-        with patch(
-            "aiac.pdp.policy.library.api.requests.delete", return_value=_err(404)
-        ):
+        with patch("aiac.pdp.policy.library.api.requests.delete", return_value=_err(404)):
             from aiac.pdp.policy.library.api import delete_agent_policy
 
             with pytest.raises(RuntimeError):
@@ -252,9 +248,7 @@ class TestDeleteAgentPolicy:
 
 class TestDeletePolicy:
     def test_deletes_policy_path(self):
-        with patch(
-            "aiac.pdp.policy.library.api.requests.delete", return_value=_ok(204)
-        ) as m:
+        with patch("aiac.pdp.policy.library.api.requests.delete", return_value=_ok(204)) as m:
             from aiac.pdp.policy.library.api import delete_policy
 
             result = delete_policy()
@@ -263,9 +257,7 @@ class TestDeletePolicy:
         assert m.call_args.kwargs.get("params") is None
 
     def test_raises_on_non_2xx(self):
-        with patch(
-            "aiac.pdp.policy.library.api.requests.delete", return_value=_err(500)
-        ):
+        with patch("aiac.pdp.policy.library.api.requests.delete", return_value=_err(500)):
             from aiac.pdp.policy.library.api import delete_policy
 
             with pytest.raises(RuntimeError):
@@ -297,11 +289,10 @@ class TestNoRealmParam:
     def test_none_of_the_four_functions_append_realm(self):
         policy = PolicyModel.model_validate(_POLICY_DICT)
         agent = AgentPolicyModel.model_validate(_AGENT_POLICY_DICT)
-        with patch(
-            "aiac.pdp.policy.library.api.requests.post", return_value=_ok()
-        ) as post, patch(
-            "aiac.pdp.policy.library.api.requests.delete", return_value=_ok(204)
-        ) as delete:
+        with (
+            patch("aiac.pdp.policy.library.api.requests.post", return_value=_ok()) as post,
+            patch("aiac.pdp.policy.library.api.requests.delete", return_value=_ok(204)) as delete,
+        ):
             from aiac.pdp.policy.library.api import (
                 apply_agent_policy,
                 apply_policy,

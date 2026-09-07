@@ -1,6 +1,6 @@
 # AIAC Codebase Guide
 
-All paths below are relative to `cortex/aiac/`.
+All paths below are relative to the repository root.
 
 ## Requirements / PRD docs
 
@@ -116,10 +116,10 @@ Exercises all `Configuration` methods — run `ls test/idp/configuration/` to se
 
 ## Python environment
 
-Virtual environment: `cortex/aiac/.venv`
+Virtual environment: `.venv`
 
-Activate: `source cortex/aiac/.venv/bin/activate`
-Run directly: `cortex/aiac/.venv/bin/python` / `cortex/aiac/.venv/bin/pytest`
+Activate: `source .venv/bin/activate`
+Run directly: `.venv/bin/python` / `.venv/bin/pytest`
 
 Always use this venv for any Python execution, test runs, or dependency checks.
 

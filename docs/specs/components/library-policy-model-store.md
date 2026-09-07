@@ -3,12 +3,12 @@
 Companion library for the [AIAC Policy Model Store](policy-model-store.md). Follows the same pattern as `aiac.pdp.policy.library` — module-level functions, URL from env var via `python-dotenv`, `RuntimeError` on non-2xx.
 
 ## Location
-`aiac/src/aiac/policy/model_store/library/`
+`src/aiac/policy/model_store/library/`
 
 ## Package structure
 
 ```
-aiac/src/aiac/policy/model_store/
+src/aiac/policy/model_store/
 └── library/
     ├── __init__.py     # empty
     └── api.py          # six module-level functions (SPM-centric surface)

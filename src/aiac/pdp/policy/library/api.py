@@ -51,11 +51,7 @@ def apply_policy(model: PolicyModel) -> None:
 
 
 def apply_agent_policy(agent_id: str, model: AgentPolicyModel) -> None:
-    _check(
-        requests.post(
-            f"{_base_url()}/policy/agents/{_agent_id_segment(agent_id)}", json=model.model_dump()
-        )
-    )
+    _check(requests.post(f"{_base_url()}/policy/agents/{_agent_id_segment(agent_id)}", json=model.model_dump()))
 
 
 def delete_agent_policy(agent_id: str) -> None:

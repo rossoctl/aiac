@@ -85,9 +85,7 @@ def resolve_focal_entities(
         services = config.get_services()
         subjects = config.get_subjects()
     except Exception as e:
-        raise HTTPException(
-            502, f"IdP Configuration Service unavailable for service {service_id!r}: {e}"
-        )
+        raise HTTPException(502, f"IdP Configuration Service unavailable for service {service_id!r}: {e}")
 
     # The trigger id is the Keycloak internal client UUID (Service.id), not the human-readable
     # clientId (Service.serviceId): the /apply/service/{id} route is keyed on the UUID because a
@@ -101,11 +99,7 @@ def resolve_focal_entities(
 
     # kind=Agent rides through unchanged from get_services() → routes to source_roles in the PCE.
     other_agent_roles = [
-        r
-        for other in services
-        if other.serviceId != focus.serviceId
-        for r in other.roles
-        if r.aiac_managed
+        r for other in services if other.serviceId != focus.serviceId for r in other.roles if r.aiac_managed
     ]
 
     # User roles are membership-derived, not aiac.managed: a realm role qualifies iff a user
@@ -128,11 +122,7 @@ def resolve_focal_entities(
     # would both (a) fail to exclude the focus's own scopes (``"" != focus.serviceId`` is always
     # true) and (b) route any resulting rule to ``SPM("")``, a 422 dead-end.
     other_scopes = [
-        s
-        for other in services
-        if other.serviceId != focus.serviceId
-        for s in other.scopes
-        if s.aiac_managed
+        s for other in services if other.serviceId != focus.serviceId for s in other.scopes if s.aiac_managed
     ]
 
     candidate_roles = _flatten_dedup(user_roles + other_agent_roles)

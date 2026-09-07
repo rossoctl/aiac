@@ -16,9 +16,7 @@ WORKLOAD = "weather"
 
 
 def _state():
-    return OnboardingProvisionState(
-        trigger=Trigger(entity_id="svc-123"), namespace=NS, workload_name=WORKLOAD
-    )
+    return OnboardingProvisionState(trigger=Trigger(entity_id="svc-123"), namespace=NS, workload_name=WORKLOAD)
 
 
 def _card(name=WORKLOAD, skills=None):
@@ -59,7 +57,6 @@ class TestAnalyzeAgentFound:
         assert f"{WORKLOAD}.agent" not in [r.name for r in provision.roles]
         assert "derived from AgentCard: 2 skills" == provision.reasoning
 
-
     def test_agentcard_matched_by_targetref_not_metadata_name(self):
         # The operator names the card after the Deployment (e.g. "<workload>-deployment-card") and
         # points spec.targetRef at the workload; provision must link the card by targetRef, not by
@@ -87,9 +84,9 @@ class TestAnalyzeAgentLegacyFallback:
         assert "partial: no AgentCard found" in provision.reasoning
 
     def test_agentcard_present_but_no_name_match_is_legacy_fallback(self):
-        provision = _run(
-            items=[_card(name="other-agent", skills=[{"id": "x", "name": "X", "description": "y"}])]
-        )["service_provision"]
+        provision = _run(items=[_card(name="other-agent", skills=[{"id": "x", "name": "X", "description": "y"}])])[
+            "service_provision"
+        ]
         assert [s.name for s in provision.scopes] == [f"{WORKLOAD}.access"]
         assert "partial: no AgentCard found" in provision.reasoning
 

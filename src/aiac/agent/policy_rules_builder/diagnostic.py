@@ -35,7 +35,7 @@ fan-out (#155): a scope-focal run is ``candidate_roles`` against one ``own_scope
 run (AGENT services only) is one ``own_role`` against ``other_scopes``.
 """
 
-from typing import Any, NamedTuple, TypedDict
+from typing import Any, NamedTuple
 
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel
@@ -54,21 +54,21 @@ from .diagnostic_models import (
     UnevaluatedReason,
 )
 from .graph import (
-    MAX_AUDIT_RETRIES,
-    AuditVerdict,
-    RoleSelection,
-    ScopeSelection,
-    _precheck,
-    _propose,
-    _PRBWorking,
-    _role_cands,
-    _role_focal,
-    _scope_cands,
-    _scope_focal,
     _ROLE_CONTRACT,
     _ROLE_DIRECTION,
     _SCOPE_CONTRACT,
     _SCOPE_DIRECTION,
+    MAX_AUDIT_RETRIES,
+    AuditVerdict,
+    RoleSelection,
+    ScopeSelection,
+    _PRBWorking,
+    _precheck,
+    _propose,
+    _role_cands,
+    _role_focal,
+    _scope_cands,
+    _scope_focal,
 )
 from .prompts import build_auditor_messages, build_explain_messages
 

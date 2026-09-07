@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# opa-kind-driver.sh — execute aiac/k8s/opa-kind-runbook.md end-to-end.
+# opa-kind-driver.sh — execute k8s/opa-kind-runbook.md end-to-end.
 #
 # This is an automated driver for the AIAC "OPA Kind Cluster Runbook"
-# (aiac/k8s/opa-kind-runbook.md). It runs every step of that runbook in
+# (k8s/opa-kind-runbook.md). It runs every step of that runbook in
 # order, prints each step and the result it obtained, prints the OPA `input`
 # documents for BOTH the inbound and the outbound legs, and FAILS with a clear
 # message the moment an observed result does not match the runbook's stated
@@ -45,21 +45,21 @@
 #                  is unreachable — a Kind node reassigns its API-server host port
 #                  on restart, which leaves the exported kubeconfig stale.
 #
-# Run from the repo root (cortex/):
-#   OPERATOR_DIR=../operator ROSSOCTL_DIR=../rossoctl ./aiac/k8s/opa-kind-driver.sh
-#   SKIP_ENABLE=1 ./aiac/k8s/opa-kind-driver.sh   # skip the rebuild, just re-test
+# Run from the repo root:
+#   OPERATOR_DIR=../operator ROSSOCTL_DIR=../rossoctl ./k8s/opa-kind-driver.sh
+#   SKIP_ENABLE=1 ./k8s/opa-kind-driver.sh   # skip the rebuild, just re-test
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CORTEX_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # ── Configuration (runbook defaults) ────────────────────────────────────────
 # Sibling repo clones the enable step needs; default to ../operator and
-# ../rossoctl (relative to the cortex repo root) when not set, mirroring
+# ../rossoctl (relative to this repo root) when not set, mirroring
 # opa-kind-enable.sh.
-OPERATOR_DIR="${OPERATOR_DIR:-$(cd "$CORTEX_DIR/../operator" 2>/dev/null && pwd || echo "")}"
-ROSSOCTL_DIR="${ROSSOCTL_DIR:-$(cd "$CORTEX_DIR/../rossoctl" 2>/dev/null && pwd || echo "")}"
+OPERATOR_DIR="${OPERATOR_DIR:-$(cd "$REPO_ROOT/../operator" 2>/dev/null && pwd || echo "")}"
+ROSSOCTL_DIR="${ROSSOCTL_DIR:-$(cd "$REPO_ROOT/../rossoctl" 2>/dev/null && pwd || echo "")}"
 
 NS="${NS:-team1}"
 SYS_NS="${SYS_NS:-rossoctl-system}"
@@ -70,7 +70,7 @@ KIND_CLUSTER="${KIND_CLUSTER:-rossoctl}"
 
 AGENT_LABEL="app.kubernetes.io/name=github-agent"
 EXPECTED_SPIFFE="spiffe://localtest.me/ns/${NS}/sa/github-agent"
-POLICY_FILE="${CORTEX_DIR}/aiac/docs/examples/opa-team1-policy.yaml"
+POLICY_FILE="${REPO_ROOT}/docs/examples/opa-team1-policy.yaml"
 ENABLE_SCRIPT="${SCRIPT_DIR}/opa-kind-enable.sh"
 RESTORE_SCRIPT="${SCRIPT_DIR}/opa-kind-restore.sh"
 
@@ -136,7 +136,7 @@ try:
 except Exception:
     print("no/invalid JSON from the token endpoint (is Keycloak reachable at the URL above?)")' 2>/dev/null || true)
     die "could not mint a token for user '${user}' at ${KC} — Keycloak said: ${err}
-     Keycloak Prerequisites (aiac/k8s/opa-kind-runbook.md): in realm '${REALM}' the
+     Keycloak Prerequisites (k8s/opa-kind-runbook.md): in realm '${REALM}' the
      'rossoctl' client needs Direct Access Grants enabled + a username->sub protocol
      mapper, and users must exist with password == username."
   fi
@@ -241,7 +241,7 @@ dump_opa_input() {
 
 # ── Preflight ────────────────────────────────────────────────────────────────
 printf '%s%sAIAC OPA Kind runbook driver%s\n' "$C_BLD" "$C_CYN" "$C_RST"
-info "runbook: aiac/k8s/opa-kind-runbook.md   namespace: ${NS}   keycloak: ${KC}"
+info "runbook: k8s/opa-kind-runbook.md   namespace: ${NS}   keycloak: ${KC}"
 
 step "Preflight — required tooling and files"
 require_cmd

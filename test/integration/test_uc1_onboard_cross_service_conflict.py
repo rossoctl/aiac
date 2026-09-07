@@ -124,9 +124,7 @@ def _onboard_via_fresh_controller(policy_md: str, workload: str, *, expect_confl
     uc1.ensure_agent_policy(uc1.CONTROLLER_NAMESPACE, policy_md=policy_md)
     service_id = uc1.resolve_service_id(uc1.connect_admin(), TEST_REALM, f"{NAMESPACE}/{workload}")
     controller_target = (
-        uc1.CONTROLLER_TARGET
-        if os.environ.get("AIAC_CONTROLLER_TARGET")
-        else f"pod/{uc1.resolve_controller_pod()}"
+        uc1.CONTROLLER_TARGET if os.environ.get("AIAC_CONTROLLER_TARGET") else f"pod/{uc1.resolve_controller_pod()}"
     )
     with uc1.port_forward(
         controller_target,
@@ -182,9 +180,7 @@ def test_cross_service_conflict_is_surfaced_as_422_conflict_report() -> None:
         # Phase 2 — agent onboarding under the source-granting policy: the outbound subject gate's fresh
         # ALLOW(tester -> github-tool.source-*) collides with the tool's already-applied DENY on the same
         # (role, scope). The #2504 store read surfaces it -> 422 + ConflictReport.
-        report = _onboard_via_fresh_controller(
-            POLICY_AGENT_GRANTS_SOURCE, scn.AGENT_WORKLOAD, expect_conflict=True
-        )
+        report = _onboard_via_fresh_controller(POLICY_AGENT_GRANTS_SOURCE, scn.AGENT_WORKLOAD, expect_conflict=True)
     finally:
         uc1.delete_agent_cr()  # after — drop any CR (there should be none on the raising path)
         uc1.cleanup_provisioned(admin, TEST_REALM)  # restore the pre-run Keycloak state

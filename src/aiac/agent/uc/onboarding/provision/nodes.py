@@ -96,8 +96,7 @@ def classify_service(state: OnboardingProvisionState) -> dict:
     if "/" not in name:
         raise HTTPException(
             502,
-            f"client.name {name!r} for service {service_id!r} has no '/': "
-            "namespace/workload_name unrecoverable",
+            f"client.name {name!r} for service {service_id!r} has no '/': namespace/workload_name unrecoverable",
         )
     namespace, workload_name = name.split("/", 1)
 
@@ -108,9 +107,7 @@ def classify_service(state: OnboardingProvisionState) -> dict:
 
     pod = _select_pod(pods, workload_name)
     if pod is None:
-        raise HTTPException(
-            502, f"no pod owned by workload {workload_name!r} in namespace {namespace!r}"
-        )
+        raise HTTPException(502, f"no pod owned by workload {workload_name!r} in namespace {namespace!r}")
 
     label = (getattr(pod.metadata, "labels", None) or {}).get(_TYPE_LABEL)
     try:
@@ -182,14 +179,8 @@ def analyze_agent(state: OnboardingProvisionState) -> dict:
             )
         return key
 
-    scopes = [
-        ScopeDefinition(name=f"{workload}.{_skill_key(s)}", description=s.get("description", ""))
-        for s in skills
-    ]
-    roles = [
-        RoleDefinition(name=f"{workload}.{_skill_key(s)}", description=s.get("description", ""))
-        for s in skills
-    ]
+    scopes = [ScopeDefinition(name=f"{workload}.{_skill_key(s)}", description=s.get("description", "")) for s in skills]
+    roles = [RoleDefinition(name=f"{workload}.{_skill_key(s)}", description=s.get("description", "")) for s in skills]
     provision = ServiceProvision(
         roles=roles,
         scopes=scopes,
@@ -207,9 +198,7 @@ def analyze_tool(state: OnboardingProvisionState) -> dict:
     try:
         svc = read_service(workload, namespace)
     except Exception as e:
-        raise HTTPException(
-            502, f"Kubernetes Service GET failed for {workload!r} in namespace {namespace!r}: {e}"
-        )
+        raise HTTPException(502, f"Kubernetes Service GET failed for {workload!r} in namespace {namespace!r}: {e}")
 
     labels = getattr(svc.metadata, "labels", None) or {}
     if _MCP_LABEL not in labels:
@@ -223,8 +212,7 @@ def analyze_tool(state: OnboardingProvisionState) -> dict:
     if not ports:
         raise HTTPException(
             502,
-            f"Service {workload!r} in namespace {namespace!r} exposes no ports; "
-            "cannot resolve an MCP endpoint",
+            f"Service {workload!r} in namespace {namespace!r} exposes no ports; cannot resolve an MCP endpoint",
         )
     port = ports[0].port
     endpoint = f"http://{workload}.{namespace}.svc.cluster.local:{port}/mcp"
@@ -235,9 +223,7 @@ def analyze_tool(state: OnboardingProvisionState) -> dict:
     try:
         token = _discovery_token(state.service_id)
     except Exception as e:
-        raise HTTPException(
-            502, f"discovery token minting failed for service {state.service_id!r}: {e}"
-        )
+        raise HTTPException(502, f"discovery token minting failed for service {state.service_id!r}: {e}")
 
     try:
         tools = _mcp_tools_list(endpoint, token=token)
@@ -254,10 +240,7 @@ def analyze_tool(state: OnboardingProvisionState) -> dict:
             )
         return name
 
-    scopes = [
-        ScopeDefinition(name=f"{workload}.{_tool_name(t)}", description=t.get("description", ""))
-        for t in tools
-    ]
+    scopes = [ScopeDefinition(name=f"{workload}.{_tool_name(t)}", description=t.get("description", "")) for t in tools]
     provision = ServiceProvision(
         roles=[],
         scopes=scopes,

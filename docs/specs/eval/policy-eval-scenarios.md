@@ -15,17 +15,17 @@
 
 Two independent groups of files, split by cost tier:
 
-**Heavy scenarios (1, 3, 4, 6-10) — full pipeline, new marker — under `aiac/eval/`,
+**Heavy scenarios (1, 3, 4, 6-10) — full pipeline, new marker — under `eval/`,
 except `agent_delegation`:**
-- `aiac/eval/test_policy_pipeline_eval.py` — the test module, `@pytest.mark.eval_extended`.
-- `aiac/eval/scenario_eval_baseline.py` (Scenario 1),
+- `eval/test_policy_pipeline_eval.py` — the test module, `@pytest.mark.eval_extended`.
+- `eval/scenario_eval_baseline.py` (Scenario 1),
   `scenario_eval_unreachable_resources.py` (Scenario 4), `scenario_eval_ambiguous_clause.py`
   (Scenario 6), `scenario_eval_wildcard_grant.py` (Scenario 7),
   `scenario_eval_misleading_descriptions.py` (Scenario 8), `scenario_eval_confusable_agents.py`
   (Scenario 9), `scenario_eval_empty_descriptions.py` (Scenario 10) — pure-data scenario modules
   (mirroring `scenario.py`'s shape, generalized to lists/dicts of many entities), each isolating
   exactly one aspect at the minimal entity count that aspect needs.
-- **`aiac/test/integration/scenario_eval_agent_delegation.py`** (Scenario 3) — the one exception:
+- **`test/integration/scenario_eval_agent_delegation.py`** (Scenario 3) — the one exception:
   lives at the **top level** of `test/integration/` (sibling of `launcher.py`/`scenario_uc1.py`),
   not under `eval/` like the other seven. It isolates the agent-to-agent `target_scopes`
   delegation mechanism, which is conceptually closer to the top-level fixed-scenario family than to
@@ -36,19 +36,19 @@ except `agent_delegation`:**
 - A matching `policy.eval_<name>.md` next to each scenario module above — the scenario's policy
   text, read by the PRB via `AIAC_POLICY_FILE` (these **are** load-bearing at runtime, unlike the
   two light-scenario `.md` files below).
-- `aiac/eval/probe_eval.rego` — a generalized outbound probe, parameterized by
+- `eval/probe_eval.rego` — a generalized outbound probe, parameterized by
   `input.agent_id`, serving every agent in every heavy scenario (see
   [Testing Decisions](#testing-decisions)).
-- `aiac/eval/conftest.py` — writes a per-run pass/fail/skip/error report
+- `eval/conftest.py` — writes a per-run pass/fail/skip/error report
   (`reports/report_<DD_MM_HH_MM>.md`, Asia/Jerusalem local time) after every session that
   collects at least one `eval_extended`-marked test (see [Test report](#test-report)).
-- `aiac/test/integration/launcher.py` (unmoved, stays in `test/integration/`) — reused
+- `test/integration/launcher.py` (unmoved, stays in `test/integration/`) — reused
   **unmodified** from `policy-pipeline.md`.
 
 **Light scenarios (2, 5) — PRB-only, existing marker, existing directory:**
-- `aiac/test/agent/policy_rules_builder/test_guardrail_conflicts.py` — Scenario 2.
-- `aiac/test/agent/policy_rules_builder/test_guardrail_injection.py` — Scenario 5.
-- `aiac/test/agent/policy_rules_builder/policy.eval_conflicts.md`,
+- `test/agent/policy_rules_builder/test_guardrail_conflicts.py` — Scenario 2.
+- `test/agent/policy_rules_builder/test_guardrail_injection.py` — Scenario 5.
+- `test/agent/policy_rules_builder/policy.eval_conflicts.md`,
   `policy.eval_injection.md` — **human-readable mirrors only** (see the callout below).
 
 > **These two `.md` files are not read at runtime.** Unlike the eight heavy-scenario `.md` files

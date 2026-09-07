@@ -195,9 +195,7 @@ _PERMANENT_EXCEPTIONS = [
 ]
 
 
-@pytest.mark.parametrize(
-    "exc", _PERMANENT_EXCEPTIONS, ids=[type(e).__name__ for e in _PERMANENT_EXCEPTIONS]
-)
+@pytest.mark.parametrize("exc", _PERMANENT_EXCEPTIONS, ids=[type(e).__name__ for e in _PERMANENT_EXCEPTIONS])
 def test_dispatch_terminates_permanent_failure_immediately_below_max_deliver(exc):
     # Every permanent failure is DLQ'd + term()ed on FIRST delivery, never left to
     # redeliver — even though num_delivered is well below MAX_DELIVER — and logged once.

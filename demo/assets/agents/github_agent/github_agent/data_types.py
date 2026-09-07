@@ -7,9 +7,7 @@ class GithubQueryInfo(BaseModel):
     repo: str | None = Field(None, description="The repository name.")
     ref: str | None = Field(None, description="Branch, tag, or sha if named.")
     path: str | None = Field(None, description="File path if named.")
-    numbers: list[int] | None = Field(
-        None, description="Issue or PR numbers mentioned by the user."
-    )
+    numbers: list[int] | None = Field(None, description="Issue or PR numbers mentioned by the user.")
 
     @field_validator("numbers", mode="before")
     @classmethod

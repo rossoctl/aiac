@@ -17,6 +17,7 @@ class _NamedDefinition(Protocol):
     name: str
     description: str
 
+
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
 
@@ -44,8 +45,7 @@ class Configuration:
         realm = os.getenv(REALM_ENV_VAR, "").strip()
         if not realm:
             raise RuntimeError(
-                f"{REALM_ENV_VAR} is unset or empty; set it to the Keycloak realm the AIAC "
-                "pipeline operates on"
+                f"{REALM_ENV_VAR} is unset or empty; set it to the Keycloak realm the AIAC pipeline operates on"
             )
         return cls.for_realm(realm)
 
@@ -80,9 +80,7 @@ class Configuration:
 
     def _build_subject(self, raw: dict, all_roles: dict[str, Role]) -> Subject:
         subject_id = raw["id"]
-        assignments_resp = self._request(
-            "GET", f"/subjects/{subject_id}/assignments", params=self._params()
-        )
+        assignments_resp = self._request("GET", f"/subjects/{subject_id}/assignments", params=self._params())
         realm_role_ids = {r["id"] for r in assignments_resp.json().get("realmMappings", [])}
         roles = [r.model_dump() for r in all_roles.values() if r.id in realm_role_ids]
         return Subject.model_validate({**raw, "roles": roles})
@@ -98,21 +96,15 @@ class Configuration:
         for raw in resp.json():
             role_data = dict(raw)
             if raw.get("composite"):
-                composites_resp = self._request(
-                    "GET", f"/roles/{raw['name']}/composites", params=self._params()
-                )
+                composites_resp = self._request("GET", f"/roles/{raw['name']}/composites", params=self._params())
                 role_data["childRoles"] = composites_resp.json()
             roles.append(Role.model_validate(role_data))
         return roles
 
     def _build_service(self, raw: dict, all_roles: dict[str, Role], all_scopes: dict[str, Scope]) -> Service:
         service_id = raw["id"]
-        roles_resp = self._request(
-            "GET", f"/services/{service_id}/roles", params=self._params()
-        )
-        scopes_resp = self._request(
-            "GET", f"/services/{service_id}/scopes", params=self._params()
-        )
+        roles_resp = self._request("GET", f"/services/{service_id}/roles", params=self._params())
+        scopes_resp = self._request("GET", f"/services/{service_id}/scopes", params=self._params())
         # The per-service roles response carries the authoritative kind/actorIds for each role
         # (e.g. kind=Agent + actorIds=[serviceId] for agent-owned roles). Merge those fields into
         # the fully-validated all_roles objects (which carry composite/attributes/etc.) so Role
@@ -154,9 +146,7 @@ class Configuration:
         tool discovery against the tool's AuthBridge sidecar. The config service (which holds the
         Keycloak admin) does the minting; this returns the raw ``access_token`` string. Raises
         ``RuntimeError`` on a non-OK response (via ``_check``)."""
-        resp = self._request(
-            "GET", f"/services/{service_id}/discovery-token", params=self._params()
-        )
+        resp = self._request("GET", f"/services/{service_id}/discovery-token", params=self._params())
         return resp.json()["access_token"]
 
     def get_services_by_role(self, role: Role) -> list[Service]:
@@ -164,9 +154,7 @@ class Configuration:
         return [s for s in self.get_services() if any(r.id == role.id for r in s.roles)]
 
     def get_subjects_by_role(self, role: Role) -> list[Subject]:
-        resp = self._request(
-            "GET", "/subjects", params={"role_id": role.id, "realm": self.realm}
-        )
+        resp = self._request("GET", "/subjects", params={"role_id": role.id, "realm": self.realm})
         return [Subject.model_validate(s) for s in resp.json()]
 
     def get_services_by_scope(self, scope: Scope) -> list[Service]:
@@ -187,9 +175,7 @@ class Configuration:
         return Scope.model_validate(resp.json())
 
     def map_scope_to_service(self, service: Service, scope: Scope) -> Service:
-        self._request(
-            "POST", f"/services/{service.id}/scopes/{scope.id}", params=self._params()
-        )
+        self._request("POST", f"/services/{service.id}/scopes/{scope.id}", params=self._params())
         get_resp = self._request("GET", f"/services/{service.id}", params=self._params())
         return Service.model_validate(get_resp.json())
 
@@ -279,9 +265,7 @@ class Configuration:
         return Role.model_validate(resp.json())
 
     def map_role_to_service(self, service: Service, role: Role) -> Service:
-        self._request(
-            "POST", f"/services/{service.id}/roles/{role.id}", params=self._params()
-        )
+        self._request("POST", f"/services/{service.id}/roles/{role.id}", params=self._params())
         get_resp = self._request("GET", f"/services/{service.id}", params=self._params())
         return Service.model_validate(get_resp.json())
 
@@ -296,9 +280,7 @@ class Configuration:
         mapping / role as success, so this raises only on a genuine non-OK status (via ``_check``).
         Returns ``None``.
         """
-        self._request(
-            "DELETE", f"/services/{service.id}/roles/{role.id}", params=self._params()
-        )
+        self._request("DELETE", f"/services/{service.id}/roles/{role.id}", params=self._params())
 
     def delete_service_scope(self, service: Service, scope: Scope) -> None:
         """Teardown of a scope this service created — consumed by the UC1 rollback.
@@ -310,6 +292,4 @@ class Configuration:
         the service treats an already-gone assignment / scope as success, so this raises only on a
         genuine non-OK status (via ``_check``). Returns ``None``.
         """
-        self._request(
-            "DELETE", f"/services/{service.id}/scopes/{scope.id}", params=self._params()
-        )
+        self._request("DELETE", f"/services/{service.id}/scopes/{scope.id}", params=self._params())

@@ -25,10 +25,7 @@ POLICY_FILE = "policy.eval_confusable_agents.md"
 
 AGENTS: dict[str, dict] = {
     "team1/coach-agent": {
-        "description": (
-            "Autonomous Agent acting on a user's behalf to manage team rosters and practice "
-            "schedules."
-        ),
+        "description": ("Autonomous Agent acting on a user's behalf to manage team rosters and practice schedules."),
         "inbound_scopes": {
             "agent-scope-coaching-access": (
                 "Scope granting use of the coaching agent's roster and scheduling capability."
@@ -46,15 +43,12 @@ AGENTS: dict[str, dict] = {
         ),
         "inbound_scopes": {
             "agent-scope-review-access": (
-                "Scope granting use of the coach-review agent's performance-evaluation "
-                "capability."
+                "Scope granting use of the coach-review agent's performance-evaluation capability."
             ),
         },
         "delegation_scopes": {},
         "roles": {
-            "agent-role-review-operations": (
-                "Covers reading and recording player performance evaluations."
-            ),
+            "agent-role-review-operations": ("Covers reading and recording player performance evaluations."),
         },
     },
 }

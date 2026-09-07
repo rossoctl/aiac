@@ -78,8 +78,7 @@ def identity_ref(agent_id: str) -> tuple[str, str]:
         namespace, name = parts
     if not _valid_label(namespace) or not _valid_label(name):
         raise ValueError(
-            f"agent_id {agent_id!r} yields invalid DNS-1123 label(s): "
-            f"namespace={namespace!r}, name={name!r}"
+            f"agent_id {agent_id!r} yields invalid DNS-1123 label(s): namespace={namespace!r}, name={name!r}"
         )
     return namespace, name
 
@@ -174,10 +173,7 @@ def _name_map_deprefixed(mapping) -> dict[str, list[str]]:
     Keys stay the **full** target service id (they match
     ``input.identity.service_id``, a full SPIFFE ID); only the scope *values*
     de-prefix to the bare MCP tool names carried in ``input.mcp.params.name``."""
-    return {
-        key: [_deprefix(scope) for scope in scopes]
-        for key, scopes in mapping.items()
-    }
+    return {key: [_deprefix(scope) for scope in scopes] for key, scopes in mapping.items()}
 
 
 # --- inbound gate templates -------------------------------------------------
@@ -211,9 +207,7 @@ def _inbound_source_allow_gate(platform_clients: tuple[str, ...]) -> str:
     """
     rules = ["source_allow_ok if { not input.identity.client_id }"]
     for client in platform_clients:
-        rules.append(
-            f"source_allow_ok if {{ input.identity.client_id == {json.dumps(client)} }}"
-        )
+        rules.append(f"source_allow_ok if {{ input.identity.client_id == {json.dumps(client)} }}")
     rules.append(
         "source_allow_ok if {\n"
         "    some role in source_roles[input.identity.client_id]\n"
@@ -260,11 +254,7 @@ def _outbound_subject_gate(gate: str, scope_map: str) -> str:
 
 
 def _outbound_target_gate(gate: str, scope_map: str) -> str:
-    return (
-        f"{gate} if {{\n"
-        f"    input.mcp.params.name in {scope_map}[input.identity.service_id]\n"
-        "}"
-    )
+    return f"{gate} if {{\n    input.mcp.params.name in {scope_map}[input.identity.service_id]\n}}"
 
 
 # --- trailing decision block (the only thing default_effect changes) --------
@@ -279,9 +269,7 @@ def _outbound_target_gate(gate: str, scope_map: str) -> str:
 # each individual (role, scope) stays allow-XOR-deny.
 
 
-def _decision_block(
-    default_effect: RuleEffect, allow_body: str, deny_gates: tuple[str, ...]
-) -> str:
+def _decision_block(default_effect: RuleEffect, allow_body: str, deny_gates: tuple[str, ...]) -> str:
     """Render the trailing ``allow`` decision — the *only* part that varies by mode.
 
     ``DENY`` (least-privilege) reproduces today's output byte-for-byte:
@@ -301,9 +289,7 @@ def _decision_block(
     return "default allow := false\n" + f"allow if {{ {allow_body} }}"
 
 
-def generate_inbound_rego(
-    model: AgentPolicyModel, platform_clients: tuple[str, ...] = ("rossoctl",)
-) -> str:
+def generate_inbound_rego(model: AgentPolicyModel, platform_clients: tuple[str, ...] = ("rossoctl",)) -> str:
     """Render the fixed ``authbridge.client.inbound.request`` Rego package.
 
     Gates a caller reaching the agent. The decision is deny-overrides:
@@ -351,8 +337,7 @@ def generate_inbound_rego(
             # is deny-if-either-side.
             _decision_block(
                 model.default_effect,
-                "subject_allow_ok; source_allow_ok; "
-                "not subject_deny_ok; not source_deny_ok",
+                "subject_allow_ok; source_allow_ok; not subject_deny_ok; not source_deny_ok",
                 ("subject_deny_ok", "source_deny_ok"),
             ),
         ]
@@ -402,12 +387,8 @@ def generate_outbound_rego(model: AgentPolicyModel) -> str:
                 "agent_role_scopes",
                 _group_rules_deprefixed(model.outbound_target_allow_rules),
             ),
-            _render_map(
-                "target_allow_scopes", _name_map_deprefixed(model.target_allow_scopes)
-            ),
-            _render_map(
-                "target_deny_scopes", _name_map_deprefixed(model.target_deny_scopes)
-            ),
+            _render_map("target_allow_scopes", _name_map_deprefixed(model.target_allow_scopes)),
+            _render_map("target_deny_scopes", _name_map_deprefixed(model.target_deny_scopes)),
         ]
     )
     rules = "\n".join(
@@ -424,8 +405,7 @@ def generate_outbound_rego(model: AgentPolicyModel) -> str:
             # EITHER gate overrides it.
             _decision_block(
                 model.default_effect,
-                "subject_allow_ok; target_allow_ok; "
-                "not subject_deny_ok; not target_deny_ok",
+                "subject_allow_ok; target_allow_ok; not subject_deny_ok; not target_deny_ok",
                 ("subject_deny_ok", "target_deny_ok"),
             ),
         ]

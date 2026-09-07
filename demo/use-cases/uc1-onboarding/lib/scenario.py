@@ -66,8 +66,7 @@ USER_ROLES: dict[str, str] = {
 
 AGENT_SCOPES: dict[str, str] = {
     "github-agent.source_operations": (
-        "Browse and search code; read, create, and modify repository file contents, branches, "
-        "and commits."
+        "Browse and search code; read, create, and modify repository file contents, branches, and commits."
     ),
     "github-agent.issue_operations": (
         "Read, search, create, and update issues, comments, sub-issues, and pull requests."
@@ -125,6 +124,7 @@ Grant access on a least-privilege basis: allow only what this policy states; den
 
 
 # --- Human intents driven at the terminal — fixed mapping, no LLM, so the demo is deterministic
+
 
 @dataclass(frozen=True)
 class Intent:

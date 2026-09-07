@@ -25,9 +25,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CORTEX_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-ROSSOCTL_DIR="${ROSSOCTL_DIR:-$(cd "$CORTEX_DIR/../rossoctl" 2>/dev/null && pwd || echo "")}"
+ROSSOCTL_DIR="${ROSSOCTL_DIR:-$(cd "$REPO_ROOT/../rossoctl" 2>/dev/null && pwd || echo "")}"
 RELEASE_NAME="${RELEASE_NAME:-rossoctl}"
 RELEASE_NAMESPACE="${RELEASE_NAMESPACE:-rossoctl-system}"
 AGENT_NAMESPACE="${AGENT_NAMESPACE:-team1}"

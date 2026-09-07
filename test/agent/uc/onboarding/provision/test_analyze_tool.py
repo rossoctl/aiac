@@ -19,9 +19,7 @@ MCP_LABEL = "protocol.rossoctl.io/mcp"
 
 
 def _state():
-    return OnboardingProvisionState(
-        trigger=Trigger(entity_id="svc-9"), namespace=NS, workload_name=WORKLOAD
-    )
+    return OnboardingProvisionState(trigger=Trigger(entity_id="svc-9"), namespace=NS, workload_name=WORKLOAD)
 
 
 def _svc(labels, port=8080):
@@ -67,9 +65,7 @@ class TestAnalyzeToolFound:
         ]
         assert provision.scopes[0].description == "Open an issue"
         assert "derived from MCP manifest: 2 tools" == provision.reasoning
-        mcp.assert_called_once_with(
-            f"http://{WORKLOAD}.{NS}.svc.cluster.local:8080/mcp", token="disco-tok"
-        )
+        mcp.assert_called_once_with(f"http://{WORKLOAD}.{NS}.svc.cluster.local:8080/mcp", token="disco-tok")
 
     def test_endpoint_uses_services_first_port(self):
         _run(svc=_svc({MCP_LABEL: ""}, port=9000), tools=[])[1].assert_called_once_with(

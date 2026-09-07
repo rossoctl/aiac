@@ -15,7 +15,6 @@ from aiac.agent.policy_rules_builder.diagnostic_models import (
     UnevaluatedReason,
 )
 
-
 # --- enum values (pinned exactly) -------------------------------------------------------------
 
 
@@ -151,18 +150,13 @@ def test_report_round_trips_via_json():
 
 
 def test_derive_status_no_conflict():
-    assert (
-        ConflictReport.derive_status([], [], evaluated_count=3) == ConflictStatus.NO_CONFLICT
-    )
+    assert ConflictReport.derive_status([], [], evaluated_count=3) == ConflictStatus.NO_CONFLICT
 
 
 def test_derive_status_conflicts_found_takes_precedence_over_unevaluated():
     u = Unevaluated(focal=FocalRef(name="r", id="r-1", type=FocalType.ROLE))
     # conflicts win even when there are also unevaluated entities
-    assert (
-        ConflictReport.derive_status([_conflict()], [u], evaluated_count=1)
-        == ConflictStatus.CONFLICTS_FOUND
-    )
+    assert ConflictReport.derive_status([_conflict()], [u], evaluated_count=1) == ConflictStatus.CONFLICTS_FOUND
 
 
 def test_derive_status_incomplete_when_zero_evaluated():
@@ -171,9 +165,7 @@ def test_derive_status_incomplete_when_zero_evaluated():
 
 def test_derive_status_incomplete_when_unevaluated_present():
     u = Unevaluated(focal=FocalRef(name="r", id="r-1", type=FocalType.ROLE))
-    assert (
-        ConflictReport.derive_status([], [u], evaluated_count=5) == ConflictStatus.INCOMPLETE
-    )
+    assert ConflictReport.derive_status([], [u], evaluated_count=5) == ConflictStatus.INCOMPLETE
 
 
 def test_from_survey_encodes_precedence():

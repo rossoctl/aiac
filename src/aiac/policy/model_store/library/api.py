@@ -41,9 +41,7 @@ def _fresh_empty(service_id: str) -> ServicePolicyModel:
 
 
 def get_service_policy(service_id: str) -> ServicePolicyModel:
-    resp = requests.get(
-        f"{_base_url()}/policy/services/{encode_service_id(service_id)}", timeout=_HTTP_TIMEOUT
-    )
+    resp = requests.get(f"{_base_url()}/policy/services/{encode_service_id(service_id)}", timeout=_HTTP_TIMEOUT)
     if resp.status_code == 404:
         return _fresh_empty(service_id)
     _check(resp)
@@ -62,9 +60,7 @@ def get_service_policies_by_role(role: Role) -> list[ServicePolicyModel]:
     # The one genuinely new route. Returns every SPM whose inbound_rules reference role.id —
     # including stale role->service mappings the live IdP no longer reflects (which
     # override-purge needs). [] when none match.
-    resp = requests.get(
-        f"{_base_url()}/policy/services", params={"role": role.id}, timeout=_HTTP_TIMEOUT
-    )
+    resp = requests.get(f"{_base_url()}/policy/services", params={"role": role.id}, timeout=_HTTP_TIMEOUT)
     _check(resp)
     return [ServicePolicyModel.model_validate(item) for item in resp.json()]
 
@@ -79,9 +75,7 @@ def apply_service_policy(service_id: str, spm: ServicePolicyModel) -> None:
 
 
 def delete_service_policy(service_id: str) -> None:
-    resp = requests.delete(
-        f"{_base_url()}/policy/services/{encode_service_id(service_id)}", timeout=_HTTP_TIMEOUT
-    )
+    resp = requests.delete(f"{_base_url()}/policy/services/{encode_service_id(service_id)}", timeout=_HTTP_TIMEOUT)
     _check(resp)
 
 

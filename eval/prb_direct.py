@@ -35,8 +35,12 @@ def build_roles_and_scopes(scenario: ModuleType) -> tuple[dict[str, Role], dict[
             scopes[name] = Scope(id=f"scope-{name}", name=name, description=desc, serviceId=agent_id)
         for name, desc in agent["roles"].items():
             roles[name] = Role(
-                id=f"role-agent-{name}", name=name, description=desc, composite=False,
-                kind=RoleKind.AGENT, actorIds=[agent_id],
+                id=f"role-agent-{name}",
+                name=name,
+                description=desc,
+                composite=False,
+                kind=RoleKind.AGENT,
+                actorIds=[agent_id],
             )
     for tool_id, tool in scenario.TOOLS.items():
         for name, desc in tool["scopes"].items():

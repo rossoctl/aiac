@@ -15,7 +15,7 @@ and re-raises. On success it re-enables the client (idempotent).
 """
 
 import threading
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
@@ -101,9 +101,7 @@ class TestDefaultEffectForwarding:
             patch.object(orchestrator, "_config", return_value=_config_returning(object())),
         ):
             spb.build.return_value = [object()]
-            rules, override, default_effect = orchestrator.onboard_service(
-                SERVICE_ID, default_effect=RuleEffect.ALLOW
-            )
+            rules, override, default_effect = orchestrator.onboard_service(SERVICE_ID, default_effect=RuleEffect.ALLOW)
 
         assert override is False
         assert default_effect is RuleEffect.ALLOW

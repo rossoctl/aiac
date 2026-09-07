@@ -41,6 +41,16 @@ force-exclude = true
 [tool.ruff.lint]
 select = ["E", "F", "I", "W"]
 
+[tool.ruff.lint.per-file-ignores]
+# Production code under src/ is linted strictly. The test/eval/demo trees carry
+# long-line prose inside triple-quoted docstrings and scenario fixtures (design
+# notes, verbatim policy-pipeline descriptions) where a line-length wrap would
+# either be impossible (inline `# noqa` can't sit inside a string) or would
+# corrupt fixture text the tests assert on. E501 is relaxed for those trees only.
+"test/**" = ["E501"]
+"eval/**" = ["E501"]
+"demo/**" = ["E501"]
+
 [tool.pytest.ini_options]
 testpaths = ["test", "eval"]
 pythonpath = ["src"]

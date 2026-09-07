@@ -127,10 +127,7 @@ class Configuration:
                     for s in scopes_raw
                 ]
             else:
-                scopes = [
-                    Scope(id=r.name, name=r.name, description=r.description)
-                    for r in roles
-                ]
+                scopes = [Scope(id=r.name, name=r.name, description=r.description) for r in roles]
 
             result.append(
                 Service(

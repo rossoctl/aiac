@@ -22,11 +22,7 @@ def _agent_config_data() -> dict[str, str]:
     """Return the ``data`` map of the ``aiac-agent-config`` ConfigMap from the manifest."""
     docs = list(yaml.safe_load_all(_MANIFEST.read_text()))
     for doc in docs:
-        if (
-            doc
-            and doc.get("kind") == "ConfigMap"
-            and doc.get("metadata", {}).get("name") == "aiac-agent-config"
-        ):
+        if doc and doc.get("kind") == "ConfigMap" and doc.get("metadata", {}).get("name") == "aiac-agent-config":
             return doc.get("data", {})
     raise AssertionError("aiac-agent-config ConfigMap not found in agent-deployment.yaml")
 

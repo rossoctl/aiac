@@ -153,9 +153,7 @@ def onboard_service(
     roll back a shared entity, while different service_ids run concurrently. This is an
     in-process lock (one agent replica only); cross-replica serialization is out of scope."""
     with _lock_for(service_id):
-        provision = build_provision_graph().invoke(
-            OnboardingProvisionState(trigger=Trigger(entity_id=service_id))
-        )
+        provision = build_provision_graph().invoke(OnboardingProvisionState(trigger=Trigger(entity_id=service_id)))
         service_type = provision["service_type"]
         created_roles = provision["created_roles"]
         created_scopes = provision["created_scopes"]

@@ -100,8 +100,7 @@ USER_ROLES: dict[str, str] = {
 # name -> description. Agent-boundary scopes, from the AgentCard skills (verbatim descriptions).
 AGENT_SCOPES: dict[str, str] = {
     "github-agent.source_operations": (
-        "Browse and search code; read, create, and modify repository file contents, branches, "
-        "and commits."
+        "Browse and search code; read, create, and modify repository file contents, branches, and commits."
     ),
     "github-agent.issue_operations": (
         "Read, search, create, and update issues, comments, sub-issues, and pull requests."

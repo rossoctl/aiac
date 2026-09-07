@@ -30,7 +30,7 @@
 
 ## Location
 
-`aiac/test/integration/` — pytest modules marked `@pytest.mark.integration`, one per rung
+`test/integration/` — pytest modules marked `@pytest.mark.integration`, one per rung
 (`test_uc1_onboard_agent_only.py`, `test_uc1_onboard_agent_then_tool.py`,
 `test_uc1_onboard_tool_then_agent.py`, `test_uc1_onboard_failure_rollback.py`). Each is a thin module that wraps the shared harness in a
 one-line session fixture and supplies only its own rung's oracle (verdicts computed from

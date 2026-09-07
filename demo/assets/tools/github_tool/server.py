@@ -14,6 +14,7 @@ TOOLS = [
 mcp = FastMCP("github-tool", host="0.0.0.0", json_response=True, stateless_http=True)
 
 for _tool_name, _tool_desc in TOOLS:
+
     def _make_stub(name: str):
         def stub() -> str:
             return f"stub: {name} not implemented in phase-1 demo"

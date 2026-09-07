@@ -199,9 +199,7 @@ def test_unjoinable_auditor_candidate_is_marked_unevaluated_not_clean():
                 approved=False,
                 contradictions=[Contradiction(candidate_name="ghost", description="phantom collision")],
             )
-        return RoleSelection(
-            granted_scope_names=["issues"], denied_scope_names=["issues"], reasoning="r"
-        )
+        return RoleSelection(granted_scope_names=["issues"], denied_scope_names=["issues"], reasoning="r")
 
     with ExitStack() as stack:
         _patch_calls(stack, se)

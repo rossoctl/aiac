@@ -20,3 +20,17 @@ eval/reports/
 
 # uc1-onboarding demo's captured .rego snapshots — regenerated per run, not source of truth.
 demo/use-cases/uc1-onboarding/generated/
+
+# Python bytecode / build / tool caches (regenerated; never source of truth)
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/

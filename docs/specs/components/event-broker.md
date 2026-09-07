@@ -78,7 +78,7 @@ No authentication credentials are required. The NATS server runs with no-auth co
 
 ## Kubernetes Manifest
 
-`aiac/k8s/event-broker-deployment.yaml` — NATS JetStream Pod Deployment + ClusterIP Service.
+`k8s/event-broker-deployment.yaml` — NATS JetStream Pod Deployment + ClusterIP Service.
 
 ---
 

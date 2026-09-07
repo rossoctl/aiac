@@ -15,7 +15,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 
 import scenario as scn
 import setup_keycloak
-from _lib import GENERATED, abort, capture_rego, connect_admin, load_config, note, ok, onboard, port_forward, resolve_service_id, say
+from _lib import (
+    GENERATED,
+    abort,
+    capture_rego,
+    connect_admin,
+    load_config,
+    note,
+    ok,
+    onboard,
+    port_forward,
+    resolve_service_id,
+    say,
+)
 
 
 def main() -> None:
@@ -27,7 +39,13 @@ def main() -> None:
     note(f"service id: {service_id}")
 
     say("2", "4", "Onboard (POST /apply/service/{id}) — this drives the PRB and can take minutes")
-    with port_forward(cfg.controller_target, namespace=cfg.controller_namespace, local_port=cfg.controller_local_port, remote_port=cfg.controller_remote_port, ready_url=f"http://127.0.0.1:{cfg.controller_local_port}/health") as base_url:
+    with port_forward(
+        cfg.controller_target,
+        namespace=cfg.controller_namespace,
+        local_port=cfg.controller_local_port,
+        remote_port=cfg.controller_remote_port,
+        ready_url=f"http://127.0.0.1:{cfg.controller_local_port}/health",
+    ) as base_url:
         onboard(cfg, base_url, service_id)
     ok("onboarding call returned 200")
 
@@ -48,8 +66,10 @@ def main() -> None:
     # token would lack the tool audience and downstream calls would silently fail, so abort rather
     # than report a success the token exchange can't back up.
     if not setup_keycloak.ensure_default_audience_scope(admin, cfg, agent_uuid, scn.AGENT_WORKLOAD, tool_aud_scope):
-        abort(f"tool-audience scope {tool_aud_scope!r} not found after onboarding {scn.TOOL_WORKLOAD} — "
-              "the agent's exchanged tokens would lack the tool audience; check the onboarding call above")
+        abort(
+            f"tool-audience scope {tool_aud_scope!r} not found after onboarding {scn.TOOL_WORKLOAD} — "
+            "the agent's exchanged tokens would lack the tool audience; check the onboarding call above"
+        )
 
     print(f"\nTool onboarded. Snapshot: {rego_dir}")
     print("Next: make show   (or: make dev / make test / make devops)")

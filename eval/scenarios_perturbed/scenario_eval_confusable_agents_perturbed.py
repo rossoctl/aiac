@@ -19,14 +19,9 @@ POLICY_FILE = "policy.eval_confusable_agents_perturbed.md"
 
 AGENTS: dict[str, dict] = {
     "coach-agent": {
-        "description": (
-            "An autonomous agent that handles team rosters and practice schedules on a user's "
-            "behalf."
-        ),
+        "description": ("An autonomous agent that handles team rosters and practice schedules on a user's behalf."),
         "inbound_scopes": {
-            "agent-scope-coaching-access": (
-                "Lets a holder use the coaching agent's roster and scheduling abilities."
-            ),
+            "agent-scope-coaching-access": ("Lets a holder use the coaching agent's roster and scheduling abilities."),
         },
         "delegation_scopes": {},
         "roles": {
@@ -46,9 +41,7 @@ AGENTS: dict[str, dict] = {
         },
         "delegation_scopes": {},
         "roles": {
-            "agent-role-review-operations": (
-                "Covers looking up and recording player performance evaluations."
-            ),
+            "agent-role-review-operations": ("Covers looking up and recording player performance evaluations."),
         },
     },
 }

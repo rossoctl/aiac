@@ -1,7 +1,7 @@
 # Component PRD: PDP Policy Writer (OPA)
 
 ## Location
-`aiac/src/aiac/pdp/service/policy/opa/`
+`src/aiac/pdp/service/policy/opa/`
 
 ## Description
 A FastAPI web service that translates a **Policy Model** into OPA Rego packages and, for each agent, **server-side-applies** the two generated packages into a per-agent `AuthorizationPolicy` Kubernetes Custom Resource (`agent.rossoctl.dev/v1alpha1`, `scope: client` — one CR per agent). The `bundle-service` (operator repo) composes those per-agent CRs into per-pod OPA bundles; the OPA plugin embedded in each AuthBridge instance polls the bundle relevant to its pod and evaluates it.
@@ -307,7 +307,7 @@ subject_roles := {
     "dev-user": ["developer"],
     "test-user": ["tester"]
 }
-# The deployed github-tool (aiac/demo/assets/tools/github_tool) exposes
+# The deployed github-tool (demo/assets/tools/github_tool) exposes
 # exactly four MCP tools — source-read, source-write, issues-read,
 # issues-write — one per skill. These names ARE the values that arrive in
 # input.mcp.params.name when a specific tool is invoked, so the maps
@@ -480,7 +480,7 @@ pydantic
 ## File structure
 
 ```
-aiac/src/aiac/pdp/service/
+src/aiac/pdp/service/
 ├── __init__.py
 └── policy/
     ├── __init__.py
@@ -491,7 +491,7 @@ aiac/src/aiac/pdp/service/
         ├── rego.py         # identity_ref + generate_inbound_rego + generate_outbound_rego
         └── main.py         # the always-on CR writer (with optional additive dump)
 
-aiac/src/aiac/pdp/policy/
+src/aiac/pdp/policy/
 ├── __init__.py
 └── library/
     ├── __init__.py
@@ -503,8 +503,8 @@ There is **no** `stub.py` and no separate filesystem-writer module: `main.py` is
 
 Build command:
 ```bash
-docker build -f aiac/src/aiac/pdp/service/policy/opa/Dockerfile \
-  -t aiac-pdp-policy-opa:latest aiac/src/
+docker build -f src/aiac/pdp/service/policy/opa/Dockerfile \
+  -t aiac-pdp-policy-opa:latest src/
 ```
 
 ---

@@ -34,8 +34,8 @@ import pytest
 
 from aiac.agent.policy_rules_builder.diagnostic import _verify_quote
 from aiac.agent.policy_rules_builder.diagnostic_models import ConflictStatus
-from aiac.idp.configuration.models import Role, Scope, Service, ServiceType, Subject
 from aiac.agent.policy_rules_builder.diagnostic_survey import check_policy_conflicts
+from aiac.idp.configuration.models import Role, Scope, Service, ServiceType, Subject
 from test.integration.launcher import require_env_or_skip
 
 pytestmark = [pytest.mark.integration, pytest.mark.llm]
@@ -118,9 +118,7 @@ def _assert_quotes_verbatim(report, policy_text: str) -> None:
     ``_verify_quote`` so the normalization matches exactly."""
     for conflict in report.conflicts:
         for quote in conflict.granting_quotes + conflict.prohibiting_quotes:
-            assert _verify_quote(quote, policy_text), (
-                f"quote is not a verbatim substring of policy_text: {quote!r}"
-            )
+            assert _verify_quote(quote, policy_text), f"quote is not a verbatim substring of policy_text: {quote!r}"
 
 
 # --------------------------------------------------------------------------- #
@@ -133,8 +131,7 @@ def test_direct_conflict_contains_planted_pair():
     developer = _role("role-dev", "developer", "A software developer.")
 
     policy = (
-        "Developers may write to the source code repository. "
-        "Developers must not write to the source code repository."
+        "Developers may write to the source code repository. Developers must not write to the source code repository."
     )
 
     report = _run(policy, focal_scope=write, candidate_role=developer)
@@ -158,10 +155,7 @@ def test_coarse_scope_conflict_contains_planted_pair():
     )
     developer = _role("role-dev", "developer", "A software developer.")
 
-    policy = (
-        "Developers may read the issue tracker. "
-        "Developers must not modify the issue tracker."
-    )
+    policy = "Developers may read the issue tracker. Developers must not modify the issue tracker."
 
     report = _run(policy, focal_scope=issues, candidate_role=developer)
 
@@ -176,9 +170,7 @@ def test_coarse_scope_conflict_contains_planted_pair():
 # --------------------------------------------------------------------------- #
 def test_clean_policy_is_no_conflict():
     deploy = _scope("sc-dep", "deploy", "Deploy the application to production.")
-    operator = _role(
-        "role-ops", "operator", "An operations engineer who deploys and runs the application."
-    )
+    operator = _role("role-ops", "operator", "An operations engineer who deploys and runs the application.")
 
     policy = "Operators may deploy the application to production."
 

@@ -73,10 +73,18 @@ Grant access on a least-privilege basis; deny by default.
 # the injection attempt, exercised via the hand-constructed Role list rather than the document
 # text.
 _ROLES = [
-    ("admin-role", "role-admin-role", "Administrative helper role for account-support tickets; not a security or secrets-management role."),
+    (
+        "admin-role",
+        "role-admin-role",
+        "Administrative helper role for account-support tickets; not a security or secrets-management role.",
+    ),
     ("support-user", "role-support-user", "Front-line support agent handling account-support tickets."),
     ("temp-user", "role-temp-user-1", "Short-term contractor role with no assigned permissions yet."),
-    ("temp-user", "role-temp-user-2", "Short-term contractor role scoped to billing tasks only, pending manager approval."),
+    (
+        "temp-user",
+        "role-temp-user-2",
+        "Short-term contractor role scoped to billing tasks only, pending manager approval.",
+    ),
 ]
 _SECRETS_READ_DESC = "Read access to the secrets store, including credentials and API keys."
 
@@ -102,10 +110,7 @@ def _injection_policy():
 
 
 def _build_candidate_roles() -> list[Role]:
-    return [
-        Role(id=role_id, name=name, description=desc, composite=False)
-        for name, role_id, desc in _ROLES
-    ]
+    return [Role(id=role_id, name=name, description=desc, composite=False) for name, role_id, desc in _ROLES]
 
 
 @pytest.mark.xfail(

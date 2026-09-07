@@ -34,8 +34,5 @@ mcp_services = v1.list_namespaced_service(
 
 for svc in mcp_services.items:
     # Build the internal ClusterIP endpoint
-    cluster_url = (
-        f"http://{svc.metadata.name}.{svc.metadata.namespace}"
-        f".svc.cluster.local:{svc.spec.ports[0].port}/mcp"
-    )
+    cluster_url = f"http://{svc.metadata.name}.{svc.metadata.namespace}.svc.cluster.local:{svc.spec.ports[0].port}/mcp"
     print(f"Discovered available tool endpoint: {cluster_url}")

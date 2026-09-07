@@ -1,5 +1,3 @@
-import os
-import json
 import pytest
 from starlette.testclient import TestClient
 from starlette.applications import Starlette

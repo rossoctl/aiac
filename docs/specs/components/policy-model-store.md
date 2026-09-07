@@ -38,7 +38,7 @@ The SPM is the **source of truth**. The PDP Policy Writer retains sole ownership
 
 ### Policy Model Store Service
 
-**Location:** `aiac/src/aiac/policy/model_store/service/`
+**Location:** `src/aiac/policy/model_store/service/`
 
 **Port:** `0.0.0.0:7074`
 
@@ -135,7 +135,7 @@ segment).
 **File structure:**
 
 ```
-aiac/src/aiac/policy/model_store/service/
+src/aiac/policy/model_store/service/
 ├── __init__.py
 ├── Dockerfile
 ├── requirements.txt
@@ -144,8 +144,8 @@ aiac/src/aiac/policy/model_store/service/
 
 Build command (run from repo root):
 ```bash
-docker build -f aiac/src/aiac/policy/model_store/service/Dockerfile \
-  -t aiac-policy-model-store:latest aiac/src/
+docker build -f src/aiac/policy/model_store/service/Dockerfile \
+  -t aiac-policy-model-store:latest src/
 ```
 
 ---

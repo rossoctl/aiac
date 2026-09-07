@@ -32,8 +32,7 @@ AGENTS: dict[str, dict] = {
         "delegation_scopes": {},
         "roles": {
             "agent-role-intake-operations": (
-                "Covers both reading and writing patient records — looking at record contents and "
-                "updating them."
+                "Covers both reading and writing patient records — looking at record contents and updating them."
             ),
         },
     },
@@ -52,8 +51,7 @@ AGENTS: dict[str, dict] = {
         "delegation_scopes": {},
         "roles": {
             "agent-role-billing-operations": (
-                "Covers both reading and writing patient invoices. Not yet handed to any target in "
-                "the policy text."
+                "Covers both reading and writing patient invoices. Not yet handed to any target in the policy text."
             ),
         },
     },

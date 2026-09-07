@@ -382,7 +382,7 @@ The PCE is the **single point of coordination** between the Policy Model Store a
 
 ### 7.5 Library
 
-Python package at `aiac/src/`. Clean `idp` / `pdp` / `policy` namespace split:
+Python package at `src/`. Clean `idp` / `pdp` / `policy` namespace split:
 
 **IdP library** (Keycloak entity management):
 - **`aiac.idp.configuration.models`** — dependency-free Pydantic models for IdP entities (`Subject`, `Role`, `Service`, `Scope`). Plain pydantic models with default field-based equality; not hashable and not used as dict keys.
@@ -474,11 +474,11 @@ Four separate manifest files:
 
 | File | Contents |
 |------|----------|
-| `aiac/k8s/pdp-interface-deployment.yaml` | `aiac-pdp-config` ConfigMap + Rossoctl Interface Pod Deployment (IdP Configuration Service container + PDP Policy Writer container) + two ClusterIP Services (`aiac-pdp-config-service:7071`, `aiac-pdp-policy-service:7072`) |
-| `aiac/k8s/policy-model-store-statefulset.yaml` | `aiac-policy-model-store` StatefulSet (Policy Model Store container) + `volumeClaimTemplate` (1 Gi, `ReadWriteOnce`, mounted at `/data`) + headless Service + `aiac-policy-model-store-service:7074` ClusterIP Service |
-| `aiac/k8s/agent-deployment.yaml` | Agent Pod Deployment (AIAC Agent container) + ClusterIP Service _(Phase 1; `aiac-init` init container added in Phase 2, issue 4.21)_ |
-| `aiac/k8s/event-broker-deployment.yaml` _(pending)_ | Event Broker Pod Deployment (NATS JetStream) + ClusterIP Service |
-| `aiac/k8s/rag-statefulset.yaml` _(pending)_ | RAG StatefulSet (ChromaDB + RAG Ingest Service + Policy Guardrails Agent containers) + 1 Gi PVC template + ClusterIP Service (ChromaDB + RAG Ingest Service ports only — the Policy Guardrails Agent is pod-local, not on the ClusterIP Service) |
+| `k8s/pdp-interface-deployment.yaml` | `aiac-pdp-config` ConfigMap + Rossoctl Interface Pod Deployment (IdP Configuration Service container + PDP Policy Writer container) + two ClusterIP Services (`aiac-pdp-config-service:7071`, `aiac-pdp-policy-service:7072`) |
+| `k8s/policy-model-store-statefulset.yaml` | `aiac-policy-model-store` StatefulSet (Policy Model Store container) + `volumeClaimTemplate` (1 Gi, `ReadWriteOnce`, mounted at `/data`) + headless Service + `aiac-policy-model-store-service:7074` ClusterIP Service |
+| `k8s/agent-deployment.yaml` | Agent Pod Deployment (AIAC Agent container) + ClusterIP Service _(Phase 1; `aiac-init` init container added in Phase 2, issue 4.21)_ |
+| `k8s/event-broker-deployment.yaml` _(pending)_ | Event Broker Pod Deployment (NATS JetStream) + ClusterIP Service |
+| `k8s/rag-statefulset.yaml` _(pending)_ | RAG StatefulSet (ChromaDB + RAG Ingest Service + Policy Guardrails Agent containers) + 1 Gi PVC template + ClusterIP Service (ChromaDB + RAG Ingest Service ports only — the Policy Guardrails Agent is pod-local, not on the ClusterIP Service) |
 
 Both Interface Pod containers mount `aiac-pdp-config` (KEYCLOAK_URL, KEYCLOAK_REALM, KEYCLOAK_ADMIN_REALM) as env vars; only the IdP Configuration Service container also mounts `keycloak-admin-secret` (KEYCLOAK_ADMIN_USERNAME, KEYCLOAK_ADMIN_PASSWORD) and uses `KEYCLOAK_ADMIN_REALM` (ignoring `KEYCLOAK_REALM`). The PDP Policy Writer (`aiac-pdp-policy-opa`, the Phase 1 rego-file mock) needs no Keycloak credentials — it writes `.rego` files to `REGO_OUTPUT_DIR` (default `/rego`, an `emptyDir` volume). The Policy Model Store container mounts `aiac-policy-model-store-config` for `SERVICEPOLICY_DB_PATH` (default `/data/policy_model.db`) — no Kubernetes API access or RBAC required.
 
@@ -488,16 +488,16 @@ Built independently. No entry in the repo's `build.yaml` CI matrix.
 
 ```bash
 # Build IdP Configuration Service (Rossoctl Interface Pod container 1)
-docker build -f aiac/src/aiac/idp/service/configuration/keycloak/Dockerfile -t aiac-pdp-config:latest aiac/src/
+docker build -f src/aiac/idp/service/configuration/keycloak/Dockerfile -t aiac-pdp-config:latest src/
 
 # Build PDP Policy Writer — Phase 1 OPA rego-file mock (Rossoctl Interface Pod container 2; writes .rego to filesystem)
-docker build -f aiac/src/aiac/pdp/service/policy/opa/Dockerfile -t aiac-pdp-policy-opa:latest aiac/src/
+docker build -f src/aiac/pdp/service/policy/opa/Dockerfile -t aiac-pdp-policy-opa:latest src/
 
 # Build Policy Model Store (deployed as StatefulSet aiac-policy-model-store)
-docker build -f aiac/src/aiac/policy/model_store/service/Dockerfile -t aiac-policy-model-store:latest aiac/src/
+docker build -f src/aiac/policy/model_store/service/Dockerfile -t aiac-policy-model-store:latest src/
 
 # Build Agent (aiac-init init container deferred to Phase 2, issue 4.21)
-docker build -f aiac/src/aiac/agent/controller/Dockerfile -t aiac-agent:latest aiac/src/
+docker build -f src/aiac/agent/controller/Dockerfile -t aiac-agent:latest src/
 
 # Build RAG Ingest Service
 docker build -t aiac-rag-ingest:latest aiac/rag-ingest/
@@ -548,7 +548,7 @@ Update `KEYCLOAK_URL` and `KEYCLOAK_REALM` for the target environment before app
 
 ## 9. Testing
 
-Tests live in `aiac/test/`.
+Tests live in `test/`.
 
 ### Unit tests
 

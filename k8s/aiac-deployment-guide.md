@@ -19,28 +19,28 @@ This guide covers the full AIAC deployment in the `aiac-system` namespace.
 
 ## 1 — Build the images
 
-Run from the repo root (`cortex/`):
+Run from the repo root:
 
 ```bash
 # IdP Configuration Service (Interface Pod container 1)
 # Build context is the component directory (Dockerfile copies requirements.txt + main.py from there)
-docker build -f aiac/src/aiac/idp/service/configuration/keycloak/Dockerfile \
+docker build -f src/aiac/idp/service/configuration/keycloak/Dockerfile \
   -t localhost/aiac-pdp-config:local \
-  aiac/src/aiac/idp/service/configuration/keycloak/
+  src/aiac/idp/service/configuration/keycloak/
 
 # PDP Policy Writer — Phase 1 OPA rego-file mock (Interface Pod container 2, writes .rego to filesystem)
-# Build context is aiac/src/ (the OPA Dockerfile COPYs the whole tree and sets PYTHONPATH)
-docker build -f aiac/src/aiac/pdp/service/policy/opa/Dockerfile \
+# Build context is src/ (the OPA Dockerfile COPYs the whole tree and sets PYTHONPATH)
+docker build -f src/aiac/pdp/service/policy/opa/Dockerfile \
   -t localhost/aiac-pdp-policy-opa:local \
-  aiac/src/
+  src/
 
 # Policy Model Store
-docker build -f aiac/src/aiac/policy/model_store/service/Dockerfile \
-  -t localhost/aiac-policy-model-store:local aiac/src/
+docker build -f src/aiac/policy/model_store/service/Dockerfile \
+  -t localhost/aiac-policy-model-store:local src/
 
-# AIAC Agent (also used as the aiac-init init container, via a command override) — context: aiac/src/
-docker build -f aiac/src/aiac/agent/controller/Dockerfile \
-  -t localhost/aiac-agent:local aiac/src/
+# AIAC Agent (also used as the aiac-init init container, via a command override) — context: src/
+docker build -f src/aiac/agent/controller/Dockerfile \
+  -t localhost/aiac-agent:local src/
 ```
 
 The Event Broker uses the stock `nats:2.14-alpine` image (pinned in
@@ -142,17 +142,17 @@ Apply in dependency order:
 
 ```bash
 # 1. Interface Pod — creates the namespace, ConfigMap, Secret, and ClusterIP Services
-kubectl apply -f aiac/k8s/pdp-interface-deployment.yaml
+kubectl apply -f k8s/pdp-interface-deployment.yaml
 
 # 2. Event Broker — NATS JetStream, no dependencies
-kubectl apply -f aiac/k8s/event-broker-deployment.yaml
+kubectl apply -f k8s/event-broker-deployment.yaml
 
 # 3. Policy Model Store — needs the aiac-system namespace
-kubectl apply -f aiac/k8s/policy-model-store-statefulset.yaml
+kubectl apply -f k8s/policy-model-store-statefulset.yaml
 
 # 4. Agent — aiac-init waits for NATS + Interface Pod to be healthy (it does not
 #    currently gate on Policy Model Store readiness)
-kubectl apply -f aiac/k8s/agent-deployment.yaml
+kubectl apply -f k8s/agent-deployment.yaml
 ```
 
 Wait for all pods to be ready:
@@ -242,9 +242,9 @@ pkill -f "port-forward.*7071"
 
 ```bash
 # Rebuild the changed image, e.g. IdP Configuration Service (context: the service dir):
-docker build -f aiac/src/aiac/idp/service/configuration/keycloak/Dockerfile \
+docker build -f src/aiac/idp/service/configuration/keycloak/Dockerfile \
   -t localhost/aiac-pdp-config:local \
-  aiac/src/aiac/idp/service/configuration/keycloak/
+  src/aiac/idp/service/configuration/keycloak/
 kind load docker-image localhost/aiac-pdp-config:local --name <cluster-name>
 
 # Restart the affected deployment:
@@ -265,8 +265,8 @@ See issue [4.18 — K8s: OPA PDP Policy Writer AuthorizationPolicy CR + RBAC upg
 
 ```bash
 # Rebuild the OPA PDP Policy Writer image with the Phase 2 (CR-backed) implementation
-docker build -f aiac/src/aiac/pdp/service/policy/opa/Dockerfile \
-  -t localhost/aiac-pdp-policy-opa:local aiac/src/
+docker build -f src/aiac/pdp/service/policy/opa/Dockerfile \
+  -t localhost/aiac-pdp-policy-opa:local src/
 kind load docker-image localhost/aiac-pdp-policy-opa:local --name <cluster-name>
 ```
 
@@ -277,7 +277,7 @@ kind load docker-image localhost/aiac-pdp-policy-opa:local --name <cluster-name>
 To test the IdP Configuration Service in isolation without deploying the full stack, use the standalone dev pod manifest:
 
 ```bash
-kubectl apply -f aiac/k8s/idp-configuration-keycloak-pod.yaml
+kubectl apply -f k8s/idp-configuration-keycloak-pod.yaml
 kubectl wait pod/idp-configuration-keycloak-pod -n aiac-system \
   --for=condition=Ready --timeout=60s
 ```

@@ -5,7 +5,6 @@ Module for A2A Agent.
 import asyncio
 import concurrent.futures
 import logging
-import os
 import sys
 import traceback
 

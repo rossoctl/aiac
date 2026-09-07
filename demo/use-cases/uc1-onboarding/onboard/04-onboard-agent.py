@@ -12,7 +12,18 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 
 import scenario as scn
-from _lib import GENERATED, capture_rego, connect_admin, load_config, note, ok, onboard, port_forward, resolve_service_id, say
+from _lib import (
+    GENERATED,
+    capture_rego,
+    connect_admin,
+    load_config,
+    note,
+    ok,
+    onboard,
+    port_forward,
+    resolve_service_id,
+    say,
+)
 
 
 def main() -> None:
@@ -24,7 +35,13 @@ def main() -> None:
     note(f"service id: {service_id}")
 
     say("2", "3", "Onboard (POST /apply/service/{id}) — this drives the PRB and can take minutes")
-    with port_forward(cfg.controller_target, namespace=cfg.controller_namespace, local_port=cfg.controller_local_port, remote_port=cfg.controller_remote_port, ready_url=f"http://127.0.0.1:{cfg.controller_local_port}/health") as base_url:
+    with port_forward(
+        cfg.controller_target,
+        namespace=cfg.controller_namespace,
+        local_port=cfg.controller_local_port,
+        remote_port=cfg.controller_remote_port,
+        ready_url=f"http://127.0.0.1:{cfg.controller_local_port}/health",
+    ) as base_url:
         onboard(cfg, base_url, service_id)
     ok("onboarding call returned 200")
 

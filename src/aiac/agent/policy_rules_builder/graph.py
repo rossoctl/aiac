@@ -116,7 +116,9 @@ class AuditVerdict(BaseModel):
 
 class PolicyRulesBuilderBaseError(Exception): ...
 
+
 class PolicyRulesBuilderError(PolicyRulesBuilderBaseError): ...
+
 
 class LLMAccessError(PolicyRulesBuilderBaseError):
     """Raised by ``_structured_call`` when the LLM endpoint stays unreachable after the transport
@@ -124,11 +126,13 @@ class LLMAccessError(PolicyRulesBuilderBaseError):
     it never carries the endpoint / host / API key; the raw transport error is chained on
     ``__cause__`` for internal logging only."""
 
+
 class UnparseableLLMResponseError(PolicyRulesBuilderBaseError):
     """Raised by ``_structured_call`` when the LLM is REACHABLE but its response cannot be parsed /
     fails schema validation (a non-transient failure, so it is not retried). Distinct from
     ``LLMAccessError`` (endpoint unreachable) so a consumer can tell the two apart. Sanitized the
     same way -- no endpoint / host / API key in the message; original error chained on ``__cause__``."""
+
 
 class PolicyContradictionError(PolicyRulesBuilderBaseError):
     """Raised when the policy GENUINELY both grants and prohibits the same (focal, candidate) pair
@@ -405,9 +409,7 @@ def build_role_graph(*, deny_only: bool = False):
         return _precheck(s, candidate_names={sc.name for sc in s["scopes"]})
 
     def audit(s: RoleRulesState) -> dict[str, Any]:
-        return _audit(
-            s, focal=_role_focal(s["role"]), candidates=_scope_cands(s["scopes"]), direction=_ROLE_DIRECTION
-        )
+        return _audit(s, focal=_role_focal(s["role"]), candidates=_scope_cands(s["scopes"]), direction=_ROLE_DIRECTION)
 
     def build(s: RoleRulesState) -> dict[str, Any]:
         # DENY from the exclusivity complement + explicit prohibitions -- every rule rebuilt from
@@ -450,9 +452,7 @@ def build_scope_graph():
         return _precheck(s, candidate_names={r.name for r in s["roles"]})
 
     def audit(s: ScopeRulesState) -> dict[str, Any]:
-        return _audit(
-            s, focal=_scope_focal(s["scope"]), candidates=_role_cands(s["roles"]), direction=_SCOPE_DIRECTION
-        )
+        return _audit(s, focal=_scope_focal(s["scope"]), candidates=_role_cands(s["roles"]), direction=_SCOPE_DIRECTION)
 
     def build(s: ScopeRulesState) -> dict[str, Any]:
         # ALLOW from granted names, DENY from explicit prohibitions -- every rule rebuilt from the

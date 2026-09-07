@@ -59,6 +59,4 @@ def log_by_type(exc: BaseException) -> None:
     exception class name and its sanitized summary; the traceback and chained root cause
     ride along on ``exc_info`` for the operator, never in the caller's HTTP response body.
     """
-    logging.getLogger(_logger_name_for(exc)).error(
-        "%s: %s", type(exc).__name__, exc, exc_info=exc
-    )
+    logging.getLogger(_logger_name_for(exc)).error("%s: %s", type(exc).__name__, exc, exc_info=exc)

@@ -342,9 +342,7 @@ def opa_eval(rego_paths: list[Path], query: str, input_doc: dict) -> bool:
         "--stdin-input",
         query,
     ]
-    out = subprocess.run(
-        cmd, input=json.dumps(input_doc), capture_output=True, text=True, check=True
-    ).stdout
+    out = subprocess.run(cmd, input=json.dumps(input_doc), capture_output=True, text=True, check=True).stdout
     return json.loads(out)["result"][0]["expressions"][0]["value"]
 
 
@@ -404,9 +402,7 @@ def expected_inbound(scenario: ModuleType, subject: str, agent_id: str) -> bool:
     agent = scenario.AGENTS[agent_id]
     agent_scopes = set(agent["inbound_scopes"]) | set(agent.get("delegation_scopes", {}))
     via_inbound = any(r == role and s in agent_scopes for r, s in scenario.INBOUND_PAIRS)
-    via_target_delegation = any(
-        r == role and s in agent_scopes for r, s in scenario.OUTBOUND_SUBJECT_PAIRS
-    )
+    via_target_delegation = any(r == role and s in agent_scopes for r, s in scenario.OUTBOUND_SUBJECT_PAIRS)
     return via_inbound or via_target_delegation
 
 
@@ -451,10 +447,7 @@ def _outbound_explanation(scenario: ModuleType, subject: str, agent_id: str, sco
     if subject_ok and agent_ok:
         return f"role '{role}' is entitled to scope '{scope}' AND '{agent_id}' is entitled to it"
     if not subject_ok and not agent_ok:
-        return (
-            f"role '{role}' is not entitled to scope '{scope}', and neither is '{agent_id}' — "
-            "denied on both sides"
-        )
+        return f"role '{role}' is not entitled to scope '{scope}', and neither is '{agent_id}' — denied on both sides"
     if not subject_ok:
         return f"role '{role}' is not entitled to scope '{scope}' (even though '{agent_id}' is)"
     return f"'{agent_id}' is not entitled to scope '{scope}' (even though role '{role}' is)"
@@ -552,7 +545,10 @@ def pipeline() -> dict[str, dict]:
             os.environ["AIAC_POLICY_FILE"] = str(scenario_dir / scenario.POLICY_FILE)
             log.info(
                 "scenario %s: realm=%s policy=%s rego_dir=%s",
-                name, scenario.REALM_DEFAULT, os.environ["AIAC_POLICY_FILE"], rego_dir,
+                name,
+                scenario.REALM_DEFAULT,
+                os.environ["AIAC_POLICY_FILE"],
+                rego_dir,
             )
 
             idp = Service("aiac.idp.service.configuration.keycloak.main:app", port=idp_port, host=idp_host)
@@ -638,9 +634,7 @@ def _inbound_cases() -> list[tuple[str, str, str]]:
 
 
 @pytest.mark.parametrize("scenario_name,agent_id,subject", _inbound_cases())
-def test_inbound(
-    pipeline: dict[str, dict], scenario_name: str, agent_id: str, subject: str, record_property
-) -> None:
+def test_inbound(pipeline: dict[str, dict], scenario_name: str, agent_id: str, subject: str, record_property) -> None:
     """The generated inbound gate allows a user iff their role may reach that agent's own scope."""
     scenario = SCENARIOS[scenario_name]
     role = scenario.USERS[subject]
@@ -652,8 +646,7 @@ def test_inbound(
     expected = expected_inbound(scenario, subject, agent_id)
     record_property(
         "description",
-        f"Can '{subject}' (subject, role '{role}') access '{agent_id}' (agent) in the "
-        f"'{scenario_name}' scenario?",
+        f"Can '{subject}' (subject, role '{role}') access '{agent_id}' (agent) in the '{scenario_name}' scenario?",
     )
     record_property("expected", expected)
     record_property("expected_explanation", _inbound_explanation(scenario, subject, agent_id))
@@ -667,15 +660,11 @@ def test_inbound(
         assert not expected, f"{agent_id} produced no inbound rego but {subject} is expected to reach it"
         return
 
-    allowed = opa_eval(
-        [rego], "data.authbridge.client.inbound.request.allow", {"identity": {"subject": subject}}
-    )
+    allowed = opa_eval([rego], "data.authbridge.client.inbound.request.allow", {"identity": {"subject": subject}})
     record_property("output", allowed)
     record_property(
         "llm_reasoning",
-        "\n".join(
-            f"scope '{s}': {reasoning_by_scope.get(s, 'no reasoning recorded')}" for s in agent_scopes
-        ),
+        "\n".join(f"scope '{s}': {reasoning_by_scope.get(s, 'no reasoning recorded')}" for s in agent_scopes),
     )
     assert allowed == expected
 
@@ -731,8 +720,7 @@ def test_outbound(
     record_property("output", allowed)
     reasoning_lines = [f"subject-side (scope '{scope}'): {reasoning_by_scope.get(scope, 'no reasoning recorded')}"]
     reasoning_lines += [
-        f"agent-side (role '{r}'): {reasoning_by_agent_role.get(r, 'no reasoning recorded')}"
-        for r in agent_role_names
+        f"agent-side (role '{r}'): {reasoning_by_agent_role.get(r, 'no reasoning recorded')}" for r in agent_role_names
     ]
     record_property("llm_reasoning", "\n".join(reasoning_lines))
     assert allowed == expected
@@ -798,9 +786,5 @@ def test_identity_confusion_probes(pipeline: dict[str, dict], scenario_name: str
     scenario_result = _require_scenario(pipeline, scenario_name)
     for subject, agent_id, expected in probes:
         rego = _rego_path(scenario_result["rego_dir"], agent_id, "inbound")
-        allowed = opa_eval(
-            [rego], "data.authbridge.client.inbound.request.allow", {"identity": {"subject": subject}}
-        )
-        assert allowed == expected, (
-            f"{scenario_name}: identity-confusion probe subject={subject!r} agent={agent_id!r}"
-        )
+        allowed = opa_eval([rego], "data.authbridge.client.inbound.request.allow", {"identity": {"subject": subject}})
+        assert allowed == expected, f"{scenario_name}: identity-confusion probe subject={subject!r} agent={agent_id!r}"

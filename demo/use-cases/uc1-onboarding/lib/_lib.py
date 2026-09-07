@@ -24,7 +24,6 @@ from pathlib import Path
 from typing import Iterator
 
 import requests
-
 import scenario as scn
 
 HERE = Path(__file__).resolve().parent.parent  # lib/ -> uc1-onboarding/
@@ -183,13 +182,9 @@ def load_config() -> Config:
 
 
 def kubectl(*args: str, input_text: str | None = None, timeout: float = 60.0) -> str:
-    proc = subprocess.run(
-        ["kubectl", *args], input=input_text, capture_output=True, text=True, timeout=timeout
-    )
+    proc = subprocess.run(["kubectl", *args], input=input_text, capture_output=True, text=True, timeout=timeout)
     if proc.returncode != 0:
-        raise subprocess.CalledProcessError(
-            proc.returncode, ["kubectl", *args], output=proc.stdout, stderr=proc.stderr
-        )
+        raise subprocess.CalledProcessError(proc.returncode, ["kubectl", *args], output=proc.stdout, stderr=proc.stderr)
     return proc.stdout
 
 
@@ -214,12 +209,19 @@ def terminate(proc: subprocess.Popen) -> None:
 
 @contextmanager
 def port_forward(
-    target: str, *, namespace: str, local_port: int, remote_port: int,
-    ready_url: str | None = None, timeout: float = 30.0,
+    target: str,
+    *,
+    namespace: str,
+    local_port: int,
+    remote_port: int,
+    ready_url: str | None = None,
+    timeout: float = 30.0,
 ) -> Iterator[str]:
     proc = subprocess.Popen(
         ["kubectl", "port-forward", "-n", namespace, target, f"{local_port}:{remote_port}"],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
     )
     base_url = f"http://127.0.0.1:{local_port}"
     output: list[str] = []
@@ -370,8 +372,10 @@ def clear_policy_store(cfg: Config) -> None:
     on a surviving PV and onboarding appends with ``override=False``, so a store that answers with a
     non-2xx means the clear actually failed and this run would proceed on dirty state."""
     with port_forward(
-        cfg.store_target, namespace=cfg.store_namespace,
-        local_port=cfg.store_local_port, remote_port=cfg.store_remote_port,
+        cfg.store_target,
+        namespace=cfg.store_namespace,
+        local_port=cfg.store_local_port,
+        remote_port=cfg.store_remote_port,
         ready_url=f"http://127.0.0.1:{cfg.store_local_port}/health",
     ) as base_url:
         resp = requests.delete(f"{base_url}/policy/services", timeout=30)
@@ -383,7 +387,8 @@ def ensure_agent_policy(cfg: Config) -> None:
     """Ensure the PRB's ``policy.md`` (``scenario.POLICY_ABSTRACT``) is mounted on the Controller
     Deployment, rolling out only when the ConfigMap content or the mount actually changed."""
     cm = {
-        "apiVersion": "v1", "kind": "ConfigMap",
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
         "metadata": {"name": cfg.policy_configmap, "namespace": cfg.controller_namespace},
         "data": {"policy.md": scn.POLICY_ABSTRACT},
     }
@@ -391,8 +396,13 @@ def ensure_agent_policy(cfg: Config) -> None:
     cm_changed = "unchanged" not in apply_out
 
     mounted = kubectl(
-        "get", "deployment", cfg.controller_deployment, "-n", cfg.controller_namespace,
-        "-o", "jsonpath={.spec.template.spec.volumes[*].configMap.name}",
+        "get",
+        "deployment",
+        cfg.controller_deployment,
+        "-n",
+        cfg.controller_namespace,
+        "-o",
+        "jsonpath={.spec.template.spec.volumes[*].configMap.name}",
     )
     if cfg.policy_configmap in mounted.split():
         if cm_changed:
@@ -401,15 +411,33 @@ def ensure_agent_policy(cfg: Config) -> None:
         return
 
     patch = {
-        "spec": {"template": {"spec": {
-            "volumes": [{"name": "aiac-policy", "configMap": {"name": cfg.policy_configmap}}],
-            "containers": [{
-                "name": cfg.controller_deployment,
-                "volumeMounts": [{"name": "aiac-policy", "mountPath": cfg.policy_mount_path, "readOnly": True}],
-            }],
-        }}}
+        "spec": {
+            "template": {
+                "spec": {
+                    "volumes": [{"name": "aiac-policy", "configMap": {"name": cfg.policy_configmap}}],
+                    "containers": [
+                        {
+                            "name": cfg.controller_deployment,
+                            "volumeMounts": [
+                                {"name": "aiac-policy", "mountPath": cfg.policy_mount_path, "readOnly": True}
+                            ],
+                        }
+                    ],
+                }
+            }
+        }
     }
-    kubectl("patch", "deployment", cfg.controller_deployment, "-n", cfg.controller_namespace, "--type", "strategic", "-p", json.dumps(patch))
+    kubectl(
+        "patch",
+        "deployment",
+        cfg.controller_deployment,
+        "-n",
+        cfg.controller_namespace,
+        "--type",
+        "strategic",
+        "-p",
+        json.dumps(patch),
+    )
     kubectl_rollout_status(f"deployment/{cfg.controller_deployment}", namespace=cfg.controller_namespace)
 
 
@@ -426,8 +454,12 @@ def clear_writer_rego(cfg: Config) -> None:
     writer's rego" means "delete the CR" — the next onboard server-side-applies a fresh one.
     Idempotent: ``--ignore-not-found`` treats an already-absent CR as success."""
     kubectl(
-        "delete", AUTHZ_POLICY_RESOURCE, cfg.cr_name,
-        "-n", cfg.namespace, "--ignore-not-found",
+        "delete",
+        AUTHZ_POLICY_RESOURCE,
+        cfg.cr_name,
+        "-n",
+        cfg.namespace,
+        "--ignore-not-found",
     )
 
 
@@ -465,12 +497,20 @@ def ropc_login(cfg: Config, client_id: str, username: str, password: str) -> dic
     enabled). Aborts on any non-token response — this demo does a real login, not a stub."""
     resp = requests.post(
         f"{cfg.keycloak_url}/realms/{cfg.realm}/protocol/openid-connect/token",
-        data={"grant_type": "password", "client_id": client_id, "username": username, "password": password, "scope": "openid"},
+        data={
+            "grant_type": "password",
+            "client_id": client_id,
+            "username": username,
+            "password": password,
+            "scope": "openid",
+        },
         timeout=15,
     )
     body = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
     if resp.status_code != 200 or "access_token" not in body:
-        abort(f"ROPC login for {username!r} via {client_id!r} failed: HTTP {resp.status_code} — {body or resp.text[:300]}")
+        abort(
+            f"ROPC login for {username!r} via {client_id!r} failed: HTTP {resp.status_code} — {body or resp.text[:300]}"
+        )
     return body
 
 
@@ -528,10 +568,13 @@ def drive(username: str) -> None:
     # Fixed package + live-plugin input shape. This demo path is an end-user ROPC login with no
     # platform source client, so we send NO input.identity.client_id — source_ok is satisfied by
     # the writer's `source_ok if { not input.identity.client_id }` rule.
-    inbound_allowed = bool(opa_eval(
-        [inbound_rego], "data.authbridge.client.inbound.request.allow",
-        {"identity": {"subject": username}},
-    ))
+    inbound_allowed = bool(
+        opa_eval(
+            [inbound_rego],
+            "data.authbridge.client.inbound.request.allow",
+            {"identity": {"subject": username}},
+        )
+    )
     expected_in = scn.expected_inbound(username)
     if inbound_allowed != expected_in:
         abort(f"inbound mismatch for subject={username!r}: opa said {inbound_allowed}, expected {expected_in}")
@@ -555,16 +598,23 @@ def drive(username: str) -> None:
         abort(f"outbound rego at {outbound_rego} has no target_allow_scopes — is the tool onboarded?")
     target_uri = next(iter(target_scopes))
 
-    token_exchange(cfg, client_id=agent_client_id, client_secret_value=secret, subject_token=subject_token, audience=target_uri)
+    token_exchange(
+        cfg, client_id=agent_client_id, client_secret_value=secret, subject_token=subject_token, audience=target_uri
+    )
     note(f"exchanged token; aud includes {target_uri}")
 
     rows: list[tuple[str, ...]] = []
     for intent in scn.INTENTS[username]:
-        allowed = bool(opa_eval(
-            [outbound_rego], "data.authbridge.client.outbound.request.allow",
-            {"identity": {"subject": username, "service_id": target_uri},
-             "mcp": {"params": {"name": intent.function_name}}},
-        ))
+        allowed = bool(
+            opa_eval(
+                [outbound_rego],
+                "data.authbridge.client.outbound.request.allow",
+                {
+                    "identity": {"subject": username, "service_id": target_uri},
+                    "mcp": {"params": {"name": intent.function_name}},
+                },
+            )
+        )
         expected_out = scn.expected_outbound(username, intent.function_name)
         if allowed != expected_out:
             abort(

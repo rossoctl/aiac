@@ -19,6 +19,9 @@
 # Env vars:
 #   OPERATOR_DIR        path to the rossoctl/operator repo clone (bundle-service)
 #   ROSSOCTL_DIR        path to the rossoctl/rossoctl repo clone (the chart)
+#   CORTEX_DIR          path to the rossoctl/cortex repo clone; the authbridge
+#                       source built in Step 2 lives there, not in this repo
+#                       (default: ../cortex)
 #   CLUSTER_NAME        kind cluster name                 (default: rossoctl)
 #   RELEASE_NAME        helm release name                 (default: rossoctl)
 #   RELEASE_NAMESPACE   namespace the chart is installed in (default: rossoctl-system)
@@ -29,10 +32,14 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CORTEX_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-OPERATOR_DIR="${OPERATOR_DIR:-$(cd "$CORTEX_DIR/../operator" 2>/dev/null && pwd || echo "")}"
-ROSSOCTL_DIR="${ROSSOCTL_DIR:-$(cd "$CORTEX_DIR/../rossoctl" 2>/dev/null && pwd || echo "")}"
+OPERATOR_DIR="${OPERATOR_DIR:-$(cd "$REPO_ROOT/../operator" 2>/dev/null && pwd || echo "")}"
+ROSSOCTL_DIR="${ROSSOCTL_DIR:-$(cd "$REPO_ROOT/../rossoctl" 2>/dev/null && pwd || echo "")}"
+# The authbridge source built in Step 2 lives in the cortex monorepo, not in
+# this extracted repo — default to a sibling ../cortex clone, override with
+# CORTEX_DIR.
+CORTEX_DIR="${CORTEX_DIR:-$(cd "$REPO_ROOT/../cortex" 2>/dev/null && pwd || echo "")}"
 CLUSTER_NAME="${CLUSTER_NAME:-rossoctl}"
 RELEASE_NAME="${RELEASE_NAME:-rossoctl}"
 RELEASE_NAMESPACE="${RELEASE_NAMESPACE:-rossoctl-system}"
@@ -45,6 +52,12 @@ if [ -z "$OPERATOR_DIR" ] || [ ! -d "$OPERATOR_DIR" ]; then
 fi
 if [ -z "$ROSSOCTL_DIR" ] || [ ! -d "$ROSSOCTL_DIR" ]; then
   echo "ERROR: Set ROSSOCTL_DIR to point to your rossoctl/rossoctl repo clone" >&2
+  exit 1
+fi
+if [ -z "$CORTEX_DIR" ] || [ ! -d "$CORTEX_DIR/authbridge" ]; then
+  echo "ERROR: Set CORTEX_DIR to point to your rossoctl/cortex repo clone" >&2
+  echo "       (Step 2 builds the authbridge-proxy image from \$CORTEX_DIR/authbridge," >&2
+  echo "        which lives in the cortex monorepo, not in this repo)" >&2
   exit 1
 fi
 

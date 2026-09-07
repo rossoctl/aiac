@@ -3,7 +3,7 @@ KEYCLOAK_VERSION := 26.6.3
 
 JAR := target/aiac-event-listener-$(SPI_VERSION).jar
 
-REGISTRY  ?= ghcr.io/rossoctl/cortex
+REGISTRY  ?= ghcr.io/rossoctl/lab-aiac
 IMAGE     ?= aiac-keycloak-event-listener
 IMAGE_TAG ?= $(SPI_VERSION)-kc$(KEYCLOAK_VERSION)
 IMAGE_REF := $(REGISTRY)/$(IMAGE):$(IMAGE_TAG)

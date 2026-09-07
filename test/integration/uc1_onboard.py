@@ -60,13 +60,13 @@ if str(REPO_ROOT) not in sys.path:  # so ``import test.integration.*`` resolves
 
 from test.integration import scenario_uc1 as scn  # noqa: E402
 from test.integration.launcher import (  # noqa: E402
-    inbound_probe,
     inbound_outcome,
+    inbound_probe,
     kubectl,
     kubectl_rollout_status,
     mint_token,
-    outbound_probe,
     outbound_outcome,
+    outbound_probe,
     poll_until,
     port_forward,
     require_env,
@@ -348,8 +348,13 @@ def ensure_agent_policy(namespace: str, policy_md: str = scn.POLICY_ABSTRACT) ->
     cm_changed = "unchanged" not in apply_out
 
     mounted = kubectl(
-        "get", "deployment", CONTROLLER_DEPLOYMENT, "-n", namespace,
-        "-o", "jsonpath={.spec.template.spec.volumes[*].configMap.name}",
+        "get",
+        "deployment",
+        CONTROLLER_DEPLOYMENT,
+        "-n",
+        namespace,
+        "-o",
+        "jsonpath={.spec.template.spec.volumes[*].configMap.name}",
     )
     if POLICY_CONFIGMAP in mounted.split():
         # Already mounted, so no deployment patch (and thus no rollout) is triggered. But a projected
@@ -363,19 +368,30 @@ def ensure_agent_policy(namespace: str, policy_md: str = scn.POLICY_ABSTRACT) ->
         return  # already mounted — content is now current
 
     patch = {
-        "spec": {"template": {"spec": {
-            "volumes": [{"name": "aiac-policy", "configMap": {"name": POLICY_CONFIGMAP}}],
-            "containers": [{
-                "name": CONTROLLER_DEPLOYMENT,
-                "volumeMounts": [
-                    {"name": "aiac-policy", "mountPath": POLICY_MOUNT_PATH, "readOnly": True}
-                ],
-            }],
-        }}}
+        "spec": {
+            "template": {
+                "spec": {
+                    "volumes": [{"name": "aiac-policy", "configMap": {"name": POLICY_CONFIGMAP}}],
+                    "containers": [
+                        {
+                            "name": CONTROLLER_DEPLOYMENT,
+                            "volumeMounts": [{"name": "aiac-policy", "mountPath": POLICY_MOUNT_PATH, "readOnly": True}],
+                        }
+                    ],
+                }
+            }
+        }
     }
     kubectl(
-        "patch", "deployment", CONTROLLER_DEPLOYMENT, "-n", namespace,
-        "--type", "strategic", "-p", json.dumps(patch),
+        "patch",
+        "deployment",
+        CONTROLLER_DEPLOYMENT,
+        "-n",
+        namespace,
+        "--type",
+        "strategic",
+        "-p",
+        json.dumps(patch),
     )
     kubectl_rollout_status(f"deployment/{CONTROLLER_DEPLOYMENT}", namespace=namespace)
 
@@ -393,13 +409,26 @@ def _set_controller_default_effect(namespace: str, effect: str) -> None:
     merge patch is keyed on the env-var ``name``, so it upserts just this one var and leaves the
     Controller's other env untouched."""
     patch = {
-        "spec": {"template": {"spec": {"containers": [
-            {"name": CONTROLLER_DEPLOYMENT, "env": [{"name": DEFAULT_EFFECT_ENV, "value": effect}]}
-        ]}}}
+        "spec": {
+            "template": {
+                "spec": {
+                    "containers": [
+                        {"name": CONTROLLER_DEPLOYMENT, "env": [{"name": DEFAULT_EFFECT_ENV, "value": effect}]}
+                    ]
+                }
+            }
+        }
     }
     kubectl(
-        "patch", "deployment", CONTROLLER_DEPLOYMENT, "-n", namespace,
-        "--type", "strategic", "-p", json.dumps(patch),
+        "patch",
+        "deployment",
+        CONTROLLER_DEPLOYMENT,
+        "-n",
+        namespace,
+        "--type",
+        "strategic",
+        "-p",
+        json.dumps(patch),
     )
     kubectl("rollout", "restart", f"deployment/{CONTROLLER_DEPLOYMENT}", "-n", namespace)
     kubectl_rollout_status(f"deployment/{CONTROLLER_DEPLOYMENT}", namespace=namespace)
@@ -409,9 +438,7 @@ def onboard(base_url: str, service_id: str) -> None:
     """``POST /apply/service/{service_id}`` against the Controller; assert 200. This upserts the
     ``AuthorizationPolicy`` CR on the live Kubernetes API (bundle-service picks it up)."""
     resp = requests.post(f"{base_url}/apply/service/{service_id}", timeout=ONBOARD_TIMEOUT)
-    assert resp.status_code == 200, (
-        f"onboard {service_id!r} at {base_url}: HTTP {resp.status_code} — {resp.text[:500]}"
-    )
+    assert resp.status_code == 200, f"onboard {service_id!r} at {base_url}: HTTP {resp.status_code} — {resp.text[:500]}"
 
 
 def delete_agent_cr() -> None:
@@ -420,8 +447,13 @@ def delete_agent_cr() -> None:
     SPIFFE SA segment). Ignored if absent; a delete failure is logged, not raised."""
     try:
         kubectl(
-            "delete", "authorizationpolicy", scn.AGENT_WORKLOAD, "-n", NAMESPACE,
-            "--ignore-not-found", timeout=60,
+            "delete",
+            "authorizationpolicy",
+            scn.AGENT_WORKLOAD,
+            "-n",
+            NAMESPACE,
+            "--ignore-not-found",
+            timeout=60,
         )
     except subprocess.CalledProcessError as exc:
         log.warning("delete_agent_cr: %s", (exc.stderr or exc.output or exc))
@@ -455,14 +487,18 @@ def ensure_github_tool_route(namespace: str) -> None:
     ConfigMap if it does not exist. Idempotent: a second call is a no-op when the route is present."""
     tool = scn.TOOL_WORKLOAD
     route_block = (
-        f'- host: "{tool}"\n'
-        f'  target_audience: "{_tool_audience()}"\n'
-        f'  token_scopes: "openid {_tool_aud_scope()}"\n'
+        f'- host: "{tool}"\n  target_audience: "{_tool_audience()}"\n  token_scopes: "openid {_tool_aud_scope()}"\n'
     )
     try:
         current = kubectl(
-            "get", "configmap", "authproxy-routes", "-n", namespace,
-            "-o", r"jsonpath={.data.routes\.yaml}", timeout=30,
+            "get",
+            "configmap",
+            "authproxy-routes",
+            "-n",
+            namespace,
+            "-o",
+            r"jsonpath={.data.routes\.yaml}",
+            timeout=30,
         )
     except subprocess.CalledProcessError:
         current = ""  # ConfigMap (or key) absent — treat as empty, create below
@@ -474,13 +510,22 @@ def ensure_github_tool_route(namespace: str) -> None:
     patch = {"data": {"routes.yaml": new_routes}}
     try:
         kubectl(
-            "patch", "configmap", "authproxy-routes", "-n", namespace,
-            "--type", "merge", "-p", json.dumps(patch), timeout=30,
+            "patch",
+            "configmap",
+            "authproxy-routes",
+            "-n",
+            namespace,
+            "--type",
+            "merge",
+            "-p",
+            json.dumps(patch),
+            timeout=30,
         )
     except subprocess.CalledProcessError:
         # ConfigMap does not exist yet — create it with just the github-tool route.
         cm = {
-            "apiVersion": "v1", "kind": "ConfigMap",
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
             "metadata": {"name": "authproxy-routes", "namespace": namespace},
             "data": {"routes.yaml": new_routes},
         }
@@ -688,9 +733,7 @@ def onboarded_stack(
     provision_realm_and_users(admin, TEST_REALM)  # BEFORE onboarding (PRB reads the role universe)
     # username->sub mapper + Direct Access Grants are a one-time realm prereq the fixture does NOT
     # provision; skip (don't fail) if a token can't be minted or its ``sub`` isn't the username.
-    verify_subject_mapper(
-        keycloak_url=keycloak_url, realm=TEST_REALM, user="dev-user", password=scn.USER_PASSWORD
-    )
+    verify_subject_mapper(keycloak_url=keycloak_url, realm=TEST_REALM, user="dev-user", password=scn.USER_PASSWORD)
 
     tool_onboarded = scn.TOOL_WORKLOAD in workloads
     signals = list(ready_signals) if ready_signals is not None else _default_ready_signals(tool_onboarded)
@@ -702,9 +745,7 @@ def onboarded_stack(
         if default_effect_applied:
             _set_controller_default_effect(CONTROLLER_NAMESPACE, default_effect)  # BEFORE onboarding
         ensure_agent_policy(CONTROLLER_NAMESPACE, policy_md=policy_md)  # mount this run's policy.md
-        service_ids = [
-            resolve_service_id(admin, TEST_REALM, f"{NAMESPACE}/{workload}") for workload in workloads
-        ]
+        service_ids = [resolve_service_id(admin, TEST_REALM, f"{NAMESPACE}/{workload}") for workload in workloads]
         # Bind the onboard port-forward to the resolved **live** Controller pod, not the Service:
         # the rollouts above can leave an old pod ``Terminating`` that the Service still routes to,
         # dropping the long onboard POST mid-flight (see ``resolve_controller_pod``). An explicit

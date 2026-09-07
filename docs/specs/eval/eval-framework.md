@@ -4,7 +4,7 @@
 
 This document specifies an evaluation framework for AIAC, designed independently
 of the evaluation suite that previously lived at `test/integration/eval/` and
-has since been relocated to `aiac/eval/` (see §11) (the "legacy suite"). The
+has since been relocated to `eval/` (see §11) (the "legacy suite"). The
 legacy suite's *implementation* — Keycloak
 provisioning helpers, the `opa eval` invocation wrapper, the synthetic
 Role/Scope fixture builder, and its report-generation `conftest.py` hooks —
@@ -293,7 +293,7 @@ shouldn't have.
 ## 11. Repository structure and migration
 
 - The existing suite at `test/integration/eval/` is **moved** (not left in
-  place, not rebuilt from scratch alongside it) to **`aiac/eval/`** — a
+  place, not rebuilt from scratch alongside it) to **`eval/`** — a
   top-level directory inside the `aiac/` package root, separate from
   `test/`.
 - Everything already implemented there that covers something this spec

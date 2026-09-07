@@ -8,14 +8,14 @@
 > general, and not the only integration-test PRD.
 
 ## Location
-`aiac/test/integration/test_policy_pipeline.py` — a pytest module marked `@pytest.mark.integration`.
-It imports two shared modules: `aiac/test/integration/scenario_uc1.py` — the canonical `github-agent`
+`test/integration/test_policy_pipeline.py` — a pytest module marked `@pytest.mark.integration`.
+It imports two shared modules: `test/integration/scenario_uc1.py` — the canonical `github-agent`
 scenario as pure data (the role→access truth table the *Expected output* renders — the pair-lists,
 expressed over the **discovered, workload-prefixed** names `github-tool.source-read`,
-`github-agent.source_operations`, …) — and `aiac/test/integration/uc1_onboard.py` — the shared live
+`github-agent.source_operations`, …) — and `test/integration/uc1_onboard.py` — the shared live
 harness (Keycloak provisioning/cleanup, the `POST /apply/service/{id}` onboard trigger, the outbound
 token-exchange-leg prep, the bundle-convergence poll, and the live decision oracle + probes). The
-harness in turn builds on `aiac/test/integration/launcher.py`'s live-cluster half (`kubectl` wrappers,
+harness in turn builds on `test/integration/launcher.py`'s live-cluster half (`kubectl` wrappers,
 `port_forward`, `resolve_pod`, `mint_token`, `inbound_probe` / `outbound_probe`, `inbound_outcome` /
 `outbound_outcome`, `poll_until`, and the skip gates). There is **no** standalone Rego module and **no**
 `opa` binary here anymore: the evaluator is the deployed AuthBridge OPA plugin (see *[What it
