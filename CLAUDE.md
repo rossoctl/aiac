@@ -13,33 +13,6 @@ For current file list, `ls docs/specs/` and `ls docs/specs/components/`.
 
 When a document under `docs/specs/` contains a markdown link to another file, use the AskUserQuestion tool to ask before reading it — present "Yes" and "No" as clickable options. If the user picks Yes, read the file normally. If No, treat the link as a label and continue without reading it.
 
-## Issue tracking
-
-Issues are tracked as **GitHub issues** on the `s-and-p-team/cortex` repo,
-organized in the org-level **AIAC** Project (Projects v2):
-<https://github.com/orgs/s-and-p-team/projects/1>. Use `gh` to read and manage
-them.
-
-Note: `s-and-p-team/cortex` is the AIAC team's fork of the canonical upstream
-`rossoctl/cortex`. Tracking issues on the fork (not upstream) is deliberate —
-PRs still target upstream, but issue tracking stays on the team fork, so the
-`-R s-and-p-team/cortex` scoping below is intentional.
-
-Hierarchy: the Project groups **Feature**-typed container issues — one per
-component area, nested via GitHub **native sub-issues** to form the tree — over
-**Task**-typed leaf issues. Every issue carries the `aiac` label plus cumulative
-`area:<path>` labels; open issues also carry a `status:<value>` label, and the
-Project's built-in **Status** field mirrors that value.
-
-```bash
-# list / view (filter to the AIAC set)
-gh issue list -R s-and-p-team/cortex --label aiac --state all
-gh issue view <number> -R s-and-p-team/cortex
-```
-
-Filtered web list:
-<https://github.com/s-and-p-team/cortex/issues?q=is%3Aissue+label%3Aaiac>
-
 ## Issue tracking — codebase inspection policy
 
 When working on an issue would benefit from inspecting the relevant source code, use the AskUserQuestion tool to ask before doing so — present "Yes" and "No" as clickable options. If the user picks Yes, inspect the codebase normally. If No, work from the issue description and existing context only.
@@ -70,15 +43,39 @@ ls src/aiac/<subsystem>/               # drill into any layer
 **Unit test command:**
 
 ```bash
-.venv/bin/pytest test/ -m "not integration"
+.venv/bin/pytest test/
 ```
 
-The whole `test/` tree collects and runs green — no `--ignore` flags are needed.
-(This wasn't always true: the Policy Computation Engine was migrated to the SPM
-store surface in Wave 3, which resolved the earlier PCE-chain collection
+`pyproject.toml`'s `addopts` defaults `-m` to excluding every live-infra marker
+(`integration`, `eval_extended`, `eval_consistency`,
+`eval_robustness`), so a bare invocation never makes a real LLM/Keycloak
+call. The whole `test/` tree collects and runs green — no `--ignore` flags are
+needed. (This wasn't always true: the Policy Computation Engine was migrated to
+the SPM store surface in Wave 3, which resolved the earlier PCE-chain collection
 failures.)
 
+The `-m "not integration"` expression needs no external services. The live-LLM
+PRB suite (below) is marked **both** `integration` and `llm` — `integration`
+because it calls a real LLM endpoint, so `-m "not integration"` already deselects
+it (the routine collected count is unchanged by it); `llm` so it can be selected
+on its own, cluster-free, via `-m llm`.
+
 Use `ls test/` / `find test -type d` to discover current test directories.
+
+**Live-LLM PRB tests** (`-m llm`) run the **real** LLM end-to-end through the
+Policy Rules Builder (`test/agent/policy_rules_builder/test_graph_live_llm.py`)
+and assert the emitted `(name, effect)` rule set matches the policy text — for
+allow-only policies and for policies with explicit / description-driven /
+exclusivity denies. Only the role/scope **descriptions** and the **policy
+source** are mocked in-process (the `_structured_call` LLM seam is left live), so
+the suite needs **no Kubernetes and no Keycloak** — only an LLM endpoint. It
+reuses the same `LLM_BASE_URL` / `LLM_MODEL` / `LLM_API_KEY` env as the
+integration suite and **skips cleanly** when they are unset. Run it opt-in:
+
+```bash
+set -a; . test/integration/.env; set +a   # or export LLM_BASE_URL / LLM_MODEL / LLM_API_KEY
+.venv/bin/pytest test/ -m llm
+```
 
 **Integration tests** (`-m integration`) now close the **real OPA evaluation loop** — they onboard
 through the in-cluster Controller, then drive real HTTP requests **through AuthBridge** and assert the
@@ -98,6 +95,16 @@ set -a; . test/integration/.env; set +a
 ```
 
 When the cluster is not wired or the env is unset, the suite **skips cleanly** (it never false-passes).
+
+A passed `-m` always overrides the default, so this opts back into exactly
+`integration` (not the heavier markers below). Three heavier, narrower-infra
+markers exist alongside it — `eval_extended` (same live infra as
+`integration`, many more PRB/LLM calls), `eval_consistency` and
+`eval_robustness` (LLM only, no Keycloak/`opa`) — each invoked the same
+way, e.g. `pytest eval/ -m eval_extended`. See
+`docs/specs/eval/policy-eval-scenarios.md` and
+`docs/specs/eval/policy-eval-robustness-consistency.md` for their
+runbooks.
 
 **Smoke test** (requires live service at `AIAC_PDP_CONFIG_URL`, default `http://127.0.0.1:7071`):
 
@@ -210,11 +217,7 @@ demo workloads, which don't) and CPU/memory requests + limits.
 
 ### Issue tracker
 
-GitHub issues on `s-and-p-team/cortex`, filtered by the `aiac` label, tracked in the org-level AIAC Project. See `docs/agents/issue-tracker.md`.
-
-### Triage labels
-
-Issue status is tracked with `status:<value>` labels; the board's built-in **Status** field carries the same values. See `docs/agents/triage-labels.md`.
+GitHub issues on `s-and-p-team/cortex` (the origin fork), filtered by the `aiac` label. See `docs/agents/issue-tracker.md`.
 
 ### Domain docs
 

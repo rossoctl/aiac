@@ -29,11 +29,18 @@ from aiac.agent.eventbus.stream import (
     STREAM_NAME,
     ensure_stream,
 )
-from aiac.agent.uc.onboarding.orchestrator import onboard_service
+from aiac.agent.policy_rules_builder.conflict_detection import PolicyConflictError
+from aiac.agent.policy_rules_builder.graph import (
+    PolicyContradictionError,
+    PolicyRulesBuilderError,
+    UnparseableLLMResponseError,
+)
+from aiac.agent.shared.error_logging import log_by_type
+from aiac.agent.uc.onboarding.orchestrator import onboard_service, reenable_service
 from aiac.agent.uc.policy_update.build import build_policy
 from aiac.agent.uc.role_update.role import update_role
 from aiac.policy.computation import compute_and_apply
-from aiac.policy.model.models import PolicyRule
+from aiac.policy.model.models import PolicyRule, RuleEffect
 
 logger = logging.getLogger(__name__)
 
@@ -46,8 +53,24 @@ _SERVICE_PREFIX = "aiac.apply.service."
 _ROLE_PREFIX = "aiac.apply.role."
 _POLICY_BUILD_SUBJECT = "aiac.apply.policy.build"
 
+# PERMANENT failures: redelivery can never make them succeed (a real policy conflict /
+# contradiction, an unparseable LLM response, or a builder fault), so they are DLQ'd +
+# term()ed on the FIRST delivery. Everything else — LLMAccessError (a transient LLM
+# outage that may clear) and genuinely unknown/transient errors — is RETRYABLE: left
+# unacked to redeliver until MAX_DELIVER, then DLQ'd. LLMAccessError is a sibling of the
+# permanent PRB errors under PolicyRulesBuilderBaseError, so isinstance() below correctly
+# excludes it from the permanent set.
+_PERMANENT_ERRORS: tuple[type[Exception], ...] = (
+    PolicyConflictError,
+    PolicyContradictionError,
+    PolicyRulesBuilderError,
+    UnparseableLLMResponseError,
+)
 
-def _handle(subject: str) -> tuple[list[PolicyRule], bool]:
+
+def _handle(subject: str) -> tuple[list[PolicyRule], bool, RuleEffect]:
+    # Normalize every handler to ``(rules, override, default_effect)``. Only onboarding carries a
+    # caller-requestable ``default_effect``; the others always emit least-privilege ``DENY``.
     if subject.startswith(_SERVICE_PREFIX):
         return onboard_service(subject[len(_SERVICE_PREFIX) :])
     if subject.startswith(_ROLE_PREFIX):
@@ -55,9 +78,11 @@ def _handle(subject: str) -> tuple[list[PolicyRule], bool]:
         # contain '.', which NATS treats as a token separator, so the SPI percent-encodes them
         # into a single token before publishing. unquote() is the general-purpose inverse; safe
         # here because every literal '%' in the original name was itself escaped to "%25".
-        return update_role(unquote(subject[len(_ROLE_PREFIX) :]))
+        rules, override = update_role(unquote(subject[len(_ROLE_PREFIX) :]))
+        return rules, override, RuleEffect.DENY
     if subject == _POLICY_BUILD_SUBJECT:
-        return build_policy()
+        rules, override = build_policy()
+        return rules, override, RuleEffect.DENY
     raise ValueError(f"no handler for subject {subject!r}")
 
 
@@ -117,22 +142,33 @@ class AiacEventConsumer:
     async def _dispatch(self, msg: Msg) -> None:
         logger.info("received %s (delivery %d)", msg.subject, msg.metadata.num_delivered)
         try:
-            rules, override = _handle(msg.subject)
-            compute_and_apply(rules, override)
-        except Exception:
-            logger.exception("failed to process %s", msg.subject)
-            if msg.metadata.num_delivered >= MAX_DELIVER:
+            rules, override, default_effect = _handle(msg.subject)
+            compute_and_apply(rules, override, default_effect)
+            # UC1 only: re-enable the client AFTER a successful compute_and_apply, mirroring the
+            # HTTP route. If compute_and_apply raised above, this is skipped and the client stays
+            # disabled (the failed-service marker), never enabled-with-no-policy.
+            if msg.subject.startswith(_SERVICE_PREFIX):
+                reenable_service(msg.subject[len(_SERVICE_PREFIX) :])
+        except Exception as exc:
+            # Log exactly once, routed by exception TYPE to its per-persona named logger.
+            # FastAPI's exception handlers never fire on this path (there is no request), so
+            # this is the single place the failure is surfaced.
+            log_by_type(exc)
+            permanent = isinstance(exc, _PERMANENT_ERRORS)
+            if permanent or msg.metadata.num_delivered >= MAX_DELIVER:
                 # jetstream().publish() waits for the broker's PubAck and raises on failure —
                 # unlike the raw client's fire-and-forget publish() — so the message is only
                 # terminated once the DLQ write is confirmed persisted.
                 await self._nc.jetstream().publish(DLQ_SUBJECT, msg.data)
                 await msg.term()
                 logger.error(
-                    "moved %s to %s after %d deliveries",
+                    "moved %s to %s (%s failure after %d deliveries)",
                     msg.subject,
                     DLQ_SUBJECT,
+                    "permanent" if permanent else "retryable",
                     msg.metadata.num_delivered,
                 )
+            # Retryable + still under MAX_DELIVER: leave unacked so NATS redelivers.
             return
         await msg.ack()
         logger.info("acked %s", msg.subject)

@@ -14,16 +14,23 @@ from openai import APIConnectionError, APITimeoutError
 
 from aiac.agent.policy_rules_builder.graph import (
     AuditVerdict,
+    Contradiction,
+    LLMAccessError,
+    PolicyContradictionError,
+    PolicyRulesBuilderBaseError,
     PolicyRulesBuilderError,
     RoleSelection,
     ScopeSelection,
+    UnparseableLLMResponseError,
     _build_llm,
+    _llm_retry_config,
+    build_role_denies,
     build_role_rules,
     build_scope_rules,
 )
 from aiac.idp.configuration.models import Role, Scope
-from aiac.policy.model.models import PolicyRule
-from aiac.shared.upstream import is_transient
+from aiac.policy.model.models import PolicyRule, RuleEffect
+from aiac.shared.upstream import is_transient, max_retries
 
 
 # --------------------------------------------------------------------------- #
@@ -199,14 +206,17 @@ def test_auditor_rejects_past_budget_raises():
 
 
 # --------------------------------------------------------------------------- #
-# Slice 9 — a persistently-unavailable LLM is transport-retried UPSTREAM_MAX_    #
-# RETRIES times, then the original transport error propagates (never swallowed). #
+# Slice 9 — a persistently-unavailable LLM is transport-retried LLM_MAX_RETRIES  #
+# times (#166 gave the LLM seam its own knob, decoupled from UPSTREAM_MAX_        #
+# RETRIES), then #165 surfaces a TYPED LLMAccessError (not the raw transport      #
+# error) whose __cause__ chains back to the original ConnectionError.            #
 # time.sleep is patched so tenacity's backoff waits are skipped.               #
 # --------------------------------------------------------------------------- #
-def test_llm_unavailable_raises_after_upstream_max_retries(monkeypatch):
-    monkeypatch.setenv("UPSTREAM_MAX_RETRIES", "2")
+def test_llm_unavailable_raises_after_llm_max_retries(monkeypatch):
+    monkeypatch.setenv("LLM_MAX_RETRIES", "2")
 
-    invoke = MagicMock(side_effect=ConnectionError("down"))
+    original = ConnectionError("down")
+    invoke = MagicMock(side_effect=original)
     runnable = MagicMock()
     runnable.invoke = invoke
     llm = MagicMock()
@@ -216,10 +226,11 @@ def test_llm_unavailable_raises_after_upstream_max_retries(monkeypatch):
         stack.enter_context(patch("aiac.agent.policy_rules_builder.graph.get_policy_source", return_value=_Source()))
         stack.enter_context(patch("aiac.agent.policy_rules_builder.graph._build_llm", return_value=llm))
         stack.enter_context(patch("time.sleep"))  # NOT tenacity.nap.sleep (ineffective)
-        with pytest.raises(ConnectionError):
+        with pytest.raises(LLMAccessError) as exc:
             build_role_rules(_role(), [_scope("s-write", "write")])
 
-    assert invoke.call_count == 2
+    assert invoke.call_count == 2  # retry cadence unchanged
+    assert exc.value.__cause__ is original  # original transient chained, not swallowed
 
 
 # --------------------------------------------------------------------------- #
@@ -245,11 +256,13 @@ def test_openai_timeout_and_connection_errors_are_transient(exc):
 
 
 def test_llm_timeout_is_retried_then_reraised(monkeypatch):
-    """A never-returning LLM that raises APITimeoutError is retried UPSTREAM_MAX_RETRIES
-    times and then surfaces — proving the timeout path self-heals rather than wedging."""
-    monkeypatch.setenv("UPSTREAM_MAX_RETRIES", "2")
+    """A never-returning LLM that raises APITimeoutError is retried LLM_MAX_RETRIES
+    times and then surfaces as a TYPED LLMAccessError (#165) — proving the timeout path
+    self-heals rather than wedging, while the original timeout stays chained on __cause__."""
+    monkeypatch.setenv("LLM_MAX_RETRIES", "2")
 
-    invoke = MagicMock(side_effect=APITimeoutError(request=_openai_request()))
+    original = APITimeoutError(request=_openai_request())
+    invoke = MagicMock(side_effect=original)
     runnable = MagicMock()
     runnable.invoke = invoke
     llm = MagicMock()
@@ -259,10 +272,11 @@ def test_llm_timeout_is_retried_then_reraised(monkeypatch):
         stack.enter_context(patch("aiac.agent.policy_rules_builder.graph.get_policy_source", return_value=_Source()))
         stack.enter_context(patch("aiac.agent.policy_rules_builder.graph._build_llm", return_value=llm))
         stack.enter_context(patch("time.sleep"))
-        with pytest.raises(APITimeoutError):
+        with pytest.raises(LLMAccessError) as exc:
             build_role_rules(_role(), [_scope("s-write", "write")])
 
     assert invoke.call_count == 2
+    assert exc.value.__cause__ is original
 
 
 # --------------------------------------------------------------------------- #
@@ -290,3 +304,729 @@ def test_build_llm_defaults_timeout_on_bad_env(monkeypatch):
         _build_llm()
 
     assert mk.call_args.kwargs["timeout"] == 120
+
+
+# =========================================================================== #
+# #165 — the _structured_call seam surfaces TYPED, SANITIZED LLM-access errors  #
+# instead of reraising the raw transient/parse exception. From a consumer's     #
+# view an unreachable LLM (after retries) and a reachable-but-unparseable        #
+# response are two distinct, catchable types, and NEITHER message leaks the      #
+# endpoint / host / API key. Exercised at the same seam the transport slices     #
+# use: patch _build_llm so the real _structured_call runs against a mock invoke. #
+# The underlying error is loaded with a fake endpoint/host/key so the            #
+# sanitization assertion is meaningful.                                          #
+# =========================================================================== #
+_FAKE_ENDPOINT = "https://secret-llm.internal:8443/v1"
+_FAKE_HOST = "secret-llm.internal"
+_FAKE_KEY = "sk-supersecretapikey0123456789"
+_LEAK_SUBSTRINGS = (_FAKE_ENDPOINT, _FAKE_HOST, _FAKE_KEY)
+
+
+def _run_with_failing_invoke(error, monkeypatch):
+    """Drive build_role_rules with a mock LLM whose .invoke() always raises `error`, so the
+    real _structured_call runs its retry loop + typed-raise wrapper. Returns the raised
+    exception (captured via pytest.raises). Retries are bounded to 2 and backoff sleeps skipped."""
+    monkeypatch.setenv("LLM_MAX_RETRIES", "2")
+    invoke = MagicMock(side_effect=error)
+    runnable = MagicMock()
+    runnable.invoke = invoke
+    llm = MagicMock()
+    llm.with_structured_output.return_value = runnable
+
+    with ExitStack() as stack:
+        stack.enter_context(patch("aiac.agent.policy_rules_builder.graph.get_policy_source", return_value=_Source()))
+        stack.enter_context(patch("aiac.agent.policy_rules_builder.graph._build_llm", return_value=llm))
+        stack.enter_context(patch("time.sleep"))
+        with pytest.raises(PolicyRulesBuilderBaseError) as exc:
+            build_role_rules(_role(), [_scope("s-write", "write")])
+    return exc.value
+
+
+def test_transient_exhaustion_raises_sanitized_llm_access_error(monkeypatch):
+    # A transient error that never clears (retry budget exhausted) -> LLMAccessError, chained.
+    leaky = ConnectionError(f"cannot reach {_FAKE_ENDPOINT} host={_FAKE_HOST} key={_FAKE_KEY}")
+    raised = _run_with_failing_invoke(leaky, monkeypatch)
+
+    assert type(raised) is LLMAccessError  # exact type, not the raw ConnectionError
+    assert raised.__cause__ is leaky  # original transient chained
+    message = str(raised)
+    for secret in _LEAK_SUBSTRINGS:
+        assert secret not in message  # message is sanitized -- no endpoint/host/key leak
+
+
+def test_parse_error_raises_sanitized_unparseable_response_error(monkeypatch):
+    # A NON-transient failure (reachable LLM, but its response cannot be parsed / fails schema
+    # validation) is not retried; #165 surfaces it as UnparseableLLMResponseError, chained + sanitized.
+    leaky = ValueError(f"could not parse structured output from {_FAKE_ENDPOINT} host={_FAKE_HOST} key={_FAKE_KEY}")
+    raised = _run_with_failing_invoke(leaky, monkeypatch)
+
+    assert type(raised) is UnparseableLLMResponseError  # distinct from LLMAccessError
+    assert isinstance(raised, PolicyRulesBuilderBaseError)  # shares the PRB base hierarchy
+    assert raised.__cause__ is leaky  # original parse/validation error chained
+    message = str(raised)
+    for secret in _LEAK_SUBSTRINGS:
+        assert secret not in message  # message is sanitized -- no endpoint/host/key leak
+
+
+# =========================================================================== #
+# #123 — deny extraction from natural-language policy text.                    #
+# The proposer now returns explicit prohibitions (denied_* name lists) and an  #
+# exclusivity flag alongside its grants; build emits ALLOW rules for grants    #
+# and DENY rules for prohibitions (+ the derived exclusivity complement),      #
+# allows-first then denies, each in candidate order. All cases drive the       #
+# existing _structured_call seam — proposer + auditor turns interleaved.       #
+# =========================================================================== #
+
+
+# --------------------------------------------------------------------------- #
+# Slice A (tracer) — direct prohibition -> DENY, role direction. "developers    #
+# may read but must not touch issues": the proposer grants `read` and denies    #
+# `issues`; the auditor approves; an ALLOW(read) + DENY(issues) pair comes back.#
+# --------------------------------------------------------------------------- #
+def test_direct_prohibition_yields_deny_role_direction():
+    role = _role("r-dev", "developer")
+    read = _scope("s-read", "read")
+    issues = _scope("s-issues", "issues")
+
+    with ExitStack() as stack:
+        stack.enter_context(patch("aiac.agent.policy_rules_builder.graph.get_policy_source", return_value=_Source()))
+        stack.enter_context(
+            patch(
+                "aiac.agent.policy_rules_builder.graph._structured_call",
+                side_effect=[
+                    RoleSelection(
+                        granted_scope_names=["read"],
+                        denied_scope_names=["issues"],
+                        grant_is_exclusive=False,
+                        reasoning="may read but must not touch issues",
+                    ),
+                    AuditVerdict(approved=True),
+                ],
+            )
+        )
+        rules = build_role_rules(role, [read, issues])
+
+    assert rules == [
+        PolicyRule(role=role, scope=read, effect=RuleEffect.ALLOW),
+        PolicyRule(role=role, scope=issues, effect=RuleEffect.DENY),
+    ]
+
+
+# --------------------------------------------------------------------------- #
+# Slice B — symmetric direct prohibition -> DENY, scope direction. The scope is #
+# focal, roles are candidates: one role is granted access, another is denied.   #
+# --------------------------------------------------------------------------- #
+def test_direct_prohibition_yields_deny_scope_direction():
+    scope = _scope("s-audit", "audit-log")
+    security = _role("r-sec", "security")
+    intern = _role("r-int", "intern")
+
+    with ExitStack() as stack:
+        stack.enter_context(patch("aiac.agent.policy_rules_builder.graph.get_policy_source", return_value=_Source()))
+        stack.enter_context(
+            patch(
+                "aiac.agent.policy_rules_builder.graph._structured_call",
+                side_effect=[
+                    ScopeSelection(
+                        roles_with_access_names=["security"],
+                        roles_denied_access_names=["intern"],
+                        access_is_exclusive=False,
+                        reasoning="security may reach the audit log; interns must not",
+                    ),
+                    AuditVerdict(approved=True),
+                ],
+            )
+        )
+        rules = build_scope_rules([security, intern], scope)
+
+    assert rules == [
+        PolicyRule(role=security, scope=scope, effect=RuleEffect.ALLOW),
+        PolicyRule(role=intern, scope=scope, effect=RuleEffect.DENY),
+    ]
+
+
+# --------------------------------------------------------------------------- #
+# Slice C — exclusivity ("developers can ONLY access source") -> the derived    #
+# complement. grant_is_exclusive=True with granted=[source] over {source,       #
+# issues,deploy} yields ALLOW(source) + DENY(issues) + DENY(deploy). The        #
+# complement is DERIVED from the candidate set, not enumerated by the proposer  #
+# (denied_scope_names is empty).                                               #
+# --------------------------------------------------------------------------- #
+def test_exclusivity_derives_complement_role_direction():
+    role = _role("r-dev", "developer")
+    source = _scope("s-src", "source")
+    issues = _scope("s-iss", "issues")
+    deploy = _scope("s-dep", "deploy")
+
+    with ExitStack() as stack:
+        stack.enter_context(patch("aiac.agent.policy_rules_builder.graph.get_policy_source", return_value=_Source()))
+        stack.enter_context(
+            patch(
+                "aiac.agent.policy_rules_builder.graph._structured_call",
+                side_effect=[
+                    RoleSelection(
+                        granted_scope_names=["source"],
+                        denied_scope_names=[],
+                        grant_is_exclusive=True,
+                        reasoning="developers can only access source",
+                    ),
+                    AuditVerdict(approved=True),
+                ],
+            )
+        )
+        rules = build_role_rules(role, [source, issues, deploy])
+
+    assert rules == [
+        PolicyRule(role=role, scope=source, effect=RuleEffect.ALLOW),
+        PolicyRule(role=role, scope=issues, effect=RuleEffect.DENY),
+        PolicyRule(role=role, scope=deploy, effect=RuleEffect.DENY),
+    ]
+
+
+# --------------------------------------------------------------------------- #
+# Slice D — exclusivity symmetric, scope direction ("ONLY developers may access #
+# source"). access_is_exclusive=True with granted=[developer] over the role     #
+# candidate set denies every OTHER candidate role for the focal scope.         #
+# --------------------------------------------------------------------------- #
+def test_exclusivity_derives_complement_scope_direction():
+    scope = _scope("s-src", "source")
+    dev = _role("r-dev", "developer")
+    tester = _role("r-tst", "tester")
+    ops = _role("r-ops", "ops")
+
+    with ExitStack() as stack:
+        stack.enter_context(patch("aiac.agent.policy_rules_builder.graph.get_policy_source", return_value=_Source()))
+        stack.enter_context(
+            patch(
+                "aiac.agent.policy_rules_builder.graph._structured_call",
+                side_effect=[
+                    ScopeSelection(
+                        roles_with_access_names=["developer"],
+                        roles_denied_access_names=[],
+                        access_is_exclusive=True,
+                        reasoning="only developers may access source",
+                    ),
+                    AuditVerdict(approved=True),
+                ],
+            )
+        )
+        rules = build_scope_rules([dev, tester, ops], scope)
+
+    assert rules == [
+        PolicyRule(role=dev, scope=scope, effect=RuleEffect.ALLOW),
+        PolicyRule(role=tester, scope=scope, effect=RuleEffect.DENY),
+        PolicyRule(role=ops, scope=scope, effect=RuleEffect.DENY),
+    ]
+
+
+# --------------------------------------------------------------------------- #
+# Slice E — a NON-exclusive grant imposes nothing on the complement. "developers #
+# may access source" (grant_is_exclusive=False, no explicit deny) grants source  #
+# and leaves issues a silent non-grant -- no DENY(issues).                      #
+# --------------------------------------------------------------------------- #
+def test_non_exclusive_grant_imposes_no_complement_deny():
+    role = _role("r-dev", "developer")
+    source = _scope("s-src", "source")
+    issues = _scope("s-iss", "issues")
+
+    with ExitStack() as stack:
+        stack.enter_context(patch("aiac.agent.policy_rules_builder.graph.get_policy_source", return_value=_Source()))
+        stack.enter_context(
+            patch(
+                "aiac.agent.policy_rules_builder.graph._structured_call",
+                side_effect=[
+                    RoleSelection(
+                        granted_scope_names=["source"],
+                        denied_scope_names=[],
+                        grant_is_exclusive=False,
+                        reasoning="developers may access source",
+                    ),
+                    AuditVerdict(approved=True),
+                ],
+            )
+        )
+        rules = build_role_rules(role, [source, issues])
+
+    assert rules == [PolicyRule(role=role, scope=source, effect=RuleEffect.ALLOW)]
+
+
+# --------------------------------------------------------------------------- #
+# Slice F — a genuine grant/deny overlap on the same candidate (a coarse scope   #
+# "may read issues but must not modify them", where `issues` covers read+write)  #
+# is a contradiction. precheck flags issues in BOTH lists; the auditor           #
+# adjudicates it genuine, so the builder RAISES PolicyContradictionError         #
+# carrying the focal entity and the contradiction (with its description),        #
+# fail-closed -- no rule set is returned.                                       #
+# --------------------------------------------------------------------------- #
+def test_genuine_overlap_raises_policy_contradiction_error():
+    role = _role("r-dev", "developer")
+    issues = _scope("s-iss", "issues")
+
+    with ExitStack() as stack:
+        stack.enter_context(patch("aiac.agent.policy_rules_builder.graph.get_policy_source", return_value=_Source()))
+        stack.enter_context(
+            patch(
+                "aiac.agent.policy_rules_builder.graph._structured_call",
+                side_effect=[
+                    RoleSelection(
+                        granted_scope_names=["issues"],
+                        denied_scope_names=["issues"],
+                        grant_is_exclusive=False,
+                        reasoning="may read issues but must not modify them",
+                    ),
+                    AuditVerdict(
+                        approved=False,
+                        contradictions=[
+                            Contradiction(
+                                candidate_name="issues",
+                                description="coarse-scope granularity mismatch: issues covers read and write",
+                            )
+                        ],
+                    ),
+                ],
+            )
+        )
+        with pytest.raises(PolicyContradictionError) as exc:
+            build_role_rules(role, [issues])
+
+    # The raise carries the focal identity (its name appears) and all genuine contradictions,
+    # each with its description -- the report IS the raise; no rule set comes back.
+    assert role.name in exc.value.focal
+    assert [c.candidate_name for c in exc.value.contradictions] == ["issues"]
+    assert "coarse-scope" in exc.value.contradictions[0].description
+
+
+# --------------------------------------------------------------------------- #
+# Slice G — multiple genuine contradictions are reported in a SINGLE raise, so   #
+# the author can fix them all in one pass (not discover them one at a time).    #
+# --------------------------------------------------------------------------- #
+def test_multiple_contradictions_reported_in_one_raise():
+    role = _role("r-dev", "developer")
+    issues = _scope("s-iss", "issues")
+    deploy = _scope("s-dep", "deploy")
+
+    with ExitStack() as stack:
+        stack.enter_context(patch("aiac.agent.policy_rules_builder.graph.get_policy_source", return_value=_Source()))
+        stack.enter_context(
+            patch(
+                "aiac.agent.policy_rules_builder.graph._structured_call",
+                side_effect=[
+                    RoleSelection(
+                        granted_scope_names=["issues", "deploy"],
+                        denied_scope_names=["issues", "deploy"],
+                        grant_is_exclusive=False,
+                        reasoning="both coarse scopes are partly permitted and partly forbidden",
+                    ),
+                    AuditVerdict(
+                        approved=False,
+                        contradictions=[
+                            Contradiction(candidate_name="issues", description="direct policy conflict"),
+                            Contradiction(candidate_name="deploy", description="coarse-scope granularity mismatch"),
+                        ],
+                    ),
+                ],
+            )
+        )
+        with pytest.raises(PolicyContradictionError) as exc:
+            build_role_rules(role, [issues, deploy])
+
+    assert {c.candidate_name for c in exc.value.contradictions} == {"issues", "deploy"}
+
+
+# --------------------------------------------------------------------------- #
+# Slice H — a generation-error overlap is NOT a policy finding. The auditor      #
+# rejects the first proposal with contradictions=[] (ordinary rejection); the    #
+# builder threads the reason back, re-proposes cleanly, and the auditor          #
+# approves. Rules come back, no PolicyContradictionError is raised.             #
+# --------------------------------------------------------------------------- #
+def test_generation_error_overlap_retries_then_approves():
+    role = _role("r-dev", "developer")
+    issues = _scope("s-iss", "issues")
+
+    with ExitStack() as stack:
+        stack.enter_context(patch("aiac.agent.policy_rules_builder.graph.get_policy_source", return_value=_Source()))
+        sc = stack.enter_context(
+            patch(
+                "aiac.agent.policy_rules_builder.graph._structured_call",
+                side_effect=[
+                    RoleSelection(
+                        granted_scope_names=["issues"],
+                        denied_scope_names=["issues"],
+                        grant_is_exclusive=False,
+                        reasoning="accidentally listed issues in both",
+                    ),
+                    AuditVerdict(approved=False, reason="you listed issues as both granted and denied; pick one"),
+                    RoleSelection(
+                        granted_scope_names=["issues"],
+                        denied_scope_names=[],
+                        grant_is_exclusive=False,
+                        reasoning="issues is granted only",
+                    ),
+                    AuditVerdict(approved=True),
+                ],
+            )
+        )
+        rules = build_role_rules(role, [issues])
+
+    assert rules == [PolicyRule(role=role, scope=issues, effect=RuleEffect.ALLOW)]
+    # The re-proposal (3rd structured call) must carry the auditor's rejection reason.
+    reproposal_msg = sc.call_args_list[2].args[1][1].content
+    assert "pick one" in reproposal_msg
+
+
+# --------------------------------------------------------------------------- #
+# Slice I — an all-deny result (a prohibition with no current grant) is a valid, #
+# first-class output, NOT collapsed to []. It blocks a future broad grant under  #
+# deny-overrides.                                                               #
+# --------------------------------------------------------------------------- #
+def test_all_deny_result_is_first_class():
+    role = _role("r-dev", "developer")
+    issues = _scope("s-iss", "issues")
+
+    with ExitStack() as stack:
+        stack.enter_context(patch("aiac.agent.policy_rules_builder.graph.get_policy_source", return_value=_Source()))
+        stack.enter_context(
+            patch(
+                "aiac.agent.policy_rules_builder.graph._structured_call",
+                side_effect=[
+                    RoleSelection(
+                        granted_scope_names=[],
+                        denied_scope_names=["issues"],
+                        grant_is_exclusive=False,
+                        reasoning="developers must never touch issues",
+                    ),
+                    AuditVerdict(approved=True),
+                ],
+            )
+        )
+        rules = build_role_rules(role, [issues])
+
+    assert rules == [PolicyRule(role=role, scope=issues, effect=RuleEffect.DENY)]
+
+
+# --------------------------------------------------------------------------- #
+# Slice J — precheck drops a hallucinated DENIED name before the auditor sees it #
+# (symmetric with the existing granted-name hallucination-drop slice). "ghost"   #
+# is not a candidate, so the auditor audits only the real "issues" prohibition. #
+# --------------------------------------------------------------------------- #
+def test_precheck_drops_hallucinated_denied_name():
+    role = _role("r-dev", "developer")
+    issues = _scope("s-iss", "issues")
+
+    with ExitStack() as stack:
+        stack.enter_context(patch("aiac.agent.policy_rules_builder.graph.get_policy_source", return_value=_Source()))
+        sc = stack.enter_context(
+            patch(
+                "aiac.agent.policy_rules_builder.graph._structured_call",
+                side_effect=[
+                    RoleSelection(
+                        granted_scope_names=[],
+                        denied_scope_names=["issues", "ghost"],
+                        grant_is_exclusive=False,
+                        reasoning="must not touch issues",
+                    ),
+                    AuditVerdict(approved=True),
+                ],
+            )
+        )
+        rules = build_role_rules(role, [issues])
+
+    assert rules == [PolicyRule(role=role, scope=issues, effect=RuleEffect.DENY)]
+    auditor_msg = sc.call_args_list[1].args[1][1].content
+    assert "issues" in auditor_msg and "ghost" not in auditor_msg
+
+
+# --------------------------------------------------------------------------- #
+# Slice K — a single call mixing grants and prohibitions returns BOTH, ordered   #
+# deterministically: all ALLOWs first, then all DENYs, each in candidate order   #
+# (stable + diffable across runs).                                              #
+# --------------------------------------------------------------------------- #
+def test_mixed_allow_and_deny_ordered_allows_then_denies_candidate_order():
+    role = _role("r-dev", "developer")
+    source = _scope("s-src", "source")
+    issues = _scope("s-iss", "issues")
+    deploy = _scope("s-dep", "deploy")
+    audit = _scope("s-aud", "audit")
+
+    with ExitStack() as stack:
+        stack.enter_context(patch("aiac.agent.policy_rules_builder.graph.get_policy_source", return_value=_Source()))
+        stack.enter_context(
+            patch(
+                "aiac.agent.policy_rules_builder.graph._structured_call",
+                side_effect=[
+                    RoleSelection(
+                        granted_scope_names=["source", "deploy"],
+                        denied_scope_names=["issues", "audit"],
+                        grant_is_exclusive=False,
+                        reasoning="may access source and deploy; must not touch issues or audit",
+                    ),
+                    AuditVerdict(approved=True),
+                ],
+            )
+        )
+        # Candidate order: source, issues, deploy, audit.
+        rules = build_role_rules(role, [source, issues, deploy, audit])
+
+    assert rules == [
+        PolicyRule(role=role, scope=source, effect=RuleEffect.ALLOW),
+        PolicyRule(role=role, scope=deploy, effect=RuleEffect.ALLOW),
+        PolicyRule(role=role, scope=issues, effect=RuleEffect.DENY),
+        PolicyRule(role=role, scope=audit, effect=RuleEffect.DENY),
+    ]
+
+
+# --------------------------------------------------------------------------- #
+# Slice L — prompt content. (a) The proposer AND the auditor are told the        #
+# deny/exclusivity contract (a one-sided rule would let them diverge): explicit  #
+# prohibitions -> deny, and restrictive "only" closes the set. (b) The POLICY    #
+# block labels the baseline as grants-only and the scenario separately, so       #
+# deny/exclusivity binds to the scenario layer only. Asserted on the captured    #
+# message content at the _structured_call seam.                                 #
+# --------------------------------------------------------------------------- #
+def _capture_first_two_messages():
+    """Run one happy build_role_rules and return (proposer_msgs, auditor_msgs) as captured at the
+    seam. Each is [SystemMessage, HumanMessage]."""
+    role = _role("r-dev", "developer")
+    write = _scope("s-write", "write")
+    with ExitStack() as stack:
+        stack.enter_context(
+            patch("aiac.agent.policy_rules_builder.graph.get_policy_source", return_value=_Source("SCEN-TEXT"))
+        )
+        sc = stack.enter_context(
+            patch(
+                "aiac.agent.policy_rules_builder.graph._structured_call",
+                side_effect=[
+                    RoleSelection(granted_scope_names=["write"], reasoning="r"),
+                    AuditVerdict(approved=True),
+                ],
+            )
+        )
+        build_role_rules(role, [write])
+    return sc.call_args_list[0].args[1], sc.call_args_list[1].args[1]
+
+
+def test_proposer_and_auditor_share_deny_and_exclusivity_contract():
+    proposer_msgs, auditor_msgs = _capture_first_two_messages()
+    for msgs in (proposer_msgs, auditor_msgs):
+        system = msgs[0].content.lower()
+        assert "prohibition" in system or "must not" in system  # explicit-prohibition -> deny
+        assert "only" in system and "exclusiv" in system  # restrictive "only" closes the set
+
+
+def test_policy_block_labels_baseline_grants_only_and_scenario():
+    proposer_msgs, _ = _capture_first_two_messages()
+    human = proposer_msgs[1].content
+    assert "BASELINE POLICY" in human and "grants only" in human
+    assert "SCENARIO POLICY" in human
+    # The scenario text sits under the SCENARIO label, after the baseline.
+    assert human.index("BASELINE POLICY") < human.index("SCENARIO POLICY") < human.index("SCEN-TEXT")
+
+
+# --------------------------------------------------------------------------- #
+# Door B — user-role-focal DENY-only pass (build_role_denies). Same graph as    #
+# build_role_rules (propose/precheck/audit), but the build node keeps ONLY the  #
+# DENY effects: the scope-focal pass stays the single grant authority, so Door  #
+# B never emits an ALLOW. These slices mirror the exclusivity/prohibition/       #
+# permissive fixtures above but assert the deny-only projection.                #
+# --------------------------------------------------------------------------- #
+def test_door_b_exclusivity_yields_complement_denies_only():
+    # "Testers may access only issues" -> grant issues (exclusive) over the focus's own
+    # scopes {issues, source-read, source-write}; Door B emits the DERIVED complement DENY on
+    # every other own scope and DROPS the ALLOW(issues) that the scope-focal pass owns.
+    tester = _role("r-tst", "tester")
+    issues = _scope("s-iss", "issues")
+    source_read = _scope("s-sr", "source-read")
+    source_write = _scope("s-sw", "source-write")
+
+    with ExitStack() as stack:
+        stack.enter_context(patch("aiac.agent.policy_rules_builder.graph.get_policy_source", return_value=_Source()))
+        stack.enter_context(
+            patch(
+                "aiac.agent.policy_rules_builder.graph._structured_call",
+                side_effect=[
+                    RoleSelection(
+                        granted_scope_names=["issues"],
+                        denied_scope_names=[],
+                        grant_is_exclusive=True,
+                        reasoning="testers may access only issues",
+                    ),
+                    AuditVerdict(approved=True),
+                ],
+            )
+        )
+        rules = build_role_denies(tester, [issues, source_read, source_write])
+
+    # DENY-only: no ALLOW(issues); the complement (source-read, source-write) in candidate order.
+    assert rules == [
+        PolicyRule(role=tester, scope=source_read, effect=RuleEffect.DENY),
+        PolicyRule(role=tester, scope=source_write, effect=RuleEffect.DENY),
+    ]
+
+
+def test_door_b_permissive_policy_is_noop():
+    # A non-exclusive grant with no explicit prohibition imposes nothing -> Door B returns [].
+    tester = _role("r-tst", "tester")
+    issues = _scope("s-iss", "issues")
+    source = _scope("s-src", "source")
+
+    with ExitStack() as stack:
+        stack.enter_context(patch("aiac.agent.policy_rules_builder.graph.get_policy_source", return_value=_Source()))
+        stack.enter_context(
+            patch(
+                "aiac.agent.policy_rules_builder.graph._structured_call",
+                side_effect=[
+                    RoleSelection(
+                        granted_scope_names=["issues"],
+                        denied_scope_names=[],
+                        grant_is_exclusive=False,
+                        reasoning="testers may access issues",
+                    ),
+                    AuditVerdict(approved=True),
+                ],
+            )
+        )
+        rules = build_role_denies(tester, [issues, source])
+
+    assert rules == []
+
+
+def test_door_b_explicit_prohibition_deny_only():
+    # An explicit prohibition ("DevOps may not access source") emits the DENY and, being
+    # deny-only, contributes no ALLOW even if the proposer also named a grant.
+    devops = _role("r-ops", "devops")
+    source = _scope("s-src", "source")
+    issues = _scope("s-iss", "issues")
+
+    with ExitStack() as stack:
+        stack.enter_context(patch("aiac.agent.policy_rules_builder.graph.get_policy_source", return_value=_Source()))
+        stack.enter_context(
+            patch(
+                "aiac.agent.policy_rules_builder.graph._structured_call",
+                side_effect=[
+                    RoleSelection(
+                        granted_scope_names=["issues"],
+                        denied_scope_names=["source"],
+                        grant_is_exclusive=False,
+                        reasoning="devops may not access source",
+                    ),
+                    AuditVerdict(approved=True),
+                ],
+            )
+        )
+        rules = build_role_denies(devops, [source, issues])
+
+    assert rules == [PolicyRule(role=devops, scope=source, effect=RuleEffect.DENY)]
+
+
+# =========================================================================== #
+# #166 — the PRB LLM seam (_structured_call) gets its OWN retry cadence,        #
+# independent of the shared UPSTREAM_MAX_RETRIES that governs the IdP/MCP/K8s   #
+# transport seams. Knobs: LLM_MAX_RETRIES (default 3), LLM_RETRY_BACKOFF_MIN    #
+# (default 1), LLM_RETRY_BACKOFF_MAX (default 30), each read at call time and   #
+# tolerant of unset / non-numeric values (mirrors _request_timeout). Exercised  #
+# at the same seam the transport slices use: set the env knobs and patch        #
+# _build_llm so the real _structured_call runs its retry loop against a mock     #
+# invoke; time.sleep is patched so tenacity's backoff waits are skipped.        #
+# =========================================================================== #
+def test_llm_retry_config_defaults_when_unset(monkeypatch):
+    # Every knob unset -> the issue's stated defaults 3 / 1 / 30.
+    for var in ("LLM_MAX_RETRIES", "LLM_RETRY_BACKOFF_MIN", "LLM_RETRY_BACKOFF_MAX"):
+        monkeypatch.delenv(var, raising=False)
+
+    cfg = _llm_retry_config()
+
+    assert (cfg.max_retries, cfg.backoff_min, cfg.backoff_max) == (3, 1, 30)
+
+
+def _failing_llm(error):
+    """Build a mock LLM whose .invoke() always raises `error`, so the real _structured_call
+    runs its retry loop against it. Returns (llm, invoke_mock)."""
+    invoke = MagicMock(side_effect=error)
+    runnable = MagicMock()
+    runnable.invoke = invoke
+    llm = MagicMock()
+    llm.with_structured_output.return_value = runnable
+    return llm, invoke
+
+
+def test_structured_call_honors_llm_max_retries(monkeypatch):
+    # The LLM loop's attempt count comes from LLM_MAX_RETRIES; UPSTREAM_MAX_RETRIES is set high on
+    # purpose and must be ignored here (proves the loop reads the dedicated knob, not the shared one).
+    monkeypatch.setenv("LLM_MAX_RETRIES", "2")
+    monkeypatch.setenv("UPSTREAM_MAX_RETRIES", "5")
+
+    llm, invoke = _failing_llm(ConnectionError("down"))
+
+    with ExitStack() as stack:
+        stack.enter_context(patch("aiac.agent.policy_rules_builder.graph.get_policy_source", return_value=_Source()))
+        stack.enter_context(patch("aiac.agent.policy_rules_builder.graph._build_llm", return_value=llm))
+        stack.enter_context(patch("time.sleep"))
+        with pytest.raises(LLMAccessError):
+            build_role_rules(_role(), [_scope("s-write", "write")])
+
+    assert invoke.call_count == 2  # LLM_MAX_RETRIES, not UPSTREAM_MAX_RETRIES (=5)
+
+
+def test_structured_call_backoff_bounds_from_env(monkeypatch):
+    # The exponential-backoff bounds flow from LLM_RETRY_BACKOFF_MIN / _MAX into the retry wait.
+    # One attempt (no sleep) is enough: we assert the wait_exponential CONSTRUCTION bounds.
+    monkeypatch.setenv("LLM_MAX_RETRIES", "1")
+    monkeypatch.setenv("LLM_RETRY_BACKOFF_MIN", "7")
+    monkeypatch.setenv("LLM_RETRY_BACKOFF_MAX", "9")
+
+    llm, _ = _failing_llm(ConnectionError("down"))
+
+    with ExitStack() as stack:
+        stack.enter_context(patch("aiac.agent.policy_rules_builder.graph.get_policy_source", return_value=_Source()))
+        stack.enter_context(patch("aiac.agent.policy_rules_builder.graph._build_llm", return_value=llm))
+        stack.enter_context(patch("time.sleep"))
+        we = stack.enter_context(patch("aiac.agent.policy_rules_builder.graph.wait_exponential"))
+        with pytest.raises(LLMAccessError):
+            build_role_rules(_role(), [_scope("s-write", "write")])
+
+    assert we.call_args.kwargs["min"] == 7
+    assert we.call_args.kwargs["max"] == 9
+
+
+def test_structured_call_decoupled_from_upstream_max_retries(monkeypatch):
+    # Decoupling proof (#166): with LLM_MAX_RETRIES UNSET, the LLM loop uses its OWN default (3) and
+    # ignores UPSTREAM_MAX_RETRIES entirely -- while the shared max_retries() STILL reads
+    # UPSTREAM_MAX_RETRIES for the IdP/MCP/K8s seams.
+    monkeypatch.delenv("LLM_MAX_RETRIES", raising=False)
+    monkeypatch.setenv("UPSTREAM_MAX_RETRIES", "2")
+
+    assert max_retries() == 2  # the shared knob is untouched -- other seams keep honoring it
+
+    llm, invoke = _failing_llm(ConnectionError("down"))
+
+    with ExitStack() as stack:
+        stack.enter_context(patch("aiac.agent.policy_rules_builder.graph.get_policy_source", return_value=_Source()))
+        stack.enter_context(patch("aiac.agent.policy_rules_builder.graph._build_llm", return_value=llm))
+        stack.enter_context(patch("time.sleep"))
+        with pytest.raises(LLMAccessError):
+            build_role_rules(_role(), [_scope("s-write", "write")])
+
+    assert invoke.call_count == 3  # LLM default, NOT UPSTREAM_MAX_RETRIES (=2) -> decoupled
+
+
+def test_llm_retry_config_reads_env(monkeypatch):
+    # Well-formed values are read straight through from the env.
+    monkeypatch.setenv("LLM_MAX_RETRIES", "5")
+    monkeypatch.setenv("LLM_RETRY_BACKOFF_MIN", "2")
+    monkeypatch.setenv("LLM_RETRY_BACKOFF_MAX", "45")
+
+    cfg = _llm_retry_config()
+
+    assert (cfg.max_retries, cfg.backoff_min, cfg.backoff_max) == (5, 2, 45)
+
+
+def test_llm_retry_config_tolerates_non_numeric(monkeypatch):
+    # Garbage / empty values must each fall back to their default WITHOUT crashing the
+    # request (mirrors _request_timeout's tolerant parse).
+    monkeypatch.setenv("LLM_MAX_RETRIES", "not-a-number")
+    monkeypatch.setenv("LLM_RETRY_BACKOFF_MIN", "garbage")
+    monkeypatch.setenv("LLM_RETRY_BACKOFF_MAX", "")
+
+    cfg = _llm_retry_config()
+
+    assert (cfg.max_retries, cfg.backoff_min, cfg.backoff_max) == (3, 1, 30)

@@ -92,9 +92,16 @@ A thin adapter started as an **asyncio background task** in the FastAPI `lifespa
 
 ### Ack contract
 
-The consumer **awaits** the internal handler before issuing the NATS acknowledgement. On handler success → ack. On handler exception → do not ack; NATS redelivers after `AckWait`. After 5 unacknowledged redeliveries, NATS routes the message to `aiac.apply.dlq`.
+The consumer **awaits** the internal handler before it issues the NATS acknowledgement. On handler success → ack.
 
-Fire-and-forget (`asyncio.create_task`) is explicitly prohibited — acking before handler completion would break at-least-once guarantees.
+On handler failure, the consumer classifies the exception by **type**, not by HTTP status code:
+
+- **Permanent** — `PolicyConflictError`, `PolicyContradictionError`, `PolicyRulesBuilderError`, and `UnparseableLLMResponseError`. The consumer calls `term()` and routes the message to `aiac.apply.dlq` **immediately**. There is no redelivery, because the same input cannot succeed on a retry.
+- **Retryable** — `LLMAccessError`, plus any genuinely unknown or transient error. The consumer does **not** ack. NATS redelivers after `AckWait`, up to `MAX_DELIVER` (5) deliveries, then routes the message to `aiac.apply.dlq`.
+
+Both entry paths log through the shared `log_by_type` helper (`agent/shared/error_logging.py`), because FastAPI exception handlers do **not** fire on the NATS path.
+
+Fire-and-forget (`asyncio.create_task`) is explicitly prohibited — an ack before handler completion would break the at-least-once guarantee.
 
 ### Failure isolation
 
@@ -156,7 +163,7 @@ Every sub-agent (UC1 Provision + Service Policy Builder, UC2 Build + Rebuild, UC
 
 The `/apply/offboard/{service_id}` path uses the `{service_id:path}` converter (slash-bearing SPIFFE-URI clientIds) and is keyed on the **clientId (SPM key)**, not the Keycloak UUID that `/apply/service/{service_id}` carries — an offboarded client is gone from `get_services()`, so UUID→clientId resolution is impossible.
 
-The `/apply/*` endpoints return bare HTTP status codes: `200 OK` on success (no response body), and the status codes from the Error Handling table on upstream failure. Success responses carry no body; upstream failures are raised as FastAPI `HTTPException`s, so error responses carry FastAPI's default JSON error body (`{"detail": ...}`) alongside the status code. Summary, applied-rule details, and debug information are written to the service log. Validation failures surface as an error status and log entry; detailed reporting is specified in [policy-rules-builder.md](aiac-agent/policy-rules-builder.md).
+The `/apply/*` endpoints return bare HTTP status codes: `200 OK` on success (no response body), and the status codes from the Error Handling table on upstream failure. Success responses carry no body; upstream failures and PRB exceptions are raised as FastAPI `HTTPException`s, so error responses carry a sanitized JSON error body (`{"detail": <safe summary>}`; see [Error Handling → Sanitized body vs. full log](#sanitized-body-vs-full-log)) alongside the status code. Summary, applied-rule details, and debug information are written to the service log. Validation failures surface as an error status and log entry; detailed reporting is specified in [policy-rules-builder.md](aiac-agent/policy-rules-builder.md). A genuine grant/prohibit conflict surfaces on `/apply` as a `422` with a `ConflictReport` body (verbatim policy quotes; see [Error Handling](#error-handling)). There is no separate pre-commit `/policy/check` route — it is retired ([ADR 0001](../../adr/0001-identify-never-reconcile.md) / #2503), and the conflict diagnostic is folded into `/apply`.
 
 ---
 
@@ -177,6 +184,11 @@ The `/apply/*` endpoints return bare HTTP status codes: `200 OK` on success (no 
 | `CHROMA_N_RESULTS` | `10` | ConfigMap |
 | `MAX_CHANGES_PER_RUN` | `50` | ConfigMap |
 | `UPSTREAM_MAX_RETRIES` | `3` | ConfigMap |
+| `LLM_MAX_RETRIES` | `3` | ConfigMap |
+| `LLM_RETRY_BACKOFF_MIN` | `1` | ConfigMap |
+| `LLM_RETRY_BACKOFF_MAX` | `30` | ConfigMap |
+
+`UPSTREAM_MAX_RETRIES` governs the IdP, MCP, and Kubernetes transport seams only. The `LLM_*` knobs govern the PRB's LLM seam (see [Error Handling → Two retry layers](#two-retry-layers)).
 
 ChromaDB collections: `aiac-policies` and `aiac-domain-knowledge`.
 
@@ -184,7 +196,15 @@ ChromaDB collections: `aiac-policies` and `aiac-domain-knowledge`.
 
 ## Error Handling
 
-All upstream calls are retried up to `UPSTREAM_MAX_RETRIES` times with exponential backoff (`tenacity`) before propagating the error. The retry primitive is the project-level shared `run_upstream(fn)` helper (`aiac/shared/upstream.py`), which is transport-agnostic: it re-raises the original exception after the final attempt. Retry is applied at the **transport boundary**, not at the agent call sites — inside the idp-library `Configuration` (its `_request` helper), inside the provision MCP helper (`_mcp_tools_list`), and inside the provision Kubernetes seam (`uc/onboarding/provision/kube.py`). Each caller then maps the re-raised failure to the status below (e.g. an IdP/Kubernetes failure → `502`).
+### Two retry layers
+
+The Agent keeps two retry layers distinct.
+
+**Transport retries.** The Agent retries each upstream transport call up to `UPSTREAM_MAX_RETRIES` times with exponential backoff (`tenacity`) before the error propagates. The retry primitive is the project-level shared `run_upstream(fn)` helper (`aiac/shared/upstream.py`). It is transport-agnostic: it re-raises the original exception after the final attempt. The Agent applies retry at the **transport boundary**, not at the agent call sites — inside the idp-library `Configuration` (its `_request` helper), inside the provision MCP helper (`_mcp_tools_list`), and inside the provision Kubernetes seam (`uc/onboarding/provision/kube.py`). Each caller then maps the re-raised failure to the upstream status below.
+
+**LLM-seam retries.** The Policy Rules Builder (PRB) retries its own LLM seam with dedicated knobs — `LLM_MAX_RETRIES`, `LLM_RETRY_BACKOFF_MIN`, and `LLM_RETRY_BACKOFF_MAX` (specified in [`aiac-agent/policy-rules-builder.md`](aiac-agent/policy-rules-builder.md)). `UPSTREAM_MAX_RETRIES` does **not** govern LLM calls. It stays for the IdP, MCP, and Kubernetes transport seams only.
+
+### Upstream → HTTP status
 
 | Upstream | HTTP status on final failure |
 |---|---|
@@ -192,9 +212,32 @@ All upstream calls are retried up to `UPSTREAM_MAX_RETRIES` times with exponenti
 | IdP Configuration Service | `502 Bad Gateway` |
 | PDP Policy Writer | `502 Bad Gateway` |
 | Kubernetes API | `502 Bad Gateway` |
-| LLM API | `504 Gateway Timeout` |
+| LLM API | `502 Bad Gateway` |
 
-Upstream failures propagate as bare HTTP error responses (see table above), raised as FastAPI `HTTPException`s; the status code is authoritative and error responses carry FastAPI's default JSON error body (`{"detail": ...}`). All failure details are logged.
+### Exception → HTTP status
+
+The PRB raises a typed exception hierarchy (specified in [`aiac-agent/policy-rules-builder.md`](aiac-agent/policy-rules-builder.md)). Each consuming caller maps the exception to an HTTP status.
+
+| Exception | Raised where | HTTP status |
+|---|---|---|
+| `PolicyRulesBuilderBaseError` (base) | — | `500` (safety net) |
+| `PolicyRulesBuilderError` | PRB `_audit`, after `MAX_AUDIT_RETRIES` | `422` |
+| `LLMAccessError` | PRB `_structured_call`, transient retries exhausted | `502` |
+| `UnparseableLLMResponseError` | PRB `_structured_call`, reachable but unparseable | `502` |
+| `PolicyContradictionError` | PRB `_audit`, genuine contradiction | `422` |
+| `PolicyConflictError` (carries a `ConflictReport`) | `ServicePolicyBuilder.build` (UC1) | `422` |
+
+The base class `PolicyRulesBuilderBaseError` is a `500` safety net: any unforeseen PRB error still returns a defined status, not an untyped `500`. Both `LLMAccessError` and `UnparseableLLMResponseError` map to `502`, but they differ on the async path (see [Async failure classification](#async-failure-classification)). The HTTP status is decoupled from the async retry class.
+
+### Sanitized body vs. full log
+
+An error response body carries a safe summary only — `{"detail": <safe summary>}` — with no internal endpoint, host, or key. The full detail (endpoint, root cause, and traceback) goes to the named loggers only. The `PolicyConflictError` body is the one exception: its `ConflictReport` is already safe, because it carries policy quotes only.
+
+Upstream failures and PRB exceptions propagate as HTTP error responses on the synchronous `/apply/*` paths, raised as FastAPI `HTTPException`s. The status code is authoritative.
+
+### Async failure classification
+
+On the NATS path the failure class is decided by **exception type**, never by HTTP status code. Permanent failures route straight to the dead-letter subject; retryable failures are redelivered. See [NATS Consumer → Ack contract](#ack-contract).
 
 ---
 
@@ -214,7 +257,7 @@ aiac/src/aiac/
 ├── shared/                             ← project-level shared: run_upstream (upstream.py) — transport retry primitive
 └── agent/
     ├── controller/
-    ├── shared/                         ← flatten_role (roles.py)
+    ├── shared/                         ← flatten_role (roles.py); focal_entities.py (resolve_focal_entities — D13, shared by live build() + diagnostic); error_logging.py (log_by_type — per-persona named-logger router)
     ├── uc/
     │   ├── onboarding/
     │   │   ├── orchestrator.py         ← sequences provision → policy_builder, returns list[PolicyRule]
@@ -225,6 +268,8 @@ aiac/src/aiac/
     │   │   └── rebuild/                ← delegates to Build; TBD internals
     │   └── role_update/                ← calls PRB with (role, all_scopes), returns list[PolicyRule]
     └── policy_rules_builder/           ← shared; called by Service Policy Builder, Build, and Role sub-agent
+        ├── diagnostic.py               ← parallel diagnostic assembly (START-seeds-text, _audit_diagnostic record-not-raise, terminal _explain)
+        └── diagnostic_models.py        ← ConflictReport + conflict/unevaluated row models
 ```
 
 Docker build command (run from repo root):

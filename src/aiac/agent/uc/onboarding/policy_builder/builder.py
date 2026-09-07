@@ -20,16 +20,36 @@ name: the focus service's own ``aiac.managed`` roles/scopes are never candidates
 services' ``aiac.managed`` roles carry ``kind=Agent``; realm roles held by at least one user
 (composite-expanded, and not owned by any service) carry ``kind=User``. This keeps
 ``subject_roles``/``source_roles`` routing correct downstream in the PCE.
+
+The focal-entity resolution itself (the own-scope / candidate-role / other-scope split, and
+the IdP-unreachable / unknown-service ``HTTPException(502/404)`` boundary) lives in the shared
+``resolve_focal_entities`` (D13) so the read-only Policy Conflict Check diagnostic can reuse
+the exact same entity set. This module keeps only the fan-out loop over that set. The local
+``_config`` seam is preserved and threaded into the resolver so existing tests patch it as
+before.
 """
 
 import logging
 
-from fastapi import HTTPException
-
-from aiac.agent.policy_rules_builder.graph import build_role_rules, build_scope_rules
+from aiac.agent.policy_rules_builder.conflict_detection import (
+    PolicyConflictError,
+    detect_conflicts,
+    report_from_contradictions,
+)
+from aiac.agent.policy_rules_builder.conflict_enrichment import enrich_report
+from aiac.agent.policy_rules_builder.diagnostic_models import ConflictReport
+from aiac.agent.policy_rules_builder.graph import (
+    PolicyContradictionError,
+    build_role_denies,
+    build_role_rules,
+    build_scope_rules,
+)
+from aiac.agent.policy_rules_builder.policy_source import get_policy_source
+from aiac.agent.shared.focal_entities import resolve_focal_entities
 from aiac.agent.shared.roles import flatten_role
+from aiac.agent.uc.onboarding.policy_builder.cross_service import applied_rules_for_scopes
 from aiac.idp.configuration.api import Configuration
-from aiac.idp.configuration.models import Role, ServiceType
+from aiac.idp.configuration.models import RoleKind, ServiceType
 from aiac.policy.model.models import PolicyRule
 
 logger = logging.getLogger(__name__)
@@ -39,91 +59,111 @@ def _config() -> Configuration:
     return Configuration.for_default_realm()
 
 
-def _flatten_dedup(roles):
-    """Union of every role's closure, de-duplicated by ``role.id``."""
-    out = []
-    seen: set[str] = set()
-    for role in roles:
-        for member in flatten_role(role):
-            if member.id not in seen:
-                seen.add(member.id)
-                out.append(member)
-    return out
-
-
 class ServicePolicyBuilder:
     @staticmethod
     def build(service_id: str, service_type: ServiceType) -> list[PolicyRule]:
-        config = _config()
-
-        try:
-            services = config.get_services()
-            subjects = config.get_subjects()
-        except Exception as e:
-            raise HTTPException(
-                502, f"IdP Configuration Service unavailable for service {service_id!r}: {e}"
-            )
-
-        # The trigger id is the Keycloak internal client UUID (Service.id), not the human-readable
-        # clientId (Service.serviceId): the /apply/service/{id} route is keyed on the UUID because a
-        # clientId can be a slash-bearing SPIFFE URI the single-segment route cannot carry.
-        focus = next((s for s in services if s.id == service_id), None)
-        if focus is None:
-            raise HTTPException(404, f"service {service_id!r} not found in IdP catalog")
-
-        own_roles = [r for r in focus.roles if r.aiac_managed]
-        own_scopes = [s for s in focus.scopes if s.aiac_managed]
-
-        # kind=Agent rides through unchanged from get_services() → routes to source_roles in the PCE.
-        other_agent_roles = [
-            r
-            for other in services
-            if other.serviceId != focus.serviceId
-            for r in other.roles
-            if r.aiac_managed
-        ]
-
-        # User roles are membership-derived, not aiac.managed: a realm role qualifies iff a user
-        # holds it directly or via a composite parent they hold, and no service owns it.
-        service_owned_ids = {r.id for s in services for r in s.roles}
-        user_roles_by_id: dict[str, Role] = {}
-        for subject in subjects:
-            for role in subject.roles:
-                # NB: flatten_role on an agent composite role would yield children whose kind
-                # defaults to User (composites endpoint doesn't carry per-service kind) — a latent
-                # edge case if a user is ever assigned a composite agent role. Not hit here.
-                for member in flatten_role(role):
-                    if member.id not in service_owned_ids:
-                        user_roles_by_id[member.id] = member
-        user_roles = list(user_roles_by_id.values())
-
-        # Other services' aiac.managed scopes, sourced from get_services() (mirroring
-        # other_agent_roles) so each scope carries its owning serviceId — the SPM routing key the
-        # PCE needs. The global get_scopes() endpoint returns scopes with an empty serviceId, which
-        # would both (a) fail to exclude the focus's own scopes (``"" != focus.serviceId`` is always
-        # true) and (b) route any resulting rule to ``SPM("")``, a 422 dead-end.
-        other_scopes = [
-            s
-            for other in services
-            if other.serviceId != focus.serviceId
-            for s in other.scopes
-            if s.aiac_managed
-        ]
-
-        candidate_roles = _flatten_dedup(user_roles + other_agent_roles)
+        # service_type is routed through the parameter (the requested classification for the
+        # fan-out), never conflated with focus.type — see #154 AC#6.
+        focal = resolve_focal_entities(service_id, service_type, config=_config())
         logger.info(
             "ServicePolicyBuilder.build service_id=%r type=%s own_scopes=%r own_roles=%r candidates=%r",
-            service_id, service_type, [s.name for s in own_scopes], [r.name for r in own_roles],
-            [r.name for r in candidate_roles],
+            service_id, service_type, [s.name for s in focal.own_scopes], [r.name for r in focal.own_roles],
+            [r.name for r in focal.candidate_roles],
         )
 
         rules: list[PolicyRule] = []
-        for scope in own_scopes:
-            rules.extend(build_scope_rules(candidate_roles, scope))
+        # #168: the fan-out must NOT abort on the FIRST policy contradiction. Each PRB call is
+        # guarded: a ``PolicyContradictionError`` (the LLM auditor's *policy finding* -- this focal's
+        # rule set is withheld) is accumulated as its ``(focal, contradictions)`` and the fan-out
+        # CONTINUES, so every focal's contradiction is collected in one build rather than the report
+        # stopping at whichever pair the loop happened to reach first. A HARD failure
+        # (PolicyRulesBuilderError / LLMAccessError / UnparseableLLMResponseError -- sibling
+        # PolicyRulesBuilderBaseError subclasses that are NOT PolicyContradictionError) is deliberately
+        # NOT caught here: it aborts the build immediately and propagates so the Orchestrator rolls
+        # back. We catch the narrow PolicyContradictionError ONLY -- never the base -- so a hard fault
+        # can never be silently folded into the report.
+        contradictions: list[PolicyContradictionError] = []
+
+        def _guarded(fn, *args) -> None:
+            try:
+                rules.extend(fn(*args))
+            except PolicyContradictionError as exc:
+                contradictions.append(exc)
+
+        for scope in focal.own_scopes:
+            _guarded(build_scope_rules, focal.candidate_roles, scope)
+        # Door B -- user-role-focal DENY-only pass at the focus's OWN-scope onboarding, alongside
+        # the scope-focal pass above. Fan the kind=User subset of the (already flattened+deduped)
+        # candidate roles over the focus's own scopes to surface each user role's exclusivity
+        # ("Testers may access only issues") as the DENY rules the scope-focal pass structurally
+        # cannot express. Deny-only: the scope-focal pass stays the single grant authority. Placing
+        # it here -- own scopes always exist at the service's own onboarding -- keeps it
+        # order-independent (tool-first vs agent-first yields identical denies), and produces both
+        # the scope-focal (role, own-scope) grant and the Door B (role, own-scope) prohibition in
+        # the same build.
+        for user_role in (r for r in focal.candidate_roles if r.kind is RoleKind.USER):
+            _guarded(build_role_denies, user_role, focal.own_scopes)
         if service_type is ServiceType.AGENT:
-            for own_role in own_roles:
+            for own_role in focal.own_roles:
                 for role in flatten_role(own_role):
-                    rules.extend(build_role_rules(role, other_scopes))
+                    _guarded(build_role_rules, role, focal.other_scopes)
+        # Inline, deterministic (non-LLM) conflict detection over the COMBINED state (#2504): this
+        # build's fully assembled rules (scope-focal grants + Door B denies) PLUS the already-applied
+        # inbound rules of the OTHER services on the scopes this build touches, read from the Policy
+        # Store. Widening the input this way lets the SAME #2502 allow∩deny intersection surface a
+        # cross-service overlap -- an Allow here and a Deny another service already applied on the
+        # same (role.id, scope.id) -- that a single build's own rules could never reveal. Onboarding
+        # appends (override=False), so ``combined`` is exactly the post-apply persisted state.
+        #
+        # Per ADR 0001 we surface, never reconcile: a (role, scope) carrying both an Allow and a Deny
+        # raises HERE -- before the Orchestrator/Controller reach ``compute_and_apply`` -- so a
+        # conflict leaves persisted state untouched (atomic-by-construction; the store read above is
+        # side-effect-free). Detection is order-independent (keyed on ids), so tool-first vs
+        # agent-first onboarding yields the identical outcome.
+        combined = rules + applied_rules_for_scopes(rules)
+        structural = detect_conflicts(combined)
+        # #168: UNION the deterministic conflict survey (allow∩deny over the combined state) with the
+        # auditor contradictions accumulated during the fan-out, into ONE ConflictReport. Each withheld
+        # focal is reshaped via ``report_from_contradictions`` into the SAME Conflict-row shape the
+        # structural detector emits (real-id-less rows with quotes_verified=False), so a focal withheld
+        # for a genuine contradiction surfaces as Conflict rows alongside the structural overlaps rather
+        # than being lost. ``evaluated_count`` mirrors both producers -- the distinct (role.id, scope.id)
+        # pairs the detector examined plus one per accumulated focal -- but the raise decision below reads
+        # only ``report.conflicts`` (any conflict => CONFLICTS_FOUND), so the merge is order-independent.
+        conflicts = list(structural.conflicts)
+        unevaluated = list(structural.unevaluated)
+        for exc in contradictions:
+            per_focal = report_from_contradictions(exc.focal, exc.contradictions)
+            conflicts.extend(per_focal.conflicts)
+            unevaluated.extend(per_focal.unevaluated)
+        evaluated_count = len({(r.role.id, r.scope.id) for r in combined}) + len(contradictions)
+        report = ConflictReport.from_survey(conflicts, unevaluated, evaluated_count=evaluated_count)
+        if report.conflicts:
+            # A conflict was found: NOW (and only now) run the LLM explain/quote survey over the
+            # exact pairs detect_conflicts surfaced -- classifying each kind and extracting verbatim,
+            # substring-validated quotes from the candidate policy text (#2503). Gating the LLM
+            # behind report.conflicts keeps a clean apply fully deterministic and LLM-free (the
+            # explain seam never fires) -- true for a clean cross-service apply too. ``combined`` is
+            # passed so enrichment can resolve the typed Role/Scope of a pair whose sides came from
+            # different services (a conflict may join a new rule to a stored one). Policy source is
+            # read only on this path.
+            #
+            # Enrichment (policy fetch + LLM explain/quote) is best-effort: if the policy source is
+            # unreadable/missing or the explain pass errors, we still raise with the STRUCTURAL
+            # report (ADR 0001: surface, never drop). Letting the error escape here would bypass the
+            # controller's PolicyConflictError handler and return a 500 instead of the required 422
+            # ConflictReport.
+            try:
+                report = enrich_report(report, combined, get_policy_source().fetch())
+            except Exception:
+                # Best-effort only (ADR 0001: surface, never drop). Log at WARNING with the
+                # traceback so a genuine bug in enrich_report (TypeError/AttributeError) is
+                # distinguishable in production from an expected "policy source unavailable",
+                # rather than being silently swallowed. We still raise the STRUCTURAL report.
+                logger.warning("policy conflict enrichment failed; falling back to structural report", exc_info=True)
+            raise PolicyConflictError(report)
+        # Only this build's own rules are applied; the OTHER services' rules read above are already
+        # persisted and are used solely to widen detection, never re-emitted.
         logger.info(
             "ServicePolicyBuilder.build service_id=%r -> %d rule(s): %r",
             service_id, len(rules), [(r.role.name, r.scope.name) for r in rules],
