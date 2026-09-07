@@ -40,6 +40,10 @@ CORTEX_DIR="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
 
 CLUSTER_NAME="${CLUSTER_NAME:-rossoctl}"
 AIAC_NAMESPACE="${AIAC_NAMESPACE:-aiac-system}"
+# ConfigMap the Controller mounts at /etc/aiac/policy.md — the scenario policy the PRB reads. Not
+# owned by any other uc1-e2e step, so this script provisions it (see step_stack) instead of silently
+# depending on a leftover from a prior uc1-onboarding run, which may hold a stale/incomplete policy.
+POLICY_CONFIGMAP="${POLICY_CONFIGMAP:-aiac-policy}"
 OPENAI_SECRET_NS="${OPENAI_SECRET_NS:-team1}"
 OPENAI_SECRET_NAME="${OPENAI_SECRET_NAME:-openai-secret}"
 LLM_BASE_URL="${LLM_BASE_URL:-https://api.openai.com/v1}"
@@ -69,7 +73,8 @@ case "${1:-}" in
 esac
 
 TMPFILES=()
-cleanup() { [ "${#TMPFILES[@]}" -gt 0 ] && rm -f "${TMPFILES[@]}"; }
+# -rf, not -f: TMPFILES holds both files and the mktemp -d build dir (the derived-image context).
+cleanup() { [ "${#TMPFILES[@]}" -gt 0 ] && rm -rf "${TMPFILES[@]}"; }
 trap cleanup EXIT
 
 load_image_to_kind() {
@@ -124,6 +129,20 @@ step_stack() {
     load_image_to_kind "$image"
   done
 
+  # Provision the scenario policy the PRB reads (aiac-policy ConfigMap -> /etc/aiac/policy.md).
+  # uc1-e2e is a companion to uc1-onboarding, so it uses that demo's canonical POLICY_ABSTRACT
+  # verbatim — the same policy the acceptance-table verdicts assume. Sourced from scenario.py (not
+  # a hand-copied duplicate) so the two can't drift, and applied here so the agent-deployment mount
+  # + the rollout restart below pick it up. Without this the demo runs against whatever aiac-policy
+  # happens to already exist (observed: a stale one-liner that makes the PRB oscillate and omits
+  # every tester/issues rule the acceptance table needs).
+  echo "==> [stack] Provisioning scenario policy ConfigMap '${POLICY_CONFIGMAP}' (policy.md)"
+  local scenario_lib="$CORTEX_DIR/aiac/demo/use-cases/uc1-onboarding/lib" policy_md
+  policy_md="$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import scenario; sys.stdout.write(scenario.POLICY_ABSTRACT)' "$scenario_lib")"
+  [ -n "$policy_md" ] || { echo "ERROR: could not read POLICY_ABSTRACT from ${scenario_lib}/scenario.py" >&2; exit 1; }
+  kubectl create configmap "$POLICY_CONFIGMAP" -n "$AIAC_NAMESPACE" \
+    --from-literal=policy.md="$policy_md" --dry-run=client -o yaml | kubectl apply -f -
+
   echo "==> [stack] Applying AIAC manifests"
   kubectl apply -f "$CORTEX_DIR/aiac/k8s/pdp-interface-deployment.yaml"
   kubectl apply -f "$CORTEX_DIR/aiac/k8s/policy-model-store-statefulset.yaml"
@@ -151,10 +170,45 @@ step_broker() {
 
 # ── Step 3 — The Keycloak SPI listener ──────────────────────────────────────
 step_spi() {
-  echo "==> [spi] Building the Keycloak SPI jar"
-  ( cd "$CORTEX_DIR/aiac/keycloak-spi" && mvn -q package )
+  # Build the SPI jar inside a maven container instead of shelling out to a host `mvn`, so this
+  # demo needs no JDK/Maven installed on the machine running it. Mirrors keycloak-spi/Dockerfile's
+  # stage-1 builder exactly (maven:3.9-eclipse-temurin-17, `mvn -B -DskipTests package`).
+  #
+  # MAVEN_MIRROR_URL (optional): route Maven Central through a mirror. repo.maven.apache.org
+  # rate-limits by source IP and will 429 ("Too Many Requests") on shared/CI hosts; point this at
+  # a mirror to dodge that, e.g.:
+  #   MAVEN_MIRROR_URL=https://maven-central.storage-download.googleapis.com/maven2/
+  echo "==> [spi] Building the Keycloak SPI jar in a maven container (no host mvn/java needed)"
+  local mvn_mirror_mount=()
+  if [ -n "${MAVEN_MIRROR_URL:-}" ]; then
+    local settings_file
+    settings_file="$(mktemp "${TMPDIR:-/tmp}/uc1-e2e-mvn-settings.XXXXXX.xml")"
+    TMPFILES+=("$settings_file")
+    cat > "$settings_file" <<SETTINGS
+<settings xmlns="http://maven.apache.org/SETTINGS/1.0.0">
+  <mirrors>
+    <mirror>
+      <id>uc1-e2e-mirror</id>
+      <name>uc1-e2e configured Maven mirror</name>
+      <url>${MAVEN_MIRROR_URL}</url>
+      <mirrorOf>central</mirrorOf>
+    </mirror>
+  </mirrors>
+</settings>
+SETTINGS
+    mvn_mirror_mount=(-v "${settings_file}:/root/.m2/settings.xml:ro")
+    echo "    routing Maven Central through mirror: ${MAVEN_MIRROR_URL}"
+  fi
+  "$CONTAINER_RUNTIME" run --rm \
+    -v "$CORTEX_DIR/aiac/keycloak-spi":/build -w /build \
+    ${mvn_mirror_mount[@]+"${mvn_mirror_mount[@]}"} \
+    maven:3.9-eclipse-temurin-17 \
+    mvn -B -DskipTests package
   local jar
-  jar=$(find "$CORTEX_DIR/aiac/keycloak-spi/target" -maxdepth 1 -name '*.jar' ! -name '*-tests.jar' | head -1)
+  # Exclude the shade plugin's pre-shade artifact (original-*.jar) — it lacks the bundled jnats
+  # dependency, so loading it as the SPI would fail at runtime. Keep only the shaded uber-jar.
+  jar=$(find "$CORTEX_DIR/aiac/keycloak-spi/target" -maxdepth 1 -name '*.jar' \
+          ! -name 'original-*.jar' ! -name '*-tests.jar' | head -1)
   [ -n "$jar" ] || { echo "ERROR: no jar found under aiac/keycloak-spi/target after mvn package" >&2; exit 1; }
   echo "    built: ${jar}"
 
@@ -193,9 +247,22 @@ DOCKERFILE
   kubectl rollout status "statefulset/${KEYCLOAK_STATEFULSET}" -n "$KEYCLOAK_NAMESPACE" --timeout=180s
 
   echo "==> [spi] Enabling the listener on realm '${REALM}'"
-  local admin
-  admin=$(admin_token)
-  [ -n "$admin" ] || { echo "ERROR: could not obtain a Keycloak master admin token" >&2; exit 1; }
+  # `kubectl rollout status` returns once the pod passes its readiness probe, but Keycloak's HTTP
+  # endpoints (incl. the master-realm token endpoint admin_token hits) can still be warming up for
+  # several more seconds — a single admin_token call here would come back empty and skip the enable
+  # (leaving the realm on jboss-logging only). Poll until the token endpoint actually serves.
+  local admin=""
+  local token_deadline=$((SECONDS + 120))
+  while :; do
+    admin=$(admin_token)
+    [ -n "$admin" ] && break
+    if [ "$SECONDS" -ge "$token_deadline" ]; then
+      echo "ERROR: could not obtain a Keycloak master admin token within 120s of the rollout" >&2
+      exit 1
+    fi
+    echo "    waiting for Keycloak's token endpoint to come up..."
+    sleep 5
+  done
   curl -s -o /dev/null -w "    events/config HTTP %{http_code}\n" -X PUT \
     -H "Authorization: Bearer ${admin}" -H "Content-Type: application/json" \
     "${KC}/admin/realms/${REALM}/events/config" \
