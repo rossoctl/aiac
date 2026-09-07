@@ -27,7 +27,7 @@
              dependency here: this SPI imports only org.keycloak.Config (core),
              org.keycloak.models.* (server-spi), and org.keycloak.events.*
              (server-spi-private). -->
-        <keycloak.version>26.6.3</keycloak.version>
+        <keycloak.version>26.7.3</keycloak.version>
         <!-- Verify against Maven Central at implementation/upgrade time. -->
         <jnats.version>2.20.6</jnats.version>
         <!-- jboss-logging is Keycloak's logging facade, on its runtime classpath;
