@@ -133,25 +133,40 @@ spec:
                 - ALL
           resources:
             requests:
-              cpu: 100m
+              cpu: 250m
               memory: 256Mi
+            # Onboarding drives blocking LLM/LangGraph work; a 500m cap throttled it enough to
+            # both slow convergence and starve the /health handler. Give it a full core.
             limits:
-              cpu: 500m
-              memory: 512Mi
-          # The Controller is stateless; GET /health is a bare liveness/readiness
-          # signal (200 {"status": "ok"} whenever the process is serving).
+              cpu: "2"
+              memory: 768Mi
+          # The Controller is stateless; GET /health is a bare liveness/readiness signal
+          # (200 {"status": "ok"} whenever the process is serving).
+          #
+          # A single service-onboarding pass runs several Policy-Rules-Builder graphs, each with
+          # blocking LLM calls (seconds each) on the process, so GET /health can be unanswerable
+          # for a minutes-long stretch. The k8s defaults (timeoutSeconds 1, failureThreshold 3,
+          # 20s period => ~60s) treated that busy stretch as a dead process and SIGKILLed it
+          # (exitCode 137) mid-onboarding; JetStream then redelivered and re-ran the WHOLE build
+          # from scratch, so a slow-LLM run never converged. Liveness here only needs to catch a
+          # genuine deadlock, so make it very tolerant (10s timeout x 30 failures x 20s period =>
+          # ~10 min) — long enough for onboarding to finish uninterrupted. Readiness stays tighter
+          # (it only gates Service endpoints; nothing calls the Controller's HTTP during onboarding).
           readinessProbe:
             httpGet:
               path: /health
               port: 7070
             initialDelaySeconds: 5
             periodSeconds: 10
+            timeoutSeconds: 5
           livenessProbe:
             httpGet:
               path: /health
               port: 7070
             initialDelaySeconds: 10
             periodSeconds: 20
+            timeoutSeconds: 10
+            failureThreshold: 30
           envFrom:
             - configMapRef:
                 name: aiac-pdp-config
