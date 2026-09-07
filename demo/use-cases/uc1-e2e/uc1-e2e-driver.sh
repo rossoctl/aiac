@@ -27,15 +27,38 @@
 #   ./uc1-e2e-driver.sh --only-deploy
 #   ./uc1-e2e-driver.sh --only-wire-outbound
 #   ./uc1-e2e-driver.sh --only-enforce
+#   ./uc1-e2e-driver.sh --collect-logs     # (composes with any of the above) dump every
+#                                          # component's logs into a per-run directory at the end,
+#                                          # AND on any die() failure — so a failed run is
+#                                          # debuggable without re-running. Time-scoped to this run.
 #
 # Env vars (defaults match the rest of this demo family):
 #   NS, SYS_NS, AIAC_NS   namespaces (team1, rossoctl-system, aiac-system)
 #   KC, REALM             Keycloak base URL + realm
-#   ROPC_CLIENT_ID        public client the Phase 1 demo's users log in with (default: aiac-demo-cli)
+#   ROPC_CLIENT_ID        OIDC client the demo users log in through (default: rossoctl). Must be a
+#                         client AIAC's inbound rego accepts as the source (its source_ok allows the
+#                         "rossoctl" platform client) AND whose tokens carry the workload audiences +
+#                         a username->sub claim. The rossoctl platform client is provisioned with all
+#                         of that (username->sub mapper, agent-team1-github-{agent,tool}-aud default
+#                         scopes, Direct Access Grants) by the rossoctl installer; aiac-demo-cli (the
+#                         uc1-onboarding run-*.py client) is NOT accepted by source_ok, so inbound
+#                         probes through it are denied with the wrong azp.
 #   USER_PASSWORD         shared demo-user password (default: password) — see scenario.py
-#   POLL_SECS             max seconds to wait for a bundle-service poll / trigger evidence (default: 150)
+#   POLL_SECS             max seconds a polling phase waits for trigger evidence / a bundle-service
+#                         poll (default: 420). Sized for the slowest convergence: the agent publishes
+#                         its A2A AgentCard skills only AFTER the deploy trigger, so onboarding
+#                         redelivers (JetStream) for a few minutes until source_operations/
+#                         issue_operations resolve and AIAC writes the AuthorizationPolicy CR. Each
+#                         phase still breaks the instant its condition is met, so a healthy run is fast.
 #   DEPLOY_WAIT_SECS      max seconds to wait for pods to become Ready after deploy   (default: 180)
 #   KIND_CLUSTER          name of the Kind cluster                             (default: rossoctl)
+#   KC_NS                 namespace Keycloak runs in, for --collect-logs       (default: keycloak)
+#   COLLECT_ROOT          parent dir for --collect-logs run directories        (default: /tmp)
+#   COLLECT_SINCE         RFC3339 timestamp to scope collected component logs from. Overrides the
+#                         default absolutely; set an earlier timestamp to widen the window further.
+#   COLLECT_LOOKBACK_MIN  minutes before run-start the default collection window opens (default: 10)
+#                         — the margin ensures a die() on an early/instant failure still captures
+#                         recent history instead of an empty window.
 
 set -euo pipefail
 
@@ -48,11 +71,17 @@ SYS_NS="${SYS_NS:-rossoctl-system}"
 AIAC_NS="${AIAC_NS:-aiac-system}"
 KC="${KC:-http://keycloak.localtest.me:8080}"
 REALM="${REALM:-rossoctl}"
-ROPC_CLIENT_ID="${ROPC_CLIENT_ID:-aiac-demo-cli}"
+ROPC_CLIENT_ID="${ROPC_CLIENT_ID:-rossoctl}"
 USER_PASSWORD="${USER_PASSWORD:-password}"
-POLL_SECS="${POLL_SECS:-150}"
+POLL_SECS="${POLL_SECS:-420}"
 DEPLOY_WAIT_SECS="${DEPLOY_WAIT_SECS:-180}"
 KIND_CLUSTER="${KIND_CLUSTER:-rossoctl}"
+KC_NS="${KC_NS:-keycloak}"
+COLLECT_ROOT="${COLLECT_ROOT:-/tmp}"
+
+# Recorded once, up front, so both the end-of-run collection and any die()-triggered collection
+# scope component logs to this invocation (COLLECT_SINCE overrides — see the header docs).
+RUN_START_TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 AGENT_LABEL="app.kubernetes.io/name=github-agent"
 TOOL_LABEL="app=github-tool"
@@ -61,13 +90,21 @@ POLICY_CR="authorizationpolicies.agent.rossoctl.dev"
 DO_DEPLOY=1
 DO_WIRE=1
 DO_ENFORCE=1
-case "${1:-}" in
-  --only-deploy) DO_WIRE=0; DO_ENFORCE=0 ;;
-  --only-wire-outbound) DO_DEPLOY=0; DO_ENFORCE=0 ;;
-  --only-enforce) DO_DEPLOY=0; DO_WIRE=0 ;;
-  "") ;;
-  *) echo "Usage: $0 [--only-deploy|--only-wire-outbound|--only-enforce]" >&2; exit 1 ;;
-esac
+DO_COLLECT=0
+COLLECT_DIR=""
+# Args compose: at most one --only-* phase selector, optionally plus --collect-logs.
+for arg in "$@"; do
+  case "$arg" in
+    --only-deploy) DO_WIRE=0; DO_ENFORCE=0 ;;
+    --only-wire-outbound) DO_DEPLOY=0; DO_ENFORCE=0 ;;
+    --only-enforce) DO_DEPLOY=0; DO_WIRE=0 ;;
+    --collect-logs) DO_COLLECT=1 ;;
+    "") ;;
+    *) echo "Usage: $0 [--only-deploy|--only-wire-outbound|--only-enforce] [--collect-logs]" >&2; exit 1 ;;
+  esac
+done
+# Fix the destination once, so the end-of-run and die()-path collections write to the same directory.
+[ "$DO_COLLECT" -eq 1 ] && COLLECT_DIR="${COLLECT_ROOT}/uc1-e2e-logs-$(date -u +%Y%m%dT%H%M%SZ)"
 
 # ── Output helpers (same palette/shape as uc1-integration-driver.sh) ───────
 if [ -t 1 ]; then
@@ -82,7 +119,13 @@ step() { STEP_N=$((STEP_N + 1)); printf '\n%s==> [%02d] %s%s\n' "$C_BLD$C_CYN" "
 info() { printf '     %s\n' "$*"; }
 pass() { printf '     %sPASS%s %s\n' "$C_GRN" "$C_RST" "$*"; }
 warn() { printf '     %sWARN%s %s\n' "$C_YEL" "$C_RST" "$*"; }
-die()  { printf '\n%sFAIL:%s %s\n' "$C_RED$C_BLD" "$C_RST" "$*" >&2; exit 1; }
+die()  {
+  printf '\n%sFAIL:%s %s\n' "$C_RED$C_BLD" "$C_RST" "$*" >&2
+  # Best-effort log capture on failure — the most valuable time to have it. Guarded so a
+  # collection hiccup can't mask the original failure; we still exit non-zero regardless.
+  [ "${DO_COLLECT:-0}" -eq 1 ] && collect_logs "$COLLECT_DIR" || true
+  exit 1
+}
 
 expect_eq() {
   local label="$1" got="$2" want="$3"
@@ -123,6 +166,68 @@ for c in json.load(sys.stdin):
 
 latest_pod() {
   kubectl get pod -n "$NS" -l "$1" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null
+}
+
+# ── Log collection (--collect-logs) ────────────────────────────────────────────
+# Dumps every component this demo touches into one per-run directory: the operator (client
+# registration), aiac-agent (onboarding pipeline), the NATS broker, Keycloak (SPI listener), and the
+# github-agent sidecar (the OPA allow/deny decisions) + app container + github-tool. Component logs
+# are time-scoped to this run (COLLECT_SINCE / RUN_START_TS) so log volume can't push evidence out of
+# view — the same reasoning phase_verify_trigger uses for --since-time over --tail. Durable state
+# (the AuthorizationPolicy CR, the routing/runtime ConfigMaps, pod listings) is captured as
+# point-in-time snapshots. Every command is best-effort: a missing component leaves a note in its
+# file rather than aborting, so this is safe to call from die() mid-failure.
+collect_logs() {
+  local dir="${1:-$COLLECT_ROOT/uc1-e2e-logs-$(date -u +%Y%m%dT%H%M%SZ)}"
+  # Default window: RUN_START_TS minus COLLECT_LOOKBACK_MIN (default 10m). The margin matters for the
+  # die() path — an early/instant failure would otherwise pin --since-time to the run-start instant
+  # and capture an EMPTY window (exactly when the logs are most wanted). A little pre-run history is
+  # harmless for the success path. COLLECT_SINCE overrides this absolutely.
+  local margin_min="${COLLECT_LOOKBACK_MIN:-10}" default_since
+  default_since="$(date -u -d "@$(( $(date -u -d "$RUN_START_TS" +%s 2>/dev/null || date -u +%s) - margin_min * 60 ))" \
+    +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "$RUN_START_TS")"
+  local since="${COLLECT_SINCE:-$default_since}"
+  if ! mkdir -p "$dir" 2>/dev/null; then warn "could not create log dir ${dir} — skipping collection"; return 0; fi
+  printf '\n%s==> Collecting logs into %s (component logs since %s)%s\n' "$C_BLD$C_CYN" "$dir" "$since" "$C_RST"
+
+  # <outfile> <kubectl-logs-args...> — time-scoped component logs; note on absence, never abort.
+  _dump() {
+    local out="$1"; shift
+    kubectl logs "$@" --since-time="$since" >"${dir}/${out}" 2>&1 \
+      || echo "(unavailable — component absent, or no logs since ${since})" >"${dir}/${out}"
+  }
+  _dump operator-controller-manager.log deployment/rossoctl-controller-manager -n "$SYS_NS"
+  _dump aiac-agent.log                  deployment/aiac-agent                  -n "$AIAC_NS"
+  _dump aiac-event-broker.log           deployment/aiac-event-broker           -n "$AIAC_NS"
+  _dump keycloak.log                    statefulset/keycloak                   -n "$KC_NS"
+
+  local agent_pod tool_pod
+  agent_pod="$(latest_pod "$AGENT_LABEL" || true)"
+  tool_pod="$(latest_pod "$TOOL_LABEL" || true)"
+  if [ -n "$agent_pod" ]; then
+    _dump github-agent-authbridge-proxy.log -n "$NS" "$agent_pod" -c authbridge-proxy  # OPA decisions
+    _dump github-agent-app.log              -n "$NS" "$agent_pod" -c agent
+  else
+    echo "(github-agent pod not found)" >"${dir}/github-agent-authbridge-proxy.log"
+  fi
+  if [ -n "$tool_pod" ]; then
+    _dump github-tool.log -n "$NS" "$tool_pod" --all-containers
+  else
+    echo "(github-tool pod not found)" >"${dir}/github-tool.log"
+  fi
+
+  # Point-in-time snapshots of the durable artifacts (not time-scoped — current observed state).
+  kubectl get "$POLICY_CR" github-agent -n "$NS" -o yaml \
+    >"${dir}/authorizationpolicy-github-agent.yaml" 2>&1 || true
+  kubectl get configmap authproxy-routes -n "$NS" -o yaml \
+    >"${dir}/cm-authproxy-routes.yaml" 2>&1 || true
+  kubectl get configmap authbridge-runtime-config -n "$NS" -o yaml \
+    >"${dir}/cm-authbridge-runtime-config.yaml" 2>&1 || true
+  kubectl get pods -n "$NS" -o wide      >"${dir}/pods-${NS}.txt" 2>&1 || true
+  kubectl get pods -n "$AIAC_NS" -o wide >"${dir}/pods-${AIAC_NS}.txt" 2>&1 || true
+
+  pass "logs collected: ${dir}"
+  ls -1 "$dir" 2>/dev/null | sed 's/^/       /' || true
 }
 
 # ── Preflight ────────────────────────────────────────────────────────────────
@@ -213,24 +318,46 @@ phase_verify_trigger() {
   info "tool client uuid:  ${TOOL_UUID}"
   pass "operator registered both clients for the first time — a real CLIENT_CREATE just fired from the deploy alone"
 
-  step "Confirming AIAC consumed the live event — NO manual onboarding call was made"
-  # aiac-agent's LangChain tracing + constant health-check logging can push a target UUID's
-  # log lines well past any fixed --tail count within seconds (observed: >500 lines of other
-  # chatter between one event's own "received" and "acked" lines) — a --since-time scoped to
-  # when this run's DEPLOY started is immune to log volume, unlike --tail=N.
-  local ev_deadline=$((SECONDS + POLL_SECS)) found_agent=0 found_tool=0
+  step "Confirming AIAC consumed both live events — NO manual onboarding call was made"
+  # Proof of consumption is a DURABLE artifact, not a log line. On consuming each
+  # aiac.apply.service.<uuid> over NATS, AIAC's onboarding provisions that service's Keycloak
+  # objects, including its per-service audience client-scope (agent-<ns>-github-agent-aud /
+  # agent-<ns>-github-tool-aud). Those scopes persist regardless of pod restarts or log rotation —
+  # unlike a grep of aiac-agent's pod logs, which the verbose onboarding tracing rotates out within
+  # seconds and a liveness restart wipes entirely, so a log grep false-negatives even when both
+  # events WERE consumed. Poll the scopes as the authoritative signal; the log line is shown only as
+  # best-effort supplementary evidence when it happens to still be present.
+  local ev_deadline=$((SECONDS + POLL_SECS)) agent_seen="" tool_seen=""
   while :; do
-    local logs
-    logs=$(kubectl logs deployment/aiac-agent -n "$AIAC_NS" --since-time="${UC1E2E_DEPLOY_START_TS}" 2>/dev/null || true)
-    printf '%s\n' "$logs" | grep -q "$AGENT_UUID" && found_agent=1
-    printf '%s\n' "$logs" | grep -q "$TOOL_UUID" && found_tool=1
-    [ "$found_agent" -eq 1 ] && [ "$found_tool" -eq 1 ] && break
+    ADMIN="$(admin_token)"
+    local scopes_json
+    scopes_json=$(curl -s -H "Authorization: Bearer ${ADMIN}" "${KC}/admin/realms/${REALM}/client-scopes" 2>/dev/null || true)
+    agent_seen=$(printf '%s' "$scopes_json" | SCOPE="agent-${NS}-github-agent-aud" python3 -c '
+import sys, json, os
+try: names = {s.get("name") for s in json.load(sys.stdin)}
+except Exception: names = set()
+print("yes" if os.environ["SCOPE"] in names else "")' 2>/dev/null || true)
+    tool_seen=$(printf '%s' "$scopes_json" | SCOPE="agent-${NS}-github-tool-aud" python3 -c '
+import sys, json, os
+try: names = {s.get("name") for s in json.load(sys.stdin)}
+except Exception: names = set()
+print("yes" if os.environ["SCOPE"] in names else "")' 2>/dev/null || true)
+    [ -n "$agent_seen" ] && [ -n "$tool_seen" ] && break
     if [ "$SECONDS" -ge "$ev_deadline" ]; then
-      die "aiac-agent logs never mentioned the new client uuids (agent seen=${found_agent}, tool seen=${found_tool}) after ${POLL_SECS}s. Check: kubectl logs deployment/aiac-agent -n ${AIAC_NS}; kubectl logs statefulset/keycloak -n keycloak | grep -i aiac-event-listener"
+      die "AIAC did not provision both services' Keycloak audience scopes (agent=${agent_seen:-no}, tool=${tool_seen:-no}) after ${POLL_SECS}s — it may not have consumed both aiac.apply.service events. Check: kubectl logs deployment/aiac-agent -n ${AIAC_NS}; kubectl logs statefulset/keycloak -n keycloak | grep -i aiac-event-listener"
     fi
     sleep 5
   done
-  pass "aiac-agent consumed both aiac.apply.service.<uuid> events over NATS — no /apply/service/{id} call anywhere in this script"
+  pass "AIAC consumed both aiac.apply.service.<uuid> events over NATS — both services' Keycloak audience scopes are provisioned (no /apply/service/{id} call anywhere in this script)"
+  # Supplementary: surface the direct NATS-consumption log lines if the verbose-trace logs haven't
+  # rotated them out yet (informational only — the provisioned scopes above are the durable proof).
+  local logs
+  logs=$(kubectl logs deployment/aiac-agent -n "$AIAC_NS" --since-time="${UC1E2E_DEPLOY_START_TS}" 2>/dev/null || true)
+  if printf '%s\n' "$logs" | grep -q "$AGENT_UUID" && printf '%s\n' "$logs" | grep -q "$TOOL_UUID"; then
+    info "aiac-agent logs still show both aiac.apply.service.<uuid> events (direct NATS-consumption evidence)"
+  else
+    info "aiac-agent's verbose onboarding logs have since rotated; the provisioned scopes above are the durable proof of consumption"
+  fi
 
   step "Confirming a fresh AuthorizationPolicy CR for github-agent"
   local before_rv="${UC1E2E_BEFORE_RV:-<none>}" cr_deadline=$((SECONDS + POLL_SECS))
@@ -324,8 +451,11 @@ tok = """$tok"""
 op = urllib.request.build_opener(urllib.request.ProxyHandler({"http": "http://127.0.0.1:8081"}))
 body = json.dumps({"jsonrpc":"2.0","id":"1","method":"tools/call",
                     "params":{"name":"$tool","arguments":{}}}).encode()
-req = urllib.request.Request("http://github-tool:9090/", data=body,
-    headers={"Content-Type":"application/json","Authorization":"Bearer "+tok})
+# FastMCP's streamable_http_app serves the MCP endpoint at /mcp (not /) and requires the
+# streamable Accept header; posting to / or without it 404s/406s even on an OPA-allowed call.
+# Matches the agent's real MCP_URL (…/mcp) and test/integration/launcher.py's outbound_probe.
+req = urllib.request.Request("http://github-tool:9090/mcp", data=body,
+    headers={"Content-Type":"application/json","Accept":"application/json, text/event-stream","Authorization":"Bearer "+tok})
 code, raw = None, ""
 try:
     r = op.open(req, timeout=15); code = r.status; raw = r.read().decode("utf-8", "replace")
@@ -387,6 +517,24 @@ phase_enforce() {
     pass "added '${AUD_SCOPE}' as a default scope on '${ROPC_CLIENT_ID}'"
   fi
 
+  step "Ensuring ${ROPC_CLIENT_ID} stamps the username into the token 'sub' claim"
+  # AuthBridge's jwt-validation sets input.identity.subject from the token 'sub'; AIAC's inbound
+  # rego keys subject_roles on the USERNAME ("dev-user"/"test-user"). Stock Keycloak 26 puts the
+  # user UUID in 'sub' (and only when the 'basic' client scope is assigned — otherwise 'sub' is
+  # absent entirely), so without a username->sub mapper every inbound probe is denied with an
+  # EMPTY subject. This is the realm's "username -> sub mapper" prerequisite that
+  # test/integration/launcher.py:verify_subject_mapper only *skips* on — provisioned here so the
+  # demo is self-sufficient. Idempotent: 201 created, 409 already present.
+  MAPPER_HTTP=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+    -H "Authorization: Bearer ${ADMIN}" -H "Content-Type: application/json" \
+    "${KC}/admin/realms/${REALM}/clients/${ROPC_UUID}/protocol-mappers/models" \
+    -d '{"name":"username-to-sub","protocol":"openid-connect","protocolMapper":"oidc-usermodel-property-mapper","config":{"user.attribute":"username","claim.name":"sub","jsonType.label":"String","access.token.claim":"true","id.token.claim":"true","userinfo.token.claim":"true"}}')
+  case "$MAPPER_HTTP" in
+    201) pass "created 'username-to-sub' mapper on '${ROPC_CLIENT_ID}' (HTTP 201)" ;;
+    409) warn "'username-to-sub' mapper already present (HTTP 409) — idempotent, continuing" ;;
+    *) die "creating the username->sub mapper returned HTTP ${MAPPER_HTTP} (expected 201/409)" ;;
+  esac
+
   step "Inbound — dev-user and test-user allowed, devops-user denied [polling up to ${POLL_SECS}s]"
   probe_agent dev-user    200 "$POLL_SECS" "dev-user -> github-agent (inbound)"
   probe_agent test-user   200 "$POLL_SECS" "test-user -> github-agent (inbound)"
@@ -435,6 +583,8 @@ if [ "$DO_DEPLOY" -eq 1 ]; then
 fi
 [ "$DO_WIRE" -eq 1 ] && phase_wire_outbound
 [ "$DO_ENFORCE" -eq 1 ] && phase_enforce
+
+[ "$DO_COLLECT" -eq 1 ] && collect_logs "$COLLECT_DIR"
 
 printf '\n%s%s====== DONE ======%s\n' "$C_BLD" "$C_GRN" "$C_RST"
 cat <<EOF

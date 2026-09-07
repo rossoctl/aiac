@@ -104,6 +104,38 @@ Individual phases can be re-run on their own:
 ./aiac/demo/use-cases/uc1-e2e/uc1-e2e-driver.sh --only-enforce
 ```
 
+### Capturing every operation (`--collect-logs`)
+
+The driver narrates each step to stdout, but the underlying operations play out across several
+in-cluster components. To dump all of them into one per-run directory, add `--collect-logs` (it
+composes with any of the phase flags above, or a full run):
+
+```bash
+./aiac/demo/use-cases/uc1-e2e/uc1-e2e-driver.sh --collect-logs
+# or scope it to one phase:
+./aiac/demo/use-cases/uc1-e2e/uc1-e2e-driver.sh --only-enforce --collect-logs
+```
+
+Logs are written at the end of a successful run **and on any `die()` failure** (the most useful time
+to have them — a failed run is debuggable without re-running). The run directory is printed at the
+end; by default it lands under `/tmp/uc1-e2e-logs-<timestamp>/` and contains:
+
+| File | Component | What it shows |
+|---|---|---|
+| `operator-controller-manager.log` | `rossoctl-controller-manager` (`rossoctl-system`) | client registration, `rossoctl.io/type` labelling |
+| `aiac-agent.log` | `aiac-agent` (`aiac-system`) | the onboarding pipeline consuming `aiac.apply.service.<uuid>` over NATS |
+| `aiac-event-broker.log` | NATS broker (`aiac-system`) | the event bus |
+| `keycloak.log` | `keycloak` (`keycloak`) | the `aiac-event-listener` SPI emitting events |
+| `github-agent-authbridge-proxy.log` | AuthBridge sidecar (`team1`) | **the OPA inbound/outbound allow/deny decisions** |
+| `github-agent-app.log`, `github-tool.log` | workload app containers (`team1`) | app-side behaviour |
+| `authorizationpolicy-github-agent.yaml` | the CR AIAC wrote | the generated rego (snapshot) |
+| `cm-authproxy-routes.yaml`, `cm-authbridge-runtime-config.yaml`, `pods-*.txt` | routing/runtime config + pod listings | current desired/observed state (snapshots) |
+
+Component logs are time-scoped to the run (so log volume can't push evidence out of view). When
+collecting after a `--only-*` run whose interesting history predates the invocation, widen the window
+with `COLLECT_SINCE` (an RFC3339 timestamp). `COLLECT_ROOT` changes the parent directory and `KC_NS`
+the Keycloak namespace if yours differ from the defaults (`/tmp`, `keycloak`).
+
 > **Known gap — "direct user → tool" is not enforced in this deployment.** Same gap as
 > `uc1-integration`: #646's acceptance table also lists `dev-user` calling `github-tool`
 > **directly** (bypassing the agent), which should be denied. `github-tool`
@@ -136,6 +168,11 @@ kubectl delete namespace aiac-system
 ```
 
 ## Troubleshooting
+
+> **Tip:** re-run the failing invocation with `--collect-logs` (see
+> [Capturing every operation](#capturing-every-operation---collect-logs)) — on a `die()` failure it
+> dumps every component's logs into one directory, including the AuthBridge OPA decision log, so you
+> can diagnose the symptoms below from captured output instead of racing the live logs.
 
 - **`uc1-e2e-driver.sh` refuses to run DEPLOY, saying github-agent/github-tool already exist.**
   That guard exists specifically so this demo never silently degrades into `uc1-integration`'s
