@@ -1,15 +1,11 @@
 # Access Control Policy — ambiguous-clause evaluation scenario
 
-Grant access on a least-privilege basis. Only grant a (role, scope) pair when this
-policy supports it; deny by default.
+Access is granted on a least-privilege basis: only what this document explicitly allows is
+permitted; anything not mentioned here is denied.
 
-## Users → agent capabilities (inbound; user may call an agent)
-- Advisors may use an agent's current-status lookup capability.
+Enrollment advisors may use the registrar agent to access a student's enrollment information for
+advisory purposes. For advisory purposes, "enrollment information" means a student's current
+enrollment status only — it does not include historical enrollment records.
 
-## Users → tool operations (outbound subject; user may reach a tool operation)
-- Advisors may access a subject's record information for advisory purposes. For
-  advisory purposes, "record information" means a subject's current status only.
-
-## Agent roles → tool operations (outbound target; an agent role may reach a tool
-## operation)
-- Advisory agents may look up a subject's current status and historical record.
+The registrar agent itself is capable of looking up both a student's current enrollment status
+and their historical enrollment record.

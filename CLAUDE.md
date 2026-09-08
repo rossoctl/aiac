@@ -48,7 +48,7 @@ ls src/aiac/<subsystem>/               # drill into any layer
 
 `pyproject.toml`'s `addopts` defaults `-m` to excluding every live-infra marker
 (`integration`, `eval_extended`, `eval_consistency`,
-`eval_robustness`), so a bare invocation never makes a real LLM/Keycloak
+`eval_robustness`, `eval_correctness_prb`), so a bare invocation never makes a real LLM/Keycloak
 call. The whole `test/` tree collects and runs green — no `--ignore` flags are
 needed. (This wasn't always true: the Policy Computation Engine was migrated to
 the SPM store surface in Wave 3, which resolved the earlier PCE-chain collection
@@ -97,13 +97,14 @@ set -a; . .env; set +a
 When the cluster is not wired or the env is unset, the suite **skips cleanly** (it never false-passes).
 
 A passed `-m` always overrides the default, so this opts back into exactly
-`integration` (not the heavier markers below). Three heavier, narrower-infra
+`integration` (not the heavier markers below). Four heavier, narrower-infra
 markers exist alongside it — `eval_extended` (same live infra as
-`integration`, many more PRB/LLM calls), `eval_consistency` and
-`eval_robustness` (LLM only, no Keycloak/`opa`) — each invoked the same
+`integration`, many more PRB/LLM calls), `eval_consistency`,
+`eval_robustness`, and `eval_correctness_prb` (LLM only, no Keycloak/`opa`) — each invoked the same
 way, e.g. `pytest eval/ -m eval_extended`. See
-`docs/specs/eval/policy-eval-scenarios.md` and
-`docs/specs/eval/policy-eval-robustness-consistency.md` for their
+`docs/specs/eval/policy-eval-scenarios.md`,
+`docs/specs/eval/policy-eval-robustness-consistency.md`, and
+`docs/specs/eval/policy-eval-correctness-prb.md` for their
 runbooks.
 
 **Smoke test** (requires live service at `AIAC_PDP_CONFIG_URL`, default `http://127.0.0.1:7071`):
