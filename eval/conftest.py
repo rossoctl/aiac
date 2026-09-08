@@ -1,19 +1,21 @@
-"""Per-run pass/fail/skip report for the policy-eval-scenarios, policy-eval-robustness, and
-policy-eval-consistency suites (spec: ``docs/specs/eval/policy-eval-scenarios.md`` and
-``docs/specs/eval/policy-eval-robustness-consistency.md``).
+"""Per-run pass/fail/skip report for the policy-eval-scenarios, policy-eval-robustness,
+policy-eval-consistency, and policy-eval-correctness-prb suites (spec: ``docs/specs/eval/
+policy-eval-scenarios.md``, ``docs/specs/eval/policy-eval-robustness-consistency.md``, and
+``docs/specs/eval/policy-eval-correctness-prb.md``).
 
 Every run of ``test_policy_pipeline_eval.py`` (``@pytest.mark.eval_extended``),
-``test_policy_pipeline_consistency.py`` (``@pytest.mark.eval_consistency``), or
-``test_policy_pipeline_robustness.py`` (``@pytest.mark.eval_robustness``) writes a Markdown
-report to ``reports/`` listing every collected test's outcome — passed, failed, skipped, xfailed,
-xpassed, or a setup/collection error. All six sections are always present (even empty) so a reader
-can see at a glance that nothing was silently omitted. Failed/error entries carry the assertion's
-crash message (pytest's own computed diff, e.g. "assert True == False" or a custom mismatch
-message with expected/actual sets); skipped/xfailed entries carry the skip reason; every entry
-carries the test function's docstring so a reader doesn't have to open the source file to know
-what was actually being checked. The report is scoped to these three markers (not just "any test
-collected while this conftest happens to be loaded"), so running the whole repo's test suite from
-a parent directory does not pull unrelated tests into this suite's report.
+``test_policy_pipeline_consistency.py`` (``@pytest.mark.eval_consistency``),
+``test_policy_pipeline_robustness.py`` (``@pytest.mark.eval_robustness``), or
+``test_policy_pipeline_correctness_prb.py`` (``@pytest.mark.eval_correctness_prb``) writes a
+Markdown report to ``reports/`` listing every collected test's outcome — passed, failed, skipped,
+xfailed, xpassed, or a setup/collection error. All six sections are always present (even empty) so
+a reader can see at a glance that nothing was silently omitted. Failed/error entries carry the
+assertion's crash message (pytest's own computed diff, e.g. "assert True == False" or a custom
+mismatch message with expected/actual sets); skipped/xfailed entries carry the skip reason; every
+entry carries the test function's docstring so a reader doesn't have to open the source file to
+know what was actually being checked. The report is scoped to these four markers (not just "any
+test collected while this conftest happens to be loaded"), so running the whole repo's test suite
+from a parent directory does not pull unrelated tests into this suite's report.
 
 Filename: ``reports/report_<DD_MM_HH_MM_SS>.md``, timestamped in UTC (override via
 ``EVAL_REPORT_TZ``, e.g. ``Asia/Jerusalem``), e.g. ``report_04_08_16_37_22.md`` for 04 Aug at
@@ -25,6 +27,11 @@ subject[/scope] combination) additionally ``record_property`` a concrete per-cel
 an expected/actual boolean and explanation -- read back here via ``report.user_properties`` and
 rendered as "What it tests" / "Expected output" / "Output" instead of the generic docstring +
 crash-message fallback used by every other test in this suite (see ``_render_entry``).
+
+``test_prb_correctness`` (the correctness-prb suite) similarly ``record_property``s
+precision/recall/denial-precision plus the over-grants/under-grants/incorrectly-denied pair
+breakdown per scenario -- rendered as its own metrics + detail block, always (pass or fail), since
+the tracked-but-non-gating under-grant/denial detail is otherwise invisible on a passing run.
 """
 
 from __future__ import annotations
@@ -40,7 +47,7 @@ from dotenv import load_dotenv
 HERE = Path(__file__).resolve().parent
 REPORTS_DIR = HERE / "reports"
 REPORT_TZ = ZoneInfo(os.environ.get("EVAL_REPORT_TZ", "UTC"))
-MARKERS = {"eval_extended", "eval_consistency", "eval_robustness"}
+MARKERS = {"eval_extended", "eval_consistency", "eval_robustness", "eval_correctness_prb"}
 
 # Auto-load the repo-root .env so LLM_BASE_URL/KEYCLOAK_URL/etc. are set without having to
 # `set -a; . .env; set +a` before invoking pytest. Existing environment
@@ -118,10 +125,22 @@ def _render_field(lines: list[str], label: str, text: str) -> None:
         lines.append(f"- **{label}:** {text}")
 
 
+def _format_pairs_dict(pairs_by_gate: dict) -> str:
+    """Render a ``{gate: [(role, scope), ...]}`` dict (as produced by ``ScenarioScore.over_grants``
+    /``under_grants``/``incorrectly_denied``) as one line per non-empty gate, or ``"none"``."""
+    if not pairs_by_gate:
+        return "none"
+    return "\n".join(
+        f"{gate}: " + ", ".join(f"({r}, {s})" for r, s in pairs) for gate, pairs in sorted(pairs_by_gate.items())
+    )
+
+
 def _render_entry(lines: list[str], nodeid: str, report: pytest.TestReport, category: str) -> None:
     """Per-cell tests (``test_inbound``/``test_outbound``) ``record_property`` a concrete
-    description + expected/actual boolean + explanation; render those instead of the generic
-    docstring + crash/skip-reason fallback every other test in this suite gets."""
+    description + expected/actual boolean + explanation; ``test_prb_correctness`` (correctness-prb)
+    ``record_property``s precision/recall/denial-precision + the over-/under-grant/incorrect-denial
+    pair breakdown; render each instead of the generic docstring + crash/skip-reason fallback every
+    other test in this suite gets."""
     lines.append(f"### `{nodeid}`")
     props = dict(report.user_properties)
     if "expected" in props and "output" in props:
@@ -130,6 +149,16 @@ def _render_entry(lines: list[str], nodeid: str, report: pytest.TestReport, cate
             lines.append(f"- **What it tests:** {description}")
         _render_field(lines, "Expected output", f"{props['expected']} — {props.get('expected_explanation', '')}")
         _render_field(lines, "Output", f"{props['output']} — {props.get('llm_reasoning', '')}")
+    elif "precision" in props and "recall" in props:
+        description = _docstrings.get(nodeid)
+        if description:
+            lines.append(f"- **What it tests:** {description}")
+        lines.append(f"- **Precision:** {props['precision']:.3f}")
+        lines.append(f"- **Recall:** {props['recall']:.3f}")
+        lines.append(f"- **Denial precision:** {props['denial_precision']:.3f}")
+        _render_field(lines, "Over-grants", _format_pairs_dict(props.get("over_grants", {})))
+        _render_field(lines, "Under-grants", _format_pairs_dict(props.get("under_grants", {})))
+        _render_field(lines, "Incorrectly denied", _format_pairs_dict(props.get("incorrectly_denied", {})))
     else:
         doc = _docstrings.get(nodeid)
         if doc:
