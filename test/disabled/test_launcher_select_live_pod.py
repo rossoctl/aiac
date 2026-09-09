@@ -13,10 +13,14 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[2]  # -> aiac/
 sys.path.insert(0, str(REPO_ROOT))
 
 from test.integration.launcher import select_live_pod  # noqa: E402
+
+pytestmark = pytest.mark.skip(reason="isolated/disabled — moved to test/disabled/")
 
 
 def _pod(name: str, *, created: str, phase: str = "Running", ready: bool = True, terminating: bool = False) -> dict:

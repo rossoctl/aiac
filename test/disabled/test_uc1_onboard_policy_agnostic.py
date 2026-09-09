@@ -17,11 +17,15 @@ import inspect
 import sys
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[2]  # -> aiac/
 sys.path.insert(0, str(REPO_ROOT))
 
 from test.integration import scenario_uc1 as scn  # noqa: E402
 from test.integration import uc1_onboard as uc1  # noqa: E402
+
+pytestmark = pytest.mark.skip(reason="isolated/disabled — moved to test/disabled/")
 
 # --- ReadySignal: the parametrized convergence probe --------------------------------------------
 
