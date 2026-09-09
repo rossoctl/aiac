@@ -64,3 +64,25 @@ The governing principle: a `(role, scope)` carrying both an `Allow` and a `Deny`
 **is** a conflict — surface it, never resolve it. No precedence, no
 "deny wins," no merge. See `docs/adr/0001-identify-never-reconcile.md`.
 _Avoid_: deny-overrides, conflict resolution.
+
+**Source policy**:
+The original human-authored authorization policy as provided — free
+natural-language prose (e.g. the text held in the RAG knowledge base). The raw
+input a digest is derived from.
+_Avoid_: raw policy, input policy.
+
+**Digested policy**:
+A structured restatement of a source policy's intent in the digested-policy
+language — domain knowledge plus three statement kinds (direct grants, attribute
+invariants, role-assignment constraints). An authoring-layer artifact, upstream
+of the engine's `PolicyRule`s. See `docs/specs/digested-policy.md`.
+_Avoid_: parsed policy, normalized policy.
+
+**Authoring-layer conflict**:
+Two direct grants _within one digested policy_ with opposite effect whose
+subjects, operations, and resources overlap. Distinct from the engine-level
+**Conflict** (a cross-pass `(role, scope)` allow∩deny): this is among a digested
+policy's own statements, before it becomes `PolicyRule`s. Currently reported,
+never auto-resolved — deny-overrides reserved (see
+`docs/adr/0002-authoring-vs-engine-conflict-semantics.md`).
+_Avoid_: using unqualified "Conflict" for this.
