@@ -277,6 +277,33 @@ def cleanup_provisioned(admin, realm: str) -> None:
                 log.warning("cleanup: delete client scope %r failed: %s", name, exc)
 
 
+def reenable_provisioned_clients(admin, realm: str) -> None:
+    """Re-enable any demo workload client (``{namespace}/github-agent`` / ``{namespace}/github-tool``)
+    left **disabled** by a prior run before onboarding starts.
+
+    A failed onboard rolls back by disabling the service's Keycloak client as a failed-service marker
+    (``orchestrator._rollback`` -> ``set_service_enabled(False)``); a fully successful onboard re-enables
+    it. So a client left disabled is the fingerprint of an earlier crashed/aborted run, and it makes the
+    next run's discovery-token mint fail with ``invalid_client`` (a disabled client cannot use the
+    client_credentials grant). Flipping it back to ``enabled`` here restores the same clean slate the
+    onboard's own success path would — idempotent: an already-enabled client is left untouched.
+
+    Keys clients by ``name`` (``{namespace}/{workload}``), exactly as ``resolve_service_id`` and
+    ``require_pipeline`` do — never the SPIFFE ``clientId``. Best-effort: a failure to re-enable one
+    client is logged, not raised, so the run proceeds to onboard (which will surface the real cause)."""
+    from keycloak.exceptions import KeycloakError
+
+    admin.change_current_realm(realm)
+    demo_client_names = {f"{NAMESPACE}/{scn.AGENT_WORKLOAD}", f"{NAMESPACE}/{scn.TOOL_WORKLOAD}"}
+    for client in admin.get_clients():
+        if client.get("name") in demo_client_names and not client.get("enabled", True):
+            try:
+                admin.update_client(client["id"], {"enabled": True})
+                log.info("cleanup: re-enabled disabled client %r left by a prior run", client.get("name"))
+            except KeycloakError as exc:
+                log.warning("cleanup: re-enable client %r failed: %s", client.get("name"), exc)
+
+
 def clear_policy_store() -> None:
     """Drop every persisted SPM from the in-cluster Policy Store before a run — the store-side twin
     of ``cleanup_provisioned``'s Keycloak reset.
@@ -729,6 +756,7 @@ def onboarded_stack(
     admin = connect_admin()
     delete_agent_cr()  # before — clean policy slate (drop any prior run's CR)
     cleanup_provisioned(admin, TEST_REALM)  # before — clean slate (Keycloak)
+    reenable_provisioned_clients(admin, TEST_REALM)  # before — undo any prior run's failed-service disable
     clear_policy_store()  # before — clean slate (Policy Store SPMs; PV survives redeploys)
     provision_realm_and_users(admin, TEST_REALM)  # BEFORE onboarding (PRB reads the role universe)
     # username->sub mapper + Direct Access Grants are a one-time realm prereq the fixture does NOT
