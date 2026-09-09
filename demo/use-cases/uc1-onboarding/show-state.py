@@ -21,7 +21,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
 
 import scenario as scn
-from _lib import GENERATED, abort, connect_admin, load_config, note, opa_eval, rule, say, table
+from _lib import GENERATED, abort, connect_admin, grant_sets, load_config, note, rule, say, table
 
 
 def latest_snapshot() -> Path | None:
@@ -48,28 +48,9 @@ def show_keycloak(admin, cfg) -> None:
 
     all_scopes = {s["name"]: s.get("description", "") for s in admin.get_client_scopes()}
     provisioned_scopes = {n: d for n, d in all_scopes.items() if n.startswith(prefixes)}
-    print(
-        f"\n  Provisioned client scopes ({scn.AGENT_WORKLOAD}.*/{scn.TOOL_WORKLOAD}.*): {len(provisioned_scopes) or 'none yet'}"
-    )
+    print(f"\n  Provisioned client scopes ({scn.AGENT_WORKLOAD}.*/{scn.TOOL_WORKLOAD}.*): {len(provisioned_scopes) or 'none yet'}")
     for name, desc in sorted(provisioned_scopes.items()):
         note(f"{name} — {desc}")
-
-
-def grant_sets(cfg, rego_dir: Path) -> tuple[set[tuple[str, str]], set[tuple[str, str]]]:
-    inbound_rego = rego_dir / cfg.inbound_rego
-    outbound_rego = rego_dir / cfg.outbound_rego
-    # Inbound values stay FULL agent-scope names (not de-prefixed) — the inbound gate compares
-    # subject_role_allow_scopes against agent_scopes internally, never against input.mcp.params.name.
-    role_scopes = opa_eval([inbound_rego], "data.authbridge.client.inbound.request.subject_role_allow_scopes", {}) or {}
-    agent_scopes = set(opa_eval([inbound_rego], "data.authbridge.client.inbound.request.agent_scopes", {}) or [])
-    inbound = {(role, scope) for role, scopes in role_scopes.items() for scope in scopes if scope in agent_scopes}
-
-    # Outbound subject_role_allow_scopes values are BARE de-prefixed tool scopes.
-    subj_scopes = (
-        opa_eval([outbound_rego], "data.authbridge.client.outbound.request.subject_role_allow_scopes", {}) or {}
-    )
-    outbound = {(role, scope) for role, scopes in subj_scopes.items() for scope in scopes}
-    return inbound, outbound
 
 
 def show_snapshot(cfg, rego_dir: Path) -> None:

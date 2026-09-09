@@ -16,14 +16,16 @@ import os
 import shutil
 import subprocess
 import sys
+import textwrap
 import threading
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator
 
 import requests
+
 import scenario as scn
 
 HERE = Path(__file__).resolve().parent.parent  # lib/ -> uc1-onboarding/
@@ -91,6 +93,44 @@ def table(rows: list[tuple[str, ...]], headers: tuple[str, ...] | None = None) -
 def abort(msg: str) -> None:
     print(f"\n{_c('31;1', 'ABORT')}: {msg}", file=sys.stderr)
     raise SystemExit(1)
+
+
+# ======================================================================================
+# Presenter mode — explanatory prose, literal commands, and a "talk now" pause. All three
+# are additive narration only: none of them change control flow or return a value a caller
+# depends on, so a presenter-mode script and a plain one behave identically end to end.
+# ======================================================================================
+
+_PAUSE_ENABLED = os.environ.get("AIAC_DEMO_PAUSE", "1").strip().lower() not in ("0", "false", "no")
+
+
+def explain(text: str) -> None:
+    """Print a wrapped prose paragraph under a ``say()`` header: what this step does, why,
+    and which AIAC component(s) act and how they hand off to each other / to Keycloak / to
+    Kubernetes. Multiple paragraphs may be passed separated by blank lines."""
+    for para in text.strip().split("\n\n"):
+        wrapped = textwrap.fill(" ".join(para.split()), width=88, initial_indent="  ", subsequent_indent="  ")
+        print(_c("36", wrapped))
+    print()
+
+
+def cmd(description: str, shown: str) -> None:
+    """Print the literal command/API call about to run, so a recording shows the actual
+    mechanism (not just its result) before the code below performs it."""
+    print(f"  {_c('2', description + ':')}")
+    print(f"    {_c('35', '$ ' + shown)}")
+
+
+def pause(msg: str = "Press Enter to continue — or narrate this step now") -> None:
+    """Presenter's 'I'm done talking, continue' gate. Gated by ``AIAC_DEMO_PAUSE`` (default
+    on) and only blocks on an interactive TTY, so an unattended/piped ``make demo`` (CI, or a
+    quick smoke run) never hangs waiting for input that will never arrive."""
+    if not _PAUSE_ENABLED or not sys.stdin.isatty():
+        return
+    try:
+        input(f"\n  {_c('33', '⏸  ' + msg)} ")
+    except EOFError:
+        pass
 
 
 # ======================================================================================
@@ -182,9 +222,13 @@ def load_config() -> Config:
 
 
 def kubectl(*args: str, input_text: str | None = None, timeout: float = 60.0) -> str:
-    proc = subprocess.run(["kubectl", *args], input=input_text, capture_output=True, text=True, timeout=timeout)
+    proc = subprocess.run(
+        ["kubectl", *args], input=input_text, capture_output=True, text=True, timeout=timeout
+    )
     if proc.returncode != 0:
-        raise subprocess.CalledProcessError(proc.returncode, ["kubectl", *args], output=proc.stdout, stderr=proc.stderr)
+        raise subprocess.CalledProcessError(
+            proc.returncode, ["kubectl", *args], output=proc.stdout, stderr=proc.stderr
+        )
     return proc.stdout
 
 
@@ -209,19 +253,12 @@ def terminate(proc: subprocess.Popen) -> None:
 
 @contextmanager
 def port_forward(
-    target: str,
-    *,
-    namespace: str,
-    local_port: int,
-    remote_port: int,
-    ready_url: str | None = None,
-    timeout: float = 30.0,
+    target: str, *, namespace: str, local_port: int, remote_port: int,
+    ready_url: str | None = None, timeout: float = 30.0,
 ) -> Iterator[str]:
     proc = subprocess.Popen(
         ["kubectl", "port-forward", "-n", namespace, target, f"{local_port}:{remote_port}"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
     )
     base_url = f"http://127.0.0.1:{local_port}"
     output: list[str] = []
@@ -260,6 +297,66 @@ def port_forward(
     finally:
         terminate(proc)
         reader.join(timeout=1)
+
+
+_LOG_COLORS = ("36", "35", "33", "32")  # cyan, magenta, yellow, green — cycled per deployment
+
+
+@contextmanager
+def tail_component_logs(pairs: list[tuple[str, str, str, str | None]]) -> Iterator[None]:
+    """Stream ``kubectl logs -f`` for each ``(label, deployment, namespace, container)`` in
+    the background, each line prefixed with a colored ``[label]``, for the duration of the
+    wrapped block. This is what turns Part 1's new component-level ``logger.info(...)`` calls
+    (Controller, Policy Rules Builder, Policy Writer) into live narration during a
+    long-running onboarding call — the presenter can point at real component behavior as it
+    happens instead of only reporting the eventual HTTP result.
+
+    ``container`` MUST be given (not ``None``) for any deployment with more than one
+    non-init container — e.g. ``aiac-interface`` runs both ``aiac-pdp-config`` (the IdP
+    Configuration service) and ``aiac-pdp-policy-opa`` (the actual Policy Writer): omitting
+    ``-c`` there does not reliably error, it can silently tail the WRONG container (observed
+    live — it defaulted to ``aiac-pdp-config`` and every line looked like Policy Writer
+    narration but was not). Pass ``None`` only for a deployment with exactly one container
+    (e.g. ``aiac-agent`` — its ``aiac-init`` init container doesn't count).
+
+    Best-effort: a log stream that fails to start (e.g. the deployment briefly unready) is
+    noted and skipped rather than aborting the whole step — this is presentation value-add,
+    never a correctness dependency."""
+    procs: list[subprocess.Popen] = []
+    threads: list[threading.Thread] = []
+    stop = threading.Event()
+
+    def _drain(proc: subprocess.Popen, label: str, color: str) -> None:
+        assert proc.stdout is not None
+        prefix = _c(color, f"[{label}]")
+        for line in proc.stdout:
+            if stop.is_set():
+                break
+            print(f"  {prefix} {line.rstrip()}")
+
+    for i, (label, deployment, namespace, container) in enumerate(pairs):
+        args = ["kubectl", "logs", "-f", f"deployment/{deployment}", "-n", namespace, "--since=1s", "--tail=0"]
+        if container:
+            args += ["-c", container]
+        try:
+            proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        except FileNotFoundError:
+            note(f"could not start log tail for {label!r} (kubectl not found) — continuing without it")
+            continue
+        procs.append(proc)
+        color = _LOG_COLORS[i % len(_LOG_COLORS)]
+        t = threading.Thread(target=_drain, args=(proc, label, color), daemon=True)
+        t.start()
+        threads.append(t)
+
+    try:
+        yield
+    finally:
+        stop.set()
+        for proc in procs:
+            terminate(proc)
+        for t in threads:
+            t.join(timeout=1)
 
 
 def opa_bin() -> str:
@@ -372,10 +469,8 @@ def clear_policy_store(cfg: Config) -> None:
     on a surviving PV and onboarding appends with ``override=False``, so a store that answers with a
     non-2xx means the clear actually failed and this run would proceed on dirty state."""
     with port_forward(
-        cfg.store_target,
-        namespace=cfg.store_namespace,
-        local_port=cfg.store_local_port,
-        remote_port=cfg.store_remote_port,
+        cfg.store_target, namespace=cfg.store_namespace,
+        local_port=cfg.store_local_port, remote_port=cfg.store_remote_port,
         ready_url=f"http://127.0.0.1:{cfg.store_local_port}/health",
     ) as base_url:
         resp = requests.delete(f"{base_url}/policy/services", timeout=30)
@@ -387,8 +482,7 @@ def ensure_agent_policy(cfg: Config) -> None:
     """Ensure the PRB's ``policy.md`` (``scenario.POLICY_ABSTRACT``) is mounted on the Controller
     Deployment, rolling out only when the ConfigMap content or the mount actually changed."""
     cm = {
-        "apiVersion": "v1",
-        "kind": "ConfigMap",
+        "apiVersion": "v1", "kind": "ConfigMap",
         "metadata": {"name": cfg.policy_configmap, "namespace": cfg.controller_namespace},
         "data": {"policy.md": scn.POLICY_ABSTRACT},
     }
@@ -396,13 +490,8 @@ def ensure_agent_policy(cfg: Config) -> None:
     cm_changed = "unchanged" not in apply_out
 
     mounted = kubectl(
-        "get",
-        "deployment",
-        cfg.controller_deployment,
-        "-n",
-        cfg.controller_namespace,
-        "-o",
-        "jsonpath={.spec.template.spec.volumes[*].configMap.name}",
+        "get", "deployment", cfg.controller_deployment, "-n", cfg.controller_namespace,
+        "-o", "jsonpath={.spec.template.spec.volumes[*].configMap.name}",
     )
     if cfg.policy_configmap in mounted.split():
         if cm_changed:
@@ -411,33 +500,15 @@ def ensure_agent_policy(cfg: Config) -> None:
         return
 
     patch = {
-        "spec": {
-            "template": {
-                "spec": {
-                    "volumes": [{"name": "aiac-policy", "configMap": {"name": cfg.policy_configmap}}],
-                    "containers": [
-                        {
-                            "name": cfg.controller_deployment,
-                            "volumeMounts": [
-                                {"name": "aiac-policy", "mountPath": cfg.policy_mount_path, "readOnly": True}
-                            ],
-                        }
-                    ],
-                }
-            }
-        }
+        "spec": {"template": {"spec": {
+            "volumes": [{"name": "aiac-policy", "configMap": {"name": cfg.policy_configmap}}],
+            "containers": [{
+                "name": cfg.controller_deployment,
+                "volumeMounts": [{"name": "aiac-policy", "mountPath": cfg.policy_mount_path, "readOnly": True}],
+            }],
+        }}}
     }
-    kubectl(
-        "patch",
-        "deployment",
-        cfg.controller_deployment,
-        "-n",
-        cfg.controller_namespace,
-        "--type",
-        "strategic",
-        "-p",
-        json.dumps(patch),
-    )
+    kubectl("patch", "deployment", cfg.controller_deployment, "-n", cfg.controller_namespace, "--type", "strategic", "-p", json.dumps(patch))
     kubectl_rollout_status(f"deployment/{cfg.controller_deployment}", namespace=cfg.controller_namespace)
 
 
@@ -454,12 +525,8 @@ def clear_writer_rego(cfg: Config) -> None:
     writer's rego" means "delete the CR" — the next onboard server-side-applies a fresh one.
     Idempotent: ``--ignore-not-found`` treats an already-absent CR as success."""
     kubectl(
-        "delete",
-        AUTHZ_POLICY_RESOURCE,
-        cfg.cr_name,
-        "-n",
-        cfg.namespace,
-        "--ignore-not-found",
+        "delete", AUTHZ_POLICY_RESOURCE, cfg.cr_name,
+        "-n", cfg.namespace, "--ignore-not-found",
     )
 
 
@@ -482,6 +549,96 @@ def capture_rego(cfg: Config, rego_dir: Path) -> None:
 
 
 # ======================================================================================
+# State snapshots — automatic before/after narration around a step
+# ======================================================================================
+
+
+@dataclass(frozen=True)
+class StateSnapshot:
+    """A point-in-time read of exactly the state UC-1 onboarding changes: provisioned
+    Keycloak roles/scopes, whether the agent's AuthorizationPolicy CR exists, and (when a
+    rego snapshot directory is given and both files are present) the inbound/outbound grant
+    sets computed from it. Two snapshots taken around one step, fed to ``print_state_before``/
+    ``print_state_diff``, are the demo's automatic "what changed" — no separate ``make
+    show``/``make diff`` invocation needed to narrate it during a step."""
+
+    roles: dict[str, str] = field(default_factory=dict)
+    scopes: dict[str, str] = field(default_factory=dict)
+    cr_exists: bool = False
+    inbound_grants: set[tuple[str, str]] = field(default_factory=set)
+    outbound_grants: set[tuple[str, str]] = field(default_factory=set)
+
+
+def grant_sets(cfg: Config, rego_dir: Path) -> tuple[set[tuple[str, str]], set[tuple[str, str]]]:
+    """The (role, scope) grant sets a snapshot's generated Rego encodes. Shared by
+    ``show-state.py`` (the full text-diff view) and ``snapshot_state`` (the automatic
+    per-step diff below) — one OPA-eval-based implementation, not two."""
+    inbound_rego = rego_dir / cfg.inbound_rego
+    outbound_rego = rego_dir / cfg.outbound_rego
+    # Inbound values stay FULL agent-scope names (not de-prefixed) — the inbound gate compares
+    # subject_role_allow_scopes against agent_scopes internally, never against input.mcp.params.name.
+    role_scopes = opa_eval([inbound_rego], "data.authbridge.client.inbound.request.subject_role_allow_scopes", {}) or {}
+    agent_scopes = set(opa_eval([inbound_rego], "data.authbridge.client.inbound.request.agent_scopes", {}) or [])
+    inbound = {(role, scope) for role, scopes in role_scopes.items() for scope in scopes if scope in agent_scopes}
+
+    # Outbound subject_role_allow_scopes values are BARE de-prefixed tool scopes.
+    subj_scopes = opa_eval([outbound_rego], "data.authbridge.client.outbound.request.subject_role_allow_scopes", {}) or {}
+    outbound = {(role, scope) for role, scopes in subj_scopes.items() for scope in scopes}
+    return inbound, outbound
+
+
+def _cr_exists(cfg: Config) -> bool:
+    try:
+        kubectl_get_json(f"{AUTHZ_POLICY_RESOURCE}/{cfg.cr_name}", namespace=cfg.namespace)
+        return True
+    except subprocess.CalledProcessError:
+        return False
+
+
+def snapshot_state(cfg: Config, admin, rego_dir: Path | None = None) -> StateSnapshot:
+    """Capture exactly the state UC-1 onboarding changes, for automatic before/after
+    narration around a step. Pass the SAME ``rego_dir`` (the ``generated/<snapshot>``
+    directory this step's Rego will land in, or already has) before and after a step so
+    ``print_state_diff`` compares like with like; omit it for a step that never touches
+    Rego (grant sets then stay empty on both sides, which is correct — nothing to diff)."""
+    admin.change_current_realm(cfg.realm)
+    prefixes = (f"{scn.AGENT_WORKLOAD}.", f"{scn.TOOL_WORKLOAD}.")
+    roles = {r["name"]: r.get("description", "") for r in admin.get_realm_roles() if r["name"].startswith(prefixes)}
+    scopes = {s["name"]: s.get("description", "") for s in admin.get_client_scopes() if s["name"].startswith(prefixes)}
+    inbound: set[tuple[str, str]] = set()
+    outbound: set[tuple[str, str]] = set()
+    if rego_dir is not None and (rego_dir / cfg.inbound_rego).is_file() and (rego_dir / cfg.outbound_rego).is_file():
+        inbound, outbound = grant_sets(cfg, rego_dir)
+    return StateSnapshot(
+        roles=roles, scopes=scopes, cr_exists=_cr_exists(cfg), inbound_grants=inbound, outbound_grants=outbound
+    )
+
+
+def print_state_before(snapshot: StateSnapshot) -> None:
+    print(f"  {_c('2', 'System state BEFORE this step:')}")
+    note(f"provisioned roles: {len(snapshot.roles) or 'none'}")
+    note(f"provisioned client scopes: {len(snapshot.scopes) or 'none'}")
+    note(f"agent AuthorizationPolicy CR: {'present' if snapshot.cr_exists else 'absent'}")
+    note(f"inbound grants: {len(snapshot.inbound_grants)}   outbound grants: {len(snapshot.outbound_grants)}")
+    print()
+
+
+def print_state_diff(before: StateSnapshot, after: StateSnapshot) -> None:
+    print(f"  {_c('2', 'System state AFTER this step — what changed:')}")
+    added_roles = sorted(set(after.roles) - set(before.roles))
+    added_scopes = sorted(set(after.scopes) - set(before.scopes))
+    note(f"roles added: {added_roles or 'none'}")
+    note(f"client scopes added: {added_scopes or 'none'}")
+    if before.cr_exists != after.cr_exists:
+        note(f"agent AuthorizationPolicy CR: {'appeared' if after.cr_exists else 'disappeared'}")
+    added_in = sorted(after.inbound_grants - before.inbound_grants)
+    added_out = sorted(after.outbound_grants - before.outbound_grants)
+    note(f"inbound grants added: {added_in or 'none'}")
+    note(f"outbound grants added: {added_out or 'none'}")
+    print()
+
+
+# ======================================================================================
 # ROPC login + RFC 8693 token exchange
 # ======================================================================================
 
@@ -497,20 +654,12 @@ def ropc_login(cfg: Config, client_id: str, username: str, password: str) -> dic
     enabled). Aborts on any non-token response — this demo does a real login, not a stub."""
     resp = requests.post(
         f"{cfg.keycloak_url}/realms/{cfg.realm}/protocol/openid-connect/token",
-        data={
-            "grant_type": "password",
-            "client_id": client_id,
-            "username": username,
-            "password": password,
-            "scope": "openid",
-        },
+        data={"grant_type": "password", "client_id": client_id, "username": username, "password": password, "scope": "openid"},
         timeout=15,
     )
     body = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
     if resp.status_code != 200 or "access_token" not in body:
-        abort(
-            f"ROPC login for {username!r} via {client_id!r} failed: HTTP {resp.status_code} — {body or resp.text[:300]}"
-        )
+        abort(f"ROPC login for {username!r} via {client_id!r} failed: HTTP {resp.status_code} — {body or resp.text[:300]}")
     return body
 
 
@@ -553,28 +702,45 @@ def drive(username: str) -> None:
     outbound_rego = rego_dir / cfg.outbound_rego
     if not (inbound_rego.is_file() and outbound_rego.is_file()):
         abort(
-            f"no policy found at {rego_dir} — run `make onboard-agent` and `make onboard-tool` first "
+            f"no policy found at {rego_dir} — run `make agent` and `make tool` first "
             "(run-*.py always drives against the after-tool snapshot)"
         )
 
     admin = connect_admin(cfg)
 
     say("1", "3", f"{username} ({role}): ROPC login")
+    explain(f"""
+        This is a REAL Keycloak login: a {scn.USER_PASSWORD!r}-password ``grant_type=password``
+        call against the public ``{scn.ROPC_CLIENT_ID}`` client, standing in for how a human
+        (or a human-facing client on their behalf) would authenticate before talking to the
+        {scn.AGENT_WORKLOAD} agent. Nothing AIAC-specific happens yet — Keycloak just mints an
+        access token carrying {username!r}'s realm role ({role!r}) in ``realm_access.roles``.
+    """)
+    cmd("Input", f"POST {cfg.keycloak_url}/realms/{cfg.realm}/protocol/openid-connect/token "
+                 f"grant_type=password client_id={scn.ROPC_CLIENT_ID} username={username}")
     login = ropc_login(cfg, scn.ROPC_CLIENT_ID, username, scn.USER_PASSWORD)
     subject_token = login["access_token"]
-    ok("logged in")
+    ok("logged in — access token issued")
+    pause()
 
     say("2", "3", "Inbound gate: may this user call the agent?")
+    explain(f"""
+        The inbound gate is the Rego AIAC's Policy Writer generated for {scn.AGENT_WORKLOAD} at
+        onboarding time (``authbridge.client.inbound.request``) — the same package a live
+        AuthBridge sidecar in front of the agent would evaluate on every request. It answers one
+        question: does {username!r}'s realm role source ANY scope this agent exposes? This demo
+        evaluates it directly with ``opa eval`` (the same query AuthBridge's OPA plugin runs),
+        rather than sending a real HTTP request through the sidecar.
+    """)
+    cmd("Input", f"opa eval -d {inbound_rego} data.authbridge.client.inbound.request.allow "
+                 f'--stdin-input <<< {{"identity": {{"subject": "{username}"}}}}')
     # Fixed package + live-plugin input shape. This demo path is an end-user ROPC login with no
     # platform source client, so we send NO input.identity.client_id — source_ok is satisfied by
     # the writer's `source_ok if { not input.identity.client_id }` rule.
-    inbound_allowed = bool(
-        opa_eval(
-            [inbound_rego],
-            "data.authbridge.client.inbound.request.allow",
-            {"identity": {"subject": username}},
-        )
-    )
+    inbound_allowed = bool(opa_eval(
+        [inbound_rego], "data.authbridge.client.inbound.request.allow",
+        {"identity": {"subject": username}},
+    ))
     expected_in = scn.expected_inbound(username)
     if inbound_allowed != expected_in:
         abort(f"inbound mismatch for subject={username!r}: opa said {inbound_allowed}, expected {expected_in}")
@@ -584,9 +750,19 @@ def drive(username: str) -> None:
         blocked(f"{intent.label!r} -> blocked at inbound (the intended {username} story, not an error)")
         table([(username, role, intent.label, "blocked at inbound")], headers=("user", "role", "intent", "result"))
         return
-    ok("inbound allowed")
+    ok("inbound allowed — result: True")
+    pause()
 
     say("3", "3", "Per-intent outbound gate (via a real RFC 8693 exchange)")
+    explain(f"""
+        Passing the inbound gate only proves {username!r} may reach the agent — it says nothing
+        about what the agent may then do on {scn.TOOL_WORKLOAD}. So this stage performs a REAL
+        RFC 8693 token exchange: the agent's own Keycloak client trades {username!r}'s subject
+        token for a new one audienced at the tool. Each of {username!r}'s intents is then checked
+        against the SAME outbound gate the Policy Writer generated when {scn.TOOL_WORKLOAD} was
+        onboarded — a two-gate AND (subject_ok: does {role!r} source this tool scope? AND
+        target_ok: does the exchanged token's audience expose it?).
+    """)
     agent_uuid = resolve_service_id(admin, cfg, f"{cfg.namespace}/{scn.AGENT_WORKLOAD}")
     agent_client_id = admin.get_client(agent_uuid)["clientId"]
     secret = client_secret(admin, cfg, agent_uuid)
@@ -598,23 +774,19 @@ def drive(username: str) -> None:
         abort(f"outbound rego at {outbound_rego} has no target_allow_scopes — is the tool onboarded?")
     target_uri = next(iter(target_scopes))
 
-    token_exchange(
-        cfg, client_id=agent_client_id, client_secret_value=secret, subject_token=subject_token, audience=target_uri
-    )
+    cmd("Input", f"POST {cfg.keycloak_url}/realms/{cfg.realm}/protocol/openid-connect/token "
+                 f"grant_type=token-exchange subject_token=<{username}'s access token> audience={target_uri}")
+    token_exchange(cfg, client_id=agent_client_id, client_secret_value=secret, subject_token=subject_token, audience=target_uri)
     note(f"exchanged token; aud includes {target_uri}")
+    pause()
 
     rows: list[tuple[str, ...]] = []
     for intent in scn.INTENTS[username]:
-        allowed = bool(
-            opa_eval(
-                [outbound_rego],
-                "data.authbridge.client.outbound.request.allow",
-                {
-                    "identity": {"subject": username, "service_id": target_uri},
-                    "mcp": {"params": {"name": intent.function_name}},
-                },
-            )
-        )
+        allowed = bool(opa_eval(
+            [outbound_rego], "data.authbridge.client.outbound.request.allow",
+            {"identity": {"subject": username, "service_id": target_uri},
+             "mcp": {"params": {"name": intent.function_name}}},
+        ))
         expected_out = scn.expected_outbound(username, intent.function_name)
         if allowed != expected_out:
             abort(

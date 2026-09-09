@@ -24,7 +24,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 
 import scenario as scn
-from _lib import Config, abort, kubectl, kubectl_get_json, kubectl_rollout_status, load_config, note, ok, rule, say
+from _lib import Config, abort, explain, kubectl, kubectl_get_json, kubectl_rollout_status, load_config, note, ok, pause, rule, say
 
 HERE = Path(__file__).resolve().parent
 AIAC_ROOT = HERE.parents[3]  # demo/use-cases/uc1-onboarding/init/ -> aiac/
@@ -32,11 +32,7 @@ ASSETS_DIR = HERE.parents[2] / "assets"  # demo/assets/
 
 AIAC_NAMESPACE = "aiac-system"
 AIAC_IMAGES = [
-    (
-        "localhost/aiac-pdp-config:local",
-        "src/aiac/idp/service/configuration/keycloak/Dockerfile",
-        "src/aiac/idp/service/configuration/keycloak",
-    ),
+    ("localhost/aiac-pdp-config:local", "src/aiac/idp/service/configuration/keycloak/Dockerfile", "src/aiac/idp/service/configuration/keycloak"),
     ("localhost/aiac-pdp-policy-opa:local", "src/aiac/pdp/service/policy/opa/Dockerfile", "src"),
     ("localhost/aiac-policy-model-store:local", "src/aiac/policy/model_store/service/Dockerfile", "src"),
     ("localhost/aiac-agent:local", "src/aiac/agent/controller/Dockerfile", "src"),
@@ -74,14 +70,8 @@ def verify_namespace(namespace: str) -> None:
 
 def verify_spire() -> None:
     out = kubectl(
-        "get",
-        "pods",
-        "-A",
-        "-l",
-        "app.kubernetes.io/name=agent,app.kubernetes.io/instance=spire",
-        "-o",
-        "jsonpath={.items[*].status.phase}",
-        timeout=15,
+        "get", "pods", "-A", "-l", "app.kubernetes.io/name=agent,app.kubernetes.io/instance=spire",
+        "-o", "jsonpath={.items[*].status.phase}", timeout=15,
     )
     if not out.split() or any(phase != "Running" for phase in out.split()):
         abort(f"SPIRE agent not Running (got phases: {out or '<none>'}) — is SPIRE installed?")
@@ -146,14 +136,7 @@ def ensure_aiac_deployed(cfg: Config) -> None:
         kubectl("apply", "-f", str(AIAC_ROOT / "k8s" / manifest))
 
     kubectl("wait", "deployment/aiac-interface", "-n", AIAC_NAMESPACE, "--for=condition=Available", "--timeout=120s")
-    kubectl(
-        "wait",
-        "statefulset/aiac-policy-model-store",
-        "-n",
-        AIAC_NAMESPACE,
-        "--for=jsonpath={.status.readyReplicas}=1",
-        "--timeout=120s",
-    )
+    kubectl("wait", "statefulset/aiac-policy-model-store", "-n", AIAC_NAMESPACE, "--for=jsonpath={.status.readyReplicas}=1", "--timeout=120s")
     kubectl("wait", "deployment/aiac-agent", "-n", AIAC_NAMESPACE, "--for=condition=Available", "--timeout=120s")
     ok("AIAC stack deployed")
 
@@ -202,13 +185,8 @@ def wait_for_client_registration(cfg: Config, timeout: float = 180.0) -> None:
 
 def verify_mcp_label(namespace: str) -> None:
     label = kubectl(
-        "get",
-        "service",
-        scn.TOOL_WORKLOAD,
-        "-n",
-        namespace,
-        "-o",
-        "jsonpath={.metadata.labels.protocol\\.rossoctl\\.io/mcp}",
+        "get", "service", scn.TOOL_WORKLOAD, "-n", namespace,
+        "-o", "jsonpath={.metadata.labels.protocol\\.rossoctl\\.io/mcp}",
     ).strip()
     if label != "true":
         abort(
@@ -223,19 +201,51 @@ def main() -> None:
     cfg = load_config()
 
     say("1", "4", "Verify: cluster + CRDs + namespace + SPIRE + Keycloak")
+    explain("""
+        Every later step talks to this cluster, so this checks the ground it needs before
+        touching anything: kubectl reaches a cluster, the operator's AgentRuntime/AgentCard
+        CRDs exist (AIAC reads agent capability CRs through them), the demo namespace exists,
+        SPIRE is up (workload identity for the agent/tool sidecars), and Keycloak answers —
+        nothing AIAC-specific yet, just the platform AIAC sits on top of.
+    """)
     verify_cluster_reachable()
     verify_crds()
     verify_namespace(cfg.namespace)
     verify_spire()
     verify_keycloak(cfg)
+    pause()
 
     say("2", "4", "Verify/install: AIAC stack")
+    explain("""
+        AIAC itself is three cooperating services: the Controller (dispatches onboarding
+        requests to the Policy Rules Builder), the IdP Configuration service + Policy Writer
+        (aiac-interface — reads/writes Keycloak roles/scopes and renders the generated Rego
+        into AuthorizationPolicy CRs), and the Policy Model Store (persists applied policy so
+        onboarding is incremental). All three must be Available before /apply/service calls
+        can succeed.
+    """)
     ensure_aiac_deployed(cfg)
+    pause()
 
     say("3", "4", "Verify/install: demo workloads (github-agent, github-tool)")
+    explain("""
+        github-agent and github-tool are the two workloads this demo onboards — a stand-in
+        agent and the GitHub-shaped MCP tool it will call. Each carries an AuthBridge sidecar
+        (SPIFFE identity + JWT validation) so the later inbound/outbound gates have a real
+        enforcement point to describe, even though this demo evaluates the generated Rego
+        directly rather than sending traffic through the sidecar.
+    """)
     ensure_workloads_deployed(cfg.namespace)
+    pause()
 
     say("4", "4", "Wait: Keycloak client registration + MCP service label")
+    explain("""
+        The operator registers each workload as a Keycloak client asynchronously after
+        injecting its sidecar — "the Deployment rolled out" is not "Keycloak knows about it
+        yet". This polls until both clients exist, and checks github-tool's Service carries
+        the protocol.rossoctl.io/mcp label AIAC's tool-discovery step (analyze_tool) requires
+        to find its MCP endpoint.
+    """)
     wait_for_client_registration(cfg)
     verify_mcp_label(cfg.namespace)
 

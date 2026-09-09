@@ -116,9 +116,7 @@ class AuditVerdict(BaseModel):
 
 class PolicyRulesBuilderBaseError(Exception): ...
 
-
 class PolicyRulesBuilderError(PolicyRulesBuilderBaseError): ...
-
 
 class LLMAccessError(PolicyRulesBuilderBaseError):
     """Raised by ``_structured_call`` when the LLM endpoint stays unreachable after the transport
@@ -126,13 +124,11 @@ class LLMAccessError(PolicyRulesBuilderBaseError):
     it never carries the endpoint / host / API key; the raw transport error is chained on
     ``__cause__`` for internal logging only."""
 
-
 class UnparseableLLMResponseError(PolicyRulesBuilderBaseError):
     """Raised by ``_structured_call`` when the LLM is REACHABLE but its response cannot be parsed /
     fails schema validation (a non-transient failure, so it is not retried). Distinct from
     ``LLMAccessError`` (endpoint unreachable) so a consumer can tell the two apart. Sanitized the
     same way -- no endpoint / host / API key in the message; original error chained on ``__cause__``."""
-
 
 class PolicyContradictionError(PolicyRulesBuilderBaseError):
     """Raised when the policy GENUINELY both grants and prohibits the same (focal, candidate) pair
@@ -219,9 +215,18 @@ def _structured_call(schema: type[T], messages: list[BaseMessage]) -> T:
         raise UnparseableLLMResponseError("LLM returned an unparseable or schema-invalid response") from err
 
 
+def _loggable(value: object) -> str:
+    """Neutralize a value for single-line logging (drop CR/LF); see
+    ``uc.onboarding.orchestrator._loggable``. Applied to LLM-derived names/reasoning — untrusted
+    free text, not this process's own naming."""
+    return str(value).replace("\r", "").replace("\n", "")
+
+
 # shared node helpers (typed against _PRBWorking; direction specifics passed as kwargs)
 def _fetch(state: _PRBWorking) -> dict[str, Any]:
-    return {"policy_text": get_policy_source().fetch()}
+    text = get_policy_source().fetch()
+    logger.info("PRB _fetch: read policy source (%d chars)", len(text))
+    return {"policy_text": text}
 
 
 def _propose(
@@ -240,10 +245,19 @@ def _propose(
         state["policy_text"], focal, candidates, contract, state["audit_feedback"], direction=direction
     )
     sel = _structured_call(schema, msgs)
+    granted = list(getattr(sel, names_field))
+    denied = list(getattr(sel, denied_names_field))
+    exclusive = bool(getattr(sel, exclusive_field))
+    # direction's first sentence is "GATE DIRECTION -- <axis> gate. ..." -- pull just "<axis> gate".
+    gate_kind = direction.split("--", 1)[-1].split(".", 1)[0].strip()
+    logger.info(
+        "PRB _propose: focal=%s (%s) -> LLM granted=%s denied=%s exclusive=%s",
+        _loggable(focal), gate_kind, _loggable(granted), _loggable(denied), exclusive,
+    )
     return {
-        "selected_names": list(getattr(sel, names_field)),
-        "denied_names": list(getattr(sel, denied_names_field)),
-        "exclusive": bool(getattr(sel, exclusive_field)),
+        "selected_names": granted,
+        "denied_names": denied,
+        "exclusive": exclusive,
         "reasoning": sel.reasoning,
     }
 
@@ -281,13 +295,23 @@ def _audit(state: _PRBWorking, *, focal: str, candidates: str, direction: str) -
     # Three-way routing. A genuine contradiction short-circuits past retry (retrying can't fix a
     # real conflict) and fails closed regardless of the audit budget; the raise IS the report.
     if verdict.contradictions:
+        logger.info(
+            "PRB _audit: focal=%s -> REJECTED, %d genuine contradiction(s): %s",
+            _loggable(focal), len(verdict.contradictions),
+            _loggable([c.candidate_name for c in verdict.contradictions]),
+        )
         raise PolicyContradictionError(focal, verdict.contradictions)
     if verdict.approved:
+        logger.info("PRB _audit: focal=%s -> APPROVED after %d retry(ies)", _loggable(focal), state["retry_count"])
         return {"approved": True}
     # Ordinary rejection (includes a generation-error overlap the auditor did NOT deem genuine):
     # feed the reason back and re-propose on the shared budget.
     if state["retry_count"] >= MAX_AUDIT_RETRIES:
         raise PolicyRulesBuilderError(f"Auditor rejected after {MAX_AUDIT_RETRIES} retries: {verdict.reason}")
+    logger.info(
+        "PRB _audit: focal=%s -> rejected (retry %d/%d): %s",
+        _loggable(focal), state["retry_count"] + 1, MAX_AUDIT_RETRIES, _loggable(verdict.reason),
+    )
     return {"approved": False, "audit_feedback": verdict.reason, "retry_count": state["retry_count"] + 1}
 
 
@@ -409,7 +433,9 @@ def build_role_graph(*, deny_only: bool = False):
         return _precheck(s, candidate_names={sc.name for sc in s["scopes"]})
 
     def audit(s: RoleRulesState) -> dict[str, Any]:
-        return _audit(s, focal=_role_focal(s["role"]), candidates=_scope_cands(s["scopes"]), direction=_ROLE_DIRECTION)
+        return _audit(
+            s, focal=_role_focal(s["role"]), candidates=_scope_cands(s["scopes"]), direction=_ROLE_DIRECTION
+        )
 
     def build(s: RoleRulesState) -> dict[str, Any]:
         # DENY from the exclusivity complement + explicit prohibitions -- every rule rebuilt from
@@ -423,12 +449,19 @@ def build_role_graph(*, deny_only: bool = False):
         if deny_only:
             # Door B contributes only prohibitions; a purely permissive policy (no exclusivity,
             # no explicit deny) yields [] -- a structural no-op that never broadens access.
+            logger.info("PRB build (role, deny-only/Door B): role=%s -> %d deny rule(s): %s",
+                        _loggable(s["role"].name), len(denies), _loggable([d.scope.name for d in denies]))
             return {"rules": denies}
         # ALLOW from granted names first, then the denies -- each in candidate order.
         granted = set(s["selected_names"])
         allows = [
             PolicyRule(role=s["role"], scope=sc, effect=RuleEffect.ALLOW) for sc in s["scopes"] if sc.name in granted
         ]
+        logger.info(
+            "PRB build (role): role=%s -> %d allow + %d deny rule(s): allow=%s deny=%s",
+            _loggable(s["role"].name), len(allows), len(denies),
+            _loggable([a.scope.name for a in allows]), _loggable([d.scope.name for d in denies]),
+        )
         return {"rules": allows + denies}
 
     return _assemble(RoleRulesState, propose, precheck, audit, build)
@@ -452,7 +485,9 @@ def build_scope_graph():
         return _precheck(s, candidate_names={r.name for r in s["roles"]})
 
     def audit(s: ScopeRulesState) -> dict[str, Any]:
-        return _audit(s, focal=_scope_focal(s["scope"]), candidates=_role_cands(s["roles"]), direction=_SCOPE_DIRECTION)
+        return _audit(
+            s, focal=_scope_focal(s["scope"]), candidates=_role_cands(s["roles"]), direction=_SCOPE_DIRECTION
+        )
 
     def build(s: ScopeRulesState) -> dict[str, Any]:
         # ALLOW from granted names, DENY from explicit prohibitions -- every rule rebuilt from the
@@ -465,6 +500,11 @@ def build_scope_graph():
             PolicyRule(role=r, scope=s["scope"], effect=RuleEffect.ALLOW) for r in s["roles"] if r.name in granted
         ]
         denies = [PolicyRule(role=r, scope=s["scope"], effect=RuleEffect.DENY) for r in s["roles"] if r.name in denied]
+        logger.info(
+            "PRB build (scope): scope=%s -> %d allow + %d deny rule(s): allow=%s deny=%s",
+            _loggable(s["scope"].name), len(allows), len(denies),
+            _loggable([a.role.name for a in allows]), _loggable([d.role.name for d in denies]),
+        )
         return {"rules": allows + denies}
 
     return _assemble(ScopeRulesState, propose, precheck, audit, build)

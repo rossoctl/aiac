@@ -59,12 +59,23 @@ def _config() -> Configuration:
     return Configuration.for_default_realm()
 
 
+def _loggable(value: object) -> str:
+    """Neutralize a value for single-line logging (drop CR/LF); see
+    ``uc.onboarding.orchestrator._loggable``."""
+    return str(value).replace("\r", "").replace("\n", "")
+
+
 class ServicePolicyBuilder:
     @staticmethod
     def build(service_id: str, service_type: ServiceType) -> list[PolicyRule]:
         # service_type is routed through the parameter (the requested classification for the
         # fan-out), never conflated with focus.type — see #154 AC#6.
         focal = resolve_focal_entities(service_id, service_type, config=_config())
+        logger.info(
+            "ServicePolicyBuilder: service_id=%s type=%s -> %d own scope(s), %d own role(s), %d candidate role(s)",
+            _loggable(service_id), service_type.value,
+            len(focal.own_scopes), len(focal.own_roles), len(focal.candidate_roles),
+        )
 
         rules: list[PolicyRule] = []
         # #168: the fan-out must NOT abort on the FIRST policy contradiction. Each PRB call is
@@ -157,6 +168,11 @@ class ServicePolicyBuilder:
                 # rather than being silently swallowed. We still raise the STRUCTURAL report.
                 logger.warning("policy conflict enrichment failed; falling back to structural report", exc_info=True)
             raise PolicyConflictError(report)
+        allow_count = sum(1 for r in rules if r.effect.value == "Allow")
+        logger.info(
+            "ServicePolicyBuilder: service_id=%s -> assembled %d rule(s) total (%d allow, %d deny)",
+            _loggable(service_id), len(rules), allow_count, len(rules) - allow_count,
+        )
         # Only this build's own rules are applied; the OTHER services' rules read above are already
         # persisted and are used solely to widen detection, never re-emitted.
         return rules

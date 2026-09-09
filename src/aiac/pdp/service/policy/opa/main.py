@@ -11,6 +11,7 @@ The CR write is **always active** — it is never gated by an env var. Setting
 disables, replaces, or gates the CR write.
 """
 
+import logging
 import os
 import shutil
 from pathlib import Path
@@ -26,6 +27,21 @@ from aiac.pdp.service.policy.opa.rego import (
     identity_ref,
 )
 from aiac.policy.model.models import AgentPolicyModel, PolicyModel
+
+# No process launching this module (uvicorn) otherwise configures logging, so a bare
+# ``logging.getLogger(__name__)`` would sit at the default root level (WARNING) and drop every
+# INFO call below. Module-level so it fires regardless of entrypoint.
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+
+def _loggable(value: object) -> str:
+    """Neutralize a value for single-line logging (drop CR/LF); see
+    ``uc.onboarding.orchestrator._loggable`` — ``agent_id`` here is caller-controlled."""
+    return str(value).replace("\r", "").replace("\n", "")
 
 # --------------------------------------------------------------------------- #
 # CR coordinates & write identity — code constants, never env vars (Q6, Q8a). #
@@ -122,7 +138,9 @@ def _build_cr(model: AgentPolicyModel) -> dict:
             "policies": [
                 {
                     "path": "inbound/request.rego",
-                    "content": generate_inbound_rego(model, platform_clients=_platform_clients()),
+                    "content": generate_inbound_rego(
+                        model, platform_clients=_platform_clients()
+                    ),
                 },
                 {
                     "path": "outbound/request.rego",
@@ -151,6 +169,11 @@ def _upsert_agent(model: AgentPolicyModel) -> None:
     """Server-side-apply the agent's CR (idempotent), then dump if enabled (Q6b)."""
     namespace, name = identity_ref(model.agent_id)
     body = _build_cr(model)
+    sizes = {p["path"]: len(p["content"]) for p in body["spec"]["policies"]}
+    logger.info(
+        "PolicyWriter: applying AuthorizationPolicy %s/%s (rego bytes: %s)",
+        _loggable(namespace), _loggable(name), sizes,
+    )
     _api.patch_namespaced_custom_object(
         group=_GROUP,
         version=_VERSION,
@@ -162,6 +185,8 @@ def _upsert_agent(model: AgentPolicyModel) -> None:
         force=True,
         _content_type="application/apply-patch+yaml",
     )
+    logger.info("PolicyWriter: AuthorizationPolicy %s/%s applied (server-side-apply succeeded)",
+                _loggable(namespace), _loggable(name))
     if _dump_enabled():
         _dump_cr(namespace, name, body)
 
@@ -190,7 +215,9 @@ def _delete_all() -> None:
     A per-item 404 (a concurrent delete race) is tolerated; other API failures
     propagate (mapped to 502). If the dump is on, clear the dumped tree too.
     """
-    listing = _api.list_cluster_custom_object(_GROUP, _VERSION, _PLURAL, label_selector=_MANAGED_BY_SELECTOR)
+    listing = _api.list_cluster_custom_object(
+        _GROUP, _VERSION, _PLURAL, label_selector=_MANAGED_BY_SELECTOR
+    )
     for item in listing.get("items", []):
         meta = item["metadata"]
         try:
@@ -228,10 +255,13 @@ def _run_write(op) -> Response:
         op()
         return Response(status_code=204)
     except ValueError as e:
+        logger.warning("PolicyWriter: rejecting malformed agent_id: %s", e)
         return JSONResponse(status_code=400, content={"error": str(e)})
     except ApiException as e:
+        logger.error("PolicyWriter: Kubernetes API call failed: HTTP %s %s", e.status, e.reason)
         return JSONResponse(status_code=502, content={"error": str(e)})
     except OSError as e:
+        logger.error("PolicyWriter: local rego dump write failed: %s", e)
         return JSONResponse(status_code=502, content={"error": str(e)})
 
 

@@ -11,6 +11,7 @@ failures are raised as FastAPI ``HTTPException``s by the handlers; the status
 code is authoritative (the accompanying default JSON error body is incidental).
 """
 
+import logging
 import os
 
 import uvicorn
@@ -37,6 +38,25 @@ from aiac.agent.uc.policy_update.rebuild import rebuild_policy
 from aiac.agent.uc.role_update.role import update_role
 from aiac.policy.computation import compute_and_apply, decommission
 from aiac.policy.model.models import RuleEffect
+
+# No process launching this module (uvicorn CLI or ``main()`` below) otherwise configures
+# logging, so per-module ``logging.getLogger(__name__)`` calls across the Controller and the
+# in-process Policy Rules Builder are silently dropped at the default root level (WARNING).
+# This is the one place that fixes that for the whole process — module-level so it runs
+# regardless of which entrypoint imports this module.
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+
+def _loggable(value: object) -> str:
+    """Neutralize a value for single-line logging: coerce to ``str`` and drop CR/LF so a
+    caller-controlled ``service_id`` cannot forge or inject extra log lines (mitigates CodeQL
+    ``py/log-injection``). Mirrors ``uc.onboarding.orchestrator._loggable``."""
+    return str(value).replace("\r", "").replace("\n", "")
+
 
 app = FastAPI(lifespan=lifespan)
 
@@ -131,6 +151,7 @@ def health() -> dict[str, str]:
 
 @app.post("/apply/service/{service_id}")
 def apply_service(service_id: str) -> Response:
+    logger.info("apply_service: onboarding request received for service_id=%s", _loggable(service_id))
     rules, override, default_effect = onboard_service(service_id, _default_effect_from_env())
     compute_and_apply(rules, override, default_effect)
     # Re-enable the client only AFTER the PCE apply succeeds — a compute_and_apply failure above

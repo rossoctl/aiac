@@ -11,6 +11,8 @@ as an `HTTPException(502, ...)` whose message names the workload and the specifi
 missing/invalid label — actionable, never silent.
 """
 
+import logging
+
 from fastapi import HTTPException
 
 from aiac.idp.configuration.api import Configuration
@@ -21,8 +23,17 @@ from .kube import list_agentcards, list_pods, read_service
 from .state import OnboardingProvisionState
 from .types import RoleDefinition, ScopeDefinition, ServiceProvision
 
+logger = logging.getLogger(__name__)
+
 _TYPE_LABEL = "rossoctl.io/type"
 _MCP_LABEL = "protocol.rossoctl.io/mcp"
+
+
+def _loggable(value: object) -> str:
+    """Neutralize a value for single-line logging (drop CR/LF); see
+    ``uc.onboarding.orchestrator._loggable``. Applied to any name sourced from Kubernetes
+    labels/CRs or an MCP tool manifest — external input, not this process's own naming."""
+    return str(value).replace("\r", "").replace("\n", "")
 
 
 # --------------------------------------------------------------------------- #
@@ -96,7 +107,8 @@ def classify_service(state: OnboardingProvisionState) -> dict:
     if "/" not in name:
         raise HTTPException(
             502,
-            f"client.name {name!r} for service {service_id!r} has no '/': namespace/workload_name unrecoverable",
+            f"client.name {name!r} for service {service_id!r} has no '/': "
+            "namespace/workload_name unrecoverable",
         )
     namespace, workload_name = name.split("/", 1)
 
@@ -107,7 +119,9 @@ def classify_service(state: OnboardingProvisionState) -> dict:
 
     pod = _select_pod(pods, workload_name)
     if pod is None:
-        raise HTTPException(502, f"no pod owned by workload {workload_name!r} in namespace {namespace!r}")
+        raise HTTPException(
+            502, f"no pod owned by workload {workload_name!r} in namespace {namespace!r}"
+        )
 
     label = (getattr(pod.metadata, "labels", None) or {}).get(_TYPE_LABEL)
     try:
@@ -119,6 +133,10 @@ def classify_service(state: OnboardingProvisionState) -> dict:
             f"(got {label!r}, expected 'agent' or 'tool')",
         )
 
+    logger.info(
+        "classify_service: service_id=%s -> namespace=%s workload=%s type=%s",
+        _loggable(service_id), _loggable(namespace), _loggable(workload_name), service_type.value,
+    )
     return {
         "service_id": service_id,
         "namespace": namespace,
@@ -164,6 +182,8 @@ def analyze_agent(state: OnboardingProvisionState) -> dict:
                 else "partial: AgentCard has no synced skills, default scope assigned"
             ),
         )
+        logger.info("analyze_agent: workload=%s no skills discovered (%s) -> default scope %s.access",
+                    _loggable(workload), provision.reasoning, _loggable(workload))
         return {"service_provision": provision}
 
     # One operator role per skill, mirroring the scope (same name + description). The role name ==
@@ -179,12 +199,22 @@ def analyze_agent(state: OnboardingProvisionState) -> dict:
             )
         return key
 
-    scopes = [ScopeDefinition(name=f"{workload}.{_skill_key(s)}", description=s.get("description", "")) for s in skills]
-    roles = [RoleDefinition(name=f"{workload}.{_skill_key(s)}", description=s.get("description", "")) for s in skills]
+    scopes = [
+        ScopeDefinition(name=f"{workload}.{_skill_key(s)}", description=s.get("description", ""))
+        for s in skills
+    ]
+    roles = [
+        RoleDefinition(name=f"{workload}.{_skill_key(s)}", description=s.get("description", ""))
+        for s in skills
+    ]
     provision = ServiceProvision(
         roles=roles,
         scopes=scopes,
         reasoning=f"derived from AgentCard: {len(skills)} skills",
+    )
+    logger.info(
+        "analyze_agent: workload=%s discovered %d skill(s) from its AgentCard -> scopes/roles %s",
+        _loggable(workload), len(skills), _loggable([s.name for s in scopes]),
     )
     return {"service_provision": provision}
 
@@ -198,7 +228,9 @@ def analyze_tool(state: OnboardingProvisionState) -> dict:
     try:
         svc = read_service(workload, namespace)
     except Exception as e:
-        raise HTTPException(502, f"Kubernetes Service GET failed for {workload!r} in namespace {namespace!r}: {e}")
+        raise HTTPException(
+            502, f"Kubernetes Service GET failed for {workload!r} in namespace {namespace!r}: {e}"
+        )
 
     labels = getattr(svc.metadata, "labels", None) or {}
     if _MCP_LABEL not in labels:
@@ -212,7 +244,8 @@ def analyze_tool(state: OnboardingProvisionState) -> dict:
     if not ports:
         raise HTTPException(
             502,
-            f"Service {workload!r} in namespace {namespace!r} exposes no ports; cannot resolve an MCP endpoint",
+            f"Service {workload!r} in namespace {namespace!r} exposes no ports; "
+            "cannot resolve an MCP endpoint",
         )
     port = ports[0].port
     endpoint = f"http://{workload}.{namespace}.svc.cluster.local:{port}/mcp"
@@ -223,7 +256,9 @@ def analyze_tool(state: OnboardingProvisionState) -> dict:
     try:
         token = _discovery_token(state.service_id)
     except Exception as e:
-        raise HTTPException(502, f"discovery token minting failed for service {state.service_id!r}: {e}")
+        raise HTTPException(
+            502, f"discovery token minting failed for service {state.service_id!r}: {e}"
+        )
 
     try:
         tools = _mcp_tools_list(endpoint, token=token)
@@ -240,11 +275,18 @@ def analyze_tool(state: OnboardingProvisionState) -> dict:
             )
         return name
 
-    scopes = [ScopeDefinition(name=f"{workload}.{_tool_name(t)}", description=t.get("description", "")) for t in tools]
+    scopes = [
+        ScopeDefinition(name=f"{workload}.{_tool_name(t)}", description=t.get("description", ""))
+        for t in tools
+    ]
     provision = ServiceProvision(
         roles=[],
         scopes=scopes,
         reasoning=f"derived from MCP manifest: {len(tools)} tools",
+    )
+    logger.info(
+        "analyze_tool: workload=%s queried MCP tools/list at %s -> discovered %d tool(s), scopes %s",
+        _loggable(workload), endpoint, len(tools), _loggable([s.name for s in scopes]),
     )
     return {"service_provision": provision}
 
