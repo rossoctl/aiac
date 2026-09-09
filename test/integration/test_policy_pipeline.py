@@ -25,7 +25,7 @@ former two-policy-variant equivalence check (explicit vs. abstract) is deferred 
 
 Run (needs a live rossoctl/Kind cluster with the AuthBridge OPA pipeline wired in — see
 ``k8s/opa-kind-runbook.md`` / ``k8s/opa-kind-enable.sh`` — the demo workloads deployed +
-registered into ``AIAC_TEST_REALM``, a real LLM in-pod, and ``test/integration/.env`` sourced):
+registered into ``AIAC_TEST_REALM``, a real LLM in-pod, and ``.env`` sourced):
 
     .venv/bin/pytest test/integration/test_policy_pipeline.py -m integration -v
 

@@ -46,7 +46,7 @@ surfaced through the real pipeline in the shared ``ConflictReport`` shape.
 
 Run (needs a live rossoctl/Kind cluster with the AuthBridge OPA pipeline wired in — see
 ``k8s/opa-kind-runbook.md`` / ``k8s/opa-kind-enable.sh`` — the demo workloads deployed + registered
-into ``AIAC_TEST_REALM``, a real LLM in-pod, and ``test/integration/.env`` sourced). It also drives the
+into ``AIAC_TEST_REALM``, a real LLM in-pod, and ``.env`` sourced). It also drives the
 real PRB LLM, so it is marked both ``integration`` and ``llm``:
 
     .venv/bin/pytest test/integration/test_uc1_onboard_cross_service_conflict.py -m integration -v

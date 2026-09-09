@@ -577,14 +577,14 @@ def poll_until(predicate: Callable[[], bool], *, timeout: float, interval: float
 
 def require_env_or_skip(*names: str) -> dict[str, str]:
     """Like ``require_env`` but ``pytest.skip`` (not exit) when a variable is unset — so a developer
-    running the integration marker without ``test/integration/.env`` sourced gets a clean skip, not a
+    running the integration marker without the repo-root ``.env`` sourced gets a clean skip, not a
     crash. ``pytest`` is imported lazily so the module stays importable outside pytest."""
     missing = [name for name in names if not os.environ.get(name)]
     if missing:
         import pytest
 
         pytest.skip(
-            "integration env not set: " + ", ".join(missing) + " — source test/integration/.env (see aiac/CLAUDE.md)."
+            "integration env not set: " + ", ".join(missing) + " — source .env (see aiac/CLAUDE.md)."
         )
     return {name: os.environ[name] for name in names}
 
