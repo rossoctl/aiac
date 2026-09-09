@@ -583,9 +583,7 @@ def require_env_or_skip(*names: str) -> dict[str, str]:
     if missing:
         import pytest
 
-        pytest.skip(
-            "integration env not set: " + ", ".join(missing) + " — source .env (see aiac/CLAUDE.md)."
-        )
+        pytest.skip("integration env not set: " + ", ".join(missing) + " — source .env (see aiac/CLAUDE.md).")
     return {name: os.environ[name] for name in names}
 
 
