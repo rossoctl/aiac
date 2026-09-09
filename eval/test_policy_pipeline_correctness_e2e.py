@@ -175,6 +175,11 @@ def test_e2e_correctness(pipeline: dict[str, dict], scenario_name: str, record_p
     record_property("under_grants", under_grants)
     record_property("incorrectly_denied", incorrectly_denied)
     record_property("best_effort_notes", best_effort_notes)
+    # Raw counts behind the precision/recall/denial_precision floats above — eval/conftest.py's
+    # trend-log writer pools these across every scenario in the run (spec:
+    # docs/specs/eval/eval-framework.md §9), rather than averaging the per-scenario floats.
+    record_property("true_positives", score.true_positive_count)
+    record_property("denied_total", score.denied_total)
     print(
         f"[correctness-e2e] {scenario_name}: precision={score.precision:.3f} "
         f"recall={score.recall:.3f} denial_precision={score.denial_precision:.3f}\n"
