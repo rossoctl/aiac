@@ -128,8 +128,10 @@ at once or the entire demo end to end:
 | `make onboard` | `04`–`05` | onboard the agent, then the tool |
 | `make run`     | —         | drive all three users (developer, tester, devops) |
 
-`make demo` chains all three (`init → onboard → run`) with no narrated pauses — use it when you just
-want the full run:
+`make demo` chains all three (`init → onboard → run`) — each numbered script's own
+presenter-mode pauses (see "Recording this demo" below) still fire the same way whether you
+invoke it via `make demo` or one target at a time, since they live in the Python scripts, not
+the Makefile:
 
 ```bash
 make demo     # init (00-03) -> onboard (04-05) -> run (dev/test/devops)
@@ -142,6 +144,82 @@ make init     # or step-by-step: make prereqs / clear / setup
 make onboard  # or: make agent / make tool
 make run      # or a single user: make dev / make test / make devops
 ```
+
+## Recording this demo
+
+Every numbered script narrates itself: a bold `[step/total]` header, an `explain()` paragraph
+(what this step does, why, which AIAC component acts and how it hands off to the next one), the
+literal command/API call about to run, the result, and — for the two onboarding steps — an
+automatic before/after summary of what changed in Keycloak/the generated Rego. The Controller's
+and Policy Writer's own logs (component-level `logger.info(...)` calls) stream inline during
+`make agent`/`make tool`, prefixed `[controller]`/`[policy-writer]`, so a single terminal shows
+both the demo's narration and the real components acting on it.
+
+**Capturing the video is on you** — these scripts shape the terminal, they don't record it.
+Use your OS's own screen recorder (macOS: `Cmd+Shift+5`, or QuickTime Player → File → New Screen
+Recording).
+
+**Presenter pausing.** Every `explain()` block is followed by a `pause()` that blocks on Enter —
+as long as stdin is a real terminal (`AIAC_DEMO_PAUSE` defaults to on; a piped/non-interactive
+run, e.g. CI, never blocks). Talk over the step, press Enter, move on — the recording keeps
+rolling, only the script waits on you. To skip pausing (e.g. a dry run to check timing, or to
+confirm the whole thing completes before your actual take), run with `AIAC_DEMO_PAUSE=0`.
+
+**Before you record — rehearse once without recording:**
+
+```bash
+AIAC_DEMO_PAUSE=0 make clear
+AIAC_DEMO_PAUSE=0 make keycloak && AIAC_DEMO_PAUSE=0 make prereqs
+AIAC_DEMO_PAUSE=0 make setup
+AIAC_DEMO_PAUSE=0 make agent
+AIAC_DEMO_PAUSE=0 make tool
+AIAC_DEMO_PAUSE=0 make dev && AIAC_DEMO_PAUSE=0 make test && AIAC_DEMO_PAUSE=0 make devops
+```
+
+This confirms the cluster is genuinely ready (a stale AIAC image — Controller, Policy Writer,
+IdP Configuration service, or Policy Model Store all serve `localhost/aiac-*:local` built from
+whatever source was checked out when they were last built/loaded — produces exactly the kind of
+mid-run 500/422/404 that's expensive to debug live on camera) before you spend a take on it. If
+this rehearsal fails, rebuild+reload+restart the specific image the traceback points at (see
+`cortex/aiac/CLAUDE.md`'s build section) and rerun the rehearsal before recording.
+
+**The actual recording**, one continuous take, pauses on:
+
+```bash
+make clear                        # clean-slate baseline (Pause 1 setup)
+make keycloak && make prereqs     # platform + AIAC stack verification
+make setup                        # provision users/roles, mount policy.md
+make agent                        # onboard the agent — first real LLM call; the tailed
+                                   #   Controller/Policy Writer logs are the best "what did
+                                   #   AIAC actually do" moment to narrate
+make show                         # Pause 1/2 payoff: inbound gate populated, outbound still empty
+make tool                         # onboard the tool — retroactively completes the outbound gate
+make diff PRIOR=01-after-agent    # Pause 3 payoff: outbound gate's grants filling in
+make dev                          # developer: allowed source r/w + issues read, denied issue close
+make test                         # tester: allowed issues r/w, denied source read
+make devops                       # blocked at the inbound gate — the intended story, not a failure
+```
+
+Or run the whole thing as `make demo` instead of calling each target — the same pauses and
+narration fire either way, so it's purely a question of whether you'd rather drive each command
+yourself on camera or let the Makefile chain them.
+
+**Between takes:** `make clear` resets Keycloak's provisioned roles/scopes, the Policy Store, the
+agent's `AuthorizationPolicy` CR, and the local `generated/` snapshots — it does **not** touch the
+AIAC stack or the demo workloads themselves, so a re-take starts from `make clear` and is fast.
+If you want each take's component logs to start clean too (no health-check spam or a prior
+take's lines when a viewer scrolls back), restart the two log-producing deployments first:
+
+```bash
+kubectl rollout restart deployment/aiac-agent deployment/aiac-interface -n aiac-system
+kubectl rollout status deployment/aiac-agent -n aiac-system
+kubectl rollout status deployment/aiac-interface -n aiac-system
+```
+
+**Tuning verbosity:** the default `LOG_LEVEL=INFO` on the Controller and Policy Writer is tuned
+to be readable on camera. Don't set `LOG_LEVEL=DEBUG` for a recording — it also surfaces
+library-internal lines (e.g. every `urllib3` HTTP call the IdP Configuration client makes), which
+is useful for debugging but is noise on a narrated take.
 
 ## Architecture
 
