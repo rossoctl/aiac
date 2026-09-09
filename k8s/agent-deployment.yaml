@@ -196,9 +196,18 @@ spec:
           volumeMounts:
             - name: tmp
               mountPath: /tmp
+            # Policy Rules Builder reads the scenario policy from
+            # AIAC_POLICY_FILE (default /etc/aiac/policy.md) — see
+            # src/aiac/agent/policy_rules_builder/policy_source.py.
+            - name: policy
+              mountPath: /etc/aiac
+              readOnly: true
       volumes:
         - name: tmp
           emptyDir: {}
+        - name: policy
+          configMap:
+            name: aiac-policy
 
 ---
 apiVersion: v1
