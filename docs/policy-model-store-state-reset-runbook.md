@@ -198,5 +198,5 @@ supported path.
 
 ---
 
-_Part of Feature #116 (Policy Model: ALLOW/DENY), Wave 2 (#131). Depends on the
-Wave 1 model change #117._
+*Part of Feature #116 (Policy Model: ALLOW/DENY), Wave 2 (#131). Depends on the
+Wave 1 model change #117.*

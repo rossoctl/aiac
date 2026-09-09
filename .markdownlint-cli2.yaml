@@ -18,6 +18,7 @@ config:
   MD013: false  # Line length — many existing docs have long lines
   MD014: false  # Dollar signs before commands — used in shell examples
   MD022: false  # Headings should be surrounded by blank lines
+  MD028: false  # Blank line inside blockquote — specs deliberately use adjacent admonition blockquotes (e.g. Depends-on + IdP-access callouts)
   MD025: false  # Multiple top-level headings — some docs have multiple H1s
   MD026: false  # Trailing punctuation in headings
   MD029: false  # Ordered list prefix style — docs use sequential numbering
