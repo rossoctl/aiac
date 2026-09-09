@@ -233,8 +233,8 @@ several indexed by the master PRD ([../PRD.md](../PRD.md), § *Integration test 
 - **Companion to, not a replacement for, [policy-eval-scenarios.md](policy-eval-scenarios.md).**
   That family proves correctness once per scenario; this family proves consistency and robustness
   of the same decisions, reusing its corpus and helpers unmodified.
-- **Independent of [policy-pipeline.md](policy-pipeline.md) and
-  [uc1-onboarding-pipeline.md](uc1-onboarding-pipeline.md).** Neither suite here touches Keycloak,
+- **Independent of [policy-pipeline.md](../integration-test/policy-pipeline.md) and
+  [uc1-onboarding-pipeline.md](../integration-test/uc1-onboarding-pipeline.md).** Neither suite here touches Keycloak,
   the PCE, `opa`, or a live cluster — see [No-Keycloak design](#no-keycloak-design).
 - **New markers, registered in `pyproject.toml`** (`eval_consistency`,
   `eval_robustness`), distinct from `integration`/`eval_extended`, so either suite

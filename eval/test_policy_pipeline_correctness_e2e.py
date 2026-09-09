@@ -136,7 +136,7 @@ def _e2e_grant_sets(pipeline_result: dict, scenario: ModuleType) -> tuple[dict[s
 
 
 @pytest.mark.parametrize("scenario_name", sorted(SCENARIOS))
-def test_e2e_correctness(pipeline: dict[str, dict], scenario_name: str, record_property) -> None:
+def test_e2e_correctness(pipeline: dict[str, dict], scenario_name: str, record_property) -> None:  # noqa: F811 - `pipeline` is the re-exported session fixture, not a redefinition
     """The full Keycloak+PCE+OPA pipeline's rendered grant/deny output, scored against the
     scenario's truth table, has zero over-grants (security-critical, gates this test) —
     under-grants and incorrect denials are tracked/reported only (spec: threshold TBD,

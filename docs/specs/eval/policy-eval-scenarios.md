@@ -6,7 +6,7 @@
 > ([../PRD.md](../PRD.md)) is the index of them. This is the **policy-eval-scenarios** family — a
 > generalized, multi-scenario evaluation of the identity→policy pipeline — not the definition of
 > integration testing in general, and not the only integration-test PRD. It is a **companion to**,
-> not a replacement for, [policy-pipeline.md](policy-pipeline.md): that test's single-agent/
+> not a replacement for, [policy-pipeline.md](../integration-test/policy-pipeline.md): that test's single-agent/
 > single-tool `github-agent` scenario stays exactly as it is, as a regression baseline, and none of
 > its files (`test_policy_pipeline.py`, `scenario.py`, `probe.rego`, `launcher.py`) are touched by
 > this work.
@@ -325,7 +325,7 @@ read.
 
 ## Configuration (env)
 
-Same variables as [policy-pipeline.md](policy-pipeline.md#configuration-env) for the heavy
+Same variables as [policy-pipeline.md](../integration-test/policy-pipeline.md#configuration-env) for the heavy
 scenarios (`KEYCLOAK_URL`, `KEYCLOAK_ADMIN_USERNAME`/`PASSWORD`, `AIAC_PDP_CONFIG_URL`,
 `AIAC_POLICY_STORE_URL`, `AIAC_PDP_POLICY_URL`, `AIAC_POLICY_FILE`, `LLM_BASE_URL`/`LLM_MODEL`/
 `LLM_API_KEY`, `OPA_BIN`), with two differences:
@@ -471,7 +471,7 @@ scenarios; the heavy scenarios additionally need Keycloak + `opa`, same discover
 This is **one** integration-test spec (covering ten scenarios across two test modules) among
 several indexed by the master PRD ([../PRD.md](../PRD.md), § *Integration test specifications*).
 
-- **Companion to, not a replacement for, [policy-pipeline.md](policy-pipeline.md).** That test's
+- **Companion to, not a replacement for, [policy-pipeline.md](../integration-test/policy-pipeline.md).** That test's
   fixed `github-agent` scenario remains the reviewable, hand-checkable regression baseline; this
   family generalizes the same pipeline+`opa eval` approach to scale, delegation, ambiguity,
   adversarial input, and the guardrail gap, using new files only.
@@ -539,7 +539,7 @@ several indexed by the master PRD ([../PRD.md](../PRD.md), § *Integration test 
 
 ## Blocked-by
 
-Same pipeline prerequisites as [policy-pipeline.md](policy-pipeline.md#blocked-by) for the heavy
+Same pipeline prerequisites as [policy-pipeline.md](../integration-test/policy-pipeline.md#prerequisites) for the heavy
 scenarios (PRB, PCE, policy model, OPA filesystem stub, Rego package generator, PDP policy library,
 Policy Store) — all resolved. The light scenarios depend only on the PRB entry points
 (`build_role_rules`/`build_scope_rules`) and a live LLM.
