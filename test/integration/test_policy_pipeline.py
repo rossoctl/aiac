@@ -25,7 +25,7 @@ former two-policy-variant equivalence check (explicit vs. abstract) is deferred 
 
 Run (needs a live rossoctl/Kind cluster with the AuthBridge OPA pipeline wired in — see
 ``k8s/opa-kind-runbook.md`` / ``k8s/opa-kind-enable.sh`` — the demo workloads deployed +
-registered into ``AIAC_TEST_REALM``, a real LLM in-pod, and ``test/integration/.env`` sourced):
+registered into ``AIAC_TEST_REALM``, a real LLM in-pod, and ``.env`` sourced):
 
     .venv/bin/pytest test/integration/test_policy_pipeline.py -m integration -v
 
@@ -129,9 +129,9 @@ def test_outbound(pipeline: dict, subject: str, tool_bare: str) -> None:
     and some agent role are entitled to that tool's scope. ``mcp-parser`` surfaces
     ``input.mcp.params.name`` (no hand-built input); a denial is a JSON-RPC error frame the harness
     classifies."""
-    assert uc1.outbound_decision(pipeline, subject, tool_bare) == uc1.expected_outbound_decision(
-        subject, tool_bare
-    ), f"{subject} / {tool_bare}"
+    assert uc1.outbound_decision(pipeline, subject, tool_bare) == uc1.expected_outbound_decision(subject, tool_bare), (
+        f"{subject} / {tool_bare}"
+    )
 
 
 # ======================================================================================

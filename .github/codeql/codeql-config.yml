@@ -1,0 +1,4 @@
+name: lab-aiac CodeQL config
+
+queries:
+  - uses: security-extended

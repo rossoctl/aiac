@@ -125,9 +125,7 @@ def _reordered(scenario: ModuleType) -> SimpleNamespace:
 
 
 @pytest.mark.parametrize("scenario_name", sorted(SCENARIOS))
-def test_prb_robust_to_perturbation(
-    scenario_name: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_prb_robust_to_perturbation(scenario_name: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Check the PRB's grant decision is unchanged under (1) a mechanical perturbation of the
     policy text, candidate descriptions, and candidate-list order, and (2) a hand-reworded
     semantic-sibling scenario with identical meaning/structure — both compared against the
@@ -152,7 +150,7 @@ def test_prb_robust_to_perturbation(
     mech_policy_path = tmp_path / f"{scenario_name}.mechanical.md"
     mech_policy_path.write_text(_mangle_text(policy_path.read_text(encoding="utf-8")))
     monkeypatch.setenv("AIAC_POLICY_FILE", str(mech_policy_path))
-    mech_rules, _, _ = orchestrate_prb(mech_roles, mech_scopes, _reordered(scenario))
+    mech_rules, _, _, _ = orchestrate_prb(mech_roles, mech_scopes, _reordered(scenario))
     mech_got = grant_sets(scenario, mech_rules)
     for gate in ("inbound", "outbound_subject", "outbound_target"):
         diff = want[gate] ^ mech_got[gate]
@@ -164,14 +162,11 @@ def test_prb_robust_to_perturbation(
     p_roles, p_scopes = build_roles_and_scopes(perturbed)
     p_policy_path = Path(perturbed.__file__).resolve().parent / perturbed.POLICY_FILE
     monkeypatch.setenv("AIAC_POLICY_FILE", str(p_policy_path))
-    sem_rules, _, _ = orchestrate_prb(p_roles, p_scopes, perturbed)
+    sem_rules, _, _, _ = orchestrate_prb(p_roles, p_scopes, perturbed)
     sem_got = grant_sets(scenario, sem_rules)
     for gate in ("inbound", "outbound_subject", "outbound_target"):
         diff = want[gate] ^ sem_got[gate]
         if diff:
             failures.append(f"semantic tier, gate={gate}: mismatching pairs={sorted(diff)}")
 
-    assert not failures, (
-        f"PRB was not robust to perturbation for scenario '{scenario_name}':\n"
-        + "\n".join(failures)
-    )
+    assert not failures, f"PRB was not robust to perturbation for scenario '{scenario_name}':\n" + "\n".join(failures)

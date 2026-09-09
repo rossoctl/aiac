@@ -1,4 +1,3 @@
-import pytest
 from github_agent.tools import (
     DEFAULT_ENABLED_TOOLS,
     EXCLUDED,
@@ -6,20 +5,35 @@ from github_agent.tools import (
     SOURCE_WRITE,
     ISSUE_READ,
     ISSUE_WRITE,
-    enabled_tool_names,
     select_enabled_tools,
 )
 
 # Extra tool names that appear in the full 44-tool github-tool catalog but are not in the
 # enabled set — used to build a representative stub list of the expected catalog size.
 _EXTRA_CATALOG_TOOLS = [
-    "get_me", "get_team_members", "get_teams", "run_secret_scanning",
-    "create_repository", "fork_repository", "list_tags", "get_tag", "get_label",
-    "create_release", "list_releases", "get_release", "get_repository",
-    "list_repositories", "watch_repository", "unwatch_repository",
-    "get_file_metadata", "list_directory", "get_tree",
-    "create_gist", "list_gists",
-    "get_discussion", "list_discussions",
+    "get_me",
+    "get_team_members",
+    "get_teams",
+    "run_secret_scanning",
+    "create_repository",
+    "fork_repository",
+    "list_tags",
+    "get_tag",
+    "get_label",
+    "create_release",
+    "list_releases",
+    "get_release",
+    "get_repository",
+    "list_repositories",
+    "watch_repository",
+    "unwatch_repository",
+    "get_file_metadata",
+    "list_directory",
+    "get_tree",
+    "create_gist",
+    "list_gists",
+    "get_discussion",
+    "list_discussions",
 ]
 
 

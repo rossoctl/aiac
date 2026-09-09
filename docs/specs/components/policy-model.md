@@ -70,12 +70,12 @@ The relationship maps (`source_roles`, `subject_roles`, `target_allow_scopes` / 
 
 **Namespace:** `aiac.policy.model`
 
-**Location:** `aiac/src/aiac/policy/model/`
+**Location:** `src/aiac/policy/model/`
 
 **Package structure:**
 
 ```
-aiac/src/aiac/policy/
+src/aiac/policy/
 └── model/
     ├── __init__.py    # empty
     └── models.py      # ServicePolicyModel, PolicyRule, AgentPolicyModel, PolicyModel

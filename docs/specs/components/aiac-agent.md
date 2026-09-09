@@ -253,7 +253,7 @@ On the NATS path the failure class is decided by **exception type**, never by HT
 ## File Structure
 
 ```
-aiac/src/aiac/
+src/aiac/
 ├── shared/                             ← project-level shared: run_upstream (upstream.py) — transport retry primitive
 └── agent/
     ├── controller/
@@ -275,9 +275,9 @@ aiac/src/aiac/
 Docker build command (run from repo root):
 
 ```bash
-docker build -f aiac/src/aiac/agent/controller/Dockerfile \
+docker build -f src/aiac/agent/controller/Dockerfile \
              -t aiac-agent:latest \
-             aiac/src/
+             src/
 ```
 
 ---

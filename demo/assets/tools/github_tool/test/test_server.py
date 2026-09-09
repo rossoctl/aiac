@@ -1,7 +1,6 @@
 import pytest
-from starlette.testclient import TestClient
-
 from scenario import TOOL_SCOPES
+from starlette.testclient import TestClient
 
 
 @pytest.fixture(scope="module")

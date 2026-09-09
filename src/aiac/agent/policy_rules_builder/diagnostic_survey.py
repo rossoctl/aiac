@@ -66,9 +66,7 @@ def check_policy_conflicts(policy_text: str, service_id: str) -> ConflictReport:
     try:
         services = config.get_services()
     except Exception as e:
-        raise HTTPException(
-            502, f"IdP Configuration Service unavailable for service {service_id!r}: {e}"
-        )
+        raise HTTPException(502, f"IdP Configuration Service unavailable for service {service_id!r}: {e}")
     focus = next((s for s in services if s.id == service_id), None)
     if focus is None:
         raise HTTPException(404, f"service {service_id!r} not found in IdP catalog")
@@ -93,18 +91,10 @@ def check_policy_conflicts(policy_text: str, service_id: str) -> ConflictReport:
 
     # Fan-out mirrors builder.py EXACTLY. First conflict never aborts — every entity runs.
     for scope in focal.own_scopes:
-        _accumulate(
-            run_scope_diagnostic(
-                policy_text, focal.candidate_roles, scope, focal_entities=focal
-            )
-        )
+        _accumulate(run_scope_diagnostic(policy_text, focal.candidate_roles, scope, focal_entities=focal))
     if service_type is ServiceType.AGENT:
         for own_role in focal.own_roles:
             for role in flatten_role(own_role):
-                _accumulate(
-                    run_role_diagnostic(
-                        policy_text, role, focal.other_scopes, focal_entities=focal
-                    )
-                )
+                _accumulate(run_role_diagnostic(policy_text, role, focal.other_scopes, focal_entities=focal))
 
     return ConflictReport.from_survey(all_conflicts, all_unevaluated, evaluated_count)

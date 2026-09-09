@@ -1,0 +1,84 @@
+# Documentation CI — markdown lint and link check
+#
+# Runs on PRs that touch markdown or documentation files.
+# All jobs are read-only and safe for fork PRs (no secrets required).
+name: Docs CI
+
+on:
+  pull_request:
+    branches: [main, "release-*"]
+    paths:
+      - "**.md"
+      - "docs/**"
+      - ".github/workflows/docs-ci.yaml"
+      - ".markdownlint-cli2.yaml"
+      - ".lychee.toml"
+
+permissions:
+  contents: read
+
+jobs:
+  markdown-lint:
+    name: Markdown Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Run markdownlint-cli2
+        uses: DavidAnson/markdownlint-cli2-action@21c1be1b93ad9ed58fa840aacc3f279cde2a72ff  # v24.2.0
+        with:
+          globs: "**/*.md"
+
+  link-check:
+    name: Link Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0  # need the merge-base to diff changed files against the PR base
+
+      # Gate on broken relative links in the .md files THIS PR changes,
+      # without forcing an up-front cleanup of the repo's pre-existing
+      # relative-link debt.
+      #
+      # Scope note: this catches a broken relative link in an *edited* file. It does
+      # NOT catch a rename that moves a link target while leaving its (unedited)
+      # referrers stale. That move-the-target class is only surfaced by the
+      # advisory full pass today.
+      - name: Determine changed markdown files
+        id: changed
+        run: |
+          base='${{ github.event.pull_request.base.sha }}'
+          # Prefix each path with ./ so a name can never be parsed as a lychee flag.
+          # (A pathological name with a space still can't inject: lychee errors on a
+          # nonexistent input path and fails the job, rather than passing silently.)
+          files="$(git diff --name-only --diff-filter=d "${base}...HEAD" -- '*.md' \
+                   | sort -u | sed 's,^,./,' | tr '\n' ' ')"
+          echo "files=${files}" >> "$GITHUB_OUTPUT"
+          [ -n "${files}" ] && echo "any=true" >> "$GITHUB_OUTPUT" || echo "any=false" >> "$GITHUB_OUTPUT"
+          echo "Changed markdown: ${files:-<none>}"
+
+      # Gating pass: --offline checks only local/relative links (no network), so it
+      # is deterministic and free of external-URL flakiness. Fails the job on a
+      # broken relative link in a changed doc.
+      - name: Link check — changed files, relative links (gating)
+        if: steps.changed.outputs.any == 'true'
+        uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8  # v2.9.0
+        with:
+          args: >-
+            --offline
+            --config .lychee.toml
+            ${{ steps.changed.outputs.files }}
+          fail: true
+
+      # Advisory pass: full check (external URLs + all docs). External links are
+      # flake-prone (rate limits, transient 5xx), so this stays non-gating.
+      - name: Link check — full, external + all docs (advisory)
+        uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8  # v2.9.0
+        with:
+          args: >-
+            --config .lychee.toml
+            "**/*.md"
+          fail: false

@@ -22,8 +22,8 @@ import pytest
 from fastapi import HTTPException
 
 from aiac.agent.shared.focal_entities import FocalEntitySet, resolve_focal_entities
-from aiac.idp.configuration.models import RoleKind, Scope, Service, ServiceType, Subject
 from aiac.idp.configuration.models import Role as RoleModel
+from aiac.idp.configuration.models import RoleKind, Scope, Service, ServiceType, Subject
 
 FOCUS_ID = "svc-focus"
 OTHER_ID = "svc-other"
@@ -111,9 +111,7 @@ class TestSplit:
 class TestCandidateRoles:
     def test_composite_other_role_flattened_and_deduped_by_id(self):
         reader = _role("github.reader", role_id="reader-id", kind=RoleKind.AGENT)
-        admin = _role(
-            "github.admin", role_id="admin-id", composite=True, children=[reader], kind=RoleKind.AGENT
-        )
+        admin = _role("github.admin", role_id="admin-id", composite=True, children=[reader], kind=RoleKind.AGENT)
         focus = _service(FOCUS_ID, scopes=[_scope("weather.forecast", service_id=FOCUS_ID)])
         other = _service(OTHER_ID, roles=[admin, reader])
 

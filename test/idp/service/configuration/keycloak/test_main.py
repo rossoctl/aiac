@@ -199,18 +199,14 @@ class TestListServiceRoles:
 
     def test_returns_502_on_keycloak_error(self):
         admin = MagicMock()
-        admin.get_client_roles.side_effect = KeycloakError(
-            error_message="not found", response_code=404
-        )
+        admin.get_client_roles.side_effect = KeycloakError(error_message="not found", response_code=404)
         resp = _make_client(admin).get(f"/services/svc-uuid/roles?realm={REALM}")
         assert resp.status_code == 502
         assert "error" in resp.json()
 
     def test_returns_empty_list_when_client_has_no_client_roles(self):
         admin = MagicMock()
-        admin.get_client_roles.side_effect = KeycloakError(
-            error_message="Client not found", response_code=400
-        )
+        admin.get_client_roles.side_effect = KeycloakError(error_message="Client not found", response_code=400)
         resp = _make_client(admin).get(f"/services/svc-uuid/roles?realm={REALM}")
         assert resp.status_code == 200
         assert resp.json() == []
@@ -288,9 +284,7 @@ class TestListServiceScopes:
 
     def test_returns_502_on_keycloak_error(self):
         admin = MagicMock()
-        admin.get_client_default_client_scopes.side_effect = KeycloakError(
-            error_message="not found", response_code=404
-        )
+        admin.get_client_default_client_scopes.side_effect = KeycloakError(error_message="not found", response_code=404)
         resp = _make_client(admin).get(f"/services/svc-uuid/scopes?realm={REALM}")
         assert resp.status_code == 502
         assert "error" in resp.json()
@@ -382,8 +376,10 @@ class TestRealmQueryParam:
             "KEYCLOAK_ADMIN_USERNAME": "admin",
             "KEYCLOAK_ADMIN_PASSWORD": "admin",
         }
-        with patch.dict(os.environ, env), \
-             patch("aiac.idp.service.configuration.keycloak.main.KeycloakAdmin", return_value=admin_mock) as mock_cls:
+        with (
+            patch.dict(os.environ, env),
+            patch("aiac.idp.service.configuration.keycloak.main.KeycloakAdmin", return_value=admin_mock) as mock_cls,
+        ):
             with TestClient(app) as client:
                 resp = client.get(f"/subjects?realm={REALM}")
         assert resp.status_code == 200
@@ -406,8 +402,10 @@ class TestRealmQueryParam:
             "KEYCLOAK_ADMIN_USERNAME": "admin",
             "KEYCLOAK_ADMIN_PASSWORD": "admin",
         }
-        with patch.dict(os.environ, env), \
-             patch("aiac.idp.service.configuration.keycloak.main.KeycloakAdmin", return_value=admin_mock) as mock_cls:
+        with (
+            patch.dict(os.environ, env),
+            patch("aiac.idp.service.configuration.keycloak.main.KeycloakAdmin", return_value=admin_mock) as mock_cls,
+        ):
             with TestClient(app) as client:
                 client.get(f"/subjects?realm={REALM}")
                 client.get(f"/subjects?realm={REALM}")
@@ -438,9 +436,7 @@ class TestHealth:
 
     def test_returns_503_when_keycloak_unreachable(self):
         admin = MagicMock()
-        admin.get_server_info.side_effect = KeycloakError(
-            error_message="connection refused", response_code=503
-        )
+        admin.get_server_info.side_effect = KeycloakError(error_message="connection refused", response_code=503)
         with patch(_HEALTH_TARGET, return_value=admin), patch.dict(os.environ, _HEALTH_ENV):
             resp = TestClient(app).get("/health")
         assert resp.status_code == 503
@@ -450,8 +446,10 @@ class TestHealth:
 
     def test_uses_admin_realm_env_var(self):
         admin = MagicMock()
-        with patch(_HEALTH_TARGET, return_value=admin) as mock_factory, \
-             patch.dict(os.environ, {"KEYCLOAK_ADMIN_REALM": "master"}):
+        with (
+            patch(_HEALTH_TARGET, return_value=admin) as mock_factory,
+            patch.dict(os.environ, {"KEYCLOAK_ADMIN_REALM": "master"}),
+        ):
             TestClient(app).get("/health")
         mock_factory.assert_called_once_with("master")
 
@@ -505,9 +503,7 @@ class TestCreateScope:
 
     def test_returns_502_on_keycloak_error(self):
         admin = MagicMock()
-        admin.create_client_scope.side_effect = KeycloakError(
-            error_message="backend failure", response_code=500
-        )
+        admin.create_client_scope.side_effect = KeycloakError(error_message="backend failure", response_code=500)
         resp = _make_client(admin).post(
             f"/services/svc/scopes?realm={REALM}",
             json={"name": "read", "description": "desc"},
@@ -555,9 +551,7 @@ class TestMintDiscoveryToken:
     def _wire(self, admin, monkeypatch, *, aud, iss=None, mappers=None, secret="sek"):
         monkeypatch.setenv("KEYCLOAK_URL", "http://kc-internal:8080")
         monkeypatch.delenv("AIAC_KEYCLOAK_ISSUER", raising=False)
-        admin.get_client.return_value = {
-            "id": "svc-uuid", "clientId": "github-tool", "secret": secret
-        }
+        admin.get_client.return_value = {"id": "svc-uuid", "clientId": "github-tool", "secret": secret}
         admin.get_mappers_from_client.return_value = mappers if mappers is not None else []
         oid = MagicMock()
         oid.token.return_value = {"access_token": _make_jwt({"aud": aud, "iss": iss or self.ISS})}
@@ -566,9 +560,7 @@ class TestMintDiscoveryToken:
     def test_returns_200_with_token_and_resolves_client_id(self, monkeypatch):
         admin = MagicMock()
         oid = self._wire(admin, monkeypatch, aud=["github-tool"])
-        with patch(
-            "aiac.idp.service.configuration.keycloak.main.KeycloakOpenID", return_value=oid
-        ):
+        with patch("aiac.idp.service.configuration.keycloak.main.KeycloakOpenID", return_value=oid):
             resp = _make_client(admin).get(f"/services/svc-uuid/discovery-token?realm={REALM}")
         assert resp.status_code == 200
         body = resp.json()
@@ -581,39 +573,33 @@ class TestMintDiscoveryToken:
     def test_adds_audience_mapper_when_absent(self, monkeypatch):
         admin = MagicMock()
         oid = self._wire(admin, monkeypatch, aud=["github-tool"], mappers=[])
-        with patch(
-            "aiac.idp.service.configuration.keycloak.main.KeycloakOpenID", return_value=oid
-        ):
+        with patch("aiac.idp.service.configuration.keycloak.main.KeycloakOpenID", return_value=oid):
             _make_client(admin).get(f"/services/svc-uuid/discovery-token?realm={REALM}")
         admin.add_mapper_to_client.assert_called_once()
 
     def test_idempotent_when_mapper_present(self, monkeypatch):
         admin = MagicMock()
         oid = self._wire(
-            admin, monkeypatch, aud=["github-tool"],
+            admin,
+            monkeypatch,
+            aud=["github-tool"],
             mappers=[{"name": "aiac-discovery-audience"}],
         )
-        with patch(
-            "aiac.idp.service.configuration.keycloak.main.KeycloakOpenID", return_value=oid
-        ):
+        with patch("aiac.idp.service.configuration.keycloak.main.KeycloakOpenID", return_value=oid):
             _make_client(admin).get(f"/services/svc-uuid/discovery-token?realm={REALM}")
         admin.add_mapper_to_client.assert_not_called()
 
     def test_does_not_regenerate_secret(self, monkeypatch):
         admin = MagicMock()
         oid = self._wire(admin, monkeypatch, aud=["github-tool"])
-        with patch(
-            "aiac.idp.service.configuration.keycloak.main.KeycloakOpenID", return_value=oid
-        ):
+        with patch("aiac.idp.service.configuration.keycloak.main.KeycloakOpenID", return_value=oid):
             _make_client(admin).get(f"/services/svc-uuid/discovery-token?realm={REALM}")
         admin.generate_client_secrets.assert_not_called()
 
     def test_502_when_aud_missing_client_id(self, monkeypatch):
         admin = MagicMock()
         oid = self._wire(admin, monkeypatch, aud=["account"])
-        with patch(
-            "aiac.idp.service.configuration.keycloak.main.KeycloakOpenID", return_value=oid
-        ):
+        with patch("aiac.idp.service.configuration.keycloak.main.KeycloakOpenID", return_value=oid):
             resp = _make_client(admin).get(f"/services/svc-uuid/discovery-token?realm={REALM}")
         assert resp.status_code == 502
         assert "does not contain" in resp.json()["error"]
@@ -622,22 +608,16 @@ class TestMintDiscoveryToken:
         admin = MagicMock()
         oid = self._wire(admin, monkeypatch, aud=["github-tool"], secret=None)
         admin.get_client_secrets.return_value = {}  # no secret available via the secrets endpoint
-        with patch(
-            "aiac.idp.service.configuration.keycloak.main.KeycloakOpenID", return_value=oid
-        ):
+        with patch("aiac.idp.service.configuration.keycloak.main.KeycloakOpenID", return_value=oid):
             resp = _make_client(admin).get(f"/services/svc-uuid/discovery-token?realm={REALM}")
         assert resp.status_code == 502
         assert "no readable secret" in resp.json()["error"]
 
     def test_hard_iss_assertion_when_env_set(self, monkeypatch):
         admin = MagicMock()
-        oid = self._wire(
-            admin, monkeypatch, aud=["github-tool"], iss="http://kc-internal:8080/realms/rossoctl"
-        )
+        oid = self._wire(admin, monkeypatch, aud=["github-tool"], iss="http://kc-internal:8080/realms/rossoctl")
         monkeypatch.setenv("AIAC_KEYCLOAK_ISSUER", self.ISS)
-        with patch(
-            "aiac.idp.service.configuration.keycloak.main.KeycloakOpenID", return_value=oid
-        ):
+        with patch("aiac.idp.service.configuration.keycloak.main.KeycloakOpenID", return_value=oid):
             resp = _make_client(admin).get(f"/services/svc-uuid/discovery-token?realm={REALM}")
         assert resp.status_code == 502
         assert "iss" in resp.json()["error"]
@@ -666,9 +646,7 @@ class TestSetServiceType:
             {"id": "svc-uuid", "clientId": "my-app", "attributes": {}},
             {"id": "svc-uuid", "clientId": "my-app", "attributes": {"client.type": "Agent"}},
         ]
-        resp = _make_client(admin).post(
-            f"/services/svc-uuid/type?realm={REALM}", json={"type": "Agent"}
-        )
+        resp = _make_client(admin).post(f"/services/svc-uuid/type?realm={REALM}", json={"type": "Agent"})
         assert resp.status_code == 200
         assert resp.json()["attributes"] == {"client.type": "Agent"}
 
@@ -690,18 +668,14 @@ class TestSetServiceType:
 
     def test_rejects_invalid_type_with_422(self):
         admin = MagicMock()
-        resp = _make_client(admin).post(
-            f"/services/svc-uuid/type?realm={REALM}", json={"type": "agent"}
-        )
+        resp = _make_client(admin).post(f"/services/svc-uuid/type?realm={REALM}", json={"type": "agent"})
         assert resp.status_code == 422
 
     def test_empty_type_clears_client_type_attribute(self):
         # The #176 client sends {"type": ""} as the CLEAR signal. Clearing drops the client.type
         # key (read-merge update_client) while preserving other attributes; returns 200.
         admin = MagicMock()
-        admin.get_client.return_value = {
-            "id": "svc-uuid", "attributes": {"existing": "keep", "client.type": "Agent"}
-        }
+        admin.get_client.return_value = {"id": "svc-uuid", "attributes": {"existing": "keep", "client.type": "Agent"}}
         resp = _make_client(admin).post(f"/services/svc-uuid/type?realm={REALM}", json={"type": ""})
         assert resp.status_code == 200
         admin.update_client.assert_called_once_with("svc-uuid", {"attributes": {"existing": "keep"}})
@@ -723,9 +697,7 @@ class TestSetServiceType:
     def test_returns_502_on_keycloak_error(self):
         admin = MagicMock()
         admin.get_client.side_effect = KeycloakError(error_message="not found", response_code=404)
-        resp = _make_client(admin).post(
-            f"/services/svc-uuid/type?realm={REALM}", json={"type": "Agent"}
-        )
+        resp = _make_client(admin).post(f"/services/svc-uuid/type?realm={REALM}", json={"type": "Agent"})
         assert resp.status_code == 502
         assert "error" in resp.json()
 
@@ -742,9 +714,7 @@ class TestSetServiceEnabled:
     def test_disable_calls_update_client_and_returns_200(self):
         admin = MagicMock()
         admin.get_client.return_value = {"id": "svc-uuid", "clientId": "my-app", "enabled": False}
-        resp = _make_client(admin).post(
-            f"/services/svc-uuid/enabled?realm={REALM}", json={"enabled": False}
-        )
+        resp = _make_client(admin).post(f"/services/svc-uuid/enabled?realm={REALM}", json={"enabled": False})
         assert resp.status_code == 200
         assert resp.json()["enabled"] is False
         admin.update_client.assert_called_once_with("svc-uuid", {"enabled": False})
@@ -752,9 +722,7 @@ class TestSetServiceEnabled:
     def test_enable_calls_update_client_with_true(self):
         admin = MagicMock()
         admin.get_client.return_value = {"id": "svc-uuid", "clientId": "my-app", "enabled": True}
-        resp = _make_client(admin).post(
-            f"/services/svc-uuid/enabled?realm={REALM}", json={"enabled": True}
-        )
+        resp = _make_client(admin).post(f"/services/svc-uuid/enabled?realm={REALM}", json={"enabled": True})
         assert resp.status_code == 200
         admin.update_client.assert_called_once_with("svc-uuid", {"enabled": True})
 
@@ -763,9 +731,7 @@ class TestSetServiceEnabled:
         # success status returned.
         admin = MagicMock()
         admin.get_client.return_value = {"id": "svc-uuid", "clientId": "my-app", "enabled": False}
-        resp = _make_client(admin).post(
-            f"/services/svc-uuid/enabled?realm={REALM}", json={"enabled": False}
-        )
+        resp = _make_client(admin).post(f"/services/svc-uuid/enabled?realm={REALM}", json={"enabled": False})
         assert resp.status_code == 200
 
     def test_missing_body_returns_422(self):
@@ -776,9 +742,7 @@ class TestSetServiceEnabled:
     def test_returns_502_on_keycloak_error(self):
         admin = MagicMock()
         admin.update_client.side_effect = KeycloakError(error_message="boom", response_code=500)
-        resp = _make_client(admin).post(
-            f"/services/svc-uuid/enabled?realm={REALM}", json={"enabled": False}
-        )
+        resp = _make_client(admin).post(f"/services/svc-uuid/enabled?realm={REALM}", json={"enabled": False})
         assert resp.status_code == 502
         assert "error" in resp.json()
 
@@ -822,17 +786,13 @@ class TestCreateScopeEndpoint:
 
     def test_returns_409_on_duplicate_name(self):
         admin = MagicMock()
-        admin.create_client_scope.side_effect = KeycloakError(
-            error_message="Conflict", response_code=409
-        )
+        admin.create_client_scope.side_effect = KeycloakError(error_message="Conflict", response_code=409)
         resp = _make_client(admin).post(f"/scopes?realm={REALM}", json={"name": "dupe", "description": ""})
         assert resp.status_code == 409
 
     def test_returns_502_on_keycloak_error(self):
         admin = MagicMock()
-        admin.create_client_scope.side_effect = KeycloakError(
-            error_message="backend failure", response_code=500
-        )
+        admin.create_client_scope.side_effect = KeycloakError(error_message="backend failure", response_code=500)
         resp = _make_client(admin).post(f"/scopes?realm={REALM}", json={"name": "read", "description": "desc"})
         assert resp.status_code == 502
         assert "error" in resp.json()
@@ -849,8 +809,10 @@ class TestCreateScopeEndpoint:
             "KEYCLOAK_ADMIN_USERNAME": "admin",
             "KEYCLOAK_ADMIN_PASSWORD": "admin",
         }
-        with patch.dict(os.environ, env), \
-             patch("aiac.idp.service.configuration.keycloak.main.KeycloakAdmin", return_value=admin_mock):
+        with (
+            patch.dict(os.environ, env),
+            patch("aiac.idp.service.configuration.keycloak.main.KeycloakAdmin", return_value=admin_mock),
+        ):
             with TestClient(app) as client:
                 resp = client.post("/scopes?realm=other", json={"name": "x", "description": ""})
         assert resp.status_code == 201
@@ -873,17 +835,13 @@ class TestAssignScopeToService:
 
     def test_returns_409_when_already_assigned(self):
         admin = MagicMock()
-        admin.add_client_default_client_scope.side_effect = KeycloakError(
-            error_message="Conflict", response_code=409
-        )
+        admin.add_client_default_client_scope.side_effect = KeycloakError(error_message="Conflict", response_code=409)
         resp = _make_client(admin).post(f"/services/svc-uuid/scopes/scope-id?realm={REALM}")
         assert resp.status_code == 409
 
     def test_returns_502_on_keycloak_error(self):
         admin = MagicMock()
-        admin.add_client_default_client_scope.side_effect = KeycloakError(
-            error_message="failure", response_code=500
-        )
+        admin.add_client_default_client_scope.side_effect = KeycloakError(error_message="failure", response_code=500)
         resp = _make_client(admin).post(f"/services/svc-uuid/scopes/scope-id?realm={REALM}")
         assert resp.status_code == 502
         assert "error" in resp.json()
@@ -929,17 +887,13 @@ class TestCreateRoleEndpoint:
 
     def test_returns_409_on_duplicate_name(self):
         admin = MagicMock()
-        admin.create_realm_role.side_effect = KeycloakError(
-            error_message="Conflict", response_code=409
-        )
+        admin.create_realm_role.side_effect = KeycloakError(error_message="Conflict", response_code=409)
         resp = _make_client(admin).post(f"/roles?realm={REALM}", json={"name": "dupe", "description": ""})
         assert resp.status_code == 409
 
     def test_returns_502_on_keycloak_error(self):
         admin = MagicMock()
-        admin.create_realm_role.side_effect = KeycloakError(
-            error_message="backend failure", response_code=500
-        )
+        admin.create_realm_role.side_effect = KeycloakError(error_message="backend failure", response_code=500)
         resp = _make_client(admin).post(f"/roles?realm={REALM}", json={"name": "reader", "description": "desc"})
         assert resp.status_code == 502
         assert "error" in resp.json()
@@ -962,25 +916,19 @@ class TestAssignRoleToService:
         assert resp.status_code == 201
         admin.get_client_service_account_user.assert_called_once_with("svc-uuid")
         admin.get_realm_role_by_id.assert_called_once_with("role-id")
-        admin.assign_realm_roles.assert_called_once_with(
-            "sa-user-id", [{"id": "role-id", "name": "src-helper"}]
-        )
+        admin.assign_realm_roles.assert_called_once_with("sa-user-id", [{"id": "role-id", "name": "src-helper"}])
 
     def test_returns_409_when_already_assigned(self):
         admin = MagicMock()
         admin.get_client_service_account_user.return_value = {"id": "sa-user-id"}
-        admin.assign_realm_roles.side_effect = KeycloakError(
-            error_message="Conflict", response_code=409
-        )
+        admin.assign_realm_roles.side_effect = KeycloakError(error_message="Conflict", response_code=409)
         resp = _make_client(admin).post(f"/services/svc-uuid/roles/role-id?realm={REALM}")
         assert resp.status_code == 409
 
     def test_returns_502_on_keycloak_error(self):
         admin = MagicMock()
         admin.get_client_service_account_user.return_value = {"id": "sa-user-id"}
-        admin.assign_realm_roles.side_effect = KeycloakError(
-            error_message="failure", response_code=500
-        )
+        admin.assign_realm_roles.side_effect = KeycloakError(error_message="failure", response_code=500)
         resp = _make_client(admin).post(f"/services/svc-uuid/roles/role-id?realm={REALM}")
         assert resp.status_code == 502
         assert "error" in resp.json()
@@ -1013,11 +961,13 @@ class TestDeleteRoleFromService:
         assert resp.status_code == 200
         # Unmap first, then the shared-object membership re-check (#178), then the delete since
         # no other subject holds the role.
-        admin.assert_has_calls([
-            call.delete_realm_roles_of_user("sa-user-id", [{"id": "role-id", "name": "src-helper"}]),
-            call.get_realm_role_members("src-helper"),
-            call.delete_realm_role("src-helper"),
-        ])
+        admin.assert_has_calls(
+            [
+                call.delete_realm_roles_of_user("sa-user-id", [{"id": "role-id", "name": "src-helper"}]),
+                call.get_realm_role_members("src-helper"),
+                call.delete_realm_role("src-helper"),
+            ]
+        )
 
     def test_shared_role_still_referenced_is_not_deleted(self):
         # Shared-object safety (#178): after unmapping the role from THIS service account, the
@@ -1038,9 +988,7 @@ class TestDeleteRoleFromService:
 
     def test_returns_502_on_keycloak_error(self):
         admin = MagicMock()
-        admin.get_client_service_account_user.side_effect = KeycloakError(
-            error_message="boom", response_code=500
-        )
+        admin.get_client_service_account_user.side_effect = KeycloakError(error_message="boom", response_code=500)
         resp = _make_client(admin).delete(f"/services/svc-uuid/roles/role-id?realm={REALM}")
         assert resp.status_code == 502
         assert "error" in resp.json()
@@ -1051,9 +999,7 @@ class TestDeleteRoleFromService:
         # (200), not 502 — otherwise the rollback aborts before unset-type + disable.
         admin = MagicMock()
         admin.get_client_service_account_user.return_value = {"id": "sa-user-id"}
-        admin.get_realm_role_by_id.side_effect = KeycloakError(
-            error_message="Could not find role", response_code=404
-        )
+        admin.get_realm_role_by_id.side_effect = KeycloakError(error_message="Could not find role", response_code=404)
         resp = _make_client(admin).delete(f"/services/svc-uuid/roles/role-id?realm={REALM}")
         assert resp.status_code == 200
 
@@ -1080,11 +1026,13 @@ class TestDeleteScopeFromService:
         assert resp.status_code == 200
         # Unmap first, then the shared-object owner rescan (#178, via get_clients), then the
         # delete since no other client exposes the scope.
-        admin.assert_has_calls([
-            call.delete_client_default_client_scope("svc-uuid", "scope-id"),
-            call.get_clients(),
-            call.delete_client_scope("scope-id"),
-        ])
+        admin.assert_has_calls(
+            [
+                call.delete_client_default_client_scope("svc-uuid", "scope-id"),
+                call.get_clients(),
+                call.delete_client_scope("scope-id"),
+            ]
+        )
 
     def test_shared_scope_still_referenced_is_not_deleted(self):
         # Shared-object safety (#178): after unmapping the scope from THIS client, another client
@@ -1100,9 +1048,7 @@ class TestDeleteScopeFromService:
 
     def test_returns_502_on_keycloak_error(self):
         admin = MagicMock()
-        admin.delete_client_default_client_scope.side_effect = KeycloakError(
-            error_message="boom", response_code=500
-        )
+        admin.delete_client_default_client_scope.side_effect = KeycloakError(error_message="boom", response_code=500)
         resp = _make_client(admin).delete(f"/services/svc-uuid/scopes/scope-id?realm={REALM}")
         assert resp.status_code == 502
         assert "error" in resp.json()
@@ -1157,9 +1103,7 @@ class TestGetSubjectsByRole:
 
     def test_returns_502_on_keycloak_error_in_get_role(self):
         admin = MagicMock()
-        admin.get_realm_role_by_id.side_effect = KeycloakError(
-            error_message="not found", response_code=404
-        )
+        admin.get_realm_role_by_id.side_effect = KeycloakError(error_message="not found", response_code=404)
         resp = _make_client(admin).get(f"/subjects?realm={REALM}&role_id=rid")
         assert resp.status_code == 502
         assert "error" in resp.json()
@@ -1167,9 +1111,7 @@ class TestGetSubjectsByRole:
     def test_returns_502_on_keycloak_error_in_get_members(self):
         admin = MagicMock()
         admin.get_realm_role_by_id.return_value = {"id": "rid", "name": "viewer"}
-        admin.get_realm_role_members.side_effect = KeycloakError(
-            error_message="error", response_code=500
-        )
+        admin.get_realm_role_members.side_effect = KeycloakError(error_message="error", response_code=500)
         resp = _make_client(admin).get(f"/subjects?realm={REALM}&role_id=rid")
         assert resp.status_code == 502
         assert "error" in resp.json()
@@ -1178,9 +1120,7 @@ class TestGetSubjectsByRole:
         admin = MagicMock()
         admin.get_realm_role_by_id.return_value = {"id": "rid", "name": "viewer"}
         admin.get_realm_role_members.return_value = [{"id": "u1", "username": "alice"}]
-        admin.get_all_roles_of_user.side_effect = KeycloakError(
-            error_message="error", response_code=500
-        )
+        admin.get_all_roles_of_user.side_effect = KeycloakError(error_message="error", response_code=500)
         resp = _make_client(admin).get(f"/subjects?realm={REALM}&role_id=rid")
         assert resp.status_code == 502
         assert "error" in resp.json()
@@ -1291,10 +1231,7 @@ class TestKeycloakErrorProduces502:
         monkeypatch.setenv("KEYCLOAK_URL", "http://kc-internal:8080")
         admin = MagicMock()
         admin.get_client.side_effect = _keycloak_error()
-        assert (
-            _make_client(admin).get(f"/services/s1/discovery-token?realm={REALM}").status_code
-            == 502
-        )
+        assert _make_client(admin).get(f"/services/s1/discovery-token?realm={REALM}").status_code == 502
 
     def teardown_method(self):
         app.dependency_overrides.clear()

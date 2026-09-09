@@ -8,14 +8,14 @@
 > general, and not the only integration-test PRD.
 
 ## Location
-`aiac/test/integration/test_policy_pipeline.py` — a pytest module marked `@pytest.mark.integration`.
-It imports two shared modules: `aiac/test/integration/scenario_uc1.py` — the canonical `github-agent`
+`test/integration/test_policy_pipeline.py` — a pytest module marked `@pytest.mark.integration`.
+It imports two shared modules: `test/integration/scenario_uc1.py` — the canonical `github-agent`
 scenario as pure data (the role→access truth table the *Expected output* renders — the pair-lists,
 expressed over the **discovered, workload-prefixed** names `github-tool.source-read`,
-`github-agent.source_operations`, …) — and `aiac/test/integration/uc1_onboard.py` — the shared live
+`github-agent.source_operations`, …) — and `test/integration/uc1_onboard.py` — the shared live
 harness (Keycloak provisioning/cleanup, the `POST /apply/service/{id}` onboard trigger, the outbound
 token-exchange-leg prep, the bundle-convergence poll, and the live decision oracle + probes). The
-harness in turn builds on `aiac/test/integration/launcher.py`'s live-cluster half (`kubectl` wrappers,
+harness in turn builds on `test/integration/launcher.py`'s live-cluster half (`kubectl` wrappers,
 `port_forward`, `resolve_pod`, `mint_token`, `inbound_probe` / `outbound_probe`, `inbound_outcome` /
 `outbound_outcome`, `poll_until`, and the skip gates). There is **no** standalone Rego module and **no**
 `opa` binary here anymore: the evaluator is the deployed AuthBridge OPA plugin (see *[What it
@@ -185,8 +185,8 @@ with — the generic descriptions are not part of this triad):
 
 ## Configuration (env)
 
-The suite reads its config from `test/integration/.env` (gitignored); source it before running
-(`set -a; . test/integration/.env; set +a`). The drivers read these:
+The suite reads its config from the repo-root `.env` (gitignored); source it before running
+(`set -a; . .env; set +a`). The drivers read these:
 
 | Variable | Purpose | Default |
 |----------|---------|---------|
@@ -215,7 +215,7 @@ prerequisites, wiring, and manual probe commands are in `k8s/opa-kind-runbook.md
 
 ```bash
 k8s/opa-kind-enable.sh          # one-time: wire the OPA plugin into both legs of the Kind cluster
-set -a; . test/integration/.env; set +a
+set -a; . .env; set +a
 .venv/bin/pytest test/integration/test_policy_pipeline.py -m integration -v
 # Parametrized over subject inbound + (subject × bare tool) outbound + negative controls.
 # A failing node names the exact cell, e.g.:

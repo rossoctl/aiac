@@ -99,8 +99,7 @@ def test_guardrail_rejects_direct_grant_revoke_contradiction(_conflicting_policy
     from aiac.agent.policy_rules_builder.graph import PolicyRulesBuilderError, build_scope_rules
 
     user_roles = [
-        Role(id=f"role-{name}", name=name, description=desc, composite=False)
-        for name, desc in _USER_ROLES.items()
+        Role(id=f"role-{name}", name=name, description=desc, composite=False) for name, desc in _USER_ROLES.items()
     ]
     deploy_trigger = Scope(id="scope-deploy-trigger", name="deploy-trigger", description=_DEPLOY_TRIGGER_DESC)
 

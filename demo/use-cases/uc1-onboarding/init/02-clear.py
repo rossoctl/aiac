@@ -15,7 +15,16 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 
-from _lib import GENERATED, cleanup_provisioned, clear_policy_store, clear_writer_rego, connect_admin, load_config, ok, say
+from _lib import (
+    GENERATED,
+    cleanup_provisioned,
+    clear_policy_store,
+    clear_writer_rego,
+    connect_admin,
+    load_config,
+    ok,
+    say,
+)
 
 
 def main() -> None:

@@ -27,7 +27,6 @@ sys.path.insert(0, str(REPO_ROOT))
 from test.integration import scenario_uc1 as scn  # noqa: E402
 from test.integration import scenario_uc1_denyworld as scn_b  # noqa: E402
 
-
 # ======================================================================================
 # §6 matrix — the oracle contract (pin the intended tables directly)
 # ======================================================================================

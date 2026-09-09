@@ -46,7 +46,7 @@ surfaced through the real pipeline in the shared ``ConflictReport`` shape.
 
 Run (needs a live rossoctl/Kind cluster with the AuthBridge OPA pipeline wired in — see
 ``k8s/opa-kind-runbook.md`` / ``k8s/opa-kind-enable.sh`` — the demo workloads deployed + registered
-into ``AIAC_TEST_REALM``, a real LLM in-pod, and ``test/integration/.env`` sourced). It also drives the
+into ``AIAC_TEST_REALM``, a real LLM in-pod, and ``.env`` sourced). It also drives the
 real PRB LLM, so it is marked both ``integration`` and ``llm``:
 
     .venv/bin/pytest test/integration/test_uc1_onboard_cross_service_conflict.py -m integration -v
@@ -124,9 +124,7 @@ def _onboard_via_fresh_controller(policy_md: str, workload: str, *, expect_confl
     uc1.ensure_agent_policy(uc1.CONTROLLER_NAMESPACE, policy_md=policy_md)
     service_id = uc1.resolve_service_id(uc1.connect_admin(), TEST_REALM, f"{NAMESPACE}/{workload}")
     controller_target = (
-        uc1.CONTROLLER_TARGET
-        if os.environ.get("AIAC_CONTROLLER_TARGET")
-        else f"pod/{uc1.resolve_controller_pod()}"
+        uc1.CONTROLLER_TARGET if os.environ.get("AIAC_CONTROLLER_TARGET") else f"pod/{uc1.resolve_controller_pod()}"
     )
     with uc1.port_forward(
         controller_target,
@@ -182,9 +180,7 @@ def test_cross_service_conflict_is_surfaced_as_422_conflict_report() -> None:
         # Phase 2 — agent onboarding under the source-granting policy: the outbound subject gate's fresh
         # ALLOW(tester -> github-tool.source-*) collides with the tool's already-applied DENY on the same
         # (role, scope). The #2504 store read surfaces it -> 422 + ConflictReport.
-        report = _onboard_via_fresh_controller(
-            POLICY_AGENT_GRANTS_SOURCE, scn.AGENT_WORKLOAD, expect_conflict=True
-        )
+        report = _onboard_via_fresh_controller(POLICY_AGENT_GRANTS_SOURCE, scn.AGENT_WORKLOAD, expect_conflict=True)
     finally:
         uc1.delete_agent_cr()  # after — drop any CR (there should be none on the raising path)
         uc1.cleanup_provisioned(admin, TEST_REALM)  # restore the pre-run Keycloak state

@@ -35,7 +35,7 @@ re-pinning a second copy of the matrix. Policy A is **not** re-implemented here 
 Run (needs a live rossoctl/Kind cluster with the AuthBridge OPA pipeline wired into both legs — see
 ``k8s/opa-kind-runbook.md`` / ``k8s/opa-kind-enable.sh`` — the demo workloads deployed + registered,
 a real LLM in-pod, **and #146's ``default_effect`` hook wired into ``onboarded_stack``**, with
-``test/integration/.env`` sourced):
+``.env`` sourced):
 
     .venv/bin/pytest test/integration/test_policy_pipeline_denyworld.py -m integration -v
 
@@ -60,7 +60,6 @@ sys.path.insert(0, str(REPO_ROOT))  # so ``import test.integration.*`` resolves
 from test.integration import scenario_uc1 as scn  # noqa: E402
 from test.integration import scenario_uc1_denyworld as scn_b  # noqa: E402
 from test.integration import uc1_onboard as uc1  # noqa: E402
-
 
 # The expected verdicts come straight from the #148 Policy-B oracle (``scenario_uc1_denyworld``), keyed
 # on the **bare** runtime tool names AuthBridge sends (``source-read``). These thin adapters only turn
@@ -143,9 +142,9 @@ def test_outbound(pipeline: dict, subject: str, tool_bare: str) -> None:
     ``DENY`` (tester→source-*, devops→source-*), and the ``devops → issues-*`` ✅
     cells are the default-flip tracer. ``mcp-parser`` surfaces ``input.mcp.params.name`` (no hand-built
     input); a denial is a JSON-RPC error frame the harness classifies."""
-    assert uc1.outbound_decision(pipeline, subject, tool_bare) == _expected_outbound(
-        subject, tool_bare
-    ), f"{subject} / {tool_bare}"
+    assert uc1.outbound_decision(pipeline, subject, tool_bare) == _expected_outbound(subject, tool_bare), (
+        f"{subject} / {tool_bare}"
+    )
 
 
 # ======================================================================================

@@ -45,17 +45,67 @@ Run (needs KEYCLOAK_URL + admin creds + LLM_* exported, ``opa`` on PATH):
 Without ``-m eval_extended`` the suite is skipped; without ``opa`` each node skips at
 runtime. This suite is heavier than ``test_policy_pipeline.py`` (eight full pipeline runs, more
 PRB/LLM calls) hence the separate marker.
+
+The ``pipeline`` fixture provisions all 8 scenarios in parallel via ``ProcessPoolExecutor``
+(``EVAL_PIPELINE_PARALLELISM``, default = scenario count) — separate OS processes, not threads:
+each scenario mutates process-global state while it runs (``os.environ["KEYCLOAK_REALM"]``/
+``["AIAC_POLICY_FILE"]``, consumed at call time by ``compute_and_apply``/
+``FilePolicySource.fetch()``; a ``KeycloakAdmin`` connection's ``change_current_realm``), which
+two threads sharing one process would race on but separate processes don't. Each worker also gets
+its own idp/store/opa port triple (offset from the module defaults by scenario index) since fixed
+ports collide regardless of thread vs. process. This is *not* the same thing as pytest-xdist's
+``-n`` (still not supported/needed here — the parallelism is inside the fixture, not across
+pytest workers).
+
+A shared ``multiprocessing.Lock()`` serializes just the ``provision_keycloak_admin`` step (realm +
+role/user/client creation) across workers — concurrent ``admin.create_realm(...)`` calls against a
+real Keycloak instance were observed to 409 with ``"Duplicate resource error"`` even across
+*distinct* realm names (an internal Keycloak race on concurrent realm creation, not a naming
+collision on this fixture's side). Everything after that per scenario — the LLM-heavy
+``orchestrate_prb`` calls and the idp/store/opa subprocesses — still runs fully concurrently, since
+realm provisioning is a small fraction of one scenario's wall-clock next to the PRB's several
+sequential LLM calls.
+
+Two known limits of this isolation, both low-likelihood for this workload and left as-is rather
+than engineered around: an ordinary Python exception in one worker is caught and isolated to that
+scenario alone (see the per-future ``except Exception`` below), but an *abnormal* worker death
+(OOM-kill, segfault) raises ``concurrent.futures.process.BrokenProcessPool`` for every other
+pending/in-flight future in the same pool too, not just the one that crashed — a wider blast radius
+than "isolate one scenario's worker crash from the rest" implies. And each worker's own
+``running_services(...)`` context manager tears down its idp/store/opa subprocess trio on a normal
+Python-level exception, but there's no top-level safety net if the worker *process* itself is
+killed externally — those subprocesses would be orphaned rather than cleaned up.
+
+``_provision_scenario`` calls ``orchestrate_prb(..., best_effort=True)`` — a scope/role decision
+the PRB's auditor rejects contributes a best-effort (never-approved) fallback rule instead of
+aborting the whole scenario (see ``orchestrate_prb``/``_invoke_graph``'s docstrings), by explicit
+user request so every scenario's real Rego/OPA output completes and scores instead of showing
+"setup failed" with nothing to show. This is one shared, session-scoped fixture serving both this
+file's own tests and ``test_e2e_correctness`` (``eval/test_policy_pipeline_correctness_e2e.py``),
+so it applies uniformly to both — there is no way to make it e2e-only without either duplicating
+the whole Keycloak+LLM provisioning pass (rejected: expensive, and the two suites would then score
+against two *different* PRB runs of the same scenario) or parametrizing the fixture (rejected:
+defeats the sharing this fixture exists for). Confirmed with the user (2026-09-08): this file's
+own per-cell tests (``test_inbound``/``test_outbound``/``test_grant_set_matches_truth_table``) are
+affected too, not just ``test_e2e_correctness`` — a scenario whose PRB hits a rejection no longer
+gets a clean scenario-level skip via ``_require_scenario``'s ``pytest.fail``; it now runs through
+with a best-effort fallback for the rejected decision only, so *those specific* per-cell
+assertions can show a real (and possibly wrong) result instead. This is the accepted tradeoff, not
+a bug — a real run after wiring this in showed 17 such failures, all traceable to the same
+scope/role names ``test_e2e_correctness``'s ``best_effort_notes`` names for the same scenarios.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import multiprocessing
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -101,11 +151,17 @@ os.environ.setdefault("KEYCLOAK_ADMIN_REALM", "master")  # inherited by the IdP 
 from keycloak import KeycloakAdmin  # noqa: E402
 from keycloak.exceptions import KeycloakError  # noqa: E402
 
-from aiac.agent.policy_rules_builder.graph import ROLE_GRAPH, SCOPE_GRAPH  # noqa: E402
+from aiac.agent.policy_rules_builder.graph import (  # noqa: E402
+    ROLE_GRAPH,
+    SCOPE_GRAPH,
+    PolicyContradictionError,
+    PolicyRulesBuilderError,
+)
 from aiac.idp.configuration.api import Configuration  # noqa: E402
 from aiac.idp.configuration.models import Role, Scope  # noqa: E402
 from aiac.policy.computation.engine import compute_and_apply  # noqa: E402
 from aiac.policy.model.models import PolicyRule  # noqa: E402
+from eval.best_effort_rules import _best_effort_rules  # noqa: E402
 
 log = logging.getLogger(__name__)
 
@@ -244,12 +300,35 @@ def _read_back(config: Configuration) -> tuple[dict[str, Role], dict[str, Scope]
     return roles, scopes
 
 
-def _invoke_graph(graph: Any, **entity: object) -> tuple[list[PolicyRule], str]:
+def _invoke_graph(
+    graph: Any, *, best_effort: bool = False, **entity: object
+) -> tuple[list[PolicyRule], str, str | None]:
     """Same state shape ``build_scope_rules``/``build_role_rules`` build internally, invoked
     directly so the final state's ``reasoning`` string (discarded by the wrapper) comes back too.
 
     ``entity`` carries the one field that differs between the two graphs: ``roles``+``scope`` for
     ``SCOPE_GRAPH``, ``role``+``scopes`` for ``ROLE_GRAPH``.
+
+    Returns ``(rules, reasoning, best_effort_note)`` — the third element is ``None`` for a normal,
+    auditor-approved decision.
+
+    ``best_effort=False`` (default): unchanged from before this parameter existed — a plain
+    ``graph.invoke(state)``, still letting ``PolicyContradictionError``/``PolicyRulesBuilderError``
+    propagate on a rejection. Every caller that doesn't opt in (``eval_extended``'s own tests via
+    the shared ``pipeline`` fixture, ``eval_consistency``, ``eval_robustness``) keeps today's exact
+    behavior — one rejected decision still aborts the whole scenario for them.
+
+    ``best_effort=True`` (the two correctness suites only): drives the graph via
+    ``graph.stream(state, stream_mode="values")`` instead of ``.invoke()`` so that if ``audit``
+    raises, the last state snapshot from immediately before the raise (i.e. right after
+    ``precheck`` — the node just before ``audit`` in ``fetch -> propose -> precheck -> audit ->
+    build``) is still available, even though ``ROLE_GRAPH``/``SCOPE_GRAPH`` attach no
+    checkpointer. On catching, falls back to ``_best_effort_rules`` built from that last-proposed
+    (never-approved) state, and returns a short string describing why — the correctness suites
+    record this per scope/role so their report can flag it: this fallback path scores something
+    that would never actually reach a real deployment (the auditor rejected it), by explicit user
+    request, to get full precision/recall coverage even for a scenario an ordinary run would
+    abort entirely.
     """
     state = {
         **entity,
@@ -264,13 +343,23 @@ def _invoke_graph(graph: Any, **entity: object) -> tuple[list[PolicyRule], str]:
         "retry_count": 0,
         "rules": [],
     }
-    out = graph.invoke(state)
-    return out["rules"], out["reasoning"]
+    if not best_effort:
+        out = graph.invoke(state)
+        return out["rules"], out["reasoning"], None
+
+    last_state = state
+    try:
+        for chunk in graph.stream(state, stream_mode="values"):
+            last_state = chunk
+    except (PolicyContradictionError, PolicyRulesBuilderError) as exc:
+        rules = _best_effort_rules(entity, last_state)
+        return rules, last_state.get("reasoning", ""), f"{type(exc).__name__}: {exc}"
+    return last_state["rules"], last_state["reasoning"], None
 
 
 def orchestrate_prb(
-    roles: dict[str, Role], scopes: dict[str, Scope], scenario: ModuleType
-) -> tuple[list[PolicyRule], dict[str, str], dict[str, str]]:
+    roles: dict[str, Role], scopes: dict[str, Scope], scenario: ModuleType, *, best_effort: bool = False
+) -> tuple[list[PolicyRule], dict[str, str], dict[str, str], dict[str, str]]:
     """Run the three PRB mappings against the real LLM and concatenate the rules, generalized over
     every agent's inbound/target scopes and every tool's scopes.
 
@@ -287,6 +376,11 @@ def orchestrate_prb(
     instead of ``build_role_rules``/``build_scope_rules`` purely to get that reasoning back —
     those wrapper functions discard it, and are shared production code used elsewhere, so they are
     not modified.
+
+    ``best_effort`` (default ``False``) is threaded into every ``_invoke_graph`` call — see its
+    docstring. The 4th return value, ``best_effort_notes``, maps a scope/role name to a short
+    reason string for every decision that fell back to an unapproved proposal; empty when
+    ``best_effort=False`` (the default) or when every decision was cleanly approved.
     """
     user_roles = [roles[name] for name in scenario.USER_ROLES]
 
@@ -302,19 +396,32 @@ def orchestrate_prb(
     rules: list[PolicyRule] = []
     reasoning_by_scope: dict[str, str] = {}
     reasoning_by_agent_role: dict[str, str] = {}
+    best_effort_notes: dict[str, str] = {}
     for agent_scope in inbound_scopes:  # (a) user role -> agent inbound scope
-        scope_rules, reasoning = _invoke_graph(SCOPE_GRAPH, roles=user_roles, scope=agent_scope)
+        scope_rules, reasoning, note = _invoke_graph(
+            SCOPE_GRAPH, roles=user_roles, scope=agent_scope, best_effort=best_effort
+        )
         rules += scope_rules
         reasoning_by_scope[agent_scope.name] = reasoning
+        if note is not None:
+            best_effort_notes[agent_scope.name] = note
     for target_scope in target_scopes:  # (b) user role -> tool/agent-target scope
-        scope_rules, reasoning = _invoke_graph(SCOPE_GRAPH, roles=user_roles, scope=target_scope)
+        scope_rules, reasoning, note = _invoke_graph(
+            SCOPE_GRAPH, roles=user_roles, scope=target_scope, best_effort=best_effort
+        )
         rules += scope_rules
         reasoning_by_scope[target_scope.name] = reasoning
+        if note is not None:
+            best_effort_notes[target_scope.name] = note
     for agent_role in agent_roles:  # (c) agent role -> all tool/agent-target scopes
-        role_rules, reasoning = _invoke_graph(ROLE_GRAPH, role=agent_role, scopes=target_scopes)
+        role_rules, reasoning, note = _invoke_graph(
+            ROLE_GRAPH, role=agent_role, scopes=target_scopes, best_effort=best_effort
+        )
         rules += role_rules
         reasoning_by_agent_role[agent_role.name] = reasoning
-    return rules, reasoning_by_scope, reasoning_by_agent_role
+        if note is not None:
+            best_effort_notes[agent_role.name] = note
+    return rules, reasoning_by_scope, reasoning_by_agent_role, best_effort_notes
 
 
 # ======================================================================================
@@ -330,9 +437,11 @@ def opa_bin() -> str:
     return found
 
 
-def opa_eval(rego_paths: list[Path], query: str, input_doc: dict) -> bool:
+def opa_eval(rego_paths: list[Path], query: str, input_doc: dict) -> Any:
     """Evaluate ``query`` against the given Rego file(s) with ``input_doc`` on stdin; return the
-    boolean result. Raises (via ``check=True``) if OPA rejects the Rego or the query errors."""
+    decoded JSON result — a ``bool`` for a decision query (e.g. ``...request.allow``), or a data
+    document (e.g. a ``{role: [scope, ...]}`` map) for a plain declaration. Raises (via
+    ``check=True``) if OPA rejects the Rego or the query errors."""
     cmd = [
         opa_bin(),
         "eval",
@@ -342,9 +451,7 @@ def opa_eval(rego_paths: list[Path], query: str, input_doc: dict) -> bool:
         "--stdin-input",
         query,
     ]
-    out = subprocess.run(
-        cmd, input=json.dumps(input_doc), capture_output=True, text=True, check=True
-    ).stdout
+    out = subprocess.run(cmd, input=json.dumps(input_doc), capture_output=True, text=True, check=True).stdout
     return json.loads(out)["result"][0]["expressions"][0]["value"]
 
 
@@ -404,9 +511,7 @@ def expected_inbound(scenario: ModuleType, subject: str, agent_id: str) -> bool:
     agent = scenario.AGENTS[agent_id]
     agent_scopes = set(agent["inbound_scopes"]) | set(agent.get("delegation_scopes", {}))
     via_inbound = any(r == role and s in agent_scopes for r, s in scenario.INBOUND_PAIRS)
-    via_target_delegation = any(
-        r == role and s in agent_scopes for r, s in scenario.OUTBOUND_SUBJECT_PAIRS
-    )
+    via_target_delegation = any(r == role and s in agent_scopes for r, s in scenario.OUTBOUND_SUBJECT_PAIRS)
     return via_inbound or via_target_delegation
 
 
@@ -451,10 +556,7 @@ def _outbound_explanation(scenario: ModuleType, subject: str, agent_id: str, sco
     if subject_ok and agent_ok:
         return f"role '{role}' is entitled to scope '{scope}' AND '{agent_id}' is entitled to it"
     if not subject_ok and not agent_ok:
-        return (
-            f"role '{role}' is not entitled to scope '{scope}', and neither is '{agent_id}' — "
-            "denied on both sides"
-        )
+        return f"role '{role}' is not entitled to scope '{scope}', and neither is '{agent_id}' — denied on both sides"
     if not subject_ok:
         return f"role '{role}' is not entitled to scope '{scope}' (even though '{agent_id}' is)"
     return f"'{agent_id}' is not entitled to scope '{scope}' (even though role '{role}' is)"
@@ -505,22 +607,158 @@ def truth(scenario: ModuleType) -> dict[str, set[tuple[str, str]]]:
 
 
 # ======================================================================================
+# ProcessPoolExecutor worker init — a multiprocessing.Lock() can only reach a worker via the
+# pool's initializer/initargs ("inheritance" at process-start time), not as a regular per-task
+# submit() argument — passing one through the ongoing call queue instead raises "Lock objects
+# should only be shared between processes through inheritance" under the forkserver/spawn start
+# methods (this Python's default is forkserver; plain fork wouldn't need this, but forkserver
+# does). See ``_provision_scenario`` for why the lock exists at all.
+# ======================================================================================
+
+_REALM_LOCK: Any = None
+
+
+def _init_worker(realm_lock: Any) -> None:
+    global _REALM_LOCK
+    _REALM_LOCK = realm_lock
+
+
+# ======================================================================================
 # Session fixture — one pipeline run per scenario
 # ======================================================================================
 
 
+def _provision_scenario(name: str, idp_port: int, store_port: int, opa_port: int) -> dict:
+    """Provision one scenario's realm and run the real PRB+PCE pipeline, leaving ``.rego`` on disk
+    under ``rego_out/policy_pipeline_eval/<scenario>/``. Returns ``{"rego_dir": Path, "rules":
+    list[PolicyRule], "reasoning_by_scope": dict[str, str], "reasoning_by_agent_role": dict[str,
+    str], "best_effort_notes": dict[str, str]}`` (the two reasoning dicts feed the eval report's
+    per-cell "Output" field, see ``conftest.py``; ``best_effort_notes`` names every scope/role
+    decision — if any — that fell back to a never-approved proposal rather than aborting the
+    scenario, see ``orchestrate_prb``), or ``{"error": <str>}`` on failure.
+
+    Fully self-contained — own ``KeycloakAdmin`` connection, own env-var writes, own
+    idp/store/opa ports — so it can run as an independent ``ProcessPoolExecutor`` worker (see the
+    module docstring for why a *shared* admin object / shared ``os.environ`` would race under
+    threads). Takes ``name`` and looks ``SCENARIOS[name]`` up itself rather than receiving the
+    scenario ``ModuleType`` as a parameter — module objects aren't picklable, and every argument
+    here has to survive being pickled across the process boundary to the worker. The error return
+    is stringified for the same reason: not every exception type is guaranteed picklable back.
+
+    ``_REALM_LOCK`` (a ``multiprocessing.Lock()`` set once per worker by ``_init_worker``, see
+    above) serializes just ``provision_keycloak_admin`` — concurrent ``admin.create_realm(...)``
+    calls against this Keycloak instance were observed to 409 with ``"Duplicate resource error"``
+    even across *distinct* realm names, i.e. an internal Keycloak race on concurrent realm
+    creation, not a bug in this fixture's realm naming. Everything after that (the LLM-heavy
+    ``orchestrate_prb`` calls, the idp/store/opa subprocesses) stays fully concurrent — realm
+    provisioning is a small fraction of one scenario's wall-clock next to the PRB's several
+    sequential LLM calls.
+    """
+    try:
+        scenario = SCENARIOS[name]
+        idp_host, _ = _host_port(os.environ["AIAC_PDP_CONFIG_URL"], DEFAULT_IDP_PORT)
+        store_host, _ = _host_port(os.environ["AIAC_POLICY_STORE_URL"], DEFAULT_STORE_PORT)
+        opa_host, _ = _host_port(os.environ["AIAC_PDP_POLICY_URL"], DEFAULT_OPA_PORT)
+
+        admin = _connect_admin()
+        os.environ["KEYCLOAK_REALM"] = scenario.REALM_DEFAULT  # PCE reads this back
+        with _REALM_LOCK:
+            provision_keycloak_admin(admin, scenario.REALM_DEFAULT, scenario)
+
+        rego_dir = HERE / "rego_out" / "policy_pipeline_eval" / name
+        if rego_dir.exists():
+            shutil.rmtree(rego_dir)
+        rego_dir.mkdir(parents=True)
+        db_path = Path(tempfile.mkdtemp(prefix=f"aiac-store-eval-{name}-")) / "policy_model.db"
+        scenario_dir = Path(scenario.__file__).resolve().parent
+        os.environ["AIAC_POLICY_FILE"] = str(scenario_dir / scenario.POLICY_FILE)
+        os.environ["AIAC_PDP_CONFIG_URL"] = f"http://{idp_host}:{idp_port}"
+        os.environ["AIAC_POLICY_STORE_URL"] = f"http://{store_host}:{store_port}"
+        # The model-store client actually reads AIAC_POLICY_MODEL_STORE_URL, not
+        # AIAC_POLICY_STORE_URL (which nothing consumes) — set both so this worker's PCE calls
+        # land on its own store subprocess instead of every worker colliding on the hardcoded
+        # 127.0.0.1:7074 default once ports diverge per worker.
+        os.environ["AIAC_POLICY_MODEL_STORE_URL"] = f"http://{store_host}:{store_port}"
+        os.environ["AIAC_PDP_POLICY_URL"] = f"http://{opa_host}:{opa_port}"
+        log.info(
+            "scenario %s: realm=%s policy=%s rego_dir=%s ports=(idp=%d store=%d opa=%d)",
+            name,
+            scenario.REALM_DEFAULT,
+            os.environ["AIAC_POLICY_FILE"],
+            rego_dir,
+            idp_port,
+            store_port,
+            opa_port,
+        )
+
+        idp = Service("aiac.idp.service.configuration.keycloak.main:app", port=idp_port, host=idp_host)
+        store = Service(
+            "aiac.policy.model_store.service.main:app",
+            port=store_port,
+            host=store_host,
+            env={"SERVICEPOLICY_DB_PATH": str(db_path)},
+        )
+        opa = Service(
+            "aiac.pdp.service.policy.opa.main:app",
+            port=opa_port,
+            host=opa_host,
+            env={"REGO_OUTPUT_DIR": str(rego_dir), "POLICY_WRITER_DUMP_REGO": "true"},
+        )
+        with running_services([idp, store, opa], src=SRC):
+            config = Configuration.for_realm(scenario.REALM_DEFAULT)
+            provision_via_config(config, scenario)  # exactly once — not idempotent
+            roles, scopes = _read_back(config)
+            # best_effort=True: a scope/role decision the auditor rejects contributes a best-effort
+            # (never-approved) fallback rule instead of aborting the whole scenario — see
+            # orchestrate_prb's docstring. This means the Rego rendered below can include a rule a
+            # real deployment never would; deliberate, by explicit user request, so every scenario's
+            # pipeline completes and scores instead of showing "setup failed" with no metrics at
+            # all. `best_effort_notes` names exactly which scope/role decisions this applies to.
+            rules, reasoning_by_scope, reasoning_by_agent_role, best_effort_notes = orchestrate_prb(
+                roles, scopes, scenario, best_effort=True
+            )
+            compute_and_apply(rules, override=False)
+
+        # Assert every agent's rego actually landed here at setup — EXCEPT agents the scenario
+        # itself declares as deliberately/emergently unreachable (Scenario 4), so a real
+        # pipeline failure still surfaces as one clear error instead of cryptic per-test skips.
+        allow_missing = set(getattr(scenario, "EXPECT_NO_REGO", frozenset()))
+        expected = [
+            _rego_path(rego_dir, agent_id, direction)
+            for agent_id in scenario.AGENTS
+            for direction in ("inbound", "outbound")
+            if agent_id not in allow_missing
+        ]
+        missing = [str(p.relative_to(rego_dir)) for p in expected if not p.is_file()]
+        if missing:
+            raise RuntimeError(
+                f"scenario {name!r}: compute_and_apply produced no {missing} in {rego_dir} "
+                f"(PRB returned {len(rules)} rule(s)); the pipeline failed silently — "
+                f"check the compute_and_apply logs above for a swallowed exception."
+            )
+        return {
+            "rego_dir": rego_dir,
+            "rules": rules,
+            "reasoning_by_scope": reasoning_by_scope,
+            "reasoning_by_agent_role": reasoning_by_agent_role,
+            "best_effort_notes": best_effort_notes,
+        }
+    except Exception as exc:  # noqa: BLE001 - isolate one scenario's setup failure from the rest
+        log.exception("scenario %s: setup failed, isolating from the rest of the session", name)
+        return {"error": f"{exc!r}"}
+
+
 @pytest.fixture(scope="session")
 def pipeline() -> dict[str, dict]:
-    """Provision Keycloak and run the real PRB+PCE pipeline once per scenario, leaving ``.rego`` on
-    disk under ``rego_out/policy_pipeline_eval/<scenario>/``. Returns ``{scenario_name: {"rego_dir":
-    Path, "rules": list[PolicyRule], "reasoning_by_scope": dict[str, str],
-    "reasoning_by_agent_role": dict[str, str]}}`` — the two reasoning dicts feed the eval report's
-    per-cell "Output" field (see ``conftest.py``).
+    """Provision Keycloak and run the real PRB+PCE pipeline once per scenario — in parallel, one
+    ``ProcessPoolExecutor`` worker per scenario (see the module docstring) — leaving ``.rego`` on
+    disk under ``rego_out/policy_pipeline_eval/<scenario>/``. Returns ``{scenario_name:
+    _provision_scenario(...)}`` for every scenario.
 
-    Each scenario gets its own realm (``scenario.REALM_DEFAULT``) and its own fresh IdP/Store/OPA
-    subprocess trio — unlike ``test_policy_pipeline.py``'s two variants (which share one realm and
-    reuse a single IdP process), these scenarios' realms differ, so nothing can safely be kept warm
-    across them.
+    Each scenario gets its own realm (``scenario.REALM_DEFAULT``), its own fresh IdP/Store/OPA
+    subprocess trio, and its own port triple (offset from the module defaults by scenario index) —
+    unlike ``test_policy_pipeline.py``'s two variants (which share one realm and reuse a single IdP
+    process), these scenarios' realms differ, so nothing can safely be kept warm across them.
     """
     require_env(
         "KEYCLOAK_URL",
@@ -531,76 +769,30 @@ def pipeline() -> dict[str, dict]:
         "LLM_API_KEY",
     )
 
-    admin = _connect_admin()
-
-    idp_host, idp_port = _host_port(os.environ["AIAC_PDP_CONFIG_URL"], DEFAULT_IDP_PORT)
-    store_host, store_port = _host_port(os.environ["AIAC_POLICY_STORE_URL"], DEFAULT_STORE_PORT)
-    opa_host, opa_port = _host_port(os.environ["AIAC_PDP_POLICY_URL"], DEFAULT_OPA_PORT)
-
+    # max(1, ...): ProcessPoolExecutor raises a bare ValueError("max_workers must be greater than
+    # 0") for 0 or negative — clearer to floor it here than to let a maintainer's typo in this
+    # escape-hatch env var surface as an opaque crash deep inside the executor.
+    max_workers = max(1, int(os.environ.get("EVAL_PIPELINE_PARALLELISM", str(len(SCENARIOS)))))
+    realm_lock = multiprocessing.Lock()  # serializes admin.create_realm — see _provision_scenario
     results: dict[str, dict] = {}
-    for name, scenario in SCENARIOS.items():
-        try:
-            os.environ["KEYCLOAK_REALM"] = scenario.REALM_DEFAULT  # PCE reads this back
-            provision_keycloak_admin(admin, scenario.REALM_DEFAULT, scenario)
-
-            rego_dir = HERE / "rego_out" / "policy_pipeline_eval" / name
-            if rego_dir.exists():
-                shutil.rmtree(rego_dir)
-            rego_dir.mkdir(parents=True)
-            db_path = Path(tempfile.mkdtemp(prefix=f"aiac-store-eval-{name}-")) / "policy_model.db"
-            scenario_dir = Path(scenario.__file__).resolve().parent
-            os.environ["AIAC_POLICY_FILE"] = str(scenario_dir / scenario.POLICY_FILE)
-            log.info(
-                "scenario %s: realm=%s policy=%s rego_dir=%s",
-                name, scenario.REALM_DEFAULT, os.environ["AIAC_POLICY_FILE"], rego_dir,
-            )
-
-            idp = Service("aiac.idp.service.configuration.keycloak.main:app", port=idp_port, host=idp_host)
-            store = Service(
-                "aiac.policy.model_store.service.main:app",
-                port=store_port,
-                host=store_host,
-                env={"SERVICEPOLICY_DB_PATH": str(db_path)},
-            )
-            opa = Service(
-                "aiac.pdp.service.policy.opa.main:app",
-                port=opa_port,
-                host=opa_host,
-                env={"REGO_OUTPUT_DIR": str(rego_dir), "POLICY_WRITER_DUMP_REGO": "true"},
-            )
-            with running_services([idp, store, opa], src=SRC):
-                config = Configuration.for_realm(scenario.REALM_DEFAULT)
-                provision_via_config(config, scenario)  # exactly once — not idempotent
-                roles, scopes = _read_back(config)
-                rules, reasoning_by_scope, reasoning_by_agent_role = orchestrate_prb(roles, scopes, scenario)
-                compute_and_apply(rules, override=False)
-
-            # Assert every agent's rego actually landed here at setup — EXCEPT agents the scenario
-            # itself declares as deliberately/emergently unreachable (Scenario 4), so a real
-            # pipeline failure still surfaces as one clear error instead of cryptic per-test skips.
-            allow_missing = set(getattr(scenario, "EXPECT_NO_REGO", frozenset()))
-            expected = [
-                _rego_path(rego_dir, agent_id, direction)
-                for agent_id in scenario.AGENTS
-                for direction in ("inbound", "outbound")
-                if agent_id not in allow_missing
-            ]
-            missing = [str(p.relative_to(rego_dir)) for p in expected if not p.is_file()]
-            if missing:
-                raise RuntimeError(
-                    f"scenario {name!r}: compute_and_apply produced no {missing} in {rego_dir} "
-                    f"(PRB returned {len(rules)} rule(s)); the pipeline failed silently — "
-                    f"check the compute_and_apply logs above for a swallowed exception."
-                )
-            results[name] = {
-                "rego_dir": rego_dir,
-                "rules": rules,
-                "reasoning_by_scope": reasoning_by_scope,
-                "reasoning_by_agent_role": reasoning_by_agent_role,
-            }
-        except Exception as exc:  # noqa: BLE001 - isolate one scenario's setup failure from the rest
-            log.exception("scenario %s: setup failed, isolating from the rest of the session", name)
-            results[name] = {"error": exc}
+    with ProcessPoolExecutor(max_workers=max_workers, initializer=_init_worker, initargs=(realm_lock,)) as executor:
+        futures = {
+            executor.submit(
+                _provision_scenario,
+                name,
+                DEFAULT_IDP_PORT + i * 10,
+                DEFAULT_STORE_PORT + i * 10,
+                DEFAULT_OPA_PORT + i * 10,
+            ): name
+            for i, name in enumerate(SCENARIOS)
+        }
+        for future in as_completed(futures):
+            name = futures[future]
+            try:
+                results[name] = future.result()
+            except Exception as exc:  # noqa: BLE001 - isolate one scenario's worker crash from the rest
+                log.exception("scenario %s: worker crashed, isolating from the rest of the session", name)
+                results[name] = {"error": f"{exc!r}"}
 
     yield results
 
@@ -638,9 +830,7 @@ def _inbound_cases() -> list[tuple[str, str, str]]:
 
 
 @pytest.mark.parametrize("scenario_name,agent_id,subject", _inbound_cases())
-def test_inbound(
-    pipeline: dict[str, dict], scenario_name: str, agent_id: str, subject: str, record_property
-) -> None:
+def test_inbound(pipeline: dict[str, dict], scenario_name: str, agent_id: str, subject: str, record_property) -> None:
     """The generated inbound gate allows a user iff their role may reach that agent's own scope."""
     scenario = SCENARIOS[scenario_name]
     role = scenario.USERS[subject]
@@ -652,8 +842,7 @@ def test_inbound(
     expected = expected_inbound(scenario, subject, agent_id)
     record_property(
         "description",
-        f"Can '{subject}' (subject, role '{role}') access '{agent_id}' (agent) in the "
-        f"'{scenario_name}' scenario?",
+        f"Can '{subject}' (subject, role '{role}') access '{agent_id}' (agent) in the '{scenario_name}' scenario?",
     )
     record_property("expected", expected)
     record_property("expected_explanation", _inbound_explanation(scenario, subject, agent_id))
@@ -667,15 +856,11 @@ def test_inbound(
         assert not expected, f"{agent_id} produced no inbound rego but {subject} is expected to reach it"
         return
 
-    allowed = opa_eval(
-        [rego], "data.authbridge.client.inbound.request.allow", {"identity": {"subject": subject}}
-    )
+    allowed = opa_eval([rego], "data.authbridge.client.inbound.request.allow", {"identity": {"subject": subject}})
     record_property("output", allowed)
     record_property(
         "llm_reasoning",
-        "\n".join(
-            f"scope '{s}': {reasoning_by_scope.get(s, 'no reasoning recorded')}" for s in agent_scopes
-        ),
+        "\n".join(f"scope '{s}': {reasoning_by_scope.get(s, 'no reasoning recorded')}" for s in agent_scopes),
     )
     assert allowed == expected
 
@@ -731,8 +916,7 @@ def test_outbound(
     record_property("output", allowed)
     reasoning_lines = [f"subject-side (scope '{scope}'): {reasoning_by_scope.get(scope, 'no reasoning recorded')}"]
     reasoning_lines += [
-        f"agent-side (role '{r}'): {reasoning_by_agent_role.get(r, 'no reasoning recorded')}"
-        for r in agent_role_names
+        f"agent-side (role '{r}'): {reasoning_by_agent_role.get(r, 'no reasoning recorded')}" for r in agent_role_names
     ]
     record_property("llm_reasoning", "\n".join(reasoning_lines))
     assert allowed == expected
@@ -798,9 +982,5 @@ def test_identity_confusion_probes(pipeline: dict[str, dict], scenario_name: str
     scenario_result = _require_scenario(pipeline, scenario_name)
     for subject, agent_id, expected in probes:
         rego = _rego_path(scenario_result["rego_dir"], agent_id, "inbound")
-        allowed = opa_eval(
-            [rego], "data.authbridge.client.inbound.request.allow", {"identity": {"subject": subject}}
-        )
-        assert allowed == expected, (
-            f"{scenario_name}: identity-confusion probe subject={subject!r} agent={agent_id!r}"
-        )
+        allowed = opa_eval([rego], "data.authbridge.client.inbound.request.allow", {"identity": {"subject": subject}})
+        assert allowed == expected, f"{scenario_name}: identity-confusion probe subject={subject!r} agent={agent_id!r}"

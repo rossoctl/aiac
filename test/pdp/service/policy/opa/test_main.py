@@ -20,28 +20,6 @@ import json
 from unittest.mock import MagicMock
 
 import pytest
-"""Unit tests for aiac.pdp.service.policy.opa.main.
-
-Targets the always-on Custom Resource writer. The module builds a
-``CustomObjectsApi`` at import (kube-config load is guarded, so import needs no
-cluster); every test patches that module-level ``_api`` with a ``MagicMock`` so
-no real Kubernetes API is contacted. The additive ``POLICY_WRITER_DUMP_REGO``
-local-dump toggle is covered here too (it never gates or replaces the CR write).
-
-Note on the delete-by-id endpoint: its route param ``{agent_id}`` is a single
-path segment, and a valid namespaced id (``<ns>/<name>`` or a SPIFFE URI) carries
-slashes. The library client percent-encodes them and the ASGI server decodes the
-segment back, but the ``TestClient``/httpx transport collapses ``%2F`` -> ``/``
-before the request is sent, so a namespaced id cannot reach the param through
-``TestClient``. Those cases therefore call the route handler function directly
-(the FastAPI decorators leave the functions callable), which still exercises the
-full write + error-mapping path through the mocked ``_api``.
-"""
-
-import json
-from unittest.mock import MagicMock
-
-import pytest
 from fastapi.testclient import TestClient
 from kubernetes.client import ApiException
 
@@ -104,9 +82,7 @@ class TestBuildCR:
         assert cr["kind"] == "AuthorizationPolicy"
         assert cr["metadata"]["name"] == "github-agent"
         assert cr["metadata"]["namespace"] == "team1"
-        assert cr["metadata"]["labels"] == {
-            "app.kubernetes.io/managed-by": "aiac-pdp-policy-writer"
-        }
+        assert cr["metadata"]["labels"] == {"app.kubernetes.io/managed-by": "aiac-pdp-policy-writer"}
         assert cr["spec"]["scope"] == "client"
         assert cr["spec"]["clientID"] == "github-agent"
 
@@ -165,9 +141,7 @@ class TestUpsertBatch:
 
     def test_bad_agent_id_returns_400_and_no_patch(self, api):
         # "github-agent" has no derivable namespace -> 400 naming it, no patch.
-        resp = TestClient(app).post(
-            "/policy", json={"agents": [_agent("github-agent")]}
-        )
+        resp = TestClient(app).post("/policy", json={"agents": [_agent("github-agent")]})
         assert resp.status_code == 400
         assert "github-agent" in resp.json()["error"]
         api.patch_namespaced_custom_object.assert_not_called()
@@ -269,9 +243,7 @@ class TestDumpToggle:
         assert "package authbridge.client.inbound.request" in inbound.read_text()
         assert "package authbridge.client.outbound.request" in outbound.read_text()
 
-    def test_dump_off_writes_no_files_but_still_patches(
-        self, api, tmp_path, monkeypatch
-    ):
+    def test_dump_off_writes_no_files_but_still_patches(self, api, tmp_path, monkeypatch):
         # Toggle unset (deleted by the api fixture); REGO_OUTPUT_DIR set but unused.
         monkeypatch.setenv("REGO_OUTPUT_DIR", str(tmp_path))
         resp = TestClient(app).post("/policy/agents/ignored", json=_agent(SPIFFE))

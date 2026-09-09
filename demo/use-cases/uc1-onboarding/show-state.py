@@ -48,7 +48,9 @@ def show_keycloak(admin, cfg) -> None:
 
     all_scopes = {s["name"]: s.get("description", "") for s in admin.get_client_scopes()}
     provisioned_scopes = {n: d for n, d in all_scopes.items() if n.startswith(prefixes)}
-    print(f"\n  Provisioned client scopes ({scn.AGENT_WORKLOAD}.*/{scn.TOOL_WORKLOAD}.*): {len(provisioned_scopes) or 'none yet'}")
+    print(
+        f"\n  Provisioned client scopes ({scn.AGENT_WORKLOAD}.*/{scn.TOOL_WORKLOAD}.*): {len(provisioned_scopes) or 'none yet'}"
+    )
     for name, desc in sorted(provisioned_scopes.items()):
         note(f"{name} — {desc}")
 
@@ -63,7 +65,9 @@ def grant_sets(cfg, rego_dir: Path) -> tuple[set[tuple[str, str]], set[tuple[str
     inbound = {(role, scope) for role, scopes in role_scopes.items() for scope in scopes if scope in agent_scopes}
 
     # Outbound subject_role_allow_scopes values are BARE de-prefixed tool scopes.
-    subj_scopes = opa_eval([outbound_rego], "data.authbridge.client.outbound.request.subject_role_allow_scopes", {}) or {}
+    subj_scopes = (
+        opa_eval([outbound_rego], "data.authbridge.client.outbound.request.subject_role_allow_scopes", {}) or {}
+    )
     outbound = {(role, scope) for role, scopes in subj_scopes.items() for scope in scopes}
     return inbound, outbound
 

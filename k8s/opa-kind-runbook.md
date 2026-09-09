@@ -102,7 +102,7 @@ read the delegation chain (see [Part B](#part-b--outbound-token-exchange--opa)).
 
   Verify with A.1 below — a good token decodes to `sub = dev-user`.
 
-All commands below are run from the repo root (`cortex/`).
+All commands below are run from the repo root.
 
 ---
 
@@ -219,7 +219,7 @@ method, which is expected and irrelevant to authorization.
 ## A.3 — Apply the client-scoped policy
 
 ```bash
-kubectl apply -f aiac/docs/examples/opa-team1-policy.yaml
+kubectl apply -f docs/examples/opa-team1-policy.yaml
 ```
 
 `bundle-service` rebuilds the `team1` bundle on the CR change; `github-agent`'s
@@ -498,7 +498,7 @@ It gates **per tool**: allowing only when the delegated user's role **and** the
 target service both admit the invoked tool — an AND across the user→tool and
 service→tool gates. The `subject_role_scopes` / `target_scopes` maps in the
 example are keyed by the actual MCP tool names exposed by the deployed
-github-tool (`aiac/demo/assets/tools/github_tool`): `source-read`,
+github-tool (`demo/assets/tools/github_tool`): `source-read`,
 `source-write`, `issues-read`, `issues-write`. (Because the gate is on
 `params.name`, MCP methods that don't invoke a specific tool — like the
 `tools/list` probe below — carry no `params.name`, so they never match and are
@@ -512,7 +512,7 @@ Undo everything, in reverse order:
 
 ```bash
 # 1. delete the inbound policy CR
-kubectl delete -f aiac/docs/examples/opa-team1-policy.yaml
+kubectl delete -f docs/examples/opa-team1-policy.yaml
 
 # 2. revert authproxy-routes to weather-only
 kubectl patch configmap authproxy-routes -n team1 --type merge -p "$(python3 -c '

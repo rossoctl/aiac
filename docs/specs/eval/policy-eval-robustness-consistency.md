@@ -1,7 +1,7 @@
-# Integration Test: policy-eval-robustness-consistency — `test_policy_pipeline_consistency.py` + `test_policy_pipeline_robustness.py`
+# Eval Spec: policy-eval-robustness-consistency — `test_policy_pipeline_consistency.py` + `test_policy_pipeline_robustness.py`
 
 > **One spec among several.** This document specifies a **family** of integration tests.
-> Integration-test specs live **one spec per test** under `docs/specs/integration-test/`
+> Eval specs live **one spec per test** under `docs/specs/eval/`
 > (a sibling of `components/`), and the master PRD's *Integration test specifications* section
 > ([../PRD.md](../PRD.md)) is the index of them. This is the **policy-eval-robustness-consistency**
 > family — it is a **companion to**, not a replacement for,
@@ -13,16 +13,16 @@
 
 ## Location
 
-Both suites live under `aiac/eval/`, alongside `policy-eval-scenarios.md`'s heavy
+Both suites live under `eval/`, alongside `policy-eval-scenarios.md`'s heavy
 scenarios, and reuse that family's scenario corpus rather than defining their own:
 
-- `aiac/eval/test_policy_pipeline_consistency.py` — the consistency suite,
+- `eval/test_policy_pipeline_consistency.py` — the consistency suite,
   `@pytest.mark.eval_consistency`.
-- `aiac/eval/test_policy_pipeline_robustness.py` — the robustness suite,
+- `eval/test_policy_pipeline_robustness.py` — the robustness suite,
   `@pytest.mark.eval_robustness`.
-- `aiac/eval/prb_direct.py` — shared helper, `build_roles_and_scopes(scenario)`,
+- `eval/prb_direct.py` — shared helper, `build_roles_and_scopes(scenario)`,
   used by both suites (see [No-Keycloak design](#no-keycloak-design) below).
-- `aiac/eval/scenarios_perturbed/` — eight hand-authored semantic-sibling scenario
+- `eval/scenarios_perturbed/` — eight hand-authored semantic-sibling scenario
   modules + policy `.md` files, one per `policy-eval-scenarios.md` scenario (including
   `agent_delegation`, even though its **original** lives at `test/integration/` top level, not
   under `eval/`) — used only by the robustness suite's semantic tier (see
@@ -30,7 +30,7 @@ scenarios, and reuse that family's scenario corpus rather than defining their ow
 - Both suites import `SCENARIOS`, `orchestrate_prb`, `grant_sets`, `truth` from
   `eval.test_policy_pipeline_eval` **unmodified** — no changes to that module's
   own logic were needed for this work, beyond the unrelated file-reorg noted below.
-- `aiac/eval/conftest.py` — the same per-run Markdown report generator
+- `eval/conftest.py` — the same per-run Markdown report generator
   `policy-eval-scenarios.md` documents, widened to also cover these two suites' markers (see
   [Test report](#test-report)).
 
@@ -233,8 +233,8 @@ several indexed by the master PRD ([../PRD.md](../PRD.md), § *Integration test 
 - **Companion to, not a replacement for, [policy-eval-scenarios.md](policy-eval-scenarios.md).**
   That family proves correctness once per scenario; this family proves consistency and robustness
   of the same decisions, reusing its corpus and helpers unmodified.
-- **Independent of [policy-pipeline.md](policy-pipeline.md) and
-  [uc1-onboarding-pipeline.md](uc1-onboarding-pipeline.md).** Neither suite here touches Keycloak,
+- **Independent of [policy-pipeline.md](../integration-test/policy-pipeline.md) and
+  [uc1-onboarding-pipeline.md](../integration-test/uc1-onboarding-pipeline.md).** Neither suite here touches Keycloak,
   the PCE, `opa`, or a live cluster — see [No-Keycloak design](#no-keycloak-design).
 - **New markers, registered in `pyproject.toml`** (`eval_consistency`,
   `eval_robustness`), distinct from `integration`/`eval_extended`, so either suite

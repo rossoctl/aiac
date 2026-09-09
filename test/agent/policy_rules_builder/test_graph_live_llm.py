@@ -107,9 +107,7 @@ def _role_effects(rules: list[PolicyRule]) -> set[tuple[str, RuleEffect]]:
 # ALLOWs, no DENY. Proves the seam wiring + marker gating before any deny logic. #
 # --------------------------------------------------------------------------- #
 def test_allow_only_role_direction():
-    developer = _role(
-        "r-dev", "developer", "A software developer who works on the source code repository."
-    )
+    developer = _role("r-dev", "developer", "A software developer who works on the source code repository.")
     source_read = _scope("s-read", "source-read", "Read source code from the repository.")
     source_write = _scope("s-write", "source-write", "Write and modify source code in the repository.")
 
@@ -152,9 +150,7 @@ def test_allow_only_scope_direction():
 # explicit DENY on the write scope (rule 5), alongside the read ALLOW.          #
 # --------------------------------------------------------------------------- #
 def test_direct_prohibition_deny():
-    developer = _role(
-        "r-dev", "developer", "A software developer who works on the source code repository."
-    )
+    developer = _role("r-dev", "developer", "A software developer who works on the source code repository.")
     source_read = _scope("s-read", "source-read", "Read source code from the repository.")
     source_write = _scope("s-write", "source-write", "Write and modify source code in the repository.")
 
@@ -225,9 +221,7 @@ def test_exclusivity_derives_complement():
 # prohibition the scope-focal pass structurally cannot express.                 #
 # --------------------------------------------------------------------------- #
 def test_door_b_exclusivity_complement_denies_only():
-    tester = _role(
-        "r-tst", "tester", "A QA tester who works in the issue tracker, not in the source repository."
-    )
+    tester = _role("r-tst", "tester", "A QA tester who works in the issue tracker, not in the source repository.")
     issues = _scope("s-iss", "issues", "Access the issue tracker.")
     source_read = _scope("s-sr", "source-read", "Read source code from the repository.")
     source_write = _scope("s-sw", "source-write", "Write and modify source code in the repository.")

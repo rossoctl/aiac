@@ -22,18 +22,24 @@ import pytest
 
 from aiac.idp.configuration.api import Configuration
 from aiac.idp.configuration.models import Role, RoleKind, Scope, Service, ServiceType
-from aiac.policy.model.models import PolicyModel, PolicyRule, RuleEffect, ServicePolicyModel
+from aiac.policy.model.models import PolicyRule, RuleEffect, ServicePolicyModel
 
 
 # --------------------------------------------------------------------------- #
 # builders                                                                    #
 # --------------------------------------------------------------------------- #
-def _role(id, name=None, *, kind=RoleKind.USER, actor_ids=None, composite=False,
-          children=None, aiac_managed=True) -> Role:
+def _role(
+    id, name=None, *, kind=RoleKind.USER, actor_ids=None, composite=False, children=None, aiac_managed=True
+) -> Role:
     attributes = {"aiac.managed": ["true"]} if aiac_managed else {}
     return Role(
-        id=id, name=name or id, composite=composite, childRoles=children or [],
-        attributes=attributes, kind=kind, actorIds=actor_ids or [],
+        id=id,
+        name=name or id,
+        composite=composite,
+        childRoles=children or [],
+        attributes=attributes,
+        kind=kind,
+        actorIds=actor_ids or [],
     )
 
 
@@ -52,8 +58,12 @@ def _scope(id, name=None, *, service_id="", aiac_managed=True) -> Scope:
 
 def _service(service_id, *, type=None, roles=None, scopes=None) -> Service:
     return Service(
-        id=f"uuid-{service_id}", serviceId=service_id, enabled=True,
-        type=type, roles=roles or [], scopes=scopes or [],
+        id=f"uuid-{service_id}",
+        serviceId=service_id,
+        enabled=True,
+        type=type,
+        roles=roles or [],
+        scopes=scopes or [],
     )
 
 
@@ -73,14 +83,17 @@ def _deny(role, scope) -> PolicyRule:
     return PolicyRule(role=role, scope=scope, effect=RuleEffect.DENY)
 
 
-def _spm(service_id, *, type=ServiceType.AGENT, owned_roles=None, owned_scopes=None,
-         inbound=None) -> ServicePolicyModel:
+def _spm(
+    service_id, *, type=ServiceType.AGENT, owned_roles=None, owned_scopes=None, inbound=None
+) -> ServicePolicyModel:
     # ``inbound`` accepts a mixed list of rules; each is filed into the allow/deny list by its
     # ``effect`` (so existing all-allow call sites keep working and deny edges route correctly).
     rules = inbound or []
     return ServicePolicyModel(
-        service_id=service_id, service_type=type,
-        owned_roles=owned_roles or [], owned_scopes=owned_scopes or [],
+        service_id=service_id,
+        service_type=type,
+        owned_roles=owned_roles or [],
+        owned_scopes=owned_scopes or [],
         inbound_allow_rules=[r for r in rules if r.effect == RuleEffect.ALLOW],
         inbound_deny_rules=[r for r in rules if r.effect == RuleEffect.DENY],
     )
@@ -97,11 +110,11 @@ def _inbound(spm) -> list[PolicyRule]:
 class FakeStore:
     def __init__(self, initial=None):
         self.data = {sid: m.model_copy(deep=True) for sid, m in (initial or {}).items()}
-        self.service_writes = []   # [(service_id, SPM)] captured from apply_service_policy
-        self.by_role_calls = []    # [Role] captured from get_service_policies_by_role
-        self.policy_pushes = []    # [PolicyModel] captured from apply_policy
+        self.service_writes = []  # [(service_id, SPM)] captured from apply_service_policy
+        self.by_role_calls = []  # [Role] captured from get_service_policies_by_role
+        self.policy_pushes = []  # [PolicyModel] captured from apply_policy
         self.service_deletes = []  # [service_id] captured from delete_service_policy
-        self.agent_deletes = []    # [agent_id] captured from delete_agent_policy
+        self.agent_deletes = []  # [agent_id] captured from delete_agent_policy
 
     def get_service_policy(self, service_id):
         if service_id in self.data:
@@ -158,25 +171,31 @@ def engine_env(catalog, store):
     with ExitStack() as stack:
         stack.enter_context(patch.dict(os.environ, {"KEYCLOAK_REALM": "test-realm"}))
         stack.enter_context(patch.object(Configuration, "get_services", return_value=list(catalog)))
-        stack.enter_context(patch("aiac.policy.computation.engine.get_service_policy",
-                                  side_effect=store.get_service_policy))
-        stack.enter_context(patch("aiac.policy.computation.engine.get_service_policies_by_role",
-                                  side_effect=store.get_service_policies_by_role))
-        stack.enter_context(patch("aiac.policy.computation.engine.apply_service_policy",
-                                  side_effect=store.apply_service_policy))
-        stack.enter_context(patch("aiac.policy.computation.engine.apply_policy",
-                                  side_effect=store.apply_policy))
-        stack.enter_context(patch("aiac.policy.computation.engine.delete_service_policy",
-                                  side_effect=store.delete_service_policy))
-        stack.enter_context(patch("aiac.policy.computation.engine.delete_agent_policy",
-                                  side_effect=store.delete_agent_policy))
+        stack.enter_context(
+            patch("aiac.policy.computation.engine.get_service_policy", side_effect=store.get_service_policy)
+        )
+        stack.enter_context(
+            patch(
+                "aiac.policy.computation.engine.get_service_policies_by_role",
+                side_effect=store.get_service_policies_by_role,
+            )
+        )
+        stack.enter_context(
+            patch("aiac.policy.computation.engine.apply_service_policy", side_effect=store.apply_service_policy)
+        )
+        stack.enter_context(patch("aiac.policy.computation.engine.apply_policy", side_effect=store.apply_policy))
+        stack.enter_context(
+            patch("aiac.policy.computation.engine.delete_service_policy", side_effect=store.delete_service_policy)
+        )
+        stack.enter_context(
+            patch("aiac.policy.computation.engine.delete_agent_policy", side_effect=store.delete_agent_policy)
+        )
         from aiac.policy.computation.engine import compute_and_apply
+
         yield compute_and_apply
 
 
-def run_engine(
-    rules, *, catalog=None, store_initial=None, override=False, default_effect=RuleEffect.DENY
-) -> FakeStore:
+def run_engine(rules, *, catalog=None, store_initial=None, override=False, default_effect=RuleEffect.DENY) -> FakeStore:
     store = FakeStore(store_initial)
     with engine_env(catalog or [], store) as compute_and_apply:
         compute_and_apply(rules, override=override, default_effect=default_effect)
@@ -379,7 +398,9 @@ def test_override_shared_role_purged_once_second_mapping_survives():
     }
     store = run_engine(
         [_rule(shared, s1), _rule(shared, s2)],
-        catalog=catalog, store_initial=initial, override=True,
+        catalog=catalog,
+        store_initial=initial,
+        override=True,
     )
 
     assert _pairs(_inbound(store.data["svc-one"])) == [("r-shared", "s-one")]
@@ -445,8 +466,8 @@ def test_p2_identity_embeds_aiac_managed_owned_roles_and_scopes():
     store = run_engine([_rule(UR, src)], catalog=[agent])
 
     apm = store.pushed_agent("github-agent")
-    assert [r.id for r in apm.agent_roles] == ["r-helper"]      # built-in role dropped
-    assert [s.id for s in apm.agent_scopes] == ["s-src"]        # profile scope dropped
+    assert [r.id for r in apm.agent_roles] == ["r-helper"]  # built-in role dropped
+    assert [s.id for s in apm.agent_scopes] == ["s-src"]  # profile scope dropped
 
 
 def test_p2_identity_empty_when_no_owned_entities():
@@ -495,35 +516,47 @@ def test_multi_role_capability_match_populates_both_outbound_gates():
     ir = _scope("s-issues-read", service_id="github-tool")
     iw = _scope("s-issues-write", service_id="github-tool")
     catalog = [
-        _agent("github-agent", roles=[src_op, issue_op],
-               scopes=[_scope("s-agent-inbound", service_id="github-agent")]),
+        _agent("github-agent", roles=[src_op, issue_op], scopes=[_scope("s-agent-inbound", service_id="github-agent")]),
         _tool("github-tool", scopes=[sr, sw, ir, iw]),
     ]
     rules = [
         # capability gate: each operator role -> its domain's tool scopes (capability-match)
-        _rule(src_op, sr), _rule(src_op, sw),
-        _rule(issue_op, ir), _rule(issue_op, iw),
+        _rule(src_op, sr),
+        _rule(src_op, sw),
+        _rule(issue_op, ir),
+        _rule(issue_op, iw),
         # subject gate: user roles -> a subset of the tool scopes
-        _rule(developer, sr), _rule(developer, sw), _rule(developer, ir),
-        _rule(tester, ir), _rule(tester, iw),
+        _rule(developer, sr),
+        _rule(developer, sw),
+        _rule(developer, ir),
+        _rule(tester, ir),
+        _rule(tester, iw),
     ]
     store = run_engine(rules, catalog=catalog)
 
     apm = store.pushed_agent("github-agent")
     # capability gate: all four agent->tool edges + target_allow_scopes covering all four scopes
-    assert _pairs(apm.outbound_target_allow_rules) == sorted([
-        ("r-src-op", "s-source-read"), ("r-src-op", "s-source-write"),
-        ("r-issue-op", "s-issues-read"), ("r-issue-op", "s-issues-write"),
-    ])
+    assert _pairs(apm.outbound_target_allow_rules) == sorted(
+        [
+            ("r-src-op", "s-source-read"),
+            ("r-src-op", "s-source-write"),
+            ("r-issue-op", "s-issues-read"),
+            ("r-issue-op", "s-issues-write"),
+        ]
+    )
     assert {k: sorted(s.id for s in v) for k, v in apm.target_allow_scopes.items()} == {
         "github-tool": ["s-issues-read", "s-issues-write", "s-source-read", "s-source-write"],
     }
     # subject gate: the user->tool grant set (developer: source rw + issues read; tester: issues rw)
-    assert _pairs(apm.outbound_subject_allow_rules) == sorted([
-        ("r-developer", "s-source-read"), ("r-developer", "s-source-write"),
-        ("r-developer", "s-issues-read"),
-        ("r-tester", "s-issues-read"), ("r-tester", "s-issues-write"),
-    ])
+    assert _pairs(apm.outbound_subject_allow_rules) == sorted(
+        [
+            ("r-developer", "s-source-read"),
+            ("r-developer", "s-source-write"),
+            ("r-developer", "s-issues-read"),
+            ("r-tester", "s-issues-read"),
+            ("r-tester", "s-issues-write"),
+        ]
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -574,14 +607,19 @@ def test_dependency_exception_propagates(caplog):
     with ExitStack() as stack:
         stack.enter_context(patch.dict(os.environ, {"KEYCLOAK_REALM": "test-realm"}))
         stack.enter_context(patch.object(Configuration, "get_services", side_effect=RuntimeError("boom")))
-        stack.enter_context(patch("aiac.policy.computation.engine.get_service_policy",
-                                  side_effect=store.get_service_policy))
-        stack.enter_context(patch("aiac.policy.computation.engine.get_service_policies_by_role",
-                                  side_effect=store.get_service_policies_by_role))
-        stack.enter_context(patch("aiac.policy.computation.engine.apply_service_policy",
-                                  side_effect=store.apply_service_policy))
-        stack.enter_context(patch("aiac.policy.computation.engine.apply_policy",
-                                  side_effect=store.apply_policy))
+        stack.enter_context(
+            patch("aiac.policy.computation.engine.get_service_policy", side_effect=store.get_service_policy)
+        )
+        stack.enter_context(
+            patch(
+                "aiac.policy.computation.engine.get_service_policies_by_role",
+                side_effect=store.get_service_policies_by_role,
+            )
+        )
+        stack.enter_context(
+            patch("aiac.policy.computation.engine.apply_service_policy", side_effect=store.apply_service_policy)
+        )
+        stack.enter_context(patch("aiac.policy.computation.engine.apply_policy", side_effect=store.apply_policy))
         from aiac.policy.computation.engine import compute_and_apply
 
         UR = _user_role("r-user", users=["u"])
@@ -607,11 +645,7 @@ def test_reconcile_drops_retired_scope_edge():
     AS = _scope("s-agent-inbound", "agent-inbound", service_id="github-agent")
     aud = _scope("s-aud", "agent-team1-github-agent-aud", service_id="github-agent")
     catalog = [_agent("github-agent", scopes=[AS])]  # ``aud`` no longer exists
-    initial = {
-        "github-agent": _spm(
-            "github-agent", owned_scopes=[AS], inbound=[_rule(UR, aud), _rule(UR, AS)]
-        )
-    }
+    initial = {"github-agent": _spm("github-agent", owned_scopes=[AS], inbound=[_rule(UR, aud), _rule(UR, AS)])}
     store = run_engine([_rule(UR, AS)], catalog=catalog, store_initial=initial)
 
     assert _pairs(_inbound(store.data["github-agent"])) == [("r-user-dev", "s-agent-inbound")]
@@ -623,11 +657,7 @@ def test_reconcile_drops_churned_scope_uuid_same_name():
     as_v1 = _scope("s-as-v1", "agent-inbound", service_id="github-agent")
     as_v2 = _scope("s-as-v2", "agent-inbound", service_id="github-agent")
     catalog = [_agent("github-agent", scopes=[as_v2])]  # only the current generation
-    initial = {
-        "github-agent": _spm(
-            "github-agent", owned_scopes=[as_v1], inbound=[_rule(UR, as_v1)]
-        )
-    }
+    initial = {"github-agent": _spm("github-agent", owned_scopes=[as_v1], inbound=[_rule(UR, as_v1)])}
     store = run_engine([_rule(UR, as_v2)], catalog=catalog, store_initial=initial)
 
     assert _pairs(_inbound(store.data["github-agent"])) == [("r-user-dev", "s-as-v2")]
@@ -642,9 +672,7 @@ def test_reconcile_collapses_churned_duplicate_user_role():
     AS = _scope("s-agent-inbound", "agent-inbound", service_id="github-agent")
     catalog = [_agent("github-agent", scopes=[AS])]
     initial = {
-        "github-agent": _spm(
-            "github-agent", owned_scopes=[AS], inbound=[_rule(dev_old, AS), _rule(dev_new, AS)]
-        )
+        "github-agent": _spm("github-agent", owned_scopes=[AS], inbound=[_rule(dev_old, AS), _rule(dev_new, AS)])
     }
     store = run_engine([_rule(dev_new, AS)], catalog=catalog, store_initial=initial)
 
@@ -661,11 +689,7 @@ def test_reconcile_drops_retired_agent_role_self_reference():
     selfref = _agent_role("r-selfref", "github-agent.agent", owner="github-agent")  # retired
     AS = _scope("s-agent-inbound", "agent-inbound", service_id="github-agent")
     catalog = [_agent("github-agent", roles=[AR], scopes=[AS])]  # r-selfref not present
-    initial = {
-        "github-agent": _spm(
-            "github-agent", owned_scopes=[AS], inbound=[_rule(selfref, AS), _rule(UR, AS)]
-        )
-    }
+    initial = {"github-agent": _spm("github-agent", owned_scopes=[AS], inbound=[_rule(selfref, AS), _rule(UR, AS)])}
     store = run_engine([_rule(UR, AS)], catalog=catalog, store_initial=initial)
 
     assert _pairs(_inbound(store.data["github-agent"])) == [("r-user-dev", "s-agent-inbound")]
@@ -678,13 +702,13 @@ def test_reconcile_preserves_live_edges_and_is_idempotent():
     initial = {
         "github-agent": _spm("github-agent", owned_scopes=[AS], inbound=[_rule(UR, AS)]),
         "github-tool": _spm(
-            "github-tool", type=ServiceType.TOOL, owned_scopes=[TS],
+            "github-tool",
+            type=ServiceType.TOOL,
+            owned_scopes=[TS],
             inbound=[_rule(AR, TS), _rule(UR, TS)],
         ),
     }
-    store = run_engine(
-        [_rule(UR, AS), _rule(AR, TS), _rule(UR, TS)], catalog=catalog, store_initial=initial
-    )
+    store = run_engine([_rule(UR, AS), _rule(AR, TS), _rule(UR, TS)], catalog=catalog, store_initial=initial)
 
     assert _pairs(_inbound(store.data["github-agent"])) == [("r-user-dev", "s-agent-inbound")]
     assert _pairs(_inbound(store.data["github-tool"])) == sorted(
@@ -697,9 +721,7 @@ def test_reconcile_skips_when_service_absent_from_catalog():
     # SPM — reconcile is skipped and the stale edge is left intact rather than dropped.
     UR = _user_role("r-user-dev", "developer", users=["dev-user"])
     orphan_scope = _scope("s-orphan", "orphan", service_id="orphan")
-    initial = {
-        "orphan": _spm("orphan", owned_scopes=[orphan_scope], inbound=[_rule(UR, orphan_scope)])
-    }
+    initial = {"orphan": _spm("orphan", owned_scopes=[orphan_scope], inbound=[_rule(UR, orphan_scope)])}
     store = run_engine([_rule(UR, orphan_scope)], catalog=[], store_initial=initial)
 
     assert _pairs(_inbound(store.data["orphan"])) == [("r-user-dev", "s-orphan")]
@@ -845,11 +867,7 @@ def test_reconcile_drops_dangling_deny_edge_and_keeps_live_deny():
     AS = _scope("s-agent-inbound", "agent-inbound", service_id="github-agent")
     aud = _scope("s-aud", "agent-team1-github-agent-aud", service_id="github-agent")  # retired
     catalog = [_agent("github-agent", scopes=[AS])]  # ``aud`` no longer exists
-    initial = {
-        "github-agent": _spm(
-            "github-agent", owned_scopes=[AS], inbound=[_deny(barred, aud), _deny(barred, AS)]
-        )
-    }
+    initial = {"github-agent": _spm("github-agent", owned_scopes=[AS], inbound=[_deny(barred, aud), _deny(barred, AS)])}
     store = run_engine([_deny(barred, AS)], catalog=catalog, store_initial=initial)
 
     assert store.data["github-agent"].inbound_allow_rules == []
@@ -865,9 +883,7 @@ def test_reconcile_churn_collapse_is_per_list_so_a_live_deny_survives():
     AS = _scope("s-agent-inbound", "agent-inbound", service_id="github-agent")
     catalog = [_agent("github-agent", scopes=[AS])]
     initial = {
-        "github-agent": _spm(
-            "github-agent", owned_scopes=[AS], inbound=[_rule(dev_allow, AS), _deny(dev_deny, AS)]
-        )
+        "github-agent": _spm("github-agent", owned_scopes=[AS], inbound=[_rule(dev_allow, AS), _deny(dev_deny, AS)])
     }
     store = run_engine([_rule(dev_allow, AS)], catalog=catalog, store_initial=initial)  # allow gen only
 
@@ -881,9 +897,7 @@ def test_reconcile_preserves_live_deny_edge_and_is_idempotent():
     AR, UR, AS, TS, catalog = _repro()
     barred = _user_role("r-user-ops", "ops", users=["ops-user"])
     initial = {
-        "github-agent": _spm(
-            "github-agent", owned_scopes=[AS], inbound=[_rule(UR, AS), _deny(barred, AS)]
-        ),
+        "github-agent": _spm("github-agent", owned_scopes=[AS], inbound=[_rule(UR, AS), _deny(barred, AS)]),
     }
     store = FakeStore(initial)
     with engine_env(catalog, store) as compute:
@@ -919,9 +933,7 @@ def test_decommission_tool_deletes_spm_holding_both_allow_and_deny_inbound():
     )
     assert _pairs(store.data["github-tool"].inbound_deny_rules) == [("r-user-ops", "s-tool-read")]
 
-    run_decommission(
-        "github-tool", catalog=[_agent("github-agent", roles=[AR], scopes=[AS])], store=store
-    )
+    run_decommission("github-tool", catalog=[_agent("github-agent", roles=[AR], scopes=[AS])], store=store)
 
     assert "github-tool" in store.service_deletes
     assert "github-tool" not in store.data  # SPM(T) gone — both lists torn down together
@@ -1064,9 +1076,7 @@ def test_default_effect_stamped_on_every_emitted_apm():
         _agent("agent-1", roles=[A1], scopes=[S1]),
         _agent("agent-2", roles=[A2], scopes=[S2]),
     ]
-    store = run_engine(
-        [_rule(U, S1), _rule(U, S2)], catalog=catalog, default_effect=RuleEffect.ALLOW
-    )
+    store = run_engine([_rule(U, S1), _rule(U, S2)], catalog=catalog, default_effect=RuleEffect.ALLOW)
 
     assert store.pushed_agent_ids == {"agent-1", "agent-2"}
     for agent_id in ("agent-1", "agent-2"):

@@ -16,6 +16,13 @@ dependencies = [
     "httpx",
     "langgraph",
     "langchain-openai",
+    # chromadb: reserved for the not-yet-wired Phase-2 ChromaDB RAG policy source
+    # (src/aiac/agent/policy_rules_builder/policy_source.py) — declared but never
+    # imported/instantiated. Open advisories (GHSA-f4j7-r4q5-qw2c, GHSA-36p7-vc44-83pf,
+    # GHSA-2wm9-hf6c-p5cr, GHSA-xph7-9rjv-w5fr) all require running the ChromaDB HTTP
+    # server (the code-injection pair also needs trust_remote_code=true); AIAC runs no
+    # such server, so none are reachable. No fixed version is published. Dependabot
+    # alerts dismissed as not_used. Re-audit these before wiring the RAG server path.
     "chromadb",
     "tenacity",
 ]
@@ -24,6 +31,7 @@ dependencies = [
 # Test/dev tooling — install with: uv pip install -e ".[test]"
 test = [
     "pytest>=9.1.1",
+    "pytest-xdist>=3.8.0",
 ]
 
 [tool.uv]
@@ -41,17 +49,29 @@ force-exclude = true
 [tool.ruff.lint]
 select = ["E", "F", "I", "W"]
 
+[tool.ruff.lint.per-file-ignores]
+# Production code under src/ is linted strictly. The test/eval/demo trees carry
+# long-line prose inside triple-quoted docstrings and scenario fixtures (design
+# notes, verbatim policy-pipeline descriptions) where a line-length wrap would
+# either be impossible (inline `# noqa` can't sit inside a string) or would
+# corrupt fixture text the tests assert on. E501 is relaxed for those trees only.
+"test/**" = ["E501"]
+"eval/**" = ["E501"]
+"demo/**" = ["E501"]
+
 [tool.pytest.ini_options]
 testpaths = ["test", "eval"]
 pythonpath = ["src"]
 # Bare `pytest` runs unit tests only — every live-infra marker is excluded by
 # default. `-m` on the command line overrides this (last `-m` wins), so
 # `pytest eval/ -m eval_extended` etc. still works to opt back in.
-addopts = ["-m", "not integration and not eval_extended and not eval_consistency and not eval_robustness"]
+addopts = ["-m", "not integration and not eval_extended and not eval_consistency and not eval_robustness and not eval_correctness_prb and not eval_correctness_e2e"]
 markers = [
     "integration: tests that call real LLM endpoints",
     "llm: tests that call the real LLM but mock descriptions/policy (no cluster)",
     "eval_extended: heavier multi-scenario policy-pipeline evaluation tests — same live infra as `integration`, but several full pipeline runs and many more PRB/LLM calls per session (see eval/test_policy_pipeline_eval.py)",
     "eval_consistency: PRB run-to-run consistency (same scenario, N repeats, exact grant-set equality) — needs LLM_BASE_URL/LLM_MODEL/LLM_API_KEY only, no Keycloak/opa (see eval/test_policy_pipeline_consistency.py)",
     "eval_robustness: PRB robustness to mechanical + semantic input perturbation against the truth-table oracle — needs LLM_BASE_URL/LLM_MODEL/LLM_API_KEY only, no Keycloak/opa (see eval/test_policy_pipeline_robustness.py)",
+    "eval_correctness_prb: PRB-level correctness — precision/recall + a denial-precision figure against the primary corpus's hand-authored truth tables, zero-tolerance over-grant gate — needs LLM_BASE_URL/LLM_MODEL/LLM_API_KEY only, no Keycloak/opa (see eval/test_policy_pipeline_correctness_prb.py)",
+    "eval_correctness_e2e: end-to-end correctness — same precision/recall + denial-precision scorer as eval_correctness_prb, but through the full Keycloak+PCE+OPA pipeline via opa eval — needs KEYCLOAK_URL + admin creds + LLM_BASE_URL/LLM_MODEL/LLM_API_KEY, plus opa on PATH (see eval/test_policy_pipeline_correctness_e2e.py)",
 ]

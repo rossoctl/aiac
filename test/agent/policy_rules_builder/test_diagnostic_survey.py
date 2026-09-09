@@ -24,6 +24,7 @@ from fastapi import HTTPException
 
 from aiac.agent.policy_rules_builder.diagnostic import ExplainResult
 from aiac.agent.policy_rules_builder.diagnostic_models import ConflictKind, ConflictStatus
+from aiac.agent.policy_rules_builder.diagnostic_survey import check_policy_conflicts
 from aiac.agent.policy_rules_builder.graph import (
     AuditVerdict,
     Contradiction,
@@ -31,9 +32,8 @@ from aiac.agent.policy_rules_builder.graph import (
     ScopeSelection,
 )
 from aiac.agent.shared import focal_entities
-from aiac.agent.policy_rules_builder.diagnostic_survey import check_policy_conflicts
-from aiac.idp.configuration.models import RoleKind, Scope, Service, ServiceType, Subject
 from aiac.idp.configuration.models import Role as RoleModel
+from aiac.idp.configuration.models import RoleKind, Scope, Service, ServiceType, Subject
 
 _SEAM = "aiac.agent.policy_rules_builder.graph._structured_call"
 

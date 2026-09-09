@@ -7,7 +7,7 @@
 > **SPM/APM note.** Under the SPM/APM redesign a user's role is a Keycloak **realm role** and an agent's role is surfaced as `kind = Agent` — sourced from the agent client's **client roles** *and* from the `aiac.managed` **realm roles assigned to its service account** (the provisioning path the `Configuration` library uses); the IdP Configuration Service populates `Role.kind`, `Role.actorIds`, and `Scope.serviceId` and fails loud on cross-kind roles (Assumption 1) and multi-owner AIAC-managed scopes (Assumption 2). See [idp-configuration-service.md](idp-configuration-service.md) for the authoritative, current description.
 
 ## Location
-`aiac/src/aiac/keycloak/service/`
+`src/aiac/keycloak/service/`
 
 ## Description
 A FastAPI web service that proxies Keycloak Admin REST API endpoints. Returns raw Keycloak JSON unchanged for read operations; forwards write operations directly. Stateless — no caching.
@@ -61,7 +61,7 @@ python-keycloak
 ## File structure
 
 ```
-aiac/src/aiac/keycloak/service/
+src/aiac/keycloak/service/
 ├── Dockerfile
 ├── requirements.txt
 └── main.py

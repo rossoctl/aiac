@@ -133,9 +133,7 @@ def _build_cr(model: AgentPolicyModel) -> dict:
             "policies": [
                 {
                     "path": "inbound/request.rego",
-                    "content": generate_inbound_rego(
-                        model, platform_clients=_platform_clients()
-                    ),
+                    "content": generate_inbound_rego(model, platform_clients=_platform_clients()),
                 },
                 {
                     "path": "outbound/request.rego",

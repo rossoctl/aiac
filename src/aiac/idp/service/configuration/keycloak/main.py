@@ -212,11 +212,13 @@ def list_subjects(
             result = []
             for user in users:
                 raw = admin.get_all_roles_of_user(user["id"])
-                result.append({
-                    **user,
-                    "realmMappings": raw.get("realmMappings", []),
-                    "serviceMappings": raw.get("clientMappings", {}),
-                })
+                result.append(
+                    {
+                        **user,
+                        "realmMappings": raw.get("realmMappings", []),
+                        "serviceMappings": raw.get("clientMappings", {}),
+                    }
+                )
             return result
         return admin.get_users()
     except KeycloakError as e:
@@ -337,9 +339,7 @@ def set_service_type(
 
 
 @app.post("/services/{service_id}/enabled", status_code=200)
-def set_service_enabled(
-    service_id: str, body: _ServiceEnabledUpdate, admin: KeycloakAdmin = Depends(get_admin)
-):
+def set_service_enabled(service_id: str, body: _ServiceEnabledUpdate, admin: KeycloakAdmin = Depends(get_admin)):
     """Enable or disable a service's Keycloak client (UC1 rollback disable / success re-enable).
 
     Writes ``enabled`` straight through ``update_client``; Keycloak merges a partial client
@@ -423,9 +423,7 @@ def assign_role_to_service(service_id: str, role_id: str, admin: KeycloakAdmin =
 
 
 @app.delete("/services/{service_id}/roles/{role_id}", status_code=200)
-def delete_role_from_service(
-    service_id: str, role_id: str, admin: KeycloakAdmin = Depends(get_admin)
-):
+def delete_role_from_service(service_id: str, role_id: str, admin: KeycloakAdmin = Depends(get_admin)):
     """Tear down a realm role this service created (UC1 rollback).
 
     Unmap-then-delete: remove the role mapping from the service account FIRST, then delete the
@@ -489,12 +487,14 @@ def list_service_scopes(service_id: str, admin: KeycloakAdmin = Depends(get_admi
 def create_scope(service_id: str, body: _ScopeCreate, admin: KeycloakAdmin = Depends(get_admin)):
     logger.info("creating scope %r for service_id=%s", body.name, service_id)
     try:
-        scope_id = admin.create_client_scope({
-            "name": body.name,
-            "description": body.description,
-            "protocol": "openid-connect",
-            "attributes": {_AIAC_MANAGED_ATTRIBUTE: "true"},  # AIAC provisioning marker
-        })
+        scope_id = admin.create_client_scope(
+            {
+                "name": body.name,
+                "description": body.description,
+                "protocol": "openid-connect",
+                "attributes": {_AIAC_MANAGED_ATTRIBUTE: "true"},  # AIAC provisioning marker
+            }
+        )
         admin.add_client_default_client_scope(service_id, scope_id, {})
         return admin.get_client_scope(scope_id)
     except KeycloakError as e:
@@ -514,9 +514,7 @@ def assign_scope_to_service(service_id: str, scope_id: str, admin: KeycloakAdmin
 
 
 @app.delete("/services/{service_id}/scopes/{scope_id}", status_code=200)
-def delete_scope_from_service(
-    service_id: str, scope_id: str, admin: KeycloakAdmin = Depends(get_admin)
-):
+def delete_scope_from_service(service_id: str, scope_id: str, admin: KeycloakAdmin = Depends(get_admin)):
     """Tear down a client scope this service created (UC1 rollback).
 
     Unmap-then-delete: remove the scope from the client's default scopes FIRST, then delete the
@@ -578,11 +576,13 @@ def list_roles(realm: str = Query(...), admin: KeycloakAdmin = Depends(get_admin
 def create_role(body: _RoleCreate, admin: KeycloakAdmin = Depends(get_admin)):
     logger.info("creating realm role %r", body.name)
     try:
-        admin.create_realm_role({
-            "name": body.name,
-            "description": body.description,
-            "attributes": {_AIAC_MANAGED_ATTRIBUTE: ["true"]},  # AIAC provisioning marker
-        })
+        admin.create_realm_role(
+            {
+                "name": body.name,
+                "description": body.description,
+                "attributes": {_AIAC_MANAGED_ATTRIBUTE: ["true"]},  # AIAC provisioning marker
+            }
+        )
         return admin.get_realm_role(body.name)
     except KeycloakError as e:
         if e.response_code == 409:
@@ -609,12 +609,14 @@ def list_scopes(admin: KeycloakAdmin = Depends(get_admin)):
 @app.post("/scopes", status_code=201)
 def create_scope_standalone(body: _ScopeCreate, admin: KeycloakAdmin = Depends(get_admin)):
     try:
-        scope_id = admin.create_client_scope({
-            "name": body.name,
-            "description": body.description,
-            "protocol": "openid-connect",
-            "attributes": {_AIAC_MANAGED_ATTRIBUTE: "true"},  # AIAC provisioning marker
-        })
+        scope_id = admin.create_client_scope(
+            {
+                "name": body.name,
+                "description": body.description,
+                "protocol": "openid-connect",
+                "attributes": {_AIAC_MANAGED_ATTRIBUTE: "true"},  # AIAC provisioning marker
+            }
+        )
         return admin.get_client_scope(scope_id)
     except KeycloakError as e:
         if e.response_code == 409:

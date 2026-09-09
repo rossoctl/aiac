@@ -84,8 +84,7 @@ USER_ROLES: dict[str, str] = {
 # issues/agent/3.20-policy-rules-builder.md, "Follow-up: auditor relationship-scoping".)
 AGENT_ROLES: dict[str, str] = {
     "source_operations": (
-        "Covers read and write access to source repository contents — listing, reading, creating, "
-        "and modifying files."
+        "Covers read and write access to source repository contents — listing, reading, creating, and modifying files."
     ),
     "issue_operations": (
         "Covers read and write access to the issue tracker — reading, filing, updating, and "

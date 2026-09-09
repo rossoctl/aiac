@@ -43,21 +43,16 @@ def _err(status=500):
 class TestAiacManagedMarker:
     def test_role_with_marker_is_managed(self):
         role = Role.model_validate(
-            {"id": "r1", "name": "source-helper", "composite": False,
-             "attributes": {"aiac.managed": ["true"]}}
+            {"id": "r1", "name": "source-helper", "composite": False, "attributes": {"aiac.managed": ["true"]}}
         )
         assert role.aiac_managed is True
 
     def test_role_without_marker_is_not_managed(self):
-        role = Role.model_validate(
-            {"id": "r1", "name": "default-roles-realm", "composite": False}
-        )
+        role = Role.model_validate({"id": "r1", "name": "default-roles-realm", "composite": False})
         assert role.aiac_managed is False
 
     def test_scope_with_marker_is_managed(self):
-        scope = Scope.model_validate(
-            {"id": "s1", "name": "source-access", "attributes": {"aiac.managed": "true"}}
-        )
+        scope = Scope.model_validate({"id": "s1", "name": "source-access", "attributes": {"aiac.managed": "true"}})
         assert scope.aiac_managed is True
 
     def test_scope_without_marker_is_not_managed(self):
@@ -169,8 +164,7 @@ class TestGetRoles:
     def test_returns_list_of_role(self, monkeypatch):
         monkeypatch.setenv("AIAC_PDP_CONFIG_URL", BASE)
         payload = [{"id": "r1", "name": "admin", "composite": False}]
-        with patch("aiac.idp.configuration.api.requests.get",
-                   return_value=_ok(payload)) as m:
+        with patch("aiac.idp.configuration.api.requests.get", return_value=_ok(payload)) as m:
             result = Configuration.for_realm(REALM).get_roles()
         assert isinstance(result[0], Role)
         assert result[0].name == "admin"
@@ -193,8 +187,7 @@ class TestGetRoles:
     def test_non_composite_role_skips_composites_and_scopes_calls(self, monkeypatch):
         monkeypatch.setenv("AIAC_PDP_CONFIG_URL", BASE)
         roles = [{"id": "r1", "name": "viewer", "composite": False}]
-        with patch("aiac.idp.configuration.api.requests.get",
-                   return_value=_ok(roles)) as m:
+        with patch("aiac.idp.configuration.api.requests.get", return_value=_ok(roles)) as m:
             Configuration.for_realm(REALM).get_roles()
         urls = [c[0][0] for c in m.call_args_list]
         assert all("/composites" not in u for u in urls)
@@ -207,8 +200,7 @@ class TestGetRoles:
             {"id": "r2", "name": "viewer", "composite": False},
         ]
         child_roles = [{"id": "r2", "name": "viewer", "composite": False}]
-        with patch("aiac.idp.configuration.api.requests.get",
-                   side_effect=[_ok(roles), _ok(child_roles)]) as m:
+        with patch("aiac.idp.configuration.api.requests.get", side_effect=[_ok(roles), _ok(child_roles)]) as m:
             Configuration.for_realm(REALM).get_roles()
         urls = [c[0][0] for c in m.call_args_list]
         assert all("/scopes" not in u for u in urls)
@@ -217,8 +209,7 @@ class TestGetRoles:
         monkeypatch.setenv("AIAC_PDP_CONFIG_URL", BASE)
         roles = [{"id": "r1", "name": "admin", "composite": True}]
         child_roles = [{"id": "r2", "name": "viewer", "composite": False}]
-        with patch("aiac.idp.configuration.api.requests.get",
-                   side_effect=[_ok(roles), _ok(child_roles)]):
+        with patch("aiac.idp.configuration.api.requests.get", side_effect=[_ok(roles), _ok(child_roles)]):
             result = Configuration.for_realm(REALM).get_roles()
         assert result[0].childRoles[0].name == "viewer"
 
@@ -226,16 +217,14 @@ class TestGetRoles:
         monkeypatch.setenv("AIAC_PDP_CONFIG_URL", BASE)
         roles = [{"id": "r1", "name": "admin", "composite": True}]
         child_roles = [{"id": "r2", "name": "viewer", "composite": False}]
-        with patch("aiac.idp.configuration.api.requests.get",
-                   side_effect=[_ok(roles), _ok(child_roles)]):
+        with patch("aiac.idp.configuration.api.requests.get", side_effect=[_ok(roles), _ok(child_roles)]):
             result = Configuration.for_realm(REALM).get_roles()
         assert not hasattr(result[0], "mappedScopes")
 
     def test_raises_if_composites_call_fails(self, monkeypatch):
         monkeypatch.setenv("AIAC_PDP_CONFIG_URL", BASE)
         roles = [{"id": "r1", "name": "admin", "composite": True}]
-        with patch("aiac.idp.configuration.api.requests.get",
-                   side_effect=[_ok(roles), _err(502)]):
+        with patch("aiac.idp.configuration.api.requests.get", side_effect=[_ok(roles), _err(502)]):
             with pytest.raises(RuntimeError):
                 Configuration.for_realm(REALM).get_roles()
 
@@ -325,11 +314,11 @@ class TestGetService:
         with patch(
             "aiac.idp.configuration.api.requests.get",
             side_effect=[
-                _ok(raw),            # GET /services/svc-001
-                _ok(all_roles),      # GET /roles (no /scopes per role)
-                _ok(all_scopes),     # GET /scopes
+                _ok(raw),  # GET /services/svc-001
+                _ok(all_roles),  # GET /roles (no /scopes per role)
+                _ok(all_scopes),  # GET /scopes
                 _ok(service_roles),  # GET /services/svc-001/roles
-                _ok(service_scopes), # GET /services/svc-001/scopes
+                _ok(service_scopes),  # GET /services/svc-001/scopes
             ],
         ):
             result = Configuration.for_realm(REALM).get_service(self.SERVICE_ID)
@@ -354,10 +343,10 @@ class TestGetService:
             "aiac.idp.configuration.api.requests.get",
             side_effect=[
                 _ok(raw),  # GET /services/svc-001
-                _ok([]),   # GET /roles
-                _ok([]),   # GET /scopes
-                _ok([]),   # GET /services/svc-001/roles
-                _ok([]),   # GET /services/svc-001/scopes
+                _ok([]),  # GET /roles
+                _ok([]),  # GET /scopes
+                _ok([]),  # GET /services/svc-001/roles
+                _ok([]),  # GET /services/svc-001/scopes
             ],
         ):
             result = Configuration.for_realm(REALM).get_service(self.SERVICE_ID)
@@ -376,10 +365,10 @@ class TestGetService:
             "aiac.idp.configuration.api.requests.get",
             side_effect=[
                 _ok(raw),  # GET /services/svc-001
-                _ok([]),   # GET /roles
-                _ok([]),   # GET /scopes
-                _ok([]),   # GET /services/svc-001/roles
-                _ok([]),   # GET /services/svc-001/scopes
+                _ok([]),  # GET /roles
+                _ok([]),  # GET /scopes
+                _ok([]),  # GET /services/svc-001/roles
+                _ok([]),  # GET /services/svc-001/scopes
             ],
         ):
             result = Configuration.for_realm(REALM).get_service(self.SERVICE_ID)
@@ -398,9 +387,9 @@ class TestGetService:
             "aiac.idp.configuration.api.requests.get",
             side_effect=[
                 _ok(raw),  # GET /services/svc-001
-                _ok([]),   # GET /roles
-                _ok([]),   # GET /scopes
-                _err(500), # GET /services/svc-001/roles → error
+                _ok([]),  # GET /roles
+                _ok([]),  # GET /scopes
+                _err(500),  # GET /services/svc-001/roles → error
             ],
         ):
             with pytest.raises(RuntimeError):
@@ -413,10 +402,10 @@ class TestGetService:
             "aiac.idp.configuration.api.requests.get",
             side_effect=[
                 _ok(raw),  # GET /services/svc-001
-                _ok([]),   # GET /roles
-                _ok([]),   # GET /scopes
-                _ok([]),   # GET /services/svc-001/roles → ok
-                _err(500), # GET /services/svc-001/scopes → error
+                _ok([]),  # GET /roles
+                _ok([]),  # GET /scopes
+                _ok([]),  # GET /services/svc-001/roles → ok
+                _err(500),  # GET /services/svc-001/scopes → error
             ],
         ):
             with pytest.raises(RuntimeError):
@@ -428,7 +417,11 @@ class TestGetService:
         with patch(
             "aiac.idp.configuration.api.requests.get",
             side_effect=[
-                _ok(raw), _ok([]), _ok([]), _ok([]), _ok([]),
+                _ok(raw),
+                _ok([]),
+                _ok([]),
+                _ok([]),
+                _ok([]),
             ],
         ) as m:
             Configuration.for_realm(REALM).get_service(self.SERVICE_ID)
@@ -448,9 +441,7 @@ class TestMintDiscoveryToken:
         with patch("aiac.idp.configuration.api.requests.get", return_value=_ok(payload)) as m:
             result = Configuration.for_realm(REALM).mint_discovery_token("svc-uuid")
         assert result == "tok"
-        m.assert_called_once_with(
-            f"{BASE}/services/svc-uuid/discovery-token", params={"realm": REALM}
-        )
+        m.assert_called_once_with(f"{BASE}/services/svc-uuid/discovery-token", params={"realm": REALM})
 
     def test_raises_on_non_2xx(self, monkeypatch):
         monkeypatch.setenv("AIAC_PDP_CONFIG_URL", BASE)
@@ -487,8 +478,13 @@ class TestSetServiceType:
     def test_posts_to_correct_url_with_type_body(self, monkeypatch):
         monkeypatch.setenv("AIAC_PDP_CONFIG_URL", BASE)
         service = self._make_service()
-        updated = {"id": "svc-uuid", "clientId": "svc-uuid", "name": "my-svc", "enabled": True,
-                   "attributes": {"client.type": "Tool"}}
+        updated = {
+            "id": "svc-uuid",
+            "clientId": "svc-uuid",
+            "name": "my-svc",
+            "enabled": True,
+            "attributes": {"client.type": "Tool"},
+        }
         with patch("aiac.idp.configuration.api.requests.post", return_value=_ok(updated, 200)) as m:
             Configuration.for_realm(REALM).set_service_type(service, "Tool")
         assert m.call_args[0][0] == f"{BASE}/services/svc-uuid/type"
@@ -497,8 +493,13 @@ class TestSetServiceType:
     def test_forwards_realm_as_query_param(self, monkeypatch):
         monkeypatch.setenv("AIAC_PDP_CONFIG_URL", BASE)
         service = self._make_service()
-        updated = {"id": "svc-uuid", "clientId": "svc-uuid", "name": "my-svc", "enabled": True,
-                   "attributes": {"client.type": "Agent"}}
+        updated = {
+            "id": "svc-uuid",
+            "clientId": "svc-uuid",
+            "name": "my-svc",
+            "enabled": True,
+            "attributes": {"client.type": "Agent"},
+        }
         with patch("aiac.idp.configuration.api.requests.post", return_value=_ok(updated, 200)) as m:
             Configuration.for_realm(REALM).set_service_type(service, "Agent")
         assert m.call_args[1].get("params") == {"realm": REALM}
@@ -514,8 +515,13 @@ class TestSetServiceType:
         # ServiceType is a str enum; set_service_type unwraps it to the plain "Agent"/"Tool" value.
         monkeypatch.setenv("AIAC_PDP_CONFIG_URL", BASE)
         service = self._make_service()
-        updated = {"id": "svc-uuid", "clientId": "svc-uuid", "name": "my-svc", "enabled": True,
-                   "attributes": {"client.type": "Agent"}}
+        updated = {
+            "id": "svc-uuid",
+            "clientId": "svc-uuid",
+            "name": "my-svc",
+            "enabled": True,
+            "attributes": {"client.type": "Agent"},
+        }
         with patch("aiac.idp.configuration.api.requests.post", return_value=_ok(updated, 200)) as m:
             Configuration.for_realm(REALM).set_service_type(service, ServiceType.AGENT)
         assert m.call_args[1].get("json") == {"type": "Agent"}
@@ -704,8 +710,10 @@ class TestMapScopeToService:
         }
         post_resp = _ok({}, 201)
         get_resp = _ok(updated)
-        with patch("aiac.idp.configuration.api.requests.post", return_value=post_resp), \
-             patch("aiac.idp.configuration.api.requests.get", return_value=get_resp) as get_m:
+        with (
+            patch("aiac.idp.configuration.api.requests.post", return_value=post_resp),
+            patch("aiac.idp.configuration.api.requests.get", return_value=get_resp) as get_m,
+        ):
             result = Configuration.for_realm(REALM).map_scope_to_service(service, scope)
         assert isinstance(result, Service)
         assert result.id == "svc-uuid"
@@ -716,8 +724,10 @@ class TestMapScopeToService:
         service = self._make_service()
         scope = self._make_scope()
         updated = {"id": "svc-uuid", "clientId": "svc-uuid", "name": "my-svc", "enabled": True}
-        with patch("aiac.idp.configuration.api.requests.post", return_value=_ok({}, 201)) as post_m, \
-             patch("aiac.idp.configuration.api.requests.get", return_value=_ok(updated)):
+        with (
+            patch("aiac.idp.configuration.api.requests.post", return_value=_ok({}, 201)) as post_m,
+            patch("aiac.idp.configuration.api.requests.get", return_value=_ok(updated)),
+        ):
             Configuration.for_realm(REALM).map_scope_to_service(service, scope)
         url = post_m.call_args[0][0]
         assert url == f"{BASE}/services/svc-uuid/scopes/scope-id"
@@ -735,8 +745,10 @@ class TestMapScopeToService:
         service = self._make_service()
         scope = self._make_scope()
         updated = {"id": "svc-uuid", "clientId": "svc-uuid", "name": "my-svc", "enabled": True}
-        with patch("aiac.idp.configuration.api.requests.post", return_value=_ok({}, 201)) as post_m, \
-             patch("aiac.idp.configuration.api.requests.get", return_value=_ok(updated)) as get_m:
+        with (
+            patch("aiac.idp.configuration.api.requests.post", return_value=_ok({}, 201)) as post_m,
+            patch("aiac.idp.configuration.api.requests.get", return_value=_ok(updated)) as get_m,
+        ):
             Configuration.for_realm(REALM).map_scope_to_service(service, scope)
         assert post_m.call_args[1].get("params") == {"realm": REALM}
         assert get_m.call_args[1].get("params") == {"realm": REALM}
@@ -811,8 +823,10 @@ class TestMapRoleToService:
         service = self._make_service()
         role = self._make_role()
         updated = {"id": "svc-uuid", "clientId": "svc-uuid", "name": "my-svc", "enabled": True}
-        with patch("aiac.idp.configuration.api.requests.post", return_value=_ok({}, 201)), \
-             patch("aiac.idp.configuration.api.requests.get", return_value=_ok(updated)) as get_m:
+        with (
+            patch("aiac.idp.configuration.api.requests.post", return_value=_ok({}, 201)),
+            patch("aiac.idp.configuration.api.requests.get", return_value=_ok(updated)) as get_m,
+        ):
             result = Configuration.for_realm(REALM).map_role_to_service(service, role)
         assert isinstance(result, Service)
         get_m.assert_called_once_with(f"{BASE}/services/svc-uuid", params={"realm": REALM})
@@ -822,8 +836,10 @@ class TestMapRoleToService:
         service = self._make_service()
         role = self._make_role()
         updated = {"id": "svc-uuid", "clientId": "svc-uuid", "name": "my-svc", "enabled": True}
-        with patch("aiac.idp.configuration.api.requests.post", return_value=_ok({}, 201)) as post_m, \
-             patch("aiac.idp.configuration.api.requests.get", return_value=_ok(updated)):
+        with (
+            patch("aiac.idp.configuration.api.requests.post", return_value=_ok({}, 201)) as post_m,
+            patch("aiac.idp.configuration.api.requests.get", return_value=_ok(updated)),
+        ):
             Configuration.for_realm(REALM).map_role_to_service(service, role)
         url = post_m.call_args[0][0]
         assert url == f"{BASE}/services/svc-uuid/roles/role-id"
@@ -841,8 +857,10 @@ class TestMapRoleToService:
         service = self._make_service()
         role = self._make_role()
         updated = {"id": "svc-uuid", "clientId": "svc-uuid", "name": "my-svc", "enabled": True}
-        with patch("aiac.idp.configuration.api.requests.post", return_value=_ok({}, 201)) as post_m, \
-             patch("aiac.idp.configuration.api.requests.get", return_value=_ok(updated)) as get_m:
+        with (
+            patch("aiac.idp.configuration.api.requests.post", return_value=_ok({}, 201)) as post_m,
+            patch("aiac.idp.configuration.api.requests.get", return_value=_ok(updated)) as get_m,
+        ):
             Configuration.for_realm(REALM).map_role_to_service(service, role)
         assert post_m.call_args[1].get("params") == {"realm": REALM}
         assert get_m.call_args[1].get("params") == {"realm": REALM}
@@ -854,10 +872,13 @@ class TestMapRoleToService:
 
 
 class TestRealmParameter:
-    @pytest.mark.parametrize("method,endpoint", [
-        ("get_roles", "roles"),
-        ("get_scopes", "scopes"),
-    ])
+    @pytest.mark.parametrize(
+        "method,endpoint",
+        [
+            ("get_roles", "roles"),
+            ("get_scopes", "scopes"),
+        ],
+    )
     def test_realm_forwarded_as_query_param(self, method, endpoint, monkeypatch):
         monkeypatch.setenv("AIAC_PDP_CONFIG_URL", BASE)
         with patch("aiac.idp.configuration.api.requests.get", return_value=_ok([])) as m:
@@ -866,6 +887,7 @@ class TestRealmParameter:
 
     def test_get_subjects_realm_forwarded_as_query_param(self, monkeypatch):
         from unittest.mock import call
+
         monkeypatch.setenv("AIAC_PDP_CONFIG_URL", BASE)
         with patch("aiac.idp.configuration.api.requests.get", return_value=_ok([])) as m:
             Configuration.for_realm(REALM).get_subjects()
@@ -873,6 +895,7 @@ class TestRealmParameter:
 
     def test_get_services_realm_forwarded_as_query_param(self, monkeypatch):
         from unittest.mock import call
+
         monkeypatch.setenv("AIAC_PDP_CONFIG_URL", BASE)
         with patch("aiac.idp.configuration.api.requests.get", return_value=_ok([])) as m:
             Configuration.for_realm(REALM).get_services()
@@ -904,13 +927,15 @@ class TestGetServicesByRole:
         return Role.model_validate({**defaults, **kwargs})
 
     def _make_service(self, sid, role_ids):
-        return Service.model_validate({
-            "id": sid,
-            "clientId": sid,
-            "name": sid,
-            "enabled": True,
-            "roles": [{"id": rid, "name": rid, "composite": False} for rid in role_ids],
-        })
+        return Service.model_validate(
+            {
+                "id": sid,
+                "clientId": sid,
+                "name": sid,
+                "enabled": True,
+                "roles": [{"id": rid, "name": rid, "composite": False} for rid in role_ids],
+            }
+        )
 
     def test_returns_only_services_whose_roles_contain_role_id(self):
         role = self._make_role(id="r1")
@@ -1048,13 +1073,15 @@ class TestGetServicesByScope:
         return Scope.model_validate({**defaults, **kwargs})
 
     def _make_service(self, sid, scope_ids):
-        return Service.model_validate({
-            "id": sid,
-            "clientId": sid,
-            "name": sid,
-            "enabled": True,
-            "scopes": [{"id": scid, "name": scid} for scid in scope_ids],
-        })
+        return Service.model_validate(
+            {
+                "id": sid,
+                "clientId": sid,
+                "name": sid,
+                "enabled": True,
+                "scopes": [{"id": scid, "name": scid} for scid in scope_ids],
+            }
+        )
 
     def test_returns_only_services_whose_scopes_contain_scope_id(self):
         scope = self._make_scope(id="s1")
@@ -1442,9 +1469,7 @@ class TestServiceEnabledRoundTrip:
 
     def test_get_services_surfaces_enabled_value(self, monkeypatch):
         monkeypatch.setenv("AIAC_PDP_CONFIG_URL", BASE)
-        services = [
-            {"id": self.SERVICE_ID, "clientId": self.SERVICE_ID, "name": "my-svc", "enabled": False}
-        ]
+        services = [{"id": self.SERVICE_ID, "clientId": self.SERVICE_ID, "name": "my-svc", "enabled": False}]
         with patch(
             "aiac.idp.configuration.api.requests.get",
             side_effect=[_ok(services), _ok([]), _ok([]), _ok([]), _ok([])],

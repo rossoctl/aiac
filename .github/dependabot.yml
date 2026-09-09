@@ -1,0 +1,41 @@
+version: 2
+updates:
+  # GitHub Actions
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      codeql-action:
+        patterns:
+          - "github/codeql-action/*"
+
+  # Python - AIAC package (pyproject.toml at repo root, uv-managed)
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+
+  # Java - Keycloak SPI event listener (Maven)
+  - package-ecosystem: maven
+    directory: /keycloak-spi
+    schedule:
+      interval: weekly
+
+  # Docker - AIAC service images
+  - package-ecosystem: docker
+    directory: /src/aiac/idp/service/configuration/keycloak
+    schedule:
+      interval: weekly
+  - package-ecosystem: docker
+    directory: /src/aiac/pdp/service/policy/opa
+    schedule:
+      interval: weekly
+  - package-ecosystem: docker
+    directory: /src/aiac/policy/model_store/service
+    schedule:
+      interval: weekly
+  - package-ecosystem: docker
+    directory: /src/aiac/agent/controller
+    schedule:
+      interval: weekly

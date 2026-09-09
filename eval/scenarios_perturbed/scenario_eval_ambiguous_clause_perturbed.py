@@ -27,8 +27,7 @@ AGENTS: dict[str, dict] = {
         ),
         "inbound_scopes": {
             "agent-scope-enrollment-status-access": (
-                "Lets a holder use the registrar agent's current-enrollment-status lookup "
-                "ability."
+                "Lets a holder use the registrar agent's current-enrollment-status lookup ability."
             ),
             "agent-scope-enrollment-history-access": (
                 "Lets a holder use the registrar agent's enrollment-history lookup ability."
@@ -37,8 +36,7 @@ AGENTS: dict[str, dict] = {
         "delegation_scopes": {},
         "roles": {
             "agent-role-registrar-operations": (
-                "Covers looking up a student's current enrollment status and past enrollment "
-                "record."
+                "Covers looking up a student's current enrollment status and past enrollment record."
             ),
         },
     },
@@ -54,8 +52,7 @@ TOOLS: dict[str, dict] = {
         ),
         "scopes": {
             "tool-scope-enrollment-status": (
-                "Look up a student's current enrollment status (enrolled, withdrawn, or on leave). "
-                "No write access."
+                "Look up a student's current enrollment status (enrolled, withdrawn, or on leave). No write access."
             ),
             "tool-scope-enrollment-history": (
                 "Look up a student's past enrollment record across terms, including earlier status "

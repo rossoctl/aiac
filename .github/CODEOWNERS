@@ -1,0 +1,15 @@
+# Default owners for everything
+* @rossoctl/maintainers
+
+# Python AIAC source
+src/aiac/ @rossoctl/maintainers
+
+# Keycloak SPI (Java)
+keycloak-spi/ @rossoctl/maintainers
+
+# CI/CD and GitHub configuration
+.github/ @rossoctl/platform
+
+# Documentation
+*.md @rossoctl/maintainers
+docs/ @rossoctl/maintainers

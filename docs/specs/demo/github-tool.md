@@ -68,7 +68,7 @@ Phase 1 only discovers and evaluates them.
 - Scenario fixture (`TOOL_SCOPES`): [`../../../test/integration/scenario.py`](../../../test/integration/scenario.py)
 - Scenario spec: [`../integration-test/policy-pipeline.md`](../integration-test/policy-pipeline.md)
 - Sibling agent spec: [`github-agent.md`](github-agent.md)
-- Reference deployment: `cortex/authbridge/demos/github-issue/k8s/`
+- Reference deployment: `authbridge/demos/github-issue/k8s/` in the `rossoctl/cortex` repo
 
 ---
 
@@ -140,8 +140,8 @@ answers `tools/list` with the four tools of §3.
   `"stub: not implemented in phase-1 demo"` message). They perform **no** GitHub work. This is
   acceptable because phase 1 drives no live traffic — but the endpoint must still be a **real,
   deployable MCP server** that answers `tools/list`.
-- **Location:** self-contained under `aiac/demo/assets/tools/github_tool/`, mirroring the agent's
-  `aiac/demo/assets/agents/github_agent/` layout. Ships its own `Dockerfile`, dependency manifest, and the
+- **Location:** self-contained under `demo/assets/tools/github_tool/`, mirroring the agent's
+  `demo/assets/agents/github_agent/` layout. Ships its own `Dockerfile`, dependency manifest, and the
   `k8s/` manifests of §7.
 - **Listen:** binds `0.0.0.0` on a container `PORT` (see §5) and serves `/mcp`.
 
@@ -199,7 +199,7 @@ State these explicitly; UC-1 identity resolution depends on all of them holding:
 
 ## 7. Deployment (aiac level)
 
-Manifests live under `aiac/demo/assets/tools/github_tool/k8s/`, adapted from the sibling agent's §7 and the
+Manifests live under `demo/assets/tools/github_tool/k8s/`, adapted from the sibling agent's §7 and the
 github-issue demo's `github-tool-deployment.yaml`. Namespace **`team1`** (installer-provided
 ConfigMaps/secrets assumed present), consistent with the agent spec.
 
@@ -251,7 +251,7 @@ port; the operator-applied pod label is `rossoctl.io/type=tool`; the operator-re
 ## 8. Verification
 
 **Local (no cluster — primary gate):**
-1. `cd aiac/demo/assets/tools/github_tool` and build: `podman build -t github-tool:latest .`.
+1. `cd demo/assets/tools/github_tool` and build: `podman build -t github-tool:latest .`.
 2. Run the container (`-e PORT=9090 -p 9090:9090`), then POST a JSON-RPC `tools/list` to `/mcp` and
    confirm the four tool names:
    ```bash
@@ -296,5 +296,5 @@ port; the operator-applied pod label is `rossoctl.io/type=tool`; the operator-re
   never invoked by `github-agent`.
 - **Any changes to the AIAC pipeline, UC-1, `policy-pipeline.md`, or the integration test** — this tool
   is an input to UC-1 discovery, not a change to it.
-- **Building this tool into `agent-examples` CI** — aiac/demo images build independently (as with the
+- **Building this tool into `agent-examples` CI** — demo images build independently (as with the
   agent spec).

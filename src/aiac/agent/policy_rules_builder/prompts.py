@@ -124,10 +124,7 @@ _PROPOSER_SYSTEM = (
     "You map an access policy to concrete GRANTS. Your primary task is to select the granted "
     "candidates for the focal entity under least-privilege. Only when the scenario policy explicitly "
     "prohibits or restricts access do you also report the prohibited candidates and whether access "
-    "is exclusive; for a purely permissive policy those are empty.\n"
-    + _SAFETY
-    + _MAPPING_RULES
-    + _DENY_RULES
+    "is exclusive; for a purely permissive policy those are empty.\n" + _SAFETY + _MAPPING_RULES + _DENY_RULES
 )
 _AUDITOR_SYSTEM = (
     "You audit a proposed set of grants and prohibitions. Approve only if every granted pair is "
@@ -213,9 +210,9 @@ _EXPLAIN_SYSTEM = (
     "An auditor has already ruled that the policy genuinely BOTH grants and prohibits this pair -- do "
     "NOT re-litigate whether the conflict exists. Your job has three parts.\n"
     "1) CLASSIFY the kind, choosing EXACTLY one:\n"
-    "   - \"direct\": the policy grants and prohibits the SAME capability for this pair -- a head-on "
+    '   - "direct": the policy grants and prohibits the SAME capability for this pair -- a head-on '
     "grant-vs-prohibit collision on the same scope.\n"
-    "   - \"coarse_scope\": a coarse/broad capability is granted while a finer operation it INCLUDES is "
+    '   - "coarse_scope": a coarse/broad capability is granted while a finer operation it INCLUDES is '
     "prohibited (or vice versa) -- a granularity mismatch (e.g. management granted, writing forbidden).\n"
     "2) QUOTE the colliding statements VERBATIM. granting_quotes and prohibiting_quotes are each a list "
     "of one or more EXACT substrings copied character-for-character from the POLICY text below: the "

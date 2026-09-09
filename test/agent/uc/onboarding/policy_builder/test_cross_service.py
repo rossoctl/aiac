@@ -69,9 +69,7 @@ def test_reads_each_distinct_owner_once():
         return _spm(service_id, deny=[_deny(_TESTER, _ISSUES if service_id == "svc-tool" else _SOURCE)])
 
     with patch(f"{_CROSS}.get_service_policy", side_effect=_by_id) as get:
-        applied = applied_rules_for_scopes(
-            [_allow(_TESTER, _ISSUES), _allow(_DEV, _SOURCE), _deny(_DEV, _ISSUES)]
-        )
+        applied = applied_rules_for_scopes([_allow(_TESTER, _ISSUES), _allow(_DEV, _SOURCE), _deny(_DEV, _ISSUES)])
 
     assert sorted(c.args[0] for c in get.call_args_list) == ["svc-other", "svc-tool"]
     assert len(applied) == 2

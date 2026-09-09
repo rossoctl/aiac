@@ -1,12 +1,12 @@
 # Component PRD: IdP Configuration Library (`aiac.idp.configuration`)
 
 ## Location
-`aiac/src/aiac/idp/configuration/`
+`src/aiac/idp/configuration/`
 
 ## Package structure
 
 ```
-aiac/src/aiac/idp/
+src/aiac/idp/
 └── configuration/
     ├── __init__.py     # empty
     ├── models.py       # Subject, Role, Service, Scope
@@ -154,7 +154,7 @@ All Keycloak interactions are consolidated here; the PDP Policy Writer (OPA) doe
 > in the `all_roles` map (built from `GET /roles`, where every role is `kind = User`), discarding the
 > per-service endpoint's authoritative `kind = Agent` / `actorIds`, and it never stamped nested
 > `Scope.serviceId`. It now merges the endpoint's `kind`/`actorIds` and stamps `serviceId` (see
-> `get_services()` below). No client-side *re-derivation* of role kind is introduced — the merged
+> `get_services()` below). No client-side _re-derivation_ of role kind is introduced — the merged
 > `kind` still comes from the service, which remains authoritative. `get_subjects_by_role` stays
 > consistent with a role's `actorIds` (both from the same service-side source). See the per-method
 > audit notes below.
@@ -390,7 +390,7 @@ class Configuration:
 
 ### Configuration
 
-Read from a `.env` file co-located with `api.py` (`aiac/src/aiac/idp/configuration/.env`) via `python-dotenv`. Falls back to the default if the file is absent or the key is not set.
+Read from a `.env` file co-located with `api.py` (`src/aiac/idp/configuration/.env`) via `python-dotenv`. Falls back to the default if the file is absent or the key is not set.
 
 | Variable | Default |
 |----------|---------|

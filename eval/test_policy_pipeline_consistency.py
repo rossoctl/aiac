@@ -62,7 +62,7 @@ def test_prb_consistent_across_repeats(scenario_name: str, monkeypatch: pytest.M
 
     runs = []
     for _ in range(N):
-        rules, _, _ = orchestrate_prb(roles, scopes, scenario)
+        rules, _, _, _ = orchestrate_prb(roles, scopes, scenario)
         runs.append(grant_sets(scenario, rules))
 
     baseline = runs[0]
@@ -72,11 +72,8 @@ def test_prb_consistent_across_repeats(scenario_name: str, monkeypatch: pytest.M
         for run_index, run in enumerate(runs[1:], start=1):
             diff = base_pairs ^ run[gate]
             if diff:
-                mismatches.append(
-                    f"gate={gate} run=0 vs run={run_index}: differing pairs={sorted(diff)}"
-                )
+                mismatches.append(f"gate={gate} run=0 vs run={run_index}: differing pairs={sorted(diff)}")
 
-    assert not mismatches, (
-        f"PRB was inconsistent across {N} repeats for scenario '{scenario_name}':\n"
-        + "\n".join(mismatches)
+    assert not mismatches, f"PRB was inconsistent across {N} repeats for scenario '{scenario_name}':\n" + "\n".join(
+        mismatches
     )

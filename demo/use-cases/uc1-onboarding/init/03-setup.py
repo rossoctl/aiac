@@ -14,7 +14,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 
 import scenario as scn
 import setup_keycloak
-from _lib import connect_admin, ensure_agent_policy, load_config, note, ok, provision_realm_and_users, resolve_service_id, say
+from _lib import (
+    connect_admin,
+    ensure_agent_policy,
+    load_config,
+    note,
+    ok,
+    provision_realm_and_users,
+    resolve_service_id,
+    say,
+)
 
 
 def main() -> None:

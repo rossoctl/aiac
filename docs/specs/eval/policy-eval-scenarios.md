@@ -1,12 +1,12 @@
-# Integration Test: policy-eval-scenarios — `test_policy_pipeline_eval.py` + guardrail tests
+# Eval Spec: policy-eval-scenarios — `test_policy_pipeline_eval.py` + guardrail tests
 
 > **One spec among several.** This document specifies a **family** of integration tests.
-> Integration-test specs live **one spec per test** under `docs/specs/integration-test/`
+> Eval specs live **one spec per test** under `docs/specs/eval/`
 > (a sibling of `components/`), and the master PRD's *Integration test specifications* section
 > ([../PRD.md](../PRD.md)) is the index of them. This is the **policy-eval-scenarios** family — a
 > generalized, multi-scenario evaluation of the identity→policy pipeline — not the definition of
 > integration testing in general, and not the only integration-test PRD. It is a **companion to**,
-> not a replacement for, [policy-pipeline.md](policy-pipeline.md): that test's single-agent/
+> not a replacement for, [policy-pipeline.md](../integration-test/policy-pipeline.md): that test's single-agent/
 > single-tool `github-agent` scenario stays exactly as it is, as a regression baseline, and none of
 > its files (`test_policy_pipeline.py`, `scenario.py`, `probe.rego`, `launcher.py`) are touched by
 > this work.
@@ -15,17 +15,17 @@
 
 Two independent groups of files, split by cost tier:
 
-**Heavy scenarios (1, 3, 4, 6-10) — full pipeline, new marker — under `aiac/eval/`,
+**Heavy scenarios (1, 3, 4, 6-10) — full pipeline, new marker — under `eval/`,
 except `agent_delegation`:**
-- `aiac/eval/test_policy_pipeline_eval.py` — the test module, `@pytest.mark.eval_extended`.
-- `aiac/eval/scenario_eval_baseline.py` (Scenario 1),
+- `eval/test_policy_pipeline_eval.py` — the test module, `@pytest.mark.eval_extended`.
+- `eval/scenario_eval_baseline.py` (Scenario 1),
   `scenario_eval_unreachable_resources.py` (Scenario 4), `scenario_eval_ambiguous_clause.py`
   (Scenario 6), `scenario_eval_wildcard_grant.py` (Scenario 7),
   `scenario_eval_misleading_descriptions.py` (Scenario 8), `scenario_eval_confusable_agents.py`
   (Scenario 9), `scenario_eval_empty_descriptions.py` (Scenario 10) — pure-data scenario modules
   (mirroring `scenario.py`'s shape, generalized to lists/dicts of many entities), each isolating
   exactly one aspect at the minimal entity count that aspect needs.
-- **`aiac/test/integration/scenario_eval_agent_delegation.py`** (Scenario 3) — the one exception:
+- **`test/integration/scenario_eval_agent_delegation.py`** (Scenario 3) — the one exception:
   lives at the **top level** of `test/integration/` (sibling of `launcher.py`/`scenario_uc1.py`),
   not under `eval/` like the other seven. It isolates the agent-to-agent `target_scopes`
   delegation mechanism, which is conceptually closer to the top-level fixed-scenario family than to
@@ -36,19 +36,19 @@ except `agent_delegation`:**
 - A matching `policy.eval_<name>.md` next to each scenario module above — the scenario's policy
   text, read by the PRB via `AIAC_POLICY_FILE` (these **are** load-bearing at runtime, unlike the
   two light-scenario `.md` files below).
-- `aiac/eval/probe_eval.rego` — a generalized outbound probe, parameterized by
+- `eval/probe_eval.rego` — a generalized outbound probe, parameterized by
   `input.agent_id`, serving every agent in every heavy scenario (see
   [Testing Decisions](#testing-decisions)).
-- `aiac/eval/conftest.py` — writes a per-run pass/fail/skip/error report
+- `eval/conftest.py` — writes a per-run pass/fail/skip/error report
   (`reports/report_<DD_MM_HH_MM>.md`, Asia/Jerusalem local time) after every session that
   collects at least one `eval_extended`-marked test (see [Test report](#test-report)).
-- `aiac/test/integration/launcher.py` (unmoved, stays in `test/integration/`) — reused
+- `test/integration/launcher.py` (unmoved, stays in `test/integration/`) — reused
   **unmodified** from `policy-pipeline.md`.
 
 **Light scenarios (2, 5) — PRB-only, existing marker, existing directory:**
-- `aiac/test/agent/policy_rules_builder/test_guardrail_conflicts.py` — Scenario 2.
-- `aiac/test/agent/policy_rules_builder/test_guardrail_injection.py` — Scenario 5.
-- `aiac/test/agent/policy_rules_builder/policy.eval_conflicts.md`,
+- `test/agent/policy_rules_builder/test_guardrail_conflicts.py` — Scenario 2.
+- `test/agent/policy_rules_builder/test_guardrail_injection.py` — Scenario 5.
+- `test/agent/policy_rules_builder/policy.eval_conflicts.md`,
   `policy.eval_injection.md` — **human-readable mirrors only** (see the callout below).
 
 > **These two `.md` files are not read at runtime.** Unlike the eight heavy-scenario `.md` files
@@ -325,7 +325,7 @@ read.
 
 ## Configuration (env)
 
-Same variables as [policy-pipeline.md](policy-pipeline.md#configuration-env) for the heavy
+Same variables as [policy-pipeline.md](../integration-test/policy-pipeline.md#configuration-env) for the heavy
 scenarios (`KEYCLOAK_URL`, `KEYCLOAK_ADMIN_USERNAME`/`PASSWORD`, `AIAC_PDP_CONFIG_URL`,
 `AIAC_POLICY_STORE_URL`, `AIAC_PDP_POLICY_URL`, `AIAC_POLICY_FILE`, `LLM_BASE_URL`/`LLM_MODEL`/
 `LLM_API_KEY`, `OPA_BIN`), with two differences:
@@ -471,7 +471,7 @@ scenarios; the heavy scenarios additionally need Keycloak + `opa`, same discover
 This is **one** integration-test spec (covering ten scenarios across two test modules) among
 several indexed by the master PRD ([../PRD.md](../PRD.md), § *Integration test specifications*).
 
-- **Companion to, not a replacement for, [policy-pipeline.md](policy-pipeline.md).** That test's
+- **Companion to, not a replacement for, [policy-pipeline.md](../integration-test/policy-pipeline.md).** That test's
   fixed `github-agent` scenario remains the reviewable, hand-checkable regression baseline; this
   family generalizes the same pipeline+`opa eval` approach to scale, delegation, ambiguity,
   adversarial input, and the guardrail gap, using new files only.
@@ -539,7 +539,7 @@ several indexed by the master PRD ([../PRD.md](../PRD.md), § *Integration test 
 
 ## Blocked-by
 
-Same pipeline prerequisites as [policy-pipeline.md](policy-pipeline.md#blocked-by) for the heavy
+Same pipeline prerequisites as [policy-pipeline.md](../integration-test/policy-pipeline.md#prerequisites) for the heavy
 scenarios (PRB, PCE, policy model, OPA filesystem stub, Rego package generator, PDP policy library,
 Policy Store) — all resolved. The light scenarios depend only on the PRB entry points
 (`build_role_rules`/`build_scope_rules`) and a live LLM.

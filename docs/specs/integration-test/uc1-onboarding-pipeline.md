@@ -30,7 +30,7 @@
 
 ## Location
 
-`aiac/test/integration/` — pytest modules marked `@pytest.mark.integration`, one per rung
+`test/integration/` — pytest modules marked `@pytest.mark.integration`, one per rung
 (`test_uc1_onboard_agent_only.py`, `test_uc1_onboard_agent_then_tool.py`,
 `test_uc1_onboard_tool_then_agent.py`, `test_uc1_onboard_failure_rollback.py`). Each is a thin module that wraps the shared harness in a
 one-line session fixture and supplies only its own rung's oracle (verdicts computed from
@@ -300,8 +300,8 @@ workloads and enforced by the deployed OPA plugin.
 
 ## Configuration (env)
 
-The suite reads its config from `test/integration/.env` (gitignored); source it before running
-(`set -a; . test/integration/.env; set +a`). The drivers read these:
+The suite reads its config from the repo-root `.env` (gitignored); source it before running
+(`set -a; . .env; set +a`). The drivers read these:
 
 | Variable | Purpose | Default |
 |----------|---------|---------|
@@ -333,7 +333,7 @@ registered** into `AIAC_TEST_REALM`, and a real LLM in-pod. Stand the pipeline u
 
 ```bash
 k8s/opa-kind-enable.sh          # one-time: wire the OPA plugin into both legs of the Kind cluster
-set -a; . test/integration/.env; set +a
+set -a; . .env; set +a
 .venv/bin/pytest test/integration/ -m integration -k uc1_onboard -v
 # A failing node names the exact cell, e.g.:
 #   test_outbound[test-user-source-read] — expected deny, plugin allowed

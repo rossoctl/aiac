@@ -25,7 +25,7 @@ drive real requests + assert → Keycloak cleanup**. Deployment + client registr
 
 Run (needs a live rossoctl/Kind cluster with the AIAC stack + AuthBridge OPA pipeline wired in — see
 ``k8s/opa-kind-runbook.md`` / ``k8s/opa-kind-enable.sh`` — the demo workloads deployed +
-registered into ``AIAC_TEST_REALM``, a real LLM in-pod, and ``test/integration/.env`` sourced):
+registered into ``AIAC_TEST_REALM``, a real LLM in-pod, and ``.env`` sourced):
 
     .venv/bin/pytest test/integration/test_uc1_onboard_agent_only.py -m integration -v
 
@@ -154,8 +154,7 @@ def test_no_tool_scopes_provisioned(onboarded: dict) -> None:
     admin = onboarded["admin"]
     admin.change_current_realm(TEST_REALM)
     tool_scopes = [
-        s["name"] for s in admin.get_client_scopes()
-        if s.get("name", "").startswith(f"{scn.TOOL_WORKLOAD}.")
+        s["name"] for s in admin.get_client_scopes() if s.get("name", "").startswith(f"{scn.TOOL_WORKLOAD}.")
     ]
     assert not tool_scopes, f"unexpected tool scopes provisioned: {tool_scopes}"
 

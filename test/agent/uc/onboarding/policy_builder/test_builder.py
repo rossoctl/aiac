@@ -28,8 +28,8 @@ from aiac.agent.policy_rules_builder.graph import (
     UnparseableLLMResponseError,
 )
 from aiac.agent.uc.onboarding.policy_builder import builder
-from aiac.idp.configuration.models import RoleKind, Scope, Service, ServiceType, Subject
 from aiac.idp.configuration.models import Role as RoleModel
+from aiac.idp.configuration.models import RoleKind, Scope, Service, ServiceType, Subject
 from aiac.policy.model.models import PolicyRule, RuleEffect
 
 FOCUS_ID = "svc-focus"
@@ -216,9 +216,7 @@ class TestFlattening:
     def test_composite_other_role_expanded_to_closure_deduped_by_id(self):
         reader = _role("github.reader", role_id="reader-id", kind=RoleKind.AGENT)
         # composite whose closure includes reader, which also appears standalone
-        admin = _role(
-            "github.admin", role_id="admin-id", composite=True, children=[reader], kind=RoleKind.AGENT
-        )
+        admin = _role("github.admin", role_id="admin-id", composite=True, children=[reader], kind=RoleKind.AGENT)
         own_scope = _scope("weather.forecast", service_id=FOCUS_ID)
         focus = _service(FOCUS_ID, scopes=[own_scope])
         other = _service(OTHER_ID, roles=[admin, reader])
@@ -630,9 +628,7 @@ class TestDoorB:
         tester = _role("tester", kind=RoleKind.USER, aiac_managed=False)
         subject = _subject("tina", roles=[tester])
         tool = _service(FOCUS_ID, scopes=[tool_scope], service_type=ServiceType.TOOL)
-        agent = _service(
-            OTHER_ID, roles=[agent_role], scopes=[agent_scope], service_type=ServiceType.AGENT
-        )
+        agent = _service(OTHER_ID, roles=[agent_role], scopes=[agent_scope], service_type=ServiceType.AGENT)
 
         def run(service_id, service_type):
             result, _, _, _, _ = _invoke(
@@ -800,9 +796,7 @@ class TestCleanRunUnchanged:
         own_scope = _scope("weather.forecast", service_id=FOCUS_ID)
         other_role = _role("github.agent", kind=RoleKind.AGENT)
         other_scope = _scope("github.issue", service_id=OTHER_ID)
-        focus = _service(
-            FOCUS_ID, roles=[own_role], scopes=[own_scope], service_type=ServiceType.AGENT
-        )
+        focus = _service(FOCUS_ID, roles=[own_role], scopes=[own_scope], service_type=ServiceType.AGENT)
         other = _service(OTHER_ID, roles=[other_role], scopes=[other_scope])
         scope_rule = _rule(other_role, own_scope)
         role_rule = _rule(own_role, other_scope)

@@ -1,6 +1,6 @@
 # AIAC Codebase Guide
 
-All paths below are relative to `cortex/aiac/`.
+All paths below are relative to the repository root.
 
 ## Requirements / PRD docs
 
@@ -46,14 +46,6 @@ ls src/aiac/<subsystem>/               # drill into any layer
 .venv/bin/pytest test/
 ```
 
-`pyproject.toml`'s `addopts` defaults `-m` to excluding every live-infra marker
-(`integration`, `eval_extended`, `eval_consistency`,
-`eval_robustness`), so a bare invocation never makes a real LLM/Keycloak
-call. The whole `test/` tree collects and runs green — no `--ignore` flags are
-needed. (This wasn't always true: the Policy Computation Engine was migrated to
-the SPM store surface in Wave 3, which resolved the earlier PCE-chain collection
-failures.)
-
 The `-m "not integration"` expression needs no external services. The live-LLM
 PRB suite (below) is marked **both** `integration` and `llm` — `integration`
 because it calls a real LLM endpoint, so `-m "not integration"` already deselects
@@ -73,7 +65,7 @@ reuses the same `LLM_BASE_URL` / `LLM_MODEL` / `LLM_API_KEY` env as the
 integration suite and **skips cleanly** when they are unset. Run it opt-in:
 
 ```bash
-set -a; . test/integration/.env; set +a   # or export LLM_BASE_URL / LLM_MODEL / LLM_API_KEY
+set -a; . .env; set +a   # or export LLM_BASE_URL / LLM_MODEL / LLM_API_KEY
 .venv/bin/pytest test/ -m llm
 ```
 
@@ -85,26 +77,16 @@ into both legs** (the demo `github-agent`/`github-tool` deployed + registered), 
 creds and an LLM endpoint for onboarding. Stand the pipeline up with `k8s/opa-kind-enable.sh`;
 the full prerequisites, wiring, and manual probe commands are in `k8s/opa-kind-runbook.md`, and the
 per-loop shape is documented in `test/integration/uc1_onboard.py`. Config lives in
-`test/integration/.env` (gitignored): `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL`, `KEYCLOAK_URL`,
+the repo-root `.env` (gitignored): `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL`, `KEYCLOAK_URL`,
 `KEYCLOAK_ADMIN_USERNAME`, `KEYCLOAK_ADMIN_PASSWORD`. Source it before running:
 
 ```bash
 k8s/opa-kind-enable.sh          # one-time: wire the OPA plugin into the Kind cluster
-set -a; . test/integration/.env; set +a
+set -a; . .env; set +a
 .venv/bin/pytest test/integration/ -m integration
 ```
 
 When the cluster is not wired or the env is unset, the suite **skips cleanly** (it never false-passes).
-
-A passed `-m` always overrides the default, so this opts back into exactly
-`integration` (not the heavier markers below). Three heavier, narrower-infra
-markers exist alongside it — `eval_extended` (same live infra as
-`integration`, many more PRB/LLM calls), `eval_consistency` and
-`eval_robustness` (LLM only, no Keycloak/`opa`) — each invoked the same
-way, e.g. `pytest eval/ -m eval_extended`. See
-`docs/specs/eval/policy-eval-scenarios.md` and
-`docs/specs/eval/policy-eval-robustness-consistency.md` for their
-runbooks.
 
 **Smoke test** (requires live service at `AIAC_PDP_CONFIG_URL`, default `http://127.0.0.1:7071`):
 
@@ -116,10 +98,10 @@ Exercises all `Configuration` methods — run `ls test/idp/configuration/` to se
 
 ## Python environment
 
-Virtual environment: `cortex/aiac/.venv`
+Virtual environment: `.venv`
 
-Activate: `source cortex/aiac/.venv/bin/activate`
-Run directly: `cortex/aiac/.venv/bin/python` / `cortex/aiac/.venv/bin/pytest`
+Activate: `source .venv/bin/activate`
+Run directly: `.venv/bin/python` / `.venv/bin/pytest`
 
 Always use this venv for any Python execution, test runs, or dependency checks.
 

@@ -1,0 +1,304 @@
+# Security Scans - Comprehensive security checks
+#
+# Jobs:
+# - Dependency Review (private repo: needs Advanced Security -> gated)
+# - Shellcheck (shell scripts)
+# - YAML Lint (workflows)
+# - Bandit (Python security)
+# - Hadolint (Dockerfiles)
+# - Trivy (filesystem + IaC)
+# - CodeQL (Python + Java; private repo: needs Advanced Security -> gated)
+# - Action Pinning (informational)
+#
+# NOTE: lab-aiac is a PRIVATE repo. CodeQL and dependency-review require GitHub
+# Advanced Security on private repos, so those jobs are gated on the repo being
+# public. They self-activate if the repo is ever made public.
+#
+name: Security Scans
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  dependency-review:
+    name: Dependency Review
+    runs-on: ubuntu-latest
+    # Needs the Dependency Review API (Advanced Security on private repos).
+    if: ${{ !github.event.repository.private }}
+    # TODO: Remove continue-on-error after enabling Dependency Graph in
+    # repo Settings > Code security and analysis
+    continue-on-error: true
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Dependency Review
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294  # v4
+        with:
+          fail-on-severity: moderate
+          deny-licenses: GPL-3.0, AGPL-3.0
+          comment-summary-in-pr: never
+          # CVE-2026-45829 / GHSA-f4j7-r4q5-qw2c (chromadb, transitive via langchain/crewai):
+          # no patched version exists (affected <= 1.5.9). Exploitation requires running a
+          # chromadb HTTP server with trust_remote_code=true, which AIAC does not do.
+          allow-ghsas: GHSA-f4j7-r4q5-qw2c
+
+  shellcheck:
+    name: Shell Script Lint
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Install shellcheck
+        run: sudo apt-get install -y shellcheck
+
+      - name: Run shellcheck
+        run: |
+          SCRIPTS=$(find . -name "*.sh" -type f 2>/dev/null | grep -v ".git/" || true)
+          if [ -z "$SCRIPTS" ]; then
+            echo "No shell scripts found"
+            exit 0
+          fi
+          echo "Found scripts:"
+          echo "$SCRIPTS"
+          echo ""
+          FAILED=0
+          for script in $SCRIPTS; do
+            echo "Checking: $script"
+            if ! shellcheck --severity=error "$script"; then
+              FAILED=1
+            fi
+          done
+          if [ $FAILED -eq 1 ]; then
+            echo "ERROR: Some scripts have shellcheck errors."
+            exit 1
+          fi
+          echo "All scripts passed shellcheck (error level)"
+
+  yamllint:
+    name: YAML Lint
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Install yamllint
+        run: pip install yamllint==1.*
+
+      - name: Create config
+        run: |
+          cat > .yamllint.yaml << 'EOF'
+          extends: relaxed
+          rules:
+            line-length:
+              max: 150
+              level: warning
+            truthy:
+              check-keys: false
+            document-start: disable
+            comments:
+              min-spaces-from-content: 1
+            indentation:
+              spaces: 2
+              indent-sequences: whatever
+          EOF
+
+      - name: Lint YAML files
+        run: |
+          yamllint -c .yamllint.yaml \
+            .github/workflows/ || true
+          echo ""
+          echo "=== Summary ==="
+          yamllint -c .yamllint.yaml -f parsable \
+            .github/workflows/ > /tmp/yamllint_output.txt 2>&1 || true
+          ERROR_COUNT=$(grep -c ":error:" /tmp/yamllint_output.txt 2>/dev/null || echo "0")
+          echo "Errors: $ERROR_COUNT"
+          if [ "$ERROR_COUNT" -gt 0 ] 2>/dev/null; then
+            echo "ERROR: YAML files have syntax errors."
+            exit 1
+          fi
+
+  bandit:
+    name: Python Security (Bandit)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Install Bandit
+        run: pip install 'bandit[toml]==1.*'
+
+      - name: Run Bandit security scan
+        run: |
+          echo "=== Bandit Python Security Scan ==="
+          # Scan the AIAC Python source and tests
+          PYTHON_DIRS=""
+          for dir in src test; do
+            if [ -d "$dir" ]; then
+              PYTHON_DIRS="$PYTHON_DIRS $dir"
+            fi
+          done
+          if [ -z "$PYTHON_DIRS" ]; then
+            echo "No Python directories found"
+            exit 0
+          fi
+          echo "Scanning:$PYTHON_DIRS"
+          echo ""
+
+          # HIGH severity blocks the build
+          HIGH_ISSUES=$(bandit -r $PYTHON_DIRS \
+            --severity-level high \
+            --confidence-level high \
+            --exclude '**/test/*,**/tests/*,**/.venv/*' \
+            -f json 2>/dev/null | jq '.results | length' 2>/dev/null || echo "0")
+
+          if [ "$HIGH_ISSUES" -gt 0 ]; then
+            echo "Found $HIGH_ISSUES HIGH severity issues:"
+            bandit -r $PYTHON_DIRS \
+              --severity-level high \
+              --confidence-level high \
+              --exclude '**/test/*,**/tests/*,**/.venv/*' \
+              -f txt
+            exit 1
+          fi
+
+          # Informational scan
+          echo "--- Full scan (informational) ---"
+          bandit -r $PYTHON_DIRS \
+            --severity-level medium \
+            --confidence-level medium \
+            --exclude '**/test/*,**/tests/*,**/.venv/*' \
+            -f txt || true
+
+  hadolint:
+    name: Dockerfile Lint (Hadolint)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Find Dockerfiles
+        id: find-dockerfiles
+        run: |
+          DOCKERFILES=$(find . -name "Dockerfile*" -type f 2>/dev/null | grep -v ".git/" || true)
+          if [ -z "$DOCKERFILES" ]; then
+            echo "has_dockerfiles=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Found Dockerfiles:"
+            echo "$DOCKERFILES"
+            echo "has_dockerfiles=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run Hadolint
+        if: steps.find-dockerfiles.outputs.has_dockerfiles == 'true'
+        uses: hadolint/hadolint-action@06be81baf89a55ffd0e24b8f04a4185738dd3387  # v3.5.0
+        with:
+          dockerfile: "**/Dockerfile*"
+          recursive: true
+          failure-threshold: error
+          # DL3007: Using latest tag, DL3008/DL3013/DL3018: Unpinned packages
+          # DL3015: No --no-install-recommends, DL3059: Multiple consecutive RUN
+          # DL3002: Last USER is root (pre-existing), DL3062: Unversioned go install
+          ignore: DL3002,DL3007,DL3008,DL3013,DL3015,DL3018,DL3059,DL3062
+
+  trivy-fs:
+    name: Trivy Filesystem Scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Dependency vulnerability scan (informational)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '0'
+          ignore-unfixed: true
+          format: 'table'
+
+      - name: IaC config scan (informational)
+        # Informational until pre-existing K8s security issues are addressed
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
+        with:
+          scan-type: 'config'
+          scan-ref: '.'
+          severity: 'CRITICAL,HIGH,MEDIUM'
+          exit-code: '0'
+          format: 'table'
+
+  codeql:
+    name: CodeQL Analysis (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    # CodeQL on private repos needs GitHub Advanced Security. Self-activates
+    # if lab-aiac is made public.
+    if: ${{ !github.event.repository.private }}
+    permissions:
+      security-events: write
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [python, java-kotlin]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Set up Java
+        if: matrix.language == 'java-kotlin'
+        uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c  # v6.0.0
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@cdf488f595d80d6e07e03d4674febd5ab45fa938  # v4
+        with:
+          languages: ${{ matrix.language }}
+          config-file: ./.github/codeql/codeql-config.yml
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@cdf488f595d80d6e07e03d4674febd5ab45fa938  # v4
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@cdf488f595d80d6e07e03d4674febd5ab45fa938  # v4
+        with:
+          category: "/language:${{ matrix.language }}"
+
+  action-pinning:
+    name: Verify Action Pinning
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Check for unpinned GitHub Actions
+        run: |
+          echo "=== Checking for unpinned GitHub Actions ==="
+          UNPINNED=$(grep -rh 'uses:' .github/workflows/ | grep -E 'uses:.*@' | grep -vE '@[0-9a-f]{40}' | sort -u || true)
+          if [ -n "$UNPINNED" ]; then
+            echo "::warning::Found actions not pinned to SHA commits:"
+            echo "$UNPINNED"
+            COUNT=$(echo "$UNPINNED" | wc -l | tr -d ' ')
+            echo "Total unpinned actions: $COUNT"
+            echo "NOTE: This check is informational."
+          else
+            echo "All actions are pinned to SHA commits!"
+          fi
+          exit 0

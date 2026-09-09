@@ -41,8 +41,7 @@ AGENTS: dict[str, dict] = {
         "delegation_scopes": {},
         "roles": {
             "agent-role-intake-operations": (
-                "Covers read and write access to patient records — reading and updating patient "
-                "record contents."
+                "Covers read and write access to patient records — reading and updating patient record contents."
             ),
         },
     },

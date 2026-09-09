@@ -318,7 +318,7 @@ All inter-pod traffic is Kubernetes ClusterIP. External access is exclusively vi
 - **NATS consumer is a thin adapter.** It receives events from the Event Broker and calls the same internal handler functions used by the debug HTTP endpoints. No business logic lives in the consumer.
 - **Agent HTTP endpoints are retained for debugging.** They are not the primary trigger path; the NATS consumer is. `kubectl port-forward` to the Agent is used only for `rebuild` and debugging.
 - **Event Broker uses WorkQueuePolicy.** Messages are removed from the stream after acknowledgement. Unacknowledged messages survive Agent pod restarts and are redelivered automatically. After 5 failed deliveries, messages are routed to `aiac.apply.dlq`.
-- **AIAC init container gates Agent startup.** Before the Agent container starts, the init container waits for NATS, IdP Configuration Service, PDP Policy Writer, and RAG Ingest Service to be healthy, then creates the `aiac-events` JetStream stream idempotently. _(Deferred to Phase 2 — issue 4.21; the Phase 1 Agent pod runs without it.)_
+- **AIAC init container gates Agent startup.** Before the Agent container starts, the init container waits for NATS, IdP Configuration Service, PDP Policy Writer, and RAG Ingest Service to be healthy, then creates the `aiac-events` JetStream stream idempotently. *(Deferred to Phase 2 — issue 4.21; the Phase 1 Agent pod runs without it.)*
 - **All `__init__.py` files under `aiac.*` are empty.** Callers use explicit submodule paths: `from aiac.idp.configuration.models import Subject`, `from aiac.policy.model.models import PolicyModel`.
 - **ChromaDB hosts two collections: `aiac-policies` and `aiac-domain-knowledge`.** Collection slug to ChromaDB name mapping: `policy` → `aiac-policies`, `domain-knowledge` → `aiac-domain-knowledge`.
 - **`user/{id}` trigger not implemented.** OPA rules are role-scoped; individual user creation/update does not require agent intervention — OPA rule evaluation resolves entitlements from the caller's role automatically.
@@ -382,7 +382,7 @@ The PCE is the **single point of coordination** between the Policy Model Store a
 
 ### 7.5 Library
 
-Python package at `aiac/src/`. Clean `idp` / `pdp` / `policy` namespace split:
+Python package at `src/`. Clean `idp` / `pdp` / `policy` namespace split:
 
 **IdP library** (Keycloak entity management):
 - **`aiac.idp.configuration.models`** — dependency-free Pydantic models for IdP entities (`Subject`, `Role`, `Service`, `Scope`). Plain pydantic models with default field-based equality; not hashable and not used as dict keys.
@@ -474,11 +474,11 @@ Four separate manifest files:
 
 | File | Contents |
 |------|----------|
-| `aiac/k8s/pdp-interface-deployment.yaml` | `aiac-pdp-config` ConfigMap + Rossoctl Interface Pod Deployment (IdP Configuration Service container + PDP Policy Writer container) + two ClusterIP Services (`aiac-pdp-config-service:7071`, `aiac-pdp-policy-service:7072`) |
-| `aiac/k8s/policy-model-store-statefulset.yaml` | `aiac-policy-model-store` StatefulSet (Policy Model Store container) + `volumeClaimTemplate` (1 Gi, `ReadWriteOnce`, mounted at `/data`) + headless Service + `aiac-policy-model-store-service:7074` ClusterIP Service |
-| `aiac/k8s/agent-deployment.yaml` | Agent Pod Deployment (AIAC Agent container) + ClusterIP Service _(Phase 1; `aiac-init` init container added in Phase 2, issue 4.21)_ |
-| `aiac/k8s/event-broker-deployment.yaml` _(pending)_ | Event Broker Pod Deployment (NATS JetStream) + ClusterIP Service |
-| `aiac/k8s/rag-statefulset.yaml` _(pending)_ | RAG StatefulSet (ChromaDB + RAG Ingest Service + Policy Guardrails Agent containers) + 1 Gi PVC template + ClusterIP Service (ChromaDB + RAG Ingest Service ports only — the Policy Guardrails Agent is pod-local, not on the ClusterIP Service) |
+| `k8s/pdp-interface-deployment.yaml` | `aiac-pdp-config` ConfigMap + Rossoctl Interface Pod Deployment (IdP Configuration Service container + PDP Policy Writer container) + two ClusterIP Services (`aiac-pdp-config-service:7071`, `aiac-pdp-policy-service:7072`) |
+| `k8s/policy-model-store-statefulset.yaml` | `aiac-policy-model-store` StatefulSet (Policy Model Store container) + `volumeClaimTemplate` (1 Gi, `ReadWriteOnce`, mounted at `/data`) + headless Service + `aiac-policy-model-store-service:7074` ClusterIP Service |
+| `k8s/agent-deployment.yaml` | Agent Pod Deployment (AIAC Agent container) + ClusterIP Service *(Phase 1; `aiac-init` init container added in Phase 2, issue 4.21)* |
+| `k8s/event-broker-deployment.yaml` *(pending)* | Event Broker Pod Deployment (NATS JetStream) + ClusterIP Service |
+| `k8s/rag-statefulset.yaml` *(pending)* | RAG StatefulSet (ChromaDB + RAG Ingest Service + Policy Guardrails Agent containers) + 1 Gi PVC template + ClusterIP Service (ChromaDB + RAG Ingest Service ports only — the Policy Guardrails Agent is pod-local, not on the ClusterIP Service) |
 
 Both Interface Pod containers mount `aiac-pdp-config` (KEYCLOAK_URL, KEYCLOAK_REALM, KEYCLOAK_ADMIN_REALM) as env vars; only the IdP Configuration Service container also mounts `keycloak-admin-secret` (KEYCLOAK_ADMIN_USERNAME, KEYCLOAK_ADMIN_PASSWORD) and uses `KEYCLOAK_ADMIN_REALM` (ignoring `KEYCLOAK_REALM`). The PDP Policy Writer (`aiac-pdp-policy-opa`, the Phase 1 rego-file mock) needs no Keycloak credentials — it writes `.rego` files to `REGO_OUTPUT_DIR` (default `/rego`, an `emptyDir` volume). The Policy Model Store container mounts `aiac-policy-model-store-config` for `SERVICEPOLICY_DB_PATH` (default `/data/policy_model.db`) — no Kubernetes API access or RBAC required.
 
@@ -488,16 +488,16 @@ Built independently. No entry in the repo's `build.yaml` CI matrix.
 
 ```bash
 # Build IdP Configuration Service (Rossoctl Interface Pod container 1)
-docker build -f aiac/src/aiac/idp/service/configuration/keycloak/Dockerfile -t aiac-pdp-config:latest aiac/src/
+docker build -f src/aiac/idp/service/configuration/keycloak/Dockerfile -t aiac-pdp-config:latest src/
 
 # Build PDP Policy Writer — Phase 1 OPA rego-file mock (Rossoctl Interface Pod container 2; writes .rego to filesystem)
-docker build -f aiac/src/aiac/pdp/service/policy/opa/Dockerfile -t aiac-pdp-policy-opa:latest aiac/src/
+docker build -f src/aiac/pdp/service/policy/opa/Dockerfile -t aiac-pdp-policy-opa:latest src/
 
 # Build Policy Model Store (deployed as StatefulSet aiac-policy-model-store)
-docker build -f aiac/src/aiac/policy/model_store/service/Dockerfile -t aiac-policy-model-store:latest aiac/src/
+docker build -f src/aiac/policy/model_store/service/Dockerfile -t aiac-policy-model-store:latest src/
 
 # Build Agent (aiac-init init container deferred to Phase 2, issue 4.21)
-docker build -f aiac/src/aiac/agent/controller/Dockerfile -t aiac-agent:latest aiac/src/
+docker build -f src/aiac/agent/controller/Dockerfile -t aiac-agent:latest src/
 
 # Build RAG Ingest Service
 docker build -t aiac-rag-ingest:latest aiac/rag-ingest/
@@ -548,7 +548,7 @@ Update `KEYCLOAK_URL` and `KEYCLOAK_REALM` for the target environment before app
 
 ## 9. Testing
 
-Tests live in `aiac/test/`.
+Tests live in `test/`.
 
 ### Unit tests
 
@@ -599,6 +599,8 @@ Beyond the marker-gated pytest tests above, individual integration tests are spe
 | `uc1-onboarding-pipeline` — a **ladder** of UC-1 onboarding tests | Discovery-driven sibling of `policy-pipeline` validating the **phase-1** deliverable against **one** in-cluster AIAC stack (OPA filesystem-stub writer, single abstract `policy.md`): with `github-agent` + a simplified `github-tool` **already deployed and registered** as Keycloak clients, three gradual rungs drive **real UC-1 onboarding** (`POST /apply/service/{id}`) — agent-only, agent→tool, tool→agent — and assert the generated Rego with `opa eval` (verdicts from `scenario_uc1.py`). Rungs 2/3 assert onboarding-**order-independence**. A fourth two-policy rung is **deferred** (two-stack topology discarded). Same scenario facts/tables as `policy-pipeline`; Rego semantically similar (not byte-identical). `@pytest.mark.integration`. | [integration-test/uc1-onboarding-pipeline.md](integration-test/uc1-onboarding-pipeline.md) |
 | `policy-eval-scenarios` — `test_policy_pipeline_eval.py` + guardrail tests | Generalized evaluation suite extending `policy-pipeline`'s single-agent/single-tool proof to ten scenarios: baseline-scale (many entities, names decoupled from roles, one agent→agent delegation grant), missing-details (emergent unreachability/zero-access under deny-by-default, a broad-sounding clause narrowed by an explicit qualifier, wildcard-grant expansion), adversarial-authoring (misleading names/descriptions, an identity/boundary-confusion probe, empty descriptions), and ambiguous-and-contradictory / adversarial-injection-and-edge-cases (whole-document `xfail` checks against the PRB directly, no Keycloak or `opa`). The eight heavy scenarios (`@pytest.mark.eval_extended`, scenario modules under `eval/scenarios/` except `agent_delegation`) assert full per-cell `opa eval` truth tables; the two light scenarios (`@pytest.mark.integration`) assert PRB-level rejection. | [eval/policy-eval-scenarios.md](eval/policy-eval-scenarios.md) |
 | `policy-eval-robustness-consistency` — `test_policy_pipeline_consistency.py` + `test_policy_pipeline_robustness.py` | Companion to `policy-eval-scenarios`, reusing its 8-scenario corpus to check the PRB's raw grant decisions (no OPA/PCE/k8s) for **consistency** (`@pytest.mark.eval_consistency`: N repeated runs on the same input, exact grant-set equality) and **robustness** (`@pytest.mark.eval_robustness`: mechanical text/order perturbation + a hand-reworded semantic-sibling corpus under `eval/scenarios_perturbed/`, both checked against the truth-table oracle). No Keycloak/`opa` needed — only `LLM_BASE_URL`/`LLM_MODEL`/`LLM_API_KEY`. | [eval/policy-eval-robustness-consistency.md](eval/policy-eval-robustness-consistency.md) |
+| `policy-eval-correctness-prb` — `test_policy_pipeline_correctness_prb.py` | Companion to `policy-eval-scenarios`/`policy-eval-robustness-consistency`, reusing the same 8-scenario corpus to score the PRB's raw grant/deny output (no OPA/PCE/k8s) against each scenario's truth table via a reusable, effect-aware scorer (`eval/correctness_scorer.py`): precision and recall tracked separately per gate and aggregated, plus a non-gating denial-precision figure for explicit `Deny` rules. `@pytest.mark.eval_correctness_prb`, zero-tolerance over-grant gate; under-grants/incorrect denials reported only. No Keycloak/`opa` needed — only `LLM_BASE_URL`/`LLM_MODEL`/`LLM_API_KEY`. | [eval/policy-eval-correctness-prb.md](eval/policy-eval-correctness-prb.md) |
+| `policy-eval-correctness-e2e` — `test_policy_pipeline_correctness_e2e.py` | Companion to `policy-eval-correctness-prb`, scoring the same 8-scenario corpus and the same reusable scorer one layer further downstream: real Keycloak provisioning → real Policy Rules Builder → real Policy Computation Engine → real `opa eval` against the rendered Rego, sourced from the rendered data maps (`subject_role_allow/deny_scopes`, `agent_role_scopes`) rather than per-pair decision probing. `@pytest.mark.eval_correctness_e2e`, same zero-tolerance over-grant gate. The shared `pipeline` fixture (`eval/test_policy_pipeline_eval.py`, also used by `eval_extended`) now provisions all 8 scenarios concurrently via `ProcessPoolExecutor`. Needs `KEYCLOAK_URL` + admin creds + `LLM_BASE_URL`/`LLM_MODEL`/`LLM_API_KEY`, plus `opa` on `PATH`. | [eval/policy-eval-correctness-e2e.md](eval/policy-eval-correctness-e2e.md) |
 
 Tracking issues: the live-Keycloak pytest integration tests in `testing/5.1-integration-tests.md`; the PDP Policy Writer integration test in `testing/5.2-pdp-writer-integration-test.md`; the policy-pipeline integration test in `testing/5.3-policy-pipeline-integration-test.md`; the UC-1 onboarding pipeline integration-test ladder in `testing/5.4-uc1-onboarding-integration-test.md` (epic) with rungs `testing/5.4.1`/`5.4.2`/`5.4.3` and the deferred two-policy `testing/5.4.4`.
 

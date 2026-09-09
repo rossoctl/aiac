@@ -39,7 +39,7 @@
 # was minted for (the last delegation hop's target audience — here the
 # github-tool SPIFFE ID). input.mcp.params.name is the specific tool invoked, so
 # the rule gates PER TOOL. The maps key on the actual MCP tool names exposed by
-# the deployed github-tool (aiac/demo/assets/tools/github_tool): source-read,
+# the deployed github-tool (demo/assets/tools/github_tool): source-read,
 # source-write, issues-read, issues-write. MCP methods that invoke no specific
 # tool (e.g. a `tools/list` discovery request) carry no params.name, so they
 # never match and are denied.
@@ -142,7 +142,7 @@ spec:
             "dev-user": ["developer"],
             "test-user": ["tester"]
         }
-        # The deployed github-tool (aiac/demo/assets/tools/github_tool) exposes
+        # The deployed github-tool (demo/assets/tools/github_tool) exposes
         # exactly four MCP tools — source-read, source-write, issues-read,
         # issues-write — one per skill. These names ARE the values that arrive in
         # input.mcp.params.name when a specific tool is invoked, so the maps
@@ -221,7 +221,7 @@ spec:
 # rule gates PER TOOL: it allows only when the delegated user's role AND the
 # target service both admit the invoked tool. The `subject_role_scopes` /
 # `target_scopes` maps below are keyed by the actual MCP tool names exposed by
-# the deployed github-tool (aiac/demo/assets/tools/github_tool): `source-read`,
+# the deployed github-tool (demo/assets/tools/github_tool): `source-read`,
 # `source-write`, `issues-read`, `issues-write`. Note that MCP methods which do
 # not invoke a specific tool (e.g. a `tools/list` discovery request) carry no
 # `params.name`, so they never match and are denied.
@@ -250,6 +250,7 @@ spec:
 # rossoctl-realm tokens carry the username in `sub` (via a username->sub
 # protocol mapper on the `rossoctl` client — see A.1 in opa-kind-runbook.md,
 # already applied cluster-wide).
+---
 apiVersion: agent.rossoctl.dev/v1alpha1
 kind: AuthorizationPolicy
 metadata:
@@ -305,7 +306,7 @@ spec:
             "dev-user": ["developer"],
             "test-user": ["tester"]
         }
-        # The deployed github-tool (aiac/demo/assets/tools/github_tool) exposes
+        # The deployed github-tool (demo/assets/tools/github_tool) exposes
         # exactly four MCP tools — source-read, source-write, issues-read,
         # issues-write — one per skill. These names ARE the values that arrive in
         # input.mcp.params.name when a specific tool is invoked, so the maps

@@ -7,7 +7,7 @@
 > test — not the definition of integration testing in general, and not the only integration-test PRD.
 
 ## Location
-`aiac/test/pdp/policy/generate_rego.py`
+`test/pdp/policy/generate_rego.py`
 
 ## Description
 

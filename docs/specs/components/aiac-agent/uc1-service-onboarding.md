@@ -258,7 +258,7 @@ therefore receives already-flattened roles, and the PCE performs no further flat
 ## File structure
 
 ```
-aiac/src/aiac/agent/uc/
+src/aiac/agent/uc/
 └── onboarding/
     ├── orchestrator.py
     ├── provision/
