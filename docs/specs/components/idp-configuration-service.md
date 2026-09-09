@@ -175,7 +175,7 @@ Under the SPM/APM policy-model redesign the Policy Computation Engine (PCE) perf
 **Assumption 3 — an agent's role is a Keycloak _client role_ (or an `aiac.managed` _realm role_ assigned to the agent's service account); a user's role is a plain Keycloak _realm role_.** In Keycloak a `RoleRepresentation` carries `clientRole: bool` and `containerId` (the client UUID for client roles, the realm id for realm roles). An agent role therefore has **two** valid representations — a client role on the agent's client, or an `aiac.managed` realm role held by the agent's service account (the provisioning path) — and both are classified `kind = Agent`; only a realm role **not** owned by any service account is a `kind = User` role. This service holds the invariant end-to-end:
 
 - **Agent roles.** `GET /services/{service_id}/roles` returns an agent's own roles (`R_A`) from two sources: the client's client roles (`admin.get_client_roles`, `clientRole == true`), **and** the `aiac.managed` realm roles assigned to the service account (the provisioning path the `Configuration` library uses). Both are surfaced as `kind = Agent` owned by this service — see the endpoint description and its Redesign note above.
-- **User roles are realm roles.** `GET /roles` continues to read realm-level roles (`kind = User`), excluding the Keycloak-generated `default-roles-<realm>` composite (exact-name match). That composite is the *only* path to Keycloak's built-ins (`offline_access`, `uma_authorization`, `view-profile`, the `account` client roles) — no user holds them directly — so dropping it keeps AIAC policy free of Keycloak built-ins without a per-name blocklist.
+- **User roles are realm roles.** `GET /roles` continues to read realm-level roles (`kind = User`), excluding the Keycloak-generated `default-roles-<realm>` composite (exact-name match). That composite is the _only_ path to Keycloak's built-ins (`offline_access`, `uma_authorization`, `view-profile`, the `account` client roles) — no user holds them directly — so dropping it keeps AIAC policy free of Keycloak built-ins without a per-name blocklist.
 
 **Field population** (in the Keycloak → generic-model mapping layer, from the raw facts above):
 
@@ -187,7 +187,7 @@ Under the SPM/APM policy-model redesign the Policy Computation Engine (PCE) perf
 
 **Fail-loud enforcement at this boundary** (detectable here via membership queries; do not silently pick a side):
 
-- **Assumption 1 — no cross-kind role.** A role held by *both* human users and agent service accounts cannot be represented by a single `actorIds` list. On violation, **raise/log** rather than choosing one kind.
+- **Assumption 1 — no cross-kind role.** A role held by _both_ human users and agent service accounts cannot be represented by a single `actorIds` list. On violation, **raise/log** rather than choosing one kind.
 - **Assumption 2 — single scope owner.** `get_services_by_scope` returns `list[Service]` (Keycloak client scopes are realm-level and assignable to many clients). For **AIAC-managed** scopes (see the `aiac.managed` marker above) that list must have length 1; if Keycloak reports multiple owners, that is an invariant violation → **raise/log**.
 
 ## Configuration

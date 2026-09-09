@@ -143,20 +143,7 @@ Each package begins with `import rego.v1`. The names never contain a slug: the `
 **`identity_ref` drives the CR metadata, not a package name (Q3).** `identity_ref(agent_id) -> (namespace, name)` accepts a SPIFFE URI (`spiffe://<trust-domain>/ns/<ns>/sa/<name>`) or a plain `<ns>/<name>` clientId, validates both segments as DNS-1123 labels (`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`, ≤63 chars), and returns the `(namespace, name)` used for the CR's `metadata`. There is **no** fallback — a bare `github-agent` (no derivable namespace) or an invalid label raises `ValueError` (→ 400). This function replaces the former per-package slug: it feeds `metadata`, never a package name.
 
 > **Two identifiers, two layers (no contradiction).** UC-1 onboarding and the Trigger use the internal Keycloak **client UUID** (`service.id` / `Trigger.entity_id`) purely to *look up* a service in the IdP — that UUID **never reaches this writer**. What flows down the policy pipeline into `PolicyRule.scope.serviceId` / `Role.actorIds` and lands as `AgentPolicyModel.agent_id` is the **clientId** (the `<ns>/<name>` / SPIFFE form), which `identity_ref` maps to the CR's `(namespace, name)`. The UUID→clientId resolution happens once, in the IdP Configuration Service, before the AgentPolicyModel is ever built.
-> **Two identifiers, two layers (no contradiction).** UC-1 onboarding and the Trigger use the internal Keycloak **client UUID** (`service.id` / `Trigger.entity_id`) purely to *look up* a service in the IdP — that UUID **never reaches this writer**. What flows down the policy pipeline into `PolicyRule.scope.serviceId` / `Role.actorIds` and lands as `AgentPolicyModel.agent_id` is the **clientId** (the `<ns>/<name>` / SPIFFE form), which `identity_ref` maps to the CR's `(namespace, name)`. The UUID→clientId resolution happens once, in the IdP Configuration Service, before the AgentPolicyModel is ever built.
 
-### Live plugin input shape (Q4)
-
-The Rego packages evaluate the `input` document the live AuthBridge OPA plugin populates — never IDs-plus-roles supplied per request. The fields the packages read:
-
-| Input field | Meaning | Tier |
-|-------------|---------|------|
-| `input.identity.subject` | The delegated end-user id (JWT `sub`) | inbound + outbound |
-| `input.identity.client_id` | The calling client — the inbound source | inbound |
-| `input.identity.service_id` | The downstream target audience the exchanged token was minted for — a **full SPIFFE id** | outbound |
-| `input.mcp.params.name` | The **bare** invoked MCP tool name (e.g. `source-read`) | outbound |
-
-On the outbound leg there is no validated JWT; the plugin synthesizes `input.identity` from the token-exchange delegation hop. A **missing** `input.mcp.params.name` (e.g. a `tools/list` discovery request, which carries no tool name) or an **absent** `input.identity.service_id` matches nothing in the maps and is therefore **denied**.
 ### Live plugin input shape (Q4)
 
 The Rego packages evaluate the `input` document the live AuthBridge OPA plugin populates — never IDs-plus-roles supplied per request. The fields the packages read:
@@ -446,9 +433,6 @@ There are **no** CR-name or CR-namespace env vars — CR coordinates are derived
 
 **Auth model.** The writer authenticates to the Kubernetes API as an **in-cluster ServiceAccount** (`aiac-pdp-policy-writer`), bound cluster-wide to a `ClusterRole` granting `get`, `list`, `create`, `update`, `patch`, `delete` on `authorizationpolicies.agent.rossoctl.dev` — **no `watch`** (the writer only creates/patches; bundle-service polls). The `ServiceAccount`, `ClusterRole`, and `ClusterRoleBinding` are declared in `k8s/pdp-interface-deployment.yaml`. The binding is cluster-scoped (not a namespaced `RoleBinding`) because the writer creates CRs in arbitrary workload namespaces (`team1`, …), derived from each agent's `identity_ref` namespace. For local development, the `kubernetes` client falls back to `~/.kube/config` automatically.
 
-## Always-on CR write + additive debug dump
-
-The **CR server-side-apply is always active** — it is never gated by an env var. The former filesystem-stub behaviour survives **only** as an additive debug/test aid, toggled by `POLICY_WRITER_DUMP_REGO` (default off). When on, `_upsert_agent` **also** writes the same rego to `<REGO_OUTPUT_DIR>/<ns>/<name>/inbound/request.rego` and `<REGO_OUTPUT_DIR>/<ns>/<name>/outbound/request.rego`, mirroring the CR `policies[].path` so the on-disk output equals the CR content; `_delete_agent` / `_delete_all` clear the corresponding dumped tree. The dump is **never** a substitute for, or a switch away from, the CR write — production runs with it off (`k8s/pdp-interface-deployment.yaml` sets no `POLICY_WRITER_DUMP_REGO`). A dump `OSError` maps to 502, so a broken debug mount surfaces rather than silently dropping files.
 ## Always-on CR write + additive debug dump
 
 The **CR server-side-apply is always active** — it is never gated by an env var. The former filesystem-stub behaviour survives **only** as an additive debug/test aid, toggled by `POLICY_WRITER_DUMP_REGO` (default off). When on, `_upsert_agent` **also** writes the same rego to `<REGO_OUTPUT_DIR>/<ns>/<name>/inbound/request.rego` and `<REGO_OUTPUT_DIR>/<ns>/<name>/outbound/request.rego`, mirroring the CR `policies[].path` so the on-disk output equals the CR content; `_delete_agent` / `_delete_all` clear the corresponding dumped tree. The dump is **never** a substitute for, or a switch away from, the CR write — production runs with it off (`k8s/pdp-interface-deployment.yaml` sets no `POLICY_WRITER_DUMP_REGO`). A dump `OSError` maps to 502, so a broken debug mount surfaces rather than silently dropping files.

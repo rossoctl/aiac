@@ -31,14 +31,14 @@ scope-focal pass. Door B adds only prohibitions and never grants.
 _Avoid_: owner, source of truth.
 
 **Contradiction**:
-An *intra-pass* grant∩deny: one focal's own proposed rule set both grants and
+An _intra-pass_ grant∩deny: one focal's own proposed rule set both grants and
 prohibits the same candidate. Detected by the LLM auditor within a single pass,
 which fails that pass closed. Modelled by `Contradiction` / raised as
 `PolicyContradictionError`.
 _Avoid_: using "conflict" for this — the two are distinct.
 
 **Conflict**:
-A *cross-pass* grant∩deny: an `Allow` from one pass and a `Deny` from another on
+A _cross-pass_ grant∩deny: an `Allow` from one pass and a `Deny` from another on
 the **same `(role, scope)`** pair. Structural (a pure id-level allow∩deny
 set-intersection over the assembled rules), not LLM-audited. Modelled by
 `Conflict` / `ConflictReport`.

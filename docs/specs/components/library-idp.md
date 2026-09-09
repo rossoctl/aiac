@@ -154,7 +154,7 @@ All Keycloak interactions are consolidated here; the PDP Policy Writer (OPA) doe
 > in the `all_roles` map (built from `GET /roles`, where every role is `kind = User`), discarding the
 > per-service endpoint's authoritative `kind = Agent` / `actorIds`, and it never stamped nested
 > `Scope.serviceId`. It now merges the endpoint's `kind`/`actorIds` and stamps `serviceId` (see
-> `get_services()` below). No client-side *re-derivation* of role kind is introduced — the merged
+> `get_services()` below). No client-side _re-derivation_ of role kind is introduced — the merged
 > `kind` still comes from the service, which remains authoritative. `get_subjects_by_role` stays
 > consistent with a role's `actorIds` (both from the same service-side source). See the per-method
 > audit notes below.
