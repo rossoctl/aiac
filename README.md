@@ -3,7 +3,7 @@
 AIAC is a Rossoctl platform extension that automates access control policy enforcement for AI agents
 running on Kubernetes. It continuously translates natural-language access-control policy into
 concrete permission rules on the active Policy Decision Point (OPA), using an identity provider
-(currently Keykloak) for roles, scopes, and services.
+(currently Keycloak) for roles, scopes, and services.
 
 See [docs/specs/PRD.md](docs/specs/PRD.md) for the full product requirements.
 
@@ -50,9 +50,12 @@ Always use `.venv` for Python execution, tests, and dependency checks (`.venv/bi
 .venv/bin/pytest test/
 ```
 
-Bare `pytest` runs unit tests only — every live-infra marker (`integration`, `llm`,
-`eval_extended`, `eval_consistency`, `eval_robustness`, `eval_correctness_prb`,
-`eval_correctness_e2e`) is excluded by default. Opt into a marker explicitly to run it, e.g.:
+Bare `pytest` runs unit tests only — `pyproject.toml` excludes `integration`,
+`eval_extended`, `eval_consistency`, `eval_robustness`, `eval_correctness_prb`, and
+`eval_correctness_e2e` by default. `llm` is not itself excluded: the live-LLM
+Policy Rules Builder suite is marked both `integration` and `llm`, so it's deselected
+via `not integration`, not because `llm` is excluded. Opt into a marker explicitly to
+run it, e.g.:
 
 ```bash
 set -a; . .env; set +a          # LLM_BASE_URL / LLM_MODEL / LLM_API_KEY
