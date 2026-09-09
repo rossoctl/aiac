@@ -105,6 +105,24 @@
                         </goals>
                         <configuration>
                             <createDependencyReducedPom>false</createDependencyReducedPom>
+                            <!--
+                              Strip bundled dependencies' JAR signatures. Shaded deps
+                              (e.g. the signed jnats client) carry META-INF/*.SF/*.DSA/*.RSA
+                              signature files whose digests no longer match once repackaged
+                              into this uber-jar. Keycloak's `kc.sh build` then aborts with
+                              "Invalid signature file digest for Manifest main attributes".
+                              Excluding the signature files makes the shaded jar loadable.
+                            -->
+                            <filters>
+                                <filter>
+                                    <artifact>*:*</artifact>
+                                    <excludes>
+                                        <exclude>META-INF/*.SF</exclude>
+                                        <exclude>META-INF/*.DSA</exclude>
+                                        <exclude>META-INF/*.RSA</exclude>
+                                    </excludes>
+                                </filter>
+                            </filters>
                         </configuration>
                     </execution>
                 </executions>

@@ -34,3 +34,7 @@ htmlcov/
 # Virtual environments
 .venv/
 venv/
+
+# Local environment / secrets (LLM + Keycloak creds). Real config values live here;
+# never commit. Moved to repo root from test/integration/.env.
+.env

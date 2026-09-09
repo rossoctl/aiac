@@ -42,10 +42,10 @@ REPORTS_DIR = HERE / "reports"
 REPORT_TZ = ZoneInfo(os.environ.get("EVAL_REPORT_TZ", "UTC"))
 MARKERS = {"eval_extended", "eval_consistency", "eval_robustness"}
 
-# Auto-load test/integration/.env so LLM_BASE_URL/KEYCLOAK_URL/etc. are set without having to
-# `set -a; . test/integration/.env; set +a` before invoking pytest. Existing environment
+# Auto-load the repo-root .env so LLM_BASE_URL/KEYCLOAK_URL/etc. are set without having to
+# `set -a; . .env; set +a` before invoking pytest. Existing environment
 # variables take precedence (override=False), so CI/shell exports still win.
-load_dotenv(HERE.parent / "test" / "integration" / ".env", override=False)
+load_dotenv(HERE.parent / ".env", override=False)
 
 _docstrings: dict[str, str] = {}
 _reports: dict[str, pytest.TestReport] = {}

@@ -38,7 +38,7 @@ poll bundle → drive real requests + assert → Keycloak cleanup**. Deployment 
 
 Run (needs a live rossoctl/Kind cluster with the AuthBridge OPA pipeline wired in — see
 ``k8s/opa-kind-runbook.md`` / ``k8s/opa-kind-enable.sh`` — the demo workloads deployed +
-registered into ``AIAC_TEST_REALM``, a real LLM in-pod, and ``test/integration/.env`` sourced):
+registered into ``AIAC_TEST_REALM``, a real LLM in-pod, and ``.env`` sourced):
 
     .venv/bin/pytest test/integration/test_uc1_onboard_tool_then_agent.py -m integration -v
 

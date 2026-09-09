@@ -35,7 +35,7 @@ re-pinning a second copy of the matrix. Policy A is **not** re-implemented here 
 Run (needs a live rossoctl/Kind cluster with the AuthBridge OPA pipeline wired into both legs — see
 ``k8s/opa-kind-runbook.md`` / ``k8s/opa-kind-enable.sh`` — the demo workloads deployed + registered,
 a real LLM in-pod, **and #146's ``default_effect`` hook wired into ``onboarded_stack``**, with
-``test/integration/.env`` sourced):
+``.env`` sourced):
 
     .venv/bin/pytest test/integration/test_policy_pipeline_denyworld.py -m integration -v
 

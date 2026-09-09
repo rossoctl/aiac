@@ -185,8 +185,8 @@ with — the generic descriptions are not part of this triad):
 
 ## Configuration (env)
 
-The suite reads its config from `test/integration/.env` (gitignored); source it before running
-(`set -a; . test/integration/.env; set +a`). The drivers read these:
+The suite reads its config from the repo-root `.env` (gitignored); source it before running
+(`set -a; . .env; set +a`). The drivers read these:
 
 | Variable | Purpose | Default |
 |----------|---------|---------|
@@ -215,7 +215,7 @@ prerequisites, wiring, and manual probe commands are in `k8s/opa-kind-runbook.md
 
 ```bash
 k8s/opa-kind-enable.sh          # one-time: wire the OPA plugin into both legs of the Kind cluster
-set -a; . test/integration/.env; set +a
+set -a; . .env; set +a
 .venv/bin/pytest test/integration/test_policy_pipeline.py -m integration -v
 # Parametrized over subject inbound + (subject × bare tool) outbound + negative controls.
 # A failing node names the exact cell, e.g.:

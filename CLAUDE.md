@@ -73,7 +73,7 @@ reuses the same `LLM_BASE_URL` / `LLM_MODEL` / `LLM_API_KEY` env as the
 integration suite and **skips cleanly** when they are unset. Run it opt-in:
 
 ```bash
-set -a; . test/integration/.env; set +a   # or export LLM_BASE_URL / LLM_MODEL / LLM_API_KEY
+set -a; . .env; set +a   # or export LLM_BASE_URL / LLM_MODEL / LLM_API_KEY
 .venv/bin/pytest test/ -m llm
 ```
 
@@ -85,12 +85,12 @@ into both legs** (the demo `github-agent`/`github-tool` deployed + registered), 
 creds and an LLM endpoint for onboarding. Stand the pipeline up with `k8s/opa-kind-enable.sh`;
 the full prerequisites, wiring, and manual probe commands are in `k8s/opa-kind-runbook.md`, and the
 per-loop shape is documented in `test/integration/uc1_onboard.py`. Config lives in
-`test/integration/.env` (gitignored): `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL`, `KEYCLOAK_URL`,
+the repo-root `.env` (gitignored): `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL`, `KEYCLOAK_URL`,
 `KEYCLOAK_ADMIN_USERNAME`, `KEYCLOAK_ADMIN_PASSWORD`. Source it before running:
 
 ```bash
 k8s/opa-kind-enable.sh          # one-time: wire the OPA plugin into the Kind cluster
-set -a; . test/integration/.env; set +a
+set -a; . .env; set +a
 .venv/bin/pytest test/integration/ -m integration
 ```
 

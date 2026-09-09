@@ -93,7 +93,9 @@ kubectl create secret generic keycloak-admin-secret \
 The AIAC Agent's Policy Rules Builder calls an **OpenAI-compatible** LLM endpoint
 (`ChatOpenAI(base_url=LLM_BASE_URL, model=LLM_MODEL, api_key=LLM_API_KEY)`). This configuration is
 split across two objects the Agent consumes via `envFrom`, and `agent-deployment.yaml` ships only
-**placeholders** — you must supply the real values per environment:
+**placeholders** — you must supply the real values per environment. The real values live in the
+repo-root `.env` (gitignored); source it (`set -a; . .env; set +a`) and use those `$LLM_BASE_URL` /
+`$LLM_MODEL` / `$LLM_API_KEY` in the commands below.
 
 | Key | Object | Notes |
 |-----|--------|-------|
