@@ -1,80 +1,90 @@
 # Issue tracker: GitHub (AIAC convention)
 
-Issues live as GitHub issues on **`s-and-p-team/cortex`** (the `origin` fork),
-filtered by the `aiac` label. Use the `gh` CLI for all operations: repository-scoped
-issue and label commands take `-R s-and-p-team/cortex`, while Projects commands are
-account-scoped — they take `--owner s-and-p-team` (and `--project-id` for item
-updates), and need the `project` scope on the token (`gh auth refresh -s project`).
+Issues live as GitHub issues in this repo's own remote, **`rossoctl/aiac`**,
+filtered by the `aiac` label. Use the `gh` CLI for all operations:
+repository-scoped issue and label commands take `-R rossoctl/aiac`, while
+Projects commands are account-scoped — they take `--owner rossoctl` (and
+`--project-id` for item updates), and need the `project` scope on the token
+(`gh auth refresh -s project`).
 
-This file exists so the engineering skills (`to-issues`, `triage`, `to-prd`,
-`qa`) have a single place to read the convention from.
+This file exists so the engineering skills (`to-tickets`, `to-spec`, and
+`triage` when installed) have a single place to read the convention from.
+
+> **Migration note (2026-09-09).** The `aiac`-labelled issues were migrated here
+> from `s-and-p-team/cortex`. GitHub cannot transfer issues across orgs, so they
+> were **copied** (authored by the migrating account, dated at copy time, with a
+> provenance line linking each copy back to its `cortex` original); the originals
+> in `cortex` were then closed with pointer comments. Issue numbers changed on
+> copy, so `#NNN` cross-references in the migrated bodies/titles were rewritten to
+> the new numbers. Full-URL links back to `cortex` were left intact.
 
 ## Conventions
 
-- **Create an issue**: `gh issue create -R s-and-p-team/cortex --title "..." --body "..." --label aiac`.
+- **Create an issue**: `gh issue create -R rossoctl/aiac --title "..." --body "..." --label aiac`.
   Use a heredoc for multi-line bodies. Always include the `aiac` label plus the
   relevant cumulative `area:<path>` label(s) for the component being touched.
-  `area:<path>` labels don't exist yet — create them lazily with
-  `gh label create area:<path> -R s-and-p-team/cortex` the first time a
-  component area comes up.
-- **Read an issue**: `gh issue view <number> -R s-and-p-team/cortex --comments`.
-- **List issues**: `gh issue list -R s-and-p-team/cortex --label aiac --state all`,
+  Create a missing `area:<path>` label lazily with
+  `gh label create area:<path> -R rossoctl/aiac` the first time a component area
+  comes up.
+- **Read an issue**: `gh issue view <number> -R rossoctl/aiac --comments`.
+- **List issues**: `gh issue list -R rossoctl/aiac --label aiac --state all`,
   narrowing with additional `--label area:<path>` filters as needed.
-- **Comment on an issue**: `gh issue comment <number> -R s-and-p-team/cortex --body "..."`.
-- **Apply / remove labels**: `gh issue edit <number> -R s-and-p-team/cortex --add-label "..."` / `--remove-label "..."`.
-- **Close**: `gh issue close <number> -R s-and-p-team/cortex --comment "..."`.
-
-## Known account limitation
-
-The `gh` account in use **cannot** `deleteIssue` or `createPullRequest` on this
-fork. Don't attempt issue deletion via `gh`; for PRs, push the branch and open
-the PR manually (or via the web UI) instead of `gh pr create`.
+- **Comment on an issue**: `gh issue comment <number> -R rossoctl/aiac --body "..."`.
+- **Apply / remove labels**: `gh issue edit <number> -R rossoctl/aiac --add-label "..."` / `--remove-label "..."`.
+- **Close**: `gh issue close <number> -R rossoctl/aiac --comment "..."`.
 
 ## Hierarchy
 
-Issues are filtered by `aiac` + cumulative `area:<path>` labels. **Native
-sub-issues are configured** on the fork — use them for container/leaf structure:
-a `Feature:`-prefixed umbrella issue with `Task:`-prefixed children linked as
-native sub-issues. (`Feature`/`Task` are a **title-prefix** convention — native
-GitHub *issue types* are not set on the fork, so `issueType` reads `null`.) Set
-a child's parent with `gh issue edit <child> -R s-and-p-team/cortex --parent <umbrella>`.
+Issues are filtered by `aiac` + cumulative `area:<path>` labels. Use native
+sub-issues for container/leaf structure: a `Feature:`-prefixed umbrella issue
+with `Task:`-prefixed children linked as native sub-issues. (`Feature`/`Task`
+are a **title-prefix** convention — native GitHub *issue types* are not set, so
+`issueType` reads `null`.) Set a child's parent with
+`gh issue edit <child> -R rossoctl/aiac --parent <umbrella>`.
 
 ## Project board
 
-There **is** an org-level Project board: **AIAC** (project number `1` on the
-`s-and-p-team` owner; id `PVT_kwDOEInZ0c4BfRuR`). (The separate `rossoctl` AIAC
-Project #11 still does not apply here.) When you file or update an `aiac` issue,
-add it to the board and set its Status field to match the triage label:
+The board is the org-level Project **AIAC**, project number **`12`** on the
+`rossoctl` owner (id `PVT_kwDODC4bxc4Bi_vF`) —
+<https://github.com/orgs/rossoctl/projects/12>. Note `rossoctl` also has a
+separate, older **AIAC** Project **#11**, which is *not* this board; always
+address the board by number `12` (its title alone is ambiguous). When you file
+or update an `aiac` issue, add it to the board and set its status:
 
-- **Add to the board**: `gh issue edit <number> -R s-and-p-team/cortex --add-project "AIAC"`
-  (requires the `project` OAuth scope — `gh auth refresh -s project` if missing).
-- **Set the Status field**: via the web UI, or `gh project item-edit
-  --project-id PVT_kwDOEInZ0c4BfRuR --id <item-id> --field-id <status-field-id>
-  --single-select-option-id <option-id>`. Discover the item and field ids with
-  `gh project item-list 1 --owner s-and-p-team --format json --limit 300` and
-  `gh project field-list 1 --owner s-and-p-team --format json`.
+- **Add to the board**: `gh project item-add 12 --owner rossoctl --url <issue-url>`
+  (returns the item id; requires the `project` OAuth scope).
+- **Set the status**: the migrated triage state lives on a **custom
+  single-select field named `Triage Status`** (field id
+  `PVTSSF_lADODC4bxc4Bi_vFzhh1vWg`), **not** the board's built-in `Status` field
+  (which is left unused / auto-driven by open-closed). Set it with
+  `gh project item-edit --project-id PVT_kwDODC4bxc4Bi_vF --id <item-id>
+  --field-id PVTSSF_lADODC4bxc4Bi_vFzhh1vWg --single-select-option-id <option-id>`.
+  Discover item and option ids with
+  `gh project item-list 12 --owner rossoctl --format json --limit 300` and
+  `gh project field-list 12 --owner rossoctl --format json`.
 
-The Status field options are `needs-triage`, `needs-info`, `ready-for-agent`,
-`ready-for-human`, `blocked`, `deferred`, `resolved`, `wontfix`.
+The `Triage Status` field options are `needs-triage`, `needs-info`,
+`ready-for-agent`, `ready-for-human`, `blocked`, `deferred`, `resolved`,
+`wontfix`.
 
 ## When a skill says "publish to the issue tracker"
 
-Create a GitHub issue on `s-and-p-team/cortex` with the `aiac` label and the
+Create a GitHub issue on `rossoctl/aiac` with the `aiac` label and the
 appropriate `area:<path>` label(s).
 
 ## When a skill says "fetch the relevant ticket"
 
-Run `gh issue view <number> -R s-and-p-team/cortex --comments`.
+Run `gh issue view <number> -R rossoctl/aiac --comments`.
 
 ## When a skill mentions triage roles
 
-The `triage` skill's five canonical roles (`needs-triage`, `needs-info`,
-`ready-for-agent`, `ready-for-human`, `wontfix`) map to **both** a `status:<role>`
-issue label **and** the matching option on the AIAC board's Status field (see
-Project board above); the board adds `blocked` / `deferred` / `resolved` beyond
-the five. Apply the `status:<role>` label with `gh issue edit` and set the board
-Status field to the same value. There is no `docs/agents/triage-labels.md` to map
-against — this section is the mapping.
+The five canonical roles (`needs-triage`, `needs-info`, `ready-for-agent`,
+`ready-for-human`, `wontfix`) map to **both** a `status:<role>` issue label
+**and** the matching option on the board's `Triage Status` field (see Project
+board above); the board adds `blocked` / `deferred` / `resolved` beyond the five.
+Apply the `status:<role>` label with `gh issue edit` and set the `Triage Status`
+field to the same value. There is no `docs/agents/triage-labels.md` (the `triage`
+skill is not installed here) — this section is the mapping.
 
 Filtered web list:
-<https://github.com/s-and-p-team/cortex/issues?q=is%3Aissue+label%3Aaiac>
+<https://github.com/rossoctl/aiac/issues?q=is%3Aissue+label%3Aaiac>

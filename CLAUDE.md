@@ -200,7 +200,7 @@ demo workloads, which don't) and CPU/memory requests + limits.
 
 ### Issue tracker
 
-GitHub issues on `s-and-p-team/cortex` (the origin fork), filtered by the `aiac` label. See `docs/agents/issue-tracker.md`.
+GitHub issues in this repo's own remote (`rossoctl/aiac`), filtered by the `aiac` label; org-level Project board **AIAC #12** on `rossoctl`, triage state on its custom `Triage Status` field. Migrated from `s-and-p-team/cortex` on 2026-09-09. See `docs/agents/issue-tracker.md`.
 
 ### Domain docs
 
