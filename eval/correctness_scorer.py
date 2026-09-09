@@ -87,6 +87,16 @@ class ScenarioScore:
     def incorrectly_denied(self) -> dict[str, frozenset[Pair]]:
         return {name: gate.incorrectly_denied for name, gate in self.gates.items() if gate.incorrectly_denied}
 
+    @property
+    def true_positive_count(self) -> int:
+        return sum(len(gate.true_positives) for gate in self.gates.values())
+
+    @property
+    def denied_total(self) -> int:
+        """Every explicit-Deny pair across all gates, correct or not (``correctly_denied |
+        incorrectly_denied``) — the denominator ``denial_precision`` is computed against."""
+        return sum(len(gate.correctly_denied) + len(gate.incorrectly_denied) for gate in self.gates.values())
+
 
 def score_gate(gate: str, granted: set[Pair], denied: set[Pair], expected: set[Pair]) -> GateScore:
     true_positives = frozenset(granted & expected)

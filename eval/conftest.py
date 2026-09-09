@@ -52,6 +52,16 @@ aborting the scenario (``eval.test_policy_pipeline_eval.orchestrate_prb``'s ``be
 by explicit user request so a scenario the auditor partly rejects still scores). When non-empty,
 ``_render_metrics_block`` appends one more field listing them, with an explicit caveat that those
 pairs don't represent real production behavior.
+
+Both suites also ``record_property`` two raw counts alongside the floats above —
+``true_positives`` and ``denied_total`` — not rendered in the Markdown report (the floats and pair
+breakdowns already cover a human reader) but read back here by ``_write_trend_log`` to pool a
+run's precision/recall/denial_precision into one committed, append-only trend-log row per suite
+(``eval/trend_log.py``, spec: ``docs/specs/eval/eval-framework.md`` §9) — pooled by summed count
+across every scenario that reached ``score_scenario`` in the run, not averaged per-scenario, so a
+run with an uneven pair count per scenario isn't skewed by weighting every scenario equally. A
+scenario whose own setup failed never recorded these, so it contributes nothing to the pooled row
+(consistent with ``_CORRECTNESS_TEST_MARKERS``'s existing setup-failure handling above).
 """
 
 from __future__ import annotations
@@ -63,6 +73,8 @@ from zoneinfo import ZoneInfo
 
 import pytest
 from dotenv import load_dotenv
+
+from eval.trend_log import append_row, pool_correctness_metrics
 
 HERE = Path(__file__).resolve().parent
 REPORTS_DIR = HERE / "reports"
@@ -171,6 +183,15 @@ def _format_pairs_dict(pairs_by_gate: dict) -> str:
 # generic branch and render its actual skip reason instead of a misleading "setup failed".
 _CORRECTNESS_TEST_MARKERS = ("::test_prb_correctness[", "::test_e2e_correctness[")
 
+# Marker -> trend-log suite name (eval/trend_log.py). Deliberately scoped to only the two
+# Correctness suites for now — the Robustness/Consistency/Scale suite tickets (#2466-#2470) add
+# their own entries here when they land, reusing the same _write_trend_log/append_row mechanism
+# rather than building a parallel one.
+_TREND_LOG_SUITES = {
+    "eval_correctness_prb": "correctness_prb",
+    "eval_correctness_e2e": "correctness_e2e",
+}
+
 
 def _format_best_effort_notes(notes: dict[str, str]) -> str:
     """Render a ``{scope_or_role_name: reason}`` dict (``orchestrate_prb``'s ``best_effort_notes``)
@@ -245,6 +266,27 @@ def _render_entry(lines: list[str], nodeid: str, report: pytest.TestReport, cate
     lines.append("")
 
 
+def _write_trend_log(now: datetime) -> None:
+    """One committed trend-log row per Correctness suite present in this session (PRB-level
+    and/or end-to-end) — spec: docs/specs/eval/eval-framework.md §9. Pools every scenario's
+    true_positives/denied_total counts (and over_grants/under_grants/incorrectly_denied pair
+    dicts) that reached score_scenario — a scenario whose own setup failed never recorded these,
+    so it contributes nothing to the pooled row, same as _render_metrics_block's
+    unavailable_reason branch above treats it as absent rather than zero."""
+    by_suite: dict[str, list[dict]] = {}
+    for report in _reports.values():
+        for marker, suite in _TREND_LOG_SUITES.items():
+            if marker in report.keywords:
+                props = dict(report.user_properties)
+                if "true_positives" in props:
+                    by_suite.setdefault(suite, []).append(props)
+                break
+
+    for suite, entries in by_suite.items():
+        if entries:
+            append_row(suite, pool_correctness_metrics(entries), timestamp=now)
+
+
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     if not _reports:
         return  # this session collected none of this suite's tests -- nothing to report
@@ -257,6 +299,7 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
         buckets[cat].sort(key=lambda pair: pair[0])
 
     now = datetime.now(REPORT_TZ)
+    _write_trend_log(now)
     total = len(_reports)
     lines = [
         "# policy-eval-scenarios test report",

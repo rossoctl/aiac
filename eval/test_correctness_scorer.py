@@ -119,6 +119,29 @@ def test_scenario_aggregates_across_gates() -> None:
     assert scenario_score.precision == 2 / 3
     assert scenario_score.recall == 2 / 3
     assert scenario_score.denial_precision == 0.0  # the one denial made was incorrect
+    assert scenario_score.true_positive_count == 2
+    assert scenario_score.denied_total == 1  # the one (incorrect) denial
+
+
+def test_scenario_true_positive_count_and_denied_total_sum_across_gates() -> None:
+    granted = {
+        "inbound": {("role-a", "scope-1")},
+        "outbound_subject": {("role-a", "scope-2")},
+    }
+    denied = {
+        "inbound": {("role-b", "scope-3")},  # correctly denied
+        "outbound_target": {("agent-role", "scope-4")},  # incorrectly denied
+    }
+    expected = {
+        "inbound": {("role-a", "scope-1")},
+        "outbound_subject": {("role-a", "scope-2")},
+        "outbound_target": {("agent-role", "scope-4")},
+    }
+
+    scenario_score = score_scenario("demo", granted, denied, expected)
+
+    assert scenario_score.true_positive_count == 2  # scope-1, scope-2
+    assert scenario_score.denied_total == 2  # scope-3 (correct) + scope-4 (incorrect)
 
 
 def test_scenario_passes_with_only_under_grants() -> None:
