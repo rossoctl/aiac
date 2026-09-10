@@ -15,24 +15,115 @@ One JSON object per line, one line per **task** (a logical unit of the demo):
 
 ```json
 {
-  "task": "<short description of what this unit of work is>",
+  "task": "<what work is being done — logical, and technically specific>",
   "steps": [
-    {"cmd": "<command or API call sent>", "output": "<response/result received>"},
-    {"cmd": "...", "output": "..."}
+    {"cmd": "<the request, exactly as issued>",
+     "output": "<the response, exactly as received>",
+     "explain": "<optional: why this step exists / what to notice>",
+     "sent": "<optional: the request body, when the payload is the substance>",
+     "elapsed_ms": 0}
   ],
-  "summary": "<what was achieved — info inferred for later stages, or confirmation a system was correctly configured, via command output or observed UI/traffic>"
+  "summary": "<what this task achieved>"
 }
 ```
 
-Notes:
-- `steps` preserves order; each entry is one concrete cmd/output pair, whether it came
-  from this demo's own terminal narration (`cmd()` in `_lib.py`) or from a Pixie query
-  result (a captured HTTP/gRPC/DNS call between pods).
-- `summary` is written by us after each task, not auto-generated — it's the
-  human-legible "why this task mattered" line the video narration will lean on.
-- Exact `task` boundaries are listed below (per the user's steer: same granularity as
-  make targets, except `agent` and `tool` are split into several finer logical units
-  since they're the most significant part of the demo).
+### The recording replays these steps — so `cmd` and `output` must be real
+
+The video simulates a developer typing each `cmd` and receiving each `output`. That is
+the whole reason this file exists, and it constrains the schema absolutely:
+
+- **`cmd` must be executable as written.** A real HTTP request, `kubectl`, or `opa eval`.
+  Never a `make` target that wraps the work, never an invented label like
+  `(inbound / outbound grants tables)`, never a summary of several calls
+  (`118× GET idp-config lookup`). If it cannot be typed and run, it is not a step.
+- **`output` must be the byte-exact response.** Not a paraphrase, not a truncation, and
+  never the demo's own narration (`✓ onboarding call returned 200`). If a call genuinely
+  returns an empty body — the onboarding POST answers `200` with `content-length: 0` — that
+  is the true output and it stays as-is; the substance then lives in `sent`.
+- **A step with no captured response is not a step.** The local `opa eval` calls are real
+  work, but the demo never prints their stdout, so there is nothing to replay. Their
+  meaning goes in `task`/`summary`/`explain`, not into a fabricated `output`.
+- **Derived views are dropped.** Grants tables, Rego diffs and result tables are computed
+  summaries, not commands. Earlier versions emitted them with a `[derived]` prefix; they
+  are now excluded, because a replay cannot type them.
+
+**Free text lives only in `task`, `summary` and `explain`.** Those three carry all
+narration; `cmd`, `output` and `sent` carry only captured bytes.
+
+### The captured story starts at the onboarding, not the setup
+
+`keycloak`/`prereqs`/`clear`/`setup` are scaffolding that gets the cluster to a clean
+baseline; they are not the demo. The assembler still runs and logs them (a clean baseline
+matters), but `--from-agent` emits only from the first onboarding task onward. That flag is
+the default way to build the artifact.
+
+### Show the work, not the product
+
+The demo's point is the complexity of doing this by hand — so a label names *the work to be
+done*, never the tool doing it. "Classify the workload and read its declared skills", not
+"AIAC discovers what the agent is". A task whose only content is *activating* AIAC has been
+removed outright: "we called the onboarding endpoint" demonstrates nothing.
+
+Labels are simultaneously **logical and technically specific**, because the audience is a
+developer. Say which mechanism is authoritative (the pod's `rossoctl.io/type` label), where
+capabilities come from (the AgentCard CR's `status.card`, synced from the A2A card), and what
+contract a call honours (`{approved, reason}`, retried up to 3 times).
+
+### Two things that hide the substance
+
+Both were invisible until the artifact was read closely:
+
+- **The request body is often the point, not the response.** The Policy Writer POST answers
+  `204` with no body while carrying the entire computed policy model (~5 KB) in its request.
+  61 of 298 records in a run have a meaningful request body. `sent` carries it; without that
+  field those steps read as `POST /policy -> 204` and say nothing.
+- **A structured LLM decision is buried in an escaped envelope.** The verdict lives in
+  `choices[0].message.content` as JSON-escaped text, so `"approved": false` appears on the
+  wire as `\"approved\":false` several hundred characters in. `output` keeps the verbatim
+  envelope — it is what a replay would show — and the decoded decision goes to `explain`.
+  (Searching the raw text for the unescaped form finds nothing, which briefly made a captured
+  audit rejection look absent when it was there all along.)
+
+### A state change needs its verification shown
+
+A mutating call often answers with a bare status and no body, which on its own proves
+nothing to a viewer. The run already contains the follow-up reads that prove it — that
+read-back is what makes re-running the onboarding idempotent — but the pattern is invisible
+unless labelled, so each mutation carries a note saying what confirms it:
+
+- `201` **with the created object in the body** — self-evidencing; the response *is* the proof.
+- a bare `204` — the note points at the GET that follows and checks the state took effect.
+- when nothing in the run reads it back, the note says so rather than implying otherwise.
+  The Policy Writer POST is the honest example: its verification is the `kubectl get
+  authorizationpolicies` step later in the demo, not an adjacent call.
+
+`POST` alone does not mean "mutation": the LLM chat-completions and MCP `tools/list` calls
+are queries that happen to use POST, and are never labelled as state changes.
+
+### Split tasks by concern, from the observed traffic
+
+Task boundaries are drawn where a developer would draw them, and derived from what the run
+actually did rather than from what the code looks like. Two lessons paid for by getting it
+wrong:
+
+- **Do not merge distinct concerns.** One "discover" task held 118 calls that turned out to
+  be four separate things: provisioning writes, a full-realm candidate sweep, subject reads,
+  and per-candidate re-reads during evaluation. Merged, the artifact hid that provisioning
+  happens at all.
+- **Do not split on HTTP method.** GET-vs-POST looked tidy but misrepresents the run: each
+  write is preceded by a read-back that makes it idempotent, so a method split reorders
+  reality. Split on *concern*, and find the boundaries in the traffic (the
+  `POST /services/{id}/type` stamp, the first and last `/subjects` read).
+
+Repetition is evidence, not noise. Sweeping all 12 realm clients — many answering `[]` — is
+exactly the tedium a human would face, so those calls are shown individually.
+
+### Field length
+
+`task` is an on-screen caption, so it stays subtitle-tight (~90 chars). `summary` and
+`explain` aim for the same brevity but are **not hard-capped**: a developer-facing detail is
+worth more than a clean line length. The assembler reports what exceeds the hint and emits it
+anyway — an earlier hard cap truncated an `explain` field to `"✓…"`.
 
 ## Task breakdown
 

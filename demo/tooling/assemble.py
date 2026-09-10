@@ -49,19 +49,24 @@ LLM_MARKER = "/chat/completions"
 
 
 
-# These three fields are read on screen in about two seconds, like a subtitle. Anything
-# longer cannot be taken in during playback, so they are hard-capped and the assembler
-# reports violations rather than silently emitting a wall of text.
-SUBTITLE_MAX = 90
+# `task` is read on screen like a subtitle, so it stays short. `summary` and `explain`
+# aim for the same brevity but are NOT hard-capped: a developer-facing detail (which label
+# is authoritative, what makes a write idempotent) is worth more than a clean line length.
+# SUBTITLE_HINT is advisory — the assembler reports what exceeds it and emits it anyway.
+SUBTITLE_HINT = 90
+# `task` is the one field that must stay subtitle-tight; it is the on-screen caption.
+TASK_MAX = 90
 
 # Where the demo proper begins; everything before it is setup scaffolding.
 FIRST_DEMO_TASK = "Resolve the agent's Keycloak client UUID"
 
 
-def _subtitle(text: str, limit: int = SUBTITLE_MAX) -> str:
-    """Collapse to one line and trim to subtitle length at a word boundary."""
+def _subtitle(text: str, limit: int | None = None) -> str:
+    """Collapse to a single line. Truncates only when a caller asks for a hard limit —
+    trimming a developer-facing explanation to fit a line length loses the detail that
+    made it worth writing (an earlier version cut an explain field down to "✓…")."""
     text = " ".join((text or "").split())
-    if len(text) <= limit:
+    if limit is None or len(text) <= limit:
         return text
     cut = text[:limit].rsplit(" ", 1)[0]
     return cut + "…"
@@ -87,12 +92,96 @@ def _llm_gist(decoded: str) -> str:
     return _subtitle("; ".join(bits) or "no grants")
 
 
-def _is_read(rec: dict) -> bool:
-    """GET vs mutating call. The IdP-config traffic is two distinct phases — discovery
-    (GET the client, the realm roles/scopes, the workload's own skills) and provisioning
-    (POST a role + scope per skill, then bind them) — and a developer reading this needs
-    them separated, not merged into one 118-call blob."""
-    return (rec.get("request", {}).get("method") or "").upper() == "GET"
+def annotate_writes(steps: list[dict]) -> list[dict]:
+    """Label each state-changing call so a developer can see what proves it worked.
+
+    Mutations here come in two shapes, and they need different notes:
+
+      * `201` WITH the created object in the body — self-evidencing; the response itself is
+        the proof, so just say a create happened.
+      * a bare `204` with no body — proves nothing on its own. The evidence is the GET that
+        follows, so point at it. (That read-back pattern is already in the traffic: it is
+        what makes re-running the onboarding idempotent.)
+
+    Without this, a replay shows a line answering `204` and the viewer cannot tell whether
+    anything changed, or which of the surrounding reads was the confirmation.
+    """
+    out = []
+    for i, st in enumerate(steps):
+        st = dict(st)
+        method = st.get("cmd", "").split(" ", 1)[0]
+        url = st.get("cmd", "").split(" ", 1)[1] if " " in st.get("cmd", "") else ""
+        # POST is not automatically a mutation: the LLM chat-completions calls are queries
+        # that happen to use it, and they carry their own decoded-verdict explain.
+        is_query_post = LLM_MARKER in url or MCP_MARKER in url
+        if method in ("POST", "PUT", "DELETE", "PATCH") and not is_query_post:
+            body = (st.get("output") or "").strip()
+            status = body.split(" ", 1)[0]
+            has_body = "—" in body and len(body.split("—", 1)[1].strip()) > 2
+            if has_body:
+                note = f"state change — {status}; the response body is the created object"
+            else:
+                nxt = next(
+                    (
+                        s2["cmd"]
+                        for s2 in steps[i + 1 : i + 4]
+                        if s2.get("cmd", "").startswith("GET")
+                    ),
+                    None,
+                )
+                note = f"state change — {status}, no body"
+                if nxt:
+                    path = re.sub(r"https?://[^/]+", "", nxt.split(" ", 1)[1] if " " in nxt else nxt)
+                    note += f"; the next GET {path[:44]} is the check that it took effect"
+                else:
+                    note += "; nothing in this run reads it back"
+            st["explain"] = _subtitle(" ".join(x for x in (st.get("explain"), note) if x))
+        out.append(st)
+    return out
+
+
+def idp_phase(recs: list[dict], phase: str) -> list[dict]:
+    """Split the IdP-config traffic by CONCERN rather than by HTTP method.
+
+    Splitting on GET-vs-POST looked tidy but misrepresented the run: the provisioning
+    writes are interleaved with read-backs (each POST is preceded by a GET that makes the
+    create idempotent), so a method split reorders what actually happened. The observed
+    sequence has three phases instead:
+
+      provision  — resolve the client, classify it, create+bind a role and scope per skill,
+                   ending with POST /services/{id}/type
+      candidates — GET /services, then every client's roles and scopes: the full candidate
+                   set the policy has to be judged against
+      subjects   — GET /subjects and each subject's assignments
+
+    The boundaries are found from the traffic itself, not hardcoded indices.
+    """
+    idp = [r for r in recs if classify(r) == "idp-config"]
+    type_stamp = next(
+        (i for i, r in enumerate(idp) if r["request"]["url"].rstrip("/").endswith("/type")),
+        -1,
+    )
+    subjects_start = next(
+        (i for i, r in enumerate(idp) if "/subjects" in r["request"]["url"]), len(idp)
+    )
+    if phase == "provision":
+        return [step(r) for r in idp[: type_stamp + 1]]
+    if phase == "candidates":
+        return [step(r) for r in idp[type_stamp + 1 : subjects_start]]
+    if phase == "trailing":
+        # Everything after the subject reads: the re-read sweep the PRB does per candidate
+        # while it works. Kept separate so it neither pads an earlier phase nor disappears.
+        idxs = [i for i, r in enumerate(idp) if "/subjects" in r["request"]["url"]]
+        tail_start = (idxs[-1] + 1) if idxs else subjects_start
+        return [step(r) for r in idp[tail_start:]]
+    if phase == "subjects":
+        # All subject reads, from the first to the last — they are interleaved with a
+        # /roles lookup, so "contiguous" cannot mean "unbroken run of /subjects URLs".
+        idxs = [i for i, r in enumerate(idp) if "/subjects" in r["request"]["url"]]
+        if not idxs:
+            return []
+        return [step(r) for r in idp[idxs[0] : idxs[-1] + 1]]
+    return []
 
 
 def classify(rec: dict) -> str:
@@ -514,27 +603,41 @@ def main() -> None:
     tasks: list[dict] = []
 
     def normalize(steps: list[dict]) -> list[dict]:
-        """Enforce the schema invariant: ``output`` holds a real response, never prose.
+        """Keep only steps the video can actually replay.
 
-        Steps sourced purely from narration (``kubectl``/``make`` lines the shim never saw,
-        because they are subprocesses rather than HTTP) arrive with the demo's commentary in
-        ``output``; move it to ``explain`` so a reader can always trust ``output`` to be
-        wire truth.
+        The recording simulates a developer typing each `cmd` and receiving each `output`,
+        so a step is usable only if BOTH are real: the command must be executable as
+        written, and the output must be the byte-exact response. That rules out two things
+        this assembler used to emit — derived views (a grants table, a diff, a result
+        table: computed summaries, not commands) and steps with no captured response (the
+        local `opa eval` subprocesses, whose stdout the demo never printed). Their content
+        survives in `task`/`summary`/`explain`, which is where prose belongs.
         """
-        fixed = []
-        for s in steps:
-            s = dict(s)
-            body = (s.get("output") or "").strip()
-            if body and body[:1] in ("✓", "✗", "⛔", "▸", "•"):
-                s["explain"] = _subtitle(" ".join(x for x in (s.get("explain"), body) if x))
-                del s["output"]
-            elif s.get("explain"):
-                s["explain"] = _subtitle(s["explain"])
-            fixed.append(s)
-        return fixed
+        kept = []
+        for st in steps:
+            st = dict(st)
+            cmd = st.get("cmd", "")
+            if cmd.startswith("[derived]"):
+                continue
+            if "output" not in st:
+                continue
+            body = (st.get("output") or "").strip()
+            if body[:1] in ("✓", "✗", "⛔", "▸", "•"):
+                # Narration that had slipped into output; it is not a response.
+                continue
+            if st.get("explain"):
+                st["explain"] = _subtitle(st["explain"])
+            kept.append(st)
+        return kept
 
     def add(task: str, steps: list[dict], summary: str) -> None:
-        tasks.append({"task": task, "steps": normalize(steps), "summary": summary})
+        # A task with no replayable step has nothing for the video to show. The Pause-3 diff
+        # is the clearest case: it was entirely a derived view, and the state it describes is
+        # already visible in the Rego read-back tasks either side of it.
+        steps = annotate_writes(normalize(steps))
+        if not steps:
+            return
+        tasks.append({"task": task, "steps": steps, "summary": summary})
 
     # 1-5 — init phase and the clean baseline
     add(
@@ -576,14 +679,30 @@ def main() -> None:
         "Its clientId is a SPIFFE URI; the UUID is what the onboarding route takes.",
     )
     add(
-        "Classify the workload and read its declared skills",
-        [step(r) for r in by(agent_recs, "idp-config") if _is_read(r)],
-        "Pod label rossoctl.io/type says Agent; skills come from its AgentCard CR.",
+        "Classify the workload, then create a role + scope per declared skill",
+        idp_phase(agent_recs, "provision"),
+        "Type comes from the pod's rossoctl.io/type label; skills from the AgentCard CR's "
+        "status.card. Each skill becomes one realm role and one client scope, bound to the "
+        "client — every write preceded by a read-back, so re-running is idempotent.",
     )
     add(
-        "Create a Keycloak role and scope per declared skill",
-        [step(r) for r in by(agent_recs, "idp-config") if not _is_read(r)],
-        "One realm role + one client scope per skill, attached to the client.",
+        "Sweep every client in the realm to build the candidate set",
+        idp_phase(agent_recs, "candidates"),
+        "GET /services, then each client's roles and scopes — 12 clients, many returning [] "
+        "— because the PRB has to judge the policy against every role that could reach this "
+        "agent, not just the ones it just created.",
+    )
+    add(
+        "Read the demo users and their role assignments",
+        idp_phase(agent_recs, "subjects"),
+        "dev-user, test-user, devops-user and their realm roles: the subjects the inbound "
+        "gate will be keyed on.",
+    )
+    add(
+        "Re-read each candidate's roles and scopes while deciding",
+        idp_phase(agent_recs, "trailing"),
+        "The rules builder re-reads a candidate's roles and scopes as it evaluates it, so "
+        "these interleave with the LLM calls below rather than all happening up front.",
     )
     add(
         "LLM proposes grants per role/scope pair against policy.md",
@@ -717,13 +836,13 @@ def main() -> None:
     long = []
     for t in tasks:
         for field in ("task", "summary"):
-            if len(t[field]) > SUBTITLE_MAX:
+            if len(t[field]) > (TASK_MAX if field == "task" else SUBTITLE_HINT):
                 long.append(f"{field} ({len(t[field])}): {t[field][:60]}")
         for st in t["steps"]:
-            if len(st.get("explain", "")) > SUBTITLE_MAX:
+            if len(st.get("explain", "")) > SUBTITLE_HINT:
                 long.append(f"explain ({len(st['explain'])}): {st['explain'][:60]}")
     if long:
-        print(f"WARNING: {len(long)} field(s) exceed the {SUBTITLE_MAX}-char subtitle budget:")
+        print(f"note: {len(long)} field(s) exceed the {SUBTITLE_HINT}-char subtitle hint (advisory):")
         for item in long[:10]:
             print("  " + item)
 
