@@ -81,13 +81,19 @@ def append_row(
     ``"unknown"`` when unset. ``run_type`` distinguishes routine regression rows from the
     ``"model_selection"`` comparison run (spec §7.1) — not produced by this ticket, but the
     parameter exists so that future run reuses this same writer instead of a parallel one.
+
+    Every float value in ``metrics`` is rounded to 3 decimal digits before being written — plenty
+    of precision to see drift over time, and keeps the committed file's diffs small and readable.
+    Non-float values (``scenarios_scored``, etc.) pass through unchanged. Applied here, not by
+    each suite's own pooling function, so every suite that reuses this writer gets it uniformly.
     """
+    rounded_metrics = {k: round(v, 3) if isinstance(v, float) else v for k, v in metrics.items()}
     row: dict[str, Any] = {
         "timestamp": (timestamp or datetime.now(timezone.utc)).isoformat(timespec="seconds"),
         "suite": suite,
         "run_type": run_type,
         "model": model if model is not None else os.environ.get("LLM_MODEL", "unknown"),
-        **metrics,
+        **rounded_metrics,
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:

@@ -135,6 +135,30 @@ def test_append_row_writes_one_json_line(tmp_path: Path) -> None:
     assert "timestamp" in written
 
 
+def test_append_row_rounds_float_metrics_to_3_decimal_digits(tmp_path: Path) -> None:
+    path = tmp_path / "trend_log.jsonl"
+
+    row = append_row(
+        "correctness_e2e",
+        {"precision": 10 / 11, "recall": 2 / 3, "denial_precision": 1.0},
+        model="m1",
+        path=path,
+    )
+
+    assert row["precision"] == 0.909
+    assert row["recall"] == 0.667
+    assert row["denial_precision"] == 1.0  # already exact -- unaffected
+
+
+def test_append_row_does_not_round_non_float_metrics(tmp_path: Path) -> None:
+    path = tmp_path / "trend_log.jsonl"
+
+    row = append_row("correctness_prb", {"scenarios_scored": 8, "run_type_note": "ok"}, model="m1", path=path)
+
+    assert row["scenarios_scored"] == 8  # int, untouched
+    assert row["run_type_note"] == "ok"  # str, untouched
+
+
 def test_append_row_appends_not_overwrites(tmp_path: Path) -> None:
     path = tmp_path / "trend_log.jsonl"
 
