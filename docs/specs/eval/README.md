@@ -19,11 +19,11 @@ design (what each attribute measures, scoring philosophy, reporting) lives in
 All five need only `LLM_BASE_URL`/`LLM_MODEL`/`LLM_API_KEY` at minimum; `eval_extended` and
 `eval_correctness_e2e` additionally need a live Keycloak and `opa`.
 
-## `eval/.env`
+## `.env`
 
-`eval/conftest.py` auto-loads `eval/.env` (gitignored, `override=False`) before any suite runs, so
-a local file removes the need to `export`/`source` anything before invoking `pytest` directly —
-real shell/CI exports still take precedence.
+`eval/conftest.py` auto-loads the repo-root `.env` (gitignored, `override=False`) before any suite
+runs, so a local file removes the need to `export`/`source` anything before invoking `pytest`
+directly — real shell/CI exports still take precedence.
 
 | Variable | Required by | Purpose |
 |---|---|---|
@@ -34,7 +34,7 @@ real shell/CI exports still take precedence.
 | `PRB_CONSISTENCY_REPEATS` (optional) | `eval_consistency` | Repeats per scenario; default 5, must be ≥ 2. |
 | `EVAL_REPORT_TZ` (optional) | none (report only) | Timezone for the Markdown report's timestamp/filename; default UTC. |
 
-Minimal `eval/.env` for the PRB-level suites only:
+Minimal repo-root `.env` for the PRB-level suites only:
 
 ```
 LLM_BASE_URL=<your LLM endpoint>
