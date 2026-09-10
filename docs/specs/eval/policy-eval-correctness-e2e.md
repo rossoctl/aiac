@@ -79,8 +79,8 @@ introduced by this suite and not fixed by it** — see [Out of Scope](#out-of-sc
 | `OPA_BIN` (optional) | Path to the `opa` binary; falls back to `opa` on `PATH`. The suite skips cleanly (not a failure) if neither resolves. |
 | `EVAL_PIPELINE_PARALLELISM` (optional, default = scenario count, currently 8) | Max concurrent `ProcessPoolExecutor` workers in the shared `pipeline` fixture — see [Parallelization](#parallelization). An escape hatch, not a tuning knob with a "correct" lower value; lower it only if the LLM endpoint rate-limits under full concurrency. |
 
-`eval/conftest.py` auto-loads `eval/.env` (gitignored, override=False) if present, so a local
-`eval/.env` with the above removes the need to `export`/source anything before invoking `pytest`
+`eval/conftest.py` auto-loads the repo-root `.env` (gitignored, override=False) if present, so a
+local `.env` with the above removes the need to `export`/source anything before invoking `pytest`
 directly.
 
 ## Parallelization
