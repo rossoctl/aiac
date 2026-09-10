@@ -31,6 +31,20 @@ import scenario as scn
 HERE = Path(__file__).resolve().parent.parent  # lib/ -> uc1-onboarding/
 GENERATED = HERE / "generated"
 
+# Demo-capture shim, off unless AIAC_CAPTURE_ENABLED is set (see
+# src/aiac/agent/shared/capture.py). The in-cluster shim only sees calls the AGENT pod
+# makes; the two calls that define the onboarding story — the driver's own
+# POST /apply/service/{id} and the Keycloak admin lookups behind resolve_service_id() —
+# originate HERE, in the driving script, so they need the same hook to be captured.
+# Imported by every numbered demo script via this module, so this is the one place to do it.
+try:  # best effort: never let capture wiring break the demo
+    sys.path.insert(0, str(HERE.parent.parent.parent / "src"))
+    from aiac.agent.shared import capture as _capture
+
+    _capture.install()
+except Exception:  # pragma: no cover - the demo must run with or without capture
+    pass
+
 # The reworked PDP Policy Writer (OPA) is CR-backed: it server-side-applies one
 # per-agent AuthorizationPolicy CR (agent.rossoctl.dev/v1alpha1) and, in production, writes
 # NO .rego files (k8s/pdp-interface-deployment.yaml keeps POLICY_WRITER_DUMP_REGO off and mounts

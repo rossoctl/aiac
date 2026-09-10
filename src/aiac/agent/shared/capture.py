@@ -32,6 +32,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 import time
 
@@ -73,6 +74,33 @@ def _truncate(text: str) -> str:
     if limit <= 0 or len(text) <= limit:
         return text
     return f"{text[:limit]}\n...[truncated {len(text) - limit} chars]"
+
+
+# Token-bearing JSON fields. Keycloak's token endpoint returns live access/refresh/ID
+# tokens in the BODY (not a header), and the RFC 8693 exchange this demo performs returns
+# more of them, so header redaction alone would still write usable credentials to disk.
+_TOKEN_FIELDS = (
+    "access_token",
+    "refresh_token",
+    "id_token",
+    "issued_token_type",
+    "client_secret",
+    "authorization_code",
+)
+_TOKEN_RE = re.compile(
+    r'("(?:' + "|".join(_TOKEN_FIELDS) + r')"\s*:\s*")([^"]{8,})(")',
+    re.IGNORECASE,
+)
+# A bare JWT appearing anywhere else (e.g. embedded in a message or a form body).
+_JWT_RE = re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}")
+
+
+def _scrub(text: str) -> str:
+    """Mask credentials that live in a request/response BODY rather than a header."""
+    if not text:
+        return text
+    text = _TOKEN_RE.sub(r"\1<redacted>\3", text)
+    return _JWT_RE.sub("<redacted-jwt>", text)
 
 
 def _redact(headers: object) -> dict:
@@ -147,18 +175,20 @@ def _record(
             "method": method.upper(),
             "url": url,
             "headers": _redact(req_headers),
-            "body": _truncate(_body_to_text(req_body)),
+            "body": _truncate(_scrub(_body_to_text(req_body))),
         },
         "response": {
             "status": status,
             "headers": _redact(resp_headers),
-            "body": _truncate(_body_to_text(resp_body)),
+            "body": _truncate(_scrub(_body_to_text(resp_body))),
         },
         "elapsed_ms": round(elapsed_ms, 1),
     }
     # `output` is the flat, human-legible half of plan.md's {cmd, output} pair; the
     # structured `request`/`response` keys above carry the full detail.
-    record["output"] = f"{status} — {_truncate(_body_to_text(resp_body))}" if error is None else f"ERROR: {error}"
+    record["output"] = (
+        f"{status} — {_truncate(_scrub(_body_to_text(resp_body)))}" if error is None else f"ERROR: {error}"
+    )
     if error is not None:
         record["error"] = error
     _write(record)
