@@ -89,3 +89,19 @@ Every run of the five markers above writes a Markdown report to the gitignored `
 append one row each to the **committed** `eval/trend_log.jsonl` (spec:
 [eval-framework.md §9](eval-framework.md#9-reporting-and-trend-persistence)) — see
 [policy-eval-correctness-prb.md § Trend log](policy-eval-correctness-prb.md#trend-log).
+
+## Dashboard
+
+`eval/dashboard.py` renders a static, self-contained HTML view (inline SVG, no external
+dependency, no CI wiring) from the two artifacts above — no new data source. Regenerate it after a
+run:
+
+```bash
+.venv/bin/python -m eval.dashboard
+```
+
+Writes `eval/dashboard.html` (gitignored, regenerated each time) with one historical trend chart
+per suite present in `eval/trend_log.jsonl`, plus a collapsible scenario drill-down section per
+report found under `eval/reports/`. A chart point links to its matching report's section when one
+is found on disk within a few hours of that trend-log row's timestamp; otherwise it still shows its
+exact values via a hover tooltip, just without a link.
