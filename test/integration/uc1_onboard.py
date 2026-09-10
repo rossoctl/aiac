@@ -690,19 +690,36 @@ class ReadySignal:
 
 
 def _default_ready_signals(tool_onboarded: bool) -> list[ReadySignal]:
-    """The Policy-A convergence signal set — the exact probe the harness has always polled, preserved
-    as the default so existing rung callers are unchanged:
+    """The Policy-A convergence signal set:
 
       * ``dev-user`` reaches the agent (inbound allow),
+      * ``test-user`` reaches the agent (inbound allow) — the ``tester -> issue_operations`` grant,
       * ``devops-user`` is blocked (inbound deny — proves the restrictive client-scoped gate is live,
         not the allow-all baseline),
       * ``dev-user``'s outbound ``source-read`` has reached its terminal verdict — ``allow`` once a tool
-        is onboarded (rungs 2 & 3), ``deny`` for the empty-gate agent-only rung (rung 1)."""
-    return [
+        is onboarded (rungs 2 & 3), ``deny`` for the empty-gate agent-only rung (rung 1),
+      * ``test-user``'s outbound ``issues-read`` reaches ``allow`` once a tool is onboarded — the
+        tester's outbound issue leg.
+
+    ``test-user`` inbound was ADDED after the 2026-09-10 report: the prior set polled only
+    ``dev-user``/``devops-user`` inbound and ``dev-user`` outbound, so a one-sided ``tester``-only
+    miss on the inbound ``issue_operations`` grant (the abstract "Testers … full read and write
+    access to issues" clause) let the fixture yield "converged" while that gate was missing — the
+    gap surfaced as a late test failure instead of a convergence timeout. Polling both of the
+    tester's legs (the two projections of the same clause) closes that hole: the harness can no
+    longer report convergence while either the inbound agent-scope grant or the outbound tool-scope
+    grant for ``tester`` is absent."""
+    signals = [
         ReadySignal("inbound", "dev-user", "allow"),
+        ReadySignal("inbound", "test-user", "allow"),
         ReadySignal("inbound", "devops-user", "deny"),
         ReadySignal("outbound", "dev-user", "allow" if tool_onboarded else "deny", tool_bare="source-read"),
     ]
+    if tool_onboarded:
+        # The tester's outbound issue leg only has a terminal ``allow`` once a tool exists to gate;
+        # on the agent-only rung there is no tool scope, so this leg is not a convergence signal.
+        signals.append(ReadySignal("outbound", "test-user", "allow", tool_bare="issues-read"))
+    return signals
 
 
 # ======================================================================================
