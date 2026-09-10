@@ -11,9 +11,18 @@ plaintext ``http://`` at the call site but ciphertext on the wire, so a packet c
 process captures the payload before TLS, pairs each request with its own response for
 free, and works for the external LLM calls too.
 
-Both client libraries are patched because the Controller uses both:
+Every client library the Controller uses is patched:
   * ``requests`` — the MCP ``tools/list`` call, the Policy Model Store, the PDP policy library
-  * ``httpx``    — the LLM round-trips (via langchain_openai) and the init health probe
+  * ``httpx``    — the init health probe
+  * ``httpx2``   — the LLM round-trips (via ``langchain_openai``/``openai``)
+
+``httpx`` and ``httpx2`` are separate installed packages, not an alias; patching only the
+former captured zero LLM calls. Both are patched, each if importable.
+
+Activation is a single explicit switch, off by default: set ``AIAC_CAPTURE_ENABLED`` to a
+truthy value (``1``/``true``/``yes``/``on``). ``AIAC_CAPTURE_FILE`` only chooses where output
+goes (default ``/tmp/capture.jsonl``) and never activates capture on its own, so a path may
+sit in a committed ConfigMap without turning recording on.
 
 Install by importing and calling ``install()`` once at process start; it is idempotent.
 """
@@ -28,13 +37,28 @@ import time
 
 logger = logging.getLogger(__name__)
 
+_ENV_ENABLED = "AIAC_CAPTURE_ENABLED"
 _ENV_FILE = "AIAC_CAPTURE_FILE"
 _ENV_MAXLEN = "AIAC_CAPTURE_MAXLEN"
 
+_DEFAULT_FILE = "/tmp/capture.jsonl"
 _DEFAULT_MAXLEN = 20000
+
+_TRUE_VALUES = ("1", "true", "yes", "on")
 
 _installed = False
 _lock = threading.Lock()
+
+
+def _enabled() -> bool:
+    """Capture is OFF unless ``AIAC_CAPTURE_ENABLED`` is explicitly truthy. The flag is the
+    single switch — the output path is configuration, not activation, so leaving a path set
+    (in a committed ConfigMap, say) never silently turns capture on."""
+    return os.environ.get(_ENV_ENABLED, "").strip().lower() in _TRUE_VALUES
+
+
+def _target_file() -> str:
+    return os.environ.get(_ENV_FILE, "").strip() or _DEFAULT_FILE
 
 
 def _maxlen() -> int:
@@ -87,9 +111,9 @@ def _body_to_text(body: object) -> str:
 def _write(record: dict) -> None:
     """Append one JSON object as a line. Best-effort: a capture failure must never break
     the demo run it is observing."""
-    path = os.environ.get(_ENV_FILE)
-    if not path:
+    if not _enabled():
         return
+    path = _target_file()
     try:
         line = json.dumps(record, default=str)
     except Exception:
@@ -188,14 +212,20 @@ def _patch_requests() -> None:
     requests.sessions.Session.request = wrapper  # type: ignore[method-assign]
 
 
-def _patch_httpx() -> None:
+def _patch_httpx_module(module_name: str) -> None:
+    """Patch one httpx-family module's ``Client``/``AsyncClient``.
+
+    ``httpx`` and ``httpx2`` are DISTINCT installed packages here (0.28.x and 2.x), and
+    ``openai``/``langchain_openai`` — i.e. every LLM round-trip — goes through ``httpx2``.
+    Patching only ``httpx`` silently captured zero LLM calls, so both are patched.
+    """
     try:
-        import httpx
+        module = __import__(module_name)
     except ImportError:
         return
 
-    sync_original = httpx.Client.send
-    async_original = httpx.AsyncClient.send
+    sync_original = module.Client.send
+    async_original = module.AsyncClient.send
 
     def _log(request, response, started, error=None):  # type: ignore[no-untyped-def]
         body = None
@@ -210,7 +240,7 @@ def _patch_httpx() -> None:
         except Exception:
             pass
         _record(
-            library="httpx",
+            library=module_name,
             method=str(request.method),
             url=str(request.url),
             req_headers=getattr(request, "headers", None),
@@ -242,15 +272,20 @@ def _patch_httpx() -> None:
         _log(request, response, started)
         return response
 
-    httpx.Client.send = sync_wrapper  # type: ignore[method-assign]
-    httpx.AsyncClient.send = async_wrapper  # type: ignore[method-assign]
+    module.Client.send = sync_wrapper  # type: ignore[method-assign]
+    module.AsyncClient.send = async_wrapper  # type: ignore[method-assign]
+
+
+def _patch_httpx() -> None:
+    for module_name in ("httpx", "httpx2"):
+        _patch_httpx_module(module_name)
 
 
 def install() -> bool:
-    """Patch the HTTP clients if ``AIAC_CAPTURE_FILE`` is set. Idempotent; returns whether
-    capture is active."""
+    """Patch the HTTP clients when ``AIAC_CAPTURE_ENABLED`` is truthy. Off by default;
+    idempotent. Returns whether capture is active."""
     global _installed
-    if not os.environ.get(_ENV_FILE):
+    if not _enabled():
         return False
     if _installed:
         return True
@@ -259,7 +294,7 @@ def install() -> bool:
     _installed = True
     logger.info(
         "capture: HTTP client instrumentation active -> %s (maxlen=%d)",
-        os.environ[_ENV_FILE],
+        _target_file(),
         _maxlen(),
     )
     return True

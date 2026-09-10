@@ -30,6 +30,23 @@ data:
   LLM_MAX_RETRIES: "3"
   LLM_RETRY_BACKOFF_MIN: "1"
   LLM_RETRY_BACKOFF_MAX: "30"
+  # Demo/diagnostic HTTP capture (agent.shared.capture): when enabled, every outbound
+  # HTTP call the Controller makes — the MCP tools/list probe, the IdP-config and
+  # Policy Model Store hops, and the LLM round-trips — is appended to AIAC_CAPTURE_FILE
+  # as one {cmd, output} JSON object per line. Credential headers are redacted and
+  # bodies are truncated at AIAC_CAPTURE_MAXLEN.
+  #
+  # OFF by default, and AIAC_CAPTURE_ENABLED is the ONLY switch: setting a file path
+  # alone never starts recording. Capture writes to the container's /tmp emptyDir, so
+  # output does not survive a pod restart — copy it out before restarting:
+  #   kubectl cp -n aiac-system -c aiac-agent <pod>:/tmp/capture.jsonl ./capture.jsonl
+  # Enable on the LIVE object (do not commit it enabled):
+  #   kubectl patch configmap aiac-agent-config -n aiac-system --type merge \
+  #     -p '{"data":{"AIAC_CAPTURE_ENABLED":"true"}}'
+  #   kubectl rollout restart deployment/aiac-agent -n aiac-system
+  AIAC_CAPTURE_ENABLED: "false"
+  AIAC_CAPTURE_FILE: "/tmp/capture.jsonl"
+  AIAC_CAPTURE_MAXLEN: "20000"
 
 ---
 # Prerequisites: create this Secret before applying this manifest:
