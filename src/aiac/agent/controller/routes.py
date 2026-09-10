@@ -30,6 +30,7 @@ from aiac.agent.policy_rules_builder.graph import (
     PolicyRulesBuilderError,
     UnparseableLLMResponseError,
 )
+from aiac.agent.shared import capture
 from aiac.agent.shared.error_logging import log_by_type
 from aiac.agent.uc.offboarding.offboard import offboard_service
 from aiac.agent.uc.onboarding.orchestrator import onboard_service, reenable_service
@@ -49,6 +50,12 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+# Demo-capture shim (branch ``demo-movie``): records every outbound HTTP call as a
+# ``{cmd, output}`` JSONL line when ``AIAC_CAPTURE_FILE`` is set, and is a no-op otherwise.
+# Installed here for the same reason logging is — module level, so it applies whichever
+# entrypoint imports this module, and before any route can issue a request.
+capture.install()
 
 
 def _loggable(value: object) -> str:
