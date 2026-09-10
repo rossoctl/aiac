@@ -145,6 +145,63 @@ def test_allow_only_scope_direction():
 
 
 # --------------------------------------------------------------------------- #
+# Slice 2b — allow-only, COARSE agent-scope focal, upward projection (rule 3).   #
+# Reproduces the 2026-09-10 integration defect: the inbound gate dropped         #
+# tester -> github-agent.issue_operations while the SAME abstract clause mapped   #
+# correctly outbound onto the fine-grained tool issue scopes. The inbound leg is #
+# build_scope_rules(user_roles, agent_scope) — identical wiring to the working    #
+# outbound leg — so the only variable is the focal scope: here a single COARSE    #
+# capability bundling read+write+search+comments+sub-issues+pull-requests. Both   #
+# developer ("read access to issues") and tester ("full read and write access to  #
+# issues") must upward-project onto it (rule 3); devops is a silent non-grant.    #
+# Exact set equality: dropping tester (the live miss) fails this fixture cluster- #
+# free, where the mocked suite and the integration convergence probe could not    #
+# see it. Uses the scenario's real policy + descriptions (test/integration/       #
+# policy.abstract.md, scenario_uc1.USER_ROLES/AGENT_SCOPES) so it tracks the       #
+# exact strings the live pipeline feeds the LLM.                                  #
+# --------------------------------------------------------------------------- #
+def test_allow_only_coarse_agent_scope_upward_projection():
+    issue_operations = _scope(
+        "s-iss-ops",
+        "github-agent.issue_operations",
+        "Read, search, create, and update issues, comments, sub-issues, and pull requests.",
+    )
+    developer = _role(
+        "r-dev",
+        "developer",
+        "Developer — an engineering user who develops the source codebase (writing and maintaining "
+        "code) and fixes code defects reported in the issue tracker; works primarily in source and "
+        "consults issues for defect reports.",
+    )
+    tester = _role(
+        "r-tst",
+        "tester",
+        "Tester — a quality-assurance user who verifies software quality and tracks defects through "
+        "the issue tracker: filing, triaging, and updating issue reports; works in the issue tracker, "
+        "not in source.",
+    )
+    devops = _role(
+        "r-ops",
+        "devops",
+        "DevOps — an operations user who manages deployment infrastructure and runtime environments; "
+        "does not author source code and does not manage the issue tracker.",
+    )
+
+    policy = (
+        "- Developers work primarily in source — writing and maintaining code — and consult the issue "
+        "tracker to follow defect reports; grant them full read and write access to source contents, "
+        "and read access to issues.\n"
+        "- Testers work in the issue tracker — filing, triaging, and updating defect reports; grant "
+        "them full read and write access to issues."
+    )
+
+    rules = _scope_rules(policy, [developer, tester, devops], issue_operations)
+
+    # Both issue-touching roles upward-project onto the coarse capability; devops earns nothing.
+    assert _role_effects(rules) == {("developer", ALLOW), ("tester", ALLOW)}
+
+
+# --------------------------------------------------------------------------- #
 # Slice 3 — direct-prohibition deny (role direction). "read the source but must  #
 # not write to it": the read-only prohibition in the SCENARIO policy records an  #
 # explicit DENY on the write scope (rule 5), alongside the read ALLOW.          #
