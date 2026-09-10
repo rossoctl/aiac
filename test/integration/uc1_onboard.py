@@ -277,6 +277,33 @@ def cleanup_provisioned(admin, realm: str) -> None:
                 log.warning("cleanup: delete client scope %r failed: %s", name, exc)
 
 
+def reenable_provisioned_clients(admin, realm: str) -> None:
+    """Re-enable any demo workload client (``{namespace}/github-agent`` / ``{namespace}/github-tool``)
+    left **disabled** by a prior run before onboarding starts.
+
+    A failed onboard rolls back by disabling the service's Keycloak client as a failed-service marker
+    (``orchestrator._rollback`` -> ``set_service_enabled(False)``); a fully successful onboard re-enables
+    it. So a client left disabled is the fingerprint of an earlier crashed/aborted run, and it makes the
+    next run's discovery-token mint fail with ``invalid_client`` (a disabled client cannot use the
+    client_credentials grant). Flipping it back to ``enabled`` here restores the same clean slate the
+    onboard's own success path would — idempotent: an already-enabled client is left untouched.
+
+    Keys clients by ``name`` (``{namespace}/{workload}``), exactly as ``resolve_service_id`` and
+    ``require_pipeline`` do — never the SPIFFE ``clientId``. Best-effort: a failure to re-enable one
+    client is logged, not raised, so the run proceeds to onboard (which will surface the real cause)."""
+    from keycloak.exceptions import KeycloakError
+
+    admin.change_current_realm(realm)
+    demo_client_names = {f"{NAMESPACE}/{scn.AGENT_WORKLOAD}", f"{NAMESPACE}/{scn.TOOL_WORKLOAD}"}
+    for client in admin.get_clients():
+        if client.get("name") in demo_client_names and not client.get("enabled", True):
+            try:
+                admin.update_client(client["id"], {"enabled": True})
+                log.info("cleanup: re-enabled disabled client %r left by a prior run", client.get("name"))
+            except KeycloakError as exc:
+                log.warning("cleanup: re-enable client %r failed: %s", client.get("name"), exc)
+
+
 def clear_policy_store() -> None:
     """Drop every persisted SPM from the in-cluster Policy Store before a run — the store-side twin
     of ``cleanup_provisioned``'s Keycloak reset.
@@ -663,19 +690,36 @@ class ReadySignal:
 
 
 def _default_ready_signals(tool_onboarded: bool) -> list[ReadySignal]:
-    """The Policy-A convergence signal set — the exact probe the harness has always polled, preserved
-    as the default so existing rung callers are unchanged:
+    """The Policy-A convergence signal set:
 
       * ``dev-user`` reaches the agent (inbound allow),
+      * ``test-user`` reaches the agent (inbound allow) — the ``tester -> issue_operations`` grant,
       * ``devops-user`` is blocked (inbound deny — proves the restrictive client-scoped gate is live,
         not the allow-all baseline),
       * ``dev-user``'s outbound ``source-read`` has reached its terminal verdict — ``allow`` once a tool
-        is onboarded (rungs 2 & 3), ``deny`` for the empty-gate agent-only rung (rung 1)."""
-    return [
+        is onboarded (rungs 2 & 3), ``deny`` for the empty-gate agent-only rung (rung 1),
+      * ``test-user``'s outbound ``issues-read`` reaches ``allow`` once a tool is onboarded — the
+        tester's outbound issue leg.
+
+    ``test-user`` inbound was ADDED after the 2026-09-10 report: the prior set polled only
+    ``dev-user``/``devops-user`` inbound and ``dev-user`` outbound, so a one-sided ``tester``-only
+    miss on the inbound ``issue_operations`` grant (the abstract "Testers … full read and write
+    access to issues" clause) let the fixture yield "converged" while that gate was missing — the
+    gap surfaced as a late test failure instead of a convergence timeout. Polling both of the
+    tester's legs (the two projections of the same clause) closes that hole: the harness can no
+    longer report convergence while either the inbound agent-scope grant or the outbound tool-scope
+    grant for ``tester`` is absent."""
+    signals = [
         ReadySignal("inbound", "dev-user", "allow"),
+        ReadySignal("inbound", "test-user", "allow"),
         ReadySignal("inbound", "devops-user", "deny"),
         ReadySignal("outbound", "dev-user", "allow" if tool_onboarded else "deny", tool_bare="source-read"),
     ]
+    if tool_onboarded:
+        # The tester's outbound issue leg only has a terminal ``allow`` once a tool exists to gate;
+        # on the agent-only rung there is no tool scope, so this leg is not a convergence signal.
+        signals.append(ReadySignal("outbound", "test-user", "allow", tool_bare="issues-read"))
+    return signals
 
 
 # ======================================================================================
@@ -729,6 +773,7 @@ def onboarded_stack(
     admin = connect_admin()
     delete_agent_cr()  # before — clean policy slate (drop any prior run's CR)
     cleanup_provisioned(admin, TEST_REALM)  # before — clean slate (Keycloak)
+    reenable_provisioned_clients(admin, TEST_REALM)  # before — undo any prior run's failed-service disable
     clear_policy_store()  # before — clean slate (Policy Store SPMs; PV survives redeploys)
     provision_realm_and_users(admin, TEST_REALM)  # BEFORE onboarding (PRB reads the role universe)
     # username->sub mapper + Direct Access Grants are a one-time realm prereq the fixture does NOT

@@ -28,6 +28,7 @@ in ``docs/handoffs/03/04-*.md`` and ``prompts.py`` (_DENY_RULES): explicit prohi
 "only …" -> derived DENY complement over the rest of the candidate set.
 """
 
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -35,6 +36,7 @@ import pytest
 from aiac.agent.policy_rules_builder.graph import build_role_denies, build_role_rules, build_scope_rules
 from aiac.idp.configuration.models import Role, Scope
 from aiac.policy.model.models import PolicyRule, RuleEffect
+from test.integration import scenario_uc1 as scn
 from test.integration.launcher import require_env_or_skip
 
 pytestmark = [pytest.mark.integration, pytest.mark.llm]
@@ -142,6 +144,46 @@ def test_allow_only_scope_direction():
     rules = _scope_rules(policy, [operator, developer], deploy)
 
     assert _role_effects(rules) == {("operator", ALLOW)}
+
+
+# --------------------------------------------------------------------------- #
+# Slice 2b — allow-only, COARSE agent-scope focal, upward projection (rule 3).   #
+# Reproduces the 2026-09-10 integration defect: the inbound gate dropped         #
+# tester -> github-agent.issue_operations while the SAME abstract clause mapped   #
+# correctly outbound onto the fine-grained tool issue scopes. The inbound leg is #
+# build_scope_rules(user_roles, agent_scope) — identical wiring to the working    #
+# outbound leg — so the only variable is the focal scope: here a single COARSE    #
+# capability bundling read+write+search+comments+sub-issues+pull-requests. Both   #
+# developer ("read access to issues") and tester ("full read and write access to  #
+# issues") must upward-project onto it (rule 3); devops is a silent non-grant.    #
+# Exact set equality: dropping tester (the live miss) fails this fixture cluster- #
+# free, where the mocked suite and the integration convergence probe could not    #
+# see it. Role/scope descriptions are imported from scenario_uc1 (USER_ROLES/     #
+# AGENT_SCOPES); the policy is read from the co-located policy.abstract.md file —  #
+# both are the exact scenario strings, sourced at test time rather than copied so   #
+# an edit there can't silently desync this reproduction. NB the file's spelled-out #
+# prose is deliberately NOT the terse POLICY_ABSTRACT constant (scenario_uc1.py)   #
+# that live UC-1 onboarding actually mounts: the fuller prose reproduces the       #
+# coarse-projection miss cluster-free more reliably.                              #
+# --------------------------------------------------------------------------- #
+def test_allow_only_coarse_agent_scope_upward_projection():
+    # Descriptions come verbatim from scenario_uc1 (the strings real UC-1 onboarding feeds the LLM),
+    # imported rather than copied so an edit there can't silently desync this reproduction.
+    issue_operations = _scope(
+        "s-iss-ops", "github-agent.issue_operations", scn.AGENT_SCOPES["github-agent.issue_operations"]
+    )
+    developer = _role("r-dev", "developer", scn.USER_ROLES["developer"])
+    tester = _role("r-tst", "tester", scn.USER_ROLES["tester"])
+    devops = _role("r-ops", "devops", scn.USER_ROLES["devops"])
+
+    # Read the scenario's spelled-out prose from disk (the string the inline copy used to duplicate)
+    # so a policy.abstract.md edit can't silently desync this reproduction.
+    policy = (Path(scn.__file__).parent / "policy.abstract.md").read_text(encoding="utf-8")
+
+    rules = _scope_rules(policy, [developer, tester, devops], issue_operations)
+
+    # Both issue-touching roles upward-project onto the coarse capability; devops earns nothing.
+    assert _role_effects(rules) == {("developer", ALLOW), ("tester", ALLOW)}
 
 
 # --------------------------------------------------------------------------- #

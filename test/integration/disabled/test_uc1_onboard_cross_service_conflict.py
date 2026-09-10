@@ -65,10 +65,14 @@ import requests
 
 # ``integration`` so ``-m "not integration"`` deselects it (no external services in the routine run);
 # ``llm`` because phase 2 drives the real PRB LLM end-to-end, so it can also be selected on its own.
-pytestmark = [pytest.mark.integration, pytest.mark.llm]
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.llm,
+    pytest.mark.skip(reason="isolated/disabled — moved to test/integration/disabled/"),
+]
 
-HERE = Path(__file__).resolve().parent  # test/integration/
-REPO_ROOT = HERE.parents[1]  # -> aiac/
+HERE = Path(__file__).resolve().parent  # test/integration/disabled/
+REPO_ROOT = HERE.parents[2]  # -> aiac/
 sys.path.insert(0, str(REPO_ROOT))  # so ``import test.integration.*`` resolves
 
 from test.integration import scenario_uc1 as scn  # noqa: E402

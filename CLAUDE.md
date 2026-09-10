@@ -46,11 +46,12 @@ ls src/aiac/<subsystem>/               # drill into any layer
 .venv/bin/pytest test/
 ```
 
-The `-m "not integration"` expression needs no external services. The live-LLM
-PRB suite (below) is marked **both** `integration` and `llm` — `integration`
-because it calls a real LLM endpoint, so `-m "not integration"` already deselects
-it (the routine collected count is unchanged by it); `llm` so it can be selected
-on its own, cluster-free, via `-m llm`.
+Bare `pytest test/` runs unit tests only and needs no external services:
+`addopts` in `pyproject.toml` excludes `integration` (and the `eval_*` markers)
+by default, and a command-line `-m` overrides that default (last `-m` wins). The
+live-LLM PRB suite (below) is marked **both** `integration` and `llm` —
+`integration` (it calls a real LLM endpoint) means the default already deselects
+it; `llm` lets it be selected on its own, cluster-free, via `-m llm`.
 
 Use `ls test/` / `find test -type d` to discover current test directories.
 
@@ -199,7 +200,7 @@ demo workloads, which don't) and CPU/memory requests + limits.
 
 ### Issue tracker
 
-GitHub issues on `s-and-p-team/cortex` (the origin fork), filtered by the `aiac` label. See `docs/agents/issue-tracker.md`.
+GitHub issues in this repo's own remote (`rossoctl/aiac`), filtered by the `aiac` label; org-level Project board **AIAC #12** on `rossoctl`, triage state on its custom `Triage Status` field. Migrated from `s-and-p-team/cortex` on 2026-09-09. See `docs/agents/issue-tracker.md`.
 
 ### Domain docs
 
