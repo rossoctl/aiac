@@ -87,10 +87,10 @@ MARKERS = {
     "eval_correctness_e2e",
 }
 
-# Auto-load eval/.env so LLM_BASE_URL/KEYCLOAK_URL/etc. are set without having to
+# Auto-load the repo-root .env so LLM_BASE_URL/KEYCLOAK_URL/etc. are set without having to
 # `set -a; . .env; set +a` before invoking pytest. Existing environment
 # variables take precedence (override=False), so CI/shell exports still win.
-load_dotenv(HERE / ".env", override=False)
+load_dotenv(HERE.parent / ".env", override=False)
 
 _docstrings: dict[str, str] = {}
 _reports: dict[str, pytest.TestReport] = {}
