@@ -35,6 +35,7 @@ import pytest
 from aiac.agent.policy_rules_builder.graph import build_role_denies, build_role_rules, build_scope_rules
 from aiac.idp.configuration.models import Role, Scope
 from aiac.policy.model.models import PolicyRule, RuleEffect
+from test.integration import scenario_uc1 as scn
 from test.integration.launcher import require_env_or_skip
 
 pytestmark = [pytest.mark.integration, pytest.mark.llm]
@@ -156,36 +157,21 @@ def test_allow_only_scope_direction():
 # issues") must upward-project onto it (rule 3); devops is a silent non-grant.    #
 # Exact set equality: dropping tester (the live miss) fails this fixture cluster- #
 # free, where the mocked suite and the integration convergence probe could not    #
-# see it. Uses the scenario's real policy + descriptions (test/integration/       #
-# policy.abstract.md, scenario_uc1.USER_ROLES/AGENT_SCOPES) so it tracks the       #
-# exact strings the live pipeline feeds the LLM.                                  #
+# see it. Role/scope descriptions are imported from scenario_uc1 (USER_ROLES/     #
+# AGENT_SCOPES) so they track the exact strings the live pipeline feeds the LLM;   #
+# the policy is a purpose-written explicit reproduction of the two abstract-policy #
+# clauses that drive this pair (deliberately more spelled-out than the terse       #
+# POLICY_ABSTRACT, to reliably reproduce the coarse-projection miss).             #
 # --------------------------------------------------------------------------- #
 def test_allow_only_coarse_agent_scope_upward_projection():
+    # Descriptions come verbatim from scenario_uc1 (the strings real UC-1 onboarding feeds the LLM),
+    # imported rather than copied so an edit there can't silently desync this reproduction.
     issue_operations = _scope(
-        "s-iss-ops",
-        "github-agent.issue_operations",
-        "Read, search, create, and update issues, comments, sub-issues, and pull requests.",
+        "s-iss-ops", "github-agent.issue_operations", scn.AGENT_SCOPES["github-agent.issue_operations"]
     )
-    developer = _role(
-        "r-dev",
-        "developer",
-        "Developer — an engineering user who develops the source codebase (writing and maintaining "
-        "code) and fixes code defects reported in the issue tracker; works primarily in source and "
-        "consults issues for defect reports.",
-    )
-    tester = _role(
-        "r-tst",
-        "tester",
-        "Tester — a quality-assurance user who verifies software quality and tracks defects through "
-        "the issue tracker: filing, triaging, and updating issue reports; works in the issue tracker, "
-        "not in source.",
-    )
-    devops = _role(
-        "r-ops",
-        "devops",
-        "DevOps — an operations user who manages deployment infrastructure and runtime environments; "
-        "does not author source code and does not manage the issue tracker.",
-    )
+    developer = _role("r-dev", "developer", scn.USER_ROLES["developer"])
+    tester = _role("r-tst", "tester", scn.USER_ROLES["tester"])
+    devops = _role("r-ops", "devops", scn.USER_ROLES["devops"])
 
     policy = (
         "- Developers work primarily in source — writing and maintaining code — and consult the issue "
