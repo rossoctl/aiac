@@ -55,7 +55,7 @@ LLM_MARKER = "/chat/completions"
 SUBTITLE_MAX = 90
 
 # Where the demo proper begins; everything before it is setup scaffolding.
-FIRST_DEMO_TASK = "Find the agent among everything registered"
+FIRST_DEMO_TASK = "Identify the agent among everything registered"
 
 
 def _subtitle(text: str, limit: int = SUBTITLE_MAX) -> str:
@@ -147,6 +147,17 @@ def short_output(rec: dict, limit: int = DEFAULT_LIMIT) -> str:
 
 def step(rec: dict) -> dict:
     out = {"cmd": rec["cmd"], "output": short_output(rec)}
+    # What was SENT is often the substance of a step, not what came back: the Policy Writer
+    # POST carries the entire computed policy model and answers only `204`, and the LLM
+    # calls carry the prompt. Without this the interesting half of those exchanges is
+    # invisible. Only real payloads are attached, so GETs stay uncluttered.
+    req_body = rec.get("request", {}).get("body") or ""
+    if len(req_body.strip()) > 2:
+        out["sent"] = (
+            req_body
+            if len(req_body) <= DEFAULT_LIMIT
+            else req_body[:DEFAULT_LIMIT] + f"…[+{len(req_body) - DEFAULT_LIMIT} chars]"
+        )
     # For an LLM call the decision is buried in JSON-escaped `choices[0].message.content`.
     # `output` keeps the verbatim envelope; the decoded decision goes to `explain` so it is
     # readable without rewriting what came back.
@@ -215,6 +226,51 @@ def _client_hint(rec: dict, workload: str) -> str | None:
         if isinstance(client, dict) and (client.get("name", "") or "").endswith(f"/{workload}"):
             return f"{len(clients)} clients returned; {workload}'s UUID is the service id"
     return f"{len(clients)} clients returned"
+
+
+# --- state-inspection steps (what `make show` / `make diff` really do) ------
+# These targets are demo wrappers, not requests. Under the hood show-state.py makes two
+# Keycloak admin calls and reads the generated .rego off disk. Emitting `$ make show` as a
+# `cmd` would put a fake request in a field reserved for real ones, so the wrapper is
+# dropped and the underlying operations are shown instead.
+GENERATED_DIR = Path(
+    "/Users/arielf/development/sentry/aiac/demo/use-cases/uc1-onboarding/generated"
+)
+
+
+def state_steps(driver_raw: list[dict], bounds: tuple[int, int]) -> list[dict]:
+    """The real Keycloak reads show-state.py performs, within a run window."""
+    lo, hi = bounds
+    out = []
+    for rec in driver_raw[lo:hi]:
+        url = rec.get("request", {}).get("url", "")
+        method = rec.get("request", {}).get("method", "")
+        if method == "GET" and (url.endswith("/roles") or url.endswith("/client-scopes")):
+            out.append(step(rec))
+    return out
+
+
+def rego_steps(snapshot: str) -> list[dict]:
+    """The generated Rego itself, read from the snapshot the demo captured.
+
+    This is the artifact the whole demo produces, and a live enforcement point reads the
+    same content out of the CR — so it belongs in `output` verbatim rather than being
+    represented by the path it was written to.
+    """
+    base = GENERATED_DIR / snapshot / "team1" / "github-agent"
+    out = []
+    for gate in ("inbound", "outbound"):
+        f = base / gate / "request.rego"
+        if f.exists():
+            out.append(
+                {
+                    "cmd": f"kubectl get authorizationpolicies.agent.rossoctl.dev github-agent "
+                    f"-n team1 -o jsonpath='{{.spec.policies[?(@.path==\"{gate}/request.rego\")].content}}'",
+                    "output": f.read_text().strip(),
+                    "explain": f"the {gate} gate AuthBridge evaluates on every request",
+                }
+            )
+    return out
 
 
 # --- Source A: terminal narration ------------------------------------------
@@ -292,31 +348,31 @@ def grants_step(log_path: Path) -> dict:
     """``make show``'s inbound/outbound grants tables — the pause evidence. These tables
     ARE the point of a show step, so they are kept verbatim rather than summarized."""
     if not log_path.exists():
-        return {"cmd": "(grants tables)", "output": "(log missing)"}
+        return {"cmd": "[derived] effective grants", "output": "(log missing)"}
     text = log_path.read_text(errors="replace")
     idx = text.find("inbound grants")
     if idx == -1:
         # Pause 1: nothing onboarded, so no grants tables exist at all.
         tail = "\n".join(ln.rstrip() for ln in text.splitlines()[-6:] if ln.strip())
         return {
-            "cmd": "(generated policy state)",
+            "cmd": "[derived] generated policy state",
             "output": tail or "(no policy generated yet)",
         }
     body = "\n".join(ln.rstrip() for ln in text[idx:].splitlines() if ln.strip())
-    return {"cmd": "(inbound / outbound grants tables)", "output": body}
+    return {"cmd": "[derived] effective grants, computed from the state above", "output": body}
 
 
 def rego_diff_step(log_path: Path) -> dict:
     """The +/- Rego hunks ``make diff`` prints — the demo's headline artifact, kept in full."""
     if not log_path.exists():
-        return {"cmd": "(rego diff)", "output": "(log missing)"}
+        return {"cmd": "[derived] rego diff", "output": "(log missing)"}
     lines = [
         ln.rstrip()
         for ln in log_path.read_text(errors="replace").splitlines()
         if ln.lstrip()[:1] in ("+", "-") and not ln.lstrip().startswith(("+++", "---"))
     ]
     return {
-        "cmd": "(generated Rego diff: 01-after-agent -> 02-after-tool)",
+        "cmd": "[derived] diff of the generated Rego: 01-after-agent -> 02-after-tool",
         "output": "\n".join(lines) or "(no differences)",
     }
 
@@ -499,125 +555,108 @@ def main() -> None:
         "workloads' Keycloak client UUIDs, and enabled RFC 8693 token exchange on the agent's client.",
     )
     add(
-        "Before: nothing is onboarded",
-        narration_steps(logs / "show-1-baseline.log", "show") + [grants_step(logs / "show-1-baseline.log")],
-        "Three users, no agent policy, nothing to enforce.",
+        "Starting point: no access rules exist",
+        state_steps(driver_raw, (0, d_agent_lo)) + [grants_step(logs / "show-1-baseline.log")],
+        "Three users with job titles. No rules about what they may reach.",
     )
 
     # 6 — make agent, split per plan.md
     add(
-        "Find the agent among everything registered",
+        "Identify the agent among everything registered",
         driver_steps(driver_raw, "keycloak-admin", window="agent", bounds=agent_bounds)
         or [{"cmd": "GET <keycloak>/admin/realms/rossoctl/clients", "output": "(not captured — see note)"}],
-        "The agent's real identity: a UUID, not a name.",
+        "12 clients in the realm. Which one is the agent, and what is its real id?",
     )
     add(
-        "Ask AIAC to onboard the agent",
-        merge_narration(
-            driver_steps(driver_raw, "apply-service", window="agent", bounds=agent_bounds),
-            narration_steps(logs / "agent.log")[:1],
-        )
-        or narration_steps(logs / "agent.log")[:1],
-        "One request. Everything below happens inside it.",
-    )
-    add(
-        "AIAC discovers what the agent is and can do",
+        "Determine what the agent is and what it can do",
         [step(r) for r in by(agent_recs, "idp-config")],
-        "It reads the agent's own capabilities and the roles that exist.",
+        "Its capabilities, and every role that might reach them — 118 lookups.",
     )
     add(
-        "Read the English policy, propose who gets what",
+        "Decide which roles may use each capability",
         [step(r) for r in by(agent_recs, "llm-propose")],
-        "An LLM maps two lines of English onto concrete grants.",
+        "Two lines of English, one decision per role/capability pair.",
     )
     add(
-        "Audit every proposal before trusting it",
+        "Check every decision before trusting it",
         [step(r) for r in by(agent_recs, "llm-audit")],
-        "A second pass checks the first — and can reject it.",
+        "A second opinion on each one, with the power to send it back.",
     )
     add(
-        "Turn the decisions into enforceable policy",
+        "Express the decisions as machine-enforceable rules",
         [step(r) for r in by(agent_recs, "policy-writer")],
-        "The decisions become Rego, enforced by the mesh.",
+        "The full policy model goes in; enforceable Rego comes out.",
     )
     add(
-        "Remember the decision for next time",
+        "Record the decisions so later work builds on them",
         [step(r) for r in by(agent_recs, "model-store")],
-        "Onboarding stays incremental, not recomputed.",
+        "So onboarding the next workload does not start from scratch.",
     )
     add(
-        "Read back the policy that now guards the agent",
-        narration_steps(logs / "agent.log")[-1:],
-        "Proof: the policy is really on the cluster.",
+        "The rules that now guard the agent",
+        rego_steps("01-after-agent"),
+        "Written by nobody. This is what a request is checked against.",
     )
     add(
-        "The agent is guarded — but it has no tool yet",
-        narration_steps(logs / "show-2-after-agent.log", "show") + [grants_step(logs / "show-2-after-agent.log")],
-        "Who may call the agent is set. What it may do is still blank.",
+        "Halfway: who may call the agent is settled",
+        state_steps(driver_raw, (d_agent_hi, d_tool_lo))
+        + [grants_step(logs / "show-2-after-agent.log")],
+        "What the agent may do downstream is still entirely blank.",
     )
 
     # 8 — make tool, split per plan.md
     add(
-        "Find the tool among everything registered",
+        "Identify the tool the agent will call",
         driver_steps(driver_raw, "keycloak-admin", window="tool", bounds=tool_bounds)
         or [{"cmd": "GET <keycloak>/admin/realms/rossoctl/clients", "output": "(not captured — see note)"}],
-        "The tool's identity, same lookup.",
+        "Same problem again: which registration is the tool?",
     )
     add(
-        "Ask AIAC to onboard the tool",
-        merge_narration(
-            driver_steps(driver_raw, "apply-service", window="tool", bounds=tool_bounds),
-            narration_steps(logs / "tool.log")[:1],
-        )
-        or narration_steps(logs / "tool.log")[:1],
-        "One request again — the tool is a target, not an actor.",
-    )
-    add(
-        "Ask the tool itself what it can do",
+        "Enumerate the tool's actual capabilities",
         [step(r) for r in by(tool_recs, "mcp-tools-list")],
-        "The tool declares 4 capabilities. Nobody typed them in.",
+        "Asked the running tool directly. It answers with 4. Nobody typed them in.",
     )
     add(
         "Decide which roles may use each tool capability",
         [step(r) for r in by(tool_recs, "llm-propose")],
-        "The same English policy, now against real tool capabilities.",
+        "The same two lines of English, now against real tool capabilities.",
     )
     add(
-        "Audit those decisions too",
+        "Check those decisions too",
         [step(r) for r in by(tool_recs, "llm-audit")],
-        "Audited again, all approved.",
+        "Every one reviewed a second time.",
     )
     add(
-        "Update the agent's policy now the tool exists",
+        "Extend the agent's rules to cover the tool",
         [step(r) for r in by(tool_recs, "policy-writer")],
-        "The agent's permissions now reach the tool.",
+        "The tool needs no rules of its own — it is a target, not an actor.",
     )
     add(
-        "Remember the tool's decisions",
+        "Record the tool's decisions",
         [step(r) for r in by(tool_recs, "model-store")],
-        "Both workloads remembered.",
+        "Both workloads now on record.",
     )
     add(
-        "Read back the completed policy",
-        narration_steps(logs / "tool.log")[-1:],
-        "The finished policy, captured.",
+        "The completed rules",
+        rego_steps("02-after-tool"),
+        "Both gates now populated.",
     )
     add(
-        "Least-privilege access, written by nobody",
-        narration_steps(logs / "diff.log", "diff PRIOR=01-after-agent") + [rego_diff_step(logs / "diff.log")],
-        "Developers get source + read issues. Testers get issues only.",
+        "The result: least privilege, written by nobody",
+        state_steps(driver_raw, (d_tool_hi, len(driver_raw))) + [rego_diff_step(logs / "diff.log")],
+        "Developers: source + read issues. Testers: issues only. From two lines.",
     )
 
     # 10-12 — drive real users through the gates
     USER_TASK = {
-        "dev": "A developer uses the agent",
-        "test": "A tester uses the agent",
+        "dev": "A developer does their job",
+        "test": "A tester does their job",
         "devops": "Someone the policy never mentioned tries",
     }
     for target, summary in (
         ("dev", "Reads and writes source, reads issues — but cannot close one."),
         ("test", "Files and reads issues — but cannot see source."),
-        ("devops", "Refused at the door. The policy never granted them anything."),
+        ("devops", "Refused at the door. Nothing ever granted them access."),
     ):
         log = logs / f"{target}.log"
         narrated = narration_steps(log)
@@ -639,7 +678,7 @@ def main() -> None:
         if rows:
             steps.append(
                 {
-                    "cmd": f"(result table for {target}-user)",
+                    "cmd": f"[derived] allow/deny outcome per intent for {target}-user",
                     "output": "\n".join(rows),
                     "explain": "The demo's own summary of each intent's allow/deny outcome.",
                 }
