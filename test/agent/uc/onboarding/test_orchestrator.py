@@ -358,6 +358,114 @@ class TestRetryableReRunRollsBackIdempotently:
         config.set_service_enabled.assert_called_once_with(service, False)
 
 
+class TestLockRegistryEviction:
+    """Issue 202: the per-service lock registry must not grow unbounded. Once the last run
+    using a service_id's lock finishes -- on the success path and on EVERY failure path --
+    the entry is evicted, while same-service runs stay strictly serialized across the
+    eviction boundary. Emptiness is observed on the module-level `_service_locks` registry
+    (the ticket's contract is precisely that this map does not accumulate idle entries)."""
+
+    def test_success_path_evicts_the_entry(self):
+        graph = _graph(service_type=ServiceType.AGENT)
+        with (
+            patch.object(orchestrator, "build_provision_graph", return_value=graph),
+            patch.object(orchestrator, "ServicePolicyBuilder") as spb,
+            patch.object(orchestrator, "_config", return_value=_config_returning(object())),
+        ):
+            spb.build.return_value = [object()]
+            orchestrator.onboard_service(SERVICE_ID)
+
+        assert SERVICE_ID not in orchestrator._service_locks
+
+    @pytest.mark.parametrize("error", _rollback_errors(), ids=lambda e: type(e).__name__)
+    def test_rollback_path_evicts_the_entry(self, error):
+        # Every typed build failure runs the compensating rollback and re-raises; the entry
+        # is evicted the same way as on success.
+        role = Role(id="r1", name="weather.forecast", composite=False)
+        scope = Scope(id="s1", name="weather.history")
+        graph = _graph(created_roles=[role], created_scopes=[scope])
+        with (
+            patch.object(orchestrator, "build_provision_graph", return_value=graph),
+            patch.object(orchestrator, "ServicePolicyBuilder") as spb,
+            patch.object(orchestrator, "_config", return_value=_config_returning(object())),
+        ):
+            spb.build.side_effect = error
+            with pytest.raises(type(error)):
+                orchestrator.onboard_service(SERVICE_ID)
+
+        assert SERVICE_ID not in orchestrator._service_locks
+
+    def test_passthrough_fault_evicts_the_entry(self):
+        # A non-rollback fault (e.g. an HTTPException from focus resolution) propagates
+        # untouched, but the lock entry is still evicted on the way out.
+        graph = _graph(service_type=ServiceType.TOOL)
+        with (
+            patch.object(orchestrator, "build_provision_graph", return_value=graph),
+            patch.object(orchestrator, "ServicePolicyBuilder") as spb,
+            patch.object(orchestrator, "_config", return_value=_config_returning(object())),
+        ):
+            spb.build.side_effect = HTTPException(502, "IdP config unavailable")
+            with pytest.raises(HTTPException):
+                orchestrator.onboard_service(SERVICE_ID)
+
+        assert SERVICE_ID not in orchestrator._service_locks
+
+    def test_provision_stage_fault_evicts_the_entry(self):
+        # A fault raised in the provision stage (before the try/except) must also evict:
+        # the entry is claimed at lock-acquire, so its release path runs on this exit too.
+        graph = MagicMock()
+        graph.invoke.side_effect = HTTPException(502, "IdP config unavailable")
+        with (
+            patch.object(orchestrator, "build_provision_graph", return_value=graph),
+            patch.object(orchestrator, "ServicePolicyBuilder"),
+        ):
+            with pytest.raises(HTTPException):
+                orchestrator.onboard_service(SERVICE_ID)
+
+        assert SERVICE_ID not in orchestrator._service_locks
+
+
+    def test_same_service_runs_stay_serialized_across_eviction(self):
+        # Overlapping same-service runs are driven through eviction boundaries: staggered
+        # arrivals let early runs finish (and evict) while later ones are still queued on or
+        # arriving at the lock. A naive delete would let a late arrival mint a fresh lock and
+        # overtake a queued waiter -- so `max` would climb above 1. Reference-counted eviction
+        # keeps the shared lock in the map while any run holds or waits, so max stays 1, and
+        # the registry is empty once the last run leaves.
+        concurrency = {"cur": 0, "max": 0}
+        counter_lock = threading.Lock()
+
+        def _build(_service_id, _service_type):
+            with counter_lock:
+                concurrency["cur"] += 1
+                concurrency["max"] = max(concurrency["max"], concurrency["cur"])
+            threading.Event().wait(0.05)
+            with counter_lock:
+                concurrency["cur"] -= 1
+            return [object()]
+
+        with (
+            patch.object(orchestrator, "build_provision_graph", return_value=_graph()),
+            patch.object(orchestrator, "ServicePolicyBuilder") as spb,
+            patch.object(orchestrator, "_config", return_value=_config_returning(object())),
+        ):
+            spb.build.side_effect = _build
+
+            def _run():
+                orchestrator.onboard_service(SERVICE_ID)
+
+            threads = [threading.Thread(target=_run) for _ in range(6)]
+            for t in threads:
+                t.start()
+                threading.Event().wait(0.02)  # stagger so runs cross eviction boundaries
+            for t in threads:
+                t.join(timeout=10)
+                assert not t.is_alive(), "onboard_service thread hung (deadlock?)"
+
+        assert concurrency["max"] == 1, "same-service runs overlapped across an eviction"
+        assert SERVICE_ID not in orchestrator._service_locks
+
+
 class TestPerServiceSerialization:
     """Issue 180: the full provision → build → rollback lifecycle is serialized per
     service_id so overlapping same-service runs (POST + NATS) cannot corrupt the
