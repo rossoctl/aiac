@@ -55,7 +55,7 @@ LLM_MARKER = "/chat/completions"
 SUBTITLE_MAX = 90
 
 # Where the demo proper begins; everything before it is setup scaffolding.
-FIRST_DEMO_TASK = "Identify the agent among everything registered"
+FIRST_DEMO_TASK = "Resolve the agent's Keycloak client UUID"
 
 
 def _subtitle(text: str, limit: int = SUBTITLE_MAX) -> str:
@@ -85,6 +85,14 @@ def _llm_gist(decoded: str) -> str:
     if denied:
         bits.append("deny " + ", ".join(map(str, denied)))
     return _subtitle("; ".join(bits) or "no grants")
+
+
+def _is_read(rec: dict) -> bool:
+    """GET vs mutating call. The IdP-config traffic is two distinct phases — discovery
+    (GET the client, the realm roles/scopes, the workload's own skills) and provisioning
+    (POST a role + scope per skill, then bind them) — and a developer reading this needs
+    them separated, not merged into one 118-call blob."""
+    return (rec.get("request", {}).get("method") or "").upper() == "GET"
 
 
 def classify(rec: dict) -> str:
@@ -562,101 +570,106 @@ def main() -> None:
 
     # 6 — make agent, split per plan.md
     add(
-        "Identify the agent among everything registered",
+        "Resolve the agent's Keycloak client UUID",
         driver_steps(driver_raw, "keycloak-admin", window="agent", bounds=agent_bounds)
         or [{"cmd": "GET <keycloak>/admin/realms/rossoctl/clients", "output": "(not captured — see note)"}],
-        "12 clients in the realm. Which one is the agent, and what is its real id?",
+        "Its clientId is a SPIFFE URI; the UUID is what the onboarding route takes.",
     )
     add(
-        "Determine what the agent is and what it can do",
-        [step(r) for r in by(agent_recs, "idp-config")],
-        "Its capabilities, and every role that might reach them — 118 lookups.",
+        "Classify the workload and read its declared skills",
+        [step(r) for r in by(agent_recs, "idp-config") if _is_read(r)],
+        "Pod label rossoctl.io/type says Agent; skills come from its AgentCard CR.",
     )
     add(
-        "Decide which roles may use each capability",
+        "Create a Keycloak role and scope per declared skill",
+        [step(r) for r in by(agent_recs, "idp-config") if not _is_read(r)],
+        "One realm role + one client scope per skill, attached to the client.",
+    )
+    add(
+        "LLM proposes grants per role/scope pair against policy.md",
         [step(r) for r in by(agent_recs, "llm-propose")],
-        "Two lines of English, one decision per role/capability pair.",
+        "One structured call per candidate pair; policy.md is the only human input.",
     )
     add(
-        "Check every decision before trusting it",
+        "Second LLM pass audits each proposal",
         [step(r) for r in by(agent_recs, "llm-audit")],
-        "A second opinion on each one, with the power to send it back.",
+        "Returns {approved, reason}; a reject retries the propose, up to 3 times.",
     )
     add(
-        "Express the decisions as machine-enforceable rules",
+        "Render Rego and server-side-apply the AuthorizationPolicy CR",
         [step(r) for r in by(agent_recs, "policy-writer")],
-        "The full policy model goes in; enforceable Rego comes out.",
+        "POST the computed model to the Policy Writer; it patches the CR. 204, no body.",
     )
     add(
-        "Record the decisions so later work builds on them",
+        "Persist the computed policy to the Policy Model Store",
         [step(r) for r in by(agent_recs, "model-store")],
-        "So onboarding the next workload does not start from scratch.",
+        "Keyed by service id, so the next onboarding is incremental.",
     )
     add(
-        "The rules that now guard the agent",
+        "The generated Rego, read back from the CR",
         rego_steps("01-after-agent"),
-        "Written by nobody. This is what a request is checked against.",
+        "Two gates: inbound (who may call) and outbound (what it may do).",
     )
     add(
-        "Halfway: who may call the agent is settled",
+        "State after the agent alone: inbound populated, outbound empty",
         state_steps(driver_raw, (d_agent_hi, d_tool_lo))
         + [grants_step(logs / "show-2-after-agent.log")],
-        "What the agent may do downstream is still entirely blank.",
+        "No tool is onboarded yet, so every outbound map is still empty.",
     )
 
     # 8 — make tool, split per plan.md
     add(
-        "Identify the tool the agent will call",
+        "Resolve the tool's Keycloak client UUID",
         driver_steps(driver_raw, "keycloak-admin", window="tool", bounds=tool_bounds)
         or [{"cmd": "GET <keycloak>/admin/realms/rossoctl/clients", "output": "(not captured — see note)"}],
-        "Same problem again: which registration is the tool?",
+        "Same lookup; its client.type attribute is Tool, not Agent.",
     )
     add(
-        "Enumerate the tool's actual capabilities",
+        "Call the tool's live MCP endpoint for tools/list",
         [step(r) for r in by(tool_recs, "mcp-tools-list")],
-        "Asked the running tool directly. It answers with 4. Nobody typed them in.",
+        "JSON-RPC to the running pod. 4 tools returned, each with its own schema.",
     )
     add(
-        "Decide which roles may use each tool capability",
+        "LLM proposes grants for the discovered tool scopes",
         [step(r) for r in by(tool_recs, "llm-propose")],
-        "The same two lines of English, now against real tool capabilities.",
+        "Same policy.md, now judged against capabilities discovered at runtime.",
     )
     add(
-        "Check those decisions too",
+        "Second LLM pass audits the tool proposals",
         [step(r) for r in by(tool_recs, "llm-audit")],
-        "Every one reviewed a second time.",
+        "Same approved/reason contract; all approved on the first pass.",
     )
     add(
-        "Extend the agent's rules to cover the tool",
+        "Re-render the AGENT's CR to fill in its outbound gate",
         [step(r) for r in by(tool_recs, "policy-writer")],
-        "The tool needs no rules of its own — it is a target, not an actor.",
+        "No CR is written for the tool: it is a target, so the agent's policy changes.",
     )
     add(
-        "Record the tool's decisions",
+        "Persist the updated policy model",
         [step(r) for r in by(tool_recs, "model-store")],
-        "Both workloads now on record.",
+        "Now covering both workloads.",
     )
     add(
-        "The completed rules",
+        "The completed Rego, read back from the CR",
         rego_steps("02-after-tool"),
-        "Both gates now populated.",
+        "The outbound gate is now keyed by the tool's SPIFFE id.",
     )
     add(
-        "The result: least privilege, written by nobody",
+        "Diff of the two snapshots: the outbound gate filling in",
         state_steps(driver_raw, (d_tool_hi, len(driver_raw))) + [rego_diff_step(logs / "diff.log")],
-        "Developers: source + read issues. Testers: issues only. From two lines.",
+        "target_allow_scopes keyed by SPIFFE id; grants from two lines of English.",
     )
 
     # 10-12 — drive real users through the gates
     USER_TASK = {
-        "dev": "A developer does their job",
-        "test": "A tester does their job",
-        "devops": "Someone the policy never mentioned tries",
+        "dev": "dev-user: ROPC login, RFC 8693 exchange, then both gates",
+        "test": "test-user: same flow, different role",
+        "devops": "devops-user: a role the policy never mentions",
     }
     for target, summary in (
         ("dev", "Reads and writes source, reads issues — but cannot close one."),
         ("test", "Files and reads issues — but cannot see source."),
-        ("devops", "Refused at the door. Nothing ever granted them access."),
+        ("devops", "Blocked at the inbound gate — no role sources any scope the agent exposes."),
     ):
         log = logs / f"{target}.log"
         narrated = narration_steps(log)
