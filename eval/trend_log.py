@@ -78,9 +78,12 @@ def append_row(
 
     ``model`` defaults to ``LLM_MODEL`` (spec §7: the pinned model version is recorded on every
     row so historical trend data stays interpretable across model changes), falling back to
-    ``"unknown"`` when unset. ``run_type`` distinguishes routine regression rows from the
-    ``"model_selection"`` comparison run (spec §7.1) — not produced by this ticket, but the
-    parameter exists so that future run reuses this same writer instead of a parallel one.
+    ``"unknown"`` when unset. ``run_type`` distinguishes routine ``"regression"`` rows from
+    ``"partial"`` (``eval/conftest.py``'s ``_write_trend_log``, when a run — a ``-k`` filter, or
+    most scenarios erroring in setup — scores fewer than the full scenario corpus, so it's not
+    comparable to a full-corpus regression row) and from the ``"model_selection"`` comparison run
+    (spec §7.1) — not produced by this ticket, but the parameter exists so that future run reuses
+    this same writer instead of a parallel one.
 
     Every float value in ``metrics`` is rounded to 3 decimal digits before being written — plenty
     of precision to see drift over time, and keeps the committed file's diffs small and readable.
