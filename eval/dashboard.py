@@ -376,9 +376,9 @@ def build_dashboard(
     ``output_path``, and return that path."""
     trend_rows = load_trend_log(trend_log_path)
     reports = parse_reports(reports_dir)
-    html = render_dashboard(trend_rows, reports)
+    page = render_dashboard(trend_rows, reports)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(html, encoding="utf-8")
+    output_path.write_text(page, encoding="utf-8")
     return output_path
 
 
