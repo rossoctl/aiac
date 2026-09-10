@@ -192,6 +192,13 @@ _TREND_LOG_SUITES = {
     "eval_correctness_e2e": "correctness_e2e",
 }
 
+# Full Correctness corpus size (eval.test_policy_pipeline_eval.SCENARIOS) -- kept as a plain
+# constant rather than imported, so this module (loaded for every eval/ run, marked or not) stays
+# free of that file's heavy Keycloak/launcher imports. A run that scores fewer scenarios than this
+# (a `-k` filter, or most scenarios erroring in setup) is not comparable to a full-corpus run, so
+# it's tagged "partial" rather than "regression" -- see _write_trend_log. Bump if the corpus grows.
+_EXPECTED_SCENARIO_COUNT = 8
+
 
 def _format_best_effort_notes(notes: dict[str, str]) -> str:
     """Render a ``{scope_or_role_name: reason}`` dict (``orchestrate_prb``'s ``best_effort_notes``)
@@ -266,13 +273,17 @@ def _render_entry(lines: list[str], nodeid: str, report: pytest.TestReport, cate
     lines.append("")
 
 
-def _write_trend_log(now: datetime) -> None:
+def _write_trend_log() -> None:
     """One committed trend-log row per Correctness suite present in this session (PRB-level
     and/or end-to-end) — spec: docs/specs/eval/eval-framework.md §9. Pools every scenario's
     true_positives/denied_total counts (and over_grants/under_grants/incorrectly_denied pair
     dicts) that reached score_scenario — a scenario whose own setup failed never recorded these,
     so it contributes nothing to the pooled row, same as _render_metrics_block's
-    unavailable_reason branch above treats it as absent rather than zero."""
+    unavailable_reason branch above treats it as absent rather than zero.
+
+    Always stamped in UTC, independent of ``EVAL_REPORT_TZ`` (that variable only controls the
+    gitignored per-run Markdown report's timestamp/filename) — a committed file read by every
+    contributor and by downstream trend analysis must not carry a per-contributor UTC offset."""
     by_suite: dict[str, list[dict]] = {}
     for report in _reports.values():
         for marker, suite in _TREND_LOG_SUITES.items():
@@ -284,10 +295,15 @@ def _write_trend_log(now: datetime) -> None:
 
     for suite, entries in by_suite.items():
         if entries:
-            append_row(suite, pool_correctness_metrics(entries), timestamp=now)
+            run_type = "regression" if len(entries) == _EXPECTED_SCENARIO_COUNT else "partial"
+            append_row(suite, pool_correctness_metrics(entries), run_type=run_type)
 
 
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    if hasattr(session.config, "workerinput"):
+        return  # xdist worker -- only the controller (which receives every worker's reports via
+        # pytest_runtest_logreport) has the full-session picture; each worker would otherwise
+        # write its own partial trend-log row and Markdown report on top of the controller's.
     if not _reports:
         return  # this session collected none of this suite's tests -- nothing to report
 
@@ -299,7 +315,7 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
         buckets[cat].sort(key=lambda pair: pair[0])
 
     now = datetime.now(REPORT_TZ)
-    _write_trend_log(now)
+    _write_trend_log()
     total = len(_reports)
     lines = [
         "# policy-eval-scenarios test report",
