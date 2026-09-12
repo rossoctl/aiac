@@ -17,8 +17,9 @@ import scenario as scn
 import setup_keycloak
 from _lib import (
     GENERATED, abort, capture_rego, cmd, connect_admin, explain, load_config, note, ok,
-    onboard, pause, port_forward, print_state_before, print_state_diff, resolve_service_id,
-    say, snapshot_state, tail_component_logs,
+    onboard, pause, port_forward, print_service_policy_table, print_state_before,
+    print_state_diff, print_steps, resolve_service_id, say, snapshot_state, steps_from_lines,
+    tail_component_logs,
 )
 
 
@@ -39,6 +40,9 @@ def main() -> None:
     """)
     print_state_before(before)
     service_id = resolve_service_id(admin, cfg, f"{cfg.namespace}/{scn.TOOL_WORKLOAD}")
+    # Policy Store rows are keyed by the client's real clientId (a SPIFFE URI under SPIRE), not
+    # the "namespace/workload" display name or the UUID — see 04-onboard-agent.py's step 1.
+    client_id = admin.get_client(service_id)["clientId"]
     note(f"service id: {service_id}")
     pause()
 
@@ -54,17 +58,21 @@ def main() -> None:
         written for the tool itself — a tool is a pure target, so only {scn.AGENT_WORKLOAD}'s CR
         changes.
 
-        Watch the component logs below for analyze_tool's discovered-scopes line and the PRB
-        rebuilding {scn.AGENT_WORKLOAD}'s outbound rules against them.
+        Once the call returns, the steps it actually performed (analyze_tool's discovery, the
+        PRB rebuilding {scn.AGENT_WORKLOAD}'s outbound rules against the new tool scopes, and
+        the Policy Writer's CR update) print below as a plain numbered list.
     """)
     cmd("Input", f"POST /apply/service/{service_id}  (Controller, port-forwarded)")
+    note("onboarding in progress — this can take a few minutes (LLM calls in flight)...")
+    raw_lines: list[str] = []
     with tail_component_logs([
         ("controller", "aiac-agent", "aiac-system", None),
         ("policy-writer", "aiac-interface", "aiac-system", "aiac-pdp-policy-opa"),
-    ]):
+    ], raw_lines):
         with port_forward(cfg.controller_target, namespace=cfg.controller_namespace, local_port=cfg.controller_local_port, remote_port=cfg.controller_remote_port, ready_url=f"http://127.0.0.1:{cfg.controller_local_port}/health") as base_url:
             onboard(cfg, base_url, service_id)
     ok("onboarding call returned 200")
+    print_steps(f"Onboard {scn.TOOL_WORKLOAD}", steps_from_lines(raw_lines))
     pause()
 
     say("3", "4", "Capture generated Rego (agent's, retroactively completed — from the CR)")
@@ -76,6 +84,11 @@ def main() -> None:
     capture_rego(cfg, rego_dir)
     for f in (cfg.inbound_rego, cfg.outbound_rego):
         ok(f"{rego_dir / f}")
+
+    print_service_policy_table(
+        cfg, client_id,
+        f"Resulting mapping — who may act on {scn.TOOL_WORKLOAD} (the agent's outbound gate, completed)",
+    )
     pause()
 
     # The tool's ``*-aud`` audience client scope only exists once the tool is onboarded, so 03-setup.py

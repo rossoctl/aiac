@@ -13,6 +13,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -299,17 +300,29 @@ def port_forward(
         reader.join(timeout=1)
 
 
-_LOG_COLORS = ("36", "35", "33", "32")  # cyan, magenta, yellow, green — cycled per deployment
-
+# Uvicorn's own formatter (startup banner, "Application startup complete.", and every
+# access-log line, including the health-probe hits liveness/readiness fire every 10-20s) is
+# `INFO:     <message>` — colon + 5 spaces, no timestamp, no logger name. Every app-level
+# `logger.info(...)` call in this codebase instead uses `logging.basicConfig(format="%(asctime)s
+# %(levelname)s %(name)s: %(message)s")`, a structurally different, always-timestamped line — so
+# this regex can drop uvicorn noise unconditionally with no risk of swallowing real narration.
+_UVICORN_NOISE_RE = re.compile(r"^INFO:\s")
 
 @contextmanager
-def tail_component_logs(pairs: list[tuple[str, str, str, str | None]]) -> Iterator[None]:
-    """Stream ``kubectl logs -f`` for each ``(label, deployment, namespace, container)`` in
-    the background, each line prefixed with a colored ``[label]``, for the duration of the
-    wrapped block. This is what turns Part 1's new component-level ``logger.info(...)`` calls
-    (Controller, Policy Rules Builder, Policy Writer) into live narration during a
-    long-running onboarding call — the presenter can point at real component behavior as it
-    happens instead of only reporting the eventual HTTP result.
+def tail_component_logs(pairs: list[tuple[str, str, str, str | None]], raw_lines: list[str]) -> Iterator[None]:
+    """Capture ``kubectl logs -f`` for each ``(label, deployment, namespace, container)`` in
+    the background, for the duration of the wrapped block, appending every non-uvicorn-noise
+    line to ``raw_lines`` (shared across threads, hence the lock) IN ARRIVAL ORDER — nothing is
+    printed live. The caller feeds ``raw_lines`` to ``steps_from_lines``/``print_steps`` once
+    the block exits, turning Controller/Policy Rules Builder/Policy Writer log events into a
+    single clean "steps performed" list instead of a raw interleaved log stream.
+
+    ``--since=30s`` (not ``1s``): Service Provision's and the PRB's first calls can fire within
+    a second of ``onboard()``'s POST landing, faster than a freshly-spawned ``kubectl logs -f``
+    reliably attaches — a 1s window lost the earliest lines (``classify_service``,
+    ``analyze_agent``/``analyze_tool``, the first PRB pass) on live runs. 30s is cheap insurance
+    since this always runs right after a fresh onboarding trigger, so it won't pull in
+    unrelated history in practice.
 
     ``container`` MUST be given (not ``None``) for any deployment with more than one
     non-init container — e.g. ``aiac-interface`` runs both ``aiac-pdp-config`` (the IdP
@@ -325,17 +338,20 @@ def tail_component_logs(pairs: list[tuple[str, str, str, str | None]]) -> Iterat
     procs: list[subprocess.Popen] = []
     threads: list[threading.Thread] = []
     stop = threading.Event()
+    lock = threading.Lock()
 
-    def _drain(proc: subprocess.Popen, label: str, color: str) -> None:
+    def _drain(proc: subprocess.Popen) -> None:
         assert proc.stdout is not None
-        prefix = _c(color, f"[{label}]")
         for line in proc.stdout:
             if stop.is_set():
                 break
-            print(f"  {prefix} {line.rstrip()}")
+            if _UVICORN_NOISE_RE.match(line):
+                continue
+            with lock:
+                raw_lines.append(line.rstrip())
 
-    for i, (label, deployment, namespace, container) in enumerate(pairs):
-        args = ["kubectl", "logs", "-f", f"deployment/{deployment}", "-n", namespace, "--since=1s", "--tail=0"]
+    for label, deployment, namespace, container in pairs:
+        args = ["kubectl", "logs", "-f", f"deployment/{deployment}", "-n", namespace, "--since=30s", "--tail=0"]
         if container:
             args += ["-c", container]
         try:
@@ -344,8 +360,7 @@ def tail_component_logs(pairs: list[tuple[str, str, str, str | None]]) -> Iterat
             note(f"could not start log tail for {label!r} (kubectl not found) — continuing without it")
             continue
         procs.append(proc)
-        color = _LOG_COLORS[i % len(_LOG_COLORS)]
-        t = threading.Thread(target=_drain, args=(proc, label, color), daemon=True)
+        t = threading.Thread(target=_drain, args=(proc,), daemon=True)
         t.start()
         threads.append(t)
 
@@ -357,6 +372,148 @@ def tail_component_logs(pairs: list[tuple[str, str, str, str | None]]) -> Iterat
             terminate(proc)
         for t in threads:
             t.join(timeout=1)
+
+
+# ======================================================================================
+# Log-line -> "step performed" parsing. Mirrors conflict_detection.py's own
+# `focal[len(PREFIX):].split(":", 1)[0].strip()` idiom for pulling a role/scope name out of a
+# `focal=...` string (the two prefixes below are exported constants in
+# policy_rules_builder/graph.py specifically so callers stay in sync with the log format; inlined
+# here rather than imported since this demo treats every AIAC service as a black box over
+# HTTP/kubectl, never `aiac.*` in-process).
+# ======================================================================================
+
+_ROLE_FOCAL_PREFIX = "role name="
+_SCOPE_FOCAL_PREFIX = "scope name="
+
+_LOG_LINE_RE = re.compile(r"^\S+ \S+ (?P<level>\w+) (?P<logger>[\w.]+): (?P<msg>.*)$")
+
+
+def _focal_kind_name(focal: str) -> tuple[str, str]:
+    if focal.startswith(_ROLE_FOCAL_PREFIX):
+        return "role", focal[len(_ROLE_FOCAL_PREFIX):].split(":", 1)[0].strip()
+    if focal.startswith(_SCOPE_FOCAL_PREFIX):
+        return "scope", focal[len(_SCOPE_FOCAL_PREFIX):].split(":", 1)[0].strip()
+    return "?", focal
+
+
+def _parse_step(raw_line: str) -> str | None:
+    m = _LOG_LINE_RE.match(raw_line)
+    if not m:
+        return None
+    level, msg = m.group("level"), m.group("msg")
+
+    if msg == "" or msg.startswith("PRB _fetch: "):
+        return None  # pure plumbing, repeats identically per focal entity
+
+    if (m2 := re.match(r"^apply_service: onboarding request received for service_id=(\S+)$", msg)):
+        return f"Received onboarding request for service_id={m2.group(1)}"
+
+    if (m2 := re.match(r"^classify_service: service_id=\S+ -> namespace=(\S+) workload=(\S+) type=(\S+)$", msg)):
+        ns, workload, stype = m2.groups()
+        return f"Classified {workload!r} (namespace {ns!r}) as a{'n' if stype[0] in 'AEIOU' else ''} {stype}"
+
+    if (m2 := re.match(r"^analyze_agent: workload=(\S+) discovered (\d+) skill\(s\) from its AgentCard -> scopes/roles (\[.*\])$", msg)):
+        workload, n, scopes = m2.groups()
+        return f"Discovered {n} skill(s) from {workload}'s AgentCard -> scopes/roles: {scopes}"
+
+    if (m2 := re.match(r"^analyze_agent: workload=(\S+) no skills discovered \(([^)]*)\) -> default scope (\S+)\.access$", msg)):
+        workload, reason, _ = m2.groups()
+        return f"No skills found on {workload}'s AgentCard ({reason}) -> falling back to default scope {workload}.access"
+
+    if (m2 := re.match(r"^analyze_tool: workload=(\S+) queried MCP tools/list at (\S+) -> discovered (\d+) tool\(s\), scopes (\[.*\])$", msg)):
+        workload, endpoint, n, scopes = m2.groups()
+        return f"Queried {workload}'s MCP tools/list ({endpoint}) -> discovered {n} tool(s), scopes: {scopes}"
+
+    if (m2 := re.match(r"^ServicePolicyBuilder: service_id=\S+ type=(\S+) -> (\d+) own scope\(s\), (\d+) own role\(s\), (\d+) candidate role\(s\)$", msg)):
+        stype, own_s, own_r, cand = m2.groups()
+        return f"Loaded service policy inputs ({stype}): {own_s} own scope(s), {own_r} own role(s), {cand} candidate role(s)"
+
+    if (m2 := re.match(r"^ServicePolicyBuilder: service_id=\S+ -> assembled (\d+) rule\(s\) total \((\d+) allow, (\d+) deny\)$", msg)):
+        total, allow, deny = m2.groups()
+        return f"Assembled {total} rule(s) total: {allow} allow, {deny} deny"
+
+    if (m2 := re.match(r"^PRB precheck dropped hallucinated names: granted=(\[.*?\]) denied=(\[.*\])$", msg)):
+        granted, denied = m2.groups()
+        if granted != "[]" or denied != "[]":
+            return f"PRB precheck caught a hallucinated name from the LLM and discarded it: granted={granted} denied={denied}"
+        return None
+
+    if msg.startswith("PRB _propose: focal="):
+        # "PRB _propose: focal=<focal> (<gate_kind>) -> LLM granted=<list> denied=<list>
+        # exclusive=<bool>" — <focal> is free-form LLM-facing text (a role/scope description)
+        # that can itself contain "(...)", so a single left-to-right regex can misidentify
+        # WHICH trailing "(...)" is the real gate_kind marker. Anchor on the fixed, non-free-text
+        # tail first (a plain regex is safe there — it's all structured data), then peel the
+        # gate_kind off the END of what's left with a GREEDY `.*` so it always grabs the LAST
+        # parenthetical, regardless of how many earlier ones the description contains.
+        body = msg[len("PRB _propose: focal="):]
+        tail = re.search(r" -> LLM granted=(\[[^\[\]]*\]) denied=(\[[^\[\]]*\]) exclusive=(\w+)$", body)
+        if tail:
+            head = body[: tail.start()]
+            granted, denied, exclusive = tail.groups()
+            gm = re.match(r"^(.*) \(([^()]*)\)$", head, re.DOTALL)
+            focal = gm.group(1) if gm else head
+            kind, name = _focal_kind_name(focal)
+            excl = " (exclusive)" if exclusive == "True" else ""
+            return f"PRB proposed for {kind} {name!r}: granted={granted} denied={denied}{excl}"
+
+    if (m2 := re.match(r"^PRB _audit: focal=(.+?) -> REJECTED, (\d+) genuine contradiction\(s\): (\[.*\])$", msg)):
+        focal, n, names = m2.groups()
+        kind, name = _focal_kind_name(focal)
+        return f"PRB found {n} genuine contradiction(s) for {kind} {name!r}: {names} — aborting"
+
+    if (m2 := re.match(r"^PRB _audit: focal=(.+?) -> APPROVED after (\d+) retry\(ies\)$", msg)):
+        focal, retries = m2.groups()
+        kind, name = _focal_kind_name(focal)
+        detail = "no retries" if retries == "0" else f"after {retries} retry(ies)"
+        return f"PRB approved {kind} {name!r} ({detail})"
+
+    if (m2 := re.match(r"^PRB _audit: focal=(.+?) -> rejected \(retry (\d+)/(\d+)\): (.*)$", msg)):
+        focal, i, maxr, reason = m2.groups()
+        kind, name = _focal_kind_name(focal)
+        return f"PRB rejected the proposal for {kind} {name!r} (attempt {i}/{maxr}): {reason}"
+
+    if (m2 := re.match(r"^PRB build \(role, deny-only/Door B\): role=(\S+) -> (\d+) deny rule\(s\): (\[.*\])$", msg)):
+        name, n, names = m2.groups()
+        return f"Final rules for role {name!r} (deny-only pass): {n} deny rule(s) {names}"
+
+    if (m2 := re.match(r"^PRB build \(role\): role=(\S+) -> (\d+) allow \+ (\d+) deny rule\(s\): allow=(\[.*?\]) deny=(\[.*\])$", msg)):
+        name, a, d, allow, deny = m2.groups()
+        return f"Final rules for role {name!r}: {a} allow {allow}, {d} deny {deny}"
+
+    if (m2 := re.match(r"^PRB build \(scope\): scope=(\S+) -> (\d+) allow \+ (\d+) deny rule\(s\): allow=(\[.*?\]) deny=(\[.*\])$", msg)):
+        name, a, d, allow, deny = m2.groups()
+        return f"Final rules for scope {name!r}: {a} allow {allow}, {d} deny {deny}"
+
+    if (m2 := re.match(r"^PolicyWriter: applying AuthorizationPolicy (\S+)/(\S+) \(rego bytes: (\{.*\})\)$", msg)):
+        ns, name, sizes = m2.groups()
+        return f"Applying AuthorizationPolicy {ns}/{name} CR (rego sizes: {sizes})"
+
+    if (m2 := re.match(r"^PolicyWriter: AuthorizationPolicy (\S+)/(\S+) applied \(server-side-apply succeeded\)$", msg)):
+        ns, name = m2.groups()
+        return f"AuthorizationPolicy {ns}/{name} CR applied (server-side-apply succeeded)"
+
+    if (m2 := re.match(r"^UC1 rollback: (.*)$", msg)):
+        return f"Rollback: {m2.group(1)}"
+
+    if level in ("WARNING", "ERROR"):
+        return f"[{level}] {msg}"
+    return None
+
+
+def steps_from_lines(raw_lines: list[str]) -> list[str]:
+    return [step for line in raw_lines if (step := _parse_step(line)) is not None]
+
+
+def print_steps(task: str, steps: list[str]) -> None:
+    print(f"  {_c('2', 'Agent task:')} {task}")
+    print(f"  {_c('2', 'Steps performed:')}")
+    if not steps:
+        note("no steps captured")
+    for i, step in enumerate(steps, 1):
+        print(f"    {i}. {step}")
+    print()
 
 
 def opa_bin() -> str:
@@ -476,6 +633,43 @@ def clear_policy_store(cfg: Config) -> None:
         resp = requests.delete(f"{base_url}/policy/services", timeout=30)
     if not (200 <= resp.status_code < 300):
         abort(f"clear_policy_store: DELETE /policy/services returned HTTP {resp.status_code}: {resp.text[:500]}")
+
+
+def get_service_policy_rules(cfg: Config, client_id: str) -> list[tuple[str, str, str]]:
+    """Fetch the Policy Store's ``ServicePolicyModel`` for ``client_id`` — the SPM key, which is
+    the Keycloak client's REAL ``clientId`` (a SPIFFE URI under SPIRE, e.g.
+    ``"spiffe://localtest.me/ns/team1/sa/github-agent"``; get it via ``admin.get_client(uuid)
+    ["clientId"]``). This is NOT the "namespace/workload" display name (Keycloak's client
+    ``name``, used to resolve the UUID via ``resolve_service_id``) and NOT the UUID itself.
+    Returns its ``(role, scope, effect)`` grant/deny triples, sorted for stable output — the
+    actual PRB decision as data, the "resulting mapping" a presenter would otherwise have to
+    reconstruct from scrollback."""
+    encoded = base64.urlsafe_b64encode(client_id.encode("utf-8")).decode("ascii").rstrip("=")
+    with port_forward(
+        cfg.store_target, namespace=cfg.store_namespace,
+        local_port=cfg.store_local_port, remote_port=cfg.store_remote_port,
+        ready_url=f"http://127.0.0.1:{cfg.store_local_port}/health",
+    ) as base_url:
+        resp = requests.get(f"{base_url}/policy/services/{encoded}", timeout=30)
+    if resp.status_code != 200:
+        abort(f"get_service_policy_rules({client_id!r}): HTTP {resp.status_code}: {resp.text[:500]}")
+    body = resp.json()
+    rows = [
+        (r["role"]["name"], r["scope"]["name"], r["effect"])
+        for key in ("inbound_allow_rules", "inbound_deny_rules")
+        for r in body.get(key, [])
+    ]
+    return sorted(rows)
+
+
+def print_service_policy_table(cfg: Config, client_id: str, label: str) -> None:
+    rows = get_service_policy_rules(cfg, client_id)
+    print(f"  {_c('2', label + ':')}")
+    if not rows:
+        note("no rules yet")
+    else:
+        table(rows, headers=("role", "scope", "effect"))
+    print()
 
 
 def ensure_agent_policy(cfg: Config) -> None:
