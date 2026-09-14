@@ -24,9 +24,11 @@ The conflict semantics in this spec are **authoring-layer** semantics: they
 describe how a *single digested policy's own statements* combine into intent.
 They are distinct from the **engine-layer** conflict semantics that govern
 collisions *across* independently authored sources and Policy Rules Builder
-passes (see `docs/adr/0001-identify-never-reconcile.md`). Why the two layers may
-diverge in the future — and why they behave identically today — is recorded in
-`docs/adr/0002-authoring-vs-engine-conflict-semantics.md`.
+passes (see the engine-layer decision
+[identify conflicts, never reconcile](components/aiac-agent/policy-rules-builder.md#design-decision-identify-conflicts-never-reconcile)).
+Why the two layers may diverge in the future — and why they behave identically
+today — is recorded below under
+[Design decision: authoring vs engine conflict semantics](#design-decision-authoring-vs-engine-conflict-semantics).
 
 ## Policy structure
 
@@ -164,8 +166,8 @@ Examples:
 Conflict detection operates at the **authoring layer**: it examines a single
 digested policy's own statements and reports the contradictions among them. It is
 distinct from the engine-layer collision detection described in
-`docs/adr/0001-identify-never-reconcile.md`, which examines `(role, scope)`
-`PolicyRule`s produced across independent sources.
+[identify conflicts, never reconcile](components/aiac-agent/policy-rules-builder.md#design-decision-identify-conflicts-never-reconcile),
+which examines `(role, scope)` `PolicyRule`s produced across independent sources.
 
 Detection recognizes one **named conflict** and two further **violation
 classes**. Only the first is called an *authoring-layer conflict*; the other two
@@ -251,5 +253,54 @@ stated how their own statements combine. The engine operates across
 independently authored sources where no such combining rule was ever authored,
 and so must never reconcile. The full argument — why the resolution rule may
 evolve here but not at the engine, and why both layers behave identically until
-then — is recorded in
-`docs/adr/0002-authoring-vs-engine-conflict-semantics.md`.
+then — is the next section.
+
+## Design decision: authoring vs engine conflict semantics
+
+The digested-policy conflict semantics above and the AIAC rule engine's
+[identify conflicts, never reconcile](components/aiac-agent/policy-rules-builder.md#design-decision-identify-conflicts-never-reconcile)
+principle both detect contradictions, and **today both behave identically** —
+identify the contradiction, surface it, apply nothing. This section records why
+they are nonetheless two distinct layers: the **authoring layer** is the only one
+that may ever evolve past identify-and-report to *resolve* conflicts (for example,
+by deny-overrides), while the **engine layer** must remain identify-never-reconcile
+permanently. The distinction is an asymmetry of *permitted future evolution*, not
+a difference in current behaviour.
+
+The reason is **who owns the intent, and over what scope**:
+
+- An **authoring-layer conflict** lives *within a single digested policy* — one
+  authored artifact, one author. A combining rule like deny-overrides is itself a
+  statement of that author's intent, so resolving an opposite-effect grant overlap
+  by "deny wins" would honour a rule the author could legitimately state.
+  Resolution here is therefore *conceivable* — reserved as future work rather than
+  adopted, but conceivable.
+
+- An **engine-layer conflict** lives *across* independently authored sources and
+  Policy Rules Builder passes (within-batch Door B, and cross-service) — an
+  `Allow` from one pass and a `Deny` from another on the same `(role, scope)`
+  pair. No single author ever stated how those pieces combine. Picking a winner
+  there would bury that ambiguity behind a rule the author never stated.
+  Resolution here is never legitimate.
+
+So the same refuse-and-report behaviour that both layers show today rests on
+different foundations: the engine refuses because reconciling un-authored
+collisions would fabricate intent, and it always will; the authoring layer
+refuses because we have not *yet* built the authored combining rule that would let
+it resolve. A well-formed (conflict-free) digested policy is reported clean before
+it is compiled to `PolicyRule`s, so it never itself produces an engine-layer
+conflict; the engine's detection then guards only the cross-source collisions the
+authoring layer cannot see.
+
+### Consequences
+
+- The **Conflict resolution** section above is deliberately a *reserved-future*
+  section, not an unfinished one: it states a definite report-only decision for
+  today and names deny-overrides as the reserved direction. It is complete.
+- Any future deny-overrides (or other combining rule) is authored and applied
+  **within the digest**, upstream of rule compilation — never in the engine, and
+  never as a cross-source precedence. The engine's identify-never-reconcile
+  principle is unchanged and unaffected by this reservation.
+- "Conflict" without qualification continues to mean the **engine-layer**
+  `(role, scope)` collision (see `CONTEXT.md`). The within-policy notion is always
+  written **authoring-layer conflict** to keep the two from being confused.

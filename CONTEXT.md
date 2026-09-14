@@ -62,7 +62,8 @@ _Avoid_: cross-request conflict, store conflict.
 **Identify-never-reconcile**:
 The governing principle: a `(role, scope)` carrying both an `Allow` and a `Deny`
 **is** a conflict — surface it, never resolve it. No precedence, no
-"deny wins," no merge. See `docs/adr/0001-identify-never-reconcile.md`.
+"deny wins," no merge. See the engine-layer design decision
+[identify conflicts, never reconcile](docs/specs/components/aiac-agent/policy-rules-builder.md#design-decision-identify-conflicts-never-reconcile).
 _Avoid_: deny-overrides, conflict resolution.
 
 **Source policy**:
@@ -84,5 +85,5 @@ subjects, operations, and resources overlap. Distinct from the engine-level
 **Conflict** (a cross-pass `(role, scope)` allow∩deny): this is among a digested
 policy's own statements, before it becomes `PolicyRule`s. Currently reported,
 never auto-resolved — deny-overrides reserved (see
-`docs/adr/0002-authoring-vs-engine-conflict-semantics.md`).
+[Design decision: authoring vs engine conflict semantics](docs/specs/digested-policy.md#design-decision-authoring-vs-engine-conflict-semantics)).
 _Avoid_: using unqualified "Conflict" for this.

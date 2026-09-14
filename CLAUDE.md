@@ -204,4 +204,4 @@ GitHub issues in this repo's own remote (`rossoctl/aiac`), filtered by the `aiac
 
 ### Domain docs
 
-Single-context, scoped to `aiac/` (`CONTEXT.md` + `docs/adr/` at the `aiac/` root). See `docs/agents/domain.md`.
+Single-context, scoped to `aiac/` (`CONTEXT.md` glossary at the `aiac/` root; design decisions documented in the relevant PRD/spec under `docs/specs/`). Consult decisions on demand, not up front. See `docs/agents/domain.md`.
