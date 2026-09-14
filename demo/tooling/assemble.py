@@ -763,8 +763,8 @@ def main() -> None:
     add(
         "Sweep every client in the realm to build the candidate set",
         idp_phase(agent_recs, "candidates"),
-        "Each of the 12 clients queried for roles and scopes, many answering [] — every role "
-        "that could reach this agent has to be judged, not just the ones just created.",
+        "Every role in the realm that could reach this agent becomes a candidate — the policy "
+        "is judged against all 12 clients, not only the roles just created.",
     )
     add(
         "Read the relevant users and their role assignments",
@@ -774,9 +774,8 @@ def main() -> None:
     add(
         "Merge per-client role ownership into the realm-wide role list",
         idp_phase(agent_recs, "trailing"),
-        "The realm list says a role exists; only the per-client read says who owns it "
-        "(kind=Agent, actorIds). Both are needed to know which roles are the agent's own, "
-        "so every client resolved costs another pair of reads.",
+        "The realm list says a role exists; only the per-client read carries kind=Agent and "
+        "actorIds. Both are needed to tell the agent's own roles from everyone else's.",
     )
     add(
         "Proposer pass: an LLM grants per role/scope pair against policy.md",
@@ -802,7 +801,7 @@ def main() -> None:
     add(
         "Persist the computed policy to the Policy Model Store",
         [step(r) for r in by(agent_recs, "model-store")],
-        "The same path answered 404 before the write and returns the stored policy after — that read is the proof it landed. Persisting it lets the next workload build on this one.",
+        "The same path answered 404 before the write and returns the stored policy after. The stored model is what a later onboarding reads instead of recomputing this one.",
     )
     add(
         "The generated OPA policy, read back from the cluster",
@@ -821,7 +820,7 @@ def main() -> None:
         "Resolve the tool's Keycloak client UUID",
         driver_steps(driver_raw, "keycloak-admin", window="tool", bounds=tool_bounds)
         or [{"cmd": "GET <keycloak>/admin/realms/rossoctl/clients", "output": "(not captured — see note)"}],
-        "Same lookup; its client.type attribute is Tool, not Agent.",
+        "Its client.type attribute reads Tool, which is what routes it down a different onboarding path than the agent.",
     )
     add(
         "Call the tool's live MCP endpoint for tools/list",
@@ -851,7 +850,7 @@ def main() -> None:
     add(
         "Persist the updated policy model",
         [step(r) for r in by(tool_recs, "model-store")],
-        "Written the same way, and the follow-up read of the same path now returns both workloads' policies.",
+        "The store now holds both workloads' policies, so the agent-plus-tool relationship survives beyond this run.",
     )
     add(
         "The completed OPA policy, read back from the cluster",
