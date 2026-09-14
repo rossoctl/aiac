@@ -228,34 +228,67 @@ def _report_anchor(report: ParsedReport) -> str:
     return "run-" + report.run_at.strftime("%Y%m%dT%H%M%SZ")
 
 
-# Metric -> (line/point color, CSS class). One polyline + one point series per metric, all three
-# always plotted together since every correctness-suite trend-log row carries all three (see
-# eval/trend_log.py's pool_correctness_metrics) -- a future suite with a different metric shape
-# gets its own dict here when it starts writing trend-log rows (dashboard.py's caller loop is
-# already generic over `suite`; only this mapping is correctness-specific today).
+# Metric -> point/line color, chosen for contrast against the dashboard's dark background (see
+# _STYLE). One polyline + one point series per metric, all three always plotted together since
+# every correctness-suite trend-log row carries all three (see eval/trend_log.py's
+# pool_correctness_metrics) -- a future suite with a different metric shape gets its own dict here
+# when it starts writing trend-log rows (dashboard.py's caller loop is already generic over
+# `suite`; only this mapping is correctness-specific today).
 _METRIC_COLORS = {
-    "precision": "#4c72b0",
-    "recall": "#55a868",
-    "denial_precision": "#c44e52",
+    "precision": "#8ab4f8",
+    "recall": "#81c995",
+    "denial_precision": "#f28b82",
 }
+
+_AXIS_COLOR = "#9aa0a6"  # legible against the dark chart background, but not competing with the
+# brighter per-metric colors above.
 
 
 def render_svg_chart(rows: list[dict[str, Any]], reports: list[ParsedReport], *, suite: str) -> str:
     """One inline, self-contained ``<svg>`` line chart for one suite's trend-log rows (already
     filtered to that suite by the caller) -- precision/recall/denial_precision plotted as three
-    polylines with per-row points. A point is wrapped in a link to its matching evidence report
-    (see ``_find_matching_report``) when one is found within tolerance; every point always carries
-    a ``<title>`` tooltip with the exact values regardless."""
-    width, height, pad = 640, 220, 30
+    polylines with per-row points, against a labeled 0-1 y-axis and a per-row date x-axis. A point
+    is wrapped in a link to its matching evidence report (see ``_find_matching_report``) when one
+    is found within tolerance; every point always carries a ``<title>`` tooltip with the exact
+    values regardless."""
+    width, height = 640, 260
+    pad_left, pad_right, pad_top, pad_bottom = 45, 15, 15, 55
     n = len(rows)
 
     def x(i: int) -> float:
-        return pad if n <= 1 else pad + i * (width - 2 * pad) / (n - 1)
+        return pad_left if n <= 1 else pad_left + i * (width - pad_left - pad_right) / (n - 1)
 
     def y(value: float) -> float:
-        return height - pad - value * (height - 2 * pad)
+        return height - pad_bottom - value * (height - pad_top - pad_bottom)
 
     parts = [f'<svg viewBox="0 0 {width} {height}" role="img" aria-label="{suite} trend chart">']
+
+    # Y-axis: gridline + value label every 0.25, spanning the full plot width.
+    for tick in (0.0, 0.25, 0.5, 0.75, 1.0):
+        ty = y(tick)
+        parts.append(
+            f'<line x1="{pad_left}" y1="{ty:.1f}" x2="{width - pad_right}" y2="{ty:.1f}" stroke="{_AXIS_COLOR}" stroke-width="0.5" stroke-dasharray="2,2" />'
+        )
+        parts.append(
+            f'<text x="{pad_left - 6}" y="{ty:.1f}" fill="{_AXIS_COLOR}" font-size="10" text-anchor="end" dominant-baseline="middle">{tick:.2f}</text>'
+        )
+
+    # X-axis: tick + rotated date label per row (the date portion of its ISO timestamp).
+    axis_y = height - pad_bottom
+    parts.append(
+        f'<line x1="{pad_left}" y1="{axis_y:.1f}" x2="{width - pad_right}" y2="{axis_y:.1f}" stroke="{_AXIS_COLOR}" stroke-width="1" />'
+    )
+    for i, row in enumerate(rows):
+        date_label = str(row.get("timestamp", ""))[:10]
+        tx = x(i)
+        parts.append(
+            f'<line x1="{tx:.1f}" y1="{axis_y:.1f}" x2="{tx:.1f}" y2="{axis_y + 4:.1f}" stroke="{_AXIS_COLOR}" stroke-width="1" />'
+        )
+        parts.append(
+            f'<text x="{tx:.1f}" y="{axis_y + 8:.1f}" fill="{_AXIS_COLOR}" font-size="10" '
+            f'text-anchor="end" transform="rotate(-40 {tx:.1f} {axis_y + 8:.1f})">{html.escape(date_label)}</text>'
+        )
+
     for metric, color in _METRIC_COLORS.items():
         points = " ".join(f"{x(i):.1f},{y(row.get(metric) or 0):.1f}" for i, row in enumerate(rows))
         parts.append(f'<polyline points="{points}" fill="none" stroke="{color}" stroke-width="2" />')
@@ -324,13 +357,16 @@ def render_scenario_table(report: ParsedReport) -> str:
 
 
 _STYLE = """
-body { font-family: system-ui, sans-serif; margin: 2rem; color: #1a1a1a; }
+body { font-family: system-ui, sans-serif; margin: 2rem; background: #121212; color: #e8eaed; }
+a { color: #8ab4f8; }
 table { border-collapse: collapse; margin: 0.5rem 0 1.5rem; width: 100%; }
-th, td { border: 1px solid #ccc; padding: 4px 8px; text-align: left; font-size: 0.85rem; }
+th, td { border: 1px solid #444; padding: 4px 8px; text-align: left; font-size: 0.85rem; }
+th { background: #1e1e1e; }
 .legend { margin-top: 0.25rem; }
 .legend-item { margin-right: 1rem; font-size: 0.85rem; }
 .legend-swatch { display: inline-block; width: 10px; height: 10px; margin-right: 4px; }
 details { margin-bottom: 0.5rem; }
+summary { cursor: pointer; }
 """
 
 

@@ -223,6 +223,39 @@ def test_render_svg_chart_links_point_to_matching_report_anchor() -> None:
     assert f'href="#{_report_anchor(report)}"' in svg
 
 
+def test_render_svg_chart_has_y_axis_value_labels_and_x_axis_date_labels() -> None:
+    rows = [
+        {
+            "suite": "correctness_prb",
+            "timestamp": "2026-09-10T07:00:00+00:00",
+            "precision": 1.0,
+            "recall": 1.0,
+            "denial_precision": 1.0,
+        },
+        {
+            "suite": "correctness_prb",
+            "timestamp": "2026-09-14T06:53:44+00:00",
+            "precision": 0.8,
+            "recall": 0.9,
+            "denial_precision": 0.95,
+        },
+    ]
+
+    svg = render_svg_chart(rows, reports=[], suite="correctness_prb")
+
+    assert "0.00" in svg  # y-axis low-end label
+    assert "1.00" in svg  # y-axis high-end label
+    assert "2026-09-10" in svg  # x-axis date label for the first row
+    assert "2026-09-14" in svg  # x-axis date label for the second row
+
+
+def test_render_dashboard_uses_dark_theme_colors() -> None:
+    page = render_dashboard([], [])
+
+    assert "#121212" in page  # dark background
+    assert "#e8eaed" in page  # bright text
+
+
 def test_render_scenario_table_lists_correctness_entries_anchored_for_chart_links() -> None:
     entry = ScenarioEntry(
         nodeid="eval/test_policy_pipeline_correctness_prb.py::test_prb_correctness[baseline]",
