@@ -1,4 +1,4 @@
-"""End-to-end correctness suite (spec: ``docs/specs/eval/policy-eval-correctness-e2e.md``).
+"""End-to-end correctness suite (spec: ``docs/evaluation/policy-eval-correctness-e2e.md``).
 
 Runs the same primary 8-scenario correctness corpus as
 ``test_policy_pipeline_correctness_prb.py`` (#2089), but through the **full** pipeline this
@@ -27,7 +27,7 @@ deployment would ever contain; ``best_effort_notes`` (``record_property``'d, pri
 exactly which scope/role decisions this applies to. See
 ``eval.test_policy_pipeline_eval.orchestrate_prb``/``_invoke_graph``'s docstrings for the
 mechanism, and its module docstring for why this applies uniformly to the shared fixture's other
-consumer (``eval_extended``) too.
+consumer (the scenarios suite) too.
 
 Known gap: the ``outbound_target`` gate's denial side (``AgentPolicyModel.outbound_target_deny_rules``)
 is computed by the PCE but never rendered into the outbound Rego by
@@ -35,7 +35,7 @@ is computed by the PCE but never rendered into the outbound Rego by
 (``agent_role_scopes``) is emitted. So for that one gate ``denied`` is always empty and its
 ``denial_precision`` reads vacuously ``1.0``; ``over_grants``/``under_grants`` for that gate are
 unaffected (they depend only on ``granted``/``expected``). See
-``docs/specs/eval/policy-eval-correctness-e2e.md`` for the full writeup — this is a pre-existing
+``docs/evaluation/policy-eval-correctness-e2e.md`` for the full writeup — this is a pre-existing
 production Rego-generator gap, not something this suite introduces or is scoped to fix.
 
 Run (needs KEYCLOAK_URL + admin creds + LLM_* exported, ``opa`` on PATH). Unlike the PRB-level
@@ -44,7 +44,7 @@ fixture) — but that fixture now parallelizes its own scenario provisioning int
 ``ProcessPoolExecutor`` (see ``eval/test_policy_pipeline_eval.py``'s module docstring), so `-n`
 was never needed for wall-clock gains here:
     .venv/bin/pytest eval/test_policy_pipeline_correctness_e2e.py \
-        -m eval_correctness_e2e -v -s
+        -m eval -v -s
 """
 
 from __future__ import annotations
@@ -55,12 +55,12 @@ from types import ModuleType
 
 import pytest
 
-pytestmark = pytest.mark.eval_correctness_e2e
+pytestmark = pytest.mark.eval
 
 HERE = Path(__file__).resolve().parent  # aiac/eval/
 REPO_ROOT = HERE.parent  # -> aiac/
 SRC = REPO_ROOT / "src"
-sys.path.insert(0, str(REPO_ROOT))  # so ``import test.integration.*``/``eval.*`` resolves
+sys.path.insert(0, str(REPO_ROOT))  # so ``import test.system.*``/``eval.*`` resolves
 sys.path.insert(0, str(SRC))  # so ``import aiac.*`` resolves
 
 from eval.correctness_e2e_helpers import _accumulate_agent_gates, _user_role_rows  # noqa: E402
@@ -75,7 +75,7 @@ from eval.test_policy_pipeline_eval import (  # noqa: E402
     truth,
 )
 from eval.test_policy_pipeline_eval import pipeline as pipeline  # noqa: E402,F401 - re-exported as a fixture
-from test.integration.launcher import require_env  # noqa: E402
+from test.system.launcher import require_env_or_skip  # noqa: E402
 
 Pair = tuple[str, str]
 
@@ -141,7 +141,7 @@ def test_e2e_correctness(pipeline: dict[str, dict], scenario_name: str, record_p
     scenario's truth table, has zero over-grants (security-critical, gates this test) —
     under-grants and incorrect denials are tracked/reported only (spec: threshold TBD,
     deferred), same philosophy as the PRB-level suite."""
-    require_env(
+    require_env_or_skip(
         "KEYCLOAK_URL",
         "KEYCLOAK_ADMIN_USERNAME",
         "KEYCLOAK_ADMIN_PASSWORD",
@@ -177,7 +177,7 @@ def test_e2e_correctness(pipeline: dict[str, dict], scenario_name: str, record_p
     record_property("best_effort_notes", best_effort_notes)
     # Raw counts behind the precision/recall/denial_precision floats above — eval/conftest.py's
     # trend-log writer pools these across every scenario in the run (spec:
-    # docs/specs/eval/eval-framework.md §9), rather than averaging the per-scenario floats.
+    # docs/evaluation/eval-framework.md §9), rather than averaging the per-scenario floats.
     record_property("true_positives", score.true_positive_count)
     record_property("denied_total", score.denied_total)
     print(

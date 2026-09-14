@@ -1,4 +1,4 @@
-"""Unit tests for ``best_effort_rules.py`` (spec: ``docs/specs/eval/policy-eval-correctness-e2e.md``).
+"""Unit tests for ``best_effort_rules.py`` (spec: ``docs/evaluation/policy-eval-correctness-e2e.md``).
 
 Pure-logic, unmarked — runs in the default fast pass (``testpaths`` already includes ``eval/``).
 No LLM, no Keycloak, no ``opa`` — just real ``Role``/``Scope``/``PolicyRule`` model construction

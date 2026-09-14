@@ -1,5 +1,5 @@
 """Semantic-perturbation sibling of ``scenario_eval_confusable_agents.py`` (spec:
-``docs/specs/eval/policy-eval-robustness-consistency.md``).
+``docs/evaluation/policy-eval-robustness-consistency.md``).
 
 Same structure (names, ``USERS``, all pair-lists, and ``IDENTITY_CONFUSION_PROBES`` are
 byte-identical to the original), reworded prose only. See

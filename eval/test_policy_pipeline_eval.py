@@ -15,7 +15,7 @@ scenario):
     user-role-developer/user-role-tester/user-role-devops roles).
   - ``scenario_eval_agent_delegation`` (Scenario 3)       — logistics/shipping; 2 users / 2 agents
     / 1 tool, isolates the agent-to-agent ``target_scopes`` delegation mechanism. Lives under
-    ``test/integration/`` (not ``eval/`` like the rest) — see the note below.
+    ``test/system/`` (not ``eval/`` like the rest) — see the note below.
   - ``scenario_eval_unreachable_resources`` (Scenario 4)  — healthcare/clinic; 1 user / 2 agents /
     2 tools, silent gaps producing emergent unreachable agents and tools.
   - ``scenario_eval_ambiguous_clause`` (Scenario 6)       — education/registrar; 1 user / 1 agent /
@@ -36,13 +36,13 @@ generalized ``probe_eval.rego`` (parameterized by ``input.agent_id``) rather tha
 ``probe.rego``. ``launcher.py`` is reused unmodified.
 
 ``scenario_eval_agent_delegation``'s data file is the one exception to the "everything lives in
-``eval/``" rule — it sits at ``test/integration/scenario_eval_agent_delegation.py`` (sibling of
+``eval/``" rule — it sits at ``test/system/scenario_eval_agent_delegation.py`` (sibling of
 ``launcher.py``/``scenario_uc1.py``), so each scenario's ``POLICY_FILE`` is resolved relative to
 *that scenario module's own directory*, not the fixed ``eval/`` directory.
 
 Run (needs KEYCLOAK_URL + admin creds + LLM_* exported, ``opa`` on PATH):
-    .venv/bin/pytest eval/test_policy_pipeline_eval.py -m eval_extended -v
-Without ``-m eval_extended`` the suite is skipped; without ``opa`` each node skips at
+    .venv/bin/pytest eval/test_policy_pipeline_eval.py -m eval -v
+Without ``-m eval`` the suite is skipped; without ``opa`` each node skips at
 runtime. This suite is heavier than ``test_policy_pipeline.py`` (eight full pipeline runs, more
 PRB/LLM calls) hence the separate marker.
 
@@ -113,12 +113,12 @@ from urllib.parse import urlsplit
 
 import pytest
 
-pytestmark = pytest.mark.eval_extended
+pytestmark = pytest.mark.eval
 
 HERE = Path(__file__).resolve().parent  # aiac/eval/
 REPO_ROOT = HERE.parent  # -> aiac/
 SRC = REPO_ROOT / "src"
-sys.path.insert(0, str(REPO_ROOT))  # so ``import test.integration.*``/``eval.*`` resolves
+sys.path.insert(0, str(REPO_ROOT))  # so ``import test.system.*``/``eval.*`` resolves
 sys.path.insert(0, str(SRC))  # so ``import aiac.*`` resolves
 
 from eval.scenarios import scenario_eval_ambiguous_clause as scn_ambiguous_clause  # noqa: E402
@@ -132,10 +132,10 @@ from eval.scenarios import (  # noqa: E402
     scenario_eval_unreachable_resources as scn_unreachable_resources,
 )
 from eval.scenarios import scenario_eval_wildcard_grant as scn_wildcard_grant  # noqa: E402
-from test.integration import scenario_eval_agent_delegation as scn_agent_delegation  # noqa: E402
-from test.integration.launcher import (  # noqa: E402
+from test.system import scenario_eval_agent_delegation as scn_agent_delegation  # noqa: E402
+from test.system.launcher import (  # noqa: E402
     Service,
-    require_env,
+    require_env_or_skip,
     running_services,
 )
 
@@ -189,7 +189,7 @@ def _host_port(url: str, default_port: int) -> tuple[str, int]:
 
 def _connect_admin() -> KeycloakAdmin:
     """Connect to the admin realm so the harness can create/delete each scenario's test realm."""
-    creds = require_env("KEYCLOAK_URL", "KEYCLOAK_ADMIN_USERNAME", "KEYCLOAK_ADMIN_PASSWORD")
+    creds = require_env_or_skip("KEYCLOAK_URL", "KEYCLOAK_ADMIN_USERNAME", "KEYCLOAK_ADMIN_PASSWORD")
     admin_realm = os.environ["KEYCLOAK_ADMIN_REALM"]
     return KeycloakAdmin(
         server_url=creds["KEYCLOAK_URL"],
@@ -314,8 +314,8 @@ def _invoke_graph(
 
     ``best_effort=False`` (default): unchanged from before this parameter existed — a plain
     ``graph.invoke(state)``, still letting ``PolicyContradictionError``/``PolicyRulesBuilderError``
-    propagate on a rejection. Every caller that doesn't opt in (``eval_extended``'s own tests via
-    the shared ``pipeline`` fixture, ``eval_consistency``, ``eval_robustness``) keeps today's exact
+    propagate on a rejection. Every caller that doesn't opt in (the scenarios suite's own tests via
+    the shared ``pipeline`` fixture, the consistency and robustness suites) keeps today's exact
     behavior — one rejected decision still aborts the whole scenario for them.
 
     ``best_effort=True`` (the two correctness suites only): drives the graph via
@@ -760,7 +760,7 @@ def pipeline() -> dict[str, dict]:
     unlike ``test_policy_pipeline.py``'s two variants (which share one realm and reuse a single IdP
     process), these scenarios' realms differ, so nothing can safely be kept warm across them.
     """
-    require_env(
+    require_env_or_skip(
         "KEYCLOAK_URL",
         "KEYCLOAK_ADMIN_USERNAME",
         "KEYCLOAK_ADMIN_PASSWORD",

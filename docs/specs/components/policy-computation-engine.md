@@ -253,7 +253,7 @@ Good tests assert external behavior — what the engine writes to the Policy Mod
 - `aiac.policy.model_store.library` — mock `get_service_policy` / `get_service_policy_by_scope`, `get_service_policies_by_role`, `apply_service_policy`, `delete_service_policy`.
 - `aiac.pdp.policy.library` — mock `apply_policy`, `delete_agent_policy`.
 
-**Un-freeze `test/policy/computation/`.** These tests were excluded (frozen imports caused collection errors). With the SPM redesign landed, un-freeze the directory so the suite runs under `pytest test/ -m "not integration"`.
+**Un-freeze `test/unit/policy/computation/`.** These tests were excluded (frozen imports caused collection errors). With the SPM redesign landed, un-freeze the directory so the suite runs under the default `pytest` (marker-only selection; the unit lane is untagged).
 
 Key behaviors to assert:
 

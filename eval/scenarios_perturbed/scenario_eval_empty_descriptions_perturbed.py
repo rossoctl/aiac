@@ -1,5 +1,5 @@
 """Semantic-perturbation sibling of ``scenario_eval_empty_descriptions.py`` (spec:
-``docs/specs/eval/policy-eval-robustness-consistency.md``).
+``docs/evaluation/policy-eval-robustness-consistency.md``).
 
 Unlike every other scenario in this directory, this module's descriptions are NOT reworded — they
 are empty in the original by design (that scenario's whole point is that no semantic content is

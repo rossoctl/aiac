@@ -1,4 +1,4 @@
-"""PRB run-to-run consistency suite (spec: ``docs/specs/eval/
+"""PRB run-to-run consistency suite (spec: ``docs/evaluation/
 policy-eval-robustness-consistency.md``).
 
 Checks whether the LLM-backed Policy Rules Builder (``aiac.agent.policy_rules_builder.graph``)
@@ -15,7 +15,7 @@ added signal). Reuses the existing 8-scenario corpus (``SCENARIOS``, ``orchestra
 
 Run (needs LLM_BASE_URL/LLM_MODEL/LLM_API_KEY exported; no Keycloak/opa needed):
     .venv/bin/pytest eval/test_policy_pipeline_consistency.py \
-        -m eval_consistency -v
+        -m eval -v
 
 N (repeats per scenario) is overridable via ``PRB_CONSISTENCY_REPEATS`` (default 5).
 """
@@ -28,12 +28,12 @@ from pathlib import Path
 
 import pytest
 
-pytestmark = pytest.mark.eval_consistency
+pytestmark = pytest.mark.eval
 
 HERE = Path(__file__).resolve().parent  # aiac/eval/
 REPO_ROOT = HERE.parent  # -> aiac/
 SRC = REPO_ROOT / "src"
-sys.path.insert(0, str(REPO_ROOT))  # so ``import test.integration.*``/``eval.*`` resolves
+sys.path.insert(0, str(REPO_ROOT))  # so ``import test.system.*``/``eval.*`` resolves
 sys.path.insert(0, str(SRC))  # so ``import aiac.*`` resolves
 
 from eval.prb_direct import build_roles_and_scopes  # noqa: E402
@@ -42,7 +42,7 @@ from eval.test_policy_pipeline_eval import (  # noqa: E402
     grant_sets,
     orchestrate_prb,
 )
-from test.integration.launcher import require_env  # noqa: E402
+from test.system.launcher import require_env_or_skip  # noqa: E402
 
 N = int(os.environ.get("PRB_CONSISTENCY_REPEATS", "5"))
 if N < 2:
@@ -54,7 +54,7 @@ def test_prb_consistent_across_repeats(scenario_name: str, monkeypatch: pytest.M
     """Run the PRB ``PRB_CONSISTENCY_REPEATS`` (default 5) times against the same unperturbed
     scenario input and assert every run's grant sets are exactly equal — no tolerance or
     majority vote, since this is access control: any run-to-run disagreement is a finding."""
-    require_env("LLM_BASE_URL", "LLM_MODEL", "LLM_API_KEY")
+    require_env_or_skip("LLM_BASE_URL", "LLM_MODEL", "LLM_API_KEY")
     scenario = SCENARIOS[scenario_name]
     roles, scopes = build_roles_and_scopes(scenario)
     policy_path = Path(scenario.__file__).resolve().parent / scenario.POLICY_FILE

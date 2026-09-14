@@ -1,7 +1,7 @@
 """Scenario 8 — misleading descriptions: 2 users, 1 agent, 1 tool, hospitality/hotel domain.
 
 Companion to ``scenario_eval_baseline.py`` (Scenario 1) for ``test_policy_pipeline_eval.py`` (spec:
-``docs/specs/eval/policy-eval-scenarios.md``). Isolates one aspect: names lie,
+``docs/evaluation/policy-eval-scenarios.md``). Isolates one aspect: names lie,
 descriptions are truth. Two misdirection devices, both name-level, neither backed by any real
 extra access:
 
