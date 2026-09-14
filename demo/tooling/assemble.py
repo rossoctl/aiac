@@ -681,28 +681,24 @@ def main() -> None:
     add(
         "Classify the workload, then create a role + scope per declared skill",
         idp_phase(agent_recs, "provision"),
-        "Type comes from the pod's rossoctl.io/type label; skills from the AgentCard CR's "
-        "status.card. Each skill becomes one realm role and one client scope, bound to the "
-        "client — every write preceded by a read-back, so re-running is idempotent.",
+        "Type comes from the pod's rossoctl.io/type label; skills from its AgentCard "
+        "resource. Each skill becomes one realm role and one client scope, bound to the client.",
     )
     add(
         "Sweep every client in the realm to build the candidate set",
         idp_phase(agent_recs, "candidates"),
-        "GET /services, then each client's roles and scopes — 12 clients, many returning [] "
-        "— because the PRB has to judge the policy against every role that could reach this "
-        "agent, not just the ones it just created.",
+        "Each of the 12 clients queried for roles and scopes, many answering [] — every role "
+        "that could reach this agent has to be judged, not just the ones just created.",
     )
     add(
-        "Read the demo users and their role assignments",
+        "Read the relevant users and their role assignments",
         idp_phase(agent_recs, "subjects"),
-        "dev-user, test-user, devops-user and their realm roles: the subjects the inbound "
-        "gate will be keyed on.",
+        "The users whose access is being decided, and the realm roles each one holds.",
     )
     add(
         "Re-read each candidate's roles and scopes while deciding",
         idp_phase(agent_recs, "trailing"),
-        "The rules builder re-reads a candidate's roles and scopes as it evaluates it, so "
-        "these interleave with the LLM calls below rather than all happening up front.",
+        "Every candidate's roles and scopes, fetched again as each one is judged.",
     )
     add(
         "LLM proposes grants per role/scope pair against policy.md",
@@ -715,17 +711,17 @@ def main() -> None:
         "Returns {approved, reason}; a reject retries the propose, up to 3 times.",
     )
     add(
-        "Render Rego and server-side-apply the AuthorizationPolicy CR",
+        "Render Rego and apply it as the agent's AuthorizationPolicy resource",
         [step(r) for r in by(agent_recs, "policy-writer")],
-        "POST the computed model to the Policy Writer; it patches the CR. 204, no body.",
+        "The whole computed model goes out; enforceable Rego lands on the cluster.",
     )
     add(
         "Persist the computed policy to the Policy Model Store",
         [step(r) for r in by(agent_recs, "model-store")],
-        "Keyed by service id, so the next onboarding is incremental.",
+        "So the next workload's onboarding can build on this one.",
     )
     add(
-        "The generated Rego, read back from the CR",
+        "The generated Rego, read back from the cluster",
         rego_steps("01-after-agent"),
         "Two gates: inbound (who may call) and outbound (what it may do).",
     )
@@ -756,12 +752,12 @@ def main() -> None:
     add(
         "Second LLM pass audits the tool proposals",
         [step(r) for r in by(tool_recs, "llm-audit")],
-        "Same approved/reason contract; all approved on the first pass.",
+        "Each tool-scope decision reviewed a second time.",
     )
     add(
-        "Re-render the AGENT's CR to fill in its outbound gate",
+        "Re-render the AGENT's policy to fill in its outbound gate",
         [step(r) for r in by(tool_recs, "policy-writer")],
-        "No CR is written for the tool: it is a target, so the agent's policy changes.",
+        "Nothing is written for the tool: it is a target, so the agent's policy is what changes.",
     )
     add(
         "Persist the updated policy model",
@@ -769,7 +765,7 @@ def main() -> None:
         "Now covering both workloads.",
     )
     add(
-        "The completed Rego, read back from the CR",
+        "The completed Rego, read back from the cluster",
         rego_steps("02-after-tool"),
         "The outbound gate is now keyed by the tool's SPIFFE id.",
     )
@@ -781,9 +777,9 @@ def main() -> None:
 
     # 10-12 — drive real users through the gates
     USER_TASK = {
-        "dev": "dev-user: ROPC login, RFC 8693 exchange, then both gates",
-        "test": "test-user: same flow, different role",
-        "devops": "devops-user: a role the policy never mentions",
+        "dev": "A user in the developer role: password login, token exchange, then both gates",
+        "test": "A user in the tester role: the same flow, a different role",
+        "devops": "A user in a role the policy never mentions",
     }
     for target, summary in (
         ("dev", "Reads and writes source, reads issues — but cannot close one."),
