@@ -48,7 +48,7 @@ So with workload `github-tool` and a tool named `source-read`, the provisioned s
 
 The canonical scenario ([`../../../test/system/scenario.py`](../../../test/system/scenario.py),
 `TOOL_SCOPES`) and its spec
-([`../testing/policy-pipeline.md`](../testing/policy-pipeline.md),
+([`../../testing/policy-pipeline.md`](../../testing/policy-pipeline.md),
 *Role & scope descriptions → Tool scopes*) fix **four** `github-tool` scopes. This tool exposes
 exactly the four MCP tools whose names + descriptions make UC-1 reproduce them:
 
@@ -66,7 +66,7 @@ Phase 1 only discovers and evaluates them.
 - Phase-1 deliverable: [`../../gh-issues/sub-issue-phase-1.md`](../../gh-issues/sub-issue-phase-1.md)
 - UC-1 `analyze_tool`: [`../components/aiac-agent/uc1-service-onboarding.md`](../components/aiac-agent/uc1-service-onboarding.md)
 - Scenario fixture (`TOOL_SCOPES`): [`../../../test/system/scenario.py`](../../../test/system/scenario.py)
-- Scenario spec: [`../testing/policy-pipeline.md`](../testing/policy-pipeline.md)
+- Scenario spec: [`../../testing/policy-pipeline.md`](../../testing/policy-pipeline.md)
 - Sibling agent spec: [`github-agent.md`](github-agent.md)
 - Reference deployment: `authbridge/demos/github-issue/k8s/` in the `rossoctl/cortex` repo
 

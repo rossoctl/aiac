@@ -13,7 +13,7 @@
 ## 1. Purpose & scenario mapping
 
 The AIAC policy-pipeline integration test
-([`../testing/policy-pipeline.md`](../testing/policy-pipeline.md))
+([`../../testing/policy-pipeline.md`](../../testing/policy-pipeline.md))
 and its fixture ([`../../../test/system/scenario.py`](../../../test/system/scenario.py)) are written
 around a canonical **`github-agent`**: an autonomous A2A agent that acts on a user's behalf against
 **source repositories** and an **issue tracker**, calling the **`github-tool`** MCP server. Until now
@@ -37,7 +37,7 @@ exposes the two capability areas; the AuthBridge sidecar performs inbound JWT va
 RFC-8693 token exchange, and the `github-tool` MitM swaps the exchanged token for a GitHub PAT by scope.
 
 ### Related artefacts
-- Scenario spec: [`../testing/policy-pipeline.md`](../testing/policy-pipeline.md)
+- Scenario spec: [`../../testing/policy-pipeline.md`](../../testing/policy-pipeline.md)
 - Scenario fixture: [`../../../test/system/scenario.py`](../../../test/system/scenario.py)
 - Existing (issue-only) agent card: [`../../analysis/github-agent-card.json`](../../analysis/github-agent-card.json)
 - `github-tool` MCP tool catalog (44 tools): [`../../analysis/github-mcp-tools-summary.json`](../../analysis/github-mcp-tools-summary.json)
