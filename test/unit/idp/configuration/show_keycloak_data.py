@@ -1,7 +1,7 @@
 """Print live Keycloak data via the IdP configuration service, exercising all Configuration methods.
 
 Usage:
-    .venv/bin/python test/idp/configuration/show_keycloak_data.py
+    .venv/bin/python test/unit/idp/configuration/show_keycloak_data.py
 
 Requires the service to be reachable at AIAC_PDP_CONFIG_URL (default: http://127.0.0.1:7071).
 """
@@ -9,7 +9,7 @@ Requires the service to be reachable at AIAC_PDP_CONFIG_URL (default: http://127
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "src"))
 
 from aiac.idp.configuration.api import Configuration
 from aiac.idp.configuration.models import Role, Scope, Service, Subject

@@ -579,13 +579,13 @@ Require a live Keycloak instance. Controlled by env vars:
 | `KEYCLOAK_ADMIN_USERNAME` | Admin username |
 | `KEYCLOAK_ADMIN_PASSWORD` | Admin password |
 
-Integration tests call the live IdP Configuration Service (running locally or via port-forward) and assert that results are non-empty lists of the correct type. Event Broker integration tests require a live NATS JetStream instance.
+System tests call the live IdP Configuration Service (running locally or via port-forward) and assert that results are non-empty lists of the correct type. Event Broker system tests require a live NATS JetStream instance.
 
-Use a pytest marker (e.g. `@pytest.mark.integration`) so unit tests and integration tests can be run independently:
+Use a pytest marker (e.g. `@pytest.mark.system`) so unit tests and system tests can be run independently (selection is marker-only — no path argument):
 
 ```bash
-pytest aiac/ -m "not integration"   # unit only
-pytest aiac/ -m integration          # integration only
+pytest              # unit only (the default)
+pytest -m system    # system only
 ```
 
 ### Test & evaluation specifications
