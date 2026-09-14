@@ -206,6 +206,30 @@ def test_render_svg_chart_has_one_circle_per_row_and_legend_labels() -> None:
     assert "denial_precision" in svg
 
 
+def test_render_svg_chart_tooltip_is_structured_multiline() -> None:
+    rows = [
+        {
+            "suite": "correctness_prb",
+            "timestamp": "2026-09-10T07:00:00+00:00",
+            "model": "Azure/gpt-5-mini-2025-08-07",
+            "precision": 1.0,
+            "recall": 0.9,
+            "denial_precision": 0.957,
+        }
+    ]
+
+    svg = render_svg_chart(rows, reports=[], suite="correctness_prb")
+
+    expected_title = (
+        "Datetime = 2026-09-10T07:00:00+00:00\n"
+        "LLM = Azure/gpt-5-mini-2025-08-07\n"
+        "Precision = 1.0\n"
+        "Recall = 0.9\n"
+        "Denial_precision = 0.957"
+    )
+    assert f"<title>{expected_title}</title>" in svg
+
+
 def test_render_svg_chart_links_point_to_matching_report_anchor() -> None:
     rows = [
         {
