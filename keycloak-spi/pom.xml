@@ -29,7 +29,7 @@
              (server-spi-private). -->
         <keycloak.version>26.7.3</keycloak.version>
         <!-- Verify against Maven Central at implementation/upgrade time. -->
-        <jnats.version>2.20.6</jnats.version>
+        <jnats.version>2.26.3</jnats.version>
         <!-- jboss-logging is Keycloak's logging facade, on its runtime classpath;
              provided-scope so it isn't shaded. Was previously pulled transitively
              via keycloak-services (dropped). -->
