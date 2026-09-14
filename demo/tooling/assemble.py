@@ -755,7 +755,7 @@ def main() -> None:
     add(
         "The generated OPA policy, read back from the cluster",
         rego_steps("01-after-agent"),
-        "Two Rego packages — authbridge.client.inbound.request and .outbound.request — each with default allow := false.",
+        "Two independent gates, both default allow := false: inbound answers who may call the agent, outbound what the agent may then do on its behalf.",
     )
     add(
         "State after the agent alone: inbound populated, outbound empty",
@@ -774,7 +774,7 @@ def main() -> None:
     add(
         "Call the tool's live MCP endpoint for tools/list",
         [step(r) for r in by(tool_recs, "mcp-tools-list")],
-        "JSON-RPC to the running pod. 4 tools returned, each with its own schema.",
+        "Capabilities are discovered by asking the running tool, not read from a manifest someone maintains — so the policy is judged against what the tool actually exposes today.",
     )
     add(
         "Proposer pass over the discovered tool scopes",
@@ -790,7 +790,7 @@ def main() -> None:
     add(
         "Recompile the AGENT's Rego to fill in its outbound gate",
         [step(r) for r in by(tool_recs, "policy-writer")],
-        "Nothing is written for the tool: it is a target, so the agent's policy is what changes.",
+        "A design decision: enforcement lives on the agent's outbound gate, not the tool's inbound. The tool gets no policy of its own — the caller is what gets constrained.",
     )
     add(
         "Persist the updated policy model",
