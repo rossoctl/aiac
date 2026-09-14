@@ -19,6 +19,7 @@ convergence on NATS redelivery. A build **failure**, however, triggers a **compe
 rollback** (UC1-only) before the error propagates — see :func:`_rollback`.
 """
 
+import contextlib
 import logging
 import threading
 
@@ -64,19 +65,57 @@ _ROLLBACK_ERRORS = (
 # Multi-replica caveat: this in-process lock serializes within ONE agent replica only.
 # Cross-replica serialization (multiple agent pods sharing a Keycloak realm) needs external
 # coordination (e.g. a distributed lock) and is out of scope here.
-_service_locks: dict[str, threading.Lock] = {}
+#
+# Eviction (issue 202): the registry must not grow one idle ``Lock`` per distinct
+# ``service_id`` ever seen. Each entry is **reference-counted** — a plain delete on the last
+# run's exit is unsafe, because another thread may still be *blocked* on that same ``Lock``
+# instance: deleting the entry would let a later arrival mint a fresh lock and run
+# concurrently with the waiter, silently breaking serialization. So a run registers as a
+# holder/waiter (``refcount += 1``) under the guard *before* it blocks on the lock, and the
+# entry is removed only when the last holder/waiter leaves (``refcount == 0``) — again under
+# the guard. While ``refcount > 0`` every arrival for that ``service_id`` shares the one
+# ``Lock`` in the map, so serialization holds across the eviction boundary.
+class _LockEntry:
+    """A per-``service_id`` lock paired with a count of runs holding or waiting on it."""
+
+    __slots__ = ("lock", "refcount")
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.refcount = 0
+
+
+_service_locks: dict[str, _LockEntry] = {}
 _service_locks_guard = threading.Lock()
 
 
-def _lock_for(service_id: str) -> threading.Lock:
-    """Return the per-``service_id`` lock, creating it lazily under the guard lock so two
-    threads racing on a first-seen service_id share one lock instance."""
+@contextlib.contextmanager
+def _service_lock(service_id: str):
+    """Serialize the ``service_id``'s onboarding lifecycle, evicting the registry entry once
+    the last holder/waiter leaves.
+
+    Under the guard, register as a holder/waiter (creating the entry lazily so threads racing
+    on a first-seen ``service_id`` share one ``Lock``), then block on that lock *outside* the
+    guard. On exit, release the lock and drop the reference under the guard; when no run still
+    holds or waits (``refcount == 0``) the entry is removed. Because the increment happens
+    under the guard before the block, a still-queued waiter keeps ``refcount > 0`` and so
+    keeps the shared lock in the map — a later arrival cannot mint a fresh one and overtake."""
     with _service_locks_guard:
-        lock = _service_locks.get(service_id)
-        if lock is None:
-            lock = threading.Lock()
-            _service_locks[service_id] = lock
-        return lock
+        entry = _service_locks.get(service_id)
+        if entry is None:
+            entry = _LockEntry()
+            _service_locks[service_id] = entry
+        entry.refcount += 1
+        lock = entry.lock
+    lock.acquire()
+    try:
+        yield
+    finally:
+        lock.release()
+        with _service_locks_guard:
+            entry.refcount -= 1
+            if entry.refcount == 0:
+                del _service_locks[service_id]
 
 
 # --------------------------------------------------------------------------- #
@@ -149,10 +188,12 @@ def onboard_service(
     end-to-end (onboard → PCE → derived APM → OPA).
 
     The full provision → build → rollback lifecycle is serialized per ``service_id`` (see
-    :func:`_lock_for`): a concurrent same-service run cannot corrupt the created-manifest or
-    roll back a shared entity, while different service_ids run concurrently. This is an
-    in-process lock (one agent replica only); cross-replica serialization is out of scope."""
-    with _lock_for(service_id):
+    :func:`_service_lock`): a concurrent same-service run cannot corrupt the created-manifest
+    or roll back a shared entity, while different service_ids run concurrently. The registry
+    entry is reference-counted and evicted once the last run using it exits (issue 202), on
+    both the success and failure paths, without breaking serialization. This is an in-process
+    lock (one agent replica only); cross-replica serialization is out of scope."""
+    with _service_lock(service_id):
         provision = build_provision_graph().invoke(OnboardingProvisionState(trigger=Trigger(entity_id=service_id)))
         service_type = provision["service_type"]
         created_roles = provision["created_roles"]

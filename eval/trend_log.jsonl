@@ -1,0 +1,1 @@
+{"timestamp": "2026-09-10T06:56:10+00:00", "suite": "correctness_e2e", "run_type": "regression", "model": "Azure/gpt-5-mini-2025-08-07", "scenarios_scored": 8, "precision": 0.984, "recall": 0.952, "denial_precision": 0.957}

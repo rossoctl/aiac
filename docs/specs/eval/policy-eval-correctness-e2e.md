@@ -79,8 +79,8 @@ introduced by this suite and not fixed by it** — see [Out of Scope](#out-of-sc
 | `OPA_BIN` (optional) | Path to the `opa` binary; falls back to `opa` on `PATH`. The suite skips cleanly (not a failure) if neither resolves. |
 | `EVAL_PIPELINE_PARALLELISM` (optional, default = scenario count, currently 8) | Max concurrent `ProcessPoolExecutor` workers in the shared `pipeline` fixture — see [Parallelization](#parallelization). An escape hatch, not a tuning knob with a "correct" lower value; lower it only if the LLM endpoint rate-limits under full concurrency. |
 
-`eval/conftest.py` auto-loads `eval/.env` (gitignored, override=False) if present, so a local
-`eval/.env` with the above removes the need to `export`/source anything before invoking `pytest`
+`eval/conftest.py` auto-loads the repo-root `.env` (gitignored, override=False) if present, so a
+local `.env` with the above removes the need to `export`/source anything before invoking `pytest`
 directly.
 
 ## Parallelization
@@ -193,6 +193,15 @@ added to the `MARKERS` set. See
 [policy-eval-correctness-prb.md § Test report](policy-eval-correctness-prb.md#test-report) for the
 render behavior itself.
 
+## Trend log
+
+Same mechanism as
+[policy-eval-correctness-prb.md § Trend log](policy-eval-correctness-prb.md#trend-log) (#2091,
+`eval/trend_log.py`) — `test_e2e_correctness` `record_property`s the same `true_positives`/
+`denied_total` counts, and `eval/conftest.py` pools them into a `suite="correctness_e2e"` row in
+the same committed `eval/trend_log.jsonl`, distinct from the PRB-level suite's
+`"correctness_prb"` row.
+
 ## Relationship to other integration tests
 
 This is **one** integration-test spec among several indexed by the master PRD
@@ -234,9 +243,6 @@ This is **one** integration-test spec among several indexed by the master PRD
   [Known gap](#known-gap-outbound_target-denial-is-unrenderable-not-just-untested). This is
   production code, unrelated to this eval suite's own scope; the gap is documented and reported
   (vacuous `denial_precision=1.0` for that one gate), not silently hidden.
-- **A committed trend log** — same deferral as
-  [policy-eval-correctness-prb.md § Out of Scope](policy-eval-correctness-prb.md#out-of-scope),
-  #2091.
 - **An under-grant tolerance threshold.** Still TBD per the originating spec; under-grants are
   tracked/reported only, never gated.
 - **New scenarios.** Reuses the existing 8-scenario corpus unmodified — see

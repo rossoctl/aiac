@@ -282,11 +282,19 @@ This is **one** integration-test spec among several indexed by the master PRD
   future `eval_correctness_e2e` marker (#2090) without ambiguity between the two correctness
   suites' infra requirements.
 
+## Trend log
+
+`eval/trend_log.py`'s shared `append_row`/`pool_correctness_metrics` (#2091) pools this suite's
+`true_positives`/`denied_total` counts (and `over_grants`/`under_grants`/`incorrectly_denied` pair
+dicts) — `record_property`'d by `test_prb_correctness` alongside the existing
+precision/recall/denial-precision floats — across every scenario that reached `score_scenario` in
+a run, and appends one row (`suite="correctness_prb"`) to the committed, append-only
+`eval/trend_log.jsonl` from `eval/conftest.py`'s `pytest_sessionfinish`. Pooled by summed count,
+not averaged per-scenario — same union-not-average philosophy as `score_scenario`'s own
+cross-gate aggregation. See `docs/specs/eval/eval-framework.md` §9.
+
 ## Out of Scope
 
-- **A committed trend log** (tracking precision/recall/denial-precision across runs over time, as
-  opposed to the per-run Markdown report — see [Test report](#test-report), which **is** wired
-  in). Deferred to #2091.
 - **End-to-end (Keycloak+OPA) correctness scoring.** Deferred to #2090 — `correctness_scorer.py`
   is designed to be reusable there; the wiring itself is not this ticket's scope.
 - **An under-grant tolerance threshold.** Per the originating spec, still TBD — under-grants are
