@@ -14,8 +14,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import scenario as scn
 from _lib import (
     GENERATED, capture_rego, cmd, connect_admin, explain, load_config, note, ok, onboard,
-    pause, port_forward, print_state_before, print_state_diff, resolve_service_id, say,
-    snapshot_state, tail_component_logs,
+    pause, port_forward, print_service_policy_table, print_state_before, print_state_diff,
+    print_steps, resolve_service_id, say, snapshot_state, steps_from_lines, tail_component_logs,
 )
 
 
@@ -34,6 +34,11 @@ def main() -> None:
     """)
     print_state_before(before)
     service_id = resolve_service_id(admin, cfg, f"{cfg.namespace}/{scn.AGENT_WORKLOAD}")
+    # The Policy Store keys ServicePolicyModel rows by the Keycloak client's REAL clientId
+    # (a SPIFFE URI under SPIRE, e.g. "spiffe://localtest.me/ns/team1/sa/github-agent") — not
+    # the "namespace/workload" display name used to resolve the UUID above, and not the UUID
+    # itself. Fetch it now so step 3 can look the mapping up correctly.
+    client_id = admin.get_client(service_id)["clientId"]
     note(f"service id: {service_id}")
     pause()
 
@@ -50,18 +55,20 @@ def main() -> None:
         isn't onboarded yet, the outbound gate comes back with every map still EMPTY — there is
         no tool for the agent to act on.
 
-        The Controller and Policy Writer pods now stream their own logs below (added narration,
-        Part 1) — watch for classify_service, PRB _propose/_audit, and PolicyWriter apply lines
-        as this call is in flight.
+        Once the call returns, the steps it actually performed (from the Controller's and
+        Policy Writer's own component logs) print below as a plain numbered list.
     """)
     cmd("Input", f"POST /apply/service/{service_id}  (Controller, port-forwarded)")
+    note("onboarding in progress — this can take a few minutes (LLM calls in flight)...")
+    raw_lines: list[str] = []
     with tail_component_logs([
         ("controller", "aiac-agent", "aiac-system", None),
         ("policy-writer", "aiac-interface", "aiac-system", "aiac-pdp-policy-opa"),
-    ]):
+    ], raw_lines):
         with port_forward(cfg.controller_target, namespace=cfg.controller_namespace, local_port=cfg.controller_local_port, remote_port=cfg.controller_remote_port, ready_url=f"http://127.0.0.1:{cfg.controller_local_port}/health") as base_url:
             onboard(cfg, base_url, service_id)
     ok("onboarding call returned 200")
+    print_steps(f"Onboard {scn.AGENT_WORKLOAD}", steps_from_lines(raw_lines))
     pause()
 
     say("3", "3", "Capture generated Rego (from the AuthorizationPolicy CR)")
@@ -75,6 +82,8 @@ def main() -> None:
     capture_rego(cfg, rego_dir)
     for f in (cfg.inbound_rego, cfg.outbound_rego):
         ok(f"{rego_dir / f}")
+
+    print_service_policy_table(cfg, client_id, f"Resulting mapping — who may call {scn.AGENT_WORKLOAD}")
 
     after = snapshot_state(cfg, admin, rego_dir)
     print_state_diff(before, after)
