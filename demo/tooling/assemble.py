@@ -800,7 +800,7 @@ def main() -> None:
     add(
         "The completed OPA policy, read back from the cluster",
         rego_steps("02-after-tool"),
-        "The outbound gate is now keyed by the tool's SPIFFE id.",
+        "Both gates are now populated and the agent and tool are fully configured. Everything below stops changing the system and just exercises it.",
     )
     add(
         "Diff of the two snapshots: the outbound gate filling in",
@@ -810,14 +810,14 @@ def main() -> None:
 
     # 10-12 — drive real users through the gates
     USER_TASK = {
-        "dev": "A user in the developer role: password login, token exchange, then both gates",
-        "test": "A user in the tester role: the same flow, a different role",
-        "devops": "A user in a role the policy never mentions",
+        "dev": "Test: a user in the developer role exercises the configured system",
+        "test": "Test: a user in the tester role, same flow",
+        "devops": "Test: a user in a role the policy never mentions",
     }
     for target, summary in (
-        ("dev", "Reads and writes source, reads issues — but cannot close one."),
-        ("test", "Files and reads issues — but cannot see source."),
-        ("devops", "Blocked at the inbound gate — no role sources any scope the agent exposes."),
+        ("dev", "Logs in, exchanges a token for the tool, then each intent is checked: source read and write and issue reads allowed, closing an issue denied."),
+        ("test", "The mirror image: issue reads and writes allowed, reading source denied."),
+        ("devops", "Refused at the inbound gate before any tool call is attempted — no role they hold sources a single scope the agent exposes."),
     ):
         log = logs / f"{target}.log"
         narrated = narration_steps(log)
