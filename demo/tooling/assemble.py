@@ -161,7 +161,7 @@ def annotate_writes(steps: list[dict]) -> list[dict]:
                         note += f"; {where} now answers {after}, showing the change"
                 else:
                     note += "; verified later in the run, not by an adjacent call"
-            st["explain"] = _subtitle(" ".join(x for x in (st.get("explain"), note) if x))
+            st["explain"] = _subtitle(" · ".join(x for x in (st.get("explain"), note) if x))
         out.append(st)
     return out
 
@@ -396,6 +396,44 @@ def rego_steps(snapshot: str) -> list[dict]:
     return out
 
 
+# --- Source C: the demo's own parsed "steps performed" list ---------------------------
+# `_lib.print_steps` (added upstream) renders each Controller/PRB/Policy-Writer log event as a
+# human-readable phrase — "Classified 'github-agent' (namespace 'team1') as an Agent", "PRB
+# rejected the proposal for role 'developer' (attempt 1/3): ...". That is a better `explain`
+# than anything derived here, because it comes from the code that emitted the event and is
+# maintained alongside it. Format is `Agent task: <task>` then numbered `N. <phrase>` lines.
+_STEP_LINE_RE = re.compile(r"^\s*(\d+)\.\s+(.*)$")
+
+
+def parsed_steps(log_path: Path) -> list[str]:
+    """The phrases from the demo's own "Steps performed" block, in order."""
+    if not log_path.exists():
+        return []
+    out: list[str] = []
+    in_block = False
+    for raw in log_path.read_text(errors="replace").splitlines():
+        if "Steps performed:" in raw:
+            in_block = True
+            continue
+        if not in_block:
+            continue
+        m = _STEP_LINE_RE.match(raw)
+        if m:
+            out.append(" ".join(m.group(2).split()))
+        elif raw.strip() and not raw.startswith(" "):
+            in_block = False
+    return out
+
+
+def phrase_for(phrases: list[str], *needles: str) -> str | None:
+    """First parsed phrase containing every needle — used to attach the demo's own wording to
+    the captured call it describes."""
+    for ph in phrases:
+        if all(n.lower() in ph.lower() for n in needles):
+            return ph
+    return None
+
+
 # --- Source A: terminal narration ------------------------------------------
 CMD_RE = re.compile(r"^\s*\$ (.+)$")
 
@@ -626,6 +664,9 @@ def main() -> None:
     def by(recs: list[dict], kind: str) -> list[dict]:
         return [r for r in recs if classify(r) == kind]
 
+    agent_phrases = parsed_steps(logs / "agent.log")
+    tool_phrases = parsed_steps(logs / "tool.log")
+
     tasks: list[dict] = []
 
     def normalize(steps: list[dict]) -> list[dict]:
@@ -656,7 +697,14 @@ def main() -> None:
             kept.append(st)
         return kept
 
-    def add(task: str, steps: list[dict], summary: str) -> None:
+    def add(task: str, steps: list[dict], summary: str, phrase: str | None = None) -> None:
+        # `phrase` is the demo's own description of this unit of work, taken from its parsed
+        # "Steps performed" output. Attached to the first step so the narration keeps the
+        # wording the emitting code chose.
+        if phrase and steps:
+            phrase = phrase.replace(" CR applied", " applied")
+            joined = " · ".join(x for x in (steps[0].get("explain"), phrase) if x)
+            steps = [dict(steps[0], explain=joined)] + steps[1:]
         # A task with no replayable step has nothing for the video to show. The Pause-3 diff
         # is the clearest case: it was entirely a derived view, and the state it describes is
         # already visible in the Rego read-back tasks either side of it.
@@ -709,6 +757,8 @@ def main() -> None:
         idp_phase(agent_recs, "provision"),
         "Type comes from the pod's rossoctl.io/type label; skills from its AgentCard "
         "resource. Each skill becomes one realm role and one client scope, bound to the client.",
+    
+        phrase=phrase_for(agent_phrases, "Classified") or phrase_for(agent_phrases, "AgentCard"),
     )
     add(
         "Sweep every client in the realm to build the candidate set",
@@ -746,6 +796,8 @@ def main() -> None:
         "Compile the decisions to OPA Rego and apply the agent's AuthorizationPolicy",
         [step(r) for r in by(agent_recs, "policy-writer")],
         "The request body is the resolved rule set — allow/deny rules per gate, the subject->role and target->scope maps, default_effect Deny. The writer compiles it to Rego and patches the AuthorizationPolicy that AuthBridge's OPA plugin evaluates.",
+    
+        phrase=phrase_for(agent_phrases, "AuthorizationPolicy", "applied"),
     )
     add(
         "Persist the computed policy to the Policy Model Store",
@@ -775,6 +827,8 @@ def main() -> None:
         "Call the tool's live MCP endpoint for tools/list",
         [step(r) for r in by(tool_recs, "mcp-tools-list")],
         "Capabilities are discovered by asking the running tool, not read from a manifest someone maintains — so the policy is judged against what the tool actually exposes today.",
+    
+        phrase=phrase_for(tool_phrases, "MCP tools/list"),
     )
     add(
         "Proposer pass over the discovered tool scopes",
@@ -791,6 +845,8 @@ def main() -> None:
         "Recompile the AGENT's Rego to fill in its outbound gate",
         [step(r) for r in by(tool_recs, "policy-writer")],
         "A design decision: enforcement lives on the agent's outbound gate, not the tool's inbound. The tool gets no policy of its own — the caller is what gets constrained.",
+    
+        phrase=phrase_for(tool_phrases, "AuthorizationPolicy", "applied"),
     )
     add(
         "Persist the updated policy model",
