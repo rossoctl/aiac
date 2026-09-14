@@ -717,9 +717,9 @@ def main() -> None:
         "reason attached, up to 3 attempts.",
     )
     add(
-        "Render Rego and apply it as the agent's AuthorizationPolicy resource",
+        "Compile the decisions to OPA Rego and apply the agent's AuthorizationPolicy",
         [step(r) for r in by(agent_recs, "policy-writer")],
-        "The whole computed model goes out; enforceable Rego lands on the cluster.",
+        "The request body is the resolved rule set — allow/deny rules per gate, the subject->role and target->scope maps, default_effect Deny. The writer compiles it to Rego and patches the AuthorizationPolicy that AuthBridge's OPA plugin evaluates.",
     )
     add(
         "Persist the computed policy to the Policy Model Store",
@@ -727,9 +727,9 @@ def main() -> None:
         "So the next workload's onboarding can build on this one.",
     )
     add(
-        "The generated Rego, read back from the cluster",
+        "The generated OPA policy, read back from the cluster",
         rego_steps("01-after-agent"),
-        "Two gates: inbound (who may call) and outbound (what it may do).",
+        "Two Rego packages — authbridge.client.inbound.request and .outbound.request — each with default allow := false.",
     )
     add(
         "State after the agent alone: inbound populated, outbound empty",
@@ -762,7 +762,7 @@ def main() -> None:
         "Every tool-scope decision independently re-derived before it is trusted.",
     )
     add(
-        "Re-render the AGENT's policy to fill in its outbound gate",
+        "Recompile the AGENT's Rego to fill in its outbound gate",
         [step(r) for r in by(tool_recs, "policy-writer")],
         "Nothing is written for the tool: it is a target, so the agent's policy is what changes.",
     )
@@ -772,7 +772,7 @@ def main() -> None:
         "Now covering both workloads.",
     )
     add(
-        "The completed Rego, read back from the cluster",
+        "The completed OPA policy, read back from the cluster",
         rego_steps("02-after-tool"),
         "The outbound gate is now keyed by the tool's SPIFFE id.",
     )
