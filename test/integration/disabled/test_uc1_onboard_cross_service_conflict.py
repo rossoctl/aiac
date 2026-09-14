@@ -10,7 +10,7 @@ and asserts the second ``POST /apply/service/{id}`` is refused with **HTTP 422 w
 ``ConflictReport``** — the same boundary shape the deterministic ``routes`` test pins.
 
 Why the conflict is caught at ONBOARDING, before OPA. A cross-service conflict short-circuits inside
-``ServicePolicyBuilder.build`` — the atomicity guarantee (ADR 0001): the builder raises before the
+``ServicePolicyBuilder.build`` — the atomicity guarantee (identify-never-reconcile design decision): the builder raises before the
 Orchestrator/Controller reach the PCE, so **no ``AuthorizationPolicy`` CR is ever upserted** and the
 conflicting policy never reaches the deployed OPA plugin. The "OPA loop" here is therefore exercised
 only to the extent that this is the *same live pipeline / same Controller* the OPA-loop rungs drive

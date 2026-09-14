@@ -13,8 +13,8 @@ conflicts, so a clean apply makes ZERO explain-LLM calls (the explain seam is
 :func:`_explain_pair`). The pairs are fixed (the structural detector's output); each is explained
 once against the candidate ``policy_text``. On ANY quote-validation failure the conflict is KEPT
 with ``quotes_verified=False`` and the explanation falls back to the structural synthesized
-description (ADR 0001: surface, never drop — reversing handoff-07 Q15/Q16, which had decided the
-on-``/apply`` report would be quote-less / no-LLM).
+description (identify-never-reconcile design decision: surface, never drop — reversing
+handoff-07 Q15/Q16, which had decided the on-``/apply`` report would be quote-less / no-LLM).
 """
 
 from aiac.policy.model.models import PolicyRule

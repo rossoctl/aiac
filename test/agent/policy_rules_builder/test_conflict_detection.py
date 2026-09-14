@@ -1,7 +1,7 @@
 """Unit tests for the pure, deterministic structural conflict detector (#2502).
 
 ``detect_conflicts`` is a pure ``(role.id, scope.id)`` allow∩deny set-intersection over the
-assembled ``list[PolicyRule]`` — **no LLM**. Per ADR 0001 it surfaces every overlap as a
+assembled ``list[PolicyRule]`` — **no LLM**. Per the identify-never-reconcile design decision it surfaces every overlap as a
 ``Conflict`` and never reconciles. These tests pin: clean → NO_CONFLICT, overlap → one DIRECT
 scope-focal ``Conflict`` (real ids, no quotes), order-independence (keyed on ids), id-vs-name
 discrimination, and the empty case. They are deterministic (NOT ``integration``/``llm``).
