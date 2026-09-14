@@ -21,15 +21,16 @@
 # The discover script is bash (arrays, [[, BASH_SOURCE) — make's default /bin/sh can't source it.
 SHELL := /bin/bash
 
-.PHONY: help keycloak prereqs clear setup agent tool show diff dev test devops init onboard run demo
+.PHONY: help keycloak prereqs clear setup agent tool show diff dev test devops init onboard run demo uninstall reinstall
 
 .DEFAULT_GOAL := help
 
 # AIAC_ROOT is fixed relative to this Makefile's location (demo/use-cases/uc1-onboarding/), not
 # an override knob — the scripts resolve their own paths the same way.
-AIAC_ROOT := ../../..
-VENV      := $(AIAC_ROOT)/.venv
-PYTHON    ?= $(VENV)/bin/python
+AIAC_ROOT   := ../../..
+VENV        := $(AIAC_ROOT)/.venv
+PYTHON      ?= $(VENV)/bin/python
+DEMO_ASSETS := $(AIAC_ROOT)/demo/assets
 
 # Every Keycloak-touching recipe sources the discovery script first. A make recipe can't export
 # env into the caller's shell (nor into the next recipe), so each recipe that needs the Keycloak
@@ -54,6 +55,12 @@ prereqs: keycloak  ## Verify (and install if absent) everything the demo needs b
 
 clear:  ## Reset to a clean slate: Keycloak roles/scopes, Policy Store, the agent's AuthorizationPolicy CR, generated/
 	$(KC_ENV) $(PYTHON) init/02-clear.py
+
+uninstall:  ## Remove github-agent/github-tool from team1 entirely (k8s objects only; run `clear` first for Keycloak/CR state)
+	$(DEMO_ASSETS)/uninstall.sh
+
+reinstall: uninstall  ## Fresh reinstall of github-agent/github-tool (implies uninstall)
+	$(DEMO_ASSETS)/install.sh
 
 setup:  ## Provision users/roles, mount policy.md, configure token exchange; prints both UUIDs
 	$(KC_ENV) $(PYTHON) init/03-setup.py
