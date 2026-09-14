@@ -30,11 +30,21 @@ HERE = Path(__file__).resolve().parent
 
 def load_trend_log(path: Path = TREND_LOG_DEFAULT_PATH) -> list[dict[str, Any]]:
     """Read the committed trend log's rows, oldest first. ``[]`` if the file doesn't exist yet
-    (a fresh checkout before any suite has ever run)."""
+    (a fresh checkout before any suite has ever run). A line that fails to parse (a truncated
+    final write, a stray merge-conflict marker) is skipped rather than crashing the whole
+    dashboard build -- same defensive posture as ``parse_reports`` takes for report files."""
     if not path.exists():
         return []
+    rows = []
     with path.open(encoding="utf-8") as f:
-        return [json.loads(line) for line in f if line.strip()]
+        for line in f:
+            if not line.strip():
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return rows
 
 
 # Nodeid substring -> trend-log suite name, the inverse of ``eval/conftest.py``'s
@@ -290,7 +300,12 @@ def render_svg_chart(rows: list[dict[str, Any]], reports: list[ParsedReport], *,
         )
 
     for metric, color in _METRIC_COLORS.items():
-        points = " ".join(f"{x(i):.1f},{y(row.get(metric) or 0):.1f}" for i, row in enumerate(rows))
+        # Skip a row missing this metric entirely -- same as the circle loop below -- so the line
+        # doesn't dip to 0 for a gap; it just connects the rows that do carry the metric.
+        coords = [(x(i), y(row[metric])) for i, row in enumerate(rows) if row.get(metric) is not None]
+        if not coords:
+            continue
+        points = " ".join(f"{px:.1f},{py:.1f}" for px, py in coords)
         parts.append(f'<polyline points="{points}" fill="none" stroke="{color}" stroke-width="2" />')
 
     for i, row in enumerate(rows):

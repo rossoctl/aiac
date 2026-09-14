@@ -7,6 +7,7 @@ already includes ``eval/``). No LLM, no Keycloak, no live pytest run.
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -204,6 +205,34 @@ def test_render_svg_chart_has_one_circle_per_row_and_legend_labels() -> None:
     assert "precision" in svg
     assert "recall" in svg
     assert "denial_precision" in svg
+
+
+def test_render_svg_chart_polyline_skips_a_missing_metric_instead_of_plotting_zero() -> None:
+    rows = [
+        {
+            "suite": "correctness_prb",
+            "timestamp": "2026-09-10T07:00:00+00:00",
+            "precision": 1.0,
+            "recall": 1.0,
+            "denial_precision": 1.0,
+        },
+        {
+            # A future suite's row missing denial_precision entirely -- should be a gap in that
+            # metric's line, not a dip to 0.
+            "suite": "correctness_prb",
+            "timestamp": "2026-09-11T07:00:00+00:00",
+            "precision": 1.0,
+            "recall": 1.0,
+        },
+    ]
+
+    svg = render_svg_chart(rows, reports=[], suite="correctness_prb")
+
+    polylines = re.findall(r'<polyline points="([^"]+)"', svg)
+    precision_points, recall_points, denial_points = polylines
+    assert len(precision_points.split()) == 2
+    assert len(recall_points.split()) == 2
+    assert len(denial_points.split()) == 1  # only the first row -- no plotted point for row 2
 
 
 def test_render_svg_chart_tooltip_is_structured_multiline() -> None:
@@ -421,3 +450,21 @@ def test_load_trend_log_missing_file_returns_empty(tmp_path: Path) -> None:
     rows = load_trend_log(tmp_path / "does_not_exist.jsonl")
 
     assert rows == []
+
+
+def test_load_trend_log_skips_a_line_that_fails_to_parse(tmp_path: Path) -> None:
+    path = tmp_path / "trend_log.jsonl"
+    path.write_text(
+        json.dumps({"suite": "correctness_prb", "precision": 1.0})
+        + "\n"
+        + "not valid json, e.g. a truncated final line\n"
+        + json.dumps({"suite": "correctness_e2e", "precision": 0.9})
+        + "\n"
+    )
+
+    rows = load_trend_log(path)
+
+    assert rows == [
+        {"suite": "correctness_prb", "precision": 1.0},
+        {"suite": "correctness_e2e", "precision": 0.9},
+    ]
