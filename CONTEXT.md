@@ -79,6 +79,21 @@ invariants, role-assignment constraints). An authoring-layer artifact, upstream
 of the engine's `PolicyRule`s. See `docs/specs/digested-policy.md`.
 _Avoid_: parsed policy, normalized policy.
 
+**Policy Digester**:
+The LLM-backed conversion that rewrites a **source policy** into a **digested
+policy**, guided by the digested-policy spec. It is _pure conversion_ — it
+produces the digest and nothing else. Reading the source, storing the digest, and
+detecting authoring-layer conflicts belong to other components, not the digester.
+_Avoid_: converter, normalizer, parser, digest step.
+
+**Faithfulness**:
+The invariant a digest must uphold: it neither **adds**, **drops**, nor
+**broadens** access relative to its source policy. A faithful digest yields
+exactly the access its source granted — never more. Guarded by comparing the
+rules the engine derives from a digest against the source's known-correct rule
+set.
+_Avoid_: correctness, accuracy, fidelity.
+
 **Authoring-layer conflict**:
 Two direct grants _within one digested policy_ with opposite effect whose
 subjects, operations, and resources overlap. Distinct from the engine-level
