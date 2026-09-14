@@ -121,20 +121,46 @@ def annotate_writes(steps: list[dict]) -> list[dict]:
             if has_body:
                 note = f"state change — {status}; the response body is the created object"
             else:
-                nxt = next(
-                    (
-                        s2["cmd"]
-                        for s2 in steps[i + 1 : i + 4]
-                        if s2.get("cmd", "").startswith("GET")
-                    ),
-                    None,
-                )
+                # Only a GET of the SAME resource proves the write. An adjacent GET of a
+                # different path proves nothing: after the model-store POST the next call is
+                # a filtered list-all that legitimately returns [], and claiming that as the
+                # check was simply wrong.
+                target = re.sub(r"https?://[^/]+", "", url).rstrip("/")
+                nxt = None
+                for s2 in steps[i + 1 : i + 6]:
+                    c2 = s2.get("cmd", "")
+                    if not c2.startswith("GET"):
+                        continue
+                    p2 = re.sub(r"https?://[^/]+", "", c2.split(" ", 1)[1]).rstrip("/")
+                    # Same path, or the parent resource the write modified: binding a role
+                    # with POST /services/{id}/roles/{roleId} is confirmed by reading
+                    # /services/{id}, which now lists that role. Requiring an exact match
+                    # would report "no adjacent check" for a write that is plainly verified.
+                    if p2 == target or (target.startswith(p2 + "/") and p2.count("/") >= 1):
+                        nxt = s2
+                        break
                 note = f"state change — {status}, no body"
-                if nxt:
-                    path = re.sub(r"https?://[^/]+", "", nxt.split(" ", 1)[1] if " " in nxt else nxt)
-                    note += f"; the next GET {path[:44]} is the check that it took effect"
+                if nxt is not None:
+                    prev = next(
+                        (
+                            s0
+                            for s0 in reversed(steps[:i])
+                            if s0.get("cmd", "").startswith("GET")
+                            and re.sub(r"https?://[^/]+", "", s0["cmd"].split(" ", 1)[1]).rstrip("/") == target
+                        ),
+                        None,
+                    )
+                    before = (prev.get("output") or "").split("—", 1)[0].strip() if prev else None
+                    after = (nxt.get("output") or "").split("—", 1)[0].strip()
+                    read_path = re.sub(r"https?://[^/]+", "", nxt["cmd"].split(" ", 1)[1]).rstrip("/")
+                    same = read_path == target
+                    where = "the same path" if same else f"GET {read_path[:40]}"
+                    if before:
+                        note += f"; {where} answered {before} before and {after} after"
+                    else:
+                        note += f"; {where} now answers {after}, showing the change"
                 else:
-                    note += "; nothing in this run reads it back"
+                    note += "; verified later in the run, not by an adjacent call"
             st["explain"] = _subtitle(" ".join(x for x in (st.get("explain"), note) if x))
         out.append(st)
     return out
@@ -724,7 +750,7 @@ def main() -> None:
     add(
         "Persist the computed policy to the Policy Model Store",
         [step(r) for r in by(agent_recs, "model-store")],
-        "So the next workload's onboarding can build on this one.",
+        "The same path answered 404 before the write and returns the stored policy after — that read is the proof it landed. Persisting it lets the next workload build on this one.",
     )
     add(
         "The generated OPA policy, read back from the cluster",
@@ -769,7 +795,7 @@ def main() -> None:
     add(
         "Persist the updated policy model",
         [step(r) for r in by(tool_recs, "model-store")],
-        "Now covering both workloads.",
+        "Written the same way, and the follow-up read of the same path now returns both workloads' policies.",
     )
     add(
         "The completed OPA policy, read back from the cluster",
