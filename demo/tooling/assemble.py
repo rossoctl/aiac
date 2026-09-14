@@ -693,22 +693,28 @@ def main() -> None:
     add(
         "Read the relevant users and their role assignments",
         idp_phase(agent_recs, "subjects"),
-        "The users whose access is being decided, and the realm roles each one holds.",
+        "Roles are flattened to their closure first, so a role held through a composite or a group counts the same as one assigned directly.",
     )
     add(
-        "Re-read each candidate's roles and scopes while deciding",
+        "Merge per-client role ownership into the realm-wide role list",
         idp_phase(agent_recs, "trailing"),
-        "Every candidate's roles and scopes, fetched again as each one is judged.",
+        "The realm list says a role exists; only the per-client read says who owns it "
+        "(kind=Agent, actorIds). Both are needed to know which roles are the agent's own, "
+        "so every client resolved costs another pair of reads.",
     )
     add(
-        "LLM proposes grants per role/scope pair against policy.md",
+        "Proposer pass: an LLM grants per role/scope pair against policy.md",
         [step(r) for r in by(agent_recs, "llm-propose")],
-        "One structured call per candidate pair; policy.md is the only human input.",
+        "One call per pair, deliberately isolated: the model sees a single focal entity and is "
+        "told to ignore everything else, so evidence about one role cannot leak into another's "
+        "decision. Deny-by-default, so silence in the policy means no grant.",
     )
     add(
-        "Second LLM pass audits each proposal",
+        "Evaluator pass: a second LLM independently judges each proposal",
         [step(r) for r in by(agent_recs, "llm-audit")],
-        "Returns {approved, reason}; a reject retries the propose, up to 3 times.",
+        "A separate call re-derives the same decision under the same rules, so an omission or an "
+        "over-grant has to survive being checked twice. A rejection sends it back with the "
+        "reason attached, up to 3 attempts.",
     )
     add(
         "Render Rego and apply it as the agent's AuthorizationPolicy resource",
@@ -745,14 +751,15 @@ def main() -> None:
         "JSON-RPC to the running pod. 4 tools returned, each with its own schema.",
     )
     add(
-        "LLM proposes grants for the discovered tool scopes",
+        "Proposer pass over the discovered tool scopes",
         [step(r) for r in by(tool_recs, "llm-propose")],
-        "Same policy.md, now judged against capabilities discovered at runtime.",
+        "Same policy text and the same one-pair-at-a-time isolation, now applied to capabilities "
+        "that were discovered at runtime rather than declared anywhere.",
     )
     add(
-        "Second LLM pass audits the tool proposals",
+        "Evaluator pass over the tool proposals",
         [step(r) for r in by(tool_recs, "llm-audit")],
-        "Each tool-scope decision reviewed a second time.",
+        "Every tool-scope decision independently re-derived before it is trusted.",
     )
     add(
         "Re-render the AGENT's policy to fill in its outbound gate",
