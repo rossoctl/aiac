@@ -110,7 +110,8 @@ class ServicePolicyBuilder:
         # same (role.id, scope.id) -- that a single build's own rules could never reveal. Onboarding
         # appends (override=False), so ``combined`` is exactly the post-apply persisted state.
         #
-        # Per ADR 0001 we surface, never reconcile: a (role, scope) carrying both an Allow and a Deny
+        # Per the identify-never-reconcile design decision we surface, never reconcile: a
+        # (role, scope) carrying both an Allow and a Deny
         # raises HERE -- before the Orchestrator/Controller reach ``compute_and_apply`` -- so a
         # conflict leaves persisted state untouched (atomic-by-construction; the store read above is
         # side-effect-free). Detection is order-independent (keyed on ids), so tool-first vs
@@ -145,13 +146,15 @@ class ServicePolicyBuilder:
             #
             # Enrichment (policy fetch + LLM explain/quote) is best-effort: if the policy source is
             # unreadable/missing or the explain pass errors, we still raise with the STRUCTURAL
-            # report (ADR 0001: surface, never drop). Letting the error escape here would bypass the
+            # report (identify-never-reconcile design decision: surface, never drop). Letting the
+            # error escape here would bypass the
             # controller's PolicyConflictError handler and return a 500 instead of the required 422
             # ConflictReport.
             try:
                 report = enrich_report(report, combined, get_policy_source().fetch())
             except Exception:
-                # Best-effort only (ADR 0001: surface, never drop). Log at WARNING with the
+                # Best-effort only (identify-never-reconcile design decision: surface, never drop).
+                # Log at WARNING with the
                 # traceback so a genuine bug in enrich_report (TypeError/AttributeError) is
                 # distinguishable in production from an expected "policy source unavailable",
                 # rather than being silently swallowed. We still raise the STRUCTURAL report.

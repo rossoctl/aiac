@@ -155,7 +155,7 @@ def test_apply_service_maps_policy_contradiction_to_422_conflict_report_and_skip
 def test_build_raises_structural_conflict_from_assembled_passes():
     # The scope-focal pass grants (tester, issues) and the Door B deny pass prohibits the SAME
     # (tester, issues): the assembled list carries both an Allow and a Deny on one pair. build()
-    # must run the inline detector and RAISE PolicyConflictError — never reconcile (ADR 0001).
+    # must run the inline detector and RAISE PolicyConflictError — never reconcile (the identify-never-reconcile design decision).
     # Enrichment is stubbed to identity here (the explain seam / policy source are exercised by the
     # dedicated enrichment test below); this pins the STRUCTURAL raise + report shape.
     with (

@@ -424,7 +424,6 @@ class TestLockRegistryEviction:
 
         assert SERVICE_ID not in orchestrator._service_locks
 
-
     def test_same_service_runs_stay_serialized_across_eviction(self):
         # Overlapping same-service runs are driven through eviction boundaries: staggered
         # arrivals let early runs finish (and evict) while later ones are still queued on or

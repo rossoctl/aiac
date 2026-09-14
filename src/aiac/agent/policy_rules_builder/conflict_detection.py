@@ -5,7 +5,7 @@ user-role-focal deny pass) into one ``list[PolicyRule]``, :func:`detect_conflict
 **pure, deterministic** allow∩deny set-intersection over ``(role.id, scope.id)``: a pair carrying
 **both** an ``Allow`` and a ``Deny`` **is** a conflict. There is no LLM anywhere in this module.
 
-Per ADR 0001 (*identify-never-reconcile*) the detector NEVER merges, drops, or picks a winner —
+Per the *identify-never-reconcile* design decision the detector NEVER merges, drops, or picks a winner —
 it surfaces the overlap as a :class:`ConflictReport` so the build can **raise before**
 ``compute_and_apply`` (atomic-by-construction: a conflict leaves persisted state untouched). This
 is the *cross-pass* structural **conflict**, distinct from the LLM auditor's *intra-pass*

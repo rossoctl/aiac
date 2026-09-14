@@ -13,7 +13,7 @@ It lives in the onboarding **use-case** layer (next to ``builder.py``), NOT in t
 the PRB stays pure and store-free (guarded by ``test_isolation``), and reading already-applied
 state is a use-case concern — the same layer that afterwards drives ``compute_and_apply``.
 
-It never merges, dedupes, or picks a winner (ADR 0001 — *identify, never reconcile*): it only
+It never merges, dedupes, or picks a winner (the *identify, never reconcile* design decision): it only
 **widens the input** the deterministic detector sees. There is no LLM here and no new report shape
 — the combined list feeds ``detect_conflicts`` (#2502) and, only on a hit, ``enrich_report``
 (#2503) unchanged. It is read-only (it mutates no store state), so the atomicity guarantee holds:

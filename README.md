@@ -77,8 +77,7 @@ To try the end-to-end onboarding flow against a demo agent/tool, see
 ## Documentation
 
 - [docs/specs/PRD.md](docs/specs/PRD.md) — master PRD
-- [docs/specs/components/](docs/specs/components/) — per-component specs
-- [docs/adr/](docs/adr/) — architecture decision records
+- [docs/specs/components/](docs/specs/components/) — per-component specs (design decisions live embedded here)
 - [CONTEXT.md](CONTEXT.md) — domain glossary
 - [k8s/aiac-deployment-guide.md](k8s/aiac-deployment-guide.md) — Kubernetes install guide
 - [k8s/opa-kind-runbook.md](k8s/opa-kind-runbook.md) — local OPA/Kind integration setup
