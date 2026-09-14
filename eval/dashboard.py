@@ -295,10 +295,14 @@ def render_svg_chart(rows: list[dict[str, Any]], reports: list[ParsedReport], *,
 
     for i, row in enumerate(rows):
         match = _find_matching_report(row, reports)
+        # A newline inside an SVG <title> renders as a real line break in the browser's native
+        # hover tooltip -- no separate tooltip widget/JS needed for a structured, multi-line view.
         title = html.escape(
-            f"{row.get('timestamp', '')} · {row.get('model', '')} · "
-            f"precision={row.get('precision')} recall={row.get('recall')} "
-            f"denial_precision={row.get('denial_precision')}"
+            f"Datetime = {row.get('timestamp', '')}\n"
+            f"LLM = {row.get('model', '')}\n"
+            f"Precision = {row.get('precision')}\n"
+            f"Recall = {row.get('recall')}\n"
+            f"Denial_precision = {row.get('denial_precision')}"
         )
         for metric, color in _METRIC_COLORS.items():
             value = row.get(metric)
