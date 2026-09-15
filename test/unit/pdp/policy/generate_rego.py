@@ -9,7 +9,7 @@ the fixed scenario (the same canonical github-agent worked example) lives in
 ``test.system.scenario`` so the two launchers cannot drift.
 
 Run:
-    .venv/bin/python test/pdp/policy/generate_rego.py
+    .venv/bin/python test/unit/pdp/policy/generate_rego.py
 """
 
 from __future__ import annotations

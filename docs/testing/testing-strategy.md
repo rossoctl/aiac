@@ -32,14 +32,17 @@ covers:
 
 | Level | Marker | Location | Needs |
 |---|---|---|---|
-| **unit** | *(untagged)* | `test/unit/` (mirrors `src/aiac/`) | Nothing external — in-process, a single unit under test. Runs in the default `pytest`. |
+| **unit** | *(untagged)* | `test/unit/` (mirrors `src/aiac/`) | Nothing external — in-process, a single unit under test — **except a live LLM endpoint when the test also carries the orthogonal `llm` tag** (see below); those are deselected by the default `pytest`. Runs in the default `pytest`. |
 | **integration** | `integration` | *(reserved — no such tests yet)* | Several AIAC units cooperating in-process on a laptop, **no cluster**. The marker exists so the level has a home; the directory is intentionally absent until the first such test. |
 | **system** | `system` | `test/system/` | A live Kind cluster / Rosso / deployed AIAC — see [`k8s/opa-kind-runbook.md`](../../k8s/opa-kind-runbook.md). Closes the real OPA evaluation loop through AuthBridge. |
 
 ## The `llm` tag (orthogonal)
 
 `llm` is **not** a level — it is an orthogonal tag on a test that calls a **real external LLM** but
-needs **no cluster**. It lets a cluster-free live-LLM test be selected on its own with `-m llm`.
+needs **no cluster**. It lets a cluster-free live-LLM test be selected on its own with `-m llm`. An
+`llm`-tagged test keeps the placement of its scope level, so a single-unit live-LLM test lives under
+`test/unit/`; the LLM endpoint it reaches is the one exception the tag opts into over the unit
+tree's otherwise "nothing external" rule.
 The live-LLM Policy Rules Builder suite
 (`test/unit/agent/policy_rules_builder/test_graph_live_llm.py`) is the canonical example: it drives
 the real LLM end-to-end but mocks only the role/scope descriptions and policy source in-process, so

@@ -78,7 +78,6 @@ from eval.trend_log import append_row, pool_correctness_metrics
 HERE = Path(__file__).resolve().parent
 REPORTS_DIR = HERE / "reports"
 REPORT_TZ = ZoneInfo(os.environ.get("EVAL_REPORT_TZ", "UTC"))
-MARKERS = {"eval"}
 
 # Auto-load the repo-root .env so LLM_BASE_URL/KEYCLOAK_URL/etc. are set without having to
 # `set -a; . .env; set +a` before invoking pytest. Existing environment
@@ -87,12 +86,23 @@ load_dotenv(HERE.parent / ".env", override=False)
 
 _docstrings: dict[str, str] = {}
 _reports: dict[str, pytest.TestReport] = {}
+# Nodeids that actually carry `@pytest.mark.eval`, captured at collection. We must NOT gate on the
+# keyword set (`"eval" in report.keywords`): the suite lives in a package directory literally named
+# `eval/` with an `__init__.py`, so pytest builds a `Package` node named `eval` and injects that
+# name into every collected item's keyword set — marked or not. Gating on the keyword would scoop
+# the pure-unit helpers under `eval/` (test_dashboard, test_trend_log, …) into this report on a
+# bare offline `pytest`, breaking this module's guarantee that only `-m eval` tests are captured.
+# The real marker is only reachable via `item.iter_markers()` at collection, so we record the
+# nodeids there and gate reports on membership. (Same controller-side flow xdist already relies on
+# for `_docstrings`.)
+_eval_nodeids: set[str] = set()
 
 
 def pytest_collection_modifyitems(session: pytest.Session, config: pytest.Config, items: list) -> None:
     for item in items:
-        if not (MARKERS & set(item.keywords)):
+        if not any(marker.name == "eval" for marker in item.iter_markers()):
             continue
+        _eval_nodeids.add(item.nodeid)
         func = getattr(item, "obj", None)
         doc = (getattr(func, "__doc__", None) or "").strip()
         if doc:
@@ -103,7 +113,7 @@ def pytest_collection_modifyitems(session: pytest.Session, config: pytest.Config
 def pytest_runtest_logreport(report: pytest.TestReport) -> None:
     if report.when == "teardown" and report.outcome == "passed":
         return
-    if not (MARKERS & set(report.keywords)):
+    if report.nodeid not in _eval_nodeids:
         return
     # A later phase (call) supersedes an earlier one (setup) for the same nodeid; a setup or
     # teardown failure has no later phase to supersede it.

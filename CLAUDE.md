@@ -49,7 +49,9 @@ default `addopts` deselects every live-infra / eval marker
 Testing has three scope-based levels:
 
 - **`unit`** (untagged) — `test/unit/` mirrors `src/aiac/`; in-process, single
-  unit, no external services. This is what a bare `pytest` runs.
+  unit, no external services **except a real LLM endpoint when the test also
+  carries the orthogonal `llm` tag** (see below). This is what a bare `pytest`
+  runs (the `llm`-tagged ones are deselected by default).
 - **`integration`** (`-m integration`) — several AIAC units cooperating
   in-process on a laptop, **no cluster**. Marker reserved; no such tests exist
   yet (the directory is intentionally absent).
@@ -57,7 +59,10 @@ Testing has three scope-based levels:
   AIAC. Lives under `test/system/`.
 
 Orthogonal to those, **`llm`** tags a test that calls a real external LLM but
-needs no cluster.
+needs no cluster. An `llm`-tagged test keeps the placement of its scope level —
+a single-unit `llm` test still lives under `test/unit/` — so the "no external
+services" rule for the unit tree is read as "no external services beyond an LLM
+endpoint the `llm` tag opts into", and only that tag reaches a live LLM.
 
 Use `ls test/` / `find test -type d` to discover current test directories.
 
