@@ -152,12 +152,12 @@ def test_allow_only_scope_direction():
 # Exact set equality: dropping tester (the live miss) fails this fixture cluster- #
 # free, where the mocked suite and the integration convergence probe could not    #
 # see it. Role/scope descriptions are imported from scenario_uc1 (USER_ROLES/     #
-# AGENT_SCOPES); the policy is read from the co-located policy.abstract.md file —  #
-# both are the exact scenario strings, sourced at test time rather than copied so   #
-# an edit there can't silently desync this reproduction. NB the file's spelled-out #
-# prose is deliberately NOT the terse POLICY_ABSTRACT constant (scenario_uc1.py)   #
-# that live UC-1 onboarding actually mounts: the fuller prose reproduces the       #
-# coarse-projection miss cluster-free more reliably.                              #
+# AGENT_SCOPES); the policy is read from the co-located policy.abstract.md file,   #
+# now written in the DIGESTED-policy language (explicit direct grants) so the PRB  #
+# is exercised on digested input as in production. The developer's "may read       #
+# issues" grant and the tester's "may read/write issues" grants upward-project     #
+# onto the coarse issue_operations capability (rule 3); devops is description-     #
+# denied. Sourced from disk at test time so an edit can't silently desync.        #
 # --------------------------------------------------------------------------- #
 def test_coarse_agent_scope_upward_projection():
     # Descriptions come verbatim from scenario_uc1 (the strings real UC-1 onboarding feeds the LLM),
@@ -169,8 +169,8 @@ def test_coarse_agent_scope_upward_projection():
     tester = _role("r-tst", "tester", scn.USER_ROLES["tester"])
     devops = _role("r-ops", "devops", scn.USER_ROLES["devops"])
 
-    # Read the scenario's spelled-out prose from disk (the string the inline copy used to duplicate)
-    # so a policy.abstract.md edit can't silently desync this reproduction.
+    # Read the digested scenario policy from disk so a policy.abstract.md edit can't silently
+    # desync this reproduction.
     policy = (Path(scn.__file__).parent / "policy.abstract.md").read_text(encoding="utf-8")
 
     rules = _scope_rules(policy, [developer, tester, devops], issue_operations)
