@@ -4,8 +4,8 @@
 > to its release as part of the Rossoctl system. On release, this document
 > should be updated accordingly.
 
-This is the AIAC-scoped companion to
-[`authbridge/docs/opa-kind-runbook.md`](../../authbridge/docs/opa-kind-runbook.md).
+This is the AIAC-scoped companion to `authbridge/docs/opa-kind-runbook.md` (in
+the separate AuthBridge repository).
 The underlying mechanism — OPA as an AuthBridge pipeline plugin, policy
 distributed via `bundle-service`, enforcement via the `AuthorizationPolicy`
 CRD — is identical. This document gives the **exact, copy-paste** steps to run
