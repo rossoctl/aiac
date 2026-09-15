@@ -24,7 +24,7 @@ its downstream tool (`github-tool`):
 
 - **`dev-user` is the allowed user, `alice` is the blocked user.** `dev-user`
   is the canonical scenario username from
-  [`docs/specs/integration-test/policy-pipeline.md`](../docs/specs/integration-test/policy-pipeline.md).
+  [`docs/testing/policy-pipeline.md`](../docs/testing/policy-pipeline.md).
 - **Inbound** authorization is enforced by a **client-scoped**
   `AuthorizationPolicy` targeting `github-agent` alone.
 - **Outbound** shows the token-exchange → OPA leg: the agent's call to
