@@ -34,19 +34,18 @@ class _Selection(BaseModel):
     reasoning: str
 
 
-# The deny name lists + exclusivity flags default to the allow-only-equivalent values
-# (no prohibition, not exclusive) so allow-only producers and the pre-#123 mocks keep
-# working byte-identically -- the same reason PolicyRule.effect defaults to ALLOW.
+# The deny name lists default to empty (no prohibition) so allow-only producers and the pre-#123
+# mocks keep working byte-identically -- the same reason PolicyRule.effect defaults to ALLOW. A
+# digested policy states every prohibition explicitly per pair, so there is no exclusivity flag and
+# no derived complement (see the PRB spec's "digested input retires exclusivity handling" decision).
 class RoleSelection(_Selection):
     granted_scope_names: list[str]
     denied_scope_names: list[str] = []  # explicit prohibitions about the focal role
-    grant_is_exclusive: bool = False  # focal role's access is closed to exactly the granted set
 
 
 class ScopeSelection(_Selection):
     roles_with_access_names: list[str]
     roles_denied_access_names: list[str] = []  # explicit prohibitions about the focal scope
-    access_is_exclusive: bool = False  # access to the focal scope is closed to exactly the granted set
 
 
 class Contradiction(BaseModel):
@@ -107,7 +106,6 @@ class _PRBWorking(TypedDict):
     selected_names: list[str]
     denied_names: list[str]
     conflict_names: list[str]
-    exclusive: bool
     reasoning: str
     approved: bool
     audit_feedback: str | None
@@ -169,7 +167,6 @@ def _propose(
     schema: type[_Selection],
     names_field: str,
     denied_names_field: str,
-    exclusive_field: str,
 ) -> dict[str, Any]:
     msgs = build_proposer_messages(
         state["policy_text"], focal, candidates, contract, state["audit_feedback"], direction=direction
@@ -178,7 +175,6 @@ def _propose(
     return {
         "selected_names": list(getattr(sel, names_field)),
         "denied_names": list(getattr(sel, denied_names_field)),
-        "exclusive": bool(getattr(sel, exclusive_field)),
         "reasoning": sel.reasoning,
     }
 
@@ -192,9 +188,9 @@ def _precheck(state: _PRBWorking, *, candidate_names: set[str]) -> dict[str, Any
     dropped_denied = [n for n in state["denied_names"] if n not in candidate_names]
     if dropped or dropped_denied:
         logger.warning("PRB precheck dropped hallucinated names: granted=%s denied=%s", dropped, dropped_denied)
-    # Deterministic overlap signal: a candidate in BOTH lists. The derived exclusivity complement
-    # is disjoint from grants by construction, so overlap can only come from an explicit denied-name
-    # that is also granted -- a direct conflict or coarse-scope mismatch. precheck resolves nothing;
+    # Deterministic overlap signal: a candidate in BOTH lists. Denies are purely the explicit
+    # prohibitions now, so overlap can only come from an explicit denied-name that is also granted
+    # -- a direct conflict or coarse-scope mismatch. precheck resolves nothing;
     # the auditor adjudicates each conflict name as genuine (raise) vs generation error (retry).
     conflict = [n for n in keep if n in set(keep_denied)]
     return {"selected_names": keep, "denied_names": keep_denied, "conflict_names": conflict}
@@ -257,11 +253,11 @@ def _role_cands(rs: list[Role]) -> str:
 
 _ROLE_CONTRACT = (
     "Return granted_scope_names (subset of candidate scope names), denied_scope_names (explicit "
-    "prohibitions, subset of candidates), grant_is_exclusive + reasoning."
+    "prohibitions, subset of candidates) + reasoning."
 )
 _SCOPE_CONTRACT = (
     "Return roles_with_access_names (subset of candidate role names), roles_denied_access_names "
-    "(explicit prohibitions, subset of candidates), access_is_exclusive + reasoning."
+    "(explicit prohibitions, subset of candidates) + reasoning."
 )
 
 # Explicit gate-direction framing, passed to BOTH the proposer and the auditor (the auditor
@@ -289,17 +285,6 @@ _SCOPE_DIRECTION = (
 )
 
 
-def _denied_names(explicit: list[str], exclusive: bool, candidate_order: list[str], granted: set[str]) -> set[str]:
-    """The set of candidate names to DENY: the explicit prohibitions, plus -- when the grant is
-    exclusive -- the derived complement (every candidate not granted). The complement is DERIVED
-    from the typed candidate set (complete by construction), never LLM-enumerated, and is disjoint
-    from grants by construction."""
-    denied = set(explicit)
-    if exclusive:
-        denied |= {c for c in candidate_order if c not in granted}
-    return denied
-
-
 def _assemble(state_type: type, propose, precheck, audit, build):
     """Wire the shared fetch -> propose -> precheck -> audit -> build shape with the
     audit -> propose retry edge. Both directions differ only in their four closures."""
@@ -318,14 +303,10 @@ def _assemble(state_type: type, propose, precheck, audit, build):
     return g.compile()
 
 
-def build_role_graph(*, deny_only: bool = False):
-    """Role-focal PRB graph. With ``deny_only=True`` this is the **Door B** variant
-    (the user-role-focal deny pass): its build node emits **DENY rules only** — the
-    exclusivity complement plus any explicit prohibitions — and never an ALLOW, so the
-    scope-focal pass remains the single grant authority. The proposer/precheck/audit
-    nodes are byte-identical to the allow+deny variant (the LLM still extracts the
-    "X may access only Y" grant so the complement can be derived); only the build node
-    differs in which effects it keeps."""
+def build_role_graph():
+    """Role-focal PRB graph: given a focal role, decide which candidate scopes it is granted and
+    which it is explicitly prohibited. ALLOW from the granted names, DENY from the explicit
+    prohibitions -- no exclusivity complement (digested input states prohibitions per pair)."""
 
     def propose(s: RoleRulesState) -> dict[str, Any]:
         return _propose(
@@ -337,7 +318,6 @@ def build_role_graph(*, deny_only: bool = False):
             schema=RoleSelection,
             names_field="granted_scope_names",
             denied_names_field="denied_scope_names",
-            exclusive_field="grant_is_exclusive",
         )
 
     def precheck(s: RoleRulesState) -> dict[str, Any]:
@@ -347,22 +327,16 @@ def build_role_graph(*, deny_only: bool = False):
         return _audit(s, focal=_role_focal(s["role"]), candidates=_scope_cands(s["scopes"]), direction=_ROLE_DIRECTION)
 
     def build(s: RoleRulesState) -> dict[str, Any]:
-        # DENY from the exclusivity complement + explicit prohibitions -- every rule rebuilt from
-        # the typed scopes (never LLM string fields), in candidate order.
-        denied = _denied_names(
-            s["denied_names"], s["exclusive"], [sc.name for sc in s["scopes"]], set(s["selected_names"])
-        )
-        denies = [
-            PolicyRule(role=s["role"], scope=sc, effect=RuleEffect.DENY) for sc in s["scopes"] if sc.name in denied
-        ]
-        if deny_only:
-            # Door B contributes only prohibitions; a purely permissive policy (no exclusivity,
-            # no explicit deny) yields [] -- a structural no-op that never broadens access.
-            return {"rules": denies}
-        # ALLOW from granted names first, then the denies -- each in candidate order.
+        # ALLOW from granted names first, then DENY from the (candidate-filtered) explicit
+        # prohibitions -- every rule rebuilt from the typed scopes (never LLM string fields),
+        # each in candidate order.
         granted = set(s["selected_names"])
+        denied = set(s["denied_names"])
         allows = [
             PolicyRule(role=s["role"], scope=sc, effect=RuleEffect.ALLOW) for sc in s["scopes"] if sc.name in granted
+        ]
+        denies = [
+            PolicyRule(role=s["role"], scope=sc, effect=RuleEffect.DENY) for sc in s["scopes"] if sc.name in denied
         ]
         return {"rules": allows + denies}
 
@@ -380,7 +354,6 @@ def build_scope_graph():
             schema=ScopeSelection,
             names_field="roles_with_access_names",
             denied_names_field="roles_denied_access_names",
-            exclusive_field="access_is_exclusive",
         )
 
     def precheck(s: ScopeRulesState) -> dict[str, Any]:
@@ -392,10 +365,8 @@ def build_scope_graph():
     def build(s: ScopeRulesState) -> dict[str, Any]:
         # ALLOW from granted names, DENY from explicit prohibitions -- every rule rebuilt from the
         # typed roles (never LLM string fields). Allows first, then denies, each in candidate order.
-        denied = _denied_names(
-            s["denied_names"], s["exclusive"], [r.name for r in s["roles"]], set(s["selected_names"])
-        )
         granted = set(s["selected_names"])
+        denied = set(s["denied_names"])
         allows = [
             PolicyRule(role=r, scope=s["scope"], effect=RuleEffect.ALLOW) for r in s["roles"] if r.name in granted
         ]
@@ -406,7 +377,6 @@ def build_scope_graph():
 
 
 ROLE_GRAPH = build_role_graph()  # module-level compile is safe (never builds the LLM)
-ROLE_DENY_GRAPH = build_role_graph(deny_only=True)  # Door B: user-role-focal deny-only variant
 SCOPE_GRAPH = build_scope_graph()
 
 
@@ -420,7 +390,6 @@ def build_role_rules(role: Role, scopes: list[Scope]) -> list[PolicyRule]:
         "selected_names": [],
         "denied_names": [],
         "conflict_names": [],
-        "exclusive": False,
         "reasoning": "",
         "approved": False,
         "audit_feedback": None,
@@ -428,34 +397,6 @@ def build_role_rules(role: Role, scopes: list[Scope]) -> list[PolicyRule]:
         "rules": [],
     }
     return ROLE_GRAPH.invoke(state)["rules"]
-
-
-def build_role_denies(role: Role, scopes: list[Scope]) -> list[PolicyRule]:
-    """Door B -- run the user-role-focal DENY-only pass for ``role`` over ``scopes``.
-
-    Same role-focal graph as :func:`build_role_rules` (propose/precheck/audit), but the
-    build node emits **only DENY rules**: the derived exclusivity complement over ``scopes``
-    plus any explicit prohibitions. It NEVER emits an ALLOW -- the scope-focal pass is the
-    single grant authority. A permissive policy (no exclusivity, no explicit prohibition)
-    returns ``[]``, so Door B is a structural no-op unless a user role's access is exclusive
-    or explicitly restricted."""
-    state: RoleRulesState = {
-        "role": role,
-        "scopes": scopes,
-        # placeholder: the graph's ``fetch`` node (START -> fetch -> propose) populates
-        # this via get_policy_source() before ``propose`` reads it -- do not fetch here.
-        "policy_text": "",
-        "selected_names": [],
-        "denied_names": [],
-        "conflict_names": [],
-        "exclusive": False,
-        "reasoning": "",
-        "approved": False,
-        "audit_feedback": None,
-        "retry_count": 0,
-        "rules": [],
-    }
-    return ROLE_DENY_GRAPH.invoke(state)["rules"]
 
 
 def build_scope_rules(roles: list[Role], scope: Scope) -> list[PolicyRule]:
@@ -468,7 +409,6 @@ def build_scope_rules(roles: list[Role], scope: Scope) -> list[PolicyRule]:
         "selected_names": [],
         "denied_names": [],
         "conflict_names": [],
-        "exclusive": False,
         "reasoning": "",
         "approved": False,
         "audit_feedback": None,

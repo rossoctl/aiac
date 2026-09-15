@@ -95,7 +95,7 @@ class ExplainResult(BaseModel):
 # --------------------------------------------------------------------------- #
 class DiagnosticState(_PRBWorking):
     """The live ``_PRBWorking`` fields (``policy_text``, ``selected_names``, ``denied_names``,
-    ``conflict_names``, ``exclusive``, ``reasoning``, ``approved``, ``audit_feedback``,
+    ``conflict_names``, ``reasoning``, ``approved``, ``audit_feedback``,
     ``retry_count``, ``rules``) plus the diagnostic-only accumulators.
 
     ``focal_entities`` carries the resolved :class:`FocalEntitySet` for the run so the name->id
@@ -338,7 +338,6 @@ def build_role_diagnostic_graph():
             schema=RoleSelection,
             names_field="granted_scope_names",
             denied_names_field="denied_scope_names",
-            exclusive_field="grant_is_exclusive",
         )
 
     def precheck(s: RoleDiagnosticState) -> dict[str, Any]:
@@ -380,7 +379,6 @@ def build_scope_diagnostic_graph():
             schema=ScopeSelection,
             names_field="roles_with_access_names",
             denied_names_field="roles_denied_access_names",
-            exclusive_field="access_is_exclusive",
         )
 
     def precheck(s: ScopeDiagnosticState) -> dict[str, Any]:
@@ -417,7 +415,6 @@ def _base_state(policy_text: str, focal_entities: FocalEntitySet | None) -> dict
         "selected_names": [],
         "denied_names": [],
         "conflict_names": [],
-        "exclusive": False,
         "reasoning": "",
         "approved": False,
         "audit_feedback": None,

@@ -18,16 +18,21 @@ The pass centred on a scope, fanning candidate roles over it. It is the sole
 **grant authority** for that scope.
 _Avoid_: scope pass, forward pass.
 
-**User-role-focal pass** (a.k.a. **Door B**):
-A pass centred on a `kind=User` role, fanning it over the focus service's own
-scopes to emit the **deny** rules that a user's exclusivity ("Testers may access
-**only** issues") implies — prohibitions the scope-focal pass structurally
-cannot express. Contributes denies only; never broadens access.
+**User-role-focal pass** (a.k.a. **Door B**) — _retired (#2540)_:
+Formerly a pass centred on a `kind=User` role, fanning it over the focus
+service's own scopes to emit the **deny** rules a user's exclusivity ("Testers
+may access **only** issues") implied — prohibitions the scope-focal pass
+structurally could not express. **Removed** once the PRB consumes only
+**digested** policy: the digested language bans "only" and states each
+prohibition as an explicit per-pair deny, which the scope-focal pass reads
+directly, so the derivation is redundant. Retained here because the term appears
+in git history and `conflict_detection.py`. See the PRB spec's _digested input
+retires exclusivity handling and Door B_ decision.
 _Avoid_: role pass (ambiguous with the agent-role-focal pass), Door B pass.
 
 **Grant authority**:
 The property that grants on a given scope come from exactly one place — the
-scope-focal pass. Door B adds only prohibitions and never grants.
+scope-focal pass.
 _Avoid_: owner, source of truth.
 
 **Contradiction**:
@@ -46,9 +51,11 @@ _Avoid_: using "contradiction" for this.
 
 **Within-batch conflict**:
 A **conflict** whose two rules are produced in one `build()` call — i.e. one
-`/apply` request. This is the Door B case: at the focus service's own-scope
-onboarding, both the scope-focal grant and the Door B deny (and any collision
-between them) are in hand in the same build. In scope.
+`/apply` request. At the focus service's own-scope onboarding the scope-focal
+pass emits both grants and explicit per-pair denies over those scopes, so a
+grant and a deny colliding on the same `(role, scope)` are in hand in the same
+build. In scope. (Formerly the Door B case, before that pass was retired — see
+**User-role-focal pass**.)
 _Avoid_: intra-request conflict.
 
 **Cross-run conflict** (a.k.a. **cross-service conflict**):
