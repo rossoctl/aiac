@@ -1,7 +1,7 @@
 """Manifest-content tests for the agent's ``aiac-agent-config`` ConfigMap.
 
-The Policy Rules Builder LLM seam reads its own dedicated retry cadence from the
-environment (``graph._llm_retry_config()`` — ``LLM_MAX_RETRIES`` / ``LLM_RETRY_BACKOFF_MIN`` /
+The shared agent LLM seam reads its own dedicated retry cadence from the
+environment (``aiac.agent.llm.load_llm_settings()`` — ``LLM_MAX_RETRIES`` / ``LLM_RETRY_BACKOFF_MIN`` /
 ``LLM_RETRY_BACKOFF_MAX``). These knobs must therefore be surfaced on the agent's ConfigMap
 so an operator can tune them per environment. They are deliberately SEPARATE from the shared
 transport-layer knob ``UPSTREAM_MAX_RETRIES`` (``aiac.shared.upstream.max_retries``, which

@@ -304,3 +304,39 @@ authoring layer cannot see.
 - "Conflict" without qualification continues to mean the **engine-layer**
   `(role, scope)` collision (see `CONTEXT.md`). The within-policy notion is always
   written **authoring-layer conflict** to keep the two from being confused.
+
+## Design decision: digestion is produced out of band
+
+A digested policy is produced **once, out of band** — never on the
+onboarding/update path. Source→digested conversion is a *pure capability*: given
+source-policy text, it returns digested-policy text and does nothing else. A
+separate standalone unit reads the source policy, invokes that conversion, and
+stores the result. Onboarding, policy update, and the Policy Rules Builder then
+read the *already-digested* policy through the existing policy source, unchanged —
+they never see the source and never trigger a digest.
+
+The reason is a **trade-off** against the alternative of digesting inline on every
+onboard:
+
+- Conversion is an expensive, non-deterministic LLM step. Running it per request
+  re-pays that cost on every onboard of every service.
+- Onboards of different services run concurrently (the onboarding lock is
+  per-service), so an inline digest writing to a shared policy artifact would race
+  across services.
+- A digest's output is *authored intent* that must be gated — by the reserved
+  authoring-layer conflict detection — **before** it drives rules. A single
+  upstream production point gives that gate one place to sit, before storage;
+  inline digestion has no such chokepoint.
+
+Producing the digest once, upstream, keeps the runtime path deterministic and
+cheap and gives conflict detection a single gate.
+
+### Consequences
+
+- The conversion capability carries **no I/O, persistence, or flow wiring** —
+  those live in the standalone unit. Its sole contract with everything downstream
+  is **faithfulness** (see `CONTEXT.md`): the digest adds, drops, or broadens no
+  access relative to its source.
+- Nothing on the onboarding/update path changes to consume a digest — the swap is
+  entirely a matter of what the policy source resolves to. The Policy Rules
+  Builder is unaware whether the policy it reads is a source or a digest.
