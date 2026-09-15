@@ -40,7 +40,6 @@ from aiac.agent.policy_rules_builder.conflict_enrichment import enrich_report
 from aiac.agent.policy_rules_builder.diagnostic_models import ConflictReport
 from aiac.agent.policy_rules_builder.graph import (
     PolicyContradictionError,
-    build_role_denies,
     build_role_rules,
     build_scope_rules,
 )
@@ -49,7 +48,7 @@ from aiac.agent.shared.focal_entities import resolve_focal_entities
 from aiac.agent.shared.roles import flatten_role
 from aiac.agent.uc.onboarding.policy_builder.cross_service import applied_rules_for_scopes
 from aiac.idp.configuration.api import Configuration
-from aiac.idp.configuration.models import RoleKind, ServiceType
+from aiac.idp.configuration.models import ServiceType
 from aiac.policy.model.models import PolicyRule
 
 logger = logging.getLogger(__name__)
@@ -87,17 +86,11 @@ class ServicePolicyBuilder:
 
         for scope in focal.own_scopes:
             _guarded(build_scope_rules, focal.candidate_roles, scope)
-        # Door B -- user-role-focal DENY-only pass at the focus's OWN-scope onboarding, alongside
-        # the scope-focal pass above. Fan the kind=User subset of the (already flattened+deduped)
-        # candidate roles over the focus's own scopes to surface each user role's exclusivity
-        # ("Testers may access only issues") as the DENY rules the scope-focal pass structurally
-        # cannot express. Deny-only: the scope-focal pass stays the single grant authority. Placing
-        # it here -- own scopes always exist at the service's own onboarding -- keeps it
-        # order-independent (tool-first vs agent-first yields identical denies), and produces both
-        # the scope-focal (role, own-scope) grant and the Door B (role, own-scope) prohibition in
-        # the same build.
-        for user_role in (r for r in focal.candidate_roles if r.kind is RoleKind.USER):
-            _guarded(build_role_denies, user_role, focal.own_scopes)
+        # Under digested input there is no separate user-role deny pass (the former "Door B"): a
+        # digested policy states every prohibition -- including a user role's -- as an explicit
+        # per-pair deny, which the scope-focal pass above reads directly when fanning the focus's
+        # own scopes over ALL candidate roles (user roles included). See the PRB spec's "digested
+        # input retires exclusivity handling and Door B" decision.
         if service_type is ServiceType.AGENT:
             for own_role in focal.own_roles:
                 for role in flatten_role(own_role):

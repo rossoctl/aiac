@@ -24,8 +24,9 @@ Each fixture asserts **exact set equality** of the emitted ``{(counterpart.name,
 pairs against a hand-verified expected set — a subset check would let over-/under-grants
 pass. Expected sets are derived by hand from the SCENARIO-layer deny triggers documented
 in ``docs/handoffs/03/04-*.md`` and ``prompts.py`` (_DENY_RULES): explicit prohibition
-("must not" / "read-only") -> DENY; a prohibition stated only in a description -> DENY;
-"only …" -> derived DENY complement over the rest of the candidate set.
+("must not" / "read-only") -> DENY; a prohibition stated only in a description -> DENY. A
+digested policy states each prohibition explicitly per pair — there is no "only …" wording
+and no derived complement (that exclusivity handling was retired; see the PRB spec).
 """
 
 from pathlib import Path
@@ -33,7 +34,7 @@ from unittest.mock import patch
 
 import pytest
 
-from aiac.agent.policy_rules_builder.graph import build_role_denies, build_role_rules, build_scope_rules
+from aiac.agent.policy_rules_builder.graph import build_role_rules, build_scope_rules
 from aiac.idp.configuration.models import Role, Scope
 from aiac.policy.model.models import PolicyRule, RuleEffect
 from test.integration import scenario_uc1 as scn
@@ -78,13 +79,6 @@ def _role_rules(policy: str, role: Role, scopes: list[Scope]) -> list[PolicyRule
     """Run build_role_rules against the real LLM with `policy` as the scenario text."""
     with patch("aiac.agent.policy_rules_builder.graph.get_policy_source", return_value=_Source(policy)):
         return build_role_rules(role, scopes)
-
-
-def _role_denies(policy: str, role: Role, scopes: list[Scope]) -> list[PolicyRule]:
-    """Run the Door B deny-only pass (build_role_denies) against the real LLM with `policy` as
-    the scenario text — the user-role-focal DENY-only projection of the role-focal graph."""
-    with patch("aiac.agent.policy_rules_builder.graph.get_policy_source", return_value=_Source(policy)):
-        return build_role_denies(role, scopes)
 
 
 def _scope_rules(policy: str, roles: list[Role], scope: Scope) -> list[PolicyRule]:
@@ -155,7 +149,8 @@ def test_allow_only_scope_direction():
 # outbound leg — so the only variable is the focal scope: here a single COARSE    #
 # capability bundling read+write+search+comments+sub-issues+pull-requests. Both   #
 # developer ("read access to issues") and tester ("full read and write access to  #
-# issues") must upward-project onto it (rule 3); devops is a silent non-grant.    #
+# issues") must upward-project onto it (rule 3); devops carries an explicit        #
+# description-driven DENY (its description disclaims managing the issue tracker).  #
 # Exact set equality: dropping tester (the live miss) fails this fixture cluster- #
 # free, where the mocked suite and the integration convergence probe could not    #
 # see it. Role/scope descriptions are imported from scenario_uc1 (USER_ROLES/     #
@@ -166,7 +161,7 @@ def test_allow_only_scope_direction():
 # that live UC-1 onboarding actually mounts: the fuller prose reproduces the       #
 # coarse-projection miss cluster-free more reliably.                              #
 # --------------------------------------------------------------------------- #
-def test_allow_only_coarse_agent_scope_upward_projection():
+def test_coarse_agent_scope_upward_projection():
     # Descriptions come verbatim from scenario_uc1 (the strings real UC-1 onboarding feeds the LLM),
     # imported rather than copied so an edit there can't silently desync this reproduction.
     issue_operations = _scope(
@@ -182,8 +177,10 @@ def test_allow_only_coarse_agent_scope_upward_projection():
 
     rules = _scope_rules(policy, [developer, tester, devops], issue_operations)
 
-    # Both issue-touching roles upward-project onto the coarse capability; devops earns nothing.
-    assert _role_effects(rules) == {("developer", ALLOW), ("tester", ALLOW)}
+    # Both issue-touching roles upward-project onto the coarse capability; devops is explicitly
+    # denied — its description ("does not manage the issue tracker") is a symmetric DENY trigger
+    # (rule 5), read for a candidate exactly as in test_description_driven_deny.
+    assert _role_effects(rules) == {("developer", ALLOW), ("tester", ALLOW), ("devops", DENY)}
 
 
 # --------------------------------------------------------------------------- #
@@ -232,18 +229,23 @@ def test_description_driven_deny():
 
 
 # --------------------------------------------------------------------------- #
-# Slice 5 — exclusivity complement (highest-signal). "may ONLY access source"    #
-# closes the set: source is granted, and the builder derives a DENY on EVERY     #
-# other candidate (issues, deploy). A missed complement is exactly the durable-  #
-# prohibition hole DENY exists to close.                                        #
+# Slice 5 — explicit per-pair denies (the digested form of the old "only"). A     #
+# digested policy states exclusivity as split direct grants: an ALLOW on source   #
+# plus explicit DENYs on issues and deploy. build_role_rules must emit exactly    #
+# that ALLOW + the two explicit DENYs — no derived complement, just what is       #
+# stated. This is the digested replacement for the retired exclusivity fixture.  #
 # --------------------------------------------------------------------------- #
-def test_exclusivity_derives_complement():
+def test_explicit_per_pair_denies_role_direction():
     developer = _role("r-dev", "developer", "A software developer.")
     source = _scope("s-src", "source", "Access the source code repository.")
     issues = _scope("s-iss", "issues", "Access the issue tracker.")
     deploy = _scope("s-dep", "deploy", "Deploy the application to production.")
 
-    policy = "Developers may only access the source code repository."
+    policy = (
+        "Developers may access the source code repository. "
+        "Developers may not access the issue tracker. "
+        "Developers may not deploy the application to production."
+    )
 
     rules = _role_rules(policy, developer, [source, issues, deploy])
 
@@ -255,25 +257,23 @@ def test_exclusivity_derives_complement():
 
 
 # --------------------------------------------------------------------------- #
-# Slice 6 — Door B (build_role_denies): the user-role-focal DENY-only pass over  #
-# the focus's OWN scopes. Real "Testers may access only issues" prose closes the #
-# tester's set to issues, so the pass derives a DENY on every OTHER own scope    #
-# (source-read, source-write) and — being deny-only — emits NO ALLOW on issues   #
-# (the scope-focal pass owns that grant). This is the exclusivity-complement      #
-# prohibition the scope-focal pass structurally cannot express.                 #
+# Slice 6 — user-role deny parity (scope direction). Door B was retired: a user   #
+# role's explicit prohibition must be captured by the SCOPE-focal pass directly.  #
+# With `source-read` focal and the tester an explicitly-prohibited candidate, the #
+# scope-focal pass must emit DENY(tester, source-read) — the deny Door B used to   #
+# produce. Guards the Door-B removal against silently dropping the deny (which     #
+# would broaden access).                                                         #
 # --------------------------------------------------------------------------- #
-def test_door_b_exclusivity_complement_denies_only():
-    tester = _role("r-tst", "tester", "A QA tester who works in the issue tracker, not in the source repository.")
-    issues = _scope("s-iss", "issues", "Access the issue tracker.")
+def test_user_role_explicit_deny_captured_by_scope_focal_pass():
     source_read = _scope("s-sr", "source-read", "Read source code from the repository.")
-    source_write = _scope("s-sw", "source-write", "Write and modify source code in the repository.")
+    tester = _role("r-tst", "tester", "A QA tester who works in the issue tracker.")
+    developer = _role("r-dev", "developer", "A software developer who works on the source repository.")
 
-    policy = "Testers may access only issues; they may not access source."
+    policy = "Developers may read the source code repository. Testers may not access the source repository."
 
-    rules = _role_denies(policy, tester, [issues, source_read, source_write])
+    rules = _scope_rules(policy, [tester, developer], source_read)
 
-    # DENY-only: the exclusivity complement over the focus's own scopes, no ALLOW(issues).
-    assert _scope_effects(rules) == {
-        ("source-read", DENY),
-        ("source-write", DENY),
+    assert _role_effects(rules) == {
+        ("developer", ALLOW),
+        ("tester", DENY),
     }

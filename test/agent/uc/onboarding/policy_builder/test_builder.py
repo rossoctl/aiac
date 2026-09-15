@@ -90,7 +90,6 @@ def _invoke(
     service_id=FOCUS_ID,
     scope_rules=None,
     role_rules=None,
-    role_denies=None,
     get_services_exc=None,
     get_subjects_exc=None,
 ):
@@ -99,16 +98,16 @@ def _invoke(
     `services` / `subjects` back `get_services()` / `get_subjects()` respectively. Both
     candidate roles and scopes are sourced from `get_services()`; `all_scopes` is retained
     only to describe the global scope catalog in each fixture and is not consulted by the
-    builder. `scope_rules` / `role_rules` / `role_denies` are optional side_effect callables
-    (scope-focal pass / agent role-focal pass / Door B user-role-focal deny pass respectively);
-    default to returning an empty list so calls are counted without inventing rule content.
+    builder. `scope_rules` / `role_rules` are optional side_effect callables (scope-focal pass /
+    agent role-focal pass respectively); default to returning an empty list so calls are counted
+    without inventing rule content. There is no separate user-role deny pass — a user role's
+    explicit denies flow through the scope-focal pass (Door B was retired under digested input).
     `get_*_exc` injects an IdP-read failure on the corresponding call.
     """
     with (
         patch.object(builder, "_config") as cfg,
         patch.object(builder, "build_scope_rules") as bsr,
         patch.object(builder, "build_role_rules") as brr,
-        patch.object(builder, "build_role_denies") as brd,
         # #2504: build() now reads the OTHER services' already-applied rules from the Policy Store to
         # widen cross-service conflict detection. These unit tests exercise a single build in
         # isolation (no other services applied), so stub the store read to [] — no store required and
@@ -127,9 +126,8 @@ def _invoke(
         cfg.return_value = conf
         bsr.side_effect = scope_rules or (lambda roles, scope: [])
         brr.side_effect = role_rules or (lambda role, scopes: [])
-        brd.side_effect = role_denies or (lambda role, scopes: [])
         result = builder.ServicePolicyBuilder.build(service_id, service_type)
-        return result, bsr, brr, brd, conf
+        return result, bsr, brr, conf
 
 
 class TestTool:
@@ -140,7 +138,7 @@ class TestTool:
         other = _service(OTHER_ID, roles=[other_role])
         rule = _rule(other_role, own_scope)
 
-        result, bsr, brr, _, _ = _invoke(
+        result, bsr, brr, _ = _invoke(
             ServiceType.TOOL,
             services=[focus, other],
             all_scopes=[own_scope],
@@ -163,7 +161,7 @@ class TestTool:
         other = _service(OTHER_ID, roles=[other_role])
         r1, r2 = _rule(other_role, s1), _rule(other_role, s2)
 
-        result, bsr, brr, _, _ = _invoke(
+        result, bsr, brr, _ = _invoke(
             ServiceType.TOOL,
             services=[focus, other],
             all_scopes=[s1, s2],
@@ -188,7 +186,7 @@ class TestAgent:
         scope_rule = _rule(other_role, own_scope)
         role_rule = _rule(own_role, other_scope)
 
-        result, bsr, brr, _, _ = _invoke(
+        result, bsr, brr, _ = _invoke(
             ServiceType.AGENT,
             services=[focus, other],
             all_scopes=[own_scope, other_scope],
@@ -221,7 +219,7 @@ class TestFlattening:
         focus = _service(FOCUS_ID, scopes=[own_scope])
         other = _service(OTHER_ID, roles=[admin, reader])
 
-        _, bsr, _, _, _ = _invoke(
+        _, bsr, _, _ = _invoke(
             ServiceType.TOOL,
             services=[focus, other],
             all_scopes=[own_scope],
@@ -240,7 +238,7 @@ class TestFlattening:
         focus = _service(FOCUS_ID, roles=[own_role], service_type=ServiceType.AGENT)
         other = _service(OTHER_ID, scopes=[other_scope])
 
-        _, _, brr, _, _ = _invoke(
+        _, _, brr, _ = _invoke(
             ServiceType.AGENT,
             services=[focus, other],
             all_scopes=[other_scope],
@@ -264,7 +262,7 @@ class TestSelfExclusion:
         focus = _service(FOCUS_ID, roles=[own_role], scopes=[own_scope], service_type=ServiceType.AGENT)
         other = _service(OTHER_ID, roles=[other_role], scopes=[other_scope])
 
-        _, bsr, brr, _, _ = _invoke(
+        _, bsr, brr, _ = _invoke(
             ServiceType.AGENT,
             services=[focus, other],
             all_scopes=[own_scope, other_scope],
@@ -296,7 +294,7 @@ class TestSelfMappingInvariant:
         focus = _service(FOCUS_ID, roles=own_roles, scopes=own_scopes, service_type=ServiceType.AGENT)
         other = _service(OTHER_ID, roles=other_roles, scopes=other_scopes)
 
-        _, bsr, brr, _, _ = _invoke(
+        _, bsr, brr, _ = _invoke(
             ServiceType.AGENT,
             services=[focus, other],
             all_scopes=own_scopes + other_scopes,
@@ -320,7 +318,7 @@ class TestOwnershipBeatsMembership:
         focus = _service(FOCUS_ID, roles=[own_role], scopes=[own_scope])
         other = _service(OTHER_ID)
 
-        _, bsr, _, _, _ = _invoke(
+        _, bsr, _, _ = _invoke(
             ServiceType.TOOL,
             services=[focus, other],
             all_scopes=[own_scope],
@@ -339,7 +337,7 @@ class TestKindRouting:
         focus = _service(FOCUS_ID, scopes=[own_scope])
         other = _service(OTHER_ID, roles=[other_role])
 
-        result, bsr, _, _, _ = _invoke(
+        result, bsr, _, _ = _invoke(
             ServiceType.TOOL,
             services=[focus, other],
             all_scopes=[own_scope],
@@ -359,7 +357,7 @@ class TestBuiltInScopeDropped:
         focus = _service(FOCUS_ID, scopes=[managed_scope, builtin_scope])
         other = _service(OTHER_ID)
 
-        _, bsr, _, _, _ = _invoke(
+        _, bsr, _, _ = _invoke(
             ServiceType.TOOL,
             services=[focus, other],
             all_scopes=[managed_scope, builtin_scope],
@@ -400,7 +398,7 @@ class TestFocusResolvedByInternalId:
         focus = _service(self.UUID, ref=self.CLIENT_ID, scopes=[own_scope])
         other = _service(OTHER_ID, ref="svc-other-client")
 
-        result, bsr, _, _, _ = _invoke(
+        result, bsr, _, _ = _invoke(
             ServiceType.TOOL,
             services=[focus, other],
             all_scopes=[own_scope],
@@ -432,7 +430,7 @@ class TestEmptyUniverse:
     def test_no_other_services_or_subjects_yields_no_rules_without_error(self):
         focus = _service(FOCUS_ID)
 
-        result, bsr, brr, _, _ = _invoke(
+        result, bsr, brr, _ = _invoke(
             ServiceType.AGENT,
             services=[focus],
             all_scopes=[],
@@ -447,7 +445,7 @@ class TestEmptyUniverse:
         own_role, own_scope = _role("weather.agent"), _scope("weather.forecast", service_id=FOCUS_ID)
         focus = _service(FOCUS_ID, roles=[own_role], scopes=[own_scope], service_type=ServiceType.AGENT)
 
-        result, bsr, brr, _, _ = _invoke(
+        result, bsr, brr, _ = _invoke(
             ServiceType.AGENT,
             services=[focus],  # no other services, no subjects
             all_scopes=[own_scope],
@@ -508,14 +506,15 @@ def _deny(role, scope):
     return PolicyRule(role=role, scope=scope, effect=RuleEffect.DENY)
 
 
-class TestDoorB:
-    """Door B — the user-role-focal DENY-only pass fanned over the focus's OWN scopes,
-    alongside the scope-focal pass. It runs `build_role_denies` once per `kind=User`
-    candidate role (never for `kind=Agent` candidates), always with the focus's own scopes."""
+class TestUserRoleDenies:
+    """Digested input retired the user-role-focal deny pass (Door B). A user role's explicit
+    prohibitions now flow through the SCOPE-focal pass, which already fans the focus's own scopes
+    over ALL candidate roles (user roles included). See the PRB spec's "digested input retires
+    exclusivity handling and Door B" design decision."""
 
-    def test_deny_pass_runs_per_user_role_over_own_scopes(self):
-        # github-tool owns two source scopes; candidates are a user role (tester) and an
-        # agent role. Door B fans ONLY the user role over the own scopes, deny-only.
+    def test_user_role_explicit_deny_flows_through_scope_focal_pass(self):
+        # github-tool owns two source scopes; the scope-focal pass explicitly denies the tester
+        # (a user role) both. No separate deny pass runs -- the scope-focal pass is the sole producer.
         source_read = _scope("source-read", service_id=FOCUS_ID)
         source_write = _scope("source-write", service_id=FOCUS_ID)
         tester = _role("tester", kind=RoleKind.USER, aiac_managed=False)
@@ -524,104 +523,44 @@ class TestDoorB:
         focus = _service(FOCUS_ID, scopes=[source_read, source_write])
         other = _service(OTHER_ID, roles=[agent_role])
 
-        result, _, _, brd, _ = _invoke(
+        result, bsr, _, _ = _invoke(
             ServiceType.TOOL,
             services=[focus, other],
             all_scopes=[source_read, source_write],
             subjects=[subject],
-            role_denies=lambda role, scopes: [_deny(role, sc) for sc in scopes],
+            scope_rules=lambda roles, scope: [_deny(tester, scope)],
         )
 
-        # invoked once, for the user role only, with the focus's own scopes
-        assert brd.call_count == 1
-        passed_role, passed_scopes = brd.call_args.args
-        assert passed_role.name == "tester"
-        assert [s.name for s in passed_scopes] == ["source-read", "source-write"]
-        # output is DENY-only
+        # the scope-focal pass ran once per own scope and produced the tester's denies directly
+        assert bsr.call_count == 2
         assert all(r.effect is RuleEffect.DENY for r in result)
         assert {(r.role.name, r.scope.name) for r in result} == {
             ("tester", "source-read"),
             ("tester", "source-write"),
         }
 
-    def test_deny_pass_skips_agent_candidate_roles(self):
-        own_scope = _scope("source-read", service_id=FOCUS_ID)
-        agent_role = _role("github.agent", kind=RoleKind.AGENT)
-        focus = _service(FOCUS_ID, scopes=[own_scope])
-        other = _service(OTHER_ID, roles=[agent_role])
-
-        _, _, _, brd, _ = _invoke(
-            ServiceType.TOOL,
-            services=[focus, other],
-            all_scopes=[own_scope],
-            subjects=[],
-        )
-
-        brd.assert_not_called()
-
-    def test_permissive_policy_deny_pass_is_noop(self):
-        # A user role candidate with a permissive policy: build_role_denies returns [] and the
-        # assembled result carries no Door B deny.
+    def test_permissive_policy_yields_no_user_role_deny(self):
+        # A permissive scenario: the scope-focal pass denies nothing -> no user-role deny assembled.
         own_scope = _scope("issues", service_id=FOCUS_ID)
         tester = _role("tester", kind=RoleKind.USER, aiac_managed=False)
         subject = _subject("tina", roles=[tester])
         focus = _service(FOCUS_ID, scopes=[own_scope])
         other = _service(OTHER_ID)
 
-        result, _, _, brd, _ = _invoke(
+        result, _, _, _ = _invoke(
             ServiceType.TOOL,
             services=[focus, other],
             all_scopes=[own_scope],
             subjects=[subject],
-            role_denies=lambda role, scopes: [],  # exclusivity-free policy -> no denies
+            scope_rules=lambda roles, scope: [],  # permissive -> nothing
         )
 
-        assert brd.call_count == 1  # the pass ran
-        assert result == []  # but contributed nothing
-
-    def test_consistent_denyworld_both_passes_deny_same_pair_no_conflict(self):
-        # denyworld: the scope-focal pass (description-driven) and Door B (exclusivity complement)
-        # BOTH deny (tester, source). The assembled list carries the agreeing DENYs and NO pair
-        # holds both an ALLOW and a DENY -- consistent, so no conflict arises.
-        source = _scope("source-read", service_id=FOCUS_ID)
-        issues = _scope("issues-read", service_id=FOCUS_ID)
-        tester = _role("tester", kind=RoleKind.USER, aiac_managed=False)
-        subject = _subject("tina", roles=[tester])
-        focus = _service(FOCUS_ID, scopes=[source, issues])
-        other = _service(OTHER_ID)
-
-        def _scope_side(roles, scope):
-            # scope-focal: grant issues, deny source (description-driven) for the tester.
-            if scope.name == "issues-read":
-                return [PolicyRule(role=tester, scope=scope, effect=RuleEffect.ALLOW)]
-            return [_deny(tester, scope)]
-
-        def _deny_side(role, scopes):
-            # Door B: exclusivity "only issues" -> complement deny on source.
-            return [_deny(role, sc) for sc in scopes if sc.name == "source-read"]
-
-        result, _, _, _, _ = _invoke(
-            ServiceType.TOOL,
-            services=[focus, other],
-            all_scopes=[source, issues],
-            subjects=[subject],
-            scope_rules=_scope_side,
-            role_denies=_deny_side,
-        )
-
-        allow_pairs = {(r.role.name, r.scope.name) for r in result if r.effect is RuleEffect.ALLOW}
-        deny_pairs = {(r.role.name, r.scope.name) for r in result if r.effect is RuleEffect.DENY}
-        # both passes agree on the (tester, source) DENY; issues is an ALLOW only
-        assert ("tester", "source-read") in deny_pairs
-        assert ("tester", "issues-read") in allow_pairs
-        # consistent: no pair carries BOTH an allow and a deny (no conflict)
-        assert allow_pairs.isdisjoint(deny_pairs)
+        assert result == []
 
     def test_order_independence_tool_first_vs_agent_first(self):
         # build() is a pure function of its focus + the (identical) live IdP state: onboarding the
-        # tool first or the agent first yields identical denies for each focus. Door B runs at each
-        # service's OWN-scope onboarding, so the tool's user-role denies are produced by the tool's
-        # build regardless of whether the agent was onboarded before or after.
+        # tool first or the agent first yields identical rules for each focus. The tester's deny on
+        # the tool's own scope is produced by the tool's scope-focal pass in either order.
         tool_scope = _scope("source-read", service_id=FOCUS_ID)
         agent_scope = _scope("source_operations", service_id=OTHER_ID)
         agent_role = _role("github.agent", role_id="agent-role-id", kind=RoleKind.AGENT)
@@ -630,14 +569,18 @@ class TestDoorB:
         tool = _service(FOCUS_ID, scopes=[tool_scope], service_type=ServiceType.TOOL)
         agent = _service(OTHER_ID, roles=[agent_role], scopes=[agent_scope], service_type=ServiceType.AGENT)
 
+        def _scope_side(roles, scope):
+            # the tester is explicitly denied the tool's own scope (scope-focal, either ordering).
+            return [_deny(tester, scope)] if scope.name == "source-read" else []
+
         def run(service_id, service_type):
-            result, _, _, _, _ = _invoke(
+            result, _, _, _ = _invoke(
                 service_type,
                 services=[tool, agent],
                 all_scopes=[tool_scope, agent_scope],
                 subjects=[subject],
                 service_id=service_id,
-                role_denies=lambda role, scopes: [_deny(role, sc) for sc in scopes],
+                scope_rules=_scope_side,
             )
             return {(r.role.name, r.scope.name, r.effect) for r in result}
 
@@ -701,29 +644,30 @@ class TestContradictionAccumulation:
         }
 
     def test_structural_conflict_unions_with_accumulated_contradiction(self):
-        # One pass emits a real allow∩deny STRUCTURAL conflict; a later (Door B) pass raises an auditor
-        # CONTRADICTION. The single raised report must carry BOTH — the deterministic survey unioned
-        # with the accumulated contradiction (structural rows keep real ids; contradiction rows carry
-        # empty ids).
-        own_scope = _scope("issues", scope_id="issues-id", service_id=FOCUS_ID)
+        # One scope-focal pass emits a real allow∩deny STRUCTURAL conflict; another scope's pass
+        # raises an auditor CONTRADICTION (naming the tester as the colliding candidate). The single
+        # raised report must carry BOTH — the deterministic survey unioned with the accumulated
+        # contradiction (structural rows keep real ids; contradiction rows carry empty ids).
+        issues = _scope("issues", scope_id="issues-id", service_id=FOCUS_ID)
+        config = _scope("config", scope_id="config-id", service_id=FOCUS_ID)
         agent_role = _role("github.agent", role_id="agent-id", kind=RoleKind.AGENT)
         tester = _role("tester", role_id="tester-id", kind=RoleKind.USER, aiac_managed=False)
         subject = _subject("tina", roles=[tester])
-        focus = _service(FOCUS_ID, scopes=[own_scope])
+        focus = _service(FOCUS_ID, scopes=[issues, config])
         other = _service(OTHER_ID, roles=[agent_role])
 
         def _scope_side(roles, scope):
-            # a real (github.agent, issues) allow∩deny overlap -> detect_conflicts surfaces it
-            return [
-                PolicyRule(role=agent_role, scope=scope, effect=RuleEffect.ALLOW),
-                PolicyRule(role=agent_role, scope=scope, effect=RuleEffect.DENY),
-            ]
-
-        def _deny_side(role, scopes):
-            # Door B user-role pass raises an auditor contradiction -> tester's rule set withheld
+            if scope.name == "issues":
+                # a real (github.agent, issues) allow∩deny overlap -> detect_conflicts surfaces it
+                return [
+                    PolicyRule(role=agent_role, scope=scope, effect=RuleEffect.ALLOW),
+                    PolicyRule(role=agent_role, scope=scope, effect=RuleEffect.DENY),
+                ]
+            # the config scope's pass raises an auditor contradiction naming the tester candidate ->
+            # that focal's rule set is withheld and the contradiction is accumulated (id-less row).
             raise PolicyContradictionError(
-                "role name=tester: desc",
-                [Contradiction(candidate_name="issues", description="tester exclusivity collides")],
+                f"scope name={scope.name}: desc",
+                [Contradiction(candidate_name="tester", description="tester collides on config")],
             )
 
         with (
@@ -734,10 +678,9 @@ class TestContradictionAccumulation:
                 _invoke(
                     ServiceType.TOOL,
                     services=[focus, other],
-                    all_scopes=[own_scope],
+                    all_scopes=[issues, config],
                     subjects=[subject],
                     scope_rules=_scope_side,
-                    role_denies=_deny_side,
                 )
 
         report = ei.value.report
@@ -801,7 +744,7 @@ class TestCleanRunUnchanged:
         scope_rule = _rule(other_role, own_scope)
         role_rule = _rule(own_role, other_scope)
 
-        result, _, _, _, _ = _invoke(
+        result, _, _, _ = _invoke(
             ServiceType.AGENT,
             services=[focus, other],
             all_scopes=[own_scope, other_scope],
