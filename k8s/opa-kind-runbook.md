@@ -4,8 +4,8 @@
 > to its release as part of the Rossoctl system. On release, this document
 > should be updated accordingly.
 
-This is the AIAC-scoped companion to
-[`authbridge/docs/opa-kind-runbook.md`](../../authbridge/docs/opa-kind-runbook.md).
+This is the AIAC-scoped companion to `authbridge/docs/opa-kind-runbook.md` (in
+the separate AuthBridge repository).
 The underlying mechanism — OPA as an AuthBridge pipeline plugin, policy
 distributed via `bundle-service`, enforcement via the `AuthorizationPolicy`
 CRD — is identical. This document gives the **exact, copy-paste** steps to run
@@ -24,7 +24,7 @@ its downstream tool (`github-tool`):
 
 - **`dev-user` is the allowed user, `alice` is the blocked user.** `dev-user`
   is the canonical scenario username from
-  [`docs/specs/integration-test/policy-pipeline.md`](../docs/specs/integration-test/policy-pipeline.md).
+  [`docs/testing/policy-pipeline.md`](../docs/testing/policy-pipeline.md).
 - **Inbound** authorization is enforced by a **client-scoped**
   `AuthorizationPolicy` targeting `github-agent` alone.
 - **Outbound** shows the token-exchange → OPA leg: the agent's call to

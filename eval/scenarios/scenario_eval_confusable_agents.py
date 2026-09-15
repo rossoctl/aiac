@@ -1,7 +1,7 @@
 """Scenario 9 — confusable agents: 2 users, 2 agents, 2 tools, sports/coaching domain.
 
 Companion to ``scenario_eval_baseline.py`` (Scenario 1) for ``test_policy_pipeline_eval.py`` (spec:
-``docs/specs/eval/policy-eval-scenarios.md``). Isolates one aspect: a deliberately
+``docs/evaluation/policy-eval-scenarios.md``). Isolates one aspect: a deliberately
 confusable agent-name pair (``coach-agent`` / ``coach-review-agent``) with entirely non-overlapping
 access, plus the identity/boundary-confusion probe this pairing enables.
 

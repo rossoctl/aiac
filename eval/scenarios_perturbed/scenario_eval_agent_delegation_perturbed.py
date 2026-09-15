@@ -1,7 +1,7 @@
 """Semantic-perturbation sibling of ``scenario_eval_agent_delegation.py`` (spec:
-``docs/specs/eval/policy-eval-robustness-consistency.md``).
+``docs/evaluation/policy-eval-robustness-consistency.md``).
 
-Note the asymmetry: the original lives at ``test/integration/`` top level (a deliberate exception
+Note the asymmetry: the original lives at ``test/system/`` top level (a deliberate exception
 in the base suite's file layout), but this perturbed sibling lives here in
 ``eval/scenarios_perturbed/`` alongside every other scenario's perturbed sibling — the robustness
 suite treats all 8 scenarios uniformly regardless of where their originals happen to live.

@@ -12,6 +12,8 @@ exclude = [
   "<your-",
   # GitHub edit/blame URLs that require authentication
   "github\\.com/.*/edit/",
+  # Local GitHub-issue mirror docs not committed to the repo (referenced by demo specs)
+  "gh-issues/",
   # Avoid rate-limiting from high-traffic sites
   "twitter\\.com",
   "x\\.com",

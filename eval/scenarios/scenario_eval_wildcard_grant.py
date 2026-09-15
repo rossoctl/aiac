@@ -1,7 +1,7 @@
 """Scenario 7 — wildcard grant: 1 user, 1 agent, 1 tool, retail/inventory domain.
 
 Companion to ``scenario_eval_baseline.py`` (Scenario 1) for ``test_policy_pipeline_eval.py`` (spec:
-``docs/specs/eval/policy-eval-scenarios.md``). Isolates one aspect: a wildcard-phrased
+``docs/evaluation/policy-eval-scenarios.md``). Isolates one aspect: a wildcard-phrased
 grant that must be expanded by the PRB to the correct concrete scope set.
 
 Both the user role (``user-role-inventory-manager``) and the agent's own role (``agent-role-inventory-operations``) are

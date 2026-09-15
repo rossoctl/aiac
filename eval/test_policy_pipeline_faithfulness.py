@@ -21,7 +21,7 @@ a BROADENING of access and fails the test (the security-critical half of faithfu
 Run (needs LLM_BASE_URL/LLM_MODEL/LLM_API_KEY; no Keycloak/opa). Scenarios are independent, so
 ``-n 8`` gives a near-linear speedup — but note each scenario now makes an EXTRA digest LLM call on
 top of the PRB's ~5-8:
-    .venv/bin/pytest eval/test_policy_pipeline_faithfulness.py -m eval_faithfulness -n 8 -v -s
+    .venv/bin/pytest eval/test_policy_pipeline_faithfulness.py -m eval -n 8 -v -s
 """
 
 from __future__ import annotations
@@ -31,12 +31,12 @@ from pathlib import Path
 
 import pytest
 
-pytestmark = pytest.mark.eval_faithfulness
+pytestmark = pytest.mark.eval
 
 HERE = Path(__file__).resolve().parent  # aiac/eval/
 REPO_ROOT = HERE.parent  # -> aiac/
 SRC = REPO_ROOT / "src"
-sys.path.insert(0, str(REPO_ROOT))  # so ``import test.integration.*``/``eval.*`` resolves
+sys.path.insert(0, str(REPO_ROOT))  # so ``import test.system.*``/``eval.*`` resolves
 sys.path.insert(0, str(SRC))  # so ``import aiac.*`` resolves
 
 from aiac.agent.policy_digester import digest_policy  # noqa: E402
@@ -49,7 +49,7 @@ from eval.test_policy_pipeline_eval import (  # noqa: E402
     orchestrate_prb,
     truth,
 )
-from test.integration.launcher import require_env  # noqa: E402
+from test.system.launcher import require_env_or_skip  # noqa: E402
 
 
 @pytest.mark.parametrize("scenario_name", sorted(SCENARIOS))
@@ -57,7 +57,7 @@ def test_digest_is_faithful(scenario_name: str, monkeypatch: pytest.MonkeyPatch,
     """The PRB's output over the scenario's DIGESTED policy, scored against the scenario's truth
     table, has zero over-grants — the digest broadens no access (security-critical, gates this
     test). Under-grants (dropped access) and incorrect denials are tracked/reported only."""
-    require_env("LLM_BASE_URL", "LLM_MODEL", "LLM_API_KEY")
+    require_env_or_skip("LLM_BASE_URL", "LLM_MODEL", "LLM_API_KEY")
     scenario = SCENARIOS[scenario_name]
     roles, scopes = build_roles_and_scopes(scenario)
 

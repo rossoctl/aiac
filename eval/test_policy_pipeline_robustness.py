@@ -1,4 +1,4 @@
-"""PRB robustness-to-perturbation suite (spec: ``docs/specs/eval/
+"""PRB robustness-to-perturbation suite (spec: ``docs/evaluation/
 policy-eval-robustness-consistency.md``).
 
 Checks whether the LLM-backed Policy Rules Builder's grant decisions are unchanged under small,
@@ -18,7 +18,7 @@ for the same no-Keycloak rationale, which applies here unchanged.
 
 Run (needs LLM_BASE_URL/LLM_MODEL/LLM_API_KEY exported; no Keycloak/opa needed):
     .venv/bin/pytest eval/test_policy_pipeline_robustness.py \
-        -m eval_robustness -v
+        -m eval -v
 """
 
 from __future__ import annotations
@@ -29,12 +29,12 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
-pytestmark = pytest.mark.eval_robustness
+pytestmark = pytest.mark.eval
 
 HERE = Path(__file__).resolve().parent  # aiac/eval/
 REPO_ROOT = HERE.parent  # -> aiac/
 SRC = REPO_ROOT / "src"
-sys.path.insert(0, str(REPO_ROOT))  # so ``import test.integration.*``/``eval.*`` resolves
+sys.path.insert(0, str(REPO_ROOT))  # so ``import test.system.*``/``eval.*`` resolves
 sys.path.insert(0, str(SRC))  # so ``import aiac.*`` resolves
 
 from eval.prb_direct import build_roles_and_scopes  # noqa: E402
@@ -54,7 +54,7 @@ from eval.test_policy_pipeline_eval import (  # noqa: E402
     orchestrate_prb,
     truth,
 )
-from test.integration.launcher import require_env  # noqa: E402
+from test.system.launcher import require_env_or_skip  # noqa: E402
 
 PERTURBED_SCENARIOS: dict[str, ModuleType] = {
     "baseline": scenario_eval_baseline_perturbed,
@@ -131,7 +131,7 @@ def test_prb_robust_to_perturbation(scenario_name: str, monkeypatch: pytest.Monk
     semantic-sibling scenario with identical meaning/structure — both compared against the
     original scenario's truth table. A single combined pass/fail per scenario; if mechanical
     passes but semantic fails (or vice versa), the scenario reports as robustness-failed overall."""
-    require_env("LLM_BASE_URL", "LLM_MODEL", "LLM_API_KEY")
+    require_env_or_skip("LLM_BASE_URL", "LLM_MODEL", "LLM_API_KEY")
     scenario = SCENARIOS[scenario_name]
     want = truth(scenario)
     failures: list[str] = []

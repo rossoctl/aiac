@@ -1,5 +1,5 @@
 """The UC-1 onboarding demo's scenario data — a standalone copy of the facts
-``test/integration/scenario_uc1.py`` encodes for the pytest ladder, plus the extra data this demo
+``test/system/scenario_uc1.py`` encodes for the pytest ladder, plus the extra data this demo
 needs and pytest does not (login profile fields, human-readable intents). Deliberately not imported
 from ``test/`` — this demo ships outside the test tree and must run with no ``aiac`` checkout beyond
 ``demo/``.

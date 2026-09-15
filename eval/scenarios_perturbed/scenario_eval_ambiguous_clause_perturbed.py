@@ -1,5 +1,5 @@
 """Semantic-perturbation sibling of ``scenario_eval_ambiguous_clause.py`` (spec:
-``docs/specs/eval/policy-eval-robustness-consistency.md``).
+``docs/evaluation/policy-eval-robustness-consistency.md``).
 
 Same structure (names, ``USERS``, all pair-lists are byte-identical to the original), reworded
 prose only. See ``scenario_eval_baseline_perturbed.py`` for the general rationale. The reworded

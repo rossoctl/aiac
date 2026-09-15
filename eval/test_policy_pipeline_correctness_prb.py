@@ -1,4 +1,4 @@
-"""PRB-level correctness suite (spec: ``docs/specs/eval/policy-eval-correctness-prb.md``).
+"""PRB-level correctness suite (spec: ``docs/evaluation/policy-eval-correctness-prb.md``).
 
 Runs the Policy Rules Builder directly (synthetic, Keycloak-free ``Role``/``Scope`` objects via
 ``eval.prb_direct.build_roles_and_scopes`` — no live IdP, no OPA) against the primary
@@ -10,8 +10,8 @@ denial-precision figure for the PRB's explicit ``Deny`` rules.
 Distinguished from ``test_policy_pipeline_eval.py``'s own ``test_grant_set_matches_truth_table``
 (which also checks grant-set equality, but downstream of the full Keycloak+OPA pipeline, and
 without effect-aware denial tracking or a reusable scorer) and from the future end-to-end
-correctness suite (#2090, ``test_policy_pipeline_correctness_e2e.py`` /
-``eval_correctness_e2e`` — same corpus and scorer, but through the real Keycloak+OPA pipeline).
+correctness suite (#2090, ``test_policy_pipeline_correctness_e2e.py`` — same corpus and scorer,
+but through the real Keycloak+OPA pipeline).
 
 Scoped to the PRB's raw output only (no OPA/PCE/k8s in the loop) — same no-Keycloak rationale as
 ``test_policy_pipeline_consistency.py``/``test_policy_pipeline_robustness.py``, which this suite
@@ -38,7 +38,7 @@ run took ~36 minutes; with ``-n 8`` it's close to 1/8th that). ``pytest-xdist`` 
 `test`-extra dependency (``aiac/pyproject.toml``'s ``[project.optional-dependencies].test``)
 picked up by a normal ``uv sync``/``pip install -e ".[test]"`` — no separate install step needed:
     .venv/bin/pytest eval/test_policy_pipeline_correctness_prb.py \
-        -m eval_correctness_prb -n 8 -v -s
+        -m eval -n 8 -v -s
 """
 
 from __future__ import annotations
@@ -48,12 +48,12 @@ from pathlib import Path
 
 import pytest
 
-pytestmark = pytest.mark.eval_correctness_prb
+pytestmark = pytest.mark.eval
 
 HERE = Path(__file__).resolve().parent  # aiac/eval/
 REPO_ROOT = HERE.parent  # -> aiac/
 SRC = REPO_ROOT / "src"
-sys.path.insert(0, str(REPO_ROOT))  # so ``import test.integration.*``/``eval.*`` resolves
+sys.path.insert(0, str(REPO_ROOT))  # so ``import test.system.*``/``eval.*`` resolves
 sys.path.insert(0, str(SRC))  # so ``import aiac.*`` resolves
 
 from aiac.policy.model.models import RuleEffect  # noqa: E402
@@ -65,7 +65,7 @@ from eval.test_policy_pipeline_eval import (  # noqa: E402
     orchestrate_prb,
     truth,
 )
-from test.integration.launcher import require_env  # noqa: E402
+from test.system.launcher import require_env_or_skip  # noqa: E402
 
 
 @pytest.mark.parametrize("scenario_name", sorted(SCENARIOS))
@@ -73,7 +73,7 @@ def test_prb_correctness(scenario_name: str, monkeypatch: pytest.MonkeyPatch, re
     """The PRB's grant/deny output, scored against the scenario's truth table, has zero
     over-grants (security-critical, gates this test) — under-grants and incorrect denials are
     tracked/reported only (spec: threshold TBD, deferred)."""
-    require_env("LLM_BASE_URL", "LLM_MODEL", "LLM_API_KEY")
+    require_env_or_skip("LLM_BASE_URL", "LLM_MODEL", "LLM_API_KEY")
     scenario = SCENARIOS[scenario_name]
     roles, scopes = build_roles_and_scopes(scenario)
     policy_path = Path(scenario.__file__).resolve().parent / scenario.POLICY_FILE
@@ -104,7 +104,7 @@ def test_prb_correctness(scenario_name: str, monkeypatch: pytest.MonkeyPatch, re
     record_property("best_effort_notes", best_effort_notes)
     # Raw counts behind the precision/recall/denial_precision floats above — eval/conftest.py's
     # trend-log writer pools these across every scenario in the run (spec:
-    # docs/specs/eval/eval-framework.md §9), rather than averaging the per-scenario floats.
+    # docs/evaluation/eval-framework.md §9), rather than averaging the per-scenario floats.
     record_property("true_positives", score.true_positive_count)
     record_property("denied_total", score.denied_total)
     print(

@@ -75,8 +75,9 @@ jobs:
 
       - name: Run tests
         # pyproject addopts already deselect the live markers
-        # (integration / llm / eval_*), so this is the offline unit suite.
-        run: uv run --no-project pytest test
+        # (integration / system / llm / eval), so this is the offline unit suite.
+        # Marker-only selection — no path arg; testpaths covers both trees.
+        run: uv run --no-project pytest
 
   keycloak-spi:
     name: Keycloak SPI (Java)

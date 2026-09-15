@@ -1,4 +1,4 @@
-"""Shared, reusable trend-log writer (spec: ``docs/specs/eval/eval-framework.md`` §9).
+"""Shared, reusable trend-log writer (spec: ``docs/evaluation/eval-framework.md`` §9).
 
 A small, **committed-to-git**, append-only file — ``eval/trend_log.jsonl`` by default — holding
 one JSON line per eval run: model version, timestamp, and a handful of small aggregate metrics

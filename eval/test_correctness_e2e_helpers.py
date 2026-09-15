@@ -1,11 +1,11 @@
-"""Unit tests for ``correctness_e2e_helpers.py`` (spec: ``docs/specs/eval/
+"""Unit tests for ``correctness_e2e_helpers.py`` (spec: ``docs/evaluation/
 policy-eval-correctness-e2e.md``).
 
 Pure-logic, unmarked — runs in the default fast pass (``testpaths`` already includes ``eval/``),
 mirroring ``test_correctness_scorer.py``'s status as a separate, unmarked file. No LLM, no
 Keycloak, no ``opa``, no fixtures beyond plain dicts/sets — the module-level
-``pytestmark = pytest.mark.eval_correctness_e2e`` in ``test_policy_pipeline_correctness_e2e.py``
-would otherwise wrongly sweep these up and exclude them from the default pass.
+``pytestmark = pytest.mark.eval`` in ``test_policy_pipeline_correctness_e2e.py`` would otherwise
+wrongly sweep these up and exclude them from the default pass.
 """
 
 from __future__ import annotations

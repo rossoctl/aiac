@@ -1,4 +1,4 @@
-"""Unit tests for ``trend_log.py`` (spec: ``docs/specs/eval/eval-framework.md`` §9).
+"""Unit tests for ``trend_log.py`` (spec: ``docs/evaluation/eval-framework.md`` §9).
 
 Pure-logic + a small file-append, unmarked — runs in the default fast pass (``testpaths`` already
 includes ``eval/``). No LLM, no Keycloak, no live pytest reports.
