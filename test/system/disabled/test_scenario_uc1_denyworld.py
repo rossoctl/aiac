@@ -1,7 +1,8 @@
 """Fixture-independent oracle-contract tests for the Policy-B (denyworld) oracle.
 
-Not an integration test (no ``pytest.mark.integration``): these need **no** cluster, Keycloak, or
-LLM and run in the routine ``-m "not integration"`` unit lane. They pin the handoff §6 intended
+Intrinsically cluster-free: these need **no** cluster, Keycloak, or LLM. They are currently parked
+disabled under ``test/system/disabled/`` and carry the ``system`` marker, so the bare ``pytest`` unit
+lane deselects them exactly as it does the other disabled system tests. They pin the handoff §6 intended
 allow/deny matrix **directly** (mirroring ``test_policy_pipeline.py:64-93``) so a wrong oracle cannot
 silently validate the live denyworld test — if these are wrong, every live assertion is meaningless.
 
@@ -27,7 +28,10 @@ sys.path.insert(0, str(REPO_ROOT))
 from test.system import scenario_uc1 as scn  # noqa: E402
 from test.system import scenario_uc1_denyworld as scn_b  # noqa: E402
 
-pytestmark = pytest.mark.skip(reason="isolated/disabled — moved to test/system/disabled/")
+pytestmark = [
+    pytest.mark.system,
+    pytest.mark.skip(reason="isolated/disabled — moved to test/system/disabled/"),
+]
 
 # ======================================================================================
 # §6 matrix — the oracle contract (pin the intended tables directly)

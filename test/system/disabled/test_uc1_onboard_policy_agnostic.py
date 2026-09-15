@@ -1,9 +1,10 @@
 """Unit tests for the policy-agnostic parametrization of the ``uc1_onboard`` harness (issue #149).
 
-Not an integration test (no ``pytest.mark.integration``): it exercises the *pure* seams the #149
-change adds — the ``ReadySignal`` convergence-probe descriptor, the Policy-A default signal set, and
-the behavior-preserving defaults of ``ensure_agent_policy`` / ``onboarded_stack`` — with no cluster,
-no Keycloak, and no LLM. It runs in the normal ``-m "not integration"`` suite.
+Intrinsically cluster-free: it exercises the *pure* seams the #149 change adds — the ``ReadySignal``
+convergence-probe descriptor, the Policy-A default signal set, and the behavior-preserving defaults
+of ``ensure_agent_policy`` / ``onboarded_stack`` — with no cluster, no Keycloak, and no LLM. It is
+currently parked disabled under ``test/system/disabled/`` and carries the ``system`` marker, so the
+bare ``pytest`` unit lane deselects it exactly as it does the other disabled system tests.
 
 The point of these tests is the #149 acceptance property: **every new parameter defaults to today's
 Policy-A behavior**, so the existing rung callers (which pass only a positional ``workloads`` list)
@@ -25,7 +26,10 @@ sys.path.insert(0, str(REPO_ROOT))
 from test.system import scenario_uc1 as scn  # noqa: E402
 from test.system import uc1_onboard as uc1  # noqa: E402
 
-pytestmark = pytest.mark.skip(reason="isolated/disabled — moved to test/system/disabled/")
+pytestmark = [
+    pytest.mark.system,
+    pytest.mark.skip(reason="isolated/disabled — moved to test/system/disabled/"),
+]
 
 # --- ReadySignal: the parametrized convergence probe --------------------------------------------
 

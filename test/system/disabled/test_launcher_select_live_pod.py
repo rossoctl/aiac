@@ -1,8 +1,9 @@
 """Unit tests for ``launcher.select_live_pod`` — the pure pod-selection behind issue #139.
 
-Not an integration test (no ``pytest.mark.integration``): it exercises the selection logic against
-synthetic ``kubectl get pods`` items, so it runs in the normal ``-m "not integration"`` suite with no
-cluster. This pins the race that stalled ``test_uc1_onboard_agent_then_tool``: during a rolling
+Intrinsically cluster-free: it exercises the selection logic against synthetic ``kubectl get pods``
+items, so it needs no cluster. It is currently parked disabled under ``test/system/disabled/`` and
+carries the ``system`` marker, so the bare ``pytest`` unit lane deselects it exactly as it does the
+other disabled system tests (rather than importing it as skipped noise). This pins the race that stalled ``test_uc1_onboard_agent_then_tool``: during a rolling
 restart the outgoing pod lingers ``Terminating`` next to the new Ready one, and the old
 ``items[0]`` selection could pin that doomed pod — every later ``kubectl exec`` then failed
 ``NotFound`` -> classified ``"error"`` -> 300s convergence timeout.
@@ -20,7 +21,10 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from test.system.launcher import select_live_pod  # noqa: E402
 
-pytestmark = pytest.mark.skip(reason="isolated/disabled — moved to test/system/disabled/")
+pytestmark = [
+    pytest.mark.system,
+    pytest.mark.skip(reason="isolated/disabled — moved to test/system/disabled/"),
+]
 
 
 def _pod(name: str, *, created: str, phase: str = "Running", ready: bool = True, terminating: bool = False) -> dict:
