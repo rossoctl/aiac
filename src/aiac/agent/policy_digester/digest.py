@@ -25,6 +25,18 @@ from .prompts import build_digest_messages
 _DIGEST_NAMESPACE = "DIGEST"
 
 
+def _message_text(content: object) -> str:
+    """Coerce an ``AIMessage``'s ``content`` (typed ``str | list``) to plain text. A ``ChatOpenAI``
+    text response is a ``str``; some backends return a list of content parts (each a ``str`` or a
+    ``{"text": ...}`` block) — join their text so the digest is always a plain markdown document,
+    honouring ``digest_policy``'s ``-> str`` contract."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(p if isinstance(p, str) else str(p.get("text", "")) for p in content)
+    return str(content)
+
+
 def _digest_call(messages: list[BaseMessage]) -> str:
     """THE digester seam. Unit tests patch this. Delegates the client build + transport retry to the
     shared ``aiac.agent.llm`` seam (on the digester's own ``DIGEST_LLM_*`` settings profile) and
@@ -36,7 +48,7 @@ def _digest_call(messages: list[BaseMessage]) -> str:
         result = call_with_retry(build_llm(settings), messages, settings=settings)
     except Exception as err:
         raise_sanitized(err)
-    return result.content
+    return _message_text(result.content)
 
 
 def digest_policy(source_policy: str) -> str:

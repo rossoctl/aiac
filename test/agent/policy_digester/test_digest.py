@@ -55,6 +55,20 @@ def test_digest_policy_returns_model_content() -> None:
         assert digest_policy(_SRC) == "DIGESTED DOCUMENT"
 
 
+def test_digest_policy_joins_list_content_parts() -> None:
+    # AIMessage.content is str | list; some backends return a list of content parts. The digest
+    # must still be a plain str (its -> str contract), with the parts' text concatenated.
+    ai = MagicMock()
+    ai.content = ["Domain knowledge.\n", {"type": "text", "text": "Direct grants."}]
+    with (
+        patch("aiac.agent.policy_digester.digest.build_llm", return_value=MagicMock()),
+        patch("aiac.agent.policy_digester.digest.call_with_retry", return_value=ai),
+    ):
+        result = digest_policy(_SRC)
+    assert result == "Domain knowledge.\nDirect grants."
+    assert isinstance(result, str)
+
+
 def test_digest_call_sanitizes_transient_as_access_error() -> None:
     with (
         patch("aiac.agent.policy_digester.digest.build_llm", return_value=MagicMock()),
