@@ -5,7 +5,8 @@ setup`` touches Keycloak. Two classes of check, per the handoff:
   1. VERIFY ONLY, else abort with a pointer to the installer: cluster reachable, the
      ``agentruntimes``/``agentcards`` CRDs, Keycloak reachable, namespace ``team1``, SPIRE.
   2. VERIFY AND INSTALL IF ABSENT: the four AIAC images (build + kind load + apply, in dependency
-     order), then the demo workloads via ``demo/assets/install.sh`` (not reimplemented here).
+     order), then the demo workloads via ``demo/assets/kind-load.sh`` then ``demo/assets/deploy.sh``
+     (the two halves of the former ``install.sh``; not reimplemented here).
 
 Then the real readiness condition: poll Keycloak until both the ``team1/github-agent`` and
 ``team1/github-tool`` clients exist (registration is async — "rollout complete" is not "ready to
@@ -166,7 +167,7 @@ def ensure_workloads_deployed(namespace: str) -> None:
         names = set()
 
     if {scn.AGENT_WORKLOAD, scn.TOOL_WORKLOAD} <= names:
-        note(f"demo workloads already deployed in {namespace!r} — skipping install.sh")
+        note(f"demo workloads already deployed in {namespace!r} — skipping kind-load.sh / deploy.sh")
         # A Deployment object existing is not the same as it being available; a partial or failed
         # prior install would otherwise skip repair and fail later at client registration. Wait for
         # both to roll out so "already deployed" also means "actually up".
@@ -174,8 +175,12 @@ def ensure_workloads_deployed(namespace: str) -> None:
             kubectl_rollout_status(f"deployment/{workload}", namespace=namespace)
         return
 
-    note("demo workloads not found — running demo/assets/install.sh")
-    subprocess.run(["bash", str(ASSETS_DIR / "install.sh")], env={**os.environ, "NAMESPACE": namespace}, check=True)
+    # install.sh was split into kind-load.sh (build + kind load) then deploy.sh (apply + rollout);
+    # run both in sequence to preserve the original build+load+apply behaviour for the demo.
+    note("demo workloads not found — running demo/assets/kind-load.sh then demo/assets/deploy.sh")
+    env = {**os.environ, "NAMESPACE": namespace}
+    subprocess.run(["bash", str(ASSETS_DIR / "kind-load.sh")], env=env, check=True)
+    subprocess.run(["bash", str(ASSETS_DIR / "deploy.sh")], env=env, check=True)
     ok("demo workloads deployed")
 
 

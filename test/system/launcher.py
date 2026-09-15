@@ -673,6 +673,68 @@ def require_pipeline(*, namespace: str, workloads: list[str]) -> None:
         )
 
 
+def event_path_reason(*, broker_phase: str, realm_config: dict) -> str | None:
+    """Return ``None`` when the event-driven onboarding path is wired, else a human-readable skip
+    reason. **Pure** — decides from two already-gathered facts (mirrors ``pipeline_unwired_reason`` /
+    ``select_live_pod``): the NATS broker pod ``broker_phase`` and the realm's events ``realm_config``
+    (its ``eventsListeners`` list + ``adminEventsEnabled`` flag). Kept side-effect-free so it is unit
+    testable offline; the I/O to gather those facts lives in ``event_path_unwired_reason``.
+
+    The event path is: deploy -> operator registers a Keycloak client -> Keycloak emits the admin
+    event ``CLIENT_CREATED`` -> the AIAC SPI (``aiac-event-listener``) publishes on NATS -> the agent
+    consumer runs ``onboard_service``. All three facts must hold or the trigger never fires."""
+    if "Running" not in (broker_phase or ""):
+        return f"NATS event broker not Running (phase={broker_phase!r})"
+    if "aiac-event-listener" not in (realm_config.get("eventsListeners") or []):
+        return "Keycloak SPI listener 'aiac-event-listener' not in realm eventsListeners"
+    if not realm_config.get("adminEventsEnabled"):
+        return "Keycloak adminEventsEnabled is false (CLIENT_CREATED is an admin event)"
+    return None
+
+
+def event_path_unwired_reason(*, admin, realm: str, broker_namespace: str = "aiac-system") -> str | None:
+    """Gather the two facts ``event_path_reason`` needs and return its verdict. ``admin`` is the
+    ``KeycloakAdmin`` client the harness already builds (``uc1_onboard.connect_admin``) — ``launcher``
+    has none of its own. Any failure to read a fact is itself a skip reason, never an error."""
+    ok, out, err = _kubectl_try(
+        "get",
+        "pods",
+        "-n",
+        broker_namespace,
+        "-l",
+        "app=aiac-event-broker",
+        "-o",
+        "jsonpath={.items[*].status.phase}",
+    )
+    if not ok:
+        return f"cannot query NATS event broker in {broker_namespace} ({err})"
+    broker_phase = out
+
+    try:
+        realm_config = admin.get_realm(realm)
+    except Exception as exc:  # noqa: BLE001 — any admin-read failure is a skippable prerequisite gap
+        return f"cannot read realm {realm!r} events config from Keycloak ({exc})"
+
+    return event_path_reason(broker_phase=broker_phase, realm_config=realm_config)
+
+
+def require_event_path(*, admin, realm: str) -> None:
+    """``pytest.skip`` with a clear message when the event-driven onboarding path is not wired, so a
+    cluster wired for OPA but not for events skips cleanly rather than hanging on a trigger that never
+    fires. Pre-built + ``kind load``ed images are a *separate* precondition surfaced later as a pod
+    that never becomes Ready (a loud failure via the deploy/convergence poll), not a skip here."""
+    reason = event_path_unwired_reason(admin=admin, realm=realm)
+    if reason:
+        import pytest
+
+        pytest.skip(
+            f"event-driven onboarding path not wired: {reason}. Deploy the NATS broker "
+            "(k8s/event-broker-deployment.yaml) and install + enable the aiac-event-listener SPI "
+            "(keycloak-spi/README.md); the two workload images must also be built + kind-loaded "
+            "(demo/assets/kind-load.sh)."
+        )
+
+
 def verify_subject_mapper(
     *, keycloak_url: str, realm: str, user: str, password: str, client_id: str = KEYCLOAK_CLIENT_ID
 ) -> str:

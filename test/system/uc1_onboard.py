@@ -7,13 +7,15 @@ standalone OPA-CLI run over dumped ``.rego`` — there is no ``.rego`` dump and 
 Every rung follows the same shape against **one** live rossoctl/Kind cluster with the AuthBridge OPA
 pipeline wired into both legs:
 
-    Keycloak cleanup + policy-store clear
-      → onboard the rung's workloads in order (POST /apply/service/{id} on the in-cluster Controller,
-        which upserts the AuthorizationPolicy CR on the live API)
+    start from a no-workloads slate (undeploy + delete registrations) + policy-store clear
+      → deploy the rung's workloads in order, one at a time — each deploy fires the EVENT-DRIVEN
+        trigger (operator registers a Keycloak client → Keycloak CLIENT_CREATED → the aiac-event-listener
+        SPI publishes on NATS → the agent consumer runs onboard_service, upserting the AuthorizationPolicy
+        CR on the live API), converging before the next
       → enable the outbound token-exchange leg (Part B: route + optional client scope + agent restart)
       → poll bundle-service + OPA until this run's CR is reflected in real decisions
       → drive REAL HTTP requests through AuthBridge and assert the real plugin's allow/deny
-      → Keycloak cleanup + CR delete
+      → teardown full-to-pristine (undeploy + delete all registrations + delete CRs, verified)
 
 The only thing that differs between rungs is *which workloads are onboarded and in what order*, so
 all the machinery lives here and each ``test_uc1_onboard_*.py`` supplies just its own oracle
@@ -23,8 +25,9 @@ This module owns:
 
 * **Config** (env, spec § Configuration) — single stack, no variants.
 * **Keycloak** — ``connect_admin`` / ``provision_realm_and_users`` (the fixture UC-1 does *not* do) /
-  ``resolve_service_id`` (route-safe trigger id = internal client UUID) / ``cleanup_provisioned``.
-* **Onboarding** — ``ensure_agent_policy`` (mount the PRB's ``policy.md``) + ``onboard``.
+  ``cleanup_provisioned`` / ``delete_workload_registrations`` (teardown).
+* **Onboarding (event-driven)** — ``ensure_agent_policy`` (mount the PRB's ``policy.md``) +
+  ``deploy_workload`` (deploy fires the trigger) / ``wait_for_registration`` / ``undeploy_workload``.
 * **Outbound-leg prep (Part B)** — ``ensure_github_tool_route`` / ``grant_exchange_scope`` /
   ``restart_agent`` so ``token-exchange`` runs and OPA is actually consulted on the outbound leg.
 * **Live decision oracle + probes** — ``expected_inbound`` / ``expected_outbound_bare`` (verdicts from
@@ -60,9 +63,12 @@ if str(REPO_ROOT) not in sys.path:  # so ``import test.system.*`` resolves
 
 from test.system import scenario_uc1 as scn  # noqa: E402
 from test.system.launcher import (  # noqa: E402
+    _kubectl_try,
     inbound_outcome,
     inbound_probe,
     kubectl,
+    kubectl_apply,
+    kubectl_delete,
     kubectl_rollout_status,
     mint_token,
     outbound_outcome,
@@ -71,6 +77,7 @@ from test.system.launcher import (  # noqa: E402
     port_forward,
     require_env,
     require_env_or_skip,
+    require_event_path,
     require_pipeline,
     resolve_pod,
     verify_subject_mapper,
@@ -83,12 +90,10 @@ TEST_REALM = os.environ.get("AIAC_TEST_REALM", scn.REALM_DEFAULT)
 NAMESPACE = os.environ.get("AIAC_DEMO_NAMESPACE", scn.DEMO_NAMESPACE_DEFAULT)
 ADMIN_REALM = os.environ.get("KEYCLOAK_ADMIN_REALM", "master")
 
-# Controller (in-cluster) reached via ``kubectl port-forward``. Target/namespace/ports are
-# overridable; defaults match the deployed AIAC stack (svc/aiac-agent-service:7070 in aiac-system).
+# Controller (in-cluster) namespace — the ns whose Controller Deployment the test patches (policy.md
+# mount, default_effect). The onboarding trigger is event-driven (deploy fires it), so the harness no
+# longer port-forwards to the Controller to POST /apply.
 CONTROLLER_NAMESPACE = os.environ.get("AIAC_CONTROLLER_NAMESPACE", "aiac-system")
-CONTROLLER_TARGET = os.environ.get("AIAC_CONTROLLER_TARGET", "svc/aiac-agent-service")
-CONTROLLER_LOCAL_PORT = int(os.environ.get("AIAC_CONTROLLER_LOCAL_PORT", "7070"))
-CONTROLLER_REMOTE_PORT = int(os.environ.get("AIAC_CONTROLLER_REMOTE_PORT", "7070"))
 
 # Policy Store (in-cluster) reached via ``kubectl port-forward`` to clear stale SPMs before a run.
 # The store's SQLite lives on a StatefulSet PV that survives image redeploys, so pre-fix cruft
@@ -106,11 +111,6 @@ CONTROLLER_DEPLOYMENT = os.environ.get("AIAC_CONTROLLER_DEPLOYMENT", "aiac-agent
 POLICY_CONFIGMAP = os.environ.get("AIAC_POLICY_CONFIGMAP", "aiac-policy")
 POLICY_MOUNT_PATH = os.environ.get("AIAC_POLICY_MOUNT_PATH", "/etc/aiac")
 
-# Onboarding drives the real PRB, which makes several LLM calls over the whole role/scope universe;
-# against a slow reasoning model that can take minutes. Configurable so slow endpoints don't spuriously
-# fail the run (``AIAC_ONBOARD_TIMEOUT``, seconds).
-ONBOARD_TIMEOUT = float(os.environ.get("AIAC_ONBOARD_TIMEOUT", "900"))
-
 # --- Live-cluster loop knobs (handoff 08) ---------------------------------------------------
 
 # The workload Deployment to restart after Part B so it reloads the new outbound route (and, on its
@@ -126,6 +126,26 @@ TRUST_DOMAIN = os.environ.get("AIAC_TRUST_DOMAIN", "localtest.me")
 # restart. ``onboarded_stack`` polls real decisions until they converge, up to this budget (seconds).
 BUNDLE_TIMEOUT = float(os.environ.get("AIAC_BUNDLE_TIMEOUT", "300"))
 BUNDLE_POLL_INTERVAL = float(os.environ.get("AIAC_BUNDLE_POLL_INTERVAL", "10"))
+
+# Deploying a workload fires the event-driven trigger (deploy -> operator registers a Keycloak client
+# -> CLIENT_CREATED -> SPI -> NATS -> the agent consumer runs ``onboard_service``). The operator's
+# client registration is asynchronous (reconcile after the pod comes up), so the fixture polls for it
+# up to this budget (``AIAC_DEPLOY_TIMEOUT``, seconds).
+DEPLOY_TIMEOUT = float(os.environ.get("AIAC_DEPLOY_TIMEOUT", "180"))
+
+# The demo manifests each workload deploys, in apply order (agent: ConfigMaps THEN Deployment; tool:
+# a single Deployment manifest). ``deploy.sh`` (demo/assets) applies this same set + order — keep the
+# two in lockstep. The Deployment name matches the workload name, so ``deployment/{workload}`` is the
+# rollout target. Undeploy walks these in reverse.
+WORKLOAD_MANIFESTS: dict[str, list[Path]] = {
+    scn.AGENT_WORKLOAD: [
+        REPO_ROOT / "demo/assets/agents/github_agent/k8s/configmaps.yaml",
+        REPO_ROOT / "demo/assets/agents/github_agent/k8s/github-agent-deployment.yaml",
+    ],
+    scn.TOOL_WORKLOAD: [
+        REPO_ROOT / "demo/assets/tools/github_tool/k8s/github-tool-deployment.yaml",
+    ],
+}
 
 # --- default_effect onboarding hook (#146 coupling seam; see ``_set_controller_default_effect``) ----
 #
@@ -234,20 +254,6 @@ def provision_realm_and_users(admin, realm: str) -> None:
         admin.assign_realm_roles(user_id, [admin.get_realm_role(role_name)])
 
 
-def resolve_service_id(admin, realm: str, client_name: str) -> str:
-    """Return the **route-safe trigger id** — the Keycloak *internal client UUID* (``client['id']``)
-    of the client whose *name* is ``client_name``.
-
-    Not the ``clientId``: under SPIRE that is a SPIFFE URI (``spiffe://.../github-agent``) whose
-    slashes the single-segment ``/apply/service/{id}`` route cannot carry; the Controller resolves
-    the trigger via ``admin.get_client(id)``, which keys on the UUID."""
-    admin.change_current_realm(realm)
-    for client in admin.get_clients():
-        if client.get("name") == client_name:
-            return client["id"]
-    raise AssertionError(f"no Keycloak client with name {client_name!r} in realm {realm!r}")
-
-
 def cleanup_provisioned(admin, realm: str) -> None:
     """Delete the entities UC-1 onboarding provisions — the realm role(s) and client scopes prefixed
     ``github-agent.`` / ``github-tool.`` — so each run starts from a clean slate and reruns converge.
@@ -288,7 +294,7 @@ def reenable_provisioned_clients(admin, realm: str) -> None:
     client_credentials grant). Flipping it back to ``enabled`` here restores the same clean slate the
     onboard's own success path would — idempotent: an already-enabled client is left untouched.
 
-    Keys clients by ``name`` (``{namespace}/{workload}``), exactly as ``resolve_service_id`` and
+    Keys clients by ``name`` (``{namespace}/{workload}``), exactly as ``wait_for_registration`` and
     ``require_pipeline`` do — never the SPIFFE ``clientId``. Best-effort: a failure to re-enable one
     client is logged, not raised, so the run proceeds to onboard (which will surface the real cause)."""
     from keycloak.exceptions import KeycloakError
@@ -342,7 +348,7 @@ def clear_policy_store() -> None:
 
 
 # ======================================================================================
-# Onboarding trigger + policy (the one mutable stack precondition the ladder owns)
+# Event-driven onboarding: policy precondition + deploy/undeploy/registration lifecycle
 # ======================================================================================
 
 
@@ -461,11 +467,123 @@ def _set_controller_default_effect(namespace: str, effect: str) -> None:
     kubectl_rollout_status(f"deployment/{CONTROLLER_DEPLOYMENT}", namespace=namespace)
 
 
-def onboard(base_url: str, service_id: str) -> None:
-    """``POST /apply/service/{service_id}`` against the Controller; assert 200. This upserts the
-    ``AuthorizationPolicy`` CR on the live Kubernetes API (bundle-service picks it up)."""
-    resp = requests.post(f"{base_url}/apply/service/{service_id}", timeout=ONBOARD_TIMEOUT)
-    assert resp.status_code == 200, f"onboard {service_id!r} at {base_url}: HTTP {resp.status_code} — {resp.text[:500]}"
+def deploy_workload(workload: str) -> None:
+    """Deploy ``workload`` (``github-agent`` / ``github-tool``) into the cluster — the **event-driven
+    onboarding trigger**: the operator reconciles the bundled ``AgentRuntime`` CR, registers a Keycloak
+    client, Keycloak emits ``CLIENT_CREATED``, the SPI publishes on NATS, and the agent consumer runs
+    ``onboard_service`` (the same handler the retired ``POST /apply`` called).
+
+    ``kubectl apply``s the workload's demo manifests in order via the generic ``kubectl_apply`` and
+    waits for the Deployment rollout. It does **not** build or ``kind load`` images (a precondition —
+    ``demo/assets/kind-load.sh``); a missing image surfaces as a pod that never becomes Ready, which
+    the rollout wait / convergence poll turns into a loud failure, never a false pass."""
+    for manifest in WORKLOAD_MANIFESTS[workload]:
+        kubectl_apply(manifest, namespace=NAMESPACE)
+    kubectl_rollout_status(f"deployment/{workload}", namespace=NAMESPACE, timeout=DEPLOY_TIMEOUT)
+
+
+def wait_for_registration(admin, workload: str) -> bool:
+    """Poll until the operator has registered the Keycloak client ``{ns}/{workload}`` (async reconcile
+    after the pod comes up — "rollout complete" is not "registered"). Returns whether it appeared
+    within ``DEPLOY_TIMEOUT``. Keyed on the client ``name`` (``{ns}/{workload}``), exactly as
+    ``reenable_provisioned_clients`` / ``grant_exchange_scope`` do — never the SPIFFE ``clientId``."""
+    client_name = f"{NAMESPACE}/{workload}"
+
+    def _registered() -> bool:
+        admin.change_current_realm(TEST_REALM)
+        return client_name in {c.get("name") for c in admin.get_clients()}
+
+    return poll_until(_registered, timeout=DEPLOY_TIMEOUT, interval=5)
+
+
+def undeploy_workload(workload: str) -> None:
+    """``kubectl delete`` ``workload``'s demo manifests in **reverse** apply order, tolerant of
+    already-absent objects (``kubectl_delete`` passes ``--ignore-not-found --wait=true``). Deleting the
+    bundled ``AgentRuntime`` CR stops the operator managing the workload's Keycloak client, so the
+    explicit registration cleanup that follows is not racing an active reconcile."""
+    for manifest in reversed(WORKLOAD_MANIFESTS[workload]):
+        try:
+            kubectl_delete(manifest, namespace=NAMESPACE)
+        except subprocess.CalledProcessError as exc:
+            log.warning("undeploy_workload(%s): delete %s failed: %s", workload, manifest.name, exc)
+
+
+def workload_clients_present(admin) -> set[str]:
+    """The subset of ``{ns}/github-agent`` / ``{ns}/github-tool`` currently registered as Keycloak
+    clients — empty when the cluster is pristine. Used to poll a clean slate before deploy and to
+    verify a footprint-free teardown."""
+    admin.change_current_realm(TEST_REALM)
+    names = {c.get("name") for c in admin.get_clients()}
+    return {n for n in (f"{NAMESPACE}/{scn.AGENT_WORKLOAD}", f"{NAMESPACE}/{scn.TOOL_WORKLOAD}") if n in names}
+
+
+def tool_scopes_present(admin) -> bool:
+    """True once every ``github-tool.*`` client scope (``scn.TOOL_SCOPES``) is provisioned in the realm
+    — the tool's convergence gate. The tool is a pure target: it produces **no** ``AuthorizationPolicy``
+    CR and **no** enforced decision of its own, so its scopes existing (not a live probe) is the signal
+    the operator finished registering it."""
+    admin.change_current_realm(TEST_REALM)
+    names = {s.get("name") for s in admin.get_client_scopes()}
+    return all(scope in names for scope in scn.TOOL_SCOPES)
+
+
+def delete_workload_registrations(admin, realm: str) -> None:
+    """Explicitly delete both workloads' Keycloak footprint — their clients, their ``*-aud`` audience
+    client scopes, and the operator's client-credentials Secret — so teardown does not trust an
+    unverified operator cascade. Best-effort + tolerant (already-absent is fine), so it is safe to run
+    both at startup (pristine slate) and at teardown.
+
+    ``cleanup_provisioned`` only clears the ``github-agent.`` / ``github-tool.``-**prefixed** roles and
+    scopes; the operator's ``*-aud`` scopes (e.g. ``agent-team1-github-tool-aud``, no ``.`` after the
+    workload) and the dynamically-named ``rossoctl-keycloak-client-credentials-<hash>`` Secret are not
+    covered there, so this sweep handles them by suffix / prefix."""
+    from keycloak.exceptions import KeycloakError
+
+    admin.change_current_realm(realm)
+    target_client_names = {f"{NAMESPACE}/{scn.AGENT_WORKLOAD}", f"{NAMESPACE}/{scn.TOOL_WORKLOAD}"}
+    for client in admin.get_clients():
+        if client.get("name") in target_client_names:
+            try:
+                admin.delete_client(client["id"])
+            except KeycloakError as exc:
+                log.warning("teardown: delete client %r failed: %s", client.get("name"), exc)
+
+    for scope in admin.get_client_scopes():
+        name = scope.get("name", "")
+        if name.endswith("-aud") and (scn.AGENT_WORKLOAD in name or scn.TOOL_WORKLOAD in name):
+            try:
+                admin.delete_client_scope(scope["id"])
+            except KeycloakError as exc:
+                log.warning("teardown: delete audience client scope %r failed: %s", name, exc)
+
+    # The operator mints a ``rossoctl-keycloak-client-credentials-<hash>`` Secret per client (dynamic
+    # hash); sweep by prefix so the namespace is left with none. Tolerant — a query failure or an
+    # already-absent Secret is not a teardown error.
+    ok, out, _ = _kubectl_try("get", "secret", "-n", NAMESPACE, "-o", "name")
+    if ok:
+        for ref in out.split():
+            if ref.startswith("secret/rossoctl-keycloak-client-credentials-"):
+                _kubectl_try("delete", ref, "-n", NAMESPACE, "--ignore-not-found")
+
+
+def sweep_authpolicies() -> None:
+    """Delete every ``AuthorizationPolicy`` CR left in the namespace. ``delete_agent_cr`` removes only
+    the agent's own CR (named for the agent workload); this sweeps any other that leaked. ``bundle-service``
+    recomposes the namespace bundle in-memory from the live CR set, so removing the CRs self-cleans the
+    OPA bundle — there is no separate OPA-bundle CR/ConfigMap to delete. Best-effort + tolerant."""
+    ok, out, _ = _kubectl_try("get", "authorizationpolicy", "-n", NAMESPACE, "-o", "name")
+    if not ok:
+        return
+    for ref in out.split():
+        if ref.strip():
+            _kubectl_try("delete", ref, "-n", NAMESPACE, "--ignore-not-found", timeout=60)
+
+
+def no_authpolicies_remain() -> bool:
+    """True when no ``AuthorizationPolicy`` CR remains in the namespace — the CR half of the pristine
+    teardown verification (the Keycloak half is ``workload_clients_present`` being empty)."""
+    ok, out, _ = _kubectl_try("get", "authorizationpolicy", "-n", NAMESPACE, "-o", "name")
+    return ok and not out.split()
 
 
 def delete_agent_cr() -> None:
@@ -615,18 +733,6 @@ def inbound_decision(ctx: dict, user: str) -> str:
     return inbound_outcome(code)
 
 
-def resolve_controller_pod() -> str:
-    """Resolve the **current** live Controller pod (newest Running+Ready, non-terminating — see
-    ``resolve_pod``). The onboard leg port-forwards to this resolved pod rather than
-    ``svc/aiac-agent-service`` because both ``_set_controller_default_effect`` and
-    ``ensure_agent_policy`` may roll the Controller Deployment right before onboarding: with
-    ``replicas=1``/``maxUnavailable=0`` the old pod lingers ``Terminating`` (up to its grace period)
-    and the Service can still route a fresh connection to it. Its ``/health`` answers 200 right up
-    until it drops the long onboard POST mid-flight — the ``RemoteDisconnected`` race, the onboard-leg
-    analogue of issue #139. Binding the resolved live pod avoids the doomed endpoint."""
-    return resolve_pod(f"app={CONTROLLER_DEPLOYMENT}", namespace=CONTROLLER_NAMESPACE)
-
-
 def resolve_agent_pod() -> str:
     """Resolve the **current** live agent pod (newest Running+Ready, non-terminating — see
     ``resolve_pod``). Re-resolved per outbound probe rather than pinned once at fixture setup: the
@@ -723,7 +829,8 @@ def _default_ready_signals(tool_onboarded: bool) -> list[ReadySignal]:
 
 
 # ======================================================================================
-# Per-rung fixture flow — cleanup → onboard (in order) → Part B → poll bundle → yield → cleanup
+# Per-rung fixture flow — no-workloads slate → deploy (in order, event-driven trigger) → Part B →
+# poll bundle → yield → teardown to pristine
 # ======================================================================================
 
 
@@ -739,15 +846,20 @@ def onboarded_stack(
 
     ``ctx`` = ``{"admin", "namespace", "agent_pod", "keycloak_url", "realm", "tool_onboarded"}``.
 
-    Flow: skip cleanly (never false-pass) if the pipeline is not wired or the integration env is
-    unset; provision users/roles + clear the store; onboard the given ``workloads`` **in order**
-    through the real in-cluster UC-1 Controller (``POST /apply/service/{id}``, upserting the CR);
-    enable the outbound leg (Part B: route + optional client scope + agent restart); then **poll real
-    decisions** until ``bundle-service`` + OPA reflect this run's CR (and token-exchange has settled)
-    before yielding. Keycloak cleanup + CR delete run before and after; the clients are left
-    registered as before (spec § Per-rung flow). The workload order is the rung's identity — e.g.
-    rung 2 passes ``[agent, tool]`` so tool onboarding retroactively completes the agent's outbound
-    gate; rung 3 passes ``[tool, agent]`` and must converge to the same live decisions.
+    Flow (event-driven trigger): skip cleanly (never false-pass) if the OPA pipeline or the event path
+    is not wired, or the integration env is unset; **start from a no-workloads slate** (a leftover
+    workload + its Keycloak client would stop the fresh deploy from re-firing ``CLIENT_CREATED``, so the
+    event would never trigger), provision users/roles + clear the store; **deploy** the given
+    ``workloads`` **in order, one at a time** — each ``kubectl apply`` fires the production trigger
+    (operator registers a Keycloak client -> Keycloak ``CLIENT_CREATED`` -> the ``aiac-event-listener``
+    SPI publishes on NATS -> the agent consumer runs ``onboard_service``, the same handler the retired
+    ``POST /apply`` called) — waiting for each to converge before the next; enable the outbound leg
+    (Part B: route + optional client scope + agent restart); then **poll real decisions** until
+    ``bundle-service`` + OPA reflect this run's CR (and token-exchange has settled) before yielding.
+    Teardown is **full-to-pristine** — the workloads and every registration are removed and the removal
+    is verified. The workload order is the rung's identity — e.g. rung 2 passes ``[agent, tool]`` so
+    tool onboarding retroactively completes the agent's outbound gate; rung 3 passes ``[tool, agent]``
+    and must converge to the same live decisions.
 
     **Policy-agnostic parametrization (#149).** Every keyword defaults to today's Policy-A behavior,
     so the rung callers (which pass only a positional ``workloads``) are byte-for-byte unchanged, while
@@ -771,11 +883,30 @@ def onboarded_stack(
     keycloak_url = creds["KEYCLOAK_URL"]
 
     admin = connect_admin()
-    delete_agent_cr()  # before — clean policy slate (drop any prior run's CR)
-    cleanup_provisioned(admin, TEST_REALM)  # before — clean slate (Keycloak)
-    reenable_provisioned_clients(admin, TEST_REALM)  # before — undo any prior run's failed-service disable
-    clear_policy_store()  # before — clean slate (Policy Store SPMs; PV survives redeploys)
-    provision_realm_and_users(admin, TEST_REALM)  # BEFORE onboarding (PRB reads the role universe)
+    # Event-path skip gate — placed here (not at the ``require_pipeline`` line) because it needs the
+    # admin client to read the realm's events config, and ``launcher`` has no KeycloakAdmin of its own.
+    require_event_path(admin=admin, realm=TEST_REALM)
+
+    # Pre-run: start from a NO-WORKLOADS slate. The trigger is event-driven — deploying a workload only
+    # re-fires ``CLIENT_CREATED`` if there is no client for it yet, so a leftover workload + its Keycloak
+    # client from a prior run would silently swallow the event and onboarding would never trigger. Remove
+    # both workloads and every registration first (best-effort, tolerant of already-absent), then poll the
+    # clients actually gone before deploying.
+    undeploy_workload(scn.AGENT_WORKLOAD)
+    undeploy_workload(scn.TOOL_WORKLOAD)
+    delete_agent_cr()  # drop any prior run's CR
+    sweep_authpolicies()  # and any other leaked AuthorizationPolicy CR (bundle self-cleans from the CR set)
+    delete_workload_registrations(admin, TEST_REALM)  # clients + *-aud scopes + credentials Secret
+    cleanup_provisioned(admin, TEST_REALM)  # prefixed roles/scopes (Keycloak)
+    reenable_provisioned_clients(admin, TEST_REALM)  # undo any prior run's failed-service disable (now a no-op if deleted)
+    clear_policy_store()  # Policy Store SPMs (PV survives redeploys)
+    if not poll_until(lambda: not workload_clients_present(admin), timeout=DEPLOY_TIMEOUT, interval=5):
+        raise RuntimeError(
+            f"pre-run cleanup left Keycloak client(s) {workload_clients_present(admin)} for {NAMESPACE!r} — the "
+            "fresh deploy would not re-fire CLIENT_CREATED, so event-driven onboarding would never trigger."
+        )
+
+    provision_realm_and_users(admin, TEST_REALM)  # BEFORE deploying (PRB reads the role universe when the event fires)
     # username->sub mapper + Direct Access Grants are a one-time realm prereq the fixture does NOT
     # provision; skip (don't fail) if a token can't be minted or its ``sub`` isn't the username.
     verify_subject_mapper(keycloak_url=keycloak_url, realm=TEST_REALM, user="dev-user", password=scn.USER_PASSWORD)
@@ -788,25 +919,49 @@ def onboarded_stack(
     default_effect_applied = default_effect != DEFAULT_EFFECT_DENY
     try:
         if default_effect_applied:
-            _set_controller_default_effect(CONTROLLER_NAMESPACE, default_effect)  # BEFORE onboarding
-        ensure_agent_policy(CONTROLLER_NAMESPACE, policy_md=policy_md)  # mount this run's policy.md
-        service_ids = [resolve_service_id(admin, TEST_REALM, f"{NAMESPACE}/{workload}") for workload in workloads]
-        # Bind the onboard port-forward to the resolved **live** Controller pod, not the Service:
-        # the rollouts above can leave an old pod ``Terminating`` that the Service still routes to,
-        # dropping the long onboard POST mid-flight (see ``resolve_controller_pod``). An explicit
-        # ``AIAC_CONTROLLER_TARGET`` override is still honored verbatim for non-default topologies.
-        controller_target = (
-            CONTROLLER_TARGET if os.environ.get("AIAC_CONTROLLER_TARGET") else f"pod/{resolve_controller_pod()}"
-        )
-        with port_forward(
-            controller_target,
-            namespace=CONTROLLER_NAMESPACE,
-            local_port=CONTROLLER_LOCAL_PORT,
-            remote_port=CONTROLLER_REMOTE_PORT,
-            ready_url=f"http://127.0.0.1:{CONTROLLER_LOCAL_PORT}/health",
-        ) as base_url:
-            for service_id in service_ids:  # onboard in the rung's order
-                onboard(base_url, service_id)
+            _set_controller_default_effect(CONTROLLER_NAMESPACE, default_effect)  # BEFORE deploying
+        ensure_agent_policy(CONTROLLER_NAMESPACE, policy_md=policy_md)  # mount this run's policy.md BEFORE deploying
+
+        # Minimal probe ctx for the per-workload agent convergence gate: the inbound leg reaches the
+        # agent through its pod-agnostic Service, so no ``agent_pod`` is needed yet (it is resolved after
+        # Part B for the outbound leg). The full ``ctx`` is assembled below once ``agent_pod`` is known.
+        probe_ctx = {"admin": admin, "namespace": NAMESPACE, "keycloak_url": keycloak_url, "realm": TEST_REALM}
+
+        # Deploy in the rung's ``workloads`` order, one at a time, converging before the next — each
+        # ``deploy_workload`` fires the event-driven trigger (deploy -> operator -> CLIENT_CREATED ->
+        # SPI -> NATS -> consumer). The order is the rung's ordering proof.
+        for workload in workloads:
+            deploy_workload(workload)
+            if not wait_for_registration(admin, workload):
+                raise RuntimeError(
+                    f"operator did not register Keycloak client {NAMESPACE}/{workload!r} within "
+                    f"{DEPLOY_TIMEOUT:.0f}s of deploying it — is the event path wired (NATS broker + "
+                    "aiac-event-listener SPI) and the image built + kind-loaded (demo/assets/kind-load.sh)? "
+                    "See k8s/opa-kind-runbook.md."
+                )
+            if workload == scn.AGENT_WORKLOAD:
+                # Option A′ — one representative ENFORCED decision proves OPA loaded the agent's bundle.
+                # A bare AuthorizationPolicy CR proves only that the operator reconciled, not that the
+                # bundle is in force; a live inbound dev-user=allow through AuthBridge->OPA is positive
+                # proof. dev-user inbound is deterministically allow on every rung.
+                gate = ReadySignal("inbound", "dev-user", "allow")
+                if not poll_until(
+                    lambda g=gate: g.decide(probe_ctx) == g.expected, timeout=BUNDLE_TIMEOUT, interval=BUNDLE_POLL_INTERVAL
+                ):
+                    raise RuntimeError(
+                        f"agent did not converge after deploy: {gate.label()}={gate.decide(probe_ctx)!r} "
+                        f"(want {gate.expected!r}) within {BUNDLE_TIMEOUT:.0f}s — OPA had not loaded the agent's "
+                        "bundle. See k8s/opa-kind-runbook.md and issue #139."
+                    )
+            else:
+                # Tool — a pure target: no CR, no enforced decision of its own, so its convergence signal
+                # is that the operator provisioned all of its ``github-tool.*`` client scopes.
+                if not poll_until(lambda: tool_scopes_present(admin), timeout=DEPLOY_TIMEOUT, interval=5):
+                    raise RuntimeError(
+                        f"tool did not converge after deploy: not all {sorted(scn.TOOL_SCOPES)} client scopes "
+                        f"present within {DEPLOY_TIMEOUT:.0f}s — did the operator finish registering "
+                        f"{scn.TOOL_WORKLOAD}?"
+                    )
 
         # Part B — enable the outbound token-exchange leg so OPA is actually consulted outbound. Done
         # after onboarding so the restarted agent (and its OPA sidecar) picks up both the new route
@@ -872,8 +1027,28 @@ def onboarded_stack(
             )
         yield ctx
     finally:
+        # Teardown — full-to-pristine, best-effort per step (each helper tolerates already-absent objects).
         if default_effect_applied:
             # Reset the shared stack to the shipped default so a later Policy-A run is unaffected.
             _set_controller_default_effect(CONTROLLER_NAMESPACE, DEFAULT_EFFECT_DENY)
-        delete_agent_cr()  # after — drop this run's CR
-        cleanup_provisioned(admin, TEST_REALM)  # after — restore the pre-run Keycloak state
+        for workload in reversed(workloads):  # undeploy in reverse deploy order
+            undeploy_workload(workload)
+        delete_workload_registrations(admin, TEST_REALM)  # explicit — do not trust an unverified operator cascade
+        delete_agent_cr()  # drop this run's CR
+        sweep_authpolicies()  # + any other leaked CR — the OPA bundle self-cleans from the live CR set
+        cleanup_provisioned(admin, TEST_REALM)  # restore the pre-run Keycloak state (prefixed roles/scopes)
+        clear_policy_store()
+        # Verify pristine: both clients gone AND no AuthorizationPolicy CR remains. A leaked footprint is
+        # a test failure, not silent drift — but do not mask a failure already propagating out of the try.
+        if not poll_until(
+            lambda: not workload_clients_present(admin) and no_authpolicies_remain(), timeout=DEPLOY_TIMEOUT, interval=5
+        ):
+            msg = (
+                f"teardown did not restore pristine: Keycloak client(s) still present="
+                f"{workload_clients_present(admin)}, AuthorizationPolicy CR(s) remain={not no_authpolicies_remain()} "
+                f"in {NAMESPACE!r}. See handoff 03 teardown (full-to-pristine)."
+            )
+            if sys.exc_info()[0] is not None:
+                log.error("%s [suppressed — a prior error is propagating]", msg)
+            else:
+                raise RuntimeError(msg)

@@ -4,8 +4,23 @@ Single install guide for both reusable demo workloads under `demo/assets/`, depl
 rossoctl/Kind cluster in namespace `team1`. Consolidates what used to be split across
 [`docs/specs/demo/github-tool.md`](../../docs/specs/demo/github-tool.md) §7–8 and the agent
 README's former "Deploying to Rossoctl" section, so the two installation paths can't drift apart
-again. Prefer [`install.sh`](install.sh) over doing this by hand; the steps below are what it
-automates.
+again.
+
+Installation is **two phases**, split along the precondition/deploy boundary so each half can run
+independently (the UC-1 onboarding system tests deploy the workloads themselves, but assume the
+images are already loaded):
+
+1. **Load images** — [`kind-load.sh`](kind-load.sh): build + `kind load` only; applies nothing.
+2. **Deploy** — [`deploy.sh`](deploy.sh): `kubectl apply` + `rollout status` only; builds/loads nothing.
+
+```bash
+./kind-load.sh   # phase 1: build + load images into the Kind node
+./deploy.sh      # phase 2: apply manifests + wait for rollout
+```
+
+Both take `--agent-only` / `--tool-only`; `kind-load.sh` also takes `--rebuild` (force a rebuild of
+an already-present image). Prefer the two scripts over doing this by hand; the steps below are what
+they automate.
 
 ## Prerequisites
 
@@ -21,8 +36,9 @@ automates.
 | tool | `localhost/github-tool:latest` | `tools/github_tool/k8s/github-tool-deployment.yaml` | ServiceAccount + Deployment + Service `github-tool` (`:9090`) + `AgentRuntime` `github-tool` (`type: tool`) |
 | agent | `localhost/github-agent:latest` | `agents/github_agent/k8s/configmaps.yaml`, **then** `agents/github_agent/k8s/github-agent-deployment.yaml` | ServiceAccount + Deployment + Service `github-agent` (`:8001`, `:8080`) + `AgentRuntime` `github-agent` (`type: agent`); the ConfigMaps are `authbridge-config` + `authproxy-routes` |
 
-Per workload, in order: build the image → `kind load docker-image <image> --name <cluster>` →
-apply the manifests → `kubectl rollout status`.
+Per workload: phase 1 (`kind-load.sh`) builds the image → `kind load docker-image <image> --name
+<cluster>`; phase 2 (`deploy.sh`) applies the manifests **in the order above** → `kubectl rollout
+status`.
 
 ## Non-obvious invariants
 
@@ -54,27 +70,38 @@ These each fail far from their cause — read before editing the manifests or in
   `/.well-known/agent-card.json` with no MCP server present, which is all UC-1 discovery needs.
   **Do not add `github-tool-mcp` to this install path.**
 - **Namespace `team1` is a precondition, not an output.** No manifest here creates it; the
-  Rossoctl installer owns it (and any labels it carries). `install.sh` fails fast with a
+  Rossoctl installer owns it (and any labels it carries). `deploy.sh` fails fast with a
   pointer to the installer if the namespace is missing.
 
-## Manual steps (what `install.sh` automates)
+## Manual steps (what the scripts automate)
 
-**Tool:**
+### Phase 1 — build + load images (what `kind-load.sh` automates)
+
 ```bash
+# Tool
 cd tools/github_tool
 podman build -t localhost/github-tool:latest .   # or docker; the localhost/ prefix must match the manifest's image ref
 kind load docker-image localhost/github-tool:latest --name rossoctl
-kubectl apply -f k8s/github-tool-deployment.yaml
-kubectl rollout status deployment/github-tool -n team1
-```
 
-**Agent:**
-```bash
-cd agents/github_agent
+# Agent
+cd ../../agents/github_agent
 podman build -t localhost/github-agent:latest .   # or docker; the localhost/ prefix must match the manifest's image ref
 kind load docker-image localhost/github-agent:latest --name rossoctl
-kubectl apply -f k8s/configmaps.yaml
-kubectl apply -f k8s/github-agent-deployment.yaml
+```
+
+(For `podman`, `kind load docker-image` does not work — save to an archive and
+`kind load image-archive <tar> --name rossoctl` instead; `kind-load.sh` handles this automatically.)
+
+### Phase 2 — apply manifests (what `deploy.sh` automates)
+
+```bash
+# Tool
+kubectl apply -n team1 -f tools/github_tool/k8s/github-tool-deployment.yaml
+kubectl rollout status deployment/github-tool -n team1
+
+# Agent (configmaps first, then the deployment)
+kubectl apply -n team1 -f agents/github_agent/k8s/configmaps.yaml
+kubectl apply -n team1 -f agents/github_agent/k8s/github-agent-deployment.yaml
 kubectl rollout status deployment/github-agent -n team1
 ```
 

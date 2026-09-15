@@ -1,31 +1,36 @@
 """Rung 1 of the UC-1 onboarding ladder — onboard the **agent only**.
 
 The simplest rung (issue ``testing/5.4.1-uc1-onboard-agent-only.md``; spec
-``docs/testing/uc1-onboarding-pipeline.md``): drive the **real** in-cluster UC-1
-Service Onboarding agent (``POST /apply/service/{id}``) for **only** the ``github-agent`` — the
-``github-tool`` is deployed + registered but **not** onboarded — then assert the agent-side outcome
-by driving **real HTTP requests through AuthBridge** and reading the **real OPA plugin's** allow/deny
-(handoff 08; live loop shape in ``k8s/opa-kind-runbook.md``). Proves agent discovery + inbound
-policy generation stand alone, and that the outbound user gate is correctly **empty** (all deny) when
-no tool has been onboarded.
+``docs/testing/uc1-onboarding-pipeline.md``): onboard **only** the ``github-agent`` **event-driven**,
+by deploying its workload (deploy → the rossoctl operator registers a Keycloak client → Keycloak
+emits ``CLIENT_CREATED`` → the AIAC SPI ``aiac-event-listener`` publishes on NATS → the agent's
+consumer runs ``onboard_service`` — the same handler the removed ``POST /apply`` once called). The
+``github-tool`` is **not deployed** (deploying it would onboard it), so no tool is onboarded. Then
+assert the agent-side outcome by driving **real HTTP requests through AuthBridge** and reading the
+**real OPA plugin's** allow/deny (handoff 08; live loop shape in ``k8s/opa-kind-runbook.md``). Proves
+agent discovery + inbound policy generation stand alone, and that the outbound user gate is correctly
+**empty** (all deny) when no tool has been onboarded.
 
-Single live rossoctl/Kind cluster with the AuthBridge OPA pipeline wired into both legs. The shared
-harness (config, Keycloak provisioning/cleanup, onboard trigger, Part-B outbound-leg prep, bundle
-convergence poll, and the per-rung fixture flow) lives in ``uc1_onboard.py`` and is reused by every
-rung; this module supplies only rung 1's oracle (verdicts computed from ``scenario_uc1.py``) and its
-live assertions. There is no ``.rego`` dump and no ``opa`` binary anymore — the deployed plugin is the
-evaluator.
+Single live rossoctl/Kind cluster with the AuthBridge OPA pipeline wired into both legs, plus the
+event path (NATS broker + ``aiac-event-listener`` SPI); it skips cleanly when either is unwired. The
+shared harness (config, Keycloak provisioning/cleanup, event-driven deploy/undeploy trigger, Part-B
+outbound-leg prep, bundle convergence poll, and the per-rung fixture flow) lives in ``uc1_onboard.py``
+and is reused by every rung; this module supplies only rung 1's oracle (verdicts computed from
+``scenario_uc1.py``) and its live assertions. There is no ``.rego`` dump and no ``opa`` binary anymore
+— the deployed plugin is the evaluator.
 
-Per-rung flow (spec § Per-rung flow): **Keycloak cleanup → onboard agent → Part B → poll bundle →
-drive real requests + assert → Keycloak cleanup**. Deployment + client registration are
-**preconditions**, not test steps.
+Per-rung flow (spec § Per-rung flow): **pre-run no-workloads slate → provision realm/users →
+deploy agent (fires the event) + converge → Part B → poll bundle → drive real requests + assert →
+tear workloads + registrations down to pristine**. Deploying the workload is now the onboarding
+**trigger** (a test step, not a precondition); teardown restores the cluster to its pre-test state.
 
 *Onboard + evaluate against the real plugin — no CrewAI flow is triggered* (the probes hit
 ``ping/nonexistent`` inbound and a bare ``tools/call`` outbound).
 
 Run (needs a live rossoctl/Kind cluster with the AIAC stack + AuthBridge OPA pipeline wired in — see
-``k8s/opa-kind-runbook.md`` / ``k8s/opa-kind-enable.sh`` — the demo workloads deployed +
-registered into ``AIAC_TEST_REALM``, a real LLM in-pod, and ``.env`` sourced):
+``k8s/opa-kind-runbook.md`` / ``k8s/opa-kind-enable.sh`` — the event path wired (NATS broker +
+``aiac-event-listener`` SPI) and the demo images built + ``kind load``ed (``demo/assets/kind-load.sh``;
+the fixture deploys the workloads itself), a real LLM in-pod, and ``.env`` sourced):
 
     .venv/bin/pytest test/system/test_uc1_onboard_agent_only.py -m system -v
 
@@ -57,16 +62,17 @@ TEST_REALM = uc1.TEST_REALM
 
 
 # ======================================================================================
-# Session fixture — cleanup → onboard agent only → Part B → poll bundle → yield → cleanup
+# Session fixture — no-workloads slate → deploy agent (fires event) → Part B → poll bundle → yield → teardown
 # ======================================================================================
 
 
 @pytest.fixture(scope="session")
 def onboarded() -> dict:
-    """Onboard **only** the agent (the tool is deployed but not onboarded) via the shared harness,
+    """Onboard **only** the agent — event-driven — by deploying its workload via the shared harness,
     and yield the live probe context (``admin`` handle, ``agent_pod``, Keycloak URL/realm,
-    ``tool_onboarded=False``). Keycloak cleanup + CR delete run before and after; the clients are
-    left registered as before (spec § Per-rung flow)."""
+    ``tool_onboarded=False``). The tool is **not** deployed, so it is not onboarded. The harness
+    starts from a no-workloads slate and, on teardown, tears the workload + all its Keycloak
+    registrations and ``AuthorizationPolicy`` CRs back down to pristine (spec § Per-rung flow)."""
     with uc1.onboarded_stack([scn.AGENT_WORKLOAD]) as ctx:
         yield ctx
 
