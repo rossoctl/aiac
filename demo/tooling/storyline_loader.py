@@ -90,6 +90,23 @@ def load(path: Path) -> dict[str, str]:
 _SCENARIO_RE = re.compile(r"SCENARIO POLICY:\s*\n(.*?)(?:\n\s*\n\s*(?:FOCAL ENTITY|CANDIDATES)\b|\Z)", re.S)
 
 
+def _scenario_policy_gist(records: list[dict], clauses: int = 2) -> str:
+    """The opening of the scenario policy, elided with an ellipsis.
+
+    The full text is often more than a summary can carry on screen, but paraphrasing it
+    would break the rule that narration quotes what the model actually judged. This keeps
+    the real bytes and simply stops early, so a viewer sees the shape of the policy and
+    knows there is more.
+    """
+    full = _scenario_policy(records)
+    if not full:
+        return ""
+    parts = [c.strip() for c in full.split(".") if c.strip()]
+    if len(parts) <= clauses:
+        return full
+    return ". ".join(parts[:clauses]) + ". …"
+
+
 def _scenario_policy(records: list[dict]) -> str:
     """The scenario policy text, lifted from the LLM prompt the run actually sent.
 
@@ -173,6 +190,7 @@ def values_from_capture(records: list[dict]) -> dict[str, str]:
         "agent_role_count": str(len(agent_roles)) if agent_roles else "",
         "tool_scopes": ", ".join(sorted(scope_names)) if scope_names else "",
         "policy_text": _scenario_policy(records),
+        "policy_gist": _scenario_policy_gist(records),
     }
     return {k: v for k, v in vals.items() if v}
 

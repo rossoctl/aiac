@@ -36,6 +36,7 @@ error, so the script and the capture cannot drift apart silently.
   | `{agent_roles}` / `{agent_role_count}` | the roles provisioned for the agent |
   | `{tool_scopes}` | the client scopes discovered for the tool |
   | `{policy_text}` | the scenario policy, lifted from the prompt the run actually sent |
+  | `{policy_gist}` | the same policy, first clauses only, elided with `…` for on-screen use |
 
   A placeholder the capture cannot fill fails the build — a demo script that claims a
   value must be able to show it.
@@ -95,19 +96,15 @@ list leaves that field at its default, so agent-owned roles arrive looking like 
 only the per-client read carries the truth. Merging the two is what tells them apart.
 
 ### Proposer pass: an LLM grants per role/scope pair against policy.md
-Determines, for each (role, scope) pair, whether the policy authorizes it. The policy is
-the whole of the input — "{policy_text}" — and every grant below is derived from it. One call
-per focal entity rather than per pair: a single role is judged against all candidate scopes (or
-a single scope against all candidate roles), and the model is told to stay strictly scoped
-to that focal and ignore everything else, so evidence about one entity cannot leak into
-another's decision. Deny by default — a pair is granted only on evidence about the focal
-itself, and policy silence is a silent non-grant (no rule at all), not an explicit
-prohibition.
+Every grant below comes from one input: "{policy_gist}" One entity is judged per call —
+one role against all scopes, or one scope against all roles — so evidence about one cannot
+leak into another's decision. Deny by default: what the policy does not say is not granted.
 
 ### Evaluator pass: a second LLM independently judges each proposal
-A separate call re-derives the same decision under the same rules, so an omission or an
-over-grant has to survive being checked twice. A rejection sends it back with the reason
-attached, up to 3 attempts.
+A separate call re-derives each decision, so an omission has to survive being checked
+twice. It caught one here: the proposer granted `developer` only source access, and the
+evaluator rejected it — the policy also says developers read issues. Sent back with that
+reason, the retry returned both scopes and was approved.
 
 ### Compile the decisions to OPA Rego and apply the agent's AuthorizationPolicy
 The request body is the resolved rule set — allow/deny rules per gate, the subject->role
@@ -115,8 +112,9 @@ and target->scope maps, default_effect Deny. The writer compiles it to Rego and 
 AuthorizationPolicy that AuthBridge's OPA plugin evaluates.
 
 ### Persist the computed policy to the Policy Model Store
-The same path answered 404 before the write and returns the stored policy after. The stored
-model is what a later onboarding reads instead of recomputing this one.
+The same path answered 404 (nothing stored yet) before the write and returns the stored
+policy after. The stored model is what a later onboarding reads instead of recomputing this
+one.
 
 ### The generated OPA policy, read back from the cluster
 Two independent gates, both `default allow := false`: inbound answers who may call the
@@ -153,8 +151,10 @@ The store now holds both workloads' policies, so the agent-plus-tool relationshi
 beyond this run.
 
 ### The completed OPA policy, read back from the cluster
-Both gates are now populated and the agent and tool are fully configured. Everything below
-stops changing the system and just exercises it.
+Both gates now carry real grants. Inbound: `developer` may reach both agent skills,
+`tester` only the issue one. Outbound: `developer` gets source read/write plus issues-read,
+`tester` gets issues read/write — keyed to the tool's identity. The agent and tool are fully
+configured; everything below stops changing the system and only exercises it.
 
 ### Diff of the two snapshots: the outbound gate filling in
 target_allow_scopes keyed by SPIFFE id; grants from two lines of English.
