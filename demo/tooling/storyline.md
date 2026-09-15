@@ -77,7 +77,7 @@ follows refers to it by the UUID Keycloak assigned it: `{agent_uuid}`.
 Read `rossoctl.io/type` on the pod to determine whether this workload is an agent or a
 tool — the two are discovered differently: an agent's skills come from its AgentCard
 resource, a tool's from querying `tools/list`. Each declared skill then becomes one realm
-role plus one client scope, bound to the client — here {agent_role_count} of them:
+role plus one client scope, bound to the client. The following agent roles were created:
 `{agent_roles}`.
 
 ### Find every existing client that could invoke this agent
