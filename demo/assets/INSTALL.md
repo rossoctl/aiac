@@ -7,8 +7,9 @@ README's former "Deploying to Rossoctl" section, so the two installation paths c
 again.
 
 Installation is **two phases**, split along the precondition/deploy boundary so each half can run
-independently (the UC-1 onboarding system tests deploy the workloads themselves, but assume the
-images are already loaded):
+independently (the UC-1 onboarding system tests drive both themselves — the suite runs `kind-load.sh`
+to load the images, then deploys the workloads, then tears them down — see
+[`docs/testing/uc1-onboarding-pipeline.md`](../../docs/testing/uc1-onboarding-pipeline.md)):
 
 1. **Load images** — [`kind-load.sh`](kind-load.sh): build + `kind load` only; applies nothing.
 2. **Deploy** — [`deploy.sh`](deploy.sh): `kubectl apply` + `rollout status` only; builds/loads nothing.

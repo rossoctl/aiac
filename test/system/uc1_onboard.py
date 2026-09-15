@@ -467,6 +467,32 @@ def _set_controller_default_effect(namespace: str, effect: str) -> None:
     kubectl_rollout_status(f"deployment/{CONTROLLER_DEPLOYMENT}", namespace=namespace)
 
 
+# The demo-asset image loader. ``kind load`` needs the ``kind`` CLI + a container runtime on the pytest
+# host, and that host must be the one hosting the Kind node — the system suite's local-Kind topology.
+# There is no ``kubectl`` equivalent, so this is the one place the harness shells out to a demo script.
+KIND_LOAD_SCRIPT = REPO_ROOT / "demo/assets/kind-load.sh"
+# Selector flags so a rung stages only the image(s) it will deploy (rung 1 = agent only); both -> no flag.
+_KIND_LOAD_FLAG = {scn.AGENT_WORKLOAD: "--agent-only", scn.TOOL_WORKLOAD: "--tool-only"}
+
+
+def load_workload_images(workloads: Sequence[str]) -> None:
+    """Fulfill the **images precondition**: build (if absent) + ``kind load`` each requested workload's
+    demo image into the Kind node, via ``demo/assets/kind-load.sh``. This is the *load* half of the
+    demo-asset lifecycle the suite now owns end-to-end (load -> deploy -> teardown to pristine);
+    ``deploy_workload`` still does only ``kubectl apply`` + rollout, so the two stay cleanly separable.
+
+    No ``--rebuild`` — an already-built image is only re-loaded into the node, not rebuilt (build-if-
+    absent), so this is cheap on a warm host and never silently ships stale source. It runs on the pytest
+    host, which must carry ``kind`` + a container runtime and host the Kind node; when it does not, the
+    script exits non-zero and the test **fails loudly** (never a false pass). Only the requested
+    workloads are staged: a single workload passes its ``--agent-only`` / ``--tool-only`` selector; both
+    passes no selector (loads both)."""
+    cmd = ["bash", str(KIND_LOAD_SCRIPT)]
+    if len(workloads) == 1:
+        cmd.append(_KIND_LOAD_FLAG[workloads[0]])
+    subprocess.run(cmd, check=True)
+
+
 def deploy_workload(workload: str) -> None:
     """Deploy ``workload`` (``github-agent`` / ``github-tool``) into the cluster — the **event-driven
     onboarding trigger**: the operator reconciles the bundled ``AgentRuntime`` CR, registers a Keycloak
@@ -474,9 +500,10 @@ def deploy_workload(workload: str) -> None:
     ``onboard_service`` (the same handler the retired ``POST /apply`` called).
 
     ``kubectl apply``s the workload's demo manifests in order via the generic ``kubectl_apply`` and
-    waits for the Deployment rollout. It does **not** build or ``kind load`` images (a precondition —
-    ``demo/assets/kind-load.sh``); a missing image surfaces as a pod that never becomes Ready, which
-    the rollout wait / convergence poll turns into a loud failure, never a false pass."""
+    waits for the Deployment rollout. It does **not** build or ``kind load`` images — ``onboarded_stack``
+    fulfills that precondition first via ``load_workload_images`` (``demo/assets/kind-load.sh``); a
+    missing image still surfaces as a pod that never becomes Ready, which the rollout wait / convergence
+    poll turns into a loud failure, never a false pass."""
     for manifest in WORKLOAD_MANIFESTS[workload]:
         kubectl_apply(manifest, namespace=NAMESPACE)
     kubectl_rollout_status(f"deployment/{workload}", namespace=NAMESPACE, timeout=DEPLOY_TIMEOUT)
@@ -849,8 +876,9 @@ def onboarded_stack(
     Flow (event-driven trigger): skip cleanly (never false-pass) if the OPA pipeline or the event path
     is not wired, or the integration env is unset; **start from a no-workloads slate** (a leftover
     workload + its Keycloak client would stop the fresh deploy from re-firing ``CLIENT_CREATED``, so the
-    event would never trigger), provision users/roles + clear the store; **deploy** the given
-    ``workloads`` **in order, one at a time** — each ``kubectl apply`` fires the production trigger
+    event would never trigger), provision users/roles + clear the store; **load** the demo image(s) into
+    the Kind node (``load_workload_images`` — build-if-absent, the images precondition), then **deploy**
+    the given ``workloads`` **in order, one at a time** — each ``kubectl apply`` fires the production trigger
     (operator registers a Keycloak client -> Keycloak ``CLIENT_CREATED`` -> the ``aiac-event-listener``
     SPI publishes on NATS -> the agent consumer runs ``onboard_service``, the same handler the retired
     ``POST /apply`` called) — waiting for each to converge before the next; enable the outbound leg
@@ -926,6 +954,11 @@ def onboarded_stack(
         # agent through its pod-agnostic Service, so no ``agent_pod`` is needed yet (it is resolved after
         # Part B for the outbound leg). The full ``ctx`` is assembled below once ``agent_pod`` is known.
         probe_ctx = {"admin": admin, "namespace": NAMESPACE, "keycloak_url": keycloak_url, "realm": TEST_REALM}
+
+        # Fulfill the images precondition BEFORE any deploy: build-if-absent + ``kind load`` the demo
+        # image(s) for exactly the workloads this rung deploys. Loading is order-independent, so it is
+        # done once here rather than per-iteration; the loop below then only ``kubectl apply``s.
+        load_workload_images(workloads)
 
         # Deploy in the rung's ``workloads`` order, one at a time, converging before the next — each
         # ``deploy_workload`` fires the event-driven trigger (deploy -> operator -> CLIENT_CREATED ->

@@ -5,8 +5,9 @@
 # See INSTALL.md for the manual steps this automates and the non-obvious invariants.
 #
 # Split rationale: the UC-1 onboarding system tests deploy the workloads themselves (deploying
-# is the event-driven onboarding trigger) but assume the images are already built + kind-loaded.
-# This script produces exactly that precondition; `deploy.sh` mirrors the apply/rollout half.
+# is the event-driven onboarding trigger) and now run THIS script first to load the images they
+# will deploy (test/system/uc1_onboard.py: load_workload_images -> kind-load.sh, build-if-absent).
+# This script produces exactly that images precondition; `deploy.sh` mirrors the apply/rollout half.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
