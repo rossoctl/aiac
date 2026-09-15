@@ -475,6 +475,26 @@ KIND_LOAD_SCRIPT = REPO_ROOT / "demo/assets/kind-load.sh"
 _KIND_LOAD_FLAG = {scn.AGENT_WORKLOAD: "--agent-only", scn.TOOL_WORKLOAD: "--tool-only"}
 
 
+def _kind_cluster_name() -> str:
+    """The Kind cluster name ``kind-load.sh`` loads into — it targets a cluster *by name* (``kind load
+    ... --name``), independent of the current kube-context, so the fixture must tell it which one.
+    Prefer an explicit ``AIAC_KIND_CLUSTER`` override; else derive it from the current kube-context,
+    which ``kind`` names ``kind-<cluster>``, so images land in the same cluster the rest of the suite
+    talks to. Fall back to ``kind-load.sh``'s own ``rossoctl`` default when the context is unreadable
+    or not a ``kind-`` one."""
+    override = os.environ.get("AIAC_KIND_CLUSTER")
+    if override:
+        return override
+    try:
+        ctx = subprocess.run(
+            ["kubectl", "config", "current-context"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+    except (subprocess.CalledProcessError, OSError):
+        return "rossoctl"
+    return ctx[len("kind-"):] if ctx.startswith("kind-") else "rossoctl"
+
+
 def load_workload_images(workloads: Sequence[str]) -> None:
     """Fulfill the **images precondition**: build (if absent) + ``kind load`` each requested workload's
     demo image into the Kind node, via ``demo/assets/kind-load.sh``. This is the *load* half of the
@@ -483,14 +503,15 @@ def load_workload_images(workloads: Sequence[str]) -> None:
 
     No ``--rebuild`` — an already-built image is only re-loaded into the node, not rebuilt (build-if-
     absent), so this is cheap on a warm host and never silently ships stale source. It runs on the pytest
-    host, which must carry ``kind`` + a container runtime and host the Kind node; when it does not, the
-    script exits non-zero and the test **fails loudly** (never a false pass). Only the requested
-    workloads are staged: a single workload passes its ``--agent-only`` / ``--tool-only`` selector; both
-    passes no selector (loads both)."""
+    host, which must carry ``kind`` + ``kubectl`` + a container runtime and host the Kind node; when it
+    does not, the script exits non-zero and the test **fails loudly** (never a false pass). The target
+    Kind cluster is passed via ``CLUSTER_NAME`` (``_kind_cluster_name``) so a cluster not named
+    ``rossoctl`` still loads correctly. Only the requested workloads are staged: a single workload passes
+    its ``--agent-only`` / ``--tool-only`` selector; both passes no selector (loads both)."""
     cmd = ["bash", str(KIND_LOAD_SCRIPT)]
     if len(workloads) == 1:
         cmd.append(_KIND_LOAD_FLAG[workloads[0]])
-    subprocess.run(cmd, check=True)
+    subprocess.run(cmd, check=True, env={**os.environ, "CLUSTER_NAME": _kind_cluster_name()})
 
 
 def deploy_workload(workload: str) -> None:
@@ -969,7 +990,7 @@ def onboarded_stack(
                 raise RuntimeError(
                     f"operator did not register Keycloak client {NAMESPACE}/{workload!r} within "
                     f"{DEPLOY_TIMEOUT:.0f}s of deploying it — is the event path wired (NATS broker + "
-                    "aiac-event-listener SPI) and the image built + kind-loaded (demo/assets/kind-load.sh)? "
+                    "aiac-event-listener SPI)? (The rollout already passed, so the image is loaded.) "
                     "See k8s/opa-kind-runbook.md."
                 )
             if workload == scn.AGENT_WORKLOAD:

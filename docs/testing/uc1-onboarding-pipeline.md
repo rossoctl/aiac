@@ -144,11 +144,13 @@ cleanly** when any of it is absent (they never stand it up, and never false-pass
   be present in the Kind node before deploy — but the fixture now **fulfills that itself** as a test step:
   before deploying, it runs `demo/assets/kind-load.sh` (`load_workload_images`) to build-if-absent +
   `kind load` exactly the image(s) the rung deploys. So the standing precondition is only the toolchain the
-  load needs: the `kind` CLI and a container runtime (`podman`/`docker`) on the machine running pytest, and
-  that machine hosting the Kind node (the suite's local-Kind topology — a remote-cluster runner cannot
+  load needs: the `kind` CLI, `kubectl`, and a container runtime (`podman`/`docker`) on the machine running
+  pytest, and that machine hosting the Kind node (the suite's local-Kind topology — a remote-cluster runner cannot
   `kind load`). When the toolchain is absent the load exits non-zero and the test **fails loudly** (never a
   false pass); `--rebuild` is not passed, so an already-built image is only re-loaded, never silently
-  rebuilt from stale source. The `deploy_workload` step itself only `kubectl apply`s manifests and waits.
+  rebuilt from stale source. The `deploy_workload` step itself only `kubectl apply`s manifests and waits. The
+  target Kind cluster is derived from the current kube-context (`kind` names it `kind-<cluster>`; override with
+  `AIAC_KIND_CLUSTER`), so a cluster not named `rossoctl` still loads correctly.
 - **Users + realm roles.** The fixture provisions them (UC-1 does not) — see
   *[Scenario](#scenario)* — via `KeycloakAdmin` into `AIAC_TEST_REALM`, **before** deploying (the PRB
   reads the realm role universe when the event fires `onboard_service`); idempotent; left in place.
@@ -380,8 +382,8 @@ Runnable against a live rossoctl/Kind cluster (operator + Keycloak + SPIRE) with
 AuthBridge OPA pipeline wired into **both** legs, the **NATS Event Broker deployed** and the **Keycloak
 SPI installed + `aiac-event-listener` enabled on the realm**, and a real LLM in-pod. The tests **load,
 deploy, and tear down** the workloads themselves — deployment and image-loading are no longer prerequisites
-(the fixture runs `demo/assets/kind-load.sh` before deploy, so only the `kind` CLI + a container runtime on
-the pytest host are assumed). Stand the pipeline up with `k8s/opa-kind-enable.sh`;
+(the fixture runs `demo/assets/kind-load.sh` before deploy, so only the `kind` CLI + `kubectl` + a container
+runtime on the pytest host are assumed). Stand the pipeline up with `k8s/opa-kind-enable.sh`;
 the full prerequisites, wiring, and manual probe commands are in `k8s/opa-kind-runbook.md`, and the SPI
 setup is in `keycloak-spi/README.md`.
 
@@ -419,7 +421,7 @@ CLI or a container runtime makes the load (and thus the test) **fail loudly**, n
   trigger; each converges before the next) → enables the outbound leg → polls → validates → **tears down
   to pristine**. The NATS broker and the Keycloak SPI listener are the standing preconditions; the images
   are no longer one — the fixture loads them itself (so "built but not loaded to kind" can't slip through),
-  assuming only the `kind` CLI + a container runtime on the Kind host. Full teardown keeps reruns hermetic.
+  assuming only the `kind` CLI + `kubectl` + a container runtime on the Kind host. Full teardown keeps reruns hermetic.
 - **One stack, one policy, the deployed plugin.** Rungs 1–3 need only one AIAC stack; the deployed OPA
   plugin + the upserted `AuthorizationPolicy` CR are what make the pipeline observable.
 - **Onboarding-order-independence is asserted, not assumed** (rungs 2 vs 3). Rung 3's intended end state
