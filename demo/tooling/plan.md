@@ -118,6 +118,19 @@ wrong:
 Repetition is evidence, not noise. Sweeping all 12 realm clients — many answering `[]` — is
 exactly the tedium a human would face, so those calls are shown individually.
 
+### Prose lives in storyline.md, structure lives here
+
+This file governs **structure**: the schema, which traffic becomes which task, what may
+appear in `cmd`/`output`. The narration itself — every `summary` line — lives in
+`demo/tooling/storyline.md`, one `###` heading per task caption, and `assemble.py` reads
+it at assemble time via `storyline_loader.py`. Editing the script is therefore a markdown
+edit, reviewable as English, with no Python change.
+
+Two guard rails keep the two from drifting apart: a task the assembler emits with no
+heading in `storyline.md` is a hard error, and a `{placeholder}` the capture cannot fill
+is a hard error rather than a silently empty sentence. Placeholders are substituted from
+the run's own captured traffic, so a summary cannot claim a value the run did not produce.
+
 ### Field length
 
 `task` is an on-screen caption, so it stays subtitle-tight (~90 chars). `summary` and
@@ -265,6 +278,20 @@ For this run: `demo/out/uc1-onboarding_<YYYYMMDD-HHMMSS>/capture.jsonl`
 self-contained bundle for one capture run — if a rerun is requested after review,
 it gets its own new `<demo_name>_<datetime>` sibling rather than overwriting the
 prior one, so previous attempts remain available for comparison.
+
+"Self-contained" has to be **made** true, not assumed. The Rego the demo writes lands
+in the live `use-cases/uc1-onboarding/generated/` tree, which the next run overwrites
+and `make clear` empties — so reading it at assemble time made an artifact depend on
+whatever ran last. Observed: a September 14 run quoted Rego written on September 15,
+and a `make clear` in between silently dropped two tasks (22 became 20). Snapshot it
+into the run directory as the final step of capture:
+
+```bash
+assemble.py demo/out/<run> --snapshot-generated
+```
+
+`rego_steps` then resolves from `<run>/generated/` and only falls back to the live tree
+for older bundles, warning on stderr when it does.
 
 ## The JSONL is the hard boundary
 

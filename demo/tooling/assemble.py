@@ -58,7 +58,7 @@ SUBTITLE_HINT = 90
 TASK_MAX = 90
 
 # Where the demo proper begins; everything before it is setup scaffolding.
-FIRST_DEMO_TASK = "Resolve the agent's Keycloak client UUID"
+FIRST_DEMO_TASK = "Resolve the agent's identity in the IdP"
 
 
 def _subtitle(text: str, limit: int | None = None) -> str:
@@ -356,8 +356,22 @@ def _client_hint(rec: dict, workload: str) -> str | None:
 # Keycloak admin calls and reads the generated .rego off disk. Emitting `$ make show` as a
 # `cmd` would put a fake request in a field reserved for real ones, so the wrapper is
 # dropped and the underlying operations are shown instead.
-GENERATED_DIR = Path(
-    "/Users/arielf/development/sentry/aiac/demo/use-cases/uc1-onboarding/generated"
+# Narrative prose lives in storyline.md, not here: the demo script is reviewed and revised
+# as English in one file, and this assembler only decides which HTTP records back each task.
+# `add()` looks each summary up by task caption; a caption with no heading there is a hard
+# error, so the script and the capture cannot drift apart unnoticed.
+from storyline_loader import StorylineError, load as load_storyline, render as render_summary, values_from_capture
+
+STORYLINE_PATH = Path(__file__).parent / "storyline.md"
+
+# Where the demo writes its Rego snapshots. Only used as a FALLBACK: a run directory is
+# supposed to carry its own `generated/` copy (see `snapshot_generated`), because reading the
+# live tree makes an assemble depend on whatever the last demo run left behind rather than on
+# what this run captured. That defeated timestamped run directories outright — assembling a
+# September 14 run spliced in Rego written on September 15, and a `make clear` in between made
+# the two "read back from the cluster" tasks vanish silently (22 tasks became 20).
+LIVE_GENERATED_DIR = (
+    Path(__file__).resolve().parents[1] / "use-cases" / "uc1-onboarding" / "generated"
 )
 
 
@@ -373,14 +387,32 @@ def state_steps(driver_raw: list[dict], bounds: tuple[int, int]) -> list[dict]:
     return out
 
 
-def rego_steps(snapshot: str) -> list[dict]:
-    """The generated Rego itself, read from the snapshot the demo captured.
+def snapshot_generated(run: Path) -> Path | None:
+    """The run's own copy of the demo's `generated/` tree, if it has one."""
+    candidate = run / "generated"
+    return candidate if candidate.is_dir() else None
+
+
+def rego_steps(run: Path, snapshot: str) -> list[dict]:
+    """The generated Rego itself, read from the snapshot this run captured.
 
     This is the artifact the whole demo produces, and a live enforcement point reads the
     same content out of the CR — so it belongs in `output` verbatim rather than being
     represented by the path it was written to.
+
+    Resolved from the RUN DIRECTORY first, so an assemble reproduces the run it is
+    narrating. Falls back to the live tree only for older run dirs captured before
+    snapshotting existed, and says so on stderr rather than silently quoting another run.
     """
-    base = GENERATED_DIR / snapshot / "team1" / "github-agent"
+    root = snapshot_generated(run)
+    if root is None:
+        root = LIVE_GENERATED_DIR
+        print(
+            f"warning: {run.name} has no generated/ snapshot; reading Rego from the live tree "
+            f"({root}) — it may belong to a later run",
+            file=sys.stderr,
+        )
+    base = root / snapshot / "team1" / "github-agent"
     out = []
     for gate in ("inbound", "outbound"):
         f = base / gate / "request.rego"
@@ -614,8 +646,27 @@ def main() -> None:
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     from_agent = "--from-agent" in sys.argv[1:]
     if len(args) != 1:
-        sys.exit("usage: assemble.py <run-dir> [--from-agent] [--no-viewer] [--no-open]")
+        sys.exit(
+            "usage: assemble.py <run-dir> [--from-agent] [--snapshot-generated] "
+            "[--no-viewer] [--no-open]"
+        )
     run = Path(args[0])
+
+    # Snapshotting belongs to the CAPTURE step, not this one: an assemble can run days after
+    # the fact, by which time the live tree describes some later run. Run it right after the
+    # demo finishes — `assemble.py <run-dir> --snapshot-generated` — and the run keeps its own
+    # copy, so every later assemble of that run reproduces it.
+    if "--snapshot-generated" in sys.argv[1:]:
+        import shutil
+
+        dest = run / "generated"
+        if not LIVE_GENERATED_DIR.is_dir():
+            sys.exit(f"nothing to snapshot: {LIVE_GENERATED_DIR} does not exist")
+        if dest.exists():
+            shutil.rmtree(dest)
+        shutil.copytree(LIVE_GENERATED_DIR, dest)
+        snaps = sorted(p.name for p in dest.iterdir() if p.is_dir())
+        print(f"snapshotted generated/ into {dest} ({', '.join(snaps) or 'empty'})")
     logs = run / "logs"
     # Two capture sources, tagged so steps can say where each call was observed:
     #   raw-capture.jsonl    — the AGENT POD's outbound calls (idp-config, MCP, LLM, …)
@@ -667,6 +718,16 @@ def main() -> None:
     agent_phrases = parsed_steps(logs / "agent.log")
     tool_phrases = parsed_steps(logs / "tool.log")
 
+    # The demo script (storyline.md) and the real values this run observed. Values are
+    # harvested from the captured responses themselves, so a summary that cites a UUID or a
+    # role name is quoting this run's traffic rather than a constant that can go stale.
+    storyline = load_storyline(STORYLINE_PATH)
+    story_values = values_from_capture(driver_raw + pod_raw)
+
+    def _story_key(cap: str) -> str:
+        cap = cap.replace("`", "").replace("\u2014", "-").replace("\u2013", "-")
+        return " ".join(cap.split()).lower()
+
     tasks: list[dict] = []
 
     def normalize(steps: list[dict]) -> list[dict]:
@@ -697,7 +758,18 @@ def main() -> None:
             kept.append(st)
         return kept
 
-    def add(task: str, steps: list[dict], summary: str, phrase: str | None = None) -> None:
+    def add(task: str, steps: list[dict], summary: str | None = None, phrase: str | None = None) -> None:
+        # `summary` is sourced from storyline.md by caption. The positional argument is kept
+        # only so a caller can override for a one-off; passing None (the normal case) means
+        # "the script owns this prose".
+        if summary is None:
+            key = _story_key(task)
+            if key not in storyline:
+                raise StorylineError(
+                    f"no storyline.md heading for task {task!r} — add a '### {task}' section "
+                    f"(matching ignores backticks/dashes/whitespace)"
+                )
+            summary = render_summary(storyline[key], story_values, caption=task)
         # `phrase` is the demo's own description of this unit of work, taken from its parsed
         # "Steps performed" output. Attached to the first step so the narration keeps the
         # wording the emitting code chose.
@@ -717,150 +789,113 @@ def main() -> None:
     add(
         "make keycloak — discover Keycloak and port-forward it",
         narration_steps(logs / "keycloak.log", "keycloak"),
-        "Port-forwarded the in-cluster Keycloak to localhost:18080 and read the admin "
-        "credentials from the keycloak-admin-secret, so every later target can reach it.",
     )
     add(
         "make prereqs — verify cluster, AIAC stack, demo workloads, Keycloak registration",
         narration_steps(logs / "prereqs.log", "prereqs"),
-        "Confirmed the cluster, the AIAC stack in aiac-system, and the github-agent/"
-        "github-tool workloads in team1 were all present, both Keycloak clients registered, "
-        "and github-tool's Service carries the protocol.rossoctl.io/mcp label tool discovery needs.",
     )
     add(
         "make clear — reset to a clean slate",
         narration_steps(logs / "clear.log", "clear"),
-        "Removed provisioned roles/scopes, deleted the AuthorizationPolicy CR, and cleared "
-        "local generated/ snapshots, so this run starts from a known-empty baseline.",
     )
     add(
         "make setup — provision users/roles, mount policy.md, configure token exchange",
         narration_steps(logs / "setup.log", "setup"),
-        "Provisioned dev-user/test-user/devops-user with their realm roles, resolved both "
-        "workloads' Keycloak client UUIDs, and enabled RFC 8693 token exchange on the agent's client.",
     )
     add(
         "Starting point: no access rules exist",
         state_steps(driver_raw, (0, d_agent_lo)) + [grants_step(logs / "show-1-baseline.log")],
-        "Three users with job titles. No rules about what they may reach.",
     )
 
     # 6 — make agent, split per plan.md
     add(
-        "Resolve the agent's Keycloak client UUID",
+        "Resolve the agent's identity in the IdP",
         driver_steps(driver_raw, "keycloak-admin", window="agent", bounds=agent_bounds)
         or [{"cmd": "GET <keycloak>/admin/realms/rossoctl/clients", "output": "(not captured — see note)"}],
-        "Its clientId is a SPIFFE URI; the UUID is what the onboarding route takes.",
     )
     add(
         "Classify the workload, then create a role + scope per declared skill",
         idp_phase(agent_recs, "provision"),
-        "Type comes from the pod's rossoctl.io/type label; skills from its AgentCard "
-        "resource. Each skill becomes one realm role and one client scope, bound to the client.",
     
         phrase=phrase_for(agent_phrases, "Classified") or phrase_for(agent_phrases, "AgentCard"),
     )
     add(
         "Sweep every client in the realm to build the candidate set",
         idp_phase(agent_recs, "candidates"),
-        "Every role in the realm that could reach this agent becomes a candidate — the policy "
-        "is judged against all 12 clients, not only the roles just created.",
     )
     add(
         "Read the relevant users and their role assignments",
         idp_phase(agent_recs, "subjects"),
-        "Roles are flattened to their closure first, so a role held through a composite or a group counts the same as one assigned directly.",
     )
     add(
         "Merge per-client role ownership into the realm-wide role list",
         idp_phase(agent_recs, "trailing"),
-        "The realm list says a role exists; only the per-client read carries kind=Agent and "
-        "actorIds. Both are needed to tell the agent's own roles from everyone else's.",
     )
     add(
         "Proposer pass: an LLM grants per role/scope pair against policy.md",
         [step(r) for r in by(agent_recs, "llm-propose")],
-        "One call per pair, deliberately isolated: the model sees a single focal entity and is "
-        "told to ignore everything else, so evidence about one role cannot leak into another's "
-        "decision. Deny-by-default, so silence in the policy means no grant.",
     )
     add(
         "Evaluator pass: a second LLM independently judges each proposal",
         [step(r) for r in by(agent_recs, "llm-audit")],
-        "A separate call re-derives the same decision under the same rules, so an omission or an "
-        "over-grant has to survive being checked twice. A rejection sends it back with the "
-        "reason attached, up to 3 attempts.",
     )
     add(
         "Compile the decisions to OPA Rego and apply the agent's AuthorizationPolicy",
         [step(r) for r in by(agent_recs, "policy-writer")],
-        "The request body is the resolved rule set — allow/deny rules per gate, the subject->role and target->scope maps, default_effect Deny. The writer compiles it to Rego and patches the AuthorizationPolicy that AuthBridge's OPA plugin evaluates.",
     
         phrase=phrase_for(agent_phrases, "AuthorizationPolicy", "applied"),
     )
     add(
         "Persist the computed policy to the Policy Model Store",
         [step(r) for r in by(agent_recs, "model-store")],
-        "The same path answered 404 before the write and returns the stored policy after. The stored model is what a later onboarding reads instead of recomputing this one.",
     )
     add(
         "The generated OPA policy, read back from the cluster",
-        rego_steps("01-after-agent"),
-        "Two independent gates, both default allow := false: inbound answers who may call the agent, outbound what the agent may then do on its behalf.",
+        rego_steps(run, "01-after-agent"),
     )
     add(
         "State after the agent alone: inbound populated, outbound empty",
         state_steps(driver_raw, (d_agent_hi, d_tool_lo))
         + [grants_step(logs / "show-2-after-agent.log")],
-        "No tool is onboarded yet, so every outbound map is still empty.",
     )
 
     # 8 — make tool, split per plan.md
     add(
-        "Resolve the tool's Keycloak client UUID",
+        "Resolve the tool's identity in the IdP",
         driver_steps(driver_raw, "keycloak-admin", window="tool", bounds=tool_bounds)
         or [{"cmd": "GET <keycloak>/admin/realms/rossoctl/clients", "output": "(not captured — see note)"}],
-        "Its client.type attribute reads Tool, which is what routes it down a different onboarding path than the agent.",
     )
     add(
         "Call the tool's live MCP endpoint for tools/list",
         [step(r) for r in by(tool_recs, "mcp-tools-list")],
-        "Capabilities are discovered by asking the running tool, not read from a manifest someone maintains — so the policy is judged against what the tool actually exposes today.",
     
         phrase=phrase_for(tool_phrases, "MCP tools/list"),
     )
     add(
         "Proposer pass over the discovered tool scopes",
         [step(r) for r in by(tool_recs, "llm-propose")],
-        "Same policy text and the same one-pair-at-a-time isolation, now applied to capabilities "
-        "that were discovered at runtime rather than declared anywhere.",
     )
     add(
         "Evaluator pass over the tool proposals",
         [step(r) for r in by(tool_recs, "llm-audit")],
-        "Every tool-scope decision independently re-derived before it is trusted.",
     )
     add(
         "Recompile the AGENT's Rego to fill in its outbound gate",
         [step(r) for r in by(tool_recs, "policy-writer")],
-        "A design decision: enforcement lives on the agent's outbound gate, not the tool's inbound. The tool gets no policy of its own — the caller is what gets constrained.",
     
         phrase=phrase_for(tool_phrases, "AuthorizationPolicy", "applied"),
     )
     add(
         "Persist the updated policy model",
         [step(r) for r in by(tool_recs, "model-store")],
-        "The store now holds both workloads' policies, so the agent-plus-tool relationship survives beyond this run.",
     )
     add(
         "The completed OPA policy, read back from the cluster",
-        rego_steps("02-after-tool"),
-        "Both gates are now populated and the agent and tool are fully configured. Everything below stops changing the system and just exercises it.",
+        rego_steps(run, "02-after-tool"),
     )
     add(
         "Diff of the two snapshots: the outbound gate filling in",
         state_steps(driver_raw, (d_tool_hi, len(driver_raw))) + [rego_diff_step(logs / "diff.log")],
-        "target_allow_scopes keyed by SPIFFE id; grants from two lines of English.",
     )
 
     # 10-12 — drive real users through the gates
@@ -869,11 +904,8 @@ def main() -> None:
         "test": "Test: a user in the tester role, same flow",
         "devops": "Test: a user in a role the policy never mentions",
     }
-    for target, summary in (
-        ("dev", "Logs in, exchanges a token for the tool, then each intent is checked: source read and write and issue reads allowed, closing an issue denied."),
-        ("test", "The mirror image: issue reads and writes allowed, reading source denied."),
-        ("devops", "Refused at the inbound gate before any tool call is attempted — no role they hold sources a single scope the agent exposes."),
-    ):
+    # Prose for these three comes from storyline.md like every other task.
+    for target in ("dev", "test", "devops"):
         log = logs / f"{target}.log"
         narrated = narration_steps(log)
         # Real HTTP for this user: the ROPC login and the RFC 8693 exchange. The opa eval
@@ -899,7 +931,7 @@ def main() -> None:
                     "explain": "The demo's own summary of each intent's allow/deny outcome.",
                 }
             )
-        add(USER_TASK[target], steps, summary)
+        add(USER_TASK[target], steps)
 
     if from_agent:
         # The demo proper starts at `make agent`; keycloak/prereqs/clear/setup are
