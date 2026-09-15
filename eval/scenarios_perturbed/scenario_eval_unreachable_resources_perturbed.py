@@ -1,5 +1,5 @@
 """Semantic-perturbation sibling of ``scenario_eval_unreachable_resources.py`` (spec:
-``docs/specs/eval/policy-eval-robustness-consistency.md``).
+``docs/evaluation/policy-eval-robustness-consistency.md``).
 
 Same structure (names, ``USERS``, all pair-lists, and ``EXPECT_NO_REGO`` are byte-identical to the
 original), reworded prose only. See ``scenario_eval_baseline_perturbed.py`` for the general

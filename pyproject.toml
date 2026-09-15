@@ -62,17 +62,14 @@ select = ["E", "F", "I", "W"]
 [tool.pytest.ini_options]
 testpaths = ["test", "eval"]
 pythonpath = ["src"]
-# Bare `pytest` runs unit tests only — every live-infra marker is excluded by
-# default. `-m` on the command line overrides this (last `-m` wins), so
-# `pytest eval/ -m eval_extended` etc. still works to opt back in.
-addopts = ["-m", "not integration and not eval_extended and not eval_consistency and not eval_robustness and not eval_correctness_prb and not eval_correctness_e2e and not eval_faithfulness"]
+# Selection is marker-only — no path is passed to pytest. testpaths collects both
+# trees; the default `-m` below deselects every live-infra / eval marker, so a bare
+# `pytest` is the offline unit suite. A command-line `-m` overrides the default
+# (last `-m` wins): `-m integration`, `-m system`, `-m eval`, `-m llm`.
+addopts = ["-m", "not integration and not system and not llm and not eval"]
 markers = [
-    "integration: tests that call real LLM endpoints",
-    "llm: tests that call the real LLM but mock descriptions/policy (no cluster)",
-    "eval_extended: heavier multi-scenario policy-pipeline evaluation tests — same live infra as `integration`, but several full pipeline runs and many more PRB/LLM calls per session (see eval/test_policy_pipeline_eval.py)",
-    "eval_consistency: PRB run-to-run consistency (same scenario, N repeats, exact grant-set equality) — needs LLM_BASE_URL/LLM_MODEL/LLM_API_KEY only, no Keycloak/opa (see eval/test_policy_pipeline_consistency.py)",
-    "eval_robustness: PRB robustness to mechanical + semantic input perturbation against the truth-table oracle — needs LLM_BASE_URL/LLM_MODEL/LLM_API_KEY only, no Keycloak/opa (see eval/test_policy_pipeline_robustness.py)",
-    "eval_correctness_prb: PRB-level correctness — precision/recall + a denial-precision figure against the primary corpus's hand-authored truth tables, zero-tolerance over-grant gate — needs LLM_BASE_URL/LLM_MODEL/LLM_API_KEY only, no Keycloak/opa (see eval/test_policy_pipeline_correctness_prb.py)",
-    "eval_correctness_e2e: end-to-end correctness — same precision/recall + denial-precision scorer as eval_correctness_prb, but through the full Keycloak+PCE+OPA pipeline via opa eval — needs KEYCLOAK_URL + admin creds + LLM_BASE_URL/LLM_MODEL/LLM_API_KEY, plus opa on PATH (see eval/test_policy_pipeline_correctness_e2e.py)",
-    "eval_faithfulness: Policy Digester faithfulness — the PRB run over each scenario's DIGESTED policy adds/drops/broadens no access vs the same hand-authored truth table (zero-tolerance over-grant gate, mirroring eval_correctness_prb but with a digest step first) — needs LLM_BASE_URL/LLM_MODEL/LLM_API_KEY only, no Keycloak/opa (see eval/test_policy_pipeline_faithfulness.py)",
+    "integration: several AIAC units cooperating in-process on a laptop — no cluster (opt in with `-m integration`)",
+    "system: needs a live Kind cluster / Rosso / deployed AIAC — see k8s/opa-kind-runbook.md (opt in with `-m system`)",
+    "llm: calls a real external LLM but needs no cluster; orthogonal tag on unit/integration tests (opt in with `-m llm`)",
+    "eval: policy-pipeline evaluation suite under `eval/` — heavy, live-infra (opt in with `-m eval`)",
 ]

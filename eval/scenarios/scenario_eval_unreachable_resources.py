@@ -1,7 +1,7 @@
 """Scenario 4 — unreachable resources: 1 user, 2 agents, 2 tools, healthcare/clinic domain.
 
 Companion to ``scenario_eval_baseline.py`` (Scenario 1) for ``test_policy_pipeline_eval.py`` (spec:
-``docs/specs/eval/policy-eval-scenarios.md``). Isolates one aspect: silent authoring
+``docs/evaluation/policy-eval-scenarios.md``). Isolates one aspect: silent authoring
 gaps that produce **emergent** (not hand-picked) unreachability under deny-by-default, merged
 across both entity kinds an unreachable resource can be — an agent and a tool — since both fall out
 of the exact same mechanism (a scope or role simply never named in the policy document).

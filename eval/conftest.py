@@ -1,23 +1,22 @@
 """Per-run pass/fail/skip report for the policy-eval-scenarios, policy-eval-robustness,
 policy-eval-consistency, policy-eval-correctness-prb, and policy-eval-correctness-e2e suites
-(spec: ``docs/specs/eval/policy-eval-scenarios.md``, ``docs/specs/eval/
-policy-eval-robustness-consistency.md``, ``docs/specs/eval/policy-eval-correctness-prb.md``, and
-``docs/specs/eval/policy-eval-correctness-e2e.md``).
+(spec: ``docs/evaluation/policy-eval-scenarios.md``, ``docs/evaluation/
+policy-eval-robustness-consistency.md``, ``docs/evaluation/policy-eval-correctness-prb.md``, and
+``docs/evaluation/policy-eval-correctness-e2e.md``).
 
-Every run of ``test_policy_pipeline_eval.py`` (``@pytest.mark.eval_extended``),
-``test_policy_pipeline_consistency.py`` (``@pytest.mark.eval_consistency``),
-``test_policy_pipeline_robustness.py`` (``@pytest.mark.eval_robustness``),
-``test_policy_pipeline_correctness_prb.py`` (``@pytest.mark.eval_correctness_prb``), or
-``test_policy_pipeline_correctness_e2e.py`` (``@pytest.mark.eval_correctness_e2e``) writes a
-Markdown report to ``reports/`` listing every collected test's outcome — passed, failed, skipped,
-xfailed, xpassed, or a setup/collection error. All six sections are always present (even empty) so
-a reader can see at a glance that nothing was silently omitted. Failed/error entries carry the
-assertion's crash message (pytest's own computed diff, e.g. "assert True == False" or a custom
-mismatch message with expected/actual sets); skipped/xfailed entries carry the skip reason; every
-entry carries the test function's docstring so a reader doesn't have to open the source file to
-know what was actually being checked. The report is scoped to these five markers (not just "any
-test collected while this conftest happens to be loaded"), so running the whole repo's test suite
-from a parent directory does not pull unrelated tests into this suite's report.
+Every run of ``test_policy_pipeline_eval.py``, ``test_policy_pipeline_consistency.py``,
+``test_policy_pipeline_robustness.py``, ``test_policy_pipeline_correctness_prb.py``, or
+``test_policy_pipeline_correctness_e2e.py`` — all now carrying the single flat
+``@pytest.mark.eval`` marker (opt in with ``-m eval``) — writes a Markdown report to ``reports/``
+listing every collected test's outcome — passed, failed, skipped, xfailed, xpassed, or a
+setup/collection error. All six sections are always present (even empty) so a reader can see at a
+glance that nothing was silently omitted. Failed/error entries carry the assertion's crash message
+(pytest's own computed diff, e.g. "assert True == False" or a custom mismatch message with
+expected/actual sets); skipped/xfailed entries carry the skip reason; every entry carries the test
+function's docstring so a reader doesn't have to open the source file to know what was actually
+being checked. The report is scoped to the ``eval`` marker (not just "any test collected while this
+conftest happens to be loaded"), so running the whole repo's test suite from a parent directory
+does not pull unrelated tests into this suite's report.
 
 Filename: ``reports/report_<DD_MM_HH_MM_SS>.md``, timestamped in UTC (override via
 ``EVAL_REPORT_TZ``, e.g. ``Asia/Jerusalem``), e.g. ``report_04_08_16_37_22.md`` for 04 Aug at
@@ -57,7 +56,7 @@ Both suites also ``record_property`` two raw counts alongside the floats above �
 ``true_positives`` and ``denied_total`` — not rendered in the Markdown report (the floats and pair
 breakdowns already cover a human reader) but read back here by ``_write_trend_log`` to pool a
 run's precision/recall/denial_precision into one committed, append-only trend-log row per suite
-(``eval/trend_log.py``, spec: ``docs/specs/eval/eval-framework.md`` §9) — pooled by summed count
+(``eval/trend_log.py``, spec: ``docs/evaluation/eval-framework.md`` §9) — pooled by summed count
 across every scenario that reached ``score_scenario`` in the run, not averaged per-scenario, so a
 run with an uneven pair count per scenario isn't skewed by weighting every scenario equally. A
 scenario whose own setup failed never recorded these, so it contributes nothing to the pooled row
@@ -79,13 +78,6 @@ from eval.trend_log import append_row, pool_correctness_metrics
 HERE = Path(__file__).resolve().parent
 REPORTS_DIR = HERE / "reports"
 REPORT_TZ = ZoneInfo(os.environ.get("EVAL_REPORT_TZ", "UTC"))
-MARKERS = {
-    "eval_extended",
-    "eval_consistency",
-    "eval_robustness",
-    "eval_correctness_prb",
-    "eval_correctness_e2e",
-}
 
 # Auto-load the repo-root .env so LLM_BASE_URL/KEYCLOAK_URL/etc. are set without having to
 # `set -a; . .env; set +a` before invoking pytest. Existing environment
@@ -94,12 +86,23 @@ load_dotenv(HERE.parent / ".env", override=False)
 
 _docstrings: dict[str, str] = {}
 _reports: dict[str, pytest.TestReport] = {}
+# Nodeids that actually carry `@pytest.mark.eval`, captured at collection. We must NOT gate on the
+# keyword set (`"eval" in report.keywords`): the suite lives in a package directory literally named
+# `eval/` with an `__init__.py`, so pytest builds a `Package` node named `eval` and injects that
+# name into every collected item's keyword set — marked or not. Gating on the keyword would scoop
+# the pure-unit helpers under `eval/` (test_dashboard, test_trend_log, …) into this report on a
+# bare offline `pytest`, breaking this module's guarantee that only `-m eval` tests are captured.
+# The real marker is only reachable via `item.iter_markers()` at collection, so we record the
+# nodeids there and gate reports on membership. (Same controller-side flow xdist already relies on
+# for `_docstrings`.)
+_eval_nodeids: set[str] = set()
 
 
 def pytest_collection_modifyitems(session: pytest.Session, config: pytest.Config, items: list) -> None:
     for item in items:
-        if not (MARKERS & set(item.keywords)):
+        if not any(marker.name == "eval" for marker in item.iter_markers()):
             continue
+        _eval_nodeids.add(item.nodeid)
         func = getattr(item, "obj", None)
         doc = (getattr(func, "__doc__", None) or "").strip()
         if doc:
@@ -110,7 +113,7 @@ def pytest_collection_modifyitems(session: pytest.Session, config: pytest.Config
 def pytest_runtest_logreport(report: pytest.TestReport) -> None:
     if report.when == "teardown" and report.outcome == "passed":
         return
-    if not (MARKERS & set(report.keywords)):
+    if report.nodeid not in _eval_nodeids:
         return
     # A later phase (call) supersedes an earlier one (setup) for the same nodeid; a setup or
     # teardown failure has no later phase to supersede it.
@@ -183,13 +186,16 @@ def _format_pairs_dict(pairs_by_gate: dict) -> str:
 # generic branch and render its actual skip reason instead of a misleading "setup failed".
 _CORRECTNESS_TEST_MARKERS = ("::test_prb_correctness[", "::test_e2e_correctness[")
 
-# Marker -> trend-log suite name (eval/trend_log.py). Deliberately scoped to only the two
-# Correctness suites for now — the Robustness/Consistency/Scale suite tickets (#2466-#2470) add
-# their own entries here when they land, reusing the same _write_trend_log/append_row mechanism
-# rather than building a parallel one.
+# Nodeid substring -> trend-log suite name (eval/trend_log.py). With the five ``eval_*`` markers
+# collapsed to one flat ``eval`` marker, the two Correctness suites can no longer be told apart by
+# marker, so they are disambiguated by their single test function's nodeid — the same
+# ``::test_prb_correctness[`` / ``::test_e2e_correctness[`` substrings ``_CORRECTNESS_TEST_MARKERS``
+# already uses. Deliberately scoped to only the two Correctness suites for now — the
+# Robustness/Consistency/Scale suite tickets (#2466-#2470) add their own entries here when they land,
+# reusing the same _write_trend_log/append_row mechanism rather than building a parallel one.
 _TREND_LOG_SUITES = {
-    "eval_correctness_prb": "correctness_prb",
-    "eval_correctness_e2e": "correctness_e2e",
+    "::test_prb_correctness[": "correctness_prb",
+    "::test_e2e_correctness[": "correctness_e2e",
 }
 
 # Full Correctness corpus size (eval.test_policy_pipeline_eval.SCENARIOS) -- kept as a plain
@@ -275,7 +281,7 @@ def _render_entry(lines: list[str], nodeid: str, report: pytest.TestReport, cate
 
 def _write_trend_log() -> None:
     """One committed trend-log row per Correctness suite present in this session (PRB-level
-    and/or end-to-end) — spec: docs/specs/eval/eval-framework.md §9. Pools every scenario's
+    and/or end-to-end) — spec: docs/evaluation/eval-framework.md §9. Pools every scenario's
     true_positives/denied_total counts (and over_grants/under_grants/incorrectly_denied pair
     dicts) that reached score_scenario — a scenario whose own setup failed never recorded these,
     so it contributes nothing to the pooled row, same as _render_metrics_block's
@@ -286,8 +292,8 @@ def _write_trend_log() -> None:
     contributor and by downstream trend analysis must not carry a per-contributor UTC offset."""
     by_suite: dict[str, list[dict]] = {}
     for report in _reports.values():
-        for marker, suite in _TREND_LOG_SUITES.items():
-            if marker in report.keywords:
+        for nodeid_marker, suite in _TREND_LOG_SUITES.items():
+            if nodeid_marker in report.nodeid:
                 props = dict(report.user_properties)
                 if "true_positives" in props:
                     by_suite.setdefault(suite, []).append(props)

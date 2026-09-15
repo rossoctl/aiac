@@ -1,5 +1,5 @@
 """Builds ``Role``/``Scope`` objects directly from a scenario module's data, with no Keycloak
-involved (spec: ``docs/specs/eval/policy-eval-robustness-consistency.md``).
+involved (spec: ``docs/evaluation/policy-eval-robustness-consistency.md``).
 
 The consistency/robustness suites are scoped to the PRB's raw output only (no OPA/PCE/k8s in the
 loop, per that spec's Testing Decisions), so they have no need for ``test_policy_pipeline_eval.py``'s

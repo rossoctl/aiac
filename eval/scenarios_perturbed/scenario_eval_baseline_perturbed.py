@@ -1,5 +1,5 @@
 """Semantic-perturbation sibling of ``scenario_eval_baseline.py`` (spec:
-``docs/specs/eval/policy-eval-robustness-consistency.md``).
+``docs/evaluation/policy-eval-robustness-consistency.md``).
 
 Same structure (names, ``USERS``, and all pair-lists are byte-identical to the original), reworded
 prose only: every ``AGENTS``/``TOOLS``/``USER_ROLES`` description below is a different phrasing of

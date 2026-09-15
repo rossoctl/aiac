@@ -1,4 +1,4 @@
-"""Unit tests for ``correctness_scorer.py`` (spec: ``docs/specs/eval/
+"""Unit tests for ``correctness_scorer.py`` (spec: ``docs/evaluation/
 policy-eval-correctness-prb.md``).
 
 Pure-logic, unmarked — runs in the default fast pass (``testpaths`` already includes ``eval/``).

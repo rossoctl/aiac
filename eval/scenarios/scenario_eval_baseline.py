@@ -2,7 +2,7 @@
 
 Companion to ``scenario.py`` (the canonical single-agent/single-tool scenario) and to
 ``scenario_uc1.py`` (the UC-1 onboarding oracle) for ``test_policy_pipeline_eval.py`` (spec:
-``docs/specs/eval/policy-eval-scenarios.md``). This is the suite's one deliberately
+``docs/evaluation/policy-eval-scenarios.md``). This is the suite's one deliberately
 code/user-role-devops-flavored (software-engineering) scenario — every other scenario in the family uses a
 non-code domain.
 
@@ -14,7 +14,7 @@ role->access facts (``user-role-developer`` reaches both agents; ``user-role-tes
 
 Unlike ``scenario_eval_baseline.py``'s previous revision, this scenario carries **no**
 agent-to-agent delegation grant — that mechanism now has its own dedicated scenario,
-``scenario_eval_agent_delegation.py`` (``test/integration/``).
+``scenario_eval_agent_delegation.py`` (``test/system/``).
 
 Pure data: no imports beyond ``__future__``, mirroring ``scenario.py``.
 """

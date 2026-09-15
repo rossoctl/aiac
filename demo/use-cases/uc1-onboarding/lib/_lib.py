@@ -1,6 +1,6 @@
 """Shared machinery for the UC-1 onboarding demo's numbered scripts: config, kubectl/opa helpers,
 Keycloak helpers, and terminal narration. Standalone by design (some overlap with
-``test/integration/launcher.py`` and ``uc1_onboard.py`` is deliberate) — this demo ships and runs
+``test/system/launcher.py`` and ``uc1_onboard.py`` is deliberate) — this demo ships and runs
 independently of the ``test/`` tree.
 
 Strictly-live, no-fallback demo: every helper here either succeeds or calls ``abort()``/raises. There

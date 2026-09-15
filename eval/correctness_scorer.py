@@ -1,5 +1,5 @@
 """Reusable precision/recall + denial-precision scorer for gate-classified grant-pair sets (spec:
-``docs/specs/eval/policy-eval-correctness-prb.md``).
+``docs/evaluation/policy-eval-correctness-prb.md``).
 
 Pure logic, no I/O, no LLM. Generic over any caller's own ``granted``/``denied``/``expected`` gate
 dicts (each a mapping of gate name -> ``set[tuple[str, str]]``) — not PRB-specific, so both this

@@ -1,7 +1,7 @@
 """Scenario 6 — ambiguous clause: 1 user, 1 agent, 1 tool, education/registrar domain.
 
 Companion to ``scenario_eval_baseline.py`` (Scenario 1) for ``test_policy_pipeline_eval.py`` (spec:
-``docs/specs/eval/policy-eval-scenarios.md``). Isolates one aspect: a broad-sounding grant clause
+``docs/evaluation/policy-eval-scenarios.md``). Isolates one aspect: a broad-sounding grant clause
 whose scope is narrowed by an explicit in-clause qualifier.
 
 The policy text grants "user-role-enrollment-advisor ... access to enrollment information," which
