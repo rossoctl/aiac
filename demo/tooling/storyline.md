@@ -83,7 +83,6 @@ role plus one client scope, bound to the client. The following agent roles were 
 ### Find every existing client that could invoke this agent
 Any client already defined in the system is a potential caller, so all {client_count} are
 read and their roles collected — that is the population the policy gets judged against.
-The agent's own roles are left out: it is not a caller of itself.
 
 ### Read the relevant users and their role assignments
 Roles are flattened first, so a role held through a parent role counts the same as one
