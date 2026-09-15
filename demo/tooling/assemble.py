@@ -791,7 +791,7 @@ def main() -> None:
         narration_steps(logs / "keycloak.log", "keycloak"),
     )
     add(
-        "make prereqs — verify cluster, AIAC stack, demo workloads, Keycloak registration",
+        "make prereqs — verify the cluster, the services, and the workloads",
         narration_steps(logs / "prereqs.log", "prereqs"),
     )
     add(
@@ -820,7 +820,7 @@ def main() -> None:
         phrase=phrase_for(agent_phrases, "Classified") or phrase_for(agent_phrases, "AgentCard"),
     )
     add(
-        "Sweep every client in the realm to build the candidate set",
+        "Find every existing client that could invoke this agent",
         idp_phase(agent_recs, "candidates"),
     )
     add(

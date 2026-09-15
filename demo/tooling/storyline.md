@@ -33,7 +33,7 @@ error, so the script and the capture cannot drift apart silently.
   | `{agent_spiffe}` / `{agent_uuid}` | the agent's clientId and resolved Keycloak UUID |
   | `{tool_spiffe}` / `{tool_uuid}` | the tool's clientId and resolved UUID |
   | `{client_count}` | how many clients the realm sweep actually returned |
-  | `{agent_roles}` / `{agent_role_count}` | the `aiac.managed` roles provisioned for the agent |
+  | `{agent_roles}` / `{agent_role_count}` | the roles provisioned for the agent |
   | `{tool_scopes}` | the client scopes discovered for the tool |
   | `{policy_text}` | the scenario policy, lifted from the prompt the run actually sent |
 
@@ -48,10 +48,10 @@ error, so the script and the capture cannot drift apart silently.
 Port-forwarded the in-cluster Keycloak to localhost:18080 and read the admin credentials
 from the keycloak-admin-secret, so every later target can reach it.
 
-### `make prereqs` — verify cluster, AIAC stack, demo workloads, Keycloak registration
-Confirmed the cluster, the AIAC stack in aiac-system, and the github-agent/github-tool
-workloads in team1 were all present, both Keycloak clients registered, and github-tool's
-Service carries the protocol.rossoctl.io/mcp label tool discovery needs.
+### `make prereqs` — verify the cluster, the services, and the workloads
+Confirmed the cluster, the policy services, and the agent and tool workloads are all
+running, both are registered in the IdP, and the tool's Service carries the label that
+makes its capabilities discoverable.
 
 ### `make clear` — reset to a clean slate
 Removed provisioned roles/scopes, deleted the AuthorizationPolicy CR, and cleared local
@@ -60,8 +60,7 @@ generated/ snapshots, so this run starts from a known-empty baseline.
 ### `make setup` — provision users/roles, mount policy.md, configure token exchange
 Provisioned dev-user/test-user/devops-user with their realm roles, resolved both workloads'
 Keycloak client UUIDs, and enabled RFC 8693 token exchange on the agent's client. The whole
-access policy is mounted as `/etc/aiac/policy.md` — four lines of English, no YAML and no
-per-scope tables: "{policy_text}"
+access policy is four lines of English — no YAML, no per-scope tables: "{policy_text}"
 
 ### Starting point: no access rules exist
 Three users with job titles. No rules about what they may reach.
@@ -81,27 +80,20 @@ resource, a tool's from querying `tools/list`. Each declared skill then becomes 
 role plus one client scope, bound to the client — here {agent_role_count} of them:
 `{agent_roles}`.
 
-### Sweep every client in the realm to build the candidate set
-The realm already holds roles from previously onboarded clients, so the candidate set is
-not just the roles created a moment ago. Sweep every client configured in the system
-({client_count} on this run) and collect the existing roles, so the policy can be evaluated
-against the full population to determine which roles it authorizes to invoke this agent.
-Candidates are selected by ownership, never by name, and the agent's own roles are excluded
-from its own candidate set.
+### Find every existing client that could invoke this agent
+Any client already defined in the system is a potential caller, so all {client_count} are
+read and their roles collected — that is the population the policy gets judged against.
+The agent's own roles are left out: it is not a caller of itself.
 
 ### Read the relevant users and their role assignments
-Roles are flattened to their closure (`flatten_role`) before any policy call, so a role
-held through a composite parent counts the same as one assigned directly. A realm role
-qualifies as a user role only if some user actually holds it and no service owns it —
-membership-derived, not `aiac.managed`.
+Roles are flattened first, so a role held through a parent role counts the same as one
+assigned directly. A role counts as a user's only if someone actually holds it and no
+service owns it.
 
 ### Merge per-client role ownership into the realm-wide role list
-A role's `kind` decides whose it is: `kind=User` is a realm role held by humans
-(`actorIds` = usernames), `kind=Agent` is a client role owned by an agent (`actorIds` =
-its serviceId). The realm-wide list returns full structure but leaves both fields at their
-defaults, so agent-owned roles arrive looking like user roles; only the per-client read
-carries the true values. Merging `kind`/`actorIds` onto the realm object is what separates
-the agent's own roles from human-held ones.
+A role's `kind` says whose it is — held by a human, or owned by an agent. The realm-wide
+list leaves that field at its default, so agent-owned roles arrive looking like human ones;
+only the per-client read carries the truth. Merging the two is what tells them apart.
 
 ### Proposer pass: an LLM grants per role/scope pair against policy.md
 Determines, for each (role, scope) pair, whether the policy authorizes it. The policy is
