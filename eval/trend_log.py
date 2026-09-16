@@ -65,6 +65,24 @@ def pool_correctness_metrics(entries: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def pool_robustness_metrics(invariant_flags: list[bool], sensitive_flags: list[bool]) -> dict[str, Any]:
+    """Pool per-scenario ``invariant``/``sensitive`` booleans recorded by
+    ``test_prb_invariant_to_mechanical_perturbation``/``test_prb_sensitive_to_mechanical_edit``
+    (``eval/test_policy_pipeline_robustness.py``) into one run's ``invariance_rate``/
+    ``sensitivity_rate`` -- spec: ``docs/specs/eval/eval-framework.md`` §9, which names both rates
+    explicitly as trend-log columns. Reported as two separate rates, never blended into one score
+    (spec §4) -- a run need not have scored both families in equal numbers (e.g. a ``-k`` filter),
+    so each list is pooled independently.
+
+    Vacuously ``1.0`` when a list is empty, same convention as ``pool_correctness_metrics``.
+    """
+    return {
+        "scenarios_scored": max(len(invariant_flags), len(sensitive_flags)),
+        "invariance_rate": (sum(invariant_flags) / len(invariant_flags)) if invariant_flags else 1.0,
+        "sensitivity_rate": (sum(sensitive_flags) / len(sensitive_flags)) if sensitive_flags else 1.0,
+    }
+
+
 def append_row(
     suite: str,
     metrics: dict[str, Any],

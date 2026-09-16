@@ -27,14 +27,14 @@ AGENTS: dict[str, dict] = {
             "look at and change what's stored in it."
         ),
         "inbound_scopes": {
-            "agent-scope-repo-access": (
+            "agent-scope-coder": (
                 "Lets a holder use the repo agent's source-code abilities: looking at repository "
                 "contents and changing them."
             ),
         },
         "delegation_scopes": {},
         "roles": {
-            "agent-role-repo-operations": (
+            "agent-role-coder": (
                 "Covers both reading and writing source repository contents: listing files, "
                 "reading them, creating new ones, and editing existing ones."
             ),
@@ -46,13 +46,13 @@ AGENTS: dict[str, dict] = {
             "filing, and updating issues along with their comment threads."
         ),
         "inbound_scopes": {
-            "agent-scope-tracker-access": (
+            "agent-scope-triager": (
                 "Lets a holder use the tracker agent's issue-tracking abilities: reading and updating issues."
             ),
         },
         "delegation_scopes": {},
         "roles": {
-            "agent-role-tracker-operations": (
+            "agent-role-triager": (
                 "Covers both reading and writing on the issue tracker: reading, filing, updating, "
                 "and commenting on issues and their threads."
             ),
@@ -121,16 +121,16 @@ USER_ROLES: dict[str, str] = {
 # Byte-identical to the original — reworded descriptions above don't change the truth table.
 
 INBOUND_PAIRS: list[tuple[str, str]] = [
-    ("user-role-developer", "agent-scope-repo-access"),
-    ("user-role-developer", "agent-scope-tracker-access"),
-    ("user-role-tester", "agent-scope-tracker-access"),
+    ("user-role-developer", "agent-scope-coder"),
+    ("user-role-developer", "agent-scope-triager"),
+    ("user-role-tester", "agent-scope-triager"),
 ]
 
 OUTBOUND_PAIRS: list[tuple[str, str]] = [
-    ("agent-role-repo-operations", "tool-scope-repo-read"),
-    ("agent-role-repo-operations", "tool-scope-repo-write"),
-    ("agent-role-tracker-operations", "tool-scope-tracker-read"),
-    ("agent-role-tracker-operations", "tool-scope-tracker-write"),
+    ("agent-role-coder", "tool-scope-repo-read"),
+    ("agent-role-coder", "tool-scope-repo-write"),
+    ("agent-role-triager", "tool-scope-tracker-read"),
+    ("agent-role-triager", "tool-scope-tracker-write"),
 ]
 
 OUTBOUND_SUBJECT_PAIRS: list[tuple[str, str]] = [

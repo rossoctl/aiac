@@ -334,7 +334,7 @@ def render_svg_chart(rows: list[dict[str, Any]], reports: list[ParsedReport], *,
         for metric, color in _METRIC_COLORS.items()
     )
     parts.append(f'<div class="legend">{legend}</div>')
-    return "".join(parts)
+    return f'<div class="chart-wrap">{"".join(parts)}</div>'
 
 
 def _fmt_metric(value: float | None) -> str:
@@ -381,7 +381,12 @@ a { color: #8ab4f8; }
 table { border-collapse: collapse; margin: 0.5rem 0 1.5rem; width: 100%; }
 th, td { border: 1px solid #444; padding: 4px 8px; text-align: left; font-size: 0.85rem; }
 th { background: #1e1e1e; }
-.legend { margin-top: 0.25rem; }
+.trends-grid { display: flex; flex-wrap: wrap; gap: 1.5rem; justify-content: center; }
+.trend-section { flex: 1 1 45%; min-width: 320px; }
+.section-summary { font-size: 1.5rem; font-weight: 600; margin: 1rem 0; cursor: pointer; }
+.chart-wrap { width: 100%; margin: 0 auto; }
+.chart-wrap svg { display: block; width: 100%; height: auto; }
+.legend { margin-top: 0.25rem; text-align: center; }
 .legend-item { margin-right: 1rem; font-size: 0.85rem; }
 .legend-swatch { display: inline-block; width: 10px; height: 10px; margin-right: 4px; }
 details { margin-bottom: 0.5rem; }
@@ -397,13 +402,14 @@ def render_dashboard(trend_rows: list[dict[str, Any]], reports: list[ParsedRepor
     suites = sorted({row["suite"] for row in trend_rows if "suite" in row})
     if suites:
         chart_sections = "".join(
-            f"<section><h3>{suite}</h3>"
+            f'<section class="trend-section"><h3>{suite}</h3>'
             + render_svg_chart([row for row in trend_rows if row.get("suite") == suite], reports, suite=suite)
             + "</section>"
             for suite in suites
         )
+        trends_body = f'<div class="trends-grid">{chart_sections}</div>'
     else:
-        chart_sections = "<p>No trend-log rows yet — run an eval suite to populate eval/trend_log.jsonl.</p>"
+        trends_body = "<p>No trend-log rows yet — run an eval suite to populate eval/trend_log.jsonl.</p>"
 
     tables = "".join(render_scenario_table(report) for report in reports)
     drilldown_sections = (
@@ -414,8 +420,9 @@ def render_dashboard(trend_rows: list[dict[str, Any]], reports: list[ParsedRepor
         "<!doctype html><html><head><meta charset='utf-8'><title>AIAC eval dashboard</title>"
         f"<style>{_STYLE}</style></head><body>"
         "<h1>AIAC eval results dashboard</h1>"
-        "<h2>Historical trends</h2>"
-        f"{chart_sections}"
+        '<details open class="trends-details"><summary class="section-summary">Historical trends</summary>'
+        f"{trends_body}"
+        "</details>"
         "<h2>Scenario drill-down</h2>"
         f"{drilldown_sections}"
         "</body></html>"
