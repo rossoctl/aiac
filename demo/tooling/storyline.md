@@ -107,9 +107,12 @@ evaluator rejected it — the policy also says developers read issues. Sent back
 reason, the retry returned both scopes and was approved.
 
 ### Compile the decisions to OPA Rego and apply the agent's AuthorizationPolicy
-The request body is the resolved rule set — allow/deny rules per gate, the subject->role
-and target->scope maps, default_effect Deny. The writer compiles it to Rego and patches the
-AuthorizationPolicy that AuthBridge's OPA plugin evaluates.
+The request body carries the resolved rule set — allow/deny rules per gate, the
+subject->role and target->scope maps, default_effect Deny. The writer turns each gate's maps
+into one Rego package with a fixed name and `default allow := false`, so a request passes
+only if an ALLOW rule matches and no DENY rule does. Both packages go into the
+AuthorizationPolicy in a single apply; the byte sizes in the note below are the compiler's
+output, and the next task reads the Rego itself back.
 
 ### Persist the computed policy to the Policy Model Store
 The same path answered 404 (nothing stored yet) before the write and returns the stored

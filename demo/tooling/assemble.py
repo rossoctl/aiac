@@ -774,7 +774,9 @@ def main() -> None:
         # "Steps performed" output. Attached to the first step so the narration keeps the
         # wording the emitting code chose.
         if phrase and steps:
-            phrase = phrase.replace(" CR applied", " applied")
+            phrase = phrase.replace(" CR applied", " applied").replace(
+                " CR (rego sizes:", " (rego sizes:"
+            )
             joined = " · ".join(x for x in (steps[0].get("explain"), phrase) if x)
             steps = [dict(steps[0], explain=joined)] + steps[1:]
         # A task with no replayable step has nothing for the video to show. The Pause-3 diff
@@ -843,7 +845,14 @@ def main() -> None:
         "Compile the decisions to OPA Rego and apply the agent's AuthorizationPolicy",
         [step(r) for r in by(agent_recs, "policy-writer")],
     
-        phrase=phrase_for(agent_phrases, "AuthorizationPolicy", "applied"),
+        phrase=" · ".join(
+            x
+            for x in (
+                phrase_for(agent_phrases, "Applying AuthorizationPolicy"),
+                phrase_for(agent_phrases, "AuthorizationPolicy", "applied"),
+            )
+            if x
+        ),
     )
     add(
         "Persist the computed policy to the Policy Model Store",
@@ -883,7 +892,14 @@ def main() -> None:
         "Recompile the AGENT's Rego to fill in its outbound gate",
         [step(r) for r in by(tool_recs, "policy-writer")],
     
-        phrase=phrase_for(tool_phrases, "AuthorizationPolicy", "applied"),
+        phrase=" · ".join(
+            x
+            for x in (
+                phrase_for(tool_phrases, "Applying AuthorizationPolicy"),
+                phrase_for(tool_phrases, "AuthorizationPolicy", "applied"),
+            )
+            if x
+        ),
     )
     add(
         "Persist the updated policy model",
