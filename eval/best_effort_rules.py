@@ -8,36 +8,31 @@ from __future__ import annotations
 
 from typing import Any
 
-from aiac.policy.model.models import PolicyRule, RuleEffect
+from aiac.agent.policy_rules_builder.graph import _assemble_rules
+from aiac.policy.model.models import PolicyRule
 
 
 def _best_effort_rules(entity: dict[str, Any], state: dict[str, Any]) -> list[PolicyRule]:
-    """Replicate ``graph.py``'s ``build`` node logic (role-focal or scope-focal, whichever
-    ``entity``'s shape indicates) against a proposal the auditor never approved — ALLOW from the
-    granted names, DENY from the explicit prohibitions only (digested input carries no exclusivity,
-    so there is no derived complement), same ALLOW-then-DENY ``PolicyRule`` shape (``graph.py``'s
-    ``build_role_graph``/``build_scope_graph`` closures, not importable — they're nested — hence
-    replicated here rather than reused).
+    """Build a best-effort rule set for a proposal the auditor never approved, using the SAME
+    assembly the real graph does — ``graph._assemble_rules`` (ALLOW from granted names, then DENY
+    from explicit prohibitions, each in candidate order). Reusing the shared helper means this
+    replica cannot silently diverge from ``build_role_graph``/``build_scope_graph`` (whose build
+    closures are nested and so not directly importable); only the role-focal vs scope-focal
+    ``make_rule`` direction is chosen here from ``entity``'s shape.
 
     Only ever called from ``eval.test_policy_pipeline_eval._invoke_graph`` after catching a
     rejection; the caller is responsible for flagging the result as best-effort (not a real,
     auditor-approved decision) — see ``orchestrate_prb``'s ``best_effort_notes``.
     """
-    selected = set(state.get("selected_names", []))
-    denied = set(state.get("denied_names", []))
+    selected = state.get("selected_names", [])
+    denied = state.get("denied_names", [])
     if "role" in entity:  # ROLE_GRAPH shape: role-focal
         role = entity["role"]
-        candidate_scopes = entity["scopes"]
-        allows = [
-            PolicyRule(role=role, scope=sc, effect=RuleEffect.ALLOW) for sc in candidate_scopes if sc.name in selected
-        ]
-        denies = [
-            PolicyRule(role=role, scope=sc, effect=RuleEffect.DENY) for sc in candidate_scopes if sc.name in denied
-        ]
-        return allows + denies
+        return _assemble_rules(
+            entity["scopes"], selected, denied, lambda sc, effect: PolicyRule(role=role, scope=sc, effect=effect)
+        )
     # SCOPE_GRAPH shape: scope-focal
     scope = entity["scope"]
-    candidate_roles = entity["roles"]
-    allows = [PolicyRule(role=r, scope=scope, effect=RuleEffect.ALLOW) for r in candidate_roles if r.name in selected]
-    denies = [PolicyRule(role=r, scope=scope, effect=RuleEffect.DENY) for r in candidate_roles if r.name in denied]
-    return allows + denies
+    return _assemble_rules(
+        entity["roles"], selected, denied, lambda r, effect: PolicyRule(role=r, scope=scope, effect=effect)
+    )

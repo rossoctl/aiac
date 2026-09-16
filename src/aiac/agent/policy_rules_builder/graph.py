@@ -192,7 +192,8 @@ def _precheck(state: _PRBWorking, *, candidate_names: set[str]) -> dict[str, Any
     # prohibitions now, so overlap can only come from an explicit denied-name that is also granted
     # -- a direct conflict or coarse-scope mismatch. precheck resolves nothing;
     # the auditor adjudicates each conflict name as genuine (raise) vs generation error (retry).
-    conflict = [n for n in keep if n in set(keep_denied)]
+    denied_set = set(keep_denied)
+    conflict = [n for n in keep if n in denied_set]
     return {"selected_names": keep, "denied_names": keep_denied, "conflict_names": conflict}
 
 
@@ -303,6 +304,20 @@ def _assemble(state_type: type, propose, precheck, audit, build):
     return g.compile()
 
 
+def _assemble_rules(candidates, granted_names, denied_names, make_rule):
+    """The single build-node rule assembly: ALLOW from the granted names, then DENY from the
+    (candidate-filtered) explicit prohibitions -- each in candidate order, every rule rebuilt from
+    the typed candidate (never LLM string fields). ``make_rule(candidate, effect)`` constructs the
+    PolicyRule for the pass's direction (role-focal or scope-focal). Shared by both build nodes AND
+    the eval best-effort replica (``eval.best_effort_rules``) so the assembly lives in ONE place and
+    the eval cannot silently diverge from the real graph."""
+    granted = set(granted_names)
+    denied = set(denied_names)
+    allows = [make_rule(c, RuleEffect.ALLOW) for c in candidates if c.name in granted]
+    denies = [make_rule(c, RuleEffect.DENY) for c in candidates if c.name in denied]
+    return allows + denies
+
+
 def build_role_graph():
     """Role-focal PRB graph: given a focal role, decide which candidate scopes it is granted and
     which it is explicitly prohibited. ALLOW from the granted names, DENY from the explicit
@@ -327,18 +342,13 @@ def build_role_graph():
         return _audit(s, focal=_role_focal(s["role"]), candidates=_scope_cands(s["scopes"]), direction=_ROLE_DIRECTION)
 
     def build(s: RoleRulesState) -> dict[str, Any]:
-        # ALLOW from granted names first, then DENY from the (candidate-filtered) explicit
-        # prohibitions -- every rule rebuilt from the typed scopes (never LLM string fields),
-        # each in candidate order.
-        granted = set(s["selected_names"])
-        denied = set(s["denied_names"])
-        allows = [
-            PolicyRule(role=s["role"], scope=sc, effect=RuleEffect.ALLOW) for sc in s["scopes"] if sc.name in granted
-        ]
-        denies = [
-            PolicyRule(role=s["role"], scope=sc, effect=RuleEffect.DENY) for sc in s["scopes"] if sc.name in denied
-        ]
-        return {"rules": allows + denies}
+        rules = _assemble_rules(
+            s["scopes"],
+            s["selected_names"],
+            s["denied_names"],
+            lambda sc, effect: PolicyRule(role=s["role"], scope=sc, effect=effect),
+        )
+        return {"rules": rules}
 
     return _assemble(RoleRulesState, propose, precheck, audit, build)
 
@@ -363,15 +373,13 @@ def build_scope_graph():
         return _audit(s, focal=_scope_focal(s["scope"]), candidates=_role_cands(s["roles"]), direction=_SCOPE_DIRECTION)
 
     def build(s: ScopeRulesState) -> dict[str, Any]:
-        # ALLOW from granted names, DENY from explicit prohibitions -- every rule rebuilt from the
-        # typed roles (never LLM string fields). Allows first, then denies, each in candidate order.
-        granted = set(s["selected_names"])
-        denied = set(s["denied_names"])
-        allows = [
-            PolicyRule(role=r, scope=s["scope"], effect=RuleEffect.ALLOW) for r in s["roles"] if r.name in granted
-        ]
-        denies = [PolicyRule(role=r, scope=s["scope"], effect=RuleEffect.DENY) for r in s["roles"] if r.name in denied]
-        return {"rules": allows + denies}
+        rules = _assemble_rules(
+            s["roles"],
+            s["selected_names"],
+            s["denied_names"],
+            lambda r, effect: PolicyRule(role=r, scope=s["scope"], effect=effect),
+        )
+        return {"rules": rules}
 
     return _assemble(ScopeRulesState, propose, precheck, audit, build)
 

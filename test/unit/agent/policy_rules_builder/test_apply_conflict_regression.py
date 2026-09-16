@@ -72,6 +72,23 @@ def _focal_own_scope() -> FocalEntitySet:
     )
 
 
+_AGENT_ROLE = Role(id="r-agent", name="repo-agent", composite=False, kind=RoleKind.AGENT)
+_TOOL_SCOPE = Scope(id="s-tool", name="tool-issues")
+
+
+def _focal_agent_own_role() -> FocalEntitySet:
+    """A minimal focal set for an Agent onboarding: one own agent role over one other (tool) scope,
+    no own scopes / candidate roles — enough to drive the agent role-focal pass (build_role_rules),
+    the pass whose focal own-role description can emit a durable DENY (rule 5(b))."""
+    return FocalEntitySet(
+        own_scopes=[],
+        own_roles=[_AGENT_ROLE],
+        candidate_roles=[],
+        other_scopes=[_TOOL_SCOPE],
+        service_type=ServiceType.AGENT,
+    )
+
+
 class _Source:
     """Stub PolicySource whose ``fetch()`` returns a fixed policy string (mirrors ``test_graph.py``)."""
 
@@ -361,6 +378,43 @@ def test_build_raises_cross_service_conflict_from_applied_store_rules():
     c = report.conflicts[0]
     assert (c.role.id, c.scope.id) == ("r-tester", "s-iss")
     assert c.focal.type is FocalType.SCOPE
+
+
+def test_role_focal_deny_collides_cross_service_with_applied_allow_and_raises():
+    # Cross-pass collision the single-pass slice tests (test_graph_live_llm slices 4/6) don't reach:
+    # rule 5(b) makes a focal (agent own-)role's OWN-description prohibition a durable DENY, emitted
+    # here by the agent role-focal pass (build_role_rules). If another service has already applied an
+    # ALLOW on the same (role.id, scope.id), the #2504 combined-state detector raises — identify-
+    # never-reconcile — rather than silently letting the later ALLOW win under deny-overrides. The
+    # DENY's *source* (role-focal description) is irrelevant to the detector; this pins that a durable
+    # deny from this pass participates in cross-service conflict detection.
+    policy = "The repo-agent does not touch the issue tracker."
+    explained = ExplainResult(
+        kind=ConflictKind.DIRECT,
+        granting_quotes=[],
+        prohibiting_quotes=[],
+        explanation="issues is denied here (role description) but already granted for repo-agent",
+    )
+    with (
+        patch(f"{_BUILDER}._config", return_value=MagicMock()),
+        patch(f"{_BUILDER}.resolve_focal_entities", return_value=_focal_agent_own_role()),
+        patch(
+            f"{_BUILDER}.build_role_rules",
+            return_value=[PolicyRule(role=_AGENT_ROLE, scope=_TOOL_SCOPE, effect=RuleEffect.DENY)],
+        ),
+        patch(f"{_BUILDER}.build_scope_rules", return_value=[]),
+        patch(f"{_BUILDER}.get_policy_source", return_value=_Source(policy)),
+        patch(_APPLIED_SEAM, return_value=[PolicyRule(role=_AGENT_ROLE, scope=_TOOL_SCOPE, effect=RuleEffect.ALLOW)]),
+        patch(_EXPLAIN_SEAM, return_value=explained),
+    ):
+        with pytest.raises(PolicyConflictError) as exc:
+            ServicePolicyBuilder.build("svc-agent", ServiceType.AGENT)
+
+    report = exc.value.report
+    assert report.status is ConflictStatus.CONFLICTS_FOUND
+    assert len(report.conflicts) == 1
+    c = report.conflicts[0]
+    assert (c.role.id, c.scope.id) == ("r-agent", "s-tool")
 
 
 def test_cross_service_conflict_raises_before_compute_and_apply_is_atomic():
