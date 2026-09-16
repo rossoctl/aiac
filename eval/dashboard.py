@@ -65,6 +65,17 @@ _SUITE_BY_NODEID_MARKER = {
     "::test_prb_invariant_to_semantic_perturbation[": "robustness_semantic",
 }
 
+# Nodeid substring -> the drill-down table's "Suite" column text specifically -- finer-grained
+# than `_SUITE_BY_NODEID_MARKER` where one trend-log suite name doesn't tell two test functions
+# apart. Both mechanical-tier tests pool into the single `robustness_mechanical` trend-log row (so
+# `entry.suite` must stay that value for `_find_matching_report`'s row-to-report matching to keep
+# working), but they exercise the invariance and sensitivity families respectively -- the table
+# should say which.
+_SUITE_DISPLAY_BY_NODEID_MARKER = {
+    "::test_prb_invariant_to_mechanical_perturbation[": "robustness_mechanical (invariant)",
+    "::test_prb_sensitive_to_mechanical_edit[": "robustness_mechanical (sensitive)",
+}
+
 _RUN_RE = re.compile(r"^Run: (.+)$")
 _HEADING_RE = re.compile(r"^## (\w+) \(\d+\)$")
 _ENTRY_RE = re.compile(r"^### `(.+)`$")
@@ -94,6 +105,7 @@ class ScenarioEntry:
 
     nodeid: str
     suite: str | None = None
+    suite_display: str | None = None
     scenario: str | None = None
     category: str = ""
     what_it_tests: str | None = None
@@ -118,6 +130,13 @@ def _suite_for_nodeid(nodeid: str) -> str | None:
         if marker in nodeid:
             return suite
     return None
+
+
+def _suite_display_for_nodeid(nodeid: str, suite: str) -> str:
+    for marker, display in _SUITE_DISPLAY_BY_NODEID_MARKER.items():
+        if marker in nodeid:
+            return display
+    return suite
 
 
 def _scenario_for_nodeid(nodeid: str) -> str | None:
@@ -178,6 +197,7 @@ def parse_report(path: Path) -> ParsedReport:
             entry = ScenarioEntry(
                 nodeid=nodeid,
                 suite=suite,
+                suite_display=_suite_display_for_nodeid(nodeid, suite) if suite is not None else None,
                 # Only meaningful for a correctness-suite entry -- the bracket for any other
                 # suite's nodeid (e.g. eval_extended's ``test_inbound[scenario-agent-subject]``)
                 # is a different, non-scenario parametrize id.
@@ -380,7 +400,7 @@ def render_scenario_table(report: ParsedReport) -> str:
         return ""
     rows_html = "".join(
         "<tr>"
-        f"<td>{_escape_cell(e.suite or '')}</td><td>{_escape_cell(e.scenario or '')}</td><td>{_escape_cell(e.category)}</td>"
+        f"<td>{_escape_cell(e.suite_display or e.suite or '')}</td><td>{_escape_cell(e.scenario or '')}</td><td>{_escape_cell(e.category)}</td>"
         f"<td>{_fmt_metric(e.precision)}</td><td>{_fmt_metric(e.recall)}</td><td>{_fmt_metric(e.denial_precision)}</td>"
         f"<td>{_escape_cell(e.over_grants)}</td><td>{_escape_cell(e.under_grants)}</td><td>{_escape_cell(e.incorrectly_denied)}</td>"
         "</tr>"

@@ -429,6 +429,44 @@ def test_render_scenario_table_includes_robustness_entries() -> None:
     assert "baseline" in table
 
 
+def test_render_scenario_table_distinguishes_mechanical_invariant_and_sensitive(tmp_path: Path) -> None:
+    """Both mechanical-tier test functions pool into the single `robustness_mechanical` trend-log
+    suite, but the drill-down table's Suite column should still say which family each entry is --
+    invariance or sensitivity -- rather than showing the same bare `robustness_mechanical` label
+    for both."""
+    body = (
+        "## passed (2)\n\n"
+        "### `eval/test_policy_pipeline_robustness.py::test_prb_invariant_to_mechanical_perturbation[baseline]`\n"
+        "- **Precision:** 1.000\n"
+        "- **Recall:** 1.000\n"
+        "- **Denial precision:** 1.000\n"
+        "- **Over-grants:** none\n"
+        "- **Under-grants:** none\n"
+        "- **Incorrectly denied:** none\n\n"
+        "### `eval/test_policy_pipeline_robustness.py::test_prb_sensitive_to_mechanical_edit[baseline]`\n"
+        "- **Precision:** 1.000\n"
+        "- **Recall:** 1.000\n"
+        "- **Denial precision:** 1.000\n"
+        "- **Over-grants:** none\n"
+        "- **Under-grants:** none\n"
+        "- **Incorrectly denied:** none\n\n"
+    )
+    path = _write_report(tmp_path, body)
+
+    report = parse_report(path)
+
+    invariant_entry, sensitive_entry = report.entries
+    assert invariant_entry.suite == "robustness_mechanical"
+    assert sensitive_entry.suite == "robustness_mechanical"
+    assert invariant_entry.suite_display == "robustness_mechanical (invariant)"
+    assert sensitive_entry.suite_display == "robustness_mechanical (sensitive)"
+
+    table = render_scenario_table(report)
+
+    assert "robustness_mechanical (invariant)" in table
+    assert "robustness_mechanical (sensitive)" in table
+
+
 def test_render_scenario_table_escapes_html_and_preserves_multiline_breaks() -> None:
     entry = ScenarioEntry(
         nodeid="eval/test_policy_pipeline_correctness_prb.py::test_prb_correctness[baseline]",
