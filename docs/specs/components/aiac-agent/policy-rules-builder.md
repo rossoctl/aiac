@@ -457,10 +457,16 @@ user-role-focal deny-only pass whose sole purpose was deriving that complement.
   **explicit** prohibition per pair (*"R may not access S2"*), which the scope-focal pass reads
   directly as a Rule-5 explicit-prohibition `DENY(R, S2)` when focal on `S2`. The role-focal
   derivation is thus redundant.
-- **Gated on parity.** Door B's deletion is validated by a live-LLM eval scenario carrying an
-  **explicit user-role deny**, asserting the scope-focal pass emits those `(user_role, own_scope)`
-  denies — a silently dropped deny would be a **broadening** of access, the one failure mode this
-  guards against.
+- **Gated on parity (two layers).** A silently dropped user-role deny would be a **broadening** of
+  access — the failure mode this removal must guard against — so it is pinned twice. The
+  **deterministic plumbing** (an explicit `(user_role, own_scope)` prohibition the proposer surfaces
+  survives precheck and is built as a `DENY`) is a **hermetic unit test**
+  (`test_graph.test_scope_focal_emits_user_role_deny_from_explicit_prohibition`) that fails a bare
+  offline `pytest` if a precheck/build regression drops it. That the **prompt** actually elicits the
+  deny from an explicit policy prohibition is verified end-to-end by the live-LLM
+  `test_graph_live_llm.test_user_role_explicit_deny_captured_by_scope_focal_pass` (opt-in `-m llm`).
+  A *prompt* regression is inherently only catchable in the live lane — no offline test can assert
+  the LLM still emits the name — so the two layers are complementary, not redundant.
 - **Durable user-role denies are policy-stated.** A durable user-role `DENY` must come from an
   **explicit prohibition in the (digested) policy** — the scope-focal pass reads it as a Rule-5
   policy prohibition on that `(user_role, scope)` pair. A prohibition left *only* in a user role's

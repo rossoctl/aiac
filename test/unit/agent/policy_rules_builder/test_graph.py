@@ -419,6 +419,44 @@ def test_direct_prohibition_yields_deny_scope_direction():
 
 
 # --------------------------------------------------------------------------- #
+# Door-B-removal parity (deterministic, OFFLINE). Retiring Door B relies on the  #
+# scope-focal pass emitting user-role denies directly. This pins the plumbing    #
+# hermetically: an explicit prohibition of a USER-kind candidate role, once the  #
+# proposer surfaces it, survives precheck and is built as DENY(user_role, scope) #
+# — so a precheck/build regression that dropped user-role denies fails a bare    #
+# `pytest`. (`_role` builds RoleKind.USER by default.) The PROMPT half — that a   #
+# real LLM actually elicits the deny — is inherently live-LLM and lives in       #
+# test_graph_live_llm.test_user_role_explicit_deny_captured_by_scope_focal_pass. #
+# --------------------------------------------------------------------------- #
+def test_scope_focal_emits_user_role_deny_from_explicit_prohibition():
+    source = _scope("s-src", "source")
+    developer = _role("r-dev", "developer")  # RoleKind.USER by default
+    tester = _role("r-tst", "tester")
+
+    with ExitStack() as stack:
+        stack.enter_context(patch("aiac.agent.policy_rules_builder.graph.get_policy_source", return_value=_Source()))
+        stack.enter_context(
+            patch(
+                "aiac.agent.policy_rules_builder.graph._structured_call",
+                side_effect=[
+                    ScopeSelection(
+                        roles_with_access_names=["developer"],
+                        roles_denied_access_names=["tester"],
+                        reasoning="developers may access source; testers must not",
+                    ),
+                    AuditVerdict(approved=True),
+                ],
+            )
+        )
+        rules = build_scope_rules([developer, tester], source)
+
+    assert rules == [
+        PolicyRule(role=developer, scope=source, effect=RuleEffect.ALLOW),
+        PolicyRule(role=tester, scope=source, effect=RuleEffect.DENY),
+    ]
+
+
+# --------------------------------------------------------------------------- #
 # Selection schemas carry NO exclusivity flag (digested input bans "only", so    #
 # there is no derived complement -- see the PRB spec's design decision). This    #
 # guards the removal from silently regressing.                                  #

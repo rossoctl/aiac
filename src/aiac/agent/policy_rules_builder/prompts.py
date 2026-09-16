@@ -31,7 +31,8 @@ _GENERIC_POLICY = (Path(__file__).parent / "generic_policy.md").read_text(encodi
 def _policy_block(policy_text: str) -> str:
     """Compose the POLICY block in three labeled layers: the least-privilege directive, then the
     generic baseline (explicitly grants-only — never a source of denials), then the scenario policy.
-    The labels let the deny/exclusivity rules bind to the SCENARIO layer only."""
+    The labels keep the grants-only baseline distinct from the scenario policy, so no deny is ever
+    drawn from the baseline."""
     return (
         f"{_GRANT_ACCESS}\n\n"
         f"BASELINE POLICY (grants only — never a source of denials):\n{_GENERIC_POLICY}\n\n"
@@ -122,9 +123,9 @@ _MAPPING_RULES = (
     "per pair, so there is no cross-candidate 'only …' inference to make."
 )
 
-# Deny / exclusivity contract — appended to BOTH the proposer and auditor system messages so the
-# two halves of the LLM contract cannot diverge. Deny extraction is SCENARIO-only; the baseline
-# is grants-only.
+# Deny contract — appended to BOTH the proposer and auditor system messages so the two halves of
+# the LLM contract cannot diverge. Denies come only from the scenario policy and the focal entity's
+# own description, never from the grants-only baseline.
 _DENY_RULES = (
     "\nThe remaining rules concern PROHIBITIONS. A prohibition has exactly two sources — the SCENARIO "
     "policy and the FOCAL entity's own description — never a candidate's description, and never the "
