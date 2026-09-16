@@ -147,8 +147,7 @@ def test_allow_only_scope_direction():
 # outbound leg — so the only variable is the focal scope: here a single COARSE    #
 # capability bundling read+write+search+comments+sub-issues+pull-requests. Both   #
 # developer ("read access to issues") and tester ("full read and write access to  #
-# issues") must upward-project onto it (rule 3); devops carries an explicit        #
-# description-driven DENY (its description disclaims managing the issue tracker).  #
+# issues") must upward-project onto it (rule 3); devops is a SILENT NON-GRANT.     #
 # Exact set equality: dropping tester (the live miss) fails this fixture cluster- #
 # free, where the mocked suite and the integration convergence probe could not    #
 # see it. Role/scope descriptions are imported from scenario_uc1 (USER_ROLES/     #
@@ -156,8 +155,10 @@ def test_allow_only_scope_direction():
 # now written in the DIGESTED-policy language (explicit direct grants) so the PRB  #
 # is exercised on digested input as in production. The developer's "may read       #
 # issues" grant and the tester's "may read/write issues" grants upward-project     #
-# onto the coarse issue_operations capability (rule 3); devops is description-     #
-# denied. Sourced from disk at test time so an edit can't silently desync.        #
+# onto the coarse issue_operations capability (rule 3); devops earns nothing —      #
+# its description merely disclaims the issue domain (a candidate job-scope note,   #
+# not a prohibition), so it is deny-by-default, matching scenario_uc1's invariant  #
+# that devops appears in no pair-list. Sourced from disk so an edit can't desync.  #
 # --------------------------------------------------------------------------- #
 def test_coarse_agent_scope_upward_projection():
     # Descriptions come verbatim from scenario_uc1 (the strings real UC-1 onboarding feeds the LLM),
@@ -175,10 +176,11 @@ def test_coarse_agent_scope_upward_projection():
 
     rules = _scope_rules(policy, [developer, tester, devops], issue_operations)
 
-    # Both issue-touching roles upward-project onto the coarse capability; devops is explicitly
-    # denied — its description ("does not manage the issue tracker") is a symmetric DENY trigger
-    # (rule 5), read for a candidate exactly as in test_description_driven_deny.
-    assert _role_effects(rules) == {("developer", ALLOW), ("tester", ALLOW), ("devops", DENY)}
+    # Both issue-touching roles upward-project onto the coarse capability; devops earns nothing.
+    # A candidate whose description merely disclaims the issue domain is a silent non-grant
+    # (deny-by-default), NOT a durable DENY — only the FOCAL entity's own description or the
+    # scenario policy can prohibit (see prompts._DENY_RULES rule 5).
+    assert _role_effects(rules) == {("developer", ALLOW), ("tester", ALLOW)}
 
 
 # --------------------------------------------------------------------------- #

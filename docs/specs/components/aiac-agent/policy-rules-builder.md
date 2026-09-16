@@ -171,14 +171,18 @@ return allows + denies   # allows-then-denies, each in candidate order
 > exclusivity flag and no derived complement. See
 > [Design decision: digested input retires exclusivity handling and Door B](#design-decision-digested-input-retires-exclusivity-handling-and-door-b).
 >
-> Deny extraction is bound by **layer, not by source**: it draws on the **scenario layer** — both the
-> scenario digested policy **and** the focal/candidate entity **descriptions** — exactly **symmetric**
-> with the grant side, which already reads descriptions (capability projection, Rule 3). A prohibition
-> stated in a role/scope description (e.g. *"works … not in source"*, *"does not manage the issue
-> tracker"*) is a valid DENY trigger just as a positive description is a valid grant signal. The generic
-> **baseline** (`generic_policy.md`) contributes **grants only** and is never a source of denials. A
-> DENY's whole purpose is to be a **durable prohibition** that survives a later, broader grant under
-> deny-overrides.
+> A DENY has exactly **two sources**: (1) the scenario digested policy prohibiting a pair, and (2) the
+> **focal entity's own** description prohibiting its own access — a prohibition stated in the *focal*
+> role/scope description (e.g. a focal role described as *"does not manage the issue tracker"*) denies
+> that candidate, just as a positive description is a valid grant signal (capability projection, Rule
+> 3). A **candidate's** description that merely disclaims a domain (its job scope) is **context, not a
+> prohibition** — it yields a silent non-grant (deny-by-default), never a durable DENY; inferring a
+> cross-DENY for a candidate from its own job description would over-reach and collide with the
+> deny-by-default baseline the scenarios assume. (This is why grants read focal **and** candidate
+> descriptions, but description-driven *denies* bind to the **focal** side only; policy-stated
+> prohibitions still deny any pair.) The generic **baseline** (`generic_policy.md`) contributes
+> **grants only** and is never a source of denials. A DENY's whole purpose is to be a **durable
+> prohibition** that survives a later, broader grant under deny-overrides.
 
 ### State fields
 
@@ -228,12 +232,12 @@ pair stays a silent non-grant, never an explicit prohibition, so the baseline ne
 
 **Deny rules** (shared by proposer AND auditor — see share note below):
 
-- **Direct-prohibition** trigger as in the deny-extraction callout above; deny extraction is bound to
-  the **scenario layer** (the scenario digested policy **and** focal/candidate descriptions —
-  symmetric with grants; the **baseline** contributes grants only), never source-restricted to the
-  prose; silence imposes nothing. **No exclusivity / "only" rule** — the digested language forbids
-  exclusive language, so every prohibition is an explicit deny direct grant (see the design decision
-  below).
+- **Direct-prohibition** trigger as in the deny-extraction callout above; a DENY comes only from the
+  **scenario digested policy** (any pair) or the **focal entity's own** description (its own access) —
+  a **candidate's** job-scope description is context, never a durable DENY; the **baseline** contributes
+  grants only, and silence imposes nothing. **No exclusivity / "only" rule** — the digested language
+  forbids exclusive language, so every prohibition is an explicit deny direct grant (see the design
+  decision below).
 - The two name lists (granted / denied) are **mutually exclusive except** when the policy genuinely
   establishes both a grant and a prohibition for the same candidate (direct conflict or coarse-scope)
   — that overlap is the **contradiction signal**, not a normal proposal.
