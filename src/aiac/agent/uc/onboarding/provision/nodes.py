@@ -28,6 +28,7 @@ from .types import RoleDefinition, ScopeDefinition, ServiceProvision
 _TYPE_LABEL = "rossoctl.io/type"
 _MCP_LABEL = "protocol.rossoctl.io/mcp"
 
+
 @dataclass(frozen=True)
 class _WaitConfig:
     """A bounded deploy->onboard race-tolerance poll. ``attempts_env``/``backoff_env`` name the

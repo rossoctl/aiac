@@ -488,11 +488,13 @@ def _kind_cluster_name() -> str:
     try:
         ctx = subprocess.run(
             ["kubectl", "config", "current-context"],
-            check=True, capture_output=True, text=True,
+            check=True,
+            capture_output=True,
+            text=True,
         ).stdout.strip()
     except (subprocess.CalledProcessError, OSError):
         return "rossoctl"
-    return ctx[len("kind-"):] if ctx.startswith("kind-") else "rossoctl"
+    return ctx[len("kind-") :] if ctx.startswith("kind-") else "rossoctl"
 
 
 def load_workload_images(workloads: Sequence[str]) -> None:
@@ -971,8 +973,12 @@ def onboarded_stack(
     # clients actually gone before deploying.
     undeploy_workload(scn.AGENT_WORKLOAD)
     undeploy_workload(scn.TOOL_WORKLOAD)
-    _scrub_to_pristine(admin)  # clients + *-aud scopes + agent CR + stray AuthorizationPolicy CRs + roles/scopes + store
-    reenable_provisioned_clients(admin, TEST_REALM)  # undo any prior run's failed-service disable (a no-op once scrubbed)
+    _scrub_to_pristine(
+        admin
+    )  # clients + *-aud scopes + agent CR + stray AuthorizationPolicy CRs + roles/scopes + store
+    reenable_provisioned_clients(
+        admin, TEST_REALM
+    )  # undo any prior run's failed-service disable (a no-op once scrubbed)
     if not poll_until(lambda: not workload_clients_present(admin), timeout=DEPLOY_TIMEOUT, interval=5):
         raise RuntimeError(
             f"pre-run cleanup left Keycloak client(s) {workload_clients_present(admin)} for {NAMESPACE!r} — the "
@@ -1024,7 +1030,9 @@ def onboarded_stack(
                 # proof. dev-user inbound is deterministically allow on every rung.
                 gate = ReadySignal("inbound", "dev-user", "allow")
                 if not poll_until(
-                    lambda g=gate: g.decide(probe_ctx) == g.expected, timeout=BUNDLE_TIMEOUT, interval=BUNDLE_POLL_INTERVAL
+                    lambda g=gate: g.decide(probe_ctx) == g.expected,
+                    timeout=BUNDLE_TIMEOUT,
+                    interval=BUNDLE_POLL_INTERVAL,
                 ):
                     raise RuntimeError(
                         f"agent did not converge after deploy: {gate.label()}={gate.decide(probe_ctx)!r} "
