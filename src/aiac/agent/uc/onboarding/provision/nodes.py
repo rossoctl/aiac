@@ -38,6 +38,17 @@ _LABEL_WAIT_BACKOFF_ENV = "ONBOARD_LABEL_WAIT_BACKOFF"
 _DEFAULT_LABEL_WAIT_ATTEMPTS = 15
 _DEFAULT_LABEL_WAIT_BACKOFF = 2.0
 
+# Deploy->onboard race tolerance for the AgentCard skill sync — a SECOND, later race than the label
+# one above. The operator syncs the fetched A2A card onto ``status.card.skills`` only AFTER the agent
+# pod is Ready, which lags the Keycloak-client registration that triggers onboarding. So this node
+# can run while ``status.card.skills`` is still empty. An absent card / empty skill list is therefore
+# a transient not-ready state, re-polled a bounded number of times before we fall back to a default
+# access scope. Same ≈30s slack and env knobs as the label wait (tests set them fast).
+_CARD_WAIT_ATTEMPTS_ENV = "ONBOARD_CARD_WAIT_ATTEMPTS"
+_CARD_WAIT_BACKOFF_ENV = "ONBOARD_CARD_WAIT_BACKOFF"
+_DEFAULT_CARD_WAIT_ATTEMPTS = 15
+_DEFAULT_CARD_WAIT_BACKOFF = 2.0
+
 
 def _env_num(name: str, default, cast, minimum):
     """Read ``name`` from the environment, tolerant of an unset / non-numeric / below-``minimum``
@@ -176,23 +187,19 @@ def _await_service_type(namespace: str, workload_name: str) -> ServiceType:
     raise HTTPException(502, detail)
 
 
-def analyze_agent(state: OnboardingProvisionState) -> dict:
-    """Derive an agent's roles + scopes from its AgentCard CR (non-LLM).
+def _await_agent_skills(namespace: str, workload: str):
+    """Resolve an agent's AgentCard + its synced skills, tolerating the deploy->onboard RACE on the
+    card sync (see the module knobs above).
 
-    The operator fetches the agent's A2A card and syncs it onto the CR's ``status.card``; each skill
-    there carries a machine ``id`` (a stable identifier, e.g. ``source_operations``) plus a display
-    ``name`` (which may contain spaces). Scope names are built from the skill ``id`` so they are
-    usable Keycloak scope names, and each skill also gets a **per-skill operator role** mirroring the
-    scope (same name + description): the role's description is what the PRB capability-match reads to
-    confine and grant the agent's outbound access on a domain basis. Falls back to a default access
-    scope + a default operator role when there is no AgentCard CR (legacy deployments) or the CR has
-    no synced skills yet."""
-    namespace, workload = state.namespace, state.workload_name
-
-    try:
-        resp = list_agentcards(namespace)
-    except Exception as e:
-        raise HTTPException(502, f"Kubernetes AgentCard LIST failed in namespace {namespace!r}: {e}")
+    The operator syncs the fetched A2A card onto ``status.card.skills`` only AFTER the agent pod is
+    Ready — a DIFFERENT, later operator action than the Keycloak-client registration that triggers
+    onboarding. So this node can run before the skills are synced. An absent card, or a card whose
+    ``status.card.skills`` is still empty, is therefore a transient not-ready state, re-polled a
+    bounded number of times. Returns ``(card, skills)`` as soon as skills are present, or the
+    last-seen ``(card, [])`` once the attempt budget is exhausted — the caller then applies the
+    legacy card-less / skill-less fallback (a genuinely card-less workload never converges here)."""
+    attempts = _env_num(_CARD_WAIT_ATTEMPTS_ENV, _DEFAULT_CARD_WAIT_ATTEMPTS, int, minimum=1)
+    backoff = _env_num(_CARD_WAIT_BACKOFF_ENV, _DEFAULT_CARD_WAIT_BACKOFF, float, minimum=0.0)
 
     # Link the card to the workload by its ``spec.targetRef`` (the Deployment it describes), since the
     # operator names the CR after the Deployment (e.g. ``<workload>-deployment-card``), not the
@@ -201,8 +208,41 @@ def analyze_agent(state: OnboardingProvisionState) -> dict:
         target = ((c.get("spec") or {}).get("targetRef") or {}).get("name")
         return target == workload or (c.get("metadata") or {}).get("name") == workload
 
-    card = next((c for c in resp.get("items", []) if _targets_workload(c)), None)
-    skills = (((card or {}).get("status") or {}).get("card") or {}).get("skills", [])
+    card = None
+    for attempt in range(attempts):
+        try:
+            resp = list_agentcards(namespace)
+        except Exception as e:
+            raise HTTPException(502, f"Kubernetes AgentCard LIST failed in namespace {namespace!r}: {e}")
+
+        card = next((c for c in resp.get("items", []) if _targets_workload(c)), None)
+        skills = (((card or {}).get("status") or {}).get("card") or {}).get("skills", [])
+        if skills:
+            return card, skills
+
+        if attempt + 1 < attempts:
+            time.sleep(backoff)
+
+    return card, []
+
+
+def analyze_agent(state: OnboardingProvisionState) -> dict:
+    """Derive an agent's roles + scopes from its AgentCard CR (non-LLM).
+
+    The operator fetches the agent's A2A card and syncs it onto the CR's ``status.card``; each skill
+    there carries a machine ``id`` (a stable identifier, e.g. ``source_operations``) plus a display
+    ``name`` (which may contain spaces). Scope names are built from the skill ``id`` so they are
+    usable Keycloak scope names, and each skill also gets a **per-skill operator role** mirroring the
+    scope (same name + description): the role's description is what the PRB capability-match reads to
+    confine and grant the agent's outbound access on a domain basis.
+
+    Because the operator syncs the card only after the agent pod is Ready — later than the event that
+    triggers onboarding — the skills are awaited with a bounded retry (``_await_agent_skills``). Falls
+    back to a default access scope + a default operator role only once that wait is exhausted: for a
+    genuinely card-less legacy deployment, or a CR whose skills never sync."""
+    namespace, workload = state.namespace, state.workload_name
+
+    card, skills = _await_agent_skills(namespace, workload)
     if not skills:
         provision = ServiceProvision(
             roles=[RoleDefinition(name=f"{workload}.access", description="Default access scope")],

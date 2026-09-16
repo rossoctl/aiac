@@ -25,6 +25,14 @@ def _card(name=WORKLOAD, skills=None):
     return {"metadata": {"name": name}, "status": {"card": {"skills": skills or []}}}
 
 
+@pytest.fixture(autouse=True)
+def _fast_card_wait(monkeypatch):
+    # Keep the deploy->onboard card-sync wait instant in unit tests: a single look, no sleep.
+    # Tests that exercise the RETRY path override ONBOARD_CARD_WAIT_ATTEMPTS themselves.
+    monkeypatch.setenv("ONBOARD_CARD_WAIT_ATTEMPTS", "1")
+    monkeypatch.setenv("ONBOARD_CARD_WAIT_BACKOFF", "0")
+
+
 def _run(items=None, list_exc=None):
     with patch.object(kube, "_custom_objects") as co:
         client = MagicMock()
@@ -96,6 +104,48 @@ class TestAnalyzeAgentLegacyFallback:
         provision = _run(items=[_card(skills=[])])["service_provision"]
         assert [s.name for s in provision.scopes] == [f"{WORKLOAD}.access"]
         assert "no synced skills" in provision.reasoning
+
+
+class TestAnalyzeAgentCardSyncRace:
+    """The operator syncs the fetched A2A card onto ``status.card.skills`` only AFTER the agent pod is
+    Ready — later than the Keycloak-registration event that triggers onboarding — so this node can run
+    while the skills are still empty. A briefly-empty skill list is a transient race, re-polled a
+    bounded number of times before falling back to a default access scope (unlike a genuinely
+    card-less legacy deployment, which converges on the fallback only after the budget is spent)."""
+
+    def _run_with_client(self, monkeypatch, *, attempts, side_effect=None, return_value=None):
+        # monkeypatch.setattr (not a with-block) so the seam stays patched through the test body,
+        # where analyze_agent is actually invoked.
+        monkeypatch.setenv("ONBOARD_CARD_WAIT_ATTEMPTS", str(attempts))
+        monkeypatch.setenv("ONBOARD_CARD_WAIT_BACKOFF", "0")
+        client = MagicMock()
+        if side_effect is not None:
+            client.list_namespaced_custom_object.side_effect = side_effect
+        else:
+            client.list_namespaced_custom_object.return_value = return_value
+        monkeypatch.setattr(kube, "_custom_objects", MagicMock(return_value=client))
+        return client
+
+    def test_skills_synced_late_are_retried_then_succeed(self, monkeypatch):
+        client = self._run_with_client(
+            monkeypatch,
+            attempts=3,
+            side_effect=[
+                {"items": [_card(skills=[])]},  # operator has not synced the A2A card onto status yet
+                {"items": [_card(skills=[{"id": "forecast", "name": "F", "description": "Get forecast"}])]},  # synced
+            ],
+        )
+        provision = nodes.analyze_agent(_state())["service_provision"]
+        assert [s.name for s in provision.scopes] == [f"{WORKLOAD}.forecast"]
+        assert "derived from AgentCard: 1 skills" == provision.reasoning
+        assert client.list_namespaced_custom_object.call_count == 2  # re-polled once, then succeeded
+
+    def test_never_synced_falls_back_after_exhausting_the_attempt_budget(self, monkeypatch):
+        client = self._run_with_client(monkeypatch, attempts=3, return_value={"items": [_card(skills=[])]})
+        provision = nodes.analyze_agent(_state())["service_provision"]
+        assert [s.name for s in provision.scopes] == [f"{WORKLOAD}.access"]
+        assert "no synced skills" in provision.reasoning
+        assert client.list_namespaced_custom_object.call_count == 3  # polled the full budget, then gave up
 
 
 class TestAnalyzeAgent502:
