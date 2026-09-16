@@ -92,7 +92,7 @@ A thin adapter started as an **asyncio background task** in the FastAPI `lifespa
 
 ### Ack contract
 
-The consumer **awaits** the internal handler before it issues the NATS acknowledgement. On handler success → ack.
+The consumer **awaits** the internal handler before it issues the NATS acknowledgement. On handler success → ack. The internal handlers are **synchronous** and slow (they run the LLM Policy Rules Builder and `compute_and_apply`), so the consumer callback does **not** call them inline on the event loop. It offloads each handler to a **threadpool executor** — `await loop.run_in_executor(None, ...)` — and awaits that future. This keeps the ack-after-processing contract (the await still completes before the ack) **and** frees the event loop while the slow work runs. Offloading is not the same as fire-and-forget: the consumer still awaits completion, so it never acks early (see below).
 
 On handler failure, the consumer classifies the exception by **type**, not by HTTP status code:
 
@@ -106,6 +106,8 @@ Fire-and-forget (`asyncio.create_task`) is explicitly prohibited — an ack befo
 ### Failure isolation
 
 The consumer and the FastAPI HTTP server share the same process. If the Agent pod crashes mid-processing, the in-flight message was never acked and NATS redelivers it to the next pod instance. This prevents the consumer from exhausting retry counts against an unavailable handler (which would occur if they were separate containers).
+
+Sharing one process also creates a **loop-starvation hazard**, which is why the consumer offloads the synchronous handler (see [Ack contract](#ack-contract)). The event loop that runs the consumer callback is the **same** loop that serves `GET /health`. If the callback ran the slow synchronous handler inline, the loop would be blocked for the whole onboarding — the liveness probe could not get a reply, Kubernetes would kill the pod mid-processing, and the unacked message would be redelivered into a replay race. The threadpool offload keeps the loop free so `/health` stays answerable during onboarding. The HTTP `/apply/*` routes never had this hazard: Starlette runs a plain-`def` route handler in a threadpool automatically, so only the event path — an `async` callback calling a synchronous handler — could block the loop, and it does so only if the offload is removed. A tolerant liveness probe is the complementary defence (see [`/health`](#endpoints)).
 
 ### Configuration
 
@@ -160,6 +162,8 @@ Every sub-agent (UC1 Provision + Service Policy Builder, UC2 Build + Rebuild, UC
 | POST | `/apply/offboard/{service_id}` | Service Offboarding | Offboard (calls PCE `decommission` directly) |
 
 `GET /health` is a bare liveness/readiness probe: the Controller is stateless (no local state, no connection held at rest), so it answers `200 {"status": "ok"}` whenever the process is serving, dispatching to no handler and touching no upstream. Upstream reachability (IdP, PCE, NATS) is validated per-request by the handlers. The k8s Deployment wires both the readiness and liveness probes to it.
+
+A `/health` reply needs a **free event loop** — the process being "up" is not enough. The event path therefore offloads its slow synchronous handler to a threadpool so the loop stays answerable during onboarding (see [NATS Consumer → Failure isolation](#failure-isolation)). As a complementary defence, the k8s Deployment tunes the **liveness** probe tolerant — an explicit `timeoutSeconds` and a raised `failureThreshold`/`periodSeconds` — so a brief loop-busy window cannot kill the pod. The concrete probe values are authoritative in `k8s/agent-deployment.yaml`; this spec fixes only the intent.
 
 The `/apply/offboard/{service_id}` path uses the `{service_id:path}` converter (slash-bearing SPIFFE-URI clientIds) and is keyed on the **clientId (SPM key)**, not the Keycloak UUID that `/apply/service/{service_id}` carries — an offboarded client is gone from `get_services()`, so UUID→clientId resolution is impossible.
 
