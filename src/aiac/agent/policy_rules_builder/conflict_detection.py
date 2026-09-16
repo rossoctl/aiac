@@ -1,7 +1,7 @@
 """Inline structural conflict detection for the assembled service policy (#2502).
 
-After a ``build()`` assembles every pass's output (scope-focal grants + the Door B
-user-role-focal deny pass) into one ``list[PolicyRule]``, :func:`detect_conflicts` runs a
+After a ``build()`` assembles every pass's output (scope-focal grants and denies, plus the
+agent role-focal grants) into one ``list[PolicyRule]``, :func:`detect_conflicts` runs a
 **pure, deterministic** allow∩deny set-intersection over ``(role.id, scope.id)``: a pair carrying
 **both** an ``Allow`` and a ``Deny`` **is** a conflict. There is no LLM anywhere in this module.
 

@@ -35,10 +35,13 @@ candidate counterparts; the caller (UC handler) does all iteration.
 Policy context is fetched behind a `PolicySource` seam, so the retrieval mechanism can change
 without touching the rest of the graph.
 
-- **Phase 1 (current):** the entire access-control policy lives in a **single file**; the PRB
-  reads the whole file into the proposer prompt. No ChromaDB, no domain-knowledge collection.
-  Located via `AIAC_POLICY_FILE` (default `/etc/aiac/policy.md`), read as UTF-8; a
-  missing/unreadable file raises.
+- **Phase 1 (current):** the entire access-control policy lives in a **single file** — the
+  **digested** policy (see [digested-policy.md](../../digested-policy.md)); the PRB reads the whole
+  file into the proposer prompt. No ChromaDB, no domain-knowledge collection. Located via
+  `AIAC_POLICY_FILE` (default `/etc/aiac/policy.md`), read as UTF-8; a missing/unreadable file raises.
+  The PRB is **unaware of provenance** — it consumes the digested artifact exactly as it once
+  consumed source prose; wiring `AIAC_POLICY_FILE` to the stored digest is the standalone unit's job
+  (#2555 / #2559), not the PRB's.
 - **Phase 2 (later issue):** policy **and** domain knowledge live in a ChromaDB vector store;
   the PRB does RAG retrieval over the `aiac-policies` and `aiac-domain-knowledge` collections
   (query text derived from the focal entity), respecting `CHROMA_N_RESULTS`. This swaps in a
@@ -54,7 +57,7 @@ without touching the rest of the graph.
 | Context retrieval | Two-phase via a `PolicySource` seam — Phase 1 whole-file read; Phase 2 ChromaDB RAG (both collections). See **Policy source** |
 | Realm parameter | None — inputs are pre-resolved typed objects; the policy source is not realm-scoped |
 | Trigger type in state | None — the function name encodes the direction; no routing field in state |
-| Output shape | Proposer emits **names** — granted **and** denied — plus an **exclusivity flag** (via `with_structured_output`); the PRB rebuilds `PolicyRule`s from the **typed inputs** filtered by name, never from LLM-produced fields. Result is a single mixed `list[PolicyRule]` (`effect` `ALLOW`/`DENY`), **allows-then-denies in candidate order**. DENYs = explicit `denied_names` **∪** the **derived** exclusivity complement (`candidate_set − granted` when the flag is set) |
+| Output shape | Proposer emits **names** — granted **and** denied (explicit prohibitions) — via `with_structured_output`; the PRB rebuilds `PolicyRule`s from the **typed inputs** filtered by name, never from LLM-produced fields. Result is a single mixed `list[PolicyRule]` (`effect` `ALLOW`/`DENY`), **allows-then-denies in candidate order**. DENYs = the explicit `denied_names` only — no exclusivity flag, no derived complement (digested input carries no "only"; see the design decision below) |
 | Dedup | PRB generates a full rule set; the PCE's additive merge handles dedup on write |
 | LLM call pattern | **Propose → LLM auditor** (2 structured calls). The auditor is **three-way**: approve → build; reject → feed its reason back into propose (bounded fix-and-retry, `MAX_AUDIT_RETRIES = 3`); **genuine grant/deny contradiction → raise**. Raises on retry exhaustion |
 | Empty result | An auditor-**approved** empty selection is a valid `[]` (deny-by-default). An **all-deny** result (`granted=[]`, `denied≠[]`) is a **first-class valid output** — a durable prohibition is meaningful with no current grant. Empty proposals are still audited |
@@ -98,16 +101,15 @@ fetch ─► propose ─► precheck ─► audit ─┬─ approved ───�
               genuine grant/deny contradiction ─► RAISE  (PolicyContradictionError)
 ```
 
-- **fetch** — `PolicySource.fetch()` → `policy_text` (Phase 1: whole file).
+- **fetch** — `PolicySource.fetch()` → `policy_text` (Phase 1: the whole **digested** policy file).
 - **propose** — proposer messages (policy + focal + candidates + any `audit_feedback`);
-  `with_structured_output(Selection)` → granted names, **denied names**, an **exclusivity flag**,
-  and reasoning.
+  `with_structured_output(Selection)` → granted names, **denied names** (explicit prohibitions), and
+  reasoning. No exclusivity flag (digested policy carries no "only" — see the design decision below).
 - **precheck** — deterministic: filter **both** the granted and denied name lists to the candidate
   set (drop hallucinated names; log drops — symmetric on both lists). Compute and store
-  `conflict_names = granted_names ∩ denied_names`. The derived exclusivity complement is disjoint
-  from grants by construction, so an overlap can only arise from an explicit `denied_names` entry
-  that also appears in `granted_names` (direct conflict or coarse-scope mismatch) — the genuine
-  contradiction signal. No LLM.
+  `conflict_names = granted_names ∩ denied_names`. Because denies are now purely the explicit
+  `denied_names`, an overlap arises only from a `denied_names` entry that also appears in
+  `granted_names` (direct conflict or coarse-scope mismatch) — the genuine contradiction signal. No LLM.
 - **audit** — auditor messages (both name sets + `conflict_names`);
   `with_structured_output(AuditVerdict)` → `{approved, reason, contradictions}`. **Three-way route:**
   `contradictions` non-empty → `raise PolicyContradictionError(focal, contradictions)`; else
@@ -117,22 +119,19 @@ fetch ─► propose ─► precheck ─► audit ─┬─ approved ───�
   error** is an ordinary rejection (reason fed back, re-propose on the shared budget). Empty
   proposals are audited too.
 - **build** — reconstruct `PolicyRule`s from the typed inputs: `ALLOW` from the granted names, `DENY`
-  from `denied_names ∪ (candidate_set − granted_names if exclusive else ∅)`. Return the single mixed
-  list, allows-then-denies in candidate order.
+  from the explicit `denied_names`. Return the single mixed list, allows-then-denies in candidate order.
 
 ### Structured-output schemas
 
 ```python
 class RoleSelection(BaseModel):     # build_role_rules (role focal, scope candidates)
     granted_scope_names: list[str]
-    denied_scope_names: list[str]     # explicit prohibitions
-    grant_is_exclusive: bool          # focal role's access is closed to exactly the granted set
+    denied_scope_names: list[str]     # explicit prohibitions (digested deny direct grants)
     reasoning: str
 
 class ScopeSelection(BaseModel):    # build_scope_rules (scope focal, role candidates)
     roles_with_access_names: list[str]
-    roles_denied_access_names: list[str]   # explicit prohibitions
-    access_is_exclusive: bool              # access to the focal scope is closed to exactly the granted set
+    roles_denied_access_names: list[str]   # explicit prohibitions (digested deny direct grants)
     reasoning: str
 
 class Contradiction(BaseModel):
@@ -146,40 +145,44 @@ class AuditVerdict(BaseModel):
 ```
 
 The PRB rebuilds rules from the typed inputs, never from LLM string fields — `ALLOW` from the
-granted names, `DENY` from `denied_names ∪ (candidate_set − granted_names if exclusive else ∅)`:
+granted names, `DENY` from the explicit `denied_names`:
 
 ```python
 allows = [PolicyRule(role=role, scope=s) for s in scopes if s.name in granted_scope_names]
 denies = [PolicyRule(role=role, scope=s, effect=RuleEffect.DENY)
-          for s in scopes if s.name in denied_scope_names
-          or (grant_is_exclusive and s.name not in granted_scope_names)]
+          for s in scopes if s.name in denied_scope_names]
 return allows + denies   # allows-then-denies, each in candidate order
 ```
 
-> **Deny extraction (ALLOW/DENY model).** With two-sided rules in the policy model (`PolicyRule.effect`,
-> `RuleEffect.ALLOW` / `DENY` — see [`../policy-model.md`](../policy-model.md)), the PRB emits **both
-> grants and prohibitions**. A **DENY** is emitted **only** for an **explicit prohibition** — never for
-> mere silence or absence of a grant (those stay deny-by-default non-grants: *no rule at all*). Two
-> triggers:
+> **Deny extraction (ALLOW/DENY model, digested input).** With two-sided rules in the policy model
+> (`PolicyRule.effect`, `RuleEffect.ALLOW` / `DENY` — see [`../policy-model.md`](../policy-model.md)),
+> the PRB emits **both grants and prohibitions**. A **DENY** is emitted **only** for an **explicit
+> prohibition** — never for mere silence or absence of a grant (those stay deny-by-default non-grants:
+> *no rule at all*). The single trigger:
 > - **Direct prohibition** about a specific pair — "must not", "cannot", "may not", "is forbidden",
 >   "never", "except", "but not", "read-only" → `DENY(focal, that candidate)`.
-> - **Exclusivity / restrictive "only"** — closes a set and denies the **complement within the candidate
->   set**: for a focal role, *"developers can **only** access source"* → `ALLOW(dev, source)` +
->   `DENY(dev, X)` for every other candidate scope X; symmetric for a focal scope (*"**only** developers
->   may access source"* → `DENY(role, source)` for every other candidate role).
 >
-> A single statement may thus yield **both** an ALLOW and one or more DENYs; a **non-exclusive** grant
-> imposes nothing on the complement (ALLOW only). Deny/exclusivity extraction is bound by **layer, not by
-> source**: it draws on the **scenario layer** — both the scenario `policy.md` prose **and** the
-> focal/candidate entity **descriptions** — exactly **symmetric** with the grant side, which already
-> reads descriptions (capability projection, Rule 3). A prohibition stated in a role/scope description
-> (e.g. *"works … not in source"*, *"does not manage the issue tracker"*) is a valid DENY trigger just
-> as a positive description is a valid grant signal. The generic **baseline** (`generic_policy.md`)
-> contributes **grants only** and is never a source of denials. The exclusivity complement is
-> **derived** from the typed candidate set (never LLM-enumerated:
-> an incomplete enumeration would silently re-open the very paths DENY exists to close) and is bounded
-> strictly to the current call's candidates — the PRB can only deny what it was handed. A DENY's whole
-> purpose is to be a **durable prohibition** that survives a later, broader grant under deny-overrides.
+> **No exclusivity / "only" handling.** The digested-policy language (see
+> [digested-policy.md](../../digested-policy.md)) forbids exclusive language *and* open-ended
+> exceptions: exclusivity is restated at the authoring layer as **explicit deny direct grants**
+> (*"Only technical personnel may access issues"* becomes *"Technical personnel may access issues"* +
+> *"Non-technical personnel may not access issues"*). Because the PRB now consumes only digested
+> policy, every prohibition arrives as an **explicit** deny it reads per-pair; there is no
+> exclusivity flag and no derived complement. See
+> [Design decision: digested input retires exclusivity handling and Door B](#design-decision-digested-input-retires-exclusivity-handling-and-door-b).
+>
+> A DENY has exactly **two sources**: (1) the scenario digested policy prohibiting a pair, and (2) the
+> **focal entity's own** description prohibiting its own access — a prohibition stated in the *focal*
+> role/scope description (e.g. a focal role described as *"does not manage the issue tracker"*) denies
+> that candidate, just as a positive description is a valid grant signal (capability projection, Rule
+> 3). A **candidate's** description that merely disclaims a domain (its job scope) is **context, not a
+> prohibition** — it yields a silent non-grant (deny-by-default), never a durable DENY; inferring a
+> cross-DENY for a candidate from its own job description would over-reach and collide with the
+> deny-by-default baseline the scenarios assume. (This is why grants read focal **and** candidate
+> descriptions, but description-driven *denies* bind to the **focal** side only; policy-stated
+> prohibitions still deny any pair.) The generic **baseline** (`generic_policy.md`) contributes
+> **grants only** and is never a source of denials. A DENY's whole purpose is to be a **durable
+> prohibition** that survives a later, broader grant under deny-overrides.
 
 ### State fields
 
@@ -205,22 +208,36 @@ class ScopeRulesState(_PRBWorking):  # roles: list[Role]; scope: Scope
 
 Lean — task framing, the structured-output contract, two **safety** meta-rules
 (**deny-by-default / policy-silence** — grant a pair only if the policy supports it — and
-**scope-strictly-to-focal**), and the **deny/exclusivity** rules below. The proposer's task framing
+**scope-strictly-to-focal**), and the **deny** rules below. The proposer's task framing
 is *"you map access policy to concrete grants **and prohibitions**."*
 
-**Policy-layer labeling.** `_policy_block()` labels the layers so the deny/exclusivity rules bind to
-the scenario layer only: `BASELINE POLICY (grants only — never a source of denials):` … then
-`SCENARIO POLICY:` …. Correspondingly, `generic_policy.md` is reworded to drop its exclusive tail
-(*"…within the domain it is responsible for~~, and nothing outside that domain~~"*) — it still
-confines grants to the domain (out-of-domain pairs stay silent non-grants) but contains no
-exclusive-language trigger.
+**Digest-aware framing.** The prompts consume **digested** policy (see
+[digested-policy.md](../../digested-policy.md)), organized into its statement kinds plus domain
+knowledge. The prompts tell both sides how to read each kind — without hard-requiring section
+headings, so the reasoning degrades gracefully:
 
-**Deny / exclusivity rules** (shared by proposer AND auditor — see share note below):
+- **Direct grants** (allow / deny) → the primary evidence for `ALLOW` / `DENY`.
+- **Attribute invariants** → **interpretive context only** — they constrain a single entity's
+  attributes and inform overlap reasoning, but map to **no `PolicyRule` field** (the model has no
+  condition field; deferred — see the deferrals note below).
+- **Role-assignment constraints** (separation of duties) → **no `(role, scope)` rule** — they limit
+  how users map to roles, which the `(role, scope, effect)` model cannot express (deferred).
+- **Domain knowledge** → context that resolves references (role→domain membership, resource
+  attributes) so the proposer/auditor can judge grants; it maps to no rule of its own.
 
-- **Direct-prohibition** and **exclusivity ("only")** triggers as in the deny-extraction callout
-  above; deny extraction is bound to the **scenario layer** (scenario `policy.md` **and** focal/candidate
-  descriptions — symmetric with grants; the **baseline** contributes grants only), never source-restricted
-  to the policy prose; silence and a non-exclusive grant impose nothing on the complement.
+**Policy-layer labeling.** `_policy_block()` labels the layers `BASELINE POLICY (grants only — never
+a source of denials):` … then `SCENARIO POLICY:` …. The bundled `generic_policy.md` baseline is
+**expressed in the digested-policy language** (as direct grants), still grants-only — an out-of-domain
+pair stays a silent non-grant, never an explicit prohibition, so the baseline never contributes a DENY.
+
+**Deny rules** (shared by proposer AND auditor — see share note below):
+
+- **Direct-prohibition** trigger as in the deny-extraction callout above; a DENY comes only from the
+  **scenario digested policy** (any pair) or the **focal entity's own** description (its own access) —
+  a **candidate's** job-scope description is context, never a durable DENY; the **baseline** contributes
+  grants only, and silence imposes nothing. **No exclusivity / "only" rule** — the digested language
+  forbids exclusive language, so every prohibition is an explicit deny direct grant (see the design
+  decision below).
 - The two name lists (granted / denied) are **mutually exclusive except** when the policy genuinely
   establishes both a grant and a prohibition for the same candidate (direct conflict or coarse-scope)
   — that overlap is the **contradiction signal**, not a normal proposal.
@@ -228,29 +245,34 @@ exclusive-language trigger.
 On top of those, two shared **mapping** rules (`_MAPPING_RULES`) govern how evidence becomes a grant
 or a deny:
 
-- **Capability projection (Rule 3, now symmetric)** — a scope names a *set* of operations. **Grant
+- **Capability projection (Rule 3, symmetric)** — a scope names a *set* of operations. **Grant
   side:** any one covered operation established for a candidate grants the whole scope, so partial
-  (e.g. read-only) access still earns it. **Deny side (new):** any one covered operation explicitly
+  (e.g. read-only) access still earns it. **Deny side:** any one covered operation explicitly
   *prohibited* for a candidate denies the whole scope. A coarse scope that is **both** partly
   permitted and partly prohibited for the same pair legitimately lands in **both** lists → surfaced
   as a **contradiction** (a scope-granularity mismatch, not silently resolved).
-- **Relationship scoping (Rule 4, amended)** — a policy may state several access relationships over
-  the same entities; each grant is judged only by evidence about *that* candidate and the focal
-  entity, and a statement about an entity that is neither the focal nor a candidate (even a
-  same-theme one) is a different relationship that never counts either way. **One sanctioned
-  exception:** exclusive/restrictive scoping **about the focal entity** *is* legitimate evidence to
-  deny the complement (that cross-candidate inference is exactly what "only developers" needs).
-  Rule 4's protection is otherwise intact for ordinary, non-exclusive multi-relationship statements.
+- **Relationship scoping (Rule 4)** — a policy may state several access relationships over the same
+  entities; each grant is judged only by evidence about *that* candidate and the focal entity, and a
+  statement about an entity that is neither the focal nor a candidate (even a same-theme one) is a
+  different relationship that never counts either way. With exclusivity removed, Rule 4 carries **no
+  exceptions** — there is no longer a sanctioned cross-candidate inference (its former "only …"
+  exception is gone, because a digested policy states each prohibition explicitly per pair).
 
 No worked examples or domain heuristics; all substantive reasoning is deferred to the
 (user-authored) policy content and the entity descriptions. The **proposer and auditor share the
 same rule set** — both make the same grant/deny decision, so a rule on only one side lets the two
 diverge (they did: see issue 3.20 *Follow-up: cross-variant convergence*). The auditor adds only its
-framing: approve only if every granted pair is policy-supported, every denied pair is a genuine
-explicit-prohibition/exclusivity deny, and the exclusivity flag is truly asserted by the scenario
-policy — and, when `conflict_names` is present, adjudicate each as a genuine contradiction (→
-`contradictions`) vs a proposer generation error (→ ordinary rejection). `build_proposer_messages` /
-`build_auditor_messages` carry both name sets (the auditor also gets `conflict_names`).
+framing: approve only if every granted pair is policy-supported and every denied pair is a genuine
+explicit-prohibition deny — and, when `conflict_names` is present, adjudicate each as a genuine
+contradiction (→ `contradictions`) vs a proposer generation error (→ ordinary rejection).
+`build_proposer_messages` / `build_auditor_messages` carry both name sets (the auditor also gets
+`conflict_names`).
+
+**Deferrals.** Attribute invariants (→ rule conditions) and role-assignment constraints (separation
+of duties) are **not** turned into rules here — neither is representable in the unchanged
+`(role, scope, effect)` model. They are consumed as context / ignored for rule output, deferred until
+the model supports them (attribute conditions) or a dedicated mechanism exists (SoD). Recorded so a
+future reader does not mistake the omission for an oversight.
 
 ### LLM + retries
 
@@ -294,10 +316,10 @@ to a human, partial-apply, re-author the policy, split the scope) is a **separat
 > earlier standalone read-only `POST /policy/check` route is **retired**.
 
 - **Detection is deterministic** (in `precheck`): `conflict_names = granted_names ∩ denied_names`,
-  after candidate-set filtering. Precheck resolves nothing; it only stores the overlap. Because the
-  derived exclusivity complement is disjoint from grants by construction, overlap can arise **only**
-  from an explicit `denied_names` entry that also appears in `granted_names` — a direct policy
-  conflict or a coarse-scope mismatch, exactly the genuine signal we want.
+  after candidate-set filtering. Precheck resolves nothing; it only stores the overlap. Because denies
+  are now purely the explicit `denied_names`, overlap can arise **only** from a `denied_names` entry
+  that also appears in `granted_names` — a direct policy conflict or a coarse-scope mismatch, exactly
+  the genuine signal we want.
 - **Adjudication is by the auditor** (three-way). For each name in `conflict_names` the auditor
   decides whether the policy **genuinely** both grants and prohibits it, or whether it's a proposer
   **generation error**:
@@ -413,6 +435,73 @@ transactional safety across *concurrent* applies remains a separate follow-up.)
 
 ---
 
+## Design decision: digested input retires exclusivity handling and Door B
+
+**Governing principle.** The PRB now consumes only **digested** policy (#2540, epic #2537).
+The digested-policy language (see
+[digested-policy.md](../../digested-policy.md)) **forbids exclusive language ("only")** and
+open-ended exceptions, requiring exclusivity to be restated at the authoring layer as **two explicit
+direct grants** — an allow and a per-pair deny (*"Only technical personnel may access issues"* →
+*"Technical personnel may access issues"* + *"Non-technical personnel may not access issues"*).
+Because every prohibition therefore arrives as an **explicit** deny the proposer reads per pair, the
+PRB **removes** its exclusivity machinery — the `grant_is_exclusive` / `access_is_exclusive` flags,
+the `exclusive` state field, and the **derived-complement** deny path — and **deletes Door B**, the
+user-role-focal deny-only pass whose sole purpose was deriving that complement.
+
+### Why this is safe
+
+- **Denies are not lost.** Door B (`build_role_denies` / the `deny_only` role graph, and the UC1
+  builder's `RoleKind.USER` loop) existed because the scope-focal pass structurally could not infer a
+  *role's* exclusivity (*"R may access only S"* → deny R on every other scope) — that is a
+  cross-candidate inference Rule 4 forbids. In digested policy that same intent is stated as an
+  **explicit** prohibition per pair (*"R may not access S2"*), which the scope-focal pass reads
+  directly as a Rule-5 explicit-prohibition `DENY(R, S2)` when focal on `S2`. The role-focal
+  derivation is thus redundant.
+- **Gated on parity (two layers).** A silently dropped user-role deny would be a **broadening** of
+  access — the failure mode this removal must guard against — so it is pinned twice. The
+  **deterministic plumbing** (an explicit `(user_role, own_scope)` prohibition the proposer surfaces
+  survives precheck and is built as a `DENY`) is a **hermetic unit test**
+  (`test_graph.test_scope_focal_emits_user_role_deny_from_explicit_prohibition`) that fails a bare
+  offline `pytest` if a precheck/build regression drops it. That the **prompt** actually elicits the
+  deny from an explicit policy prohibition is verified end-to-end by the live-LLM
+  `test_graph_live_llm.test_user_role_explicit_deny_captured_by_scope_focal_pass` (opt-in `-m llm`).
+  A *prompt* regression is inherently only catchable in the live lane — no offline test can assert
+  the LLM still emits the name — so the two layers are complementary, not redundant.
+- **Durable user-role denies are policy-stated.** A durable user-role `DENY` must come from an
+  **explicit prohibition in the (digested) policy** — the scope-focal pass reads it as a Rule-5
+  policy prohibition on that `(user_role, scope)` pair. A prohibition left *only* in a user role's
+  IdP **description** (a job-scope disclaimer such as *"works in issues, not source"*) is treated as
+  a **silent non-grant** (deny-by-default), not a durable `DENY`: since user roles are only ever
+  *candidates* (never focal) in the remaining passes, and a candidate's description is context (not a
+  deny source — see the deny-extraction callout), such a disclaimer never becomes a durable
+  prohibition. This is deliberate and matches the scenario model (`scenario_uc1` documents `devops`
+  as deny-by-default with no pair-list entry; the denyworld scenario states every user-role deny in
+  the *policy*, never relying on a description-only durable deny). It is a behavioral change from the
+  pre-digested PRB, where Door B ran each user role **role-focal** and could turn its own
+  description prohibition into a durable deny; under the digested model a prohibition that must be
+  durable belongs in the policy, not a description.
+
+### Trade-off considered
+
+The alternative was to *keep* Door B but strip it to explicit-denies-only (a conservative
+belt-and-suspenders that re-emits the same denies the scope-focal pass produces, deduped by the PCE's
+additive merge). It was rejected: it leaves a redundant LLM pass per user role and a code path whose
+reason no longer exists. Removal is the honest end state, and the parity eval closes the only risk.
+
+### Deferrals (not this issue)
+
+- **Attribute invariants → conditions.** `PolicyRule` is `(role, scope, effect)` with no condition
+  field, so attribute invariants are consumed as **context only** and map to no rule; conditions wait
+  on a model change (see #2554).
+- **Role-assignment constraints (separation of duties).** A `(user, role)` constraint is not
+  expressible in the `(role, scope, effect)` model, so it produces **no rule**; a dedicated mechanism
+  is out of scope here.
+
+Both deferrals are recorded so the omission is not mistaken for an oversight. The `PolicyRule` /
+`RuleEffect` model is **unchanged**, and the engine remains `identify-never-reconcile`.
+
+---
+
 ## Testing
 
 Two layers, distinguished by whether the LLM is real:
@@ -420,14 +509,14 @@ Two layers, distinguished by whether the LLM is real:
 - **Mocked-boundary unit tests** (default `pytest`, no marker) — patch `graph._structured_call`
   (the sole LLM seam) and stub `graph.get_policy_source`, so no endpoint is touched. These pin the
   deterministic mechanics: candidate-set precheck/drop, `conflict_names` computation, the three-way
-  audit route, the derived exclusivity complement, and allows-then-denies rebuild order. They are the
+  audit route, explicit-deny extraction, and allows-then-denies rebuild order. They are the
   fast, hermetic regression net and must stay green with no environment.
 
 - **Live-LLM verification tests** (new **`llm`** marker) — run the **real** LLM defined in the
   environment (`LLM_BASE_URL`, `LLM_MODEL`, `LLM_API_KEY`) end-to-end through `build_role_rules` /
   `build_scope_rules`, and assert the emitted rule set matches the policy text. These verify the
-  **prompt engineering itself** (that grants, direct-prohibition denies, description-driven denies,
-  and the exclusivity complement are extracted correctly), which the mocked tests — feeding canned
+  **prompt engineering itself** (that grants, direct-prohibition denies, and description-driven denies
+  are extracted correctly from digested policy), which the mocked tests — feeding canned
   proposer output — cannot.
   - **Only the LLM is real.** Descriptions and policy are **mocked in-process**: inline `Role`/`Scope`
     objects carry the descriptions, and the `PolicySource` seam is stubbed to return an inline policy
@@ -439,13 +528,24 @@ Two layers, distinguished by whether the LLM is real:
   - **Fixture matrix** (minimal but representative): allow-only in **both** directions
     (`build_role_rules`, `build_scope_rules`); a **direct-prohibition** deny ("must not" / "read-only");
     a **description-driven** deny (a prohibition stated only in an entity description, e.g. "does not
-    manage the issue tracker"); and an **exclusivity** case ("only …") asserting the derived complement.
-    The **contradiction** path (`PolicyContradictionError`) is **excluded** — a real LLM's adjudication
-    of a genuine grant/deny collision is non-deterministic and belongs to focused mocked tests.
+    manage the issue tracker"); and an **explicit user-role deny** — the fixture that proves the
+    scope-focal pass captures `(user_role, own_scope)` denies now that **Door B is removed** (see the
+    design decision above). The former "only …" exclusivity fixture is **dropped** — digested policy
+    carries no exclusive language, so there is no derived complement to assert. The **contradiction**
+    path (`PolicyContradictionError`) is **excluded** — a real LLM's adjudication of a genuine
+    grant/deny collision is non-deterministic and belongs to focused mocked tests.
 
 The `llm` marker is registered in `pyproject.toml` alongside `integration`; unlike `integration` (which
 needs the full onboarding stack), `llm` needs only an LLM endpoint. Both are deselected by the default
 `-m "not integration"` unit run — the `llm` suite is opt-in via `-m llm` with the `LLM_*` env sourced.
+
+**Faithfulness / parity gate (eval).** The corpus-level "digested output is unchanged or improved vs
+prose" acceptance criterion lives in `eval/test_policy_pipeline_faithfulness.py`: it runs the PRB over
+each scenario's **digested** policy and gates on **zero over-grants** (a digest that broadens access
+fails). It is live-LLM, opt-in (`-m eval`, part of the Evaluation suite), and skips cleanly without
+`LLM_*`. The additional **recall-floor** assertion (digested recall ≥ a committed per-scenario prose
+baseline, so digestion + the rewritten prompts may not regress grant coverage) is planned in **#2541**
+and is **not yet enforced** here.
 
 ---
 
@@ -457,6 +557,12 @@ needs the full onboarding stack), `llm` needs only an LLM endpoint. Both are des
 | UC2 — Policy Update (Build) | Build sub-agent | TBD |
 | UC3 — Role Update | Role sub-agent | `build_role_rules(role, all_scopes)` — one call |
 | Conflict diagnostic (folded into `/apply`, [identify conflicts, never reconcile](#design-decision-identify-conflicts-never-reconcile) / #2503) | Apply path | A parallel diagnostic assembly reusing propose / precheck / audit (record-not-raise + a terminal `explain` node); returns a `422` `ConflictReport` |
+
+> **Door B removed (#2540).** UC1 previously also ran a user-role-focal **deny-only** pass
+> (`build_role_denies` over each `RoleKind.USER` candidate role, alongside the scope-focal pass) to
+> derive user-role exclusivity denies. Under digested input that pass is redundant and has been
+> deleted — the scope-focal pass reads the explicit per-pair denies directly. See
+> [Design decision: digested input retires exclusivity handling and Door B](#design-decision-digested-input-retires-exclusivity-handling-and-door-b).
 
 ---
 
