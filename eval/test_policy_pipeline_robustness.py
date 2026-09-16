@@ -415,11 +415,19 @@ SENSITIVITY_EDITS: dict[str, SensitivityEdit] = {
                 "NOT authorized to use the intake agent at all. Not involved in billing or insurance verification.",
             ),
         },
+        # agent-role-receptionist and user-role-front-desk-clerk name the same worker -- the
+        # scenario's own AGENTS description text draws no distinction between them, so a full
+        # revoke of the clerk's access removes the agent role's reach into the same tool scopes
+        # too, not just the user-facing gates.
         removed={
             "inbound": {("user-role-front-desk-clerk", "agent-scope-receptionist")},
             "outbound_subject": {
                 ("user-role-front-desk-clerk", "tool-scope-records-read"),
                 ("user-role-front-desk-clerk", "tool-scope-records-write"),
+            },
+            "outbound_target": {
+                ("agent-role-receptionist", "tool-scope-records-read"),
+                ("agent-role-receptionist", "tool-scope-records-write"),
             },
         },
     ),
@@ -500,17 +508,20 @@ SENSITIVITY_EDITS: dict[str, SensitivityEdit] = {
         policy_find="Field operators may open and close irrigation valves.",
         policy_replace="Field operators may not open or close irrigation valves at all.",
         # No description edits: every description in this scenario is deliberately "" (that's its
-        # whole point, per its own docstring). The edit text only speaks to the *user role's*
-        # authorization to open/close valves — it says nothing about the agent's own structural
-        # capability, so unlike every other field on this edit, outbound_target
-        # (agent-role-groundskeeper's own reach into the valve tool) is deliberately left untouched
-        # here too, same as every other scenario in this table.
+        # whole point, per its own docstring). agent-role-groundskeeper and user-role-field-operator
+        # name the same worker -- with no description text to draw any distinction between them, a
+        # full revoke of the field operator's access removes the agent role's own reach into the
+        # valve tools too, not just the user-facing gates.
         description_edits={},
         removed={
             "inbound": {("user-role-field-operator", "agent-scope-groundskeeper")},
             "outbound_subject": {
                 ("user-role-field-operator", "tool-scope-valve-open"),
                 ("user-role-field-operator", "tool-scope-valve-close"),
+            },
+            "outbound_target": {
+                ("agent-role-groundskeeper", "tool-scope-valve-open"),
+                ("agent-role-groundskeeper", "tool-scope-valve-close"),
             },
         },
     ),

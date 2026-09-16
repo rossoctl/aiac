@@ -178,12 +178,21 @@ Each `SensitivityEdit` carries:
   touch), which is exactly the failure mode worth catching.
 
 Every edit was verified to touch only the intended gate(s) by checking, for each scenario, whether
-the *agent's own role description* (not just the user-facing policy sentence) independently asserts
-the capability being revoked/swapped — e.g. `wildcard_grant`'s `agent-role-stocker` and
-`agent_delegation`'s `agent-role-dispatcher` both carry their own explicit capability text,
-so revoking/swapping the user-facing sentence alone leaves `outbound_target` unaffected.
-`empty_descriptions` is the one exception: since *no* entity has a description, its policy text
-alone drives every gate, so its edit's delta touches `outbound_target` too.
+the *agent's own role name* names a worker genuinely distinct from the user role being edited — e.g.
+`wildcard_grant`'s `agent-role-stocker` (a stocker) is a different job from `user-role-inventory-manager`
+(a manager), and `agent_delegation`'s `agent-role-dispatcher` is distinct from either
+`user-role-shipment-coordinator` or `user-role-dock-worker`, so revoking/swapping the user-facing
+sentence alone leaves `outbound_target` unaffected for those. `empty_descriptions`
+(`agent-role-groundskeeper` / `user-role-field-operator`) and `unreachable_resources`
+(`agent-role-receptionist` / `user-role-front-desk-clerk`) are the two exceptions: in both, the agent
+role's name describes the same real-world worker as the user role it's paired with, so their edit's
+delta touches `outbound_target` too — a partial revoke that left the identically-named agent role
+untouched was not defensible, and live testing bore this out, with the auditor denying the agent
+role's access right alongside the user role's rather than respecting an artificial split between two
+names for the same job. This holds independently of whether the agent role happens to carry its own
+description text (`agent-role-receptionist` does — "Covers read and write access to patient
+records"); a description that's merely independently *written* doesn't make the two roles
+independently *real*.
 
 Even whole-scope edits are not guaranteed friction-free against a live auditor — in testing,
 `baseline`'s "only developers may access..." phrasing triggered a *different*, softer auditor note
@@ -340,13 +349,17 @@ wiring is #2467). See `docs/evaluation/eval-framework.md` §9.
   `test_prb_sensitive_to_mechanical_edit` asserts the actual grant set equals `truth(scenario)`
   with the edit's delta applied — a looser check would still pass if the edit had an unintended
   side effect elsewhere in the grant set, which is exactly the failure mode worth catching.
-- **Sensitivity edits touch the user-facing policy sentence, not the agent's own role
-  description, wherever the two are independent.** For scenarios where an agent role's own
-  description independently restates a capability (`wildcard_grant`'s
-  `agent-role-stocker`, `agent_delegation`'s `agent-role-dispatcher`),
-  revoking/swapping only the policy text's user-facing sentence keeps the edit's blast radius to
-  exactly the intended gate(s). `empty_descriptions` has no such independent description anywhere,
-  so its edit's delta necessarily touches `outbound_target` too.
+- **Sensitivity edits touch the user-facing policy sentence, not the agent's own role, only where
+  the agent role names a genuinely distinct worker.** For scenarios where the agent role and user
+  role are different jobs (`wildcard_grant`'s `agent-role-stocker` vs. `user-role-inventory-manager`,
+  `agent_delegation`'s `agent-role-dispatcher` vs. either of its user roles), revoking/swapping only
+  the policy text's user-facing sentence keeps the edit's blast radius to exactly the intended
+  gate(s). `empty_descriptions` (`agent-role-groundskeeper`) and `unreachable_resources`
+  (`agent-role-receptionist`) name the same worker as their paired user role
+  (`user-role-field-operator`, `user-role-front-desk-clerk`), so their edit's delta necessarily
+  touches `outbound_target` too — confirmed against a live LLM, which denied the agent role's access
+  right alongside the user role's rather than honoring an artificial split between two names for the
+  same job.
 - **Every sensitivity edit is whole-scope, not partial-capability — a correction made after live
   testing, not the original design.** The first revision narrowed one sub-capability of a role's
   access while the relevant inbound scope's own description still bundled that capability with
