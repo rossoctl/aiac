@@ -103,23 +103,39 @@ load_dotenv(HERE.parent / ".env", override=False)
 
 _docstrings: dict[str, str] = {}
 _reports: dict[str, pytest.TestReport] = {}
-# Nodeids that actually carry `@pytest.mark.eval`, captured at collection. We must NOT gate on the
-# keyword set (`"eval" in report.keywords`): the suite lives in a package directory literally named
-# `eval/` with an `__init__.py`, so pytest builds a `Package` node named `eval` and injects that
-# name into every collected item's keyword set — marked or not. Gating on the keyword would scoop
-# the pure-unit helpers under `eval/` (test_dashboard, test_trend_log, …) into this report on a
-# bare offline `pytest`, breaking this module's guarantee that only `-m eval` tests are captured.
-# The real marker is only reachable via `item.iter_markers()` at collection, so we record the
-# nodeids there and gate reports on membership. (Same controller-side flow xdist already relies on
-# for `_docstrings`.)
-_eval_nodeids: set[str] = set()
+
+# Every suite that carries `pytestmark = pytest.mark.eval` lives directly under `eval/` as a
+# `test_policy_pipeline_*.py` module (the scenarios/consistency/robustness/correctness-prb/
+# correctness-e2e/faithfulness suites) -- a plain nodeid-path check for that filename pattern is
+# used instead of an actual marker/collection-based check, for two reasons neither of which is
+# fixable by switching *which* collection-time hook populates a cache:
+#   1. `"eval" in report.keywords` is **always** true for every item under `eval/`, marked or not
+#      -- pytest injects the enclosing package name as a keyword, and the package here is literally
+#      named `eval` -- so it would wrongly scoop the pure-unit helpers (test_dashboard.py,
+#      test_trend_log.py, ...) into this report on a bare offline `pytest`.
+#   2. The actually-correct check, `item.iter_markers()`, needs a live collected `Item`, which only
+#      exists during collection. Under `pytest-xdist` (`-n`), the **controller** process never runs
+#      collection at all -- confirmed empirically that neither `pytest_collection_modifyitems` nor
+#      `pytest_itemcollected` fires there, only forwarded `pytest_runtest_logreport` calls do -- so
+#      any collection-time-populated set (nodeids or markers) is silently empty on the controller,
+#      and every forwarded report gets discarded by that gate: no report, no trend-log row, and no
+#      error either. This is exactly the failure mode `-n 8` (this suite's documented, recommended
+#      invocation) hit in practice. A nodeid-path check needs no collection-time state at all, so it
+#      works identically in the controller, in every worker, and in a plain non-xdist run.
+_EVAL_SUITE_PATH_PREFIX = "eval/test_policy_pipeline_"
+
+
+def _is_eval_suite_nodeid(nodeid: str) -> bool:
+    return nodeid.split("::", 1)[0].startswith(_EVAL_SUITE_PATH_PREFIX)
 
 
 def pytest_collection_modifyitems(session: pytest.Session, config: pytest.Config, items: list) -> None:
+    # `_docstrings` is best-effort under `-n`: this hook does run in every worker (each does its own
+    # full collection), just never in the controller -- so a controller-authored report's "What it
+    # tests" fallback can come up empty there even though the gate above no longer depends on it.
     for item in items:
-        if not any(marker.name == "eval" for marker in item.iter_markers()):
+        if not _is_eval_suite_nodeid(item.nodeid):
             continue
-        _eval_nodeids.add(item.nodeid)
         func = getattr(item, "obj", None)
         doc = (getattr(func, "__doc__", None) or "").strip()
         if doc:
@@ -130,7 +146,7 @@ def pytest_collection_modifyitems(session: pytest.Session, config: pytest.Config
 def pytest_runtest_logreport(report: pytest.TestReport) -> None:
     if report.when == "teardown" and report.outcome == "passed":
         return
-    if report.nodeid not in _eval_nodeids:
+    if not _is_eval_suite_nodeid(report.nodeid):
         return
     # A later phase (call) supersedes an earlier one (setup) for the same nodeid; a setup or
     # teardown failure has no later phase to supersede it.
