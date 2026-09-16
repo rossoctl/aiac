@@ -10,9 +10,11 @@ rather than hanging on a trigger that never fires.
 
 These tests need **no** cluster — ``event_path_reason`` is pure, so they exercise the decision, not the
 I/O that gathers its inputs (``event_path_unwired_reason``, which reads the live realm + broker). They
-are therefore left **untagged** — a bare ``pytest`` runs them in the default (offline) lane, so the pure
-skip-gate logic keeps fast-lane regression cover. The file lives under ``test/system/`` only to sit
-beside the ``launcher.py`` it covers (test infra, with no ``src/aiac/`` module to mirror)."""
+are therefore **untagged** and live in the unit lane (``test/unit/``, per the CLAUDE.md placement
+ladder: one unit, in-process, no external service) — a bare ``pytest`` runs them in the default
+(offline) lane, so the pure skip-gate logic keeps fast-lane regression cover. The module under test is
+test infra (``test/system/launcher.py``), which has no ``src/aiac/`` counterpart to mirror, so the file
+sits at the ``test/unit/`` root rather than in a mirroring subdirectory."""
 
 import sys
 from pathlib import Path

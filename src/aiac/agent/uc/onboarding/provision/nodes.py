@@ -175,10 +175,14 @@ def _await_service_type(namespace: str, workload_name: str) -> ServiceType:
     a bounded number of times. A label present with an INVALID value (not ``agent``/``tool``) is a
     real misconfiguration that no wait can fix, so it fails immediately. Retries exhausted -> 502
     naming the workload and the label (unchanged contract for a genuinely never-labelled workload)."""
-    detail = f"no pod owned by workload {workload_name!r} in namespace {namespace!r}"
+    no_pod_detail = f"no pod owned by workload {workload_name!r} in namespace {namespace!r}"
+    detail = no_pod_detail
 
     def _probe():
         nonlocal detail
+        # Re-derive per attempt so the exhausted-wait 502 reflects the LAST-seen state: a pod that
+        # disappears mid-poll must report "no pod", not a stale "label missing" from an earlier attempt.
+        detail = no_pod_detail
         try:
             pods = list_pods(namespace)
         except Exception as e:

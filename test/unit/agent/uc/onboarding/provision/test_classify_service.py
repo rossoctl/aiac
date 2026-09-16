@@ -174,3 +174,23 @@ class TestClassifyServiceLabelRace:
         assert ei.value.status_code == 502
         assert "rossoctl.io/type" in ei.value.detail
         assert core.list_namespaced_pod.call_count == 3  # polled the full budget, then gave up
+
+    def test_pod_vanishing_mid_poll_reports_no_pod_not_stale_label_missing(self, monkeypatch):
+        # Attempt 1 sees an unlabelled pod (sets the 'label missing' detail); the pod is then deleted
+        # for the remaining attempts. The exhausted-wait 502 must reflect the LAST-seen state ('no pod'),
+        # not the stale 'label missing' from attempt 1.
+        core = self._run_with_core(
+            monkeypatch,
+            attempts=3,
+            list_side_effect=[
+                SimpleNamespace(items=[_pod({})]),  # unlabelled pod -> 'label missing'
+                SimpleNamespace(items=[]),  # pod gone
+                SimpleNamespace(items=[]),  # still gone
+            ],
+        )
+        with pytest.raises(HTTPException) as ei:
+            nodes.classify_service(_state())
+        assert ei.value.status_code == 502
+        assert "no pod owned by workload" in ei.value.detail
+        assert "label missing" not in ei.value.detail
+        assert core.list_namespaced_pod.call_count == 3
