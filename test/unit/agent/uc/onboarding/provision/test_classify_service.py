@@ -40,6 +40,14 @@ def _core(pods):
     return core
 
 
+@pytest.fixture(autouse=True)
+def _fast_label_wait(monkeypatch):
+    # Keep the deploy->onboard label wait instant in unit tests: a single look, no sleep.
+    # Tests that exercise the RETRY path override ONBOARD_LABEL_WAIT_ATTEMPTS themselves.
+    monkeypatch.setenv("ONBOARD_LABEL_WAIT_ATTEMPTS", "1")
+    monkeypatch.setenv("ONBOARD_LABEL_WAIT_BACKOFF", "0")
+
+
 def _run(service=None, pods=None, get_service_exc=None, list_pods_exc=None):
     with patch.object(nodes, "_config") as cfg, patch.object(kube, "_core_v1") as core_v1:
         if get_service_exc is not None:
@@ -113,3 +121,56 @@ class TestClassifyService502s:
             _run(service=_service(), pods=[unrelated])
         assert ei.value.status_code == 502
         assert "weather" in ei.value.detail
+
+
+class TestClassifyServiceLabelRace:
+    """The operator applies ``rossoctl.io/type`` asynchronously, AFTER the Keycloak-registration
+    event that triggers onboarding — so this node can run before the label is patched. A
+    briefly-absent label is a transient race, re-polled a bounded number of times."""
+
+    def _run_with_core(self, monkeypatch, *, attempts, list_side_effect=None, list_return=None):
+        # monkeypatch.setattr (not a with-block) so the seams stay patched through the test body,
+        # where classify_service is actually invoked.
+        monkeypatch.setenv("ONBOARD_LABEL_WAIT_ATTEMPTS", str(attempts))
+        monkeypatch.setenv("ONBOARD_LABEL_WAIT_BACKOFF", "0")
+        cfg = MagicMock()
+        cfg.return_value.get_service.return_value = _service()
+        monkeypatch.setattr(nodes, "_config", cfg)
+        core = MagicMock()
+        if list_side_effect is not None:
+            core.list_namespaced_pod.side_effect = list_side_effect
+        else:
+            core.list_namespaced_pod.return_value = list_return
+        monkeypatch.setattr(kube, "_core_v1", MagicMock(return_value=core))
+        return core
+
+    def test_label_applied_late_is_retried_then_succeeds(self, monkeypatch):
+        core = self._run_with_core(
+            monkeypatch,
+            attempts=3,
+            list_side_effect=[
+                SimpleNamespace(items=[_pod({})]),  # operator has not patched the label yet
+                SimpleNamespace(items=[_pod({"rossoctl.io/type": "agent"})]),  # now it has
+            ],
+        )
+        result = nodes.classify_service(_state())
+        assert result["service_type"] is ServiceType.AGENT
+        assert core.list_namespaced_pod.call_count == 2  # re-polled once, then succeeded
+
+    def test_invalid_label_fails_immediately_without_retry(self, monkeypatch):
+        core = self._run_with_core(
+            monkeypatch, attempts=5, list_return=SimpleNamespace(items=[_pod({"rossoctl.io/type": "sidecar"})])
+        )
+        with pytest.raises(HTTPException) as ei:
+            nodes.classify_service(_state())
+        assert ei.value.status_code == 502
+        assert "invalid" in ei.value.detail
+        assert core.list_namespaced_pod.call_count == 1  # a real misconfig is never re-polled
+
+    def test_never_labelled_502s_after_exhausting_the_attempt_budget(self, monkeypatch):
+        core = self._run_with_core(monkeypatch, attempts=3, list_return=SimpleNamespace(items=[_pod({})]))
+        with pytest.raises(HTTPException) as ei:
+            nodes.classify_service(_state())
+        assert ei.value.status_code == 502
+        assert "rossoctl.io/type" in ei.value.detail
+        assert core.list_namespaced_pod.call_count == 3  # polled the full budget, then gave up
