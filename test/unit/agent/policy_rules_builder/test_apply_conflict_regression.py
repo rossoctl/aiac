@@ -62,13 +62,30 @@ _ISSUES = Scope(id="s-iss", name="issues")
 
 def _focal_own_scope() -> FocalEntitySet:
     """A minimal focal set for a Tool onboarding: one own scope, one kind=User candidate role,
-    no own roles / other scopes — enough to drive the scope-focal grant + Door B deny passes."""
+    no own roles / other scopes — enough to drive the scope-focal grant/deny pass."""
     return FocalEntitySet(
         own_scopes=[_ISSUES],
         own_roles=[],
         candidate_roles=[_TESTER],
         other_scopes=[],
         service_type=ServiceType.TOOL,
+    )
+
+
+_AGENT_ROLE = Role(id="r-agent", name="repo-agent", composite=False, kind=RoleKind.AGENT)
+_TOOL_SCOPE = Scope(id="s-tool", name="tool-issues")
+
+
+def _focal_agent_own_role() -> FocalEntitySet:
+    """A minimal focal set for an Agent onboarding: one own agent role over one other (tool) scope,
+    no own scopes / candidate roles — enough to drive the agent role-focal pass (build_role_rules),
+    the pass whose focal own-role description can emit a durable DENY (rule 5(b))."""
+    return FocalEntitySet(
+        own_scopes=[],
+        own_roles=[_AGENT_ROLE],
+        candidate_roles=[],
+        other_scopes=[_TOOL_SCOPE],
+        service_type=ServiceType.AGENT,
     )
 
 
@@ -98,7 +115,6 @@ def test_live_build_role_rules_still_raises_policy_contradiction():
                     RoleSelection(
                         granted_scope_names=["issues"],
                         denied_scope_names=["issues"],
-                        grant_is_exclusive=False,
                         reasoning="may read issues but must not modify them",
                     ),
                     AuditVerdict(
@@ -153,8 +169,8 @@ def test_apply_service_maps_policy_contradiction_to_422_conflict_report_and_skip
 
 
 def test_build_raises_structural_conflict_from_assembled_passes():
-    # The scope-focal pass grants (tester, issues) and the Door B deny pass prohibits the SAME
-    # (tester, issues): the assembled list carries both an Allow and a Deny on one pair. build()
+    # The scope-focal pass grants (tester, issues) AND explicitly prohibits the SAME (tester, issues):
+    # the assembled list carries both an Allow and a Deny on one pair. build()
     # must run the inline detector and RAISE PolicyConflictError — never reconcile (the identify-never-reconcile design decision).
     # Enrichment is stubbed to identity here (the explain seam / policy source are exercised by the
     # dedicated enrichment test below); this pins the STRUCTURAL raise + report shape.
@@ -163,11 +179,10 @@ def test_build_raises_structural_conflict_from_assembled_passes():
         patch(f"{_BUILDER}.resolve_focal_entities", return_value=_focal_own_scope()),
         patch(
             f"{_BUILDER}.build_scope_rules",
-            return_value=[PolicyRule(role=_TESTER, scope=_ISSUES, effect=RuleEffect.ALLOW)],
-        ),
-        patch(
-            f"{_BUILDER}.build_role_denies",
-            return_value=[PolicyRule(role=_TESTER, scope=_ISSUES, effect=RuleEffect.DENY)],
+            return_value=[
+                PolicyRule(role=_TESTER, scope=_ISSUES, effect=RuleEffect.ALLOW),
+                PolicyRule(role=_TESTER, scope=_ISSUES, effect=RuleEffect.DENY),
+            ],
         ),
         patch(f"{_BUILDER}.get_policy_source", return_value=_Source()),
         patch(_APPLIED_SEAM, return_value=[]),
@@ -201,11 +216,10 @@ def test_conflicting_build_enriches_report_with_kind_and_verbatim_quotes():
         patch(f"{_BUILDER}.resolve_focal_entities", return_value=_focal_own_scope()),
         patch(
             f"{_BUILDER}.build_scope_rules",
-            return_value=[PolicyRule(role=_TESTER, scope=_ISSUES, effect=RuleEffect.ALLOW)],
-        ),
-        patch(
-            f"{_BUILDER}.build_role_denies",
-            return_value=[PolicyRule(role=_TESTER, scope=_ISSUES, effect=RuleEffect.DENY)],
+            return_value=[
+                PolicyRule(role=_TESTER, scope=_ISSUES, effect=RuleEffect.ALLOW),
+                PolicyRule(role=_TESTER, scope=_ISSUES, effect=RuleEffect.DENY),
+            ],
         ),
         patch(f"{_BUILDER}.get_policy_source", return_value=_Source(policy)),
         patch(_APPLIED_SEAM, return_value=[]),
@@ -238,11 +252,10 @@ def test_conflicting_build_falls_back_when_quotes_not_verbatim():
         patch(f"{_BUILDER}.resolve_focal_entities", return_value=_focal_own_scope()),
         patch(
             f"{_BUILDER}.build_scope_rules",
-            return_value=[PolicyRule(role=_TESTER, scope=_ISSUES, effect=RuleEffect.ALLOW)],
-        ),
-        patch(
-            f"{_BUILDER}.build_role_denies",
-            return_value=[PolicyRule(role=_TESTER, scope=_ISSUES, effect=RuleEffect.DENY)],
+            return_value=[
+                PolicyRule(role=_TESTER, scope=_ISSUES, effect=RuleEffect.ALLOW),
+                PolicyRule(role=_TESTER, scope=_ISSUES, effect=RuleEffect.DENY),
+            ],
         ),
         patch(f"{_BUILDER}.get_policy_source", return_value=_Source(policy)),
         patch(_APPLIED_SEAM, return_value=[]),
@@ -257,9 +270,9 @@ def test_conflicting_build_falls_back_when_quotes_not_verbatim():
     assert "tester" in c.explanation and "issues" in c.explanation
 
 
-def _drive_apply_with_passes(scope_rules, deny_rules, applied=None) -> tuple[MagicMock, MagicMock]:
+def _drive_apply_with_passes(scope_rules, applied=None) -> tuple[MagicMock, MagicMock]:
     """Drive ``POST /apply/service/{id}`` through the REAL onboarding sequence (provision graph
-    stubbed to a Tool, the two PRB passes stubbed to the given rule lists, LLM/cluster untouched)
+    stubbed to a Tool, the scope-focal pass stubbed to ``scope_rules``, LLM/cluster untouched)
     and return ``(compute_and_apply, explain_seam)`` mocks so the caller can assert on the PCE seam
     AND that the explain/LLM enrichment seam fired only when a conflict was detected. ``applied`` is
     the OTHER services' already-applied rules the #2504 store read returns (default ``[]`` — a
@@ -283,7 +296,6 @@ def _drive_apply_with_passes(scope_rules, deny_rules, applied=None) -> tuple[Mag
         patch(f"{_BUILDER}._config", return_value=MagicMock()),
         patch(f"{_BUILDER}.resolve_focal_entities", return_value=_focal_own_scope()),
         patch(f"{_BUILDER}.build_scope_rules", return_value=scope_rules),
-        patch(f"{_BUILDER}.build_role_denies", return_value=deny_rules),
         patch(f"{_BUILDER}.get_policy_source", return_value=_Source()),
         patch(_APPLIED_SEAM, return_value=applied or []),
         patch(_EXPLAIN_SEAM, return_value=explained) as explain,
@@ -298,21 +310,22 @@ def test_conflict_raises_before_compute_and_apply_is_atomic():
     # build() — the PCE (the persistence seam) is provably NEVER reached, so a conflict leaves
     # persisted state untouched. This exercises the real detect_conflicts, not a patched raise.
     pce, explain = _drive_apply_with_passes(
-        scope_rules=[PolicyRule(role=_TESTER, scope=_ISSUES, effect=RuleEffect.ALLOW)],
-        deny_rules=[PolicyRule(role=_TESTER, scope=_ISSUES, effect=RuleEffect.DENY)],
+        scope_rules=[
+            PolicyRule(role=_TESTER, scope=_ISSUES, effect=RuleEffect.ALLOW),
+            PolicyRule(role=_TESTER, scope=_ISSUES, effect=RuleEffect.DENY),
+        ],
     )
     pce.assert_not_called()
     explain.assert_called_once()  # enrichment fired for the one conflicting pair
 
 
 def test_clean_build_reaches_compute_and_apply_without_touching_the_llm_seam():
-    # Control: the SAME path with no allow∩deny overlap (Door B contributes no deny) is clean —
+    # Control: the SAME path with no allow∩deny overlap (the scope-focal pass emits no deny) is clean —
     # the build returns and the PCE IS reached. Proves the raise is conditional on a real conflict,
     # that clean policies still apply, AND that the explain/LLM enrichment seam is NEVER called on a
     # clean apply (enrichment is gated strictly behind a detected structural conflict).
     pce, explain = _drive_apply_with_passes(
         scope_rules=[PolicyRule(role=_TESTER, scope=_ISSUES, effect=RuleEffect.ALLOW)],
-        deny_rules=[],
     )
     pce.assert_called_once()
     explain.assert_not_called()
@@ -321,7 +334,7 @@ def test_clean_build_reaches_compute_and_apply_without_touching_the_llm_seam():
 # --- Cross-service structural conflict (#2504) -----------------------------------------------
 #
 # The SAME structural mechanism (B), but the colliding Deny comes from ANOTHER service's already-
-# applied rules (the store read the #2504 gatherer performs), not from this build's Door B pass.
+# applied rules (the store read the #2504 gatherer performs), not from this build's own passes.
 # This build grants (tester, issues); the store already carries a Deny another service applied on
 # the SAME (role.id, scope.id). Neither side alone reveals it — only the union that build() feeds
 # to detect_conflicts does. These pin that cross-service detection raises with the same shape,
@@ -333,7 +346,7 @@ _APPLIED_DENY = PolicyRule(role=_TESTER, scope=_ISSUES, effect=RuleEffect.DENY)
 
 
 def test_build_raises_cross_service_conflict_from_applied_store_rules():
-    # This build's ONLY rule is an Allow (Door B contributes no deny), so its own rule set is clean.
+    # This build's ONLY rule is an Allow (the scope-focal pass emits no deny), so its own set is clean.
     # The store read returns another service's applied Deny on the same (tester, issues): build()
     # unions the two and the #2502 core surfaces the overlap and RAISES — proving detection sees
     # across services, not just within one build. Enrichment fires over the joined pair.
@@ -351,7 +364,6 @@ def test_build_raises_cross_service_conflict_from_applied_store_rules():
             f"{_BUILDER}.build_scope_rules",
             return_value=[PolicyRule(role=_TESTER, scope=_ISSUES, effect=RuleEffect.ALLOW)],
         ),
-        patch(f"{_BUILDER}.build_role_denies", return_value=[]),
         patch(f"{_BUILDER}.get_policy_source", return_value=_Source(policy)),
         patch(_APPLIED_SEAM, return_value=[_APPLIED_DENY]),
         patch(_EXPLAIN_SEAM, return_value=explained) as explain,
@@ -368,6 +380,43 @@ def test_build_raises_cross_service_conflict_from_applied_store_rules():
     assert c.focal.type is FocalType.SCOPE
 
 
+def test_role_focal_deny_collides_cross_service_with_applied_allow_and_raises():
+    # Cross-pass collision the single-pass slice tests (test_graph_live_llm slices 4/6) don't reach:
+    # rule 5(b) makes a focal (agent own-)role's OWN-description prohibition a durable DENY, emitted
+    # here by the agent role-focal pass (build_role_rules). If another service has already applied an
+    # ALLOW on the same (role.id, scope.id), the #2504 combined-state detector raises — identify-
+    # never-reconcile — rather than silently letting the later ALLOW win under deny-overrides. The
+    # DENY's *source* (role-focal description) is irrelevant to the detector; this pins that a durable
+    # deny from this pass participates in cross-service conflict detection.
+    policy = "The repo-agent does not touch the issue tracker."
+    explained = ExplainResult(
+        kind=ConflictKind.DIRECT,
+        granting_quotes=[],
+        prohibiting_quotes=[],
+        explanation="issues is denied here (role description) but already granted for repo-agent",
+    )
+    with (
+        patch(f"{_BUILDER}._config", return_value=MagicMock()),
+        patch(f"{_BUILDER}.resolve_focal_entities", return_value=_focal_agent_own_role()),
+        patch(
+            f"{_BUILDER}.build_role_rules",
+            return_value=[PolicyRule(role=_AGENT_ROLE, scope=_TOOL_SCOPE, effect=RuleEffect.DENY)],
+        ),
+        patch(f"{_BUILDER}.build_scope_rules", return_value=[]),
+        patch(f"{_BUILDER}.get_policy_source", return_value=_Source(policy)),
+        patch(_APPLIED_SEAM, return_value=[PolicyRule(role=_AGENT_ROLE, scope=_TOOL_SCOPE, effect=RuleEffect.ALLOW)]),
+        patch(_EXPLAIN_SEAM, return_value=explained),
+    ):
+        with pytest.raises(PolicyConflictError) as exc:
+            ServicePolicyBuilder.build("svc-agent", ServiceType.AGENT)
+
+    report = exc.value.report
+    assert report.status is ConflictStatus.CONFLICTS_FOUND
+    assert len(report.conflicts) == 1
+    c = report.conflicts[0]
+    assert (c.role.id, c.scope.id) == ("r-agent", "s-tool")
+
+
 def test_cross_service_conflict_raises_before_compute_and_apply_is_atomic():
     # ATOMIC PROOF (cross-service): build() grants (tester, issues) with no own deny, but the store
     # already carries another service's Deny on the same pair. The union conflicts, so build() short-
@@ -375,7 +424,6 @@ def test_cross_service_conflict_raises_before_compute_and_apply_is_atomic():
     # untouched. Exercises the real detect_conflicts over the combined set, not a patched raise.
     pce, explain = _drive_apply_with_passes(
         scope_rules=[PolicyRule(role=_TESTER, scope=_ISSUES, effect=RuleEffect.ALLOW)],
-        deny_rules=[],
         applied=[_APPLIED_DENY],
     )
     pce.assert_not_called()
@@ -390,7 +438,6 @@ def test_clean_cross_service_apply_reaches_pce_without_touching_the_llm_seam():
     other_role = Role(id="r-dev", name="developer", composite=False, kind=RoleKind.USER)
     pce, explain = _drive_apply_with_passes(
         scope_rules=[PolicyRule(role=_TESTER, scope=_ISSUES, effect=RuleEffect.ALLOW)],
-        deny_rules=[],
         applied=[PolicyRule(role=other_role, scope=_ISSUES, effect=RuleEffect.DENY)],
     )
     pce.assert_called_once()

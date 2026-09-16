@@ -22,7 +22,6 @@ from aiac.agent.policy_rules_builder.graph import (
     RoleSelection,
     ScopeSelection,
     UnparseableLLMResponseError,
-    build_role_denies,
     build_role_rules,
     build_scope_rules,
 )
@@ -373,7 +372,6 @@ def test_direct_prohibition_yields_deny_role_direction():
                     RoleSelection(
                         granted_scope_names=["read"],
                         denied_scope_names=["issues"],
-                        grant_is_exclusive=False,
                         reasoning="may read but must not touch issues",
                     ),
                     AuditVerdict(approved=True),
@@ -406,7 +404,6 @@ def test_direct_prohibition_yields_deny_scope_direction():
                     ScopeSelection(
                         roles_with_access_names=["security"],
                         roles_denied_access_names=["intern"],
-                        access_is_exclusive=False,
                         reasoning="security may reach the audit log; interns must not",
                     ),
                     AuditVerdict(approved=True),
@@ -422,53 +419,19 @@ def test_direct_prohibition_yields_deny_scope_direction():
 
 
 # --------------------------------------------------------------------------- #
-# Slice C — exclusivity ("developers can ONLY access source") -> the derived    #
-# complement. grant_is_exclusive=True with granted=[source] over {source,       #
-# issues,deploy} yields ALLOW(source) + DENY(issues) + DENY(deploy). The        #
-# complement is DERIVED from the candidate set, not enumerated by the proposer  #
-# (denied_scope_names is empty).                                               #
+# Door-B-removal parity (deterministic, OFFLINE). Retiring Door B relies on the  #
+# scope-focal pass emitting user-role denies directly. This pins the plumbing    #
+# hermetically: an explicit prohibition of a USER-kind candidate role, once the  #
+# proposer surfaces it, survives precheck and is built as DENY(user_role, scope) #
+# — so a precheck/build regression that dropped user-role denies fails a bare    #
+# `pytest`. (`_role` builds RoleKind.USER by default.) The PROMPT half — that a   #
+# real LLM actually elicits the deny — is inherently live-LLM and lives in       #
+# test_graph_live_llm.test_user_role_explicit_deny_captured_by_scope_focal_pass. #
 # --------------------------------------------------------------------------- #
-def test_exclusivity_derives_complement_role_direction():
-    role = _role("r-dev", "developer")
+def test_scope_focal_emits_user_role_deny_from_explicit_prohibition():
     source = _scope("s-src", "source")
-    issues = _scope("s-iss", "issues")
-    deploy = _scope("s-dep", "deploy")
-
-    with ExitStack() as stack:
-        stack.enter_context(patch("aiac.agent.policy_rules_builder.graph.get_policy_source", return_value=_Source()))
-        stack.enter_context(
-            patch(
-                "aiac.agent.policy_rules_builder.graph._structured_call",
-                side_effect=[
-                    RoleSelection(
-                        granted_scope_names=["source"],
-                        denied_scope_names=[],
-                        grant_is_exclusive=True,
-                        reasoning="developers can only access source",
-                    ),
-                    AuditVerdict(approved=True),
-                ],
-            )
-        )
-        rules = build_role_rules(role, [source, issues, deploy])
-
-    assert rules == [
-        PolicyRule(role=role, scope=source, effect=RuleEffect.ALLOW),
-        PolicyRule(role=role, scope=issues, effect=RuleEffect.DENY),
-        PolicyRule(role=role, scope=deploy, effect=RuleEffect.DENY),
-    ]
-
-
-# --------------------------------------------------------------------------- #
-# Slice D — exclusivity symmetric, scope direction ("ONLY developers may access #
-# source"). access_is_exclusive=True with granted=[developer] over the role     #
-# candidate set denies every OTHER candidate role for the focal scope.         #
-# --------------------------------------------------------------------------- #
-def test_exclusivity_derives_complement_scope_direction():
-    scope = _scope("s-src", "source")
-    dev = _role("r-dev", "developer")
+    developer = _role("r-dev", "developer")  # RoleKind.USER by default
     tester = _role("r-tst", "tester")
-    ops = _role("r-ops", "ops")
 
     with ExitStack() as stack:
         stack.enter_context(patch("aiac.agent.policy_rules_builder.graph.get_policy_source", return_value=_Source()))
@@ -478,29 +441,37 @@ def test_exclusivity_derives_complement_scope_direction():
                 side_effect=[
                     ScopeSelection(
                         roles_with_access_names=["developer"],
-                        roles_denied_access_names=[],
-                        access_is_exclusive=True,
-                        reasoning="only developers may access source",
+                        roles_denied_access_names=["tester"],
+                        reasoning="developers may access source; testers must not",
                     ),
                     AuditVerdict(approved=True),
                 ],
             )
         )
-        rules = build_scope_rules([dev, tester, ops], scope)
+        rules = build_scope_rules([developer, tester], source)
 
     assert rules == [
-        PolicyRule(role=dev, scope=scope, effect=RuleEffect.ALLOW),
-        PolicyRule(role=tester, scope=scope, effect=RuleEffect.DENY),
-        PolicyRule(role=ops, scope=scope, effect=RuleEffect.DENY),
+        PolicyRule(role=developer, scope=source, effect=RuleEffect.ALLOW),
+        PolicyRule(role=tester, scope=source, effect=RuleEffect.DENY),
     ]
 
 
 # --------------------------------------------------------------------------- #
-# Slice E — a NON-exclusive grant imposes nothing on the complement. "developers #
-# may access source" (grant_is_exclusive=False, no explicit deny) grants source  #
-# and leaves issues a silent non-grant -- no DENY(issues).                      #
+# Selection schemas carry NO exclusivity flag (digested input bans "only", so    #
+# there is no derived complement -- see the PRB spec's design decision). This    #
+# guards the removal from silently regressing.                                  #
 # --------------------------------------------------------------------------- #
-def test_non_exclusive_grant_imposes_no_complement_deny():
+def test_selection_schemas_carry_no_exclusivity_flag():
+    assert "grant_is_exclusive" not in RoleSelection.model_fields
+    assert "access_is_exclusive" not in ScopeSelection.model_fields
+
+
+# --------------------------------------------------------------------------- #
+# A grant with no explicit prohibition imposes nothing on the rest. "developers  #
+# may access source" grants source and leaves issues a silent non-grant -- no    #
+# DENY(issues), and (exclusivity removed) no derived complement either.         #
+# --------------------------------------------------------------------------- #
+def test_grant_with_no_explicit_deny_imposes_no_prohibition():
     role = _role("r-dev", "developer")
     source = _scope("s-src", "source")
     issues = _scope("s-iss", "issues")
@@ -514,7 +485,6 @@ def test_non_exclusive_grant_imposes_no_complement_deny():
                     RoleSelection(
                         granted_scope_names=["source"],
                         denied_scope_names=[],
-                        grant_is_exclusive=False,
                         reasoning="developers may access source",
                     ),
                     AuditVerdict(approved=True),
@@ -547,7 +517,6 @@ def test_genuine_overlap_raises_policy_contradiction_error():
                     RoleSelection(
                         granted_scope_names=["issues"],
                         denied_scope_names=["issues"],
-                        grant_is_exclusive=False,
                         reasoning="may read issues but must not modify them",
                     ),
                     AuditVerdict(
@@ -590,7 +559,6 @@ def test_multiple_contradictions_reported_in_one_raise():
                     RoleSelection(
                         granted_scope_names=["issues", "deploy"],
                         denied_scope_names=["issues", "deploy"],
-                        grant_is_exclusive=False,
                         reasoning="both coarse scopes are partly permitted and partly forbidden",
                     ),
                     AuditVerdict(
@@ -628,14 +596,12 @@ def test_generation_error_overlap_retries_then_approves():
                     RoleSelection(
                         granted_scope_names=["issues"],
                         denied_scope_names=["issues"],
-                        grant_is_exclusive=False,
                         reasoning="accidentally listed issues in both",
                     ),
                     AuditVerdict(approved=False, reason="you listed issues as both granted and denied; pick one"),
                     RoleSelection(
                         granted_scope_names=["issues"],
                         denied_scope_names=[],
-                        grant_is_exclusive=False,
                         reasoning="issues is granted only",
                     ),
                     AuditVerdict(approved=True),
@@ -668,7 +634,6 @@ def test_all_deny_result_is_first_class():
                     RoleSelection(
                         granted_scope_names=[],
                         denied_scope_names=["issues"],
-                        grant_is_exclusive=False,
                         reasoning="developers must never touch issues",
                     ),
                     AuditVerdict(approved=True),
@@ -698,7 +663,6 @@ def test_precheck_drops_hallucinated_denied_name():
                     RoleSelection(
                         granted_scope_names=[],
                         denied_scope_names=["issues", "ghost"],
-                        grant_is_exclusive=False,
                         reasoning="must not touch issues",
                     ),
                     AuditVerdict(approved=True),
@@ -733,7 +697,6 @@ def test_mixed_allow_and_deny_ordered_allows_then_denies_candidate_order():
                     RoleSelection(
                         granted_scope_names=["source", "deploy"],
                         denied_scope_names=["issues", "audit"],
-                        grant_is_exclusive=False,
                         reasoning="may access source and deploy; must not touch issues or audit",
                     ),
                     AuditVerdict(approved=True),
@@ -781,12 +744,16 @@ def _capture_first_two_messages():
     return sc.call_args_list[0].args[1], sc.call_args_list[1].args[1]
 
 
-def test_proposer_and_auditor_share_deny_and_exclusivity_contract():
+def test_proposer_and_auditor_share_deny_contract():
+    # Digested input: prohibitions arrive as explicit deny direct grants, so BOTH sides get the
+    # explicit-prohibition rule -- but the exclusivity ("only") handling is GONE (digested policy
+    # bans exclusive language), and both sides are framed as reading DIGESTED policy.
     proposer_msgs, auditor_msgs = _capture_first_two_messages()
     for msgs in (proposer_msgs, auditor_msgs):
         system = msgs[0].content.lower()
         assert "prohibition" in system or "must not" in system  # explicit-prohibition -> deny
-        assert "only" in system and "exclusiv" in system  # restrictive "only" closes the set
+        assert "exclusivity flag" not in system  # exclusivity handling removed (no derived complement)
+        assert "digested" in system  # prompts are digest-aware
 
 
 def test_policy_block_labels_baseline_grants_only_and_scenario():
@@ -796,102 +763,6 @@ def test_policy_block_labels_baseline_grants_only_and_scenario():
     assert "SCENARIO POLICY" in human
     # The scenario text sits under the SCENARIO label, after the baseline.
     assert human.index("BASELINE POLICY") < human.index("SCENARIO POLICY") < human.index("SCEN-TEXT")
-
-
-# --------------------------------------------------------------------------- #
-# Door B — user-role-focal DENY-only pass (build_role_denies). Same graph as    #
-# build_role_rules (propose/precheck/audit), but the build node keeps ONLY the  #
-# DENY effects: the scope-focal pass stays the single grant authority, so Door  #
-# B never emits an ALLOW. These slices mirror the exclusivity/prohibition/       #
-# permissive fixtures above but assert the deny-only projection.                #
-# --------------------------------------------------------------------------- #
-def test_door_b_exclusivity_yields_complement_denies_only():
-    # "Testers may access only issues" -> grant issues (exclusive) over the focus's own
-    # scopes {issues, source-read, source-write}; Door B emits the DERIVED complement DENY on
-    # every other own scope and DROPS the ALLOW(issues) that the scope-focal pass owns.
-    tester = _role("r-tst", "tester")
-    issues = _scope("s-iss", "issues")
-    source_read = _scope("s-sr", "source-read")
-    source_write = _scope("s-sw", "source-write")
-
-    with ExitStack() as stack:
-        stack.enter_context(patch("aiac.agent.policy_rules_builder.graph.get_policy_source", return_value=_Source()))
-        stack.enter_context(
-            patch(
-                "aiac.agent.policy_rules_builder.graph._structured_call",
-                side_effect=[
-                    RoleSelection(
-                        granted_scope_names=["issues"],
-                        denied_scope_names=[],
-                        grant_is_exclusive=True,
-                        reasoning="testers may access only issues",
-                    ),
-                    AuditVerdict(approved=True),
-                ],
-            )
-        )
-        rules = build_role_denies(tester, [issues, source_read, source_write])
-
-    # DENY-only: no ALLOW(issues); the complement (source-read, source-write) in candidate order.
-    assert rules == [
-        PolicyRule(role=tester, scope=source_read, effect=RuleEffect.DENY),
-        PolicyRule(role=tester, scope=source_write, effect=RuleEffect.DENY),
-    ]
-
-
-def test_door_b_permissive_policy_is_noop():
-    # A non-exclusive grant with no explicit prohibition imposes nothing -> Door B returns [].
-    tester = _role("r-tst", "tester")
-    issues = _scope("s-iss", "issues")
-    source = _scope("s-src", "source")
-
-    with ExitStack() as stack:
-        stack.enter_context(patch("aiac.agent.policy_rules_builder.graph.get_policy_source", return_value=_Source()))
-        stack.enter_context(
-            patch(
-                "aiac.agent.policy_rules_builder.graph._structured_call",
-                side_effect=[
-                    RoleSelection(
-                        granted_scope_names=["issues"],
-                        denied_scope_names=[],
-                        grant_is_exclusive=False,
-                        reasoning="testers may access issues",
-                    ),
-                    AuditVerdict(approved=True),
-                ],
-            )
-        )
-        rules = build_role_denies(tester, [issues, source])
-
-    assert rules == []
-
-
-def test_door_b_explicit_prohibition_deny_only():
-    # An explicit prohibition ("DevOps may not access source") emits the DENY and, being
-    # deny-only, contributes no ALLOW even if the proposer also named a grant.
-    devops = _role("r-ops", "devops")
-    source = _scope("s-src", "source")
-    issues = _scope("s-iss", "issues")
-
-    with ExitStack() as stack:
-        stack.enter_context(patch("aiac.agent.policy_rules_builder.graph.get_policy_source", return_value=_Source()))
-        stack.enter_context(
-            patch(
-                "aiac.agent.policy_rules_builder.graph._structured_call",
-                side_effect=[
-                    RoleSelection(
-                        granted_scope_names=["issues"],
-                        denied_scope_names=["source"],
-                        grant_is_exclusive=False,
-                        reasoning="devops may not access source",
-                    ),
-                    AuditVerdict(approved=True),
-                ],
-            )
-        )
-        rules = build_role_denies(devops, [source, issues])
-
-    assert rules == [PolicyRule(role=devops, scope=source, effect=RuleEffect.DENY)]
 
 
 # =========================================================================== #

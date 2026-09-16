@@ -336,7 +336,6 @@ def _invoke_graph(
         "selected_names": [],
         "denied_names": [],
         "conflict_names": [],
-        "exclusive": False,
         "reasoning": "",
         "approved": False,
         "audit_feedback": None,
