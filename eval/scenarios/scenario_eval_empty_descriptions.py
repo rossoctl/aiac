@@ -28,11 +28,11 @@ AGENTS: dict[str, dict] = {
     "team1/irrigation-agent": {
         "description": "",
         "inbound_scopes": {
-            "agent-scope-irrigation-access": "",
+            "agent-scope-groundskeeper": "",
         },
         "delegation_scopes": {},
         "roles": {
-            "agent-role-irrigation-operations": "",
+            "agent-role-groundskeeper": "",
         },
     },
 }
@@ -64,12 +64,12 @@ USER_ROLES: dict[str, str] = {
 # --- Role -> access facts (name-level; the single source of truth) --------------------------
 
 INBOUND_PAIRS: list[tuple[str, str]] = [
-    ("user-role-field-operator", "agent-scope-irrigation-access"),
+    ("user-role-field-operator", "agent-scope-groundskeeper"),
 ]
 
 OUTBOUND_PAIRS: list[tuple[str, str]] = [
-    ("agent-role-irrigation-operations", "tool-scope-valve-open"),
-    ("agent-role-irrigation-operations", "tool-scope-valve-close"),
+    ("agent-role-groundskeeper", "tool-scope-valve-open"),
+    ("agent-role-groundskeeper", "tool-scope-valve-close"),
 ]
 
 OUTBOUND_SUBJECT_PAIRS: list[tuple[str, str]] = [

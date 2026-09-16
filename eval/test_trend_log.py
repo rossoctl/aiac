@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from eval.trend_log import append_row, pool_correctness_metrics
+from eval.trend_log import append_row, pool_correctness_metrics, pool_robustness_metrics
 
 
 def test_pool_empty_entries_is_vacuously_perfect() -> None:
@@ -116,6 +116,43 @@ def test_pool_multiple_scenarios_pools_by_count_not_average() -> None:
     naive_average = (0.5 + 1.0) / 2
     assert metrics["precision"] != naive_average
     assert metrics["precision"] == 10 / 11
+
+
+def test_pool_robustness_empty_lists_are_vacuously_perfect() -> None:
+    metrics = pool_robustness_metrics([], [])
+
+    assert metrics == {
+        "scenarios_scored": 0,
+        "invariance_rate": 1.0,
+        "sensitivity_rate": 1.0,
+    }
+
+
+def test_pool_robustness_rates_are_never_blended() -> None:
+    # All invariance failures, all sensitivity passes -- the two rates must move independently.
+    metrics = pool_robustness_metrics([False, False, True, True], [True, True, True, True])
+
+    assert metrics["scenarios_scored"] == 4
+    assert metrics["invariance_rate"] == 0.5
+    assert metrics["sensitivity_rate"] == 1.0
+
+
+def test_pool_robustness_pools_by_count_not_average() -> None:
+    metrics = pool_robustness_metrics([True, False, False], [True])
+
+    assert metrics["scenarios_scored"] == 3
+    assert metrics["invariance_rate"] == 1 / 3
+    assert metrics["sensitivity_rate"] == 1.0
+
+
+def test_pool_robustness_uneven_family_counts_pool_independently() -> None:
+    # A -k filter or a subset run can score one family without the other -- each list is pooled
+    # on its own length, not against a shared denominator.
+    metrics = pool_robustness_metrics([True, True], [])
+
+    assert metrics["scenarios_scored"] == 2
+    assert metrics["invariance_rate"] == 1.0
+    assert metrics["sensitivity_rate"] == 1.0  # vacuous -- no sensitivity entries scored
 
 
 def test_append_row_writes_one_json_line(tmp_path: Path) -> None:

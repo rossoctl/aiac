@@ -315,20 +315,20 @@ def _invoke_graph(
     ``best_effort=False`` (default): unchanged from before this parameter existed — a plain
     ``graph.invoke(state)``, still letting ``PolicyContradictionError``/``PolicyRulesBuilderError``
     propagate on a rejection. Every caller that doesn't opt in (the scenarios suite's own tests via
-    the shared ``pipeline`` fixture, the consistency and robustness suites) keeps today's exact
-    behavior — one rejected decision still aborts the whole scenario for them.
+    the shared ``pipeline`` fixture, the consistency suite) keeps today's exact behavior — one
+    rejected decision still aborts the whole scenario for them.
 
-    ``best_effort=True`` (the two correctness suites only): drives the graph via
-    ``graph.stream(state, stream_mode="values")`` instead of ``.invoke()`` so that if ``audit``
-    raises, the last state snapshot from immediately before the raise (i.e. right after
-    ``precheck`` — the node just before ``audit`` in ``fetch -> propose -> precheck -> audit ->
-    build``) is still available, even though ``ROLE_GRAPH``/``SCOPE_GRAPH`` attach no
+    ``best_effort=True`` (the two correctness suites and all three robustness-suite tests):
+    drives the graph via ``graph.stream(state, stream_mode="values")`` instead of ``.invoke()`` so
+    that if ``audit`` raises, the last state snapshot from immediately before the raise (i.e. right
+    after ``precheck`` — the node just before ``audit`` in ``fetch -> propose -> precheck -> audit
+    -> build``) is still available, even though ``ROLE_GRAPH``/``SCOPE_GRAPH`` attach no
     checkpointer. On catching, falls back to ``_best_effort_rules`` built from that last-proposed
-    (never-approved) state, and returns a short string describing why — the correctness suites
-    record this per scope/role so their report can flag it: this fallback path scores something
+    (never-approved) state, and returns a short string describing why — every opted-in caller
+    records this per scope/role so its report can flag it: this fallback path scores something
     that would never actually reach a real deployment (the auditor rejected it), by explicit user
-    request, to get full precision/recall coverage even for a scenario an ordinary run would
-    abort entirely.
+    request, to get full precision/recall (or invariant/sensitive) coverage even for a scenario an
+    ordinary run would abort entirely.
     """
     state = {
         **entity,
