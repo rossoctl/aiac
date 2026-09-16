@@ -403,7 +403,7 @@ table { border-collapse: collapse; margin: 0.5rem 0 1.5rem; width: 100%; }
 th, td { border: 1px solid #444; padding: 4px 8px; text-align: left; font-size: 0.85rem; }
 th { background: #1e1e1e; }
 .trends-grid { display: flex; flex-wrap: wrap; gap: 1.5rem; justify-content: center; }
-.trend-section { flex: 1 1 45%; min-width: 320px; }
+.trend-section { flex: 0 1 45%; max-width: 45%; min-width: 320px; }
 .section-summary { font-size: 1.5rem; font-weight: 600; margin: 1rem 0; cursor: pointer; }
 .chart-wrap { width: 100%; margin: 0 auto; }
 .chart-wrap svg { display: block; width: 100%; height: auto; }
