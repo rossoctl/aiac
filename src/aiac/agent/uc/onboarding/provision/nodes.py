@@ -11,6 +11,9 @@ as an `HTTPException(502, ...)` whose message names the workload and the specifi
 missing/invalid label — actionable, never silent.
 """
 
+import os
+import time
+
 from fastapi import HTTPException
 
 from aiac.idp.configuration.api import Configuration
@@ -23,6 +26,27 @@ from .types import RoleDefinition, ScopeDefinition, ServiceProvision
 
 _TYPE_LABEL = "rossoctl.io/type"
 _MCP_LABEL = "protocol.rossoctl.io/mcp"
+
+# Deploy->onboard race tolerance for the operator-applied ``rossoctl.io/type`` label. The
+# onboarding event is triggered by a DIFFERENT operator action (Keycloak client registration ->
+# admin event), so this node can run BEFORE the operator has patched the label onto the pod. A
+# briefly-absent label is therefore a transient not-ready state, re-polled a bounded number of
+# times before we give up with a 502. Defaults ≈ 30s of slack (well under the NATS ACK_WAIT and
+# the system-test convergence poll); tunable via the environment (tests set them fast).
+_LABEL_WAIT_ATTEMPTS_ENV = "ONBOARD_LABEL_WAIT_ATTEMPTS"
+_LABEL_WAIT_BACKOFF_ENV = "ONBOARD_LABEL_WAIT_BACKOFF"
+_DEFAULT_LABEL_WAIT_ATTEMPTS = 15
+_DEFAULT_LABEL_WAIT_BACKOFF = 2.0
+
+
+def _env_num(name: str, default, cast, minimum):
+    """Read ``name`` from the environment, tolerant of an unset / non-numeric / below-``minimum``
+    value — a bad value must not crash onboarding, it falls back to the default."""
+    try:
+        value = cast(os.environ[name])
+    except (KeyError, TypeError, ValueError):
+        return default
+    return value if value >= minimum else default
 
 
 # --------------------------------------------------------------------------- #
@@ -100,24 +124,7 @@ def classify_service(state: OnboardingProvisionState) -> dict:
         )
     namespace, workload_name = name.split("/", 1)
 
-    try:
-        pods = list_pods(namespace)
-    except Exception as e:
-        raise HTTPException(502, f"Kubernetes pod LIST failed in namespace {namespace!r}: {e}")
-
-    pod = _select_pod(pods, workload_name)
-    if pod is None:
-        raise HTTPException(502, f"no pod owned by workload {workload_name!r} in namespace {namespace!r}")
-
-    label = (getattr(pod.metadata, "labels", None) or {}).get(_TYPE_LABEL)
-    try:
-        service_type = ServiceType((label or "").capitalize())
-    except ValueError:
-        raise HTTPException(
-            502,
-            f"workload {workload_name!r}: {_TYPE_LABEL} label missing or invalid "
-            f"(got {label!r}, expected 'agent' or 'tool')",
-        )
+    service_type = _await_service_type(namespace, workload_name)
 
     return {
         "service_id": service_id,
@@ -125,6 +132,48 @@ def classify_service(state: OnboardingProvisionState) -> dict:
         "workload_name": workload_name,
         "service_type": service_type,
     }
+
+
+def _await_service_type(namespace: str, workload_name: str) -> ServiceType:
+    """Resolve the service type from the operator's ``rossoctl.io/type`` pod label, tolerating the
+    deploy->onboard RACE (the label may not be patched yet — see the module knobs above).
+
+    A briefly-absent label — or a not-yet-created pod — is a transient not-ready state, re-polled
+    a bounded number of times. A label present with an INVALID value (not ``agent``/``tool``) is a
+    real misconfiguration that no wait can fix, so it fails immediately. Retries exhausted -> 502
+    naming the workload and the label (unchanged contract for a genuinely never-labelled workload)."""
+    attempts = _env_num(_LABEL_WAIT_ATTEMPTS_ENV, _DEFAULT_LABEL_WAIT_ATTEMPTS, int, minimum=1)
+    backoff = _env_num(_LABEL_WAIT_BACKOFF_ENV, _DEFAULT_LABEL_WAIT_BACKOFF, float, minimum=0.0)
+
+    detail = f"no pod owned by workload {workload_name!r} in namespace {namespace!r}"
+    for attempt in range(attempts):
+        try:
+            pods = list_pods(namespace)
+        except Exception as e:
+            raise HTTPException(502, f"Kubernetes pod LIST failed in namespace {namespace!r}: {e}")
+
+        pod = _select_pod(pods, workload_name)
+        if pod is not None:
+            label = (getattr(pod.metadata, "labels", None) or {}).get(_TYPE_LABEL)
+            if label:
+                try:
+                    return ServiceType(label.capitalize())
+                except ValueError:
+                    # Present but not agent/tool: a real misconfiguration, never a race — fail now.
+                    raise HTTPException(
+                        502,
+                        f"workload {workload_name!r}: {_TYPE_LABEL} label invalid "
+                        f"(got {label!r}, expected 'agent' or 'tool')",
+                    )
+            detail = (
+                f"workload {workload_name!r}: {_TYPE_LABEL} label missing or invalid "
+                f"(got {label!r}, expected 'agent' or 'tool')"
+            )
+
+        if attempt + 1 < attempts:
+            time.sleep(backoff)
+
+    raise HTTPException(502, detail)
 
 
 def analyze_agent(state: OnboardingProvisionState) -> dict:
