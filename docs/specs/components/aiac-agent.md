@@ -191,8 +191,10 @@ The `/apply/*` endpoints return bare HTTP status codes: `200 OK` on success (no 
 | `LLM_MAX_RETRIES` | `3` | ConfigMap |
 | `LLM_RETRY_BACKOFF_MIN` | `1` | ConfigMap |
 | `LLM_RETRY_BACKOFF_MAX` | `30` | ConfigMap |
+| `ONBOARD_LABEL_WAIT_ATTEMPTS` | `15` | ConfigMap |
+| `ONBOARD_LABEL_WAIT_BACKOFF` | `2.0` | ConfigMap |
 
-`UPSTREAM_MAX_RETRIES` governs the IdP, MCP, and Kubernetes transport seams only. The `LLM_*` knobs govern the PRB's LLM seam (see [Error Handling → Two retry layers](#two-retry-layers)).
+`UPSTREAM_MAX_RETRIES` governs the IdP, MCP, and Kubernetes transport seams only. The `LLM_*` knobs govern the PRB's LLM seam (see [Error Handling → Two retry layers](#two-retry-layers)). The `ONBOARD_LABEL_WAIT_*` knobs bound UC1 `classify_service`'s wait for the operator-applied `rossoctl.io/type` pod label (the deploy→onboard race — see [`uc1-service-onboarding.md`](aiac-agent/uc1-service-onboarding.md)): up to `ONBOARD_LABEL_WAIT_ATTEMPTS` looks, `ONBOARD_LABEL_WAIT_BACKOFF` seconds apart. A non-numeric or below-minimum value falls back to the default rather than crashing onboarding.
 
 ChromaDB collections: `aiac-policies` and `aiac-domain-knowledge`.
 
