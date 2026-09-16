@@ -461,6 +461,19 @@ user-role-focal deny-only pass whose sole purpose was deriving that complement.
   **explicit user-role deny**, asserting the scope-focal pass emits those `(user_role, own_scope)`
   denies — a silently dropped deny would be a **broadening** of access, the one failure mode this
   guards against.
+- **Durable user-role denies are policy-stated.** A durable user-role `DENY` must come from an
+  **explicit prohibition in the (digested) policy** — the scope-focal pass reads it as a Rule-5
+  policy prohibition on that `(user_role, scope)` pair. A prohibition left *only* in a user role's
+  IdP **description** (a job-scope disclaimer such as *"works in issues, not source"*) is treated as
+  a **silent non-grant** (deny-by-default), not a durable `DENY`: since user roles are only ever
+  *candidates* (never focal) in the remaining passes, and a candidate's description is context (not a
+  deny source — see the deny-extraction callout), such a disclaimer never becomes a durable
+  prohibition. This is deliberate and matches the scenario model (`scenario_uc1` documents `devops`
+  as deny-by-default with no pair-list entry; the denyworld scenario states every user-role deny in
+  the *policy*, never relying on a description-only durable deny). It is a behavioral change from the
+  pre-digested PRB, where Door B ran each user role **role-focal** and could turn its own
+  description prohibition into a durable deny; under the digested model a prohibition that must be
+  durable belongs in the policy, not a description.
 
 ### Trade-off considered
 
@@ -520,13 +533,13 @@ The `llm` marker is registered in `pyproject.toml` alongside `integration`; unli
 needs the full onboarding stack), `llm` needs only an LLM endpoint. Both are deselected by the default
 `-m "not integration"` unit run — the `llm` suite is opt-in via `-m llm` with the `LLM_*` env sourced.
 
-**Faithfulness / parity gate (eval, owned by #2541).** The corpus-level "digested output is unchanged
-or improved vs prose" acceptance criterion is enforced in `eval/`: `test_policy_pipeline_faithfulness.py`
-runs the PRB over each scenario's **digested** policy and gates on **zero over-grants** (a digest that
-broadens access fails), and — per #2540 — additionally asserts **digested recall ≥ a committed
-per-scenario prose-baseline floor** (captured once from `test_policy_pipeline_correctness_prb.py`), so
-digestion + the rewritten prompts may not regress grant coverage. These are live-LLM, opt-in
-(`-m eval_faithfulness`), and skip cleanly without `LLM_*`.
+**Faithfulness / parity gate (eval).** The corpus-level "digested output is unchanged or improved vs
+prose" acceptance criterion lives in `eval/test_policy_pipeline_faithfulness.py`: it runs the PRB over
+each scenario's **digested** policy and gates on **zero over-grants** (a digest that broadens access
+fails). It is live-LLM, opt-in (`-m eval`, part of the Evaluation suite), and skips cleanly without
+`LLM_*`. The additional **recall-floor** assertion (digested recall ≥ a committed per-scenario prose
+baseline, so digestion + the rewritten prompts may not regress grant coverage) is planned in **#2541**
+and is **not yet enforced** here.
 
 ---
 

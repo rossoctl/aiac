@@ -22,9 +22,10 @@ Each fixture asserts **exact set equality** of the emitted ``{(counterpart.name,
 pairs against a hand-verified expected set — a subset check would let over-/under-grants
 pass. Expected sets are derived by hand from the SCENARIO-layer deny triggers documented
 in ``docs/handoffs/03/04-*.md`` and ``prompts.py`` (_DENY_RULES): explicit prohibition
-("must not" / "read-only") -> DENY; a prohibition stated only in a description -> DENY. A
-digested policy states each prohibition explicitly per pair — there is no "only …" wording
-and no derived complement (that exclusivity handling was retired; see the PRB spec).
+("must not" / "read-only") -> DENY; a prohibition stated only in the FOCAL entity's own
+description -> DENY (a *candidate*'s description disclaimer is a silent non-grant, never a
+DENY). A digested policy states each prohibition explicitly per pair — there is no "only …"
+wording and no derived complement (that exclusivity handling was retired; see the PRB spec).
 """
 
 from pathlib import Path
@@ -204,10 +205,11 @@ def test_direct_prohibition_deny():
 
 
 # --------------------------------------------------------------------------- #
-# Slice 4 — description-driven deny. The prohibition lives ONLY in the focal      #
-# role's description ("does not manage the issue tracker"); the scenario policy  #
-# is silent on issues. The DENY must still appear — descriptions are read        #
-# symmetrically for grants and prohibitions — alongside the source ALLOW.        #
+# Slice 4 — description-driven deny (FOCAL side). The prohibition lives ONLY in   #
+# the FOCAL role's own description ("does not manage the issue tracker"); the      #
+# scenario policy is silent on issues. The DENY must still appear — the focal      #
+# entity's own description is a deny source (rule 5) — alongside the source ALLOW. #
+# (A *candidate*'s description disclaimer, by contrast, is a non-grant: slice 6.)  #
 # --------------------------------------------------------------------------- #
 def test_description_driven_deny():
     source_agent = _role(

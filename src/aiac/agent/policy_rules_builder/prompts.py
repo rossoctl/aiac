@@ -126,9 +126,10 @@ _MAPPING_RULES = (
 # two halves of the LLM contract cannot diverge. Deny extraction is SCENARIO-only; the baseline
 # is grants-only.
 _DENY_RULES = (
-    "\nThe remaining rules concern PROHIBITIONS and bind to the SCENARIO layer ONLY — the scenario "
-    "policy AND the focal/candidate descriptions, never the grants-only baseline. If neither the "
-    "scenario policy nor the descriptions prohibit a pair (rule 5), return EMPTY denied lists — a "
+    "\nThe remaining rules concern PROHIBITIONS. A prohibition has exactly two sources — the SCENARIO "
+    "policy and the FOCAL entity's own description — never a candidate's description, and never the "
+    "grants-only baseline (see rule 5). If neither the scenario policy nor the focal entity's own "
+    "description prohibits a pair (rule 5), return EMPTY denied lists — a "
     "purely permissive policy prohibits nothing; never invent a prohibition to hedge.\n"
     "5) EXPLICIT PROHIBITIONS -> deny. Prohibitive language about a specific pair — 'must not', "
     "'cannot', 'may not', 'is forbidden', 'never', 'except', 'but not', 'read-only' / 'may read but "

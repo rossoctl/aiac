@@ -25,9 +25,9 @@ may access **only** issues") implied — prohibitions the scope-focal pass
 structurally could not express. **Removed** once the PRB consumes only
 **digested** policy: the digested language bans "only" and states each
 prohibition as an explicit per-pair deny, which the scope-focal pass reads
-directly, so the derivation is redundant. Retained here because the term appears
-in git history and `conflict_detection.py`. See the PRB spec's _digested input
-retires exclusivity handling and Door B_ decision.
+directly, so the derivation is redundant. Retained here only because the term
+appears in git history. See the PRB spec's _digested input retires exclusivity
+handling and Door B_ decision.
 _Avoid_: role pass (ambiguous with the agent-role-focal pass), Door B pass.
 
 **Grant authority**:

@@ -96,7 +96,7 @@ class ServicePolicyBuilder:
                 for role in flatten_role(own_role):
                     _guarded(build_role_rules, role, focal.other_scopes)
         # Inline, deterministic (non-LLM) conflict detection over the COMBINED state (#2504): this
-        # build's fully assembled rules (scope-focal grants + Door B denies) PLUS the already-applied
+        # build's fully assembled rules (scope-focal grants and denies) PLUS the already-applied
         # inbound rules of the OTHER services on the scopes this build touches, read from the Policy
         # Store. Widening the input this way lets the SAME #2502 allow∩deny intersection surface a
         # cross-service overlap -- an Allow here and a Deny another service already applied on the
