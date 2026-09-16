@@ -850,10 +850,17 @@ def _default_ready_signals(tool_onboarded: bool) -> list[ReadySignal]:
       * ``test-user`` reaches the agent (inbound allow) — the ``tester -> issue_operations`` grant,
       * ``devops-user`` is blocked (inbound deny — proves the restrictive client-scoped gate is live,
         not the allow-all baseline),
-      * ``dev-user``'s outbound ``source-read`` has reached its terminal verdict — ``allow`` once a tool
-        is onboarded (rungs 2 & 3), ``deny`` for the empty-gate agent-only rung (rung 1),
+      * ``dev-user``'s outbound ``source-read`` reaches ``allow`` once a tool is onboarded (rungs 2 & 3),
       * ``test-user``'s outbound ``issues-read`` reaches ``allow`` once a tool is onboarded — the
         tester's outbound issue leg.
+
+    **Outbound signals exist only when a tool is onboarded.** The agent-only rung (rung 1) has no tool
+    to gate, so there is no real ``agent -> tool`` call and its outbound leg is neither prepared (Part B
+    is skipped) nor probed nor asserted — on a tool-less rung token-exchange short-circuits before OPA
+    (no ``github-tool`` audience grant), so an outbound "deny" there would be a Keycloak audience
+    refusal, not an OPA verdict. Rung 1's empty outbound gate is instead asserted at the unit level
+    (grant-set oracle) and by ``test_no_tool_scopes_provisioned``. So the tool-less signal set is
+    inbound-only.
 
     ``test-user`` inbound was ADDED after the 2026-09-10 report: the prior set polled only
     ``dev-user``/``devops-user`` inbound and ``dev-user`` outbound, so a one-sided ``tester``-only
@@ -867,11 +874,11 @@ def _default_ready_signals(tool_onboarded: bool) -> list[ReadySignal]:
         ReadySignal("inbound", "dev-user", "allow"),
         ReadySignal("inbound", "test-user", "allow"),
         ReadySignal("inbound", "devops-user", "deny"),
-        ReadySignal("outbound", "dev-user", "allow" if tool_onboarded else "deny", tool_bare="source-read"),
     ]
     if tool_onboarded:
-        # The tester's outbound issue leg only has a terminal ``allow`` once a tool exists to gate;
-        # on the agent-only rung there is no tool scope, so this leg is not a convergence signal.
+        # Both outbound legs only have a terminal ``allow`` once a tool exists to gate; on the
+        # agent-only rung there is no tool scope, so neither is a convergence signal (see above).
+        signals.append(ReadySignal("outbound", "dev-user", "allow", tool_bare="source-read"))
         signals.append(ReadySignal("outbound", "test-user", "allow", tool_bare="issues-read"))
     return signals
 
@@ -927,7 +934,13 @@ def onboarded_stack(
       ``devops-user`` inbound is *allow*, not *deny*) supplies its own deterministic signals so the run
       converges on the right decisions; the raw-diagnostics message is recomputed against them."""
     # Skip gates first — before any cluster mutation (acceptance #4: skip, never false-pass).
-    require_pipeline(namespace=NAMESPACE, workloads=[scn.AGENT_WORKLOAD, scn.TOOL_WORKLOAD])
+    # Gate on the *wiring* only (OPA plugin on both legs, bundle-service, CRD) — NOT on the demo
+    # workloads being pre-Running. This is the event-driven flow: the fixture starts from a
+    # no-workloads slate and deploys the workloads itself as the onboarding trigger, so requiring
+    # them up front would skip every rung on a correctly-wired cluster. A missing/unloadable image or
+    # a deploy that never converges surfaces later as a loud RuntimeError from the deploy/convergence
+    # poll below — never a skip, never a false pass.
+    require_pipeline(namespace=NAMESPACE, workloads=[])
     creds = require_env_or_skip("KEYCLOAK_URL", "KEYCLOAK_ADMIN_USERNAME", "KEYCLOAK_ADMIN_PASSWORD")
     keycloak_url = creds["KEYCLOAK_URL"]
 
@@ -1020,9 +1033,26 @@ def onboarded_stack(
         # Part B — enable the outbound token-exchange leg so OPA is actually consulted outbound. Done
         # after onboarding so the restarted agent (and its OPA sidecar) picks up both the new route
         # and, on its next poll, the recomposed bundle.
-        ensure_github_tool_route(NAMESPACE)
-        grant_exchange_scope(admin)
-        restart_agent(NAMESPACE)
+        #
+        # Prepared ONLY when this run actually probes outbound (``has_outbound``). The agent-only rung
+        # (rung 1) has no tool onboarded, so there is no real ``agent -> tool`` call to make and no
+        # outbound signal in its set — its outbound leg has no real-life counterpart, and token-exchange
+        # would short-circuit before OPA anyway (no ``github-tool`` audience grant, since the operator
+        # creates ``agent-{ns}-github-tool-aud`` only on TOOL deploy). So on a tool-less rung Part B is
+        # skipped entirely: no outbound route, no restart. Its inbound gate already converged in the
+        # per-workload loop above, and skipping the restart means rung 1 asserts the exact bundle the
+        # live event-driven onboard produced (no restart papering over a bad compose).
+        #
+        # When there IS an outbound leg: add the route so the forward proxy intercepts the github-tool
+        # call and runs token-exchange, grant the agent client the ``*-aud`` scope (only ever present
+        # once the tool is deployed) so the exchange succeeds and OPA is reached, then restart the agent
+        # so it reloads the route and re-fetches the recomposed bundle.
+        has_outbound = any(sig.kind == "outbound" for sig in signals)
+        if has_outbound:
+            ensure_github_tool_route(NAMESPACE)
+            if tool_onboarded:
+                grant_exchange_scope(admin)
+            restart_agent(NAMESPACE)
         # Resolved once for the ctx contract, but the live outbound path re-resolves per probe
         # (``resolve_agent_pod``) so a pod replaced after this point can't poison the whole run (#139).
         agent_pod = resolve_agent_pod()

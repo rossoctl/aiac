@@ -14,7 +14,7 @@
 >
 > | Rung | Issue | Onboards | Proves |
 > |---|---|---|---|
-> | 1 | `testing/5.4.1-uc1-onboard-agent-only.md` | agent only | agent discovery + inbound enforcement stand alone; outbound empty (all deny) with no tool |
+> | 1 | `testing/5.4.1-uc1-onboard-agent-only.md` | agent only | agent discovery + inbound enforcement stand alone; **inbound gate only** — no tool onboarded, so there is no real outbound call and the outbound leg is not probed live |
 > | 2 | `testing/5.4.2-uc1-onboard-agent-then-tool.md` | agent → tool | onboarding the tool **after** the agent completes the agent's outbound gate (PCE additive merge) |
 > | 3 | `testing/5.4.3-uc1-onboard-tool-then-agent.md` | tool → agent | the happy path; **and, vs rung 2, onboarding-order-independence** |
 > | 4 | `testing/5.4.4-uc1-onboard-two-policies.md` | two policies | **deferred / TBD**; two-stack impl discarded |
@@ -54,7 +54,8 @@ one-line session fixture and supplies only its own rung's oracle (verdicts compu
   **reads back** Keycloak state; it no longer resolves an internal UUID to trigger onboarding.
 - `launcher.py` — the shared live-cluster half: `kubectl` wrappers, `port_forward`, `resolve_pod`,
   `mint_token`, `jwt_claim`, `inbound_probe` / `outbound_probe`, `inbound_outcome` / `outbound_outcome`
-  (OPA denial classified by body, not status), `poll_until`, and the skip gates (`require_pipeline`,
+  (classified by body, not status: an OPA denial → `deny`, a token-exchange refusal → `error`),
+  `poll_until`, and the skip gates (`require_pipeline`,
   `require_env_or_skip`, `verify_subject_mapper`). There is **no** `opa_eval`, no `kubectl_cp` of
   `/rego`, and no standalone probe module: the evaluator is the deployed AuthBridge OPA plugin, and the
   input documents are built by AuthBridge's own parsers.
@@ -88,11 +89,15 @@ it.
 
 Live enforcement is now **in scope and is the whole point**: each rung onboards, enables the outbound
 token-exchange leg where a tool is present (Part B), waits for `bundle-service` + the AuthBridge OPA
-sidecars to recompose and reload the bundle, then drives real requests through AuthBridge on both legs
+sidecars to recompose and reload the bundle, then drives real requests through AuthBridge on the **inbound
+leg always** — plus the **outbound leg only where a tool is onboarded** (rungs 2/3)
 (`jwt-validation` builds `input.identity` inbound; `token-exchange` + `mcp-parser` build the outbound
-`input.identity` + `input.mcp.params.name`). The agent's own CrewAI reasoning flow is **not** triggered —
-the probes are synthetic requests through AuthBridge (an inbound `ping` / `nonexistent`; an outbound bare
-`tools/call`) — but the traffic is real and the deployed plugin enforces it.
+`input.identity` + `input.mcp.params.name`). Rung 1 (agent only) probes the **inbound leg only**: with no
+tool onboarded there is no real `agent -> tool` call, and token-exchange short-circuits before OPA (no
+`github-tool` audience grant on the agent client), so an outbound probe would observe a Keycloak audience
+refusal rather than the AIAC OPA policy the rung exists to prove. The agent's own CrewAI reasoning flow is
+**not** triggered — the probes are synthetic requests through AuthBridge (an inbound `ping` / `nonexistent`;
+an outbound bare `tools/call`) — but the traffic is real and the deployed plugin enforces it.
 
 The enforced decision is the **artifact under test** — the LLM/PCE that produced the policy might be
 wrong — so the tests never trust it. Expected verdicts are **computed from** the `scenario_uc1.py`
@@ -194,17 +199,23 @@ real requests + assert → full teardown.**
 
      Sequential deploy-and-wait is what keeps rung order meaningful (rung 2: agent→tool; rung 3:
      tool→agent) and the order-independence proof intact.
-3. **Enable the outbound token-exchange leg (Part B)** — only meaningful when a tool is onboarded (rungs 2
-   and 3), unchanged. `ensure_github_tool_route` adds the `github-tool` outbound route to
+3. **Enable the outbound token-exchange leg (Part B)** — runs **only when a tool is onboarded** (rungs 2
+   and 3). The harness gates the whole step on `has_outbound` (a rung has an outbound convergence signal),
+   so on rung 1 the route, grant, and restart are **all skipped** — rung 1 then asserts the exact bundle
+   the live event-driven onboard produced, with no restart papering over a bad compose.
+   `ensure_github_tool_route` adds the `github-tool` outbound route to
    `authproxy-routes`, `grant_exchange_scope` grants the agent's client the `github-tool` audience scope
    as optional, and `restart_agent` restarts the agent so it reloads the route (and its OPA sidecar
    re-fetches the recomposed bundle). Assigning the agent's `*-aud` scope is **not** operator-automatic,
-   so it stays harness provisioning. Without this the outbound call passes through unexchanged and never
-   reaches OPA.
+   so it stays harness provisioning (the operator creates that `*-aud` scope only on **tool** deploy, so
+   it does not even exist on the tool-less rung). Without this the outbound call passes through
+   unexchanged and never reaches OPA.
 4. **Poll until the pipeline converges.** `poll_until` drives real decisions until this run's CR is
-   reflected (inbound `dev-user` allow, `devops-user` deny; outbound `dev-user` `source-read` at its
-   terminal verdict), waiting out the bundle poll + post-restart token-exchange window, up to
-   `AIAC_BUNDLE_TIMEOUT`.
+   reflected (inbound `dev-user` allow, `devops-user` deny; and, **only when a tool is onboarded** (rungs
+   2/3), outbound `dev-user` `source-read` at its terminal verdict), waiting out the bundle poll +
+   post-restart token-exchange window, up to `AIAC_BUNDLE_TIMEOUT`. On rung 1 the convergence set is
+   **inbound-only** (`_default_ready_signals` appends the two outbound signals only under
+   `tool_onboarded`).
 5. **Validate two outcomes at the end** (no intermediate checks):
    1. **Keycloak provisioning.** The expected realm role(s) + client scopes exist with the expected
       names/descriptions (via `KeycloakAdmin`) — and, for rung 1, that **no** tool scopes were provisioned.
@@ -212,11 +223,15 @@ real requests + assert → full teardown.**
       plugin's** allow/deny:
       - **Inbound** — per `subject`, `inbound_decision` (200 → `allow`, 403 → `deny`); expected from
         `expected_inbound`.
-      - **Outbound (per-scope two-gate AND)** — per `(subject × bare tool name)`, a real MCP `tools/call`
-        for the **bare** tool through AuthBridge's forward proxy (`outbound_decision`); a denial is a
+      - **Outbound (per-scope two-gate AND)** — **rungs 2/3 only** (a tool is onboarded); rung 1 does not
+        probe the outbound leg. Per `(subject × bare tool name)`, a real MCP `tools/call`
+        for the **bare** tool through AuthBridge's forward proxy (`outbound_decision`); an OPA denial is a
         JSON-RPC error frame (`error.data.plugin: "opa"`) at HTTP 200 that the harness classifies as
-        `deny`. Expected from `expected_outbound_bare` — allowed iff the subject **and** some agent role
-        both reach that tool's scope.
+        `deny`. A **token-exchange refusal** (`error.data.plugin: "token-exchange"` /
+        `upstream.token-exchange-failed`) classifies as `"error"` — not `deny`, not `allow` — because the
+        outbound authz decision was never reached; this keeps a genuine token-exchange fault on rungs 2/3
+        from masquerading as an `allow`. Expected from `expected_outbound_bare` — allowed iff the subject
+        **and** some agent role both reach that tool's scope.
       - Verdicts are **computed from** `scenario_uc1.py`, never from the policy. A failing node names the
         exact cell.
 6. **Teardown → pristine.** Restore the cluster to its pre-test (no-workloads) state:
@@ -257,7 +272,11 @@ the **agent** and merges them onto the agent's stored `AgentPolicyModel`, re-ups
   is enforced.
 
 Rung 1 (agent only) is the exception by construction: with no tool onboarded there are no tool scopes in
-the universe, so the outbound user gate is **empty** (all deny). Inbound is unaffected.
+the universe, so the outbound user gate is **empty**. Rung 1 does **not** probe that gate live (the
+outbound leg has no real counterpart — see the inbound-only note above); its emptiness is asserted where
+it is deterministic and real: at the unit level by the grant-set oracle
+(`test/unit/agent/uc/onboarding/test_uc1_grant_set_oracles.py`) and live by `test_no_tool_scopes_provisioned`
+(no `github-tool.*` scope in Keycloak). Inbound is unaffected.
 
 ## Failure path — compensating rollback (rung 5) — **deferred**
 
@@ -304,7 +323,9 @@ and 3** (with a tool onboarded):
 | test-user | ❌ | ❌ | ✅ | ✅ |
 | devops-user | ❌ | ❌ | ❌ | ❌ |
 
-**Rung 1 (agent only):** the outbound table is **entirely deny** (empty user gate — no tool scopes).
+**Rung 1 (agent only):** the outbound user gate is **empty** (no tool scopes), so this table has no live
+counterpart on rung 1 — the outbound leg is **not probed**. The emptiness is asserted at the unit level
+(grant-set oracle) and live by `test_no_tool_scopes_provisioned`, not by a synthetic outbound deny.
 
 The pipeline emits an agent `AuthorizationPolicy` CR only — explicitly **no** tool CR (the tool is a pure
 target; "no rules written for the tool alone"). Each rung also asserts the expected Keycloak provisioning

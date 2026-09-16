@@ -8,8 +8,18 @@ consumer runs ``onboard_service`` — the same handler the removed ``POST /apply
 ``github-tool`` is **not deployed** (deploying it would onboard it), so no tool is onboarded. Then
 assert the agent-side outcome by driving **real HTTP requests through AuthBridge** and reading the
 **real OPA plugin's** allow/deny (handoff 08; live loop shape in ``k8s/opa-kind-runbook.md``). Proves
-agent discovery + inbound policy generation stand alone, and that the outbound user gate is correctly
-**empty** (all deny) when no tool has been onboarded.
+agent discovery + inbound policy generation stand alone.
+
+**Rung 1 asserts the inbound gate only.** The outbound leg is deliberately NOT probed here: with no
+tool onboarded there is no real ``user -> agent -> tool`` call to make, so an outbound probe would be
+a pure counterfactual. On a tool-less rung token-exchange short-circuits (the agent client holds no
+``github-tool`` audience grant, because the operator creates that ``*-aud`` scope only on **tool**
+deploy), so the call is refused **before OPA is ever consulted** — an outbound probe would observe a
+Keycloak audience refusal, not the AIAC OPA policy this rung exists to prove. The *emptiness* of the
+outbound user gate (no tool grants generated) is asserted where it is deterministic and real: at the
+unit level in ``test/unit/agent/uc/onboarding/test_uc1_grant_set_oracles.py`` (the grant-set oracle)
+and by ``test_no_tool_scopes_provisioned`` below (no ``github-tool.*`` scope in Keycloak). Rungs 2 & 3
+onboard the tool and so exercise the real outbound OPA gate.
 
 Single live rossoctl/Kind cluster with the AuthBridge OPA pipeline wired into both legs, plus the
 event path (NATS broker + ``aiac-event-listener`` SPI); it skips cleanly when either is unwired. The
@@ -24,8 +34,8 @@ deploy agent (fires the event) + converge → Part B → poll bundle → drive r
 tear workloads + registrations down to pristine**. Deploying the workload is now the onboarding
 **trigger** (a test step, not a precondition); teardown restores the cluster to its pre-test state.
 
-*Onboard + evaluate against the real plugin — no CrewAI flow is triggered* (the probes hit
-``ping/nonexistent`` inbound and a bare ``tools/call`` outbound).
+*Onboard + evaluate against the real plugin — no CrewAI flow is triggered* (the inbound probe hits
+``ping/nonexistent`` to reach the real jwt-validation → OPA gate without the agent runtime).
 
 Run (needs a live rossoctl/Kind cluster with the AIAC stack + AuthBridge OPA pipeline wired in — see
 ``k8s/opa-kind-runbook.md`` / ``k8s/opa-kind-enable.sh`` — the event path wired (NATS broker +
@@ -122,10 +132,8 @@ def test_inbound(onboarded: dict, subject: str) -> None:
     assert uc1.inbound_decision(onboarded, subject) == uc1.expected_inbound_decision(subject), subject
 
 
-@pytest.mark.parametrize("subject", list(scn.USERS))
-@pytest.mark.parametrize("tool_bare", scn.TOOL_REQUEST_NAMES)
-def test_outbound_all_deny(onboarded: dict, subject: str, tool_bare: str) -> None:
-    """Outbound user gate denies every ``(subject, tool)`` — the gate is empty because no tool was
-    onboarded. A real MCP ``tools/call`` for the bare tool through AuthBridge's forward proxy
-    (token-exchange → OPA) is denied for every user/tool pair (real-plugin decision)."""
-    assert uc1.outbound_decision(onboarded, subject, tool_bare) == "deny", f"{subject} / {tool_bare}"
+# NOTE: rung 1 has no outbound test. With no tool onboarded there is no real ``agent -> tool`` call,
+# and token-exchange short-circuits before OPA (no ``github-tool`` audience grant on the agent
+# client), so an outbound probe here would observe a Keycloak refusal, not the OPA policy. The empty
+# outbound gate is asserted at the unit level (grant-set oracle) and by ``test_no_tool_scopes_provisioned``.
+# Rungs 2 & 3 (tool onboarded) exercise the real outbound OPA gate. See the module docstring.
