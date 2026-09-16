@@ -163,7 +163,7 @@ Every sub-agent (UC1 Provision + Service Policy Builder, UC2 Build + Rebuild, UC
 
 `GET /health` is a bare liveness/readiness probe: the Controller is stateless (no local state, no connection held at rest), so it answers `200 {"status": "ok"}` whenever the process is serving, dispatching to no handler and touching no upstream. Upstream reachability (IdP, PCE, NATS) is validated per-request by the handlers. The k8s Deployment wires both the readiness and liveness probes to it.
 
-A `/health` reply needs a **free event loop** — the process being "up" is not enough. The event path therefore offloads its slow synchronous handler to a threadpool so the loop stays answerable during onboarding (see [NATS Consumer → Failure isolation](#failure-isolation)). As a complementary defence, the k8s Deployment tunes the **liveness** probe tolerant — an explicit `timeoutSeconds` and a raised `failureThreshold`/`periodSeconds` — so a brief loop-busy window cannot kill the pod. The concrete probe values are authoritative in `k8s/agent-deployment.yaml`; this spec fixes only the intent.
+A `/health` reply needs a **free event loop** — the process being "up" is not enough. The event path therefore offloads its slow synchronous handler to a threadpool so the loop stays answerable during onboarding (see [NATS Consumer → Failure isolation](#failure-isolation)). As a complementary defence, the k8s Deployment tunes the **liveness** probe tolerant — an explicit `timeoutSeconds` and a raised `failureThreshold` (so several consecutive slow probes, not one, must fail before a restart) — so a brief loop-busy window cannot kill the pod. The concrete probe values are authoritative in `k8s/agent-deployment.yaml`; this spec fixes only the intent.
 
 The `/apply/offboard/{service_id}` path uses the `{service_id:path}` converter (slash-bearing SPIFFE-URI clientIds) and is keyed on the **clientId (SPM key)**, not the Keycloak UUID that `/apply/service/{service_id}` carries — an offboarded client is gone from `get_services()`, so UUID→clientId resolution is impossible.
 
@@ -193,8 +193,10 @@ The `/apply/*` endpoints return bare HTTP status codes: `200 OK` on success (no 
 | `LLM_RETRY_BACKOFF_MAX` | `30` | ConfigMap |
 | `ONBOARD_LABEL_WAIT_ATTEMPTS` | `15` | ConfigMap |
 | `ONBOARD_LABEL_WAIT_BACKOFF` | `2.0` | ConfigMap |
+| `ONBOARD_CARD_WAIT_ATTEMPTS` | `15` | ConfigMap |
+| `ONBOARD_CARD_WAIT_BACKOFF` | `2.0` | ConfigMap |
 
-`UPSTREAM_MAX_RETRIES` governs the IdP, MCP, and Kubernetes transport seams only. The `LLM_*` knobs govern the PRB's LLM seam (see [Error Handling → Two retry layers](#two-retry-layers)). The `ONBOARD_LABEL_WAIT_*` knobs bound UC1 `classify_service`'s wait for the operator-applied `rossoctl.io/type` pod label (the deploy→onboard race — see [`uc1-service-onboarding.md`](aiac-agent/uc1-service-onboarding.md)): up to `ONBOARD_LABEL_WAIT_ATTEMPTS` looks, `ONBOARD_LABEL_WAIT_BACKOFF` seconds apart. A non-numeric or below-minimum value falls back to the default rather than crashing onboarding.
+`UPSTREAM_MAX_RETRIES` governs the IdP, MCP, and Kubernetes transport seams only. The `LLM_*` knobs govern the PRB's LLM seam (see [Error Handling → Two retry layers](#two-retry-layers)). The `ONBOARD_LABEL_WAIT_*` knobs bound UC1 `classify_service`'s wait for the operator-applied `rossoctl.io/type` pod label, and the `ONBOARD_CARD_WAIT_*` knobs bound `analyze_agent`'s wait for the agent's AgentCard `status.card.skills` to sync — **two separate deploy→onboard races** (see [`uc1-service-onboarding.md`](aiac-agent/uc1-service-onboarding.md)): up to `*_ATTEMPTS` looks, `*_BACKOFF` seconds apart (both default `15` / `2.0`, ≈30s of slack). A non-numeric or below-minimum value falls back to the default rather than crashing onboarding.
 
 ChromaDB collections: `aiac-policies` and `aiac-domain-knowledge`.
 

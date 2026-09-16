@@ -116,18 +116,25 @@ START → classify_service → [analyze_agent | analyze_tool] → provision_serv
      `spec.targetRef.name` is `workload_name` (the operator names the CR after the Deployment, e.g.
      `{workload}-deployment-card`, **not** after the workload — so match by `targetRef`, falling back
      to `metadata.name == workload_name` for hand-authored cards).
-  2. **AgentCard with synced skills found** → produce `ServiceProvision`:
-     - `roles`: `[RoleDefinition(name=f"{workloadName}.agent", description="Agent role")]`
-     - `scopes`: `[ScopeDefinition(name=f"{workloadName}.{skill.id}", description=skill.description) for skill in card.status.card.skills]` —
-       the operator syncs the fetched A2A card onto `status.card`; each skill's machine `id`
-       (e.g. `source_operations`) is used for the scope name (a stable identifier), not the display
-       `name` (which may contain spaces).
+  2. **AgentCard with synced skills found** → produce `ServiceProvision`. The operator syncs the fetched
+     A2A card onto `status.card`; each skill's **key** is its machine `id` (e.g. `source_operations`, a
+     stable identifier), or its display `name` as a fallback for a hand-authored card that omits `id` — a
+     skill with **neither** is an unusable card → `502` (naming the workload + the offending skill). From
+     that `skill_key`, **per skill**:
+     - `scopes`: `[ScopeDefinition(name=f"{workloadName}.{skill_key}", description=skill.description) for skill in card.status.card.skills]` —
+       the machine `id` (not the display `name`, which may contain spaces) so the scope name is a stable Keycloak identifier.
+     - `roles`: **one operator role per skill, mirroring the scope** — `[RoleDefinition(name=f"{workloadName}.{skill_key}", description=skill.description) for skill in …]`.
+       Role name == scope name is fine (a realm role and a client scope are distinct Keycloak objects); the **role's
+       description** is what the PRB capability-match reads to confine and grant the agent's outbound access on a domain
+       basis (see [`policy-rules-builder.md`](policy-rules-builder.md)). This **replaces** the prior single generic
+       `{workloadName}.agent`/"Agent role".
      - `reasoning`: `f"derived from AgentCard: {len(skills)} skills"`
-  3. **No AgentCard, or its `status.card` has no synced skills yet** → produce minimal `ServiceProvision`:
-     - `roles`: `[RoleDefinition(name=f"{workloadName}.agent", description="Agent role")]`
+  3. **No AgentCard, or its `status.card` has no synced skills yet** (only once the step-4 card-sync wait is exhausted) → produce minimal `ServiceProvision`:
+     - `roles`: `[RoleDefinition(name=f"{workloadName}.access", description="Default access scope")]`
      - `scopes`: `[ScopeDefinition(name=f"{workloadName}.access", description="Default access scope")]`
      - `reasoning`: `"partial: no AgentCard found, default scope assigned"` (no CR) or
        `"partial: AgentCard has no synced skills, default scope assigned"` (CR present, unsynced).
+  4. **Deploy→onboard race tolerance (AgentCard skill sync).** Steps 1–2 run inside a bounded re-poll loop (`_await_agent_skills`) — a **second, later** race than the `classify_service` label race (step 5 there). The operator syncs the fetched A2A card onto `status.card.skills` only **after** the agent pod is Ready, which lags the Keycloak client registration that fires onboarding, so this node can run while `status.card.skills` is still empty. An absent card, or a card whose skills have not synced yet, is therefore a transient not-ready state, re-polled up to `ONBOARD_CARD_WAIT_ATTEMPTS` times (default `15`) with `ONBOARD_CARD_WAIT_BACKOFF` seconds between looks (default `2.0` — ≈30s of slack, the same budget as the label wait, well under the NATS `AckWait`). It returns as soon as skills appear; the step-3 card-less / skill-less fallback applies **only after** the budget is exhausted — so a genuinely card-less legacy deployment still degrades gracefully, while a real deploy→onboard card-sync race is absorbed rather than mis-provisioned at the default scope. A Kubernetes API failure on the AgentCard LIST is an immediate `502` — not a race.
 
   > K8s access: `list` on `agentcards.agent.rossoctl.dev` in the target namespace.
 

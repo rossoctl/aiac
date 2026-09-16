@@ -13,6 +13,7 @@ missing/invalid label — actionable, never silent.
 
 import os
 import time
+from dataclasses import dataclass
 
 from fastapi import HTTPException
 
@@ -27,27 +28,32 @@ from .types import RoleDefinition, ScopeDefinition, ServiceProvision
 _TYPE_LABEL = "rossoctl.io/type"
 _MCP_LABEL = "protocol.rossoctl.io/mcp"
 
-# Deploy->onboard race tolerance for the operator-applied ``rossoctl.io/type`` label. The
-# onboarding event is triggered by a DIFFERENT operator action (Keycloak client registration ->
-# admin event), so this node can run BEFORE the operator has patched the label onto the pod. A
-# briefly-absent label is therefore a transient not-ready state, re-polled a bounded number of
-# times before we give up with a 502. Defaults ≈ 30s of slack (well under the NATS ACK_WAIT and
-# the system-test convergence poll); tunable via the environment (tests set them fast).
-_LABEL_WAIT_ATTEMPTS_ENV = "ONBOARD_LABEL_WAIT_ATTEMPTS"
-_LABEL_WAIT_BACKOFF_ENV = "ONBOARD_LABEL_WAIT_BACKOFF"
-_DEFAULT_LABEL_WAIT_ATTEMPTS = 15
-_DEFAULT_LABEL_WAIT_BACKOFF = 2.0
+@dataclass(frozen=True)
+class _WaitConfig:
+    """A bounded deploy->onboard race-tolerance poll. ``attempts_env``/``backoff_env`` name the
+    environment knobs (read at poll time, falling back to the defaults on an unset / non-numeric /
+    below-minimum value). Bundled so the two onboarding races below share one poll mechanic
+    (``_poll_until_ready``) instead of each repeating the read-env + range + backoff loop."""
 
-# Deploy->onboard race tolerance for the AgentCard skill sync — a SECOND, later race than the label
-# one above. The operator syncs the fetched A2A card onto ``status.card.skills`` only AFTER the agent
-# pod is Ready, which lags the Keycloak-client registration that triggers onboarding. So this node
-# can run while ``status.card.skills`` is still empty. An absent card / empty skill list is therefore
-# a transient not-ready state, re-polled a bounded number of times before we fall back to a default
-# access scope. Same ≈30s slack and env knobs as the label wait (tests set them fast).
-_CARD_WAIT_ATTEMPTS_ENV = "ONBOARD_CARD_WAIT_ATTEMPTS"
-_CARD_WAIT_BACKOFF_ENV = "ONBOARD_CARD_WAIT_BACKOFF"
-_DEFAULT_CARD_WAIT_ATTEMPTS = 15
-_DEFAULT_CARD_WAIT_BACKOFF = 2.0
+    attempts_env: str
+    backoff_env: str
+    default_attempts: int
+    default_backoff: float
+
+
+# Deploy->onboard race tolerance for the operator-applied ``rossoctl.io/type`` label. The onboarding
+# event is triggered by a DIFFERENT operator action (Keycloak client registration -> admin event), so
+# ``classify_service`` can run BEFORE the operator has patched the label onto the pod. A briefly-absent
+# label is therefore a transient not-ready state, re-polled before we give up with a 502. Defaults
+# ≈ 30s of slack (well under the NATS ACK_WAIT and the system-test convergence poll); tests set fast.
+_LABEL_WAIT = _WaitConfig("ONBOARD_LABEL_WAIT_ATTEMPTS", "ONBOARD_LABEL_WAIT_BACKOFF", 15, 2.0)
+
+# Deploy->onboard race tolerance for the AgentCard skill sync — a SECOND, later race than the label one
+# above. The operator syncs the fetched A2A card onto ``status.card.skills`` only AFTER the agent pod is
+# Ready, which lags the Keycloak-client registration that triggers onboarding. So ``analyze_agent`` can
+# run while ``status.card.skills`` is still empty. An absent card / empty skill list is therefore a
+# transient not-ready state, re-polled before we fall back to a default access scope. Same ≈30s slack.
+_CARD_WAIT = _WaitConfig("ONBOARD_CARD_WAIT_ATTEMPTS", "ONBOARD_CARD_WAIT_BACKOFF", 15, 2.0)
 
 
 def _env_num(name: str, default, cast, minimum):
@@ -58,6 +64,22 @@ def _env_num(name: str, default, cast, minimum):
     except (KeyError, TypeError, ValueError):
         return default
     return value if value >= minimum else default
+
+
+def _poll_until_ready(probe, cfg: _WaitConfig):
+    """Re-poll ``probe`` up to ``cfg`` attempts, backing off between looks (skipped after the last).
+    ``probe`` returns a non-``None`` 'ready' result to stop, or ``None`` to retry; it may raise to fail
+    the whole wait immediately (a real error, never a race). Returns the ready result, or ``None`` once
+    the attempt budget is exhausted — the caller then decides what an exhausted wait means."""
+    attempts = _env_num(cfg.attempts_env, cfg.default_attempts, int, minimum=1)
+    backoff = _env_num(cfg.backoff_env, cfg.default_backoff, float, minimum=0.0)
+    for attempt in range(attempts):
+        result = probe()
+        if result is not None:
+            return result
+        if attempt + 1 < attempts:
+            time.sleep(backoff)
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -153,11 +175,10 @@ def _await_service_type(namespace: str, workload_name: str) -> ServiceType:
     a bounded number of times. A label present with an INVALID value (not ``agent``/``tool``) is a
     real misconfiguration that no wait can fix, so it fails immediately. Retries exhausted -> 502
     naming the workload and the label (unchanged contract for a genuinely never-labelled workload)."""
-    attempts = _env_num(_LABEL_WAIT_ATTEMPTS_ENV, _DEFAULT_LABEL_WAIT_ATTEMPTS, int, minimum=1)
-    backoff = _env_num(_LABEL_WAIT_BACKOFF_ENV, _DEFAULT_LABEL_WAIT_BACKOFF, float, minimum=0.0)
-
     detail = f"no pod owned by workload {workload_name!r} in namespace {namespace!r}"
-    for attempt in range(attempts):
+
+    def _probe():
+        nonlocal detail
         try:
             pods = list_pods(namespace)
         except Exception as e:
@@ -180,11 +201,12 @@ def _await_service_type(namespace: str, workload_name: str) -> ServiceType:
                 f"workload {workload_name!r}: {_TYPE_LABEL} label missing or invalid "
                 f"(got {label!r}, expected 'agent' or 'tool')"
             )
+        return None
 
-        if attempt + 1 < attempts:
-            time.sleep(backoff)
-
-    raise HTTPException(502, detail)
+    service_type = _poll_until_ready(_probe, _LABEL_WAIT)
+    if service_type is None:
+        raise HTTPException(502, detail)
+    return service_type
 
 
 def _await_agent_skills(namespace: str, workload: str):
@@ -198,8 +220,6 @@ def _await_agent_skills(namespace: str, workload: str):
     bounded number of times. Returns ``(card, skills)`` as soon as skills are present, or the
     last-seen ``(card, [])`` once the attempt budget is exhausted — the caller then applies the
     legacy card-less / skill-less fallback (a genuinely card-less workload never converges here)."""
-    attempts = _env_num(_CARD_WAIT_ATTEMPTS_ENV, _DEFAULT_CARD_WAIT_ATTEMPTS, int, minimum=1)
-    backoff = _env_num(_CARD_WAIT_BACKOFF_ENV, _DEFAULT_CARD_WAIT_BACKOFF, float, minimum=0.0)
 
     # Link the card to the workload by its ``spec.targetRef`` (the Deployment it describes), since the
     # operator names the CR after the Deployment (e.g. ``<workload>-deployment-card``), not the
@@ -208,22 +228,21 @@ def _await_agent_skills(namespace: str, workload: str):
         target = ((c.get("spec") or {}).get("targetRef") or {}).get("name")
         return target == workload or (c.get("metadata") or {}).get("name") == workload
 
-    card = None
-    for attempt in range(attempts):
+    last_card = None
+
+    def _probe():
+        nonlocal last_card
         try:
             resp = list_agentcards(namespace)
         except Exception as e:
             raise HTTPException(502, f"Kubernetes AgentCard LIST failed in namespace {namespace!r}: {e}")
 
-        card = next((c for c in resp.get("items", []) if _targets_workload(c)), None)
-        skills = (((card or {}).get("status") or {}).get("card") or {}).get("skills", [])
-        if skills:
-            return card, skills
+        last_card = next((c for c in resp.get("items", []) if _targets_workload(c)), None)
+        skills = (((last_card or {}).get("status") or {}).get("card") or {}).get("skills", [])
+        return (last_card, skills) if skills else None
 
-        if attempt + 1 < attempts:
-            time.sleep(backoff)
-
-    return card, []
+    result = _poll_until_ready(_probe, _CARD_WAIT)
+    return result if result is not None else (last_card, [])
 
 
 def analyze_agent(state: OnboardingProvisionState) -> dict:

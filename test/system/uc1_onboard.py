@@ -889,6 +889,21 @@ def _default_ready_signals(tool_onboarded: bool) -> list[ReadySignal]:
 # ======================================================================================
 
 
+def _scrub_to_pristine(admin) -> None:
+    """Remove every AIAC registration + stored state a UC-1 run leaves behind, so the realm/cluster
+    is back to a no-workloads slate. Shared by the fixture's pre-run reset and its teardown — the two
+    ran the same sequence inline. Each step is best-effort (its helper tolerates already-absent
+    objects), and the five steps touch independent object classes (Keycloak clients + ``*-aud`` scopes,
+    the agent CR, stray AuthorizationPolicy CRs, prefixed roles/scopes, and the Policy Store), so their
+    order is not load-bearing. The caller owns undeploying the workloads first and verifying the
+    result — this only scrubs registrations + state, it does not delete Deployments."""
+    delete_workload_registrations(admin, TEST_REALM)  # clients + *-aud scopes + credentials Secret
+    delete_agent_cr()  # this run's (or a prior run's) CR
+    sweep_authpolicies()  # any leaked AuthorizationPolicy CR — the OPA bundle self-cleans from the CR set
+    cleanup_provisioned(admin, TEST_REALM)  # prefixed roles/scopes (Keycloak)
+    clear_policy_store()  # Policy Store SPMs (PV survives redeploys)
+
+
 @contextmanager
 def onboarded_stack(
     workloads: list[str],
@@ -956,12 +971,8 @@ def onboarded_stack(
     # clients actually gone before deploying.
     undeploy_workload(scn.AGENT_WORKLOAD)
     undeploy_workload(scn.TOOL_WORKLOAD)
-    delete_agent_cr()  # drop any prior run's CR
-    sweep_authpolicies()  # and any other leaked AuthorizationPolicy CR (bundle self-cleans from the CR set)
-    delete_workload_registrations(admin, TEST_REALM)  # clients + *-aud scopes + credentials Secret
-    cleanup_provisioned(admin, TEST_REALM)  # prefixed roles/scopes (Keycloak)
-    reenable_provisioned_clients(admin, TEST_REALM)  # undo any prior run's failed-service disable (now a no-op if deleted)
-    clear_policy_store()  # Policy Store SPMs (PV survives redeploys)
+    _scrub_to_pristine(admin)  # clients + *-aud scopes + agent CR + stray AuthorizationPolicy CRs + roles/scopes + store
+    reenable_provisioned_clients(admin, TEST_REALM)  # undo any prior run's failed-service disable (a no-op once scrubbed)
     if not poll_until(lambda: not workload_clients_present(admin), timeout=DEPLOY_TIMEOUT, interval=5):
         raise RuntimeError(
             f"pre-run cleanup left Keycloak client(s) {workload_clients_present(admin)} for {NAMESPACE!r} — the "
@@ -1117,11 +1128,8 @@ def onboarded_stack(
             _set_controller_default_effect(CONTROLLER_NAMESPACE, DEFAULT_EFFECT_DENY)
         for workload in reversed(workloads):  # undeploy in reverse deploy order
             undeploy_workload(workload)
-        delete_workload_registrations(admin, TEST_REALM)  # explicit — do not trust an unverified operator cascade
-        delete_agent_cr()  # drop this run's CR
-        sweep_authpolicies()  # + any other leaked CR — the OPA bundle self-cleans from the live CR set
-        cleanup_provisioned(admin, TEST_REALM)  # restore the pre-run Keycloak state (prefixed roles/scopes)
-        clear_policy_store()
+        # Explicit scrub — do not trust an unverified operator cascade. Same reset the pre-run slate runs.
+        _scrub_to_pristine(admin)
         # Verify pristine: both clients gone AND no AuthorizationPolicy CR remains. A leaked footprint is
         # a test failure, not silent drift — but do not mask a failure already propagating out of the try.
         if not poll_until(

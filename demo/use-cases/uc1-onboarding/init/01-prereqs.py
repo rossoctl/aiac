@@ -178,9 +178,10 @@ def ensure_workloads_deployed(namespace: str) -> None:
     # install.sh was split into kind-load.sh (build + kind load) then deploy.sh (apply + rollout);
     # run both in sequence to preserve the original build+load+apply behaviour for the demo.
     note("demo workloads not found — running demo/assets/kind-load.sh then demo/assets/deploy.sh")
-    env = {**os.environ, "NAMESPACE": namespace}
-    subprocess.run(["bash", str(ASSETS_DIR / "kind-load.sh")], env=env, check=True)
-    subprocess.run(["bash", str(ASSETS_DIR / "deploy.sh")], env=env, check=True)
+    # kind-load.sh only builds + loads images (namespace-agnostic); deploy.sh is the one that applies
+    # into NAMESPACE, so scope the env var to it rather than passing a dead var to both.
+    subprocess.run(["bash", str(ASSETS_DIR / "kind-load.sh")], check=True)
+    subprocess.run(["bash", str(ASSETS_DIR / "deploy.sh")], env={**os.environ, "NAMESPACE": namespace}, check=True)
     ok("demo workloads deployed")
 
 

@@ -8,8 +8,11 @@ realm lists ``aiac-event-listener`` in ``eventsListeners``, and ``adminEventsEna
 already-gathered facts, side-effect-free, so a cluster wired for OPA but not for events skips cleanly
 rather than hanging on a trigger that never fires.
 
-These tests carry the ``system`` marker for taxonomy but need **no** cluster — the function is pure,
-so they pass offline (they exercise the decision, not the I/O that gathers its inputs)."""
+These tests need **no** cluster — ``event_path_reason`` is pure, so they exercise the decision, not the
+I/O that gathers its inputs (``event_path_unwired_reason``, which reads the live realm + broker). They
+are therefore left **untagged** — a bare ``pytest`` runs them in the default (offline) lane, so the pure
+skip-gate logic keeps fast-lane regression cover. The file lives under ``test/system/`` only to sit
+beside the ``launcher.py`` it covers (test infra, with no ``src/aiac/`` module to mirror)."""
 
 import sys
 from pathlib import Path
@@ -21,8 +24,6 @@ if str(REPO_ROOT) not in sys.path:  # so ``import test.system.*`` resolves
     sys.path.insert(0, str(REPO_ROOT))
 
 from test.system.launcher import event_path_reason  # noqa: E402
-
-pytestmark = pytest.mark.system
 
 
 def _wired_realm() -> dict:
