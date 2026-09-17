@@ -1,0 +1,5 @@
+In this demo, we'll walk you through onboarding a new agent and a new tool onto the platform.
+we'll go through the entire process manually, step by step, showing everything that needs to happen for the GitHub agent and GitHub tool to be compliant with the access control rules defined in our GitHub policy. 
+Keep in mind the system isn't necessarilly starting from a blank slate: 
+the IdP might already has existing users with their corporate roles and profile information, and the platform might have already onboarded a number of agents and tools before this one. So what you'll see is how this existing state — including the existing access control rules — affects the newly deployed agent and tool, and how their onboarding in turn affects that existing state. 
+The core idea we're demonstrating is a mapping exercise: using what the system already knows — user IdP profiles, agent cards, and MCP tools descriptions together with the policy itself, we determine which users are authorized to access which agents and tools, and, just as importantly, which agents and tools each agent is authorized to access on behalf of the user who invoked it. (edited)
