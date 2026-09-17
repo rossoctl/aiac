@@ -56,8 +56,7 @@ def is_transient(exc: BaseException) -> bool:
         return True
     # requests.exceptions.ConnectionError / Timeout are NOT subclasses of the builtins above;
     # match them structurally by class name so this module stays transport-agnostic.
-    name = type(exc).__name__
-    if name in (
+    transient_names = {
         "ConnectionError",
         "Timeout",
         "ConnectTimeout",
@@ -67,7 +66,13 @@ def is_transient(exc: BaseException) -> bool:
         # matched by name so this module keeps no openai import (transport-agnostic).
         "APITimeoutError",
         "APIConnectionError",
-    ):
+    }
+    # Match against the WHOLE class hierarchy, not just the leaf name: a wrapper subclasses a
+    # transient base under a NEW name (e.g. langchain-openai's ``OpenAIConnectionError`` <-
+    # ``openai.APIConnectionError``), so the retryable base is present in the MRO even when the
+    # leaf name is not in the set. A leaf-only check misclassified such a connection error as
+    # permanent, dead-lettering an onboard on a transient LLM blip.
+    if any(base.__name__ in transient_names for base in type(exc).__mro__):
         return True
     status = _status_code(exc)
     return status is not None and status >= 500

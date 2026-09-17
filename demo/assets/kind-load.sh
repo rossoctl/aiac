@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
-# Idempotent installer for the demo/assets workloads (github-tool, github-agent) into a
-# rossoctl/Kind cluster. See INSTALL.md for the manual steps this automates and the
-# non-obvious invariants (MCP service label, async Keycloak registration, etc).
+# Build the demo/assets workload images (github-tool, github-agent) and load them into a
+# rossoctl/Kind cluster. This is the *images precondition* half of the old install.sh — it
+# builds + `kind load`s only; it applies NO manifests. Run `deploy.sh` afterwards to deploy.
+# See INSTALL.md for the manual steps this automates and the non-obvious invariants.
 #
-# This script does NOT wait for Keycloak client registration — that needs Keycloak
-# credentials this script has no business holding. It belongs to whatever use-case demo
-# consumes the client (e.g. the UC-1 onboarding demo's 00-prereqs.py). Do not "fix" that
-# omission here.
+# Split rationale: the UC-1 onboarding system tests deploy the workloads themselves (deploying
+# is the event-driven onboarding trigger) and now run THIS script first to load the images they
+# will deploy (test/system/uc1_onboard.py: load_workload_images -> kind-load.sh, build-if-absent).
+# This script produces exactly that images precondition; `deploy.sh` mirrors the apply/rollout half.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 CLUSTER_NAME="${CLUSTER_NAME:-rossoctl}"
-NAMESPACE="${NAMESPACE:-team1}"
 # Tags must carry the localhost/ prefix to match the Deployment manifests' image refs
 # (image: localhost/github-*:latest, imagePullPolicy: IfNotPresent). docker does not auto-prefix
 # built tags, so a bare github-*:latest would load into the kind node under a different repository
@@ -37,7 +37,7 @@ for arg in "$@"; do
   esac
 done
 
-log() { echo "[install.sh] $*" >&2; }
+log() { echo "[kind-load.sh] $*" >&2; }
 
 detect_runtime() {
   if command -v podman >/dev/null 2>&1; then
@@ -53,6 +53,8 @@ detect_runtime() {
 RUNTIME="${CONTAINER_RUNTIME:-$(detect_runtime)}"
 
 preflight() {
+  # Build/load only — needs the container runtime, kind, and the target Kind cluster to load into.
+  # Deliberately NO namespace/CRD checks: nothing is applied here (that is deploy.sh's job).
   local missing=0
   for bin in kubectl kind "$RUNTIME"; do
     if ! command -v "$bin" >/dev/null 2>&1; then
@@ -62,19 +64,9 @@ preflight() {
   done
   [ "$missing" -eq 0 ] || exit 1
 
-  if ! kubectl cluster-info >/dev/null 2>&1; then
-    log "ERROR: kubectl cannot reach a cluster. Is your kubeconfig pointing at '$CLUSTER_NAME'?"
-    exit 1
-  fi
-
-  if ! kubectl get namespace "$NAMESPACE" >/dev/null 2>&1; then
-    log "ERROR: namespace '$NAMESPACE' does not exist."
-    log "This script does not create cluster-owned resources — run the Rossoctl installer first."
-    exit 1
-  fi
-
-  if ! kubectl get crd agentruntimes.agent.rossoctl.dev >/dev/null 2>&1; then
-    log "ERROR: AgentRuntime CRD not found. Is the rossoctl-operator installed?"
+  if ! kind get clusters 2>/dev/null | grep -qx "$CLUSTER_NAME"; then
+    log "ERROR: Kind cluster '$CLUSTER_NAME' not found (kind get clusters). There is nowhere to load into."
+    log "Create the cluster first (the Rossoctl installer owns it), or set CLUSTER_NAME."
     exit 1
   fi
 }
@@ -89,7 +81,7 @@ load_image_to_kind() {
   # for podman, save to an archive and use `kind load image-archive` instead.
   if [ "$RUNTIME" = "podman" ]; then
     local tar_file
-    tar_file="$(mktemp "${TMPDIR:-/tmp}/install-image.XXXXXX")"
+    tar_file="$(mktemp "${TMPDIR:-/tmp}/kind-load-image.XXXXXX")"
     "$RUNTIME" save "$image" -o "$tar_file"
     kind load image-archive "$tar_file" --name "$CLUSTER_NAME"
     rm -f "$tar_file"
@@ -110,27 +102,17 @@ build_and_load() {
   load_image_to_kind "$image"
 }
 
-install_tool() {
-  local dir="$SCRIPT_DIR/tools/github_tool"
-  build_and_load "$TOOL_IMAGE" "$dir"
-  log "Applying tool manifests"
-  kubectl apply -n "$NAMESPACE" -f "$dir/k8s/github-tool-deployment.yaml"
-  kubectl rollout status -n "$NAMESPACE" deployment/github-tool
+load_tool() {
+  build_and_load "$TOOL_IMAGE" "$SCRIPT_DIR/tools/github_tool"
 }
 
-install_agent() {
-  local dir="$SCRIPT_DIR/agents/github_agent"
-  build_and_load "$AGENT_IMAGE" "$dir"
-  log "Applying agent configmaps"
-  kubectl apply -n "$NAMESPACE" -f "$dir/k8s/configmaps.yaml"
-  log "Applying agent manifests"
-  kubectl apply -n "$NAMESPACE" -f "$dir/k8s/github-agent-deployment.yaml"
-  kubectl rollout status -n "$NAMESPACE" deployment/github-agent
+load_agent() {
+  build_and_load "$AGENT_IMAGE" "$SCRIPT_DIR/agents/github_agent"
 }
 
 preflight
 
-[ "$DO_TOOL" -eq 1 ] && install_tool
-[ "$DO_AGENT" -eq 1 ] && install_agent
+[ "$DO_TOOL" -eq 1 ] && load_tool
+[ "$DO_AGENT" -eq 1 ] && load_agent
 
-log "Done."
+log "Done. Images built + loaded into '$CLUSTER_NAME'. Run deploy.sh to apply the manifests."
