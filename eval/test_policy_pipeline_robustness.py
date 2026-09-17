@@ -336,7 +336,7 @@ class SensitivityEdit:
 
 # One matched pair per primary correctness scenario (spec §4's acceptance bar). Every
 # restriction_word/exception_clause edit narrows *which roles* are eligible for an entire
-# existing scope ("only developers may access...", "everyone except front desk staff may
+# existing scope ("only testers may access...", "everyone except front desk staff may
 # read...") rather than narrowing *which sub-capability* of one already-bundled scope a role
 # keeps ("testers may only read..." while the inbound scope's own description still says
 # "reading and updating") — the latter reliably tripped the PRB auditor's contradiction check
@@ -353,39 +353,32 @@ SENSITIVITY_EDITS: dict[str, SensitivityEdit] = {
     "baseline": SensitivityEdit(
         edit_type="restriction_word",
         # Replaces both issue-tracker sentences at once (not just the tester one) so the edited
-        # text stays internally consistent: developers previously only had read access to the
-        # tracker (first sentence), and "only developers may access" reads as full read+write --
-        # leaving the first sentence's "read the issue tracker" in place would self-contradict the
-        # new sentence instead of cleanly superseding it. This also means the edit genuinely
-        # broadens developers (tracker-write is new for them), not just narrows testers -- reflected
-        # in `added` below.
+        # text stays internally consistent: developers previously had read-only tracker access via
+        # the first sentence, and "only testers may read and write" excludes them entirely --
+        # leaving that first sentence's "read the issue tracker" in place would contradict the new
+        # sentence instead of cleanly superseding it. Testers already had full read+write, so this
+        # narrows eligibility without changing testers' own grant -- a pure revoke for developers
+        # (`removed` below), with no `added` on either side.
         policy_find=(
             "Developers may read and write the source repository and read the issue tracker. "
             "Testers may read and write the issue tracker."
         ),
         policy_replace=(
-            "Developers may read and write the source repository. Only developers may read and write the issue tracker."
+            "Developers may read and write the source repository. Only testers may read and write the issue tracker."
         ),
         description_edits={
-            "user-role-tester": (
-                "who verifies software quality and tracks defects through the issue tracker: filing, "
-                "triaging, and updating issue reports; works in the issue tracker, not in source.",
-                "with no access to the issue tracker under this policy.",
-            ),
             "user-role-developer": (
-                "works primarily in source and consults issues for defect reports.",
-                "works primarily in source and now has full read and write access to the issue "
-                "tracker following this policy update.",
+                "who develops the source codebase (writing and maintaining code) and fixes code "
+                "defects reported in the issue tracker; works primarily in source and consults "
+                "issues for defect reports.",
+                "who develops the source codebase: writing and maintaining code. Works exclusively "
+                "in source, with no involvement in the issue tracker.",
             ),
         },
         removed={
-            "inbound": {("user-role-tester", "agent-scope-triager")},
-            "outbound_subject": {
-                ("user-role-tester", "tool-scope-tracker-read"),
-                ("user-role-tester", "tool-scope-tracker-write"),
-            },
+            "inbound": {("user-role-developer", "agent-scope-triager")},
+            "outbound_subject": {("user-role-developer", "tool-scope-tracker-read")},
         },
-        added={"outbound_subject": {("user-role-developer", "tool-scope-tracker-write")}},
     ),
     "agent_delegation": SensitivityEdit(
         edit_type="role_swap",
@@ -441,7 +434,7 @@ SENSITIVITY_EDITS: dict[str, SensitivityEdit] = {
             # grounded in real edited text, not an inferred cascade.
             "agent-role-receptionist": (
                 "Covers read and write access to patient records — reading and updating patient record contents.",
-                "NOT authorized -- the front desk clerk role it served has been fully revoked under this policy.",
+                "Covers no access to patient records.",
             ),
         },
         removed={
@@ -504,12 +497,11 @@ SENSITIVITY_EDITS: dict[str, SensitivityEdit] = {
             # user-role-front-desk-staff" -- left as-is, a faithful PRB revoking front-desk-staff
             # would reasonably revoke vip-manager too (it explicitly says its access IS
             # front-desk-staff's), corrupting this edit's `added={}` expectation that vip-manager
-            # is unaffected. Rewritten to state vip-manager's grant on its own terms, independent
-            # of front-desk-staff, so the edit only ever touches the role it names.
+            # is unaffected. Rewritten to state vip-manager's own grant on its own terms, with no
+            # reference to any other role, so the edit only ever touches the role it names.
             "user-role-vip-manager": (
                 "Real access matches user-role-front-desk-staff.",
-                "Real access: authorized to read reservation details and guest notes through the "
-                "guest-services agent, independently of user-role-front-desk-staff's own access.",
+                "Real access: authorized to read reservation details and guest notes through the guest-services agent.",
             ),
         },
         removed={
