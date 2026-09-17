@@ -118,14 +118,10 @@ def test_pool_multiple_scenarios_pools_by_count_not_average() -> None:
     assert metrics["precision"] == 10 / 11
 
 
-def test_pool_robustness_empty_lists_are_vacuously_perfect() -> None:
+def test_pool_robustness_empty_lists_omit_both_rates() -> None:
     metrics = pool_robustness_metrics([], [])
 
-    assert metrics == {
-        "scenarios_scored": 0,
-        "invariance_rate": 1.0,
-        "sensitivity_rate": 1.0,
-    }
+    assert metrics == {"scenarios_scored": 0}
 
 
 def test_pool_robustness_rates_are_never_blended() -> None:
@@ -147,12 +143,13 @@ def test_pool_robustness_pools_by_count_not_average() -> None:
 
 def test_pool_robustness_uneven_family_counts_pool_independently() -> None:
     # A -k filter or a subset run can score one family without the other -- each list is pooled
-    # on its own length, not against a shared denominator.
+    # on its own length, not against a shared denominator, and the un-run family's rate is
+    # omitted entirely rather than defaulted to a fabricated 1.0.
     metrics = pool_robustness_metrics([True, True], [])
 
     assert metrics["scenarios_scored"] == 2
     assert metrics["invariance_rate"] == 1.0
-    assert metrics["sensitivity_rate"] == 1.0  # vacuous -- no sensitivity entries scored
+    assert "sensitivity_rate" not in metrics
 
 
 def test_append_row_writes_one_json_line(tmp_path: Path) -> None:

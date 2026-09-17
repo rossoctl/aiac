@@ -352,13 +352,30 @@ class SensitivityEdit:
 SENSITIVITY_EDITS: dict[str, SensitivityEdit] = {
     "baseline": SensitivityEdit(
         edit_type="restriction_word",
-        policy_find="Testers may read and write the issue tracker.",
-        policy_replace="Only developers may access the issue tracker.",
+        # Replaces both issue-tracker sentences at once (not just the tester one) so the edited
+        # text stays internally consistent: developers previously only had read access to the
+        # tracker (first sentence), and "only developers may access" reads as full read+write --
+        # leaving the first sentence's "read the issue tracker" in place would self-contradict the
+        # new sentence instead of cleanly superseding it. This also means the edit genuinely
+        # broadens developers (tracker-write is new for them), not just narrows testers -- reflected
+        # in `added` below.
+        policy_find=(
+            "Developers may read and write the source repository and read the issue tracker. "
+            "Testers may read and write the issue tracker."
+        ),
+        policy_replace=(
+            "Developers may read and write the source repository. Only developers may read and write the issue tracker."
+        ),
         description_edits={
             "user-role-tester": (
                 "who verifies software quality and tracks defects through the issue tracker: filing, "
                 "triaging, and updating issue reports; works in the issue tracker, not in source.",
                 "with no access to the issue tracker under this policy.",
+            ),
+            "user-role-developer": (
+                "works primarily in source and consults issues for defect reports.",
+                "works primarily in source and now has full read and write access to the issue "
+                "tracker following this policy update.",
             ),
         },
         removed={
@@ -368,6 +385,7 @@ SENSITIVITY_EDITS: dict[str, SensitivityEdit] = {
                 ("user-role-tester", "tool-scope-tracker-write"),
             },
         },
+        added={"outbound_subject": {("user-role-developer", "tool-scope-tracker-write")}},
     ),
     "agent_delegation": SensitivityEdit(
         edit_type="role_swap",
@@ -414,11 +432,18 @@ SENSITIVITY_EDITS: dict[str, SensitivityEdit] = {
                 "intake agent; not involved in billing or insurance verification.",
                 "NOT authorized to use the intake agent at all. Not involved in billing or insurance verification.",
             ),
+            # outbound_target (agent-role-receptionist -> tool-scope-records-*) is decided by its
+            # own ROLE_GRAPH call over agent-role-receptionist's own description, which the clerk's
+            # negation edit never touches -- assuming that revoke cascades here on the strength of
+            # "they name the same worker" gives a faithful PRB (correctly reading its own
+            # unedited, still-granting description) no textual reason to revoke, and no way to
+            # pass. Edited directly instead, so the removed outbound_target pairs below are
+            # grounded in real edited text, not an inferred cascade.
+            "agent-role-receptionist": (
+                "Covers read and write access to patient records — reading and updating patient record contents.",
+                "NOT authorized -- the front desk clerk role it served has been fully revoked under this policy.",
+            ),
         },
-        # agent-role-receptionist and user-role-front-desk-clerk name the same worker -- the
-        # scenario's own AGENTS description text draws no distinction between them, so a full
-        # revoke of the clerk's access removes the agent role's reach into the same tool scopes
-        # too, not just the user-facing gates.
         removed={
             "inbound": {("user-role-front-desk-clerk", "agent-scope-receptionist")},
             "outbound_subject": {
@@ -475,6 +500,17 @@ SENSITIVITY_EDITS: dict[str, SensitivityEdit] = {
                 "authorized to read reservation details and guest notes through the guest-services agent.",
                 "NOT authorized to use the guest-services agent at all.",
             ),
+            # user-role-vip-manager's own description literally reads "Real access matches
+            # user-role-front-desk-staff" -- left as-is, a faithful PRB revoking front-desk-staff
+            # would reasonably revoke vip-manager too (it explicitly says its access IS
+            # front-desk-staff's), corrupting this edit's `added={}` expectation that vip-manager
+            # is unaffected. Rewritten to state vip-manager's grant on its own terms, independent
+            # of front-desk-staff, so the edit only ever touches the role it names.
+            "user-role-vip-manager": (
+                "Real access matches user-role-front-desk-staff.",
+                "Real access: authorized to read reservation details and guest notes through the "
+                "guest-services agent, independently of user-role-front-desk-staff's own access.",
+            ),
         },
         removed={
             "inbound": {("user-role-front-desk-staff", "agent-scope-concierge")},
@@ -508,10 +544,11 @@ SENSITIVITY_EDITS: dict[str, SensitivityEdit] = {
         policy_find="Field operators may open and close irrigation valves.",
         policy_replace="Field operators may not open or close irrigation valves at all.",
         # No description edits: every description in this scenario is deliberately "" (that's its
-        # whole point, per its own docstring). agent-role-groundskeeper and user-role-field-operator
-        # name the same worker -- with no description text to draw any distinction between them, a
-        # full revoke of the field operator's access removes the agent role's own reach into the
-        # valve tools too, not just the user-facing gates.
+        # whole point, per its own docstring), including agent-role-groundskeeper's -- unlike
+        # unreachable_resources' agent-role-receptionist, there is no independent, unedited
+        # description text an outbound_target ROLE_GRAPH call could fall back on instead of the
+        # one policy sentence (now negated) naming this scenario's only valve grant, so the
+        # cascade here doesn't rest on an assumption the way it did there.
         description_edits={},
         removed={
             "inbound": {("user-role-field-operator", "agent-scope-groundskeeper")},
@@ -546,7 +583,15 @@ def test_prb_sensitive_to_mechanical_edit(
     for name, (find, replace) in edit.description_edits.items():
         target = roles if name in roles else scopes
         current = target[name].description or ""
-        target[name] = target[name].model_copy(update={"description": current.replace(find, replace)})
+        new_description = current.replace(find, replace)
+        # Mirrors the policy-text staleness assert below: str.replace silently no-ops when `find`
+        # no longer matches (e.g. a future corpus reword), leaving the description unedited while
+        # the policy text is still flipped -- a policy/description pair that disagree with no
+        # signal the fixture went stale, instead of a loud failure here.
+        assert new_description != current, (
+            f"sensitivity edit description_edit for '{scenario_name}'/{name!r} did not match -- find={find!r} is stale"
+        )
+        target[name] = target[name].model_copy(update={"description": new_description})
 
     policy_path = Path(scenario.__file__).resolve().parent / scenario.POLICY_FILE
     normalized_text = " ".join(policy_path.read_text(encoding="utf-8").split())
