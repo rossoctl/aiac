@@ -6,3 +6,4 @@
 {"timestamp": "2026-09-15T13:40:04+00:00", "suite": "robustness_mechanical", "run_type": "regression", "model": "Azure/gpt-5-mini-2025-08-07", "scenarios_scored": 8, "invariance_rate": 1.0, "sensitivity_rate": 0.75}
 {"timestamp": "2026-09-16T09:53:25+00:00", "suite": "robustness_mechanical", "run_type": "regression", "model": "Azure/gpt-5-mini-2025-08-07", "scenarios_scored": 8, "invariance_rate": 0.75, "sensitivity_rate": 0.625}
 {"timestamp": "2026-09-16T12:41:55+00:00", "suite": "robustness_mechanical", "run_type": "regression", "model": "Azure/gpt-5-mini-2025-08-07", "scenarios_scored": 8, "invariance_rate": 0.75, "sensitivity_rate": 0.75}
+{"timestamp": "2026-09-17T07:46:46+00:00", "suite": "robustness_mechanical", "run_type": "regression", "model": "Azure/gpt-5-mini-2025-08-07", "scenarios_scored": 8, "invariance_rate": 0.875, "sensitivity_rate": 0.875}
