@@ -399,17 +399,16 @@ SENSITIVITY_EDITS: dict[str, SensitivityEdit] = {
                 "authorized to create and update shipment manifests through the dispatch agent, and to "
                 "have customs clearance carried out on the shipment's behalf as part of that coordinated "
                 "process.",
-                "authorized to create and update shipment manifests through the dispatch agent for "
-                "day-to-day loading and unloading; not authorized to have customs clearance carried out "
-                "on the shipment's behalf.",
+                "authorized to create and update shipment manifests for day-to-day loading and "
+                "unloading; not authorized to have customs clearance carried out on the shipment's "
+                "behalf.",
             ),
             "user-role-dock-worker": (
                 "authorized to create and update shipment manifests through the dispatch agent for "
                 "day-to-day loading and unloading; not authorized to have customs clearance carried out "
                 "on the shipment's behalf.",
-                "authorized to create and update shipment manifests through the dispatch agent, and to "
-                "have customs clearance carried out on the shipment's behalf as part of that coordinated "
-                "process.",
+                "authorized to create and update shipment manifests, and to have customs clearance "
+                "carried out on the shipment's behalf as part of a coordinated process.",
             ),
         },
         removed={"outbound_subject": {("user-role-shipment-coordinator", "agent-scope-broker")}},
@@ -423,7 +422,8 @@ SENSITIVITY_EDITS: dict[str, SensitivityEdit] = {
             "user-role-front-desk-clerk": (
                 "authorized to schedule appointments and read and update patient records through the "
                 "intake agent; not involved in billing or insurance verification.",
-                "NOT authorized to use the intake agent at all. Not involved in billing or insurance verification.",
+                "NOT authorized to schedule appointments or access patient records at all. Not "
+                "involved in billing or insurance verification.",
             ),
             # outbound_target (agent-role-receptionist -> tool-scope-records-*) is decided by its
             # own ROLE_GRAPH call over agent-role-receptionist's own description, which the clerk's
@@ -491,7 +491,7 @@ SENSITIVITY_EDITS: dict[str, SensitivityEdit] = {
         description_edits={
             "user-role-front-desk-staff": (
                 "authorized to read reservation details and guest notes through the guest-services agent.",
-                "NOT authorized to use the guest-services agent at all.",
+                "NOT authorized to read reservation details or guest notes at all.",
             ),
             # user-role-vip-manager's own description literally reads "Real access matches
             # user-role-front-desk-staff" -- left as-is, a faithful PRB revoking front-desk-staff
@@ -501,7 +501,7 @@ SENSITIVITY_EDITS: dict[str, SensitivityEdit] = {
             # reference to any other role, so the edit only ever touches the role it names.
             "user-role-vip-manager": (
                 "Real access matches user-role-front-desk-staff.",
-                "Real access: authorized to read reservation details and guest notes through the guest-services agent.",
+                "Real access: authorized to read reservation details and guest notes.",
             ),
         },
         removed={
@@ -520,7 +520,8 @@ SENSITIVITY_EDITS: dict[str, SensitivityEdit] = {
             "user-role-team-trainer": (
                 "authorized to read the team roster and update the practice schedule through the "
                 "coaching agent; not involved in performance evaluations.",
-                "NOT authorized to use the coaching agent at all. Not involved in performance evaluations.",
+                "NOT authorized to read the team roster or update the practice schedule at all. Not "
+                "involved in performance evaluations.",
             ),
         },
         removed={
