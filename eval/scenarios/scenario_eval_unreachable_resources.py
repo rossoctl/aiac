@@ -47,22 +47,18 @@ AGENTS: dict[str, dict] = {
     },
     "team1/billing-agent": {
         "description": (
-            "Autonomous Agent intended to manage patient billing and invoicing. Provisioned "
-            "ahead of the access policy meant to govern it; no policy language yet describes who "
-            "may call it or what it may reach."
+            "Autonomous Agent that manages patient billing and invoicing."
         ),
         "inbound_scopes": {
             "agent-scope-billing-access": (
                 "Scope granting use of the billing agent's invoicing capability — creating and "
-                "reading patient invoices. Not yet granted to any user role in the policy "
-                "document."
+                "reading patient invoices."
             ),
         },
         "delegation_scopes": {},
         "roles": {
             "agent-role-billing-operations": (
-                "Covers read and write access to patient invoices. Not yet granted to any target "
-                "in the policy document."
+                "Covers read and write access to patient invoices."
             ),
         },
     },
@@ -84,13 +80,11 @@ TOOLS: dict[str, dict] = {
     "insurance-tool": {
         "description": (
             "Capability provider Tool for insurance coverage verification. It performs read "
-            "operations against a patient's insurance details. No agent role is ever granted its "
-            "scope anywhere in the policy document — it is unreachable by design."
+            "operations against a patient's insurance details."
         ),
         "scopes": {
             "tool-scope-insurance-verify": (
-                "Verify a patient's insurance coverage details. No agent role is ever granted "
-                "this scope anywhere in the policy document — it is unreachable by design."
+                "Verify a patient's insurance coverage details."
             ),
         },
     },
@@ -106,8 +100,8 @@ USER_PASSWORD = "password"
 
 USER_ROLES: dict[str, str] = {
     "user-role-front-desk-clerk": (
-        "Front Desk Clerk — authorized to schedule appointments and read and update patient "
-        "records through the intake agent; not involved in billing or insurance verification."
+        "Front Desk Clerk — schedules appointments and reads and updates patient "
+        "records through the intake agent."
     ),
 }
 

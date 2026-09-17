@@ -52,11 +52,11 @@ TOOLS: dict[str, dict] = {
         ),
         "scopes": {
             "tool-scope-enrollment-status": (
-                "Look up a student's current enrollment status (enrolled, withdrawn, or on leave). No write access."
+                "Look up a student's current enrollment status (enrolled, withdrawn, or on leave)."
             ),
             "tool-scope-enrollment-history": (
                 "Look up a student's past enrollment record across terms, including earlier status "
-                "changes. No write access."
+                "changes."
             ),
         },
     },
@@ -71,7 +71,7 @@ USERS: dict[str, str] = {
 USER_PASSWORD = "password"
 
 USER_ROLES: dict[str, str] = {
-    "user-role-enrollment-advisor": "Enrollment Advisor: may look up enrollment information for advising purposes.",
+    "user-role-enrollment-advisor": "Enrollment Advisor: looks up enrollment information for advising purposes.",
 }
 
 # --- Role -> access facts (name-level; the single source of truth) --------------------------

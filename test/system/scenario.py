@@ -55,20 +55,18 @@ TOOL_DESCRIPTION = (
 USER_ROLES: dict[str, str] = {
     "developer": (
         "Developer — an engineering user who develops the source codebase (writing and maintaining "
-        "code) and fixes code defects reported in the issue tracker; works primarily in source and "
-        "consults issues for defect reports."
+        "code) and fixes code defects reported in the issue tracker."
     ),
     "tester": (
         "Tester — a quality-assurance user who verifies software quality and tracks defects through "
-        "the issue tracker: filing, triaging, and updating issue reports; works in the issue "
-        "tracker, not in source."
+        "the issue tracker: filing, triaging, and updating issue reports."
     ),
     # Deny-by-default control: devops appears in no INBOUND/OUTBOUND pair below. Its description is
     # deliberately unrelated to source and issue work, so the PRB derives no agent or tool scope for
     # it and deny-by-default leaves devops-user denied everywhere.
     "devops": (
         "DevOps — an operations user who manages deployment infrastructure and runtime "
-        "environments; does not author source code and does not manage the issue tracker."
+        "environments."
     ),
 }
 

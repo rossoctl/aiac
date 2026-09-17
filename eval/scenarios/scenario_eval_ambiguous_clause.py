@@ -82,7 +82,7 @@ USERS: dict[str, str] = {
 USER_PASSWORD = "password"
 
 USER_ROLES: dict[str, str] = {
-    "user-role-enrollment-advisor": "Enrollment Advisor — authorized to access enrollment information for advising purposes.",
+    "user-role-enrollment-advisor": "Enrollment Advisor — looks up enrollment information for advising purposes.",
 }
 
 # --- Role -> access facts (name-level; the single source of truth) --------------------------

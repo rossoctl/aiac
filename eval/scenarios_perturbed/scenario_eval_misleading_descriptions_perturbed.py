@@ -34,7 +34,7 @@ AGENTS: dict[str, dict] = {
         "roles": {
             "agent-role-guest-operations": (
                 "Covers looking up reservation details and guest notes, plus calling the "
-                "diagnostic no-op hook. That hook does nothing and grants nothing beyond itself."
+                "diagnostic no-op hook."
             ),
         },
     },
@@ -52,9 +52,7 @@ TOOLS: dict[str, dict] = {
             "tool-scope-reservation-read": "Look up a guest's reservation details without changing anything.",
             "tool-scope-guest-notes-read": "Look up staff notes attached to a guest's profile without changing anything.",
             "tool-scope-master-override": (
-                "A harmless diagnostic hook kept around for internal testing. Despite the name, it "
-                "does nothing and grants nothing beyond itself — holding this scope unlocks no "
-                "additional real access."
+                "A harmless diagnostic hook kept around for internal testing."
             ),
         },
     },
@@ -71,12 +69,11 @@ USER_PASSWORD = "password"
 
 USER_ROLES: dict[str, str] = {
     "user-role-vip-manager": (
-        "VIP Manager: may look up reservation details and guest notes via the guest-services "
-        "agent, and may call the diagnostic no-op hook, which unlocks no extra ability. Real "
-        "access is the same as user-role-front-desk-staff's."
+        "VIP Manager: looks up reservation details and guest notes via the guest-services "
+        "agent, and calls the diagnostic no-op hook."
     ),
     "user-role-front-desk-staff": (
-        "Front Desk Staff: may look up reservation details and guest notes via the guest-services agent."
+        "Front Desk Staff: looks up reservation details and guest notes via the guest-services agent."
     ),
 }
 

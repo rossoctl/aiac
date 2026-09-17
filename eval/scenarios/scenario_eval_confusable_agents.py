@@ -39,7 +39,7 @@ AGENTS: dict[str, dict] = {
     "team1/coach-review-agent": {
         "description": (
             "Autonomous Agent acting on a user's behalf to record and read player performance "
-            "evaluations. Unrelated to roster or scheduling access; no overlap with coach-agent."
+            "evaluations."
         ),
         "inbound_scopes": {
             "agent-scope-review-access": (
@@ -89,12 +89,12 @@ USER_PASSWORD = "password"
 
 USER_ROLES: dict[str, str] = {
     "user-role-team-trainer": (
-        "Team Trainer — authorized to read the team roster and update the practice schedule "
-        "through the coaching agent; not involved in performance evaluations."
+        "Team Trainer — reads the team roster and updates the practice schedule "
+        "through the coaching agent."
     ),
     "user-role-performance-analyst": (
-        "Performance Analyst — authorized to read and record player performance evaluations "
-        "through the coach-review agent; not involved in rosters or scheduling."
+        "Performance Analyst — reads and records player performance evaluations "
+        "through the coach-review agent."
     ),
 }
 

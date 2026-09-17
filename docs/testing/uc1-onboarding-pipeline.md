@@ -434,9 +434,9 @@ verbatim); client `type` is set by UC-1 from the `rossoctl.io/type` label.
 
 ### Realm roles (provisioned by the fixture)
 
-- `developer` — "Developer — an engineering user who develops the source codebase (writing and maintaining code) and fixes code defects reported in the issue tracker; works primarily in source and consults issues for defect reports."
-- `tester` — "Tester — a quality-assurance user who verifies software quality and tracks defects through the issue tracker: filing, triaging, and updating issue reports; works in the issue tracker, not in source."
-- `devops` — "DevOps — an operations user who manages deployment infrastructure and runtime environments; does not author source code and does not manage the issue tracker."
+- `developer` — "Developer — an engineering user who develops the source codebase (writing and maintaining code) and fixes code defects reported in the issue tracker."
+- `tester` — "Tester — a quality-assurance user who verifies software quality and tracks defects through the issue tracker: filing, triaging, and updating issue reports."
+- `devops` — "DevOps — an operations user who manages deployment infrastructure and runtime environments."
 
 ### `policy.md` — the single (abstract) variant
 

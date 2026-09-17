@@ -22,18 +22,18 @@ flips back to allow and the live test fails.
 
 **Every prohibition targets a pair the role's own description does NOT support** — so no DENY
 contradicts a description-derived capability grant. (Resolving a prohibition that *does* contradict a
-capability grant — e.g. denying the developer, whose description "consults issues", from issues — is
+capability grant — e.g. denying the developer, whose description covers defects reported in the issue tracker, from issues — is
 deferred future work; this scenario avoids it by leaving the developer **unconstrained**: its
 description spans source and reading issues, so under the permissive default it is fully allowed and
 carries no DENY at all.)
 
 **Both PRB deny idioms are exercised** (handoff §5), over conflict-free pairs:
   - *exclusivity* — "testers may access only issues" ⇒ ALLOW tester→issues-* **and DENY** tester→source-*
-    (the tester description works "in the issue tracker, not in source", so the DENY contradicts nothing).
+    (the tester description covers only issue-tracker work and is silent on source, so the DENY contradicts nothing).
     The ALLOW half is **inert** under ``default=ALLOW`` — everything not denied is already allowed — so
     the enforced matrix and this oracle depend only on the DENY half.
   - *direct prohibition* — "DevOps may not access source" ⇒ **DENY** devops→source-* only (no ALLOW
-    derived; the devops description "does not author source code"). DevOps is **not** prohibited from
+    derived; the devops description covers only deployment infrastructure and is silent on source). DevOps is **not** prohibited from
     issues and derives no ALLOW there, so ``devops→issues-*`` carries **no explicit rule at all** and is
     allowed **purely by the permissive default** — the signature that ``default=ALLOW`` is live (these
     cells are **deny** under Policy A). ``developer→*`` is likewise unconstrained and allowed by the
@@ -100,7 +100,7 @@ exclusive scoping that narrow access.
 #
 # Mirrors ``scenario_uc1``'s prefixed convention. Each maps 1:1 to a generated Rego DENY gate. Every
 # deny targets a (role, scope) pair the role's own description does NOT support, so none contradicts a
-# capability grant (the developer, whose description consults issues, carries no prohibition — it is
+# capability grant (the developer, whose description covers defects reported in the issue tracker, carries no prohibition — it is
 # left unconstrained).
 #
 # The prose's two source prohibitions ("testers may not access source", "DevOps may not access

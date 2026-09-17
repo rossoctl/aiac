@@ -54,7 +54,7 @@ def test_inbound_oracle(subject: str, allowed: bool) -> None:
     "subject, tool_bare, allowed",
     [
         # developer → source ✅✅ / issues ✅✅ (unconstrained — no developer prohibition; its
-        # description consults issues, so a prohibition would contradict the capability grant)
+        # description covers defects reported in the issue tracker, so a prohibition would contradict the capability grant)
         ("dev-user", "source-read", True),
         ("dev-user", "source-write", True),
         ("dev-user", "issues-read", True),
