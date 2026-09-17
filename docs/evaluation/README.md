@@ -14,7 +14,7 @@ design (what each attribute measures, scoring philosophy, reporting) lives in
 | `test_policy_pipeline_correctness_prb.py` | `eval` | PRB-level | [policy-eval-correctness-prb.md](policy-eval-correctness-prb.md) | PRB called directly (synthetic Role/Scope, no Keycloak/OPA) — precision/recall/denial-precision per scenario, zero-tolerance over-grant gate. Feeds the committed trend log. |
 | `test_policy_pipeline_correctness_e2e.py` | `eval` | End-to-end | [policy-eval-correctness-e2e.md](policy-eval-correctness-e2e.md) | Same scorer as the PRB-level suite, one layer further downstream (real Keycloak+PCE+OPA) — the only level that catches PCE-merge/Rego-rendering bugs. Feeds the committed trend log. |
 | `test_policy_pipeline_consistency.py` | `eval` | PRB-level | [policy-eval-robustness-consistency.md](policy-eval-robustness-consistency.md) | PRB run N times (default 5) on identical input, exact grant-set equality gate. **Legacy suite — not yet extended to the new eval-framework spec** (no trend-log wiring; tracked as #2468). |
-| `test_policy_pipeline_robustness.py` | `eval` | PRB-level | [policy-eval-robustness-consistency.md](policy-eval-robustness-consistency.md) | PRB grant sets checked under mechanical + semantic *meaning-preserving* perturbation (invariance family only). **Legacy suite — not yet extended to the new eval-framework spec** (no sensitivity family, no trend-log wiring; tracked as #2466/#2467). |
+| `test_policy_pipeline_robustness.py` | `eval` | PRB-level | [policy-eval-robustness-consistency.md](policy-eval-robustness-consistency.md) | PRB grant sets checked for **invariance** (mechanical + semantic *meaning-preserving* perturbation) and **sensitivity** (mechanical *meaning-changing* edits), each its own metric, feeding the trend log. **Semantic-tier sensitivity not yet built** (requires human sign-off per spec; tracked as #2467). |
 
 All five carry the single flat `eval` marker (the former per-suite `eval_*` markers were
 collapsed into one — select an individual suite by its file path or `-k`, as the runbook below
@@ -78,7 +78,7 @@ doesn't already parallelize scenarios internally:
 .venv/bin/pytest eval/test_policy_pipeline_consistency.py -m eval -n 8 -v
 
 # robustness — PRB-direct, no shared fixture, -n parallelizes cleanly.
-# (legacy suite; not yet wired into the trend log — see table above)
+# (mechanical-tier invariance + sensitivity feed the trend log; semantic tier does not — #2467)
 .venv/bin/pytest eval/test_policy_pipeline_robustness.py -m eval -n 8 -v
 ```
 
@@ -89,10 +89,12 @@ run.
 ## Reports
 
 Every run of the five markers above writes a Markdown report to the gitignored `eval/reports/`
-(`report_<DD_MM_HH_MM_SS>.md`) — see `eval/conftest.py`. The two Correctness suites additionally
-append one row each to the **committed** `eval/trend_log.jsonl` (spec:
+(`report_<DD_MM_HH_MM_SS>.md`) — see `eval/conftest.py`. The two Correctness suites and the
+Robustness suite's mechanical tier additionally append one row each to the **committed**
+`eval/trend_log.jsonl` (spec:
 [eval-framework.md §9](eval-framework.md#9-reporting-and-trend-persistence)) — see
-[policy-eval-correctness-prb.md § Trend log](policy-eval-correctness-prb.md#trend-log).
+[policy-eval-correctness-prb.md § Trend log](policy-eval-correctness-prb.md#trend-log) and
+[policy-eval-robustness-consistency.md § Trend log](policy-eval-robustness-consistency.md#trend-log).
 
 ## Dashboard
 

@@ -16,10 +16,11 @@
 Both suites live under `eval/`, alongside `policy-eval-scenarios.md`'s heavy
 scenarios, and reuse that family's scenario corpus rather than defining their own:
 
-- `eval/test_policy_pipeline_consistency.py` — the consistency suite,
-  `@pytest.mark.eval_consistency`.
-- `eval/test_policy_pipeline_robustness.py` — the robustness suite,
-  `@pytest.mark.eval_robustness`.
+- `eval/test_policy_pipeline_consistency.py` — the consistency suite, `@pytest.mark.eval`.
+- `eval/test_policy_pipeline_robustness.py` — the robustness suite, `@pytest.mark.eval`,
+  three test functions: `test_prb_invariant_to_mechanical_perturbation`,
+  `test_prb_invariant_to_semantic_perturbation`, `test_prb_sensitive_to_mechanical_edit` (see
+  [Robustness suite](#robustness-suite)).
 - `eval/prb_direct.py` — shared helper, `build_roles_and_scopes(scenario)`,
   used by both suites (see [No-Keycloak design](#no-keycloak-design) below).
 - `eval/scenarios_perturbed/` — eight hand-authored semantic-sibling scenario
@@ -73,12 +74,23 @@ that differ, and which run index disagreed with run 0.
 
 ### Robustness suite
 
-`test_prb_robust_to_perturbation` checks the PRB's grant decision is unchanged under two
-independent perturbation tiers, both applied to the **same** scenario and both compared against
-that scenario's own truth table (`truth(scenario)`, from `test_policy_pipeline_eval.py`) — not
-against each other. A single combined pass/fail per scenario; if one tier fails and the other
-passes, the scenario still reports as robustness-failed overall, with the assertion message stating
-which tier(s) failed and the mismatching pairs per gate.
+Per `docs/evaluation/eval-framework.md` §4, Robustness is scored as **two families, never
+blended**: **invariance** (a meaning-preserving edit — output must stay unchanged) and
+**sensitivity** (a meaning-*changing* edit — output must change, in the predicted direction).
+Three test functions, one metric each — no test combines two families' or two tiers' results into
+one assert:
+
+- `test_prb_invariant_to_mechanical_perturbation` — invariance family, mechanical tier (see
+  [Perturbation tiers](#perturbation-tiers) below).
+- `test_prb_invariant_to_semantic_perturbation` — invariance family, semantic tier (see
+  [Perturbation tiers](#perturbation-tiers) below).
+- `test_prb_sensitive_to_mechanical_edit` — sensitivity family, mechanical tier (see
+  [Sensitivity family](#sensitivity-family-mechanical-tier) below).
+
+All three compare against `truth(scenario)` (from `test_policy_pipeline_eval.py`) — the invariance
+tests directly, the sensitivity test against that truth table with its edit's known delta applied
+(see below). Each is its own pass/fail per scenario; the assertion message states the mismatching
+pairs per gate.
 
 #### Perturbation tiers
 
@@ -106,7 +118,93 @@ which tier(s) failed and the mismatching pairs per gate.
 
 Neither tier changes any production code: both drive `AIAC_POLICY_FILE` (via `monkeypatch.setenv`)
 and pass perturbed `Role`/`Scope`/scenario-shaped objects into the existing, unmodified
-`orchestrate_prb()`.
+`orchestrate_prb()` — called with `best_effort=True` (see
+[Sensitivity family](#sensitivity-family-mechanical-tier) below for the mechanism; mangled/reworded
+text can itself manufacture a coarse-scope contradiction the auditor rejects, and best-effort scores
+it anyway rather than erroring the whole test out). Only `test_prb_invariant_to_mechanical_perturbation`
+feeds the trend log (see [Trend log](#trend-log)) — the semantic tier's trend-log wiring is tracked
+separately as #2467.
+
+#### Sensitivity family (mechanical tier)
+
+`test_prb_sensitive_to_mechanical_edit` is the control that proves the PRB isn't just numb to its
+input: a model that ignores the policy text and always emits the same grants would score perfectly
+on the invariance family while failing every case here. One deterministic, programmatically-applied
+edit per scenario (`SENSITIVITY_EDITS: dict[str, SensitivityEdit]`, `test_policy_pipeline_
+robustness.py`), each a small but *meaning-changing* minimal edit:
+
+| `edit_type` | What it does | Scenarios |
+|---|---|---|
+| `negation` | revokes a role's entire relationship to a scope ("may not use ... at all") | `unreachable_resources`, `ambiguous_clause`, `wildcard_grant`, `confusable_agents`, `empty_descriptions` |
+| `role_swap` | swaps which of two roles an entire scope-level grant covers | `agent_delegation` |
+| `restriction_word` | inserts "only" to narrow *which roles* are eligible for an entire existing scope | `baseline` |
+| `exception_clause` | adds an explicit "except ..." carving a role *out of* eligibility for an entire scope | `misleading_descriptions` |
+
+Every edit operates at **whole-scope granularity**: it adds or removes a role's *entire*
+relationship to a given scope (all of that scope's downstream pairs together), never a partial
+slice of what one scope's own description bundles. This was a deliberate design correction made
+after live testing: an earlier revision of several edits (`baseline`, `wildcard_grant`,
+`unreachable_resources`, `confusable_agents`, `misleading_descriptions`) narrowed just *one*
+sub-capability of a role's access — e.g. "testers may only read the issue tracker" — while the
+relevant inbound scope's own (unedited) description still bundled both capabilities together
+("reading **and updating** issues"). Against a real LLM, the auditor read that as a genuine
+grant-and-prohibit contradiction on the bundled scope and rejected the decision outright, every
+time — not occasional flakiness, but a structural consequence of asking the auditor to
+partially honor a scope its own description asserts as one indivisible unit. Restriction_word and
+exception_clause are still represented — they just restrict/except *role eligibility for an entire
+scope* ("only developers may access the issue tracker", "everyone except front desk staff may use
+the guest-services agent") rather than a role's *sub-capability within* one scope, which needs no
+partial reconciliation from the auditor. Role-eligibility phrasing needs at least two roles sharing
+the same scope to have something to restrict/except, so it only fits `baseline` and
+`misleading_descriptions`; every single-role scenario (and `confusable_agents`, whose two roles use
+disjoint agents) instead gets a full `negation`.
+
+Each `SensitivityEdit` carries:
+
+- `policy_find`/`policy_replace` — applied to the scenario's policy `.md` text *after*
+  whitespace-normalization (`" ".join(text.split())`, so the edit doesn't depend on the file's
+  exact line-wrapping — the PRB's real input is the flat text, not rendered markdown).
+- `description_edits` — a `{role_or_scope_name: (find, replace)}` map applied to that entity's own
+  `.description` (via `.model_copy(update=...)`, the same mechanism the mechanical-tier mangle
+  uses), keeping the edited scenario's policy text and descriptions mutually consistent — the same
+  way the original scenario's were co-authored to agree. Empty for `empty_descriptions`: every
+  description in that scenario is deliberately `""` by design, so its policy `.md` text is the
+  PRB's only signal.
+- `removed`/`added` — the per-gate `(role, scope)` pairs that flip relative to `truth(scenario)`.
+  The test recomputes the expected truth as `truth(scenario)` with this delta applied, and asserts
+  the PRB's actual output matches it **exactly** — not merely "changed somewhere in the right
+  direction". Exact-match is deliberate: a looser check would pass even if the edit had an
+  unintended side effect elsewhere in the grant set (e.g. also moving a gate it wasn't meant to
+  touch), which is exactly the failure mode worth catching.
+
+Every edit was verified to touch only the intended gate(s) by checking, for each scenario, whether
+the *agent's own role name* names a worker genuinely distinct from the user role being edited — e.g.
+`wildcard_grant`'s `agent-role-stocker` (a stocker) is a different job from `user-role-inventory-manager`
+(a manager), and `agent_delegation`'s `agent-role-dispatcher` is distinct from either
+`user-role-shipment-coordinator` or `user-role-dock-worker`, so revoking/swapping the user-facing
+sentence alone leaves `outbound_target` unaffected for those. `empty_descriptions`
+(`agent-role-groundskeeper` / `user-role-field-operator`) and `unreachable_resources`
+(`agent-role-receptionist` / `user-role-front-desk-clerk`) are the two exceptions: in both, the agent
+role's name describes the same real-world worker as the user role it's paired with, so their edit's
+delta touches `outbound_target` too — a partial revoke that left the identically-named agent role
+untouched was not defensible, and live testing bore this out, with the auditor denying the agent
+role's access right alongside the user role's rather than respecting an artificial split between two
+names for the same job. This holds independently of whether the agent role happens to carry its own
+description text (`agent-role-receptionist` does — "Covers read and write access to patient
+records"); a description that's merely independently *written* doesn't make the two roles
+independently *real*.
+
+Even whole-scope edits are not guaranteed friction-free against a live auditor — in testing,
+`baseline`'s "only developers may access..." phrasing triggered a *different*, softer auditor note
+about how exclusivity should be signaled internally (not a contradiction), and a clean revoke can
+still occasionally be rejected as an unsupported prohibition (`ambiguous_clause`, in testing). Both
+are handled by `best_effort=True` (see [Testing Decisions](#testing-decisions)) and are qualitatively
+different from the coarse-scope contradiction this redesign specifically eliminates: they're
+LLM-behavior nuances the eval framework's own philosophy already treats as genuine findings, not
+harness bugs — see [Expected output](#expected-output).
+
+Semantic-tier sensitivity (a hand-authored, meaning-changing reworded sibling requiring human
+sign-off per spec §4) is out of scope for this suite and tracked as #2467.
 
 ## No-Keycloak design
 
@@ -131,8 +229,8 @@ entirely different concern from this family's PRB-output-only scope.
 ## Expected output
 
 Both suites parametrize over all 8 scenario names and expect **all 8 to pass** given a
-well-behaved LLM endpoint. A failing case names the scenario, the failing tier (robustness only),
-the failing gate, and the exact `(role, scope)` pairs that diverged — see
+well-behaved LLM endpoint. A failing case names the scenario, the failing family/tier (robustness
+only), the failing gate, and the exact `(role, scope)` pairs that diverged — see
 [Description](#description) above for each suite's exact failure-message shape.
 
 Because both suites' subject is LLM behavior itself, a failure is a genuine finding about the
@@ -158,7 +256,7 @@ original does not.
 | Variable | Purpose |
 |---|---|
 | `LLM_BASE_URL` / `LLM_MODEL` / `LLM_API_KEY` | The only required variables — both suites call the PRB directly against a real LLM endpoint. |
-| `AIAC_POLICY_FILE` | Set per test call (via `monkeypatch.setenv`), not from the environment — the consistency suite points it at the scenario's own unperturbed `policy.eval_<name>.md`; the robustness suite points it at a `tmp_path`-written mangled copy (mechanical tier) or the perturbed sibling's `policy.eval_<name>_perturbed.md` (semantic tier). |
+| `AIAC_POLICY_FILE` | Set per test call (via `monkeypatch.setenv`), not from the environment — the consistency suite points it at the scenario's own unperturbed `policy.eval_<name>.md`; the robustness suite points it at a `tmp_path`-written mangled copy (invariance, mechanical tier), the perturbed sibling's `policy.eval_<name>_perturbed.md` (invariance, semantic tier), or a `tmp_path`-written edited copy (sensitivity, mechanical tier — see [Sensitivity family](#sensitivity-family-mechanical-tier)). |
 | `PRB_CONSISTENCY_REPEATS` | Optional, consistency suite only. Number of repeat PRB runs per scenario. Default `5`. |
 
 Neither suite reads `KEYCLOAK_URL`, `KEYCLOAK_ADMIN_USERNAME`/`PASSWORD`, `AIAC_PDP_CONFIG_URL`,
@@ -169,31 +267,59 @@ Neither suite reads `KEYCLOAK_URL`, `KEYCLOAK_ADMIN_USERNAME`/`PASSWORD`, `AIAC_
 
 ```bash
 # Both suites need only LLM_BASE_URL/LLM_MODEL/LLM_API_KEY — no Keycloak/opa:
-.venv/bin/pytest eval/test_policy_pipeline_consistency.py -m eval_consistency -v
-.venv/bin/pytest eval/test_policy_pipeline_robustness.py -m eval_robustness -v
+.venv/bin/pytest eval/test_policy_pipeline_consistency.py -m eval -v
+.venv/bin/pytest eval/test_policy_pipeline_robustness.py -m eval -v
 
 # Override repeat count for the consistency suite:
 PRB_CONSISTENCY_REPEATS=10 .venv/bin/pytest eval/test_policy_pipeline_consistency.py \
-  -m eval_consistency -v
+  -m eval -v
 
 # A pass/fail/skip/error report for the run is written alongside the policy-eval-scenarios one:
 #   eval/reports/report_<DD_MM_HH_MM>.md (Asia/Jerusalem local time)
 ```
 
-Both suites call `require_env("LLM_BASE_URL", "LLM_MODEL", "LLM_API_KEY")` as the first line of
-each parametrized test function (not in a fixture) — matching `test_policy_pipeline_eval.py`'s
-existing pattern, this raises `SystemExit(2)` (not a `pytest.skip`) if any is unset/empty.
+Both suites call `require_env_or_skip("LLM_BASE_URL", "LLM_MODEL", "LLM_API_KEY")` as the first
+line of each parametrized test function (not in a fixture) — matching
+`test_policy_pipeline_eval.py`'s existing pattern, this `pytest.skip`s the case (not a crash) if
+any is unset/empty.
 
 ## Test report
 
 Reuses the exact report described in
 [policy-eval-scenarios.md § Test report](policy-eval-scenarios.md#test-report), widened to also
-collect `eval_consistency`/`eval_robustness`-marked tests
-(`eval/conftest.py`'s `MARKERS` set now covers all three markers). Both new suites' tests fall
-through to that report's generic docstring + crash-message rendering (neither
-`record_property`s a per-cell description the way `test_inbound`/`test_outbound` do) — a single
-docstring per parametrized test function already names exactly what's being checked, since neither
-suite sweeps a per-cell matrix the way the heavy scenarios' `test_inbound`/`test_outbound` do.
+collect this family's `eval`-marked tests (`eval/conftest.py`'s single flat `eval` marker covers
+every suite under `eval/`, this family included). Every test in this family falls
+through to that report's generic docstring + crash-message rendering (none `record_property`s a
+per-cell description the way `test_inbound`/`test_outbound` do) — a single docstring per
+parametrized test function already names exactly what's being checked, since none of these suites
+sweep a per-cell matrix the way the heavy scenarios' `test_inbound`/`test_outbound` do.
+`test_prb_invariant_to_mechanical_perturbation`/`test_prb_sensitive_to_mechanical_edit` additionally
+`record_property("invariant"/"sensitive", bool)` — not rendered in the Markdown report, but read
+back by `_write_trend_log` (see [Trend log](#trend-log)). `test_prb_sensitive_to_mechanical_edit`
+also `record_property("best_effort_notes", ...)` and prints a summary line when non-empty, same
+convention as the two correctness suites — naming which scenario's decision fell back to a
+best-effort, never-approved proposal (see [Testing Decisions](#testing-decisions)).
+
+## Trend log
+
+`eval/conftest.py`'s `_write_trend_log` collects `test_prb_invariant_to_mechanical_perturbation`'s
+and `test_prb_sensitive_to_mechanical_edit`'s `record_property("invariant"/"sensitive", bool)`
+values, via nodeid-substring matching (`_ROBUSTNESS_TEST_MARKERS`, since the single flat `eval`
+marker — shared by every suite under `eval/` — spans three test functions across two
+families/tiers that must stay unblended per spec §4), and appends **two** rows to the committed,
+append-only `eval/trend_log.jsonl` from `pytest_sessionfinish` — one per family, never combined:
+`suite="robustness_mechanical_invariance"` and `suite="robustness_mechanical_sensitivity"`. Each
+row carries that family's own pass/fail rate (`invariance_rate`/`sensitivity_rate`, mean of that
+family's booleans) *and* that family's own `precision`/`recall`/`denial_precision`, pooled from the
+same `true_positives`/`denied_total`/`over_grants`/`under_grants`/`incorrectly_denied` shape
+`_record_scoring` records (`eval/trend_log.py`'s `pool_correctness_metrics` — the same pooling
+function the two Correctness suites use, reused as-is here) — so each family's chart is directly
+comparable in shape to a Correctness chart: one measuring the PRB against the *original* inputs,
+the other against *deliberately edited* inputs. A family with zero scored scenarios in a run (e.g.
+a `-k` filter that only exercises the other family) simply gets no row at all, rather than a shared
+row mislabeling one family's count against the other's. `test_prb_invariant_to_semantic_perturbation`
+is deliberately excluded (semantic-tier trend-log wiring is #2467). See
+`docs/evaluation/eval-framework.md` §9.
 
 ## Testing Decisions
 
@@ -224,11 +350,60 @@ suite sweeps a per-cell matrix the way the heavy scenarios' `test_inbound`/`test
   keeps `PERTURBED_SCENARIOS`' construction uniform and avoids inventing a second top-level
   perturbed-scenario file just to preserve an asymmetry that has no bearing on either new suite's
   logic.
+- **Sensitivity edits are exact-match-scored, not "changed somewhere in the right direction".**
+  `test_prb_sensitive_to_mechanical_edit` asserts the actual grant set equals `truth(scenario)`
+  with the edit's delta applied — a looser check would still pass if the edit had an unintended
+  side effect elsewhere in the grant set, which is exactly the failure mode worth catching.
+- **Sensitivity edits touch the user-facing policy sentence, not the agent's own role, only where
+  the agent role names a genuinely distinct worker.** For scenarios where the agent role and user
+  role are different jobs (`wildcard_grant`'s `agent-role-stocker` vs. `user-role-inventory-manager`,
+  `agent_delegation`'s `agent-role-dispatcher` vs. either of its user roles), revoking/swapping only
+  the policy text's user-facing sentence keeps the edit's blast radius to exactly the intended
+  gate(s). `empty_descriptions` (`agent-role-groundskeeper`) and `unreachable_resources`
+  (`agent-role-receptionist`) name the same worker as their paired user role
+  (`user-role-field-operator`, `user-role-front-desk-clerk`), so their edit's delta necessarily
+  touches `outbound_target` too — confirmed against a live LLM, which denied the agent role's access
+  right alongside the user role's rather than honoring an artificial split between two names for the
+  same job.
+- **Every sensitivity edit is whole-scope, not partial-capability — a correction made after live
+  testing, not the original design.** The first revision narrowed one sub-capability of a role's
+  access while the relevant inbound scope's own description still bundled that capability with
+  another ("reading **and updating** issues"); against a real LLM this reliably read as a
+  grant-and-prohibit contradiction and the auditor rejected it every time — a structural
+  consequence of the edit shape, not occasional model flakiness. The fix: every edit now adds or
+  removes a role's *entire* relationship to a scope. `restriction_word`/`exception_clause` are
+  still represented, just as role-*eligibility* language ("only developers may access...",
+  "everyone except front desk staff may use...") rather than sub-capability language — which needs
+  at least two roles sharing one scope to have anything to restrict/except, so it's used only where
+  that structure exists (`baseline`, `misleading_descriptions`); every other scenario uses a full
+  `negation` instead. See [Sensitivity family](#sensitivity-family-mechanical-tier) for the
+  scenario-by-scenario rationale.
+- **All three test functions use `orchestrate_prb(..., best_effort=True)`.** Even a whole-scope
+  edit, or plain mangling/rewording, isn't guaranteed friction-free against a live auditor —
+  confirmed in testing: `baseline`'s "only developers may access..." triggered a softer auditor note
+  about how exclusivity should be signaled internally (rejected as an implementation nuance, not a
+  contradiction); `ambiguous_clause`'s full revoke was once rejected as an unsupported prohibition on
+  a scope nobody had ever been granted; and `agent_delegation`'s mechanical-tier mangling manufactured
+  a coarse-scope contradiction on `agent-scope-dispatcher` (which bundles manifest operations and
+  customs-clearance coordination in one scope) that the *unmangled* text never triggers. Best-effort
+  falls back to the last-proposed, never-approved rule instead of aborting the whole scenario — the
+  same mechanism and rationale as the two correctness suites — so a rejection still scores (and is
+  itself an informative finding: the PRB failing closed rather than cleanly re-deciding), rather than
+  erroring the whole test out and reporting every metric as "unavailable." This was a deliberate
+  correction: the invariance tests originally used `best_effort=False` (matching the legacy suite's
+  behavior), but that meant a rejected decision surfaced no metrics at all in the report — inconsistent
+  with the sensitivity test, which had `best_effort=True` from the start. Whether a given live run's
+  `invariance_rate`/`sensitivity_rate` comes out high or low is exactly the signal the trend log exists
+  to track over time — the eval framework's own
+  philosophy (`docs/evaluation/eval-framework.md`, and this suite's own
+  [Expected output](#expected-output)) already treats a failure against a live, non-deterministic
+  LLM as a genuine finding, not proof the harness is broken.
 
 ## Relationship to other integration tests
 
-This is **one** integration-test spec (covering two suites, 16 parametrized test cases total) among
-several indexed by the master PRD ([../PRD.md](../specs/PRD.md), § *Integration test specifications*).
+This is **one** integration-test spec (covering two suites, 32 parametrized test cases total — the
+consistency suite's 8 plus the robustness suite's 3 test functions × 8 scenarios) among several
+indexed by the master PRD ([../PRD.md](../specs/PRD.md), § *Integration test specifications*).
 
 - **Companion to, not a replacement for, [policy-eval-scenarios.md](policy-eval-scenarios.md).**
   That family proves correctness once per scenario; this family proves consistency and robustness
@@ -236,10 +411,10 @@ several indexed by the master PRD ([../PRD.md](../specs/PRD.md), § *Integration
 - **Independent of [policy-pipeline.md](../testing/policy-pipeline.md) and
   [uc1-onboarding-pipeline.md](../testing/uc1-onboarding-pipeline.md).** Neither suite here touches Keycloak,
   the PCE, `opa`, or a live cluster — see [No-Keycloak design](#no-keycloak-design).
-- **New markers, registered in `pyproject.toml`** (`eval_consistency`,
-  `eval_robustness`), distinct from `integration`/`eval_extended`, so either suite
-  can be invoked independently and its (lighter) infra requirement is visible from the marker name
-  alone.
+- **Carries the single flat `eval` marker** (`pyproject.toml`), same as every other suite under
+  `eval/` — select this suite specifically by file path or `-k`, not by a dedicated marker (the
+  former per-suite `eval_*` markers, including `eval_consistency`/`eval_robustness`, were collapsed
+  into one).
 
 ## Out of Scope
 
@@ -257,6 +432,9 @@ several indexed by the master PRD ([../PRD.md](../specs/PRD.md), § *Integration
   future work if today's exact-equality bar proves too strict in practice.
 - **Default-CI wiring.** Both markers keep this family out of the default `-m "not integration"`
   unit run, matching every other suite indexed in this PRD section.
+- **Semantic-tier sensitivity.** The sensitivity family's semantic tier (a hand-authored,
+  meaning-changing reworded sibling, requiring human sign-off per
+  `docs/evaluation/eval-framework.md` §4) is not part of this suite — tracked as #2467.
 
 ## Blocked-by
 

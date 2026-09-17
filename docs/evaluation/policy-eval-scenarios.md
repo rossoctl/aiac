@@ -123,7 +123,7 @@ session, each against its own realm):
    isolated scenario.
 4. **Run the PRB** (`orchestrate_prb`), generalized from `policy-pipeline.md`'s three fixed loops
    to loop over every agent's inbound scope, every tool/agent-target scope, and every agent role.
-   Agent-to-agent target scopes (Scenario 3: `agent-scope-customs-clearance`, owned by `customs-agent`) are
+   Agent-to-agent target scopes (Scenario 3: `agent-scope-broker`, owned by `customs-agent`) are
    folded into the same "target" candidate set as tool scopes — from the PRB/PCE's perspective a
    target scope owned by another agent is handled identically to one owned by a tool.
 5. **Run the PCE** (`compute_and_apply`) and assert every expected `.rego` file actually landed on
@@ -220,13 +220,13 @@ Files left on disk per agent under `eval/rego_out/policy_pipeline_eval/baseline/
 
 Realm `aiac-pp-eval-agent-delegation`. 2 users, 2 agents (`dispatch-agent`, `customs-agent`), 1
 tool (`manifest-tool`). `customs-agent` deliberately has **zero `inbound_scopes` of its own** —
-its only scope, `agent-scope-customs-clearance`, is a `delegation_scopes` entry on `customs-agent`'s own
+its only scope, `agent-scope-broker`, is a `delegation_scopes` entry on `customs-agent`'s own
 fixture definition, delegated through `dispatch-agent` (it also appears in `dispatch-agent`'s
 **derived** `AgentPolicyModel.target_scopes` map, keyed by `customs-agent`'s service id — the
 production, caller's-perspective sense of that name). `user-role-shipment-coordinator` holds
-`agent-scope-customs-clearance` as a subject; `user-role-dock-worker` does not.
+`agent-scope-broker` as a subject; `user-role-dock-worker` does not.
 
-Because `agent-scope-customs-clearance` is one of `customs-agent`'s owned Keycloak-client scopes regardless of
+Because `agent-scope-broker` is one of `customs-agent`'s owned Keycloak-client scopes regardless of
 whether it arrived via `inbound_scopes` or `delegation_scopes` (see [Further
 Notes](#further-notes)), `user-role-shipment-coordinator` also passes `customs-agent`'s own inbound gate
 directly — this is the cleanest demonstration in the suite of that system property, since
@@ -258,7 +258,7 @@ makes the reading determinate. Ground truth encodes only the qualified reading
 (`tool-scope-enrollment-status`). A real PRB run landing on the broader reading (also
 `tool-scope-enrollment-history`) has missed the qualifier — a genuine over-grant bug for this cell to
 surface, not an excused alternate reading. The agent's own role
-(`agent-role-registrar-operations`) is granted both scopes, so the test lives entirely on the
+(`agent-role-registrar`) is granted both scopes, so the test lives entirely on the
 subject side.
 
 ### Scenario 7 — wildcard grant
@@ -275,9 +275,11 @@ Realm `aiac-pp-eval-misleading-descriptions`. 2 users (`user-role-vip-manager`, 
 (`guest-services-agent`), 1 tool (`reservation-tool`, scopes `tool-scope-reservation-read` +
 `tool-scope-guest-notes-read` + `tool-scope-master-override`). `user-role-vip-manager` is a name-bait role: the name suggests
 broad/elevated authority, but its description confines it to the same reads as
-`user-role-front-desk-staff`, plus the scary-sounding-but-inert `tool-scope-master-override` scope, which grants no
-real capability beyond itself. `user-role-vip-manager` and `user-role-front-desk-staff` end up with *functionally
-identical* real access. Ground truth always follows the **description**, never the **name**.
+`user-role-front-desk-staff`. The scary-sounding-but-inert `tool-scope-master-override` scope is
+explicitly denied to both users (structurally reachable via `agent-role-concierge`, but granted to
+no user role by policy) — real access is a no-op regardless, so `user-role-vip-manager` and
+`user-role-front-desk-staff` end up with *identical* real access. Ground truth always follows the
+**description**, never the **name**.
 
 ### Scenario 9 — confusable agents
 
@@ -437,8 +439,8 @@ scenarios; the heavy scenarios additionally need Keycloak + `opa`, same discover
   `inbound_scopes` and its `delegation_scopes` onto the **same** Keycloak client (there is no second
   client to put them on), any role granted a delegation scope for delegation purposes through
   another agent **also, unavoidably, passes the owning agent's own inbound gate**. Concretely: in
-  Scenario 3 (`agent_delegation`), `user-role-shipment-coordinator` is granted `agent-scope-customs-clearance` so it can
-  have customs clearance carried out *through* `dispatch-agent` — but because `agent-scope-customs-clearance` is
+  Scenario 3 (`agent_delegation`), `user-role-shipment-coordinator` is granted `agent-scope-broker` so it can
+  have customs clearance carried out *through* `dispatch-agent` — but because `agent-scope-broker` is
   one of `customs-agent`'s own delegation scopes, `user-role-shipment-coordinator` also passes
   `customs-agent`'s own inbound gate directly, with no delegation involved and no `dispatch-agent`
   call required. `expected_inbound()` in `test_policy_pipeline_eval.py` encodes this correctly
@@ -513,7 +515,7 @@ several indexed by the master PRD ([../PRD.md](../specs/PRD.md), § *Integration
   version of `expected_inbound()` checked only `INBOUND_PAIRS`, and failed the delegation scenario's
   `user-role-shipment-coordinator`/`customs-agent` cell identically across repeated runs — ruled out as LLM
   nondeterminism precisely *because* it was 100% reproducible). Root-caused by reading the actual
-  generated `customs_agent.inbound.rego` (its `agent_scopes` list includes `agent-scope-customs-clearance`, a
+  generated `customs_agent.inbound.rego` (its `agent_scopes` list includes `agent-scope-broker`, a
   target scope, despite `customs-agent` having no `inbound_scopes` of its own), cross-referencing
   `pdp-policy-writer-opa.md`'s spec text (`agent_scopes` = "scopes this agent exposes," resolved from
   the IdP `Service` record, with no inbound/target split), and confirming via `engine.py` and
@@ -522,9 +524,10 @@ several indexed by the master PRD ([../PRD.md](../specs/PRD.md), § *Integration
   behaving exactly as designed. This is now Scenario 3 (`agent_delegation`)'s dedicated purpose; see
   its module docstring for the full write-up.
 - **Adversarial-scenario failures are the intended signal, not a defect to chase.** Mismatches on
-  Scenario 8 (`misleading_descriptions`)'s name-bait cell (whether the LLM correctly resists
-  `user-role-vip-manager`'s scary-sounding-but-inert `tool-scope-master-override` scope and still grants it only the same
-  real access as `user-role-front-desk-staff`) or on Scenario 9 (`confusable_agents`)'s identity-confusion
+  Scenario 8 (`misleading_descriptions`)'s name-bait cell (whether the LLM correctly denies
+  `user-role-vip-manager`'s scary-sounding-but-inert `tool-scope-master-override` scope — explicitly
+  withheld by policy — rather than over-granting it on the strength of the name, ending up with the
+  same real access as `user-role-front-desk-staff`) or on Scenario 9 (`confusable_agents`)'s identity-confusion
   probes (whether `coach-agent`'s and `coach-review-agent`'s service-account identities stay refused
   through each other's inbound gate despite the two agent names differing by only one word) may vary
   run-to-run — that variability is exactly what these scenarios are designed to surface, and is

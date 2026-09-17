@@ -47,14 +47,25 @@ def load_trend_log(path: Path = TREND_LOG_DEFAULT_PATH) -> list[dict[str, Any]]:
     return rows
 
 
-# Nodeid substring -> trend-log suite name, the inverse of ``eval/conftest.py``'s
-# ``_CORRECTNESS_TEST_MARKERS``/``_TREND_LOG_SUITES``. A non-correctness entry (``eval_extended``'s
-# ``test_inbound``/``test_outbound``, ``eval_consistency``, ``eval_robustness``) matches neither, so
-# ``suite`` stays ``None`` -- captured for the drill-down table but excluded from any trend chart,
-# since only the two Correctness suites write trend-log rows today.
+# Nodeid substring -> suite label for the drill-down table's "Suite" column, the inverse of
+# ``eval/conftest.py``'s ``_CORRECTNESS_TEST_MARKERS``/``_ROBUSTNESS_TEST_MARKERS``. Every value
+# except `robustness_semantic` matches an actual trend-log `suite` (so a matching row can link to
+# this report's drill-down section, see ``_find_matching_report``) -- the two mechanical-tier
+# robustness tests each get their *own* suite name (`robustness_mechanical_invariance`/
+# `robustness_mechanical_sensitivity`), one per trend-log row/chart, so no separate display-name
+# override is needed to tell them apart the way one used to be. `robustness_semantic` is a
+# display-only label -- that test never writes a trend-log row (semantic-tier wiring is #2467) so
+# it never matches one, but its entries still deserve to *appear* in the drill-down instead of
+# silently vanishing because ``suite`` was `None`. A nodeid matching neither pattern
+# (``eval_extended``'s ``test_inbound``/``test_outbound``, the consistency/faithfulness suites)
+# still gets `suite=None` and is left out of this table -- a pre-existing gap this fix doesn't
+# extend to, since it wasn't reported.
 _SUITE_BY_NODEID_MARKER = {
     "::test_prb_correctness[": "correctness_prb",
     "::test_e2e_correctness[": "correctness_e2e",
+    "::test_prb_invariant_to_mechanical_perturbation[": "robustness_mechanical_invariance",
+    "::test_prb_sensitive_to_mechanical_edit[": "robustness_mechanical_sensitivity",
+    "::test_prb_invariant_to_semantic_perturbation[": "robustness_semantic",
 }
 
 _RUN_RE = re.compile(r"^Run: (.+)$")
@@ -238,32 +249,48 @@ def _report_anchor(report: ParsedReport) -> str:
     return "run-" + report.run_at.strftime("%Y%m%dT%H%M%SZ")
 
 
-# Metric -> point/line color, chosen for contrast against the dashboard's dark background (see
-# _STYLE). One polyline + one point series per metric, all three always plotted together since
-# every correctness-suite trend-log row carries all three (see eval/trend_log.py's
-# pool_correctness_metrics) -- a future suite with a different metric shape gets its own dict here
-# when it starts writing trend-log rows (dashboard.py's caller loop is already generic over
-# `suite`; only this mapping is correctness-specific today).
-_METRIC_COLORS = {
-    "precision": "#8ab4f8",
-    "recall": "#81c995",
-    "denial_precision": "#f28b82",
-}
+# Bookkeeping keys every trend-log row carries (eval/trend_log.py's `append_row`, plus
+# `scenarios_scored` that every pooling function adds) that are never themselves a plottable
+# metric -- everything else on a row is one, whatever the suite. This is what actually makes the
+# chart generic over suite (each suite's own `eval/conftest.py` call site decides its row's metric
+# *names* -- e.g. `pool_correctness_metrics`'s precision/recall/denial_precision, reused as-is by
+# both Correctness suites and both Robustness families, plus whatever else that call site mixes in
+# (a family's own invariance_rate/sensitivity_rate); this module never hardcodes any of them).
+_ROW_BOOKKEEPING_KEYS = {"timestamp", "suite", "run_type", "model", "scenarios_scored"}
+
+# Fixed palette metrics are assigned from, in first-seen order, so the same metric name gets the
+# same color across repeated calls/renders for one suite. Cycles if a suite ever reports more
+# metrics than colors (unlikely: no suite has needed more than 3 so far).
+_METRIC_PALETTE = ["#8ab4f8", "#81c995", "#f28b82", "#fdd663", "#c58af9", "#78d9ec"]
 
 _AXIS_COLOR = "#9aa0a6"  # legible against the dark chart background, but not competing with the
 # brighter per-metric colors above.
 
 
+def _metric_colors(rows: list[dict[str, Any]]) -> dict[str, str]:
+    """Discover every metric key actually present across ``rows`` (first-seen order, skipping
+    ``_ROW_BOOKKEEPING_KEYS`` and any non-numeric value) and assign each a stable palette color."""
+    names: list[str] = []
+    for row in rows:
+        for key, value in row.items():
+            if key in _ROW_BOOKKEEPING_KEYS or key in names:
+                continue
+            if isinstance(value, (int, float)):
+                names.append(key)
+    return {name: _METRIC_PALETTE[i % len(_METRIC_PALETTE)] for i, name in enumerate(names)}
+
+
 def render_svg_chart(rows: list[dict[str, Any]], reports: list[ParsedReport], *, suite: str) -> str:
     """One inline, self-contained ``<svg>`` line chart for one suite's trend-log rows (already
-    filtered to that suite by the caller) -- precision/recall/denial_precision plotted as three
-    polylines with per-row points, against a labeled 0-1 y-axis and a per-row date x-axis. A point
-    is wrapped in a link to its matching evidence report (see ``_find_matching_report``) when one
-    is found within tolerance; every point always carries a ``<title>`` tooltip with the exact
-    values regardless."""
+    filtered to that suite by the caller) -- every numeric metric actually present on these rows
+    (see ``_metric_colors``) plotted as its own polyline with per-row points, against a labeled 0-1
+    y-axis and a per-row date x-axis. A point is wrapped in a link to its matching evidence report
+    (see ``_find_matching_report``) when one is found within tolerance; every point always carries
+    a ``<title>`` tooltip with the exact values regardless."""
     width, height = 640, 260
     pad_left, pad_right, pad_top, pad_bottom = 45, 15, 15, 55
     n = len(rows)
+    metric_colors = _metric_colors(rows)
 
     def x(i: int) -> float:
         return pad_left if n <= 1 else pad_left + i * (width - pad_left - pad_right) / (n - 1)
@@ -299,7 +326,7 @@ def render_svg_chart(rows: list[dict[str, Any]], reports: list[ParsedReport], *,
             f'text-anchor="end" transform="rotate(-40 {tx:.1f} {axis_y + 8:.1f})">{html.escape(date_label)}</text>'
         )
 
-    for metric, color in _METRIC_COLORS.items():
+    for metric, color in metric_colors.items():
         # Skip a row missing this metric entirely -- same as the circle loop below -- so the line
         # doesn't dip to 0 for a gap; it just connects the rows that do carry the metric.
         coords = [(x(i), y(row[metric])) for i, row in enumerate(rows) if row.get(metric) is not None]
@@ -312,14 +339,11 @@ def render_svg_chart(rows: list[dict[str, Any]], reports: list[ParsedReport], *,
         match = _find_matching_report(row, reports)
         # A newline inside an SVG <title> renders as a real line break in the browser's native
         # hover tooltip -- no separate tooltip widget/JS needed for a structured, multi-line view.
-        title = html.escape(
-            f"Datetime = {row.get('timestamp', '')}\n"
-            f"LLM = {row.get('model', '')}\n"
-            f"Precision = {row.get('precision')}\n"
-            f"Recall = {row.get('recall')}\n"
-            f"Denial_precision = {row.get('denial_precision')}"
-        )
-        for metric, color in _METRIC_COLORS.items():
+        # Generic over metric: every key this suite's row actually carries, not a fixed set of three.
+        title_lines = [f"Datetime = {row.get('timestamp', '')}", f"LLM = {row.get('model', '')}"]
+        title_lines.extend(f"{metric} = {row.get(metric)}" for metric in metric_colors)
+        title = html.escape("\n".join(title_lines))
+        for metric, color in metric_colors.items():
             value = row.get(metric)
             if value is None:
                 continue
@@ -331,10 +355,10 @@ def render_svg_chart(rows: list[dict[str, Any]], reports: list[ParsedReport], *,
 
     legend = "".join(
         f'<span class="legend-item"><span class="legend-swatch" style="background:{color}"></span>{metric}</span>'
-        for metric, color in _METRIC_COLORS.items()
+        for metric, color in metric_colors.items()
     )
     parts.append(f'<div class="legend">{legend}</div>')
-    return "".join(parts)
+    return f'<div class="chart-wrap">{"".join(parts)}</div>'
 
 
 def _fmt_metric(value: float | None) -> str:
@@ -351,11 +375,12 @@ def _escape_cell(text: str) -> str:
 
 
 def render_scenario_table(report: ParsedReport) -> str:
-    """One collapsible, anchored drill-down section for a parsed report's correctness-suite
-    entries. ``""`` when the report has none (e.g. an ``eval_extended``-only run) -- nothing for
+    """One collapsible, anchored drill-down section for a parsed report's scored entries (any
+    suite recognized by ``_SUITE_BY_NODEID_MARKER`` -- correctness and robustness today). ``""``
+    when the report has none (e.g. an ``eval_extended``-only run) -- nothing for
     ``render_dashboard`` to show for that report."""
-    correctness_entries = [e for e in report.entries if e.suite is not None]
-    if not correctness_entries:
+    scored_entries = [e for e in report.entries if e.suite is not None]
+    if not scored_entries:
         return ""
     rows_html = "".join(
         "<tr>"
@@ -363,11 +388,18 @@ def render_scenario_table(report: ParsedReport) -> str:
         f"<td>{_fmt_metric(e.precision)}</td><td>{_fmt_metric(e.recall)}</td><td>{_fmt_metric(e.denial_precision)}</td>"
         f"<td>{_escape_cell(e.over_grants)}</td><td>{_escape_cell(e.under_grants)}</td><td>{_escape_cell(e.incorrectly_denied)}</td>"
         "</tr>"
-        for e in correctness_entries
+        for e in scored_entries
     )
+    # Which suite(s) this report's scored entries belong to (usually one; a mixed-suite run would
+    # list more than one), e.g. "(correctness_prb suite)" -- shown instead of the raw run timestamp
+    # (already available from the anchor/collapsed sort order) so the summary line leads with what
+    # a reader actually wants to know: which file, from which suite.
+    suite_names = list(dict.fromkeys(e.suite for e in scored_entries if e.suite))
+    suite_word = "suite" if len(suite_names) == 1 else "suites"
+    suite_label = f"({', '.join(suite_names)} {suite_word})"
     return (
         f'<details id="{_report_anchor(report)}">'
-        f"<summary>{html.escape(report.run_at.isoformat())} — {html.escape(report.path.name)}</summary>"
+        f"<summary>{html.escape(report.path.name)} {html.escape(suite_label)}</summary>"
         "<table><thead><tr>"
         "<th>Suite</th><th>Scenario</th><th>Category</th><th>Precision</th><th>Recall</th>"
         "<th>Denial precision</th><th>Over-grants</th><th>Under-grants</th><th>Incorrectly denied</th>"
@@ -381,7 +413,12 @@ a { color: #8ab4f8; }
 table { border-collapse: collapse; margin: 0.5rem 0 1.5rem; width: 100%; }
 th, td { border: 1px solid #444; padding: 4px 8px; text-align: left; font-size: 0.85rem; }
 th { background: #1e1e1e; }
-.legend { margin-top: 0.25rem; }
+.trends-grid { display: flex; flex-wrap: wrap; gap: 1.5rem; justify-content: center; }
+.trend-section { flex: 0 1 45%; max-width: 45%; min-width: 320px; }
+.section-summary { font-size: 1.5rem; font-weight: 600; margin: 1rem 0; cursor: pointer; }
+.chart-wrap { width: 100%; margin: 0 auto; }
+.chart-wrap svg { display: block; width: 100%; height: auto; }
+.legend { margin-top: 0.25rem; text-align: center; }
 .legend-item { margin-right: 1rem; font-size: 0.85rem; }
 .legend-swatch { display: inline-block; width: 10px; height: 10px; margin-right: 4px; }
 details { margin-bottom: 0.5rem; }
@@ -397,13 +434,14 @@ def render_dashboard(trend_rows: list[dict[str, Any]], reports: list[ParsedRepor
     suites = sorted({row["suite"] for row in trend_rows if "suite" in row})
     if suites:
         chart_sections = "".join(
-            f"<section><h3>{suite}</h3>"
+            f'<section class="trend-section"><h3>{suite}</h3>'
             + render_svg_chart([row for row in trend_rows if row.get("suite") == suite], reports, suite=suite)
             + "</section>"
             for suite in suites
         )
+        trends_body = f'<div class="trends-grid">{chart_sections}</div>'
     else:
-        chart_sections = "<p>No trend-log rows yet — run an eval suite to populate eval/trend_log.jsonl.</p>"
+        trends_body = "<p>No trend-log rows yet — run an eval suite to populate eval/trend_log.jsonl.</p>"
 
     tables = "".join(render_scenario_table(report) for report in reports)
     drilldown_sections = (
@@ -414,8 +452,9 @@ def render_dashboard(trend_rows: list[dict[str, Any]], reports: list[ParsedRepor
         "<!doctype html><html><head><meta charset='utf-8'><title>AIAC eval dashboard</title>"
         f"<style>{_STYLE}</style></head><body>"
         "<h1>AIAC eval results dashboard</h1>"
-        "<h2>Historical trends</h2>"
-        f"{chart_sections}"
+        '<details open class="trends-details"><summary class="section-summary">Historical trends</summary>'
+        f"{trends_body}"
+        "</details>"
         "<h2>Scenario drill-down</h2>"
         f"{drilldown_sections}"
         "</body></html>"

@@ -14,7 +14,7 @@ encodes exactly that. A real LLM-backed PRB run that also grants ``tool-scope-en
 here has missed the qualifier and over-granted: a genuine bug worth investigating, not an excused
 alternate reading.
 
-The agent's own role (``agent-role-registrar-operations``) is deliberately granted BOTH scopes (it is capable
+The agent's own role (``agent-role-registrar``) is deliberately granted BOTH scopes (it is capable
 of reaching either), so the ambiguity lives entirely on the subject side of the per-scope AND —
 this scenario tests whether the PRB resolves the ambiguous user-facing clause narrowly, not whether
 the agent-facing capability gate is populated correctly (that is Scenario 1's job).
@@ -38,16 +38,16 @@ AGENTS: dict[str, dict] = {
             "It reads a student's current enrollment status and historical enrollment record."
         ),
         "inbound_scopes": {
-            "agent-scope-enrollment-status-access": (
+            "agent-scope-registrar": (
                 "Scope granting use of the registrar agent's current-enrollment-status lookup capability."
             ),
-            "agent-scope-enrollment-history-access": (
+            "agent-scope-archivist": (
                 "Scope granting use of the registrar agent's enrollment-history lookup capability."
             ),
         },
         "delegation_scopes": {},
         "roles": {
-            "agent-role-registrar-operations": (
+            "agent-role-registrar": (
                 "Covers reading a student's current enrollment status and historical enrollment record."
             ),
         },
@@ -92,14 +92,14 @@ USER_ROLES: dict[str, str] = {
 # the inbound clause itself, that the advisor has a history capability — an even more direct
 # textual assertion than the old bundled description, and still a contradiction against the
 # outbound qualifier below that withholds history access. Nothing in this scenario grants
-# agent-scope-enrollment-history-access to anyone, matching the outbound-subject side exactly.
+# agent-scope-archivist to anyone, matching the outbound-subject side exactly.
 INBOUND_PAIRS: list[tuple[str, str]] = [
-    ("user-role-enrollment-advisor", "agent-scope-enrollment-status-access"),
+    ("user-role-enrollment-advisor", "agent-scope-registrar"),
 ]
 
 OUTBOUND_PAIRS: list[tuple[str, str]] = [
-    ("agent-role-registrar-operations", "tool-scope-enrollment-status"),
-    ("agent-role-registrar-operations", "tool-scope-enrollment-history"),
+    ("agent-role-registrar", "tool-scope-enrollment-status"),
+    ("agent-role-registrar", "tool-scope-enrollment-history"),
 ]
 
 # The leading phrase "access to enrollment information" reads broadly in isolation and could
