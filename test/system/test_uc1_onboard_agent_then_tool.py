@@ -1,11 +1,12 @@
 """Rung 2 of the UC-1 onboarding ladder — onboard the **agent, then the tool**.
 
 Issue ``testing/5.4.2-uc1-onboard-agent-then-tool.md``; spec
-``docs/testing/uc1-onboarding-pipeline.md``. Drive the **real** in-cluster UC-1
-Service Onboarding agent (``POST /apply/service/{id}``) for the ``github-agent`` **first** and the
-``github-tool`` **second**, then assert the **full** truth table at the end by driving **real HTTP
-requests through AuthBridge** and reading the **real OPA plugin's** allow/deny (handoff 08; live loop
-shape in ``k8s/opa-kind-runbook.md``).
+``docs/testing/uc1-onboarding-pipeline.md``. Onboard **event-driven** by deploying the ``github-agent``
+workload **first** and the ``github-tool`` workload **second** (each deploy → operator registers a
+Keycloak client → ``CLIENT_CREATED`` → ``aiac-event-listener`` SPI → NATS → the agent consumer runs
+``onboard_service``), then assert the **full** truth table at the end by driving **real HTTP requests
+through AuthBridge** and reading the **real OPA plugin's** allow/deny (handoff 08; live loop shape in
+``k8s/opa-kind-runbook.md``).
 
 This rung proves the key reconciliation property: onboarding the tool **after** the agent
 retroactively completes the agent's outbound policy. When the agent is onboarded alone its outbound
@@ -21,20 +22,23 @@ There is **no agent re-onboard** and **no intermediate validation** — only the
 This is order 1 of the order-independence pair; rung 3 (tool then agent) asserts its final live
 outbound matrix is **identical** to this rung's.
 
-Reuses the shared harness (``uc1_onboard.py`` — config, Keycloak provisioning/cleanup, onboard
-trigger, Part-B outbound-leg prep, bundle convergence poll, per-rung fixture flow) and
+Reuses the shared harness (``uc1_onboard.py`` — config, Keycloak provisioning/cleanup, event-driven
+deploy/undeploy trigger, Part-B outbound-leg prep, bundle convergence poll, per-rung fixture flow) and
 ``scenario_uc1.py`` (the truth tables — the oracle). The deployed OPA plugin is the evaluator (no
 ``.rego`` dump, no ``opa`` binary). The **only** rung-2-specific content here is the oracle (the full
 outbound gate, keyed on the **bare** runtime tool names) and the live assertions; the onboarding order
-— ``[agent, tool]`` — is passed to the shared fixture flow.
+— ``[agent, tool]`` — is the deploy order passed to the shared fixture flow.
 
-Per-rung flow (spec § Per-rung flow): **Keycloak cleanup → onboard agent → onboard tool → Part B →
-poll bundle → drive real requests + assert → Keycloak cleanup**. Deployment + client registration are
-**preconditions**, not test steps.
+Per-rung flow (spec § Per-rung flow): **pre-run no-workloads slate → provision realm/users →
+deploy agent (fires the event) + converge → deploy tool (fires the event) + converge → Part B →
+poll bundle → drive real requests + assert → tear workloads + registrations down to pristine**.
+Deploying each workload is now the onboarding **trigger** (a test step, not a precondition); teardown
+restores the cluster to its pre-test state.
 
 Run (needs a live rossoctl/Kind cluster with the AIAC stack + AuthBridge OPA pipeline wired in — see
-``k8s/opa-kind-runbook.md`` / ``k8s/opa-kind-enable.sh`` — the demo workloads deployed +
-registered into ``AIAC_TEST_REALM``, a real LLM in-pod, and ``.env`` sourced):
+``k8s/opa-kind-runbook.md`` / ``k8s/opa-kind-enable.sh`` — the event path wired (NATS broker +
+``aiac-event-listener`` SPI) and the demo images built + ``kind load``ed (``demo/assets/kind-load.sh``;
+the fixture deploys the workloads itself), a real LLM in-pod, and ``.env`` sourced):
 
     .venv/bin/pytest test/system/test_uc1_onboard_agent_then_tool.py -m system -v
 
@@ -66,17 +70,19 @@ TEST_REALM = uc1.TEST_REALM
 
 
 # ======================================================================================
-# Session fixture — cleanup → onboard agent → onboard tool → Part B → poll bundle → yield → cleanup
+# Session fixture — no-workloads slate → deploy agent → deploy tool → Part B → poll bundle → yield → teardown
 # ======================================================================================
 
 
 @pytest.fixture(scope="session")
 def onboarded() -> dict:
-    """Onboard the agent **then** the tool via the shared harness (order is this rung's identity —
-    tool onboarding retroactively completes the agent's outbound gate), and yield the live probe
-    context (``admin`` handle, ``agent_pod``, Keycloak URL/realm, ``tool_onboarded=True``). Keycloak
-    cleanup + CR delete run before and after; the clients are left registered as before (spec § Per-rung
-    flow). No agent re-onboard, no intermediate validation — only the end state is asserted below."""
+    """Onboard the agent **then** the tool — event-driven — by deploying them in that order via the
+    shared harness (order is this rung's identity — tool onboarding retroactively completes the agent's
+    outbound gate), and yield the live probe context (``admin`` handle, ``agent_pod``, Keycloak
+    URL/realm, ``tool_onboarded=True``). The harness starts from a no-workloads slate and, on teardown,
+    tears both workloads + all their Keycloak registrations and ``AuthorizationPolicy`` CRs back down
+    to pristine (spec § Per-rung flow). No agent re-onboard, no intermediate validation — only the end
+    state is asserted below."""
     with uc1.onboarded_stack([scn.AGENT_WORKLOAD, scn.TOOL_WORKLOAD]) as ctx:
         yield ctx
 

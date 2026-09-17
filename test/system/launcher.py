@@ -529,12 +529,30 @@ def inbound_outcome(code: int | None) -> str:
 def outbound_outcome(code: int | None, body: str) -> str:
     """Classify an outbound probe by **body**, per runbook B.4.
 
-    On an MCP-shaped request AuthBridge renders an OPA denial as a JSON-RPC error frame **at HTTP 200**
-    (``error.data.plugin == "opa"`` / ``error.data.error == "policy.forbidden"``) — not an HTTP error.
-    So: ``503`` (token-exchange failed before OPA) or any other non-200/403 -> ``"error"``; a plain
-    ``403`` (non-MCP-shaped rejection fallback) -> ``"deny"``; HTTP 200 with an OPA error frame ->
-    ``"deny"``; HTTP 200 with any other body (a ``result`` frame, or a tool-level error that means OPA
-    *allowed* the call) -> ``"allow"``. Classify by the frame, never the transport status."""
+    On an MCP-shaped request (a ``method`` + ``id``) AuthBridge's forward proxy renders **any**
+    rejection as a JSON-RPC error frame **at HTTP 200** (``writeMCPRejection`` — the MCP client sees a
+    single failed tool call, not a transport break), so the frame's ``error.data`` — not the HTTP
+    status — carries the reason. The reason decides the class:
+
+      * **OPA** blocked it — ``error.data.plugin == "opa"`` / ``error.data.error == "policy.forbidden"``
+        -> ``"deny"``. This is the real outbound authorization verdict: token-exchange succeeded and the
+        request reached OPA, which forbade it. Only tool-onboarded rungs (2 & 3) reach this point.
+      * **token-exchange** refused to mint the downstream token — ``error.data.plugin ==
+        "token-exchange"`` (``error.data.error == "upstream.token-exchange-failed"``) -> ``"error"``,
+        NOT ``"deny"``. A refused RFC 8693 exchange means the outbound authorization decision was
+        **never reached** — the exchange broke *before* OPA — so it is not an OPA deny and must not be
+        reported as one. Reporting it as ``"error"`` (a) surfaces a genuine token-exchange fault on a
+        tool-onboarded rung honestly instead of masking it as ``"allow"`` (its old fall-through) or
+        mislabelling it ``"deny"``, and (b) keeps the classifier from ever standing in for OPA. The
+        agent-only rung (rung 1) does not probe outbound at all — with no tool there is no real
+        ``agent -> tool`` call and token-exchange would short-circuit here anyway — so this frame is
+        not an expected verdict on any rung; it always signals a fault worth surfacing.
+
+    So: a plain ``403`` (non-MCP-shaped rejection fallback) -> ``"deny"``; HTTP 200 with an OPA error
+    frame -> ``"deny"``; HTTP 200 with a token-exchange error frame -> ``"error"``; HTTP 200 with any
+    other body (a ``result`` frame, or a tool-level error that means the call was *allowed* through) ->
+    ``"allow"``; ``None`` or any other non-200/403 (a transport break, or a non-MCP token-exchange
+    ``503``) -> ``"error"``. Classify by the frame, never the transport status."""
     if code is None:
         return "error"
     if code == 403:
@@ -548,8 +566,14 @@ def outbound_outcome(code: int | None, body: str) -> str:
     err = doc.get("error") if isinstance(doc, dict) else None
     if isinstance(err, dict):
         data = err.get("data")
-        if isinstance(data, dict) and (data.get("plugin") == "opa" or data.get("error") == "policy.forbidden"):
-            return "deny"
+        if isinstance(data, dict):
+            # token-exchange refusal = the outbound decision was never reached (exchange broke before
+            # OPA). Honest class is "error", never "deny" — it must not stand in for an OPA verdict.
+            if data.get("plugin") == "token-exchange" or data.get("error") == "upstream.token-exchange-failed":
+                return "error"
+            # A real OPA verdict — token-exchange succeeded and the request reached the policy.
+            if data.get("plugin") == "opa" or data.get("error") == "policy.forbidden":
+                return "deny"
     return "allow"
 
 
@@ -670,6 +694,68 @@ def require_pipeline(*, namespace: str, workloads: list[str]) -> None:
         pytest.skip(
             f"live AuthBridge OPA pipeline not wired: {reason}. Stand it up with "
             "k8s/opa-kind-enable.sh (see k8s/opa-kind-runbook.md)."
+        )
+
+
+def event_path_reason(*, broker_phase: str, realm_config: dict) -> str | None:
+    """Return ``None`` when the event-driven onboarding path is wired, else a human-readable skip
+    reason. **Pure** — decides from two already-gathered facts (mirrors ``pipeline_unwired_reason`` /
+    ``select_live_pod``): the NATS broker pod ``broker_phase`` and the realm's events ``realm_config``
+    (its ``eventsListeners`` list + ``adminEventsEnabled`` flag). Kept side-effect-free so it is unit
+    testable offline; the I/O to gather those facts lives in ``event_path_unwired_reason``.
+
+    The event path is: deploy -> operator registers a Keycloak client -> Keycloak emits the admin
+    event ``CLIENT_CREATED`` -> the AIAC SPI (``aiac-event-listener``) publishes on NATS -> the agent
+    consumer runs ``onboard_service``. All three facts must hold or the trigger never fires."""
+    if "Running" not in (broker_phase or ""):
+        return f"NATS event broker not Running (phase={broker_phase!r})"
+    if "aiac-event-listener" not in (realm_config.get("eventsListeners") or []):
+        return "Keycloak SPI listener 'aiac-event-listener' not in realm eventsListeners"
+    if not realm_config.get("adminEventsEnabled"):
+        return "Keycloak adminEventsEnabled is false (CLIENT_CREATED is an admin event)"
+    return None
+
+
+def event_path_unwired_reason(*, admin, realm: str, broker_namespace: str = "aiac-system") -> str | None:
+    """Gather the two facts ``event_path_reason`` needs and return its verdict. ``admin`` is the
+    ``KeycloakAdmin`` client the harness already builds (``uc1_onboard.connect_admin``) — ``launcher``
+    has none of its own. Any failure to read a fact is itself a skip reason, never an error."""
+    ok, out, err = _kubectl_try(
+        "get",
+        "pods",
+        "-n",
+        broker_namespace,
+        "-l",
+        "app=aiac-event-broker",
+        "-o",
+        "jsonpath={.items[*].status.phase}",
+    )
+    if not ok:
+        return f"cannot query NATS event broker in {broker_namespace} ({err})"
+    broker_phase = out
+
+    try:
+        realm_config = admin.get_realm(realm)
+    except Exception as exc:  # noqa: BLE001 — any admin-read failure is a skippable prerequisite gap
+        return f"cannot read realm {realm!r} events config from Keycloak ({exc})"
+
+    return event_path_reason(broker_phase=broker_phase, realm_config=realm_config)
+
+
+def require_event_path(*, admin, realm: str) -> None:
+    """``pytest.skip`` with a clear message when the event-driven onboarding path is not wired, so a
+    cluster wired for OPA but not for events skips cleanly rather than hanging on a trigger that never
+    fires. Pre-built + ``kind load``ed images are a *separate* precondition surfaced later as a pod
+    that never becomes Ready (a loud failure via the deploy/convergence poll), not a skip here."""
+    reason = event_path_unwired_reason(admin=admin, realm=realm)
+    if reason:
+        import pytest
+
+        pytest.skip(
+            f"event-driven onboarding path not wired: {reason}. Deploy the NATS broker "
+            "(k8s/event-broker-deployment.yaml) and install + enable the aiac-event-listener SPI "
+            "(keycloak-spi/README.md); the two workload images must also be built + kind-loaded "
+            "(demo/assets/kind-load.sh)."
         )
 
 
