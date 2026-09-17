@@ -150,10 +150,11 @@ def test_parse_report_setup_failure_leaves_metrics_none(tmp_path: Path) -> None:
 
 
 def test_parse_report_extracts_passing_robustness_mechanical_entry(tmp_path: Path) -> None:
-    """A robustness sensitivity-tier entry gets `suite="robustness_mechanical"` -- confirming the
-    fix for #2466's report: before it, every robustness nodeid fell through to `suite=None` and
-    was silently dropped from the drill-down table entirely (see
-    `test_render_scenario_table_includes_robustness_entries` below)."""
+    """A robustness sensitivity-tier entry gets its own
+    `suite="robustness_mechanical_sensitivity"` -- confirming the fix for #2466's report: before
+    it, every robustness nodeid fell through to `suite=None` and was silently dropped from the
+    drill-down table entirely (see `test_render_scenario_table_includes_robustness_entries`
+    below)."""
     body = (
         "## passed (1)\n\n"
         "### `eval/test_policy_pipeline_robustness.py::test_prb_sensitive_to_mechanical_edit[baseline]`\n"
@@ -172,7 +173,7 @@ def test_parse_report_extracts_passing_robustness_mechanical_entry(tmp_path: Pat
     report = parse_report(path)
 
     entry = report.entries[0]
-    assert entry.suite == "robustness_mechanical"
+    assert entry.suite == "robustness_mechanical_sensitivity"
     assert entry.scenario == "baseline"
     assert entry.precision == 1.0
 
@@ -257,26 +258,31 @@ def test_render_svg_chart_has_one_circle_per_row_and_legend_labels() -> None:
 
 def test_render_svg_chart_plots_a_non_correctness_metric_shape() -> None:
     """The chart must be generic over metric *names*, not hardcoded to precision/recall/
-    denial_precision -- a robustness_mechanical row (invariance_rate/sensitivity_rate) plotted the
-    same way, with zero blank/empty series. Regression test for the bug where such a row rendered
-    an empty chart (every hardcoded metric key was absent, so `_METRIC_COLORS` found nothing)."""
+    denial_precision -- a robustness_mechanical_invariance row (precision/recall/denial_precision
+    plus its own invariance_rate) plotted the same way, with zero blank/empty series. Regression
+    test for the bug where such a row rendered an empty chart (every hardcoded metric key was
+    absent, so `_METRIC_COLORS` found nothing)."""
     rows = [
         {
-            "suite": "robustness_mechanical",
+            "suite": "robustness_mechanical_invariance",
             "timestamp": "2026-09-15T13:40:04+00:00",
             "run_type": "regression",
             "model": "m1",
             "scenarios_scored": 8,
-            "invariance_rate": 1.0,
-            "sensitivity_rate": 0.75,
+            "precision": 1.0,
+            "recall": 0.9,
+            "denial_precision": 0.95,
+            "invariance_rate": 0.75,
         }
     ]
 
-    svg = render_svg_chart(rows, reports=[], suite="robustness_mechanical")
+    svg = render_svg_chart(rows, reports=[], suite="robustness_mechanical_invariance")
 
-    assert svg.count("<circle") == 2  # one per metric, this suite has two
+    assert svg.count("<circle") == 4  # one per metric, this suite has four
+    assert "precision" in svg
+    assert "recall" in svg
+    assert "denial_precision" in svg
     assert "invariance_rate" in svg
-    assert "sensitivity_rate" in svg
     # Bookkeeping fields must never be treated as plottable metrics.
     assert "scenarios_scored" not in svg
     assert "run_type" not in svg
@@ -405,13 +411,63 @@ def test_render_scenario_table_lists_correctness_entries_anchored_for_chart_link
     assert "1.000" in table
 
 
+def test_render_scenario_table_summary_names_file_and_suite_not_raw_timestamp() -> None:
+    """The summary line leads with the report filename and names which suite ran, in parentheses
+    -- e.g. ``report_x.md (correctness_prb suite)`` -- rather than the raw ``run_at`` ISO
+    timestamp, which was redundant with the report's own filename/sort order."""
+    entry = ScenarioEntry(
+        nodeid="eval/test_policy_pipeline_correctness_prb.py::test_prb_correctness[baseline]",
+        suite="correctness_prb",
+        scenario="baseline",
+        category="passed",
+    )
+    report = ParsedReport(
+        path=Path("report_16_09_15_41_20.md"),
+        run_at=datetime.fromisoformat("2026-09-16T15:41:20.889219+00:00"),
+        entries=[entry],
+    )
+
+    table = render_scenario_table(report)
+
+    assert "<summary>report_16_09_15_41_20.md (correctness_prb suite)</summary>" in table
+    assert "2026-09-16T15:41:20" not in table
+
+
+def test_render_scenario_table_summary_lists_multiple_suites() -> None:
+    """A report with entries from more than one suite names all of them, pluralized."""
+    entries = [
+        ScenarioEntry(
+            nodeid="eval/test_policy_pipeline_robustness.py::test_prb_invariant_to_mechanical_perturbation[baseline]",
+            suite="robustness_mechanical_invariance",
+            scenario="baseline",
+            category="passed",
+        ),
+        ScenarioEntry(
+            nodeid="eval/test_policy_pipeline_robustness.py::test_prb_sensitive_to_mechanical_edit[baseline]",
+            suite="robustness_mechanical_sensitivity",
+            scenario="baseline",
+            category="passed",
+        ),
+    ]
+    report = ParsedReport(
+        path=Path("report_x.md"), run_at=datetime.fromisoformat("2026-09-10T07:00:00+00:00"), entries=entries
+    )
+
+    table = render_scenario_table(report)
+
+    assert (
+        "<summary>report_x.md (robustness_mechanical_invariance, robustness_mechanical_sensitivity suites)</summary>"
+        in table
+    )
+
+
 def test_render_scenario_table_includes_robustness_entries() -> None:
     """Regression test for the bug where a report with *only* robustness entries rendered as an
     empty string and vanished from the drill-down entirely, because `_suite_for_nodeid` recognized
     no robustness nodeid pattern and every entry's `suite` stayed `None`."""
     entry = ScenarioEntry(
         nodeid="eval/test_policy_pipeline_robustness.py::test_prb_sensitive_to_mechanical_edit[baseline]",
-        suite="robustness_mechanical",
+        suite="robustness_mechanical_sensitivity",
         scenario="baseline",
         category="passed",
         precision=1.0,
@@ -425,15 +481,15 @@ def test_render_scenario_table_includes_robustness_entries() -> None:
     table = render_scenario_table(report)
 
     assert table != ""
-    assert "robustness_mechanical" in table
+    assert "robustness_mechanical_sensitivity" in table
     assert "baseline" in table
 
 
 def test_render_scenario_table_distinguishes_mechanical_invariant_and_sensitive(tmp_path: Path) -> None:
-    """Both mechanical-tier test functions pool into the single `robustness_mechanical` trend-log
-    suite, but the drill-down table's Suite column should still say which family each entry is --
-    invariance or sensitivity -- rather than showing the same bare `robustness_mechanical` label
-    for both."""
+    """The two mechanical-tier test functions each write their own trend-log suite now
+    (`robustness_mechanical_invariance`/`robustness_mechanical_sensitivity`), so the drill-down
+    table's Suite column tells the two families apart from `entry.suite` alone -- no separate
+    display-name override needed."""
     body = (
         "## passed (2)\n\n"
         "### `eval/test_policy_pipeline_robustness.py::test_prb_invariant_to_mechanical_perturbation[baseline]`\n"
@@ -456,15 +512,13 @@ def test_render_scenario_table_distinguishes_mechanical_invariant_and_sensitive(
     report = parse_report(path)
 
     invariant_entry, sensitive_entry = report.entries
-    assert invariant_entry.suite == "robustness_mechanical"
-    assert sensitive_entry.suite == "robustness_mechanical"
-    assert invariant_entry.suite_display == "robustness_mechanical (invariant)"
-    assert sensitive_entry.suite_display == "robustness_mechanical (sensitive)"
+    assert invariant_entry.suite == "robustness_mechanical_invariance"
+    assert sensitive_entry.suite == "robustness_mechanical_sensitivity"
 
     table = render_scenario_table(report)
 
-    assert "robustness_mechanical (invariant)" in table
-    assert "robustness_mechanical (sensitive)" in table
+    assert "robustness_mechanical_invariance" in table
+    assert "robustness_mechanical_sensitivity" in table
 
 
 def test_render_scenario_table_escapes_html_and_preserves_multiline_breaks() -> None:

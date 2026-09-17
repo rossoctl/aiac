@@ -302,19 +302,24 @@ best-effort, never-approved proposal (see [Testing Decisions](#testing-decisions
 
 ## Trend log
 
-`eval/trend_log.py`'s shared `append_row`/`pool_robustness_metrics` (#2466) pools
-`test_prb_invariant_to_mechanical_perturbation`'s and `test_prb_sensitive_to_mechanical_edit`'s
-`record_property("invariant"/"sensitive", bool)` values — collected by `eval/conftest.py`'s
-`_write_trend_log` via nodeid-substring matching (`_ROBUSTNESS_TEST_MARKERS`, since the single flat
-`eval` marker — shared by every suite under `eval/` — spans three test functions across two
-families/tiers that must stay unblended per spec §4) — across every scenario scored in a run, and
-appends **one** row
-(`suite="robustness_mechanical"`) carrying both `invariance_rate` and `sensitivity_rate` to the
-committed, append-only `eval/trend_log.jsonl` from `pytest_sessionfinish`. Pooled by count (mean of
-the booleans), independently per family — an uneven scored count between the two families (e.g. a
-`-k` filter) is handled by pooling each list on its own length, not a shared denominator.
-`test_prb_invariant_to_semantic_perturbation` is deliberately excluded (semantic-tier trend-log
-wiring is #2467). See `docs/evaluation/eval-framework.md` §9.
+`eval/conftest.py`'s `_write_trend_log` collects `test_prb_invariant_to_mechanical_perturbation`'s
+and `test_prb_sensitive_to_mechanical_edit`'s `record_property("invariant"/"sensitive", bool)`
+values, via nodeid-substring matching (`_ROBUSTNESS_TEST_MARKERS`, since the single flat `eval`
+marker — shared by every suite under `eval/` — spans three test functions across two
+families/tiers that must stay unblended per spec §4), and appends **two** rows to the committed,
+append-only `eval/trend_log.jsonl` from `pytest_sessionfinish` — one per family, never combined:
+`suite="robustness_mechanical_invariance"` and `suite="robustness_mechanical_sensitivity"`. Each
+row carries that family's own pass/fail rate (`invariance_rate`/`sensitivity_rate`, mean of that
+family's booleans) *and* that family's own `precision`/`recall`/`denial_precision`, pooled from the
+same `true_positives`/`denied_total`/`over_grants`/`under_grants`/`incorrectly_denied` shape
+`_record_scoring` records (`eval/trend_log.py`'s `pool_correctness_metrics` — the same pooling
+function the two Correctness suites use, reused as-is here) — so each family's chart is directly
+comparable in shape to a Correctness chart: one measuring the PRB against the *original* inputs,
+the other against *deliberately edited* inputs. A family with zero scored scenarios in a run (e.g.
+a `-k` filter that only exercises the other family) simply gets no row at all, rather than a shared
+row mislabeling one family's count against the other's. `test_prb_invariant_to_semantic_perturbation`
+is deliberately excluded (semantic-tier trend-log wiring is #2467). See
+`docs/evaluation/eval-framework.md` §9.
 
 ## Testing Decisions
 

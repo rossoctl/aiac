@@ -71,13 +71,18 @@ scenario whose own setup failed never recorded these, so it contributes nothing 
 
 ``test_prb_invariant_to_mechanical_perturbation`` and ``test_prb_sensitive_to_mechanical_edit``
 (``test_policy_pipeline_robustness.py``, spec §4) similarly each ``record_property`` a boolean
-(``"invariant"``/``"sensitive"``) -- pooled here by nodeid substring (``_ROBUSTNESS_TEST_MARKERS``,
+(``"invariant"``/``"sensitive"``) plus the same ``true_positives``/``denied_total`` raw counts the
+two Correctness suites record -- pooled here by nodeid substring (``_ROBUSTNESS_TEST_MARKERS``,
 mirroring ``_CORRECTNESS_TEST_MARKERS``'s pattern, since the single flat ``eval`` marker spans
-three test functions across two families/tiers that must stay unblended) into one committed
-trend-log row, ``suite="robustness_mechanical"``, carrying both ``invariance_rate`` and
-``sensitivity_rate`` (``eval/trend_log.py``'s ``pool_robustness_metrics``). The third test in that
-module, ``test_prb_invariant_to_semantic_perturbation``, is deliberately excluded from this wiring --
-semantic-tier trend-log wiring is tracked separately as #2467.
+three test functions across two families/tiers that must stay unblended) into its *own* committed
+trend-log row per family -- ``suite="robustness_mechanical_invariance"``/
+``suite="robustness_mechanical_sensitivity"`` -- each carrying that family's own
+precision/recall/denial_precision (``eval/trend_log.py``'s ``pool_correctness_metrics``, the same
+pooling the two Correctness suites use, so the resulting chart is directly comparable to theirs:
+one measuring performance against the *original* inputs, the other against *deliberately edited*
+inputs) plus that family's own pass/fail rate (``invariance_rate``/``sensitivity_rate``). The third
+test in that module, ``test_prb_invariant_to_semantic_perturbation``, is deliberately excluded from
+this wiring -- semantic-tier trend-log wiring is tracked separately as #2467.
 """
 
 from __future__ import annotations
@@ -85,12 +90,13 @@ from __future__ import annotations
 import os
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import pytest
 from dotenv import load_dotenv
 
-from eval.trend_log import append_row, pool_correctness_metrics, pool_robustness_metrics
+from eval.trend_log import append_row, pool_correctness_metrics
 
 HERE = Path(__file__).resolve().parent
 REPORTS_DIR = HERE / "reports"
@@ -245,13 +251,26 @@ _TREND_LOG_SUITES = {
     "::test_e2e_correctness[": "correctness_e2e",
 }
 
-# Nodeid substring -> robustness property name, mirroring _CORRECTNESS_TEST_MARKERS below. Only
-# the mechanical-tier invariance/sensitivity tests feed the trend log — the semantic-tier
-# invariance test (test_prb_invariant_to_semantic_perturbation) is out of scope for #2466 (tracked
-# as #2467) and deliberately excluded here, per that test's own docstring.
+# Nodeid substring -> (boolean property name, this family's own trend-log suite, its pass/fail
+# rate's metric key), mirroring _CORRECTNESS_TEST_MARKERS above. Each family gets its own suite
+# (rather than one shared "robustness_mechanical" bucket) so its pooled precision/recall/
+# denial_precision (from the same true_positives/denied_total counts the two Correctness suites
+# record, see _record_scoring) sits on its own chart, directly comparable in shape to a Correctness
+# chart -- one measuring the PRB against the *original* inputs, the other against *deliberately
+# edited* inputs. Only the mechanical-tier invariance/sensitivity tests feed the trend log — the
+# semantic-tier invariance test (test_prb_invariant_to_semantic_perturbation) is out of scope for
+# #2466 (tracked as #2467) and deliberately excluded here, per that test's own docstring.
 _ROBUSTNESS_TEST_MARKERS = {
-    "::test_prb_invariant_to_mechanical_perturbation[": "invariant",
-    "::test_prb_sensitive_to_mechanical_edit[": "sensitive",
+    "::test_prb_invariant_to_mechanical_perturbation[": (
+        "invariant",
+        "robustness_mechanical_invariance",
+        "invariance_rate",
+    ),
+    "::test_prb_sensitive_to_mechanical_edit[": (
+        "sensitive",
+        "robustness_mechanical_sensitivity",
+        "sensitivity_rate",
+    ),
 }
 
 # Full Correctness corpus size (eval.test_policy_pipeline_eval.SCENARIOS) -- kept as a plain
@@ -345,18 +364,27 @@ def _render_entry(lines: list[str], nodeid: str, report: pytest.TestReport, cate
 
 def _write_trend_log() -> None:
     """One committed trend-log row per Correctness suite present in this session (PRB-level
-    and/or end-to-end) — spec: docs/evaluation/eval-framework.md §9. Pools every scenario's
-    true_positives/denied_total counts (and over_grants/under_grants/incorrectly_denied pair
-    dicts) that reached score_scenario — a scenario whose own setup failed never recorded these,
-    so it contributes nothing to the pooled row, same as _render_metrics_block's
-    unavailable_reason branch above treats it as absent rather than zero.
+    and/or end-to-end), plus one per Robustness family (invariance/sensitivity) — spec:
+    docs/evaluation/eval-framework.md §9. Pools every scenario's true_positives/denied_total counts
+    (and over_grants/under_grants/incorrectly_denied pair dicts) that reached score_scenario — a
+    scenario whose own setup failed never recorded these, so it contributes nothing to the pooled
+    row, same as _render_metrics_block's unavailable_reason branch above treats it as absent
+    rather than zero.
+
+    Each Robustness family gets its own row/suite (``robustness_mechanical_invariance``/
+    ``robustness_mechanical_sensitivity``), pooled by ``pool_correctness_metrics`` exactly like the
+    two Correctness suites — so its precision/recall/denial_precision is directly comparable to
+    theirs — plus that family's own pass/fail rate (``invariance_rate``/``sensitivity_rate``).
+    Because each family is now its own row, a ``-k``-filtered run (e.g. ``-k sensitive``) simply
+    produces no row at all for the family it never ran, rather than a shared row mislabeling one
+    family's count against the other's.
 
     Always stamped in UTC, independent of ``EVAL_REPORT_TZ`` (that variable only controls the
     gitignored per-run Markdown report's timestamp/filename) — a committed file read by every
     contributor and by downstream trend analysis must not carry a per-contributor UTC offset."""
     by_suite: dict[str, list[dict]] = {}
-    invariant_flags: list[bool] = []
-    sensitive_flags: list[bool] = []
+    robustness_flags: dict[str, list[bool]] = {}
+    robustness_entries: dict[str, list[dict]] = {}
     for nodeid, report in _reports.items():
         for nodeid_marker, suite in _TREND_LOG_SUITES.items():
             if nodeid_marker in report.nodeid:
@@ -364,11 +392,13 @@ def _write_trend_log() -> None:
                 if "true_positives" in props:
                     by_suite.setdefault(suite, []).append(props)
                 break
-        for substring, prop_name in _ROBUSTNESS_TEST_MARKERS.items():
+        for substring, (prop_name, robustness_suite, _rate_key) in _ROBUSTNESS_TEST_MARKERS.items():
             if substring in nodeid:
                 props = dict(report.user_properties)
                 if prop_name in props:
-                    (invariant_flags if prop_name == "invariant" else sensitive_flags).append(bool(props[prop_name]))
+                    robustness_flags.setdefault(robustness_suite, []).append(bool(props[prop_name]))
+                    if "true_positives" in props:
+                        robustness_entries.setdefault(robustness_suite, []).append(props)
                 break
 
     for suite, entries in by_suite.items():
@@ -376,20 +406,15 @@ def _write_trend_log() -> None:
             run_type = "regression" if len(entries) == _EXPECTED_SCENARIO_COUNT else "partial"
             append_row(suite, pool_correctness_metrics(entries), run_type=run_type)
 
-    if invariant_flags or sensitive_flags:
-        # Both families must independently reach the full corpus count to call the row a
-        # "regression" run -- a `-k`-filtered run (e.g. `-k sensitive`) that only exercises one
-        # family, however completely, is not comparable to a full-corpus run and must not be
-        # mislabeled as one (pool_robustness_metrics already omits the un-run family's rate
-        # entirely, so this only controls the row's run_type, not a fabricated metric value).
-        run_type = (
-            "regression"
-            if len(invariant_flags) == _EXPECTED_SCENARIO_COUNT and len(sensitive_flags) == _EXPECTED_SCENARIO_COUNT
-            else "partial"
-        )
-        append_row(
-            "robustness_mechanical", pool_robustness_metrics(invariant_flags, sensitive_flags), run_type=run_type
-        )
+    for _substring, (_prop_name, robustness_suite, rate_key) in _ROBUSTNESS_TEST_MARKERS.items():
+        flags = robustness_flags.get(robustness_suite, [])
+        if not flags:
+            continue
+        entries = robustness_entries.get(robustness_suite, [])
+        metrics: dict[str, Any] = pool_correctness_metrics(entries) if entries else {"scenarios_scored": 0}
+        metrics[rate_key] = sum(flags) / len(flags)
+        run_type = "regression" if len(flags) == _EXPECTED_SCENARIO_COUNT else "partial"
+        append_row(robustness_suite, metrics, run_type=run_type)
 
 
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:

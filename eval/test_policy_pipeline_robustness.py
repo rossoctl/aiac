@@ -12,9 +12,9 @@ Three independent checks, each its own test function/metric — never blended in
 2. ``test_prb_invariant_to_semantic_perturbation`` — **invariance family, semantic tier**. A
    hand-authored, meaning-preserving reworded sibling scenario module from
    ``eval/scenarios_perturbed/``. Same ground truth, same pass criterion as (1), kept as its own
-   test/metric so a semantic-tier failure never gets attributed to the mechanical-tier
-   ``invariance_rate`` this suite feeds to the trend log (spec §9) — semantic-tier trend-log wiring
-   is out of scope here (tracked separately as #2467).
+   test/metric so a semantic-tier failure never gets attributed to the mechanical-tier metrics (1)
+   feeds to the trend log (spec §9) — semantic-tier trend-log wiring is out of scope here (tracked
+   separately as #2467).
 3. ``test_prb_sensitive_to_mechanical_edit`` — **sensitivity family, mechanical tier** (new).  A
    deterministic, programmatically-applied minimal edit (``SENSITIVITY_EDITS``) that *deliberately*
    changes meaning — negation, a role swap, an added exception clause, or a restriction word
@@ -46,9 +46,16 @@ comparing the effect-blind set would make a correct explicit-deny response indis
 an unchanged grant and silently fail a case that should pass (confirmed live: ``empty_descriptions``
 initially failed the sensitivity check this way despite the PRB denying every pair it should have).
 
-(1) and (3) each ``record_property`` a boolean (``"invariant"``/``"sensitive"``) that
-``eval/conftest.py``'s ``_write_trend_log`` pools across the run into one committed trend-log row
-(``suite="robustness_mechanical"``, keys ``invariance_rate``/``sensitivity_rate`` — spec §9).
+(1) and (3) each ``record_property`` a boolean (``"invariant"``/``"sensitive"``) plus, via the
+shared ``_record_scoring`` helper, ``"true_positives"``/``"denied_total"`` — the same raw counts
+``test_prb_correctness`` records. ``eval/conftest.py``'s ``_write_trend_log`` pools each family
+across the run into its *own* committed trend-log row — ``suite="robustness_mechanical_invariance"``
+for (1), ``suite="robustness_mechanical_sensitivity"`` for (3) — carrying that family's own
+precision/recall/denial_precision (``eval.trend_log.pool_correctness_metrics``, the same pooling
+the two Correctness suites use, so the resulting charts are directly comparable to them: one
+measuring performance against the *original* inputs, the other against *deliberately edited*
+inputs) plus that family's own pass/fail rate (``invariance_rate``/``sensitivity_rate`` — spec §9),
+never blended between the two rows.
 
 All three additionally ``record_property`` (via the shared ``_record_scoring`` helper), purely for
 the Markdown report: what the perturbation/edit actually was (``"perturbation"``), the full
@@ -184,6 +191,14 @@ def _record_scoring(
     (``eval.correctness_scorer.score_scenario``, scored from ``rules`` split by
     ``RuleEffect.ALLOW``/``DENY``).
 
+    Also records ``true_positives``/``denied_total`` (the same two raw counts
+    ``test_prb_correctness`` records), purely so ``eval/conftest.py``'s ``_write_trend_log`` can
+    pool this scenario into an aggregate precision/recall/denial_precision the same way it pools
+    the two Correctness suites (``eval.trend_log.pool_correctness_metrics``) -- giving each
+    robustness family its own precision/recall/denial_precision trend, directly comparable in
+    shape to the Correctness charts: one measuring the PRB against the *original* inputs
+    (invariance), the other against *deliberately edited* inputs (sensitivity).
+
     Returns the ALLOW-only grant set (``granted``) so the caller's own exact-match
     ``invariant``/``sensitive`` check compares against the *same* set the metrics above are
     computed from. This matters: a ``PolicyRule`` carries an explicit ``effect`` (``ALLOW`` or
@@ -198,6 +213,8 @@ def _record_scoring(
     record_property("precision", score.precision)
     record_property("recall", score.recall)
     record_property("denial_precision", score.denial_precision)
+    record_property("true_positives", score.true_positive_count)
+    record_property("denied_total", score.denied_total)
     record_property("over_grants", {g: sorted(p) for g, p in score.over_grants.items()})
     record_property("under_grants", {g: sorted(p) for g, p in score.under_grants.items()})
     record_property("incorrectly_denied", {g: sorted(p) for g, p in score.incorrectly_denied.items()})
