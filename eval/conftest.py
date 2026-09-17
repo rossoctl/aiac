@@ -377,8 +377,16 @@ def _write_trend_log() -> None:
             append_row(suite, pool_correctness_metrics(entries), run_type=run_type)
 
     if invariant_flags or sensitive_flags:
-        scored = max(len(invariant_flags), len(sensitive_flags))
-        run_type = "regression" if scored == _EXPECTED_SCENARIO_COUNT else "partial"
+        # Both families must independently reach the full corpus count to call the row a
+        # "regression" run -- a `-k`-filtered run (e.g. `-k sensitive`) that only exercises one
+        # family, however completely, is not comparable to a full-corpus run and must not be
+        # mislabeled as one (pool_robustness_metrics already omits the un-run family's rate
+        # entirely, so this only controls the row's run_type, not a fabricated metric value).
+        run_type = (
+            "regression"
+            if len(invariant_flags) == _EXPECTED_SCENARIO_COUNT and len(sensitive_flags) == _EXPECTED_SCENARIO_COUNT
+            else "partial"
+        )
         append_row(
             "robustness_mechanical", pool_robustness_metrics(invariant_flags, sensitive_flags), run_type=run_type
         )

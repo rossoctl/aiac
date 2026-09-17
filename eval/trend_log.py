@@ -74,13 +74,18 @@ def pool_robustness_metrics(invariant_flags: list[bool], sensitive_flags: list[b
     (spec §4) -- a run need not have scored both families in equal numbers (e.g. a ``-k`` filter),
     so each list is pooled independently.
 
-    Vacuously ``1.0`` when a list is empty, same convention as ``pool_correctness_metrics``.
+    Unlike ``pool_correctness_metrics``'s vacuous-``1.0`` (which only fires per-*denominator*
+    inside a suite that scored at least one scenario), a family with zero scored scenarios has no
+    rate to report at all -- omitted from the returned dict rather than defaulted to a fabricated
+    ``1.0``, so a ``-k``-filtered run that only exercises one family never has the other family's
+    row read as "measured and perfect".
     """
-    return {
-        "scenarios_scored": max(len(invariant_flags), len(sensitive_flags)),
-        "invariance_rate": (sum(invariant_flags) / len(invariant_flags)) if invariant_flags else 1.0,
-        "sensitivity_rate": (sum(sensitive_flags) / len(sensitive_flags)) if sensitive_flags else 1.0,
-    }
+    metrics: dict[str, Any] = {"scenarios_scored": max(len(invariant_flags), len(sensitive_flags))}
+    if invariant_flags:
+        metrics["invariance_rate"] = sum(invariant_flags) / len(invariant_flags)
+    if sensitive_flags:
+        metrics["sensitivity_rate"] = sum(sensitive_flags) / len(sensitive_flags)
+    return metrics
 
 
 def append_row(
