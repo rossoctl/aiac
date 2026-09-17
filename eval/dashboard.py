@@ -48,32 +48,24 @@ def load_trend_log(path: Path = TREND_LOG_DEFAULT_PATH) -> list[dict[str, Any]]:
 
 
 # Nodeid substring -> suite label for the drill-down table's "Suite" column, the inverse of
-# ``eval/conftest.py``'s ``_CORRECTNESS_TEST_MARKERS``/``_ROBUSTNESS_SCORED_TEST_MARKERS``. Only
-# `correctness_prb`/`correctness_e2e`/`robustness_mechanical` match an actual trend-log `suite`
-# value (so a matching row can link to this report's drill-down section, see
-# ``_find_matching_report``); `robustness_semantic` is a display-only label -- that test never
-# writes a trend-log row (semantic-tier wiring is #2467) so it never matches one, but its entries
-# still deserve to *appear* in the drill-down instead of silently vanishing because ``suite`` was
-# `None`. A nodeid matching neither pattern (``eval_extended``'s ``test_inbound``/``test_outbound``,
-# the consistency/faithfulness suites) still gets `suite=None` and is left out of this table --
-# a pre-existing gap this fix doesn't extend to, since it wasn't reported.
+# ``eval/conftest.py``'s ``_CORRECTNESS_TEST_MARKERS``/``_ROBUSTNESS_TEST_MARKERS``. Every value
+# except `robustness_semantic` matches an actual trend-log `suite` (so a matching row can link to
+# this report's drill-down section, see ``_find_matching_report``) -- the two mechanical-tier
+# robustness tests each get their *own* suite name (`robustness_mechanical_invariance`/
+# `robustness_mechanical_sensitivity`), one per trend-log row/chart, so no separate display-name
+# override is needed to tell them apart the way one used to be. `robustness_semantic` is a
+# display-only label -- that test never writes a trend-log row (semantic-tier wiring is #2467) so
+# it never matches one, but its entries still deserve to *appear* in the drill-down instead of
+# silently vanishing because ``suite`` was `None`. A nodeid matching neither pattern
+# (``eval_extended``'s ``test_inbound``/``test_outbound``, the consistency/faithfulness suites)
+# still gets `suite=None` and is left out of this table -- a pre-existing gap this fix doesn't
+# extend to, since it wasn't reported.
 _SUITE_BY_NODEID_MARKER = {
     "::test_prb_correctness[": "correctness_prb",
     "::test_e2e_correctness[": "correctness_e2e",
-    "::test_prb_invariant_to_mechanical_perturbation[": "robustness_mechanical",
-    "::test_prb_sensitive_to_mechanical_edit[": "robustness_mechanical",
+    "::test_prb_invariant_to_mechanical_perturbation[": "robustness_mechanical_invariance",
+    "::test_prb_sensitive_to_mechanical_edit[": "robustness_mechanical_sensitivity",
     "::test_prb_invariant_to_semantic_perturbation[": "robustness_semantic",
-}
-
-# Nodeid substring -> the drill-down table's "Suite" column text specifically -- finer-grained
-# than `_SUITE_BY_NODEID_MARKER` where one trend-log suite name doesn't tell two test functions
-# apart. Both mechanical-tier tests pool into the single `robustness_mechanical` trend-log row (so
-# `entry.suite` must stay that value for `_find_matching_report`'s row-to-report matching to keep
-# working), but they exercise the invariance and sensitivity families respectively -- the table
-# should say which.
-_SUITE_DISPLAY_BY_NODEID_MARKER = {
-    "::test_prb_invariant_to_mechanical_perturbation[": "robustness_mechanical (invariant)",
-    "::test_prb_sensitive_to_mechanical_edit[": "robustness_mechanical (sensitive)",
 }
 
 _RUN_RE = re.compile(r"^Run: (.+)$")
@@ -105,7 +97,6 @@ class ScenarioEntry:
 
     nodeid: str
     suite: str | None = None
-    suite_display: str | None = None
     scenario: str | None = None
     category: str = ""
     what_it_tests: str | None = None
@@ -130,13 +121,6 @@ def _suite_for_nodeid(nodeid: str) -> str | None:
         if marker in nodeid:
             return suite
     return None
-
-
-def _suite_display_for_nodeid(nodeid: str, suite: str) -> str:
-    for marker, display in _SUITE_DISPLAY_BY_NODEID_MARKER.items():
-        if marker in nodeid:
-            return display
-    return suite
 
 
 def _scenario_for_nodeid(nodeid: str) -> str | None:
@@ -197,7 +181,6 @@ def parse_report(path: Path) -> ParsedReport:
             entry = ScenarioEntry(
                 nodeid=nodeid,
                 suite=suite,
-                suite_display=_suite_display_for_nodeid(nodeid, suite) if suite is not None else None,
                 # Only meaningful for a correctness-suite entry -- the bracket for any other
                 # suite's nodeid (e.g. eval_extended's ``test_inbound[scenario-agent-subject]``)
                 # is a different, non-scenario parametrize id.
@@ -269,9 +252,10 @@ def _report_anchor(report: ParsedReport) -> str:
 # Bookkeeping keys every trend-log row carries (eval/trend_log.py's `append_row`, plus
 # `scenarios_scored` that every pooling function adds) that are never themselves a plottable
 # metric -- everything else on a row is one, whatever the suite. This is what actually makes the
-# chart generic over suite (each suite's own pooling function, e.g.
-# `pool_correctness_metrics`/`pool_robustness_metrics`, decides its own metric *names*; this module
-# never hardcodes them).
+# chart generic over suite (each suite's own `eval/conftest.py` call site decides its row's metric
+# *names* -- e.g. `pool_correctness_metrics`'s precision/recall/denial_precision, reused as-is by
+# both Correctness suites and both Robustness families, plus whatever else that call site mixes in
+# (a family's own invariance_rate/sensitivity_rate); this module never hardcodes any of them).
 _ROW_BOOKKEEPING_KEYS = {"timestamp", "suite", "run_type", "model", "scenarios_scored"}
 
 # Fixed palette metrics are assigned from, in first-seen order, so the same metric name gets the
@@ -400,15 +384,22 @@ def render_scenario_table(report: ParsedReport) -> str:
         return ""
     rows_html = "".join(
         "<tr>"
-        f"<td>{_escape_cell(e.suite_display or e.suite or '')}</td><td>{_escape_cell(e.scenario or '')}</td><td>{_escape_cell(e.category)}</td>"
+        f"<td>{_escape_cell(e.suite or '')}</td><td>{_escape_cell(e.scenario or '')}</td><td>{_escape_cell(e.category)}</td>"
         f"<td>{_fmt_metric(e.precision)}</td><td>{_fmt_metric(e.recall)}</td><td>{_fmt_metric(e.denial_precision)}</td>"
         f"<td>{_escape_cell(e.over_grants)}</td><td>{_escape_cell(e.under_grants)}</td><td>{_escape_cell(e.incorrectly_denied)}</td>"
         "</tr>"
         for e in scored_entries
     )
+    # Which suite(s) this report's scored entries belong to (usually one; a mixed-suite run would
+    # list more than one), e.g. "(correctness_prb suite)" -- shown instead of the raw run timestamp
+    # (already available from the anchor/collapsed sort order) so the summary line leads with what
+    # a reader actually wants to know: which file, from which suite.
+    suite_names = list(dict.fromkeys(e.suite for e in scored_entries if e.suite))
+    suite_word = "suite" if len(suite_names) == 1 else "suites"
+    suite_label = f"({', '.join(suite_names)} {suite_word})"
     return (
         f'<details id="{_report_anchor(report)}">'
-        f"<summary>{html.escape(report.run_at.isoformat())} — {html.escape(report.path.name)}</summary>"
+        f"<summary>{html.escape(report.path.name)} {html.escape(suite_label)}</summary>"
         "<table><thead><tr>"
         "<th>Suite</th><th>Scenario</th><th>Category</th><th>Precision</th><th>Recall</th>"
         "<th>Denial precision</th><th>Over-grants</th><th>Under-grants</th><th>Incorrectly denied</th>"
