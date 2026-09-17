@@ -148,18 +148,29 @@ spec:
               memory: 512Mi
           # The Controller is stateless; GET /health is a bare liveness/readiness
           # signal (200 {"status": "ok"} whenever the process is serving).
+          # Explicit timeoutSeconds/failureThreshold (not the k8s defaults of 1s/3):
+          # the blocking onboard now runs off the event loop (eventbus/consumer.py runs
+          # _handle + compute_and_apply in an executor), so /health stays responsive — but
+          # give the probe generous slack anyway so a momentarily busy loop can never be a
+          # hair-trigger kill. Liveness tolerates ~50s (5 x 10s) of unresponsiveness with a
+          # 5s per-probe timeout before restarting; readiness just gates traffic, so it can
+          # react a little faster.
           readinessProbe:
             httpGet:
               path: /health
               port: 7070
             initialDelaySeconds: 5
             periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
           livenessProbe:
             httpGet:
               path: /health
               port: 7070
             initialDelaySeconds: 10
-            periodSeconds: 20
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 5
           # Optional per-onboarding default effect for pairs no rule mentions.
           # Unset/unrecognised => "Deny" (least-privilege, today's behavior).
           # "Allow" opts an onboarding into permissive-default posture (explicit

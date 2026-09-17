@@ -241,11 +241,20 @@ def _openai_request():
     return httpx.Request("POST", "https://llm.example/v1/chat/completions")
 
 
+class _WrappedConnectionError(APIConnectionError):
+    """A subclass of ``APIConnectionError`` under a DIFFERENT leaf name — mirrors how
+    langchain-openai wraps ``openai.APIConnectionError`` into its own
+    ``OpenAIConnectionError``. ``is_transient`` must recognise it through the MRO, not the
+    leaf name (a leaf-only check dead-lettered a transient LLM connection blip as permanent)."""
+
+
 @pytest.mark.parametrize(
     "exc",
     [
         APITimeoutError(request=_openai_request()),
         APIConnectionError(request=_openai_request()),
+        # subclass under a new leaf name — must still be transient via the MRO walk.
+        _WrappedConnectionError(request=_openai_request()),
     ],
 )
 def test_openai_timeout_and_connection_errors_are_transient(exc):

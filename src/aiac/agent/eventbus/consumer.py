@@ -9,6 +9,7 @@ terminated (stops redelivery on this consumer).
 """
 
 import asyncio
+import functools
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -141,8 +142,15 @@ class AiacEventConsumer:
 
     async def _dispatch(self, msg: Msg) -> None:
         try:
-            rules, override, default_effect = _handle(msg.subject)
-            compute_and_apply(rules, override, default_effect)
+            # ``_handle`` (the LLM-backed policy-rules builder) and ``compute_and_apply`` are
+            # SYNCHRONOUS and slow (tens of seconds). nats-py runs this callback ON the event loop,
+            # so calling them inline froze the loop for the whole onboard — starving the FastAPI
+            # ``/health`` endpoint until the liveness probe killed the pod mid-onboard (then NATS
+            # redelivered the unacked message and the race repeated). Offload both to the default
+            # threadpool so the loop stays free to answer ``/health`` while onboarding runs.
+            loop = asyncio.get_running_loop()
+            rules, override, default_effect = await loop.run_in_executor(None, _handle, msg.subject)
+            await loop.run_in_executor(None, functools.partial(compute_and_apply, rules, override, default_effect))
             # UC1 only: re-enable the client AFTER a successful compute_and_apply, mirroring the
             # HTTP route. If compute_and_apply raised above, this is skipped and the client stays
             # disabled (the failed-service marker), never enabled-with-no-policy.
