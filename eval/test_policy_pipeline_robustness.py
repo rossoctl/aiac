@@ -551,14 +551,15 @@ SENSITIVITY_EDITS: dict[str, SensitivityEdit] = {
     ),
     "empty_descriptions": SensitivityEdit(
         edit_type="negation",
-        policy_find="Field operators may open and close irrigation valves.",
-        policy_replace="Field operators may not open or close irrigation valves at all.",
-        # No description edits: every description in this scenario is deliberately "" (that's its
-        # whole point, per its own docstring), including agent-role-groundskeeper's -- unlike
-        # unreachable_resources' agent-role-receptionist, there is no independent, unedited
-        # description text an outbound_target ROLE_GRAPH call could fall back on instead of the
-        # one policy sentence (now negated) naming this scenario's only valve grant, so the
-        # cascade here doesn't rest on an assumption the way it did there.
+        # The policy sentence itself (not a description -- every description in this scenario is
+        # deliberately "", the whole point per its own docstring) names "the site's groundskeepers"
+        # as who "field operators" are, tying the user role to agent-role-groundskeeper by an
+        # actual textual fact rather than an inferred cascade. Without that phrase, negating only
+        # "field operators ... valves" gives a faithful PRB reading agent-role-groundskeeper's own
+        # (still-empty) description no textual reason to revoke its outbound_target reach --
+        # exactly the gap a prior review caught for this scenario.
+        policy_find="Field operators, the site's groundskeepers, may open and close irrigation valves.",
+        policy_replace="Field operators, the site's groundskeepers, may not open or close irrigation valves at all.",
         description_edits={},
         removed={
             "inbound": {("user-role-field-operator", "agent-scope-groundskeeper")},
