@@ -1,13 +1,19 @@
-"""Semantic-perturbation sibling of ``scenario_eval_agent_delegation.py`` (spec:
+"""Semantic-sensitivity sibling of ``scenario_eval_agent_delegation.py`` (spec: #2467,
 ``docs/evaluation/policy-eval-robustness-consistency.md``).
 
-Note the asymmetry: the original lives at ``test/system/`` top level (a deliberate exception
-in the base suite's file layout), but this perturbed sibling lives here in
-``eval/scenarios_perturbed/`` alongside every other scenario's perturbed sibling — the robustness
-suite treats all 8 scenarios uniformly regardless of where their originals happen to live.
+Realizes the same edit as the mechanical tier's ``SENSITIVITY_EDITS["agent_delegation"]``
+(role_swap — which of the two roles may have customs clearance carried out on the shipment's
+behalf), expressed as a full natural paraphrase rather than a literal text swap. Everything not
+touched by the swap is copied verbatim from ``scenario_eval_agent_delegation_perturbed.py``
+(including ``agent-role-dispatcher``'s own description — unaffected, since the swap moves which
+*user* role gets the capability, not what the agent role itself covers). The truth delta is
+reused directly from ``SENSITIVITY_EDITS["agent_delegation"].removed``/``.added``.
 
-Same structure (names, ``USERS``, all pair-lists are byte-identical to the original), reworded
-prose only. See ``scenario_eval_baseline_perturbed.py`` for the general rationale.
+Like its `_perturbed` sibling, lives under ``eval/scenarios_perturbed/`` even though the original
+lives at ``test/system/`` top level, for the same uniformity reason.
+
+Requires human sign-off before entering the corpus (spec §4) — see ``eval/scenarios_perturbed/
+SIGNOFF.md``.
 
 Pure data: no imports beyond ``__future__``, mirroring the original.
 """
@@ -17,9 +23,12 @@ from __future__ import annotations
 # --- Realm ------------------------------------------------------------------------------------
 
 REALM_DEFAULT = "aiac-pp-eval-agent-delegation"
-POLICY_FILE = "policy.eval_agent_delegation_perturbed.md"
+POLICY_FILE = "policy.eval_agent_delegation_sensitive_perturbed.md"
 
 # --- Agents -------------------------------------------------------------------------------------
+#
+# Byte-identical to scenario_eval_agent_delegation_perturbed.py — the swap only touches which USER
+# role's own description mentions customs clearance, below.
 
 AGENTS: dict[str, dict] = {
     "dispatch-agent": {
@@ -61,6 +70,8 @@ AGENTS: dict[str, dict] = {
 }
 
 # --- Tools --------------------------------------------------------------------------------------
+#
+# Byte-identical to scenario_eval_agent_delegation_perturbed.py.
 
 TOOLS: dict[str, dict] = {
     "manifest-tool": {
@@ -76,9 +87,6 @@ TOOLS: dict[str, dict] = {
 }
 
 # --- Users ----------------------------------------------------------------------------------
-#
-# Two contrasting roles: both may call dispatch-agent and reach manifest-tool; only
-# user-role-shipment-coordinator additionally holds the delegated agent-scope-broker scope.
 
 USERS: dict[str, str] = {
     "coordinator-user": "user-role-shipment-coordinator",
@@ -87,22 +95,25 @@ USERS: dict[str, str] = {
 
 USER_PASSWORD = "password"
 
+# The edit: swapped which role's description claims the customs-clearance capability, in
+# different words than the mechanical tier's literal text swap.
 USER_ROLES: dict[str, str] = {
     "user-role-shipment-coordinator": (
-        "Shipment Coordinator: may create and update shipment manifests via the dispatch agent, "
-        "and may have customs clearance carried out on the shipment's behalf as part of that "
-        "coordinated process."
+        "Shipment Coordinator: may create and update shipment manifests via the dispatch agent "
+        "for routine loading and unloading. May not have customs clearance carried out on the "
+        "shipment's behalf."
     ),
     "user-role-dock-worker": (
-        "Dock Worker: may create and update shipment manifests via the dispatch agent for routine "
-        "loading and unloading. May not have customs clearance carried out on the shipment's "
-        "behalf."
+        "Dock Worker: may create and update shipment manifests via the dispatch agent, and may "
+        "have customs clearance carried out on the shipment's behalf as part of that coordinated "
+        "process."
     ),
 }
 
-# --- Role -> access facts (name-level; the single source of truth) --------------------------
+# --- Role -> access facts (name-level; reflects the EDITED meaning) --------------------------
 #
-# Byte-identical to the original — reworded descriptions above don't change the truth table.
+# Not read by test_prb_sensitive_to_semantic_perturbation — kept here, edited, purely for a
+# reader's benefit.
 
 INBOUND_PAIRS: list[tuple[str, str]] = [
     ("user-role-shipment-coordinator", "agent-scope-dispatcher"),
@@ -118,7 +129,7 @@ OUTBOUND_PAIRS: list[tuple[str, str]] = [
 OUTBOUND_SUBJECT_PAIRS: list[tuple[str, str]] = [
     ("user-role-shipment-coordinator", "tool-scope-manifest-read"),
     ("user-role-shipment-coordinator", "tool-scope-manifest-write"),
-    ("user-role-shipment-coordinator", "agent-scope-broker"),
     ("user-role-dock-worker", "tool-scope-manifest-read"),
     ("user-role-dock-worker", "tool-scope-manifest-write"),
+    ("user-role-dock-worker", "agent-scope-broker"),
 ]
