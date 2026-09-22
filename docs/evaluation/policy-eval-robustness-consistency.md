@@ -98,6 +98,10 @@ is access control, so any run-to-run disagreement is itself the finding, not noi
 A failing scenario's assertion message names the offending gate, the specific `(role, scope)` pairs
 that differ, and which run index disagreed with run 0.
 
+`record_property("inconsistent"/"mismatches", ...)` feeds the trend log (#2468) — see
+[Trend log](#trend-log) — and is read back by the report renderer (see
+[Test report](#test-report)) to show each scenario's consistency status explicitly, pass or fail.
+
 ### Robustness suite
 
 Per `docs/evaluation/eval-framework.md` §4, Robustness is scored as **two families, never
@@ -370,6 +374,14 @@ also `record_property("best_effort_notes", ...)` and prints a summary line when 
 convention as the two correctness suites — naming which scenario's decision fell back to a
 best-effort, never-approved proposal (see [Testing Decisions](#testing-decisions)).
 
+`test_prb_consistent_across_repeats` (#2468) is the one exception to "falls through to the generic
+docstring + crash-message rendering" above: it `record_property("inconsistent", bool)` +
+`record_property("mismatches", [...])` (the full mismatch detail, empty when consistent), and
+`_render_entry` dispatches on `"inconsistent" in props` to render an explicit "Inconsistent:
+Yes/No" line (plus mismatch detail when `True`) via `_render_consistency_block` — on *every* entry,
+pass or fail, not just inferred from the crash message when the assertion fires. `"inconsistent"`
+is also read back by `_write_trend_log` (see [Trend log](#trend-log)).
+
 ## Trend log
 
 `eval/conftest.py`'s `_write_trend_log` collects all four test functions'
@@ -390,6 +402,15 @@ comparable in shape to a Correctness chart: two measuring the PRB against *origi
 (sensitivity, mechanical vs. semantic tier). A row with zero scored scenarios in a run (e.g. a `-k`
 filter that only exercises one test function) simply gets no row at all, rather than a shared row
 mislabeling one row's count against another's. See `docs/evaluation/eval-framework.md` §9.
+
+**Consistency (#2468)** gets its own single row, `suite="consistency"`, pooled by
+`eval/trend_log.py`'s `pool_consistency_metrics` — not `pool_correctness_metrics`, since there's no
+truth table here (Consistency compares PRB runs to each other, not to ground truth), just each
+scenario's own `inconsistent` boolean rolled up into a `disagreement_rate` (the fraction of the
+corpus's scenarios that disagreed across their `PRB_CONSISTENCY_REPEATS` repeats). Recorded whether
+the run passed or failed — spec §6's whole point is that an occasional disagreement should stay
+visible on the trend chart over time, not just show up as a one-off failed run with no lasting
+record.
 
 ## Testing Decisions
 

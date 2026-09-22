@@ -20,9 +20,12 @@ two Correctness suites (``eval/conftest.py``'s ``_write_trend_log``, fed from
 suite's invariance/sensitivity families (``test_prb_invariant_to_mechanical_perturbation``/
 ``test_prb_sensitive_to_mechanical_edit``, same ``score_scenario`` shape, pooled per family so
 precision/recall/denial_precision is directly comparable against the two Correctness charts —
-what varies is which family's own pass/fail rate ``_write_trend_log`` adds alongside it). A future
-Consistency/Scale ticket whose metric shape doesn't fit this one will need its own pooling
-function, written the same way, then handed to the same ``append_row``.
+what varies is which family's own pass/fail rate ``_write_trend_log`` adds alongside it).
+``pool_consistency_metrics`` pools the Consistency suite's own ``inconsistent`` per-scenario
+booleans (``eval/test_policy_pipeline_consistency.py``, #2468) into a ``disagreement_rate`` instead
+— its metric shape doesn't fit ``pool_correctness_metrics`` since there's no truth table involved,
+just run-to-run agreement. A future Scale ticket whose metric shape doesn't fit either will need
+its own pooling function, written the same way, then handed to the same ``append_row``.
 """
 
 from __future__ import annotations
@@ -68,6 +71,22 @@ def pool_correctness_metrics(entries: list[dict[str, Any]]) -> dict[str, Any]:
         "precision": precision,
         "recall": recall,
         "denial_precision": denial_precision,
+    }
+
+
+def pool_consistency_metrics(entries: list[dict[str, Any]]) -> dict[str, Any]:
+    """Pool per-scenario ``inconsistent`` booleans recorded by ``test_prb_consistent_across_repeats``
+    (``eval/test_policy_pipeline_consistency.py``) into one run's aggregate disagreement rate —
+    the fraction of scenarios where the PRB's grant sets differed across any of its
+    ``PRB_CONSISTENCY_REPEATS`` (default 5) repeats. Unlike ``pool_correctness_metrics``, there is no
+    truth table here — Consistency checks run-to-run agreement, not correctness against ground
+    truth — so this pools a pass/fail flag per scenario rather than true_positives/over_grants/etc.
+    counts."""
+    scenarios_scored = len(entries)
+    disagreements = sum(1 for e in entries if e.get("inconsistent"))
+    return {
+        "scenarios_scored": scenarios_scored,
+        "disagreement_rate": disagreements / scenarios_scored if scenarios_scored else 0.0,
     }
 
 
