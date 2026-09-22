@@ -18,6 +18,7 @@ from __future__ import annotations
 import html
 import json
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -374,12 +375,31 @@ def _escape_cell(text: str) -> str:
     return html.escape(text).replace("\n", "<br>")
 
 
+# Full Correctness/Robustness corpus size (eval.test_policy_pipeline_eval.SCENARIOS) -- the same
+# value as eval/conftest.py's own _EXPECTED_SCENARIO_COUNT, kept as a separate plain constant
+# rather than imported so this module stays a self-contained, dependency-light tool (see the
+# module docstring). Bump alongside conftest.py's copy if the corpus grows.
+_EXPECTED_SCENARIO_COUNT = 8
+
+
 def render_scenario_table(report: ParsedReport) -> str:
     """One collapsible, anchored drill-down section for a parsed report's scored entries (any
     suite recognized by ``_SUITE_BY_NODEID_MARKER`` -- correctness and robustness today). ``""``
-    when the report has none (e.g. an ``eval_extended``-only run) -- nothing for
-    ``render_dashboard`` to show for that report."""
-    scored_entries = [e for e in report.entries if e.suite is not None]
+    when the report has none (e.g. an ``eval_extended``-only run, or one left with none after the
+    partial-run filter below) -- nothing for ``render_dashboard`` to show for that report.
+
+    A report has no ``run_type`` field of its own (that's a trend-log-only concept, computed from
+    ``scenarios_scored`` in ``eval/conftest.py``'s ``_write_trend_log``) -- and a single report can
+    mix a full run of one suite with a `-k`-filtered partial run of another (e.g. `-k baseline`
+    produces one scenario's worth of entries for *each* robustness test function it touches). So
+    "partial" is decided per (report, suite) here: a suite's entries within this one report are
+    dropped if that suite has fewer than ``_EXPECTED_SCENARIO_COUNT`` of them -- mirroring
+    ``_write_trend_log``'s own ``== _EXPECTED_SCENARIO_COUNT`` full-run test, so a report entry
+    the trend chart would have excluded as partial (had it fed the trend log at all) doesn't linger
+    in the drill-down as an unlabeled, easy-to-mistake-for-real debug run."""
+    all_scored = [e for e in report.entries if e.suite is not None]
+    suite_counts = Counter(e.suite for e in all_scored)
+    scored_entries = [e for e in all_scored if suite_counts[e.suite] == _EXPECTED_SCENARIO_COUNT]
     if not scored_entries:
         return ""
     rows_html = "".join(
@@ -430,12 +450,21 @@ def render_dashboard(trend_rows: list[dict[str, Any]], reports: list[ParsedRepor
     """The full static dashboard page: one trend chart per suite present in ``trend_rows``
     (generic over suite name -- not hardcoded to the two Correctness suites, so a future suite
     gets its own chart the moment it starts writing trend-log rows), then one scenario drill-down
-    section per parsed report."""
-    suites = sorted({row["suite"] for row in trend_rows if "suite" in row})
+    section per parsed report.
+
+    Charts only ever plot **full** runs (``run_type != "partial"`` -- a row with no ``run_type`` at
+    all, e.g. one written before that field existed, still counts as full). A `-k`-filtered
+    single-scenario debug run pools its precision/recall from far fewer scenarios than a real
+    8-scenario regression row and would otherwise show up as an unlabeled outlier on the same line,
+    indistinguishable from a genuine regression -- see ``eval/conftest.py``'s ``_write_trend_log``
+    for where ``run_type`` is set. Excluded rows are dropped only from the *chart*; nothing here
+    rewrites ``trend_log.jsonl`` itself."""
+    full_run_rows = [row for row in trend_rows if row.get("run_type") != "partial"]
+    suites = sorted({row["suite"] for row in full_run_rows if "suite" in row})
     if suites:
         chart_sections = "".join(
             f'<section class="trend-section"><h3>{suite}</h3>'
-            + render_svg_chart([row for row in trend_rows if row.get("suite") == suite], reports, suite=suite)
+            + render_svg_chart([row for row in full_run_rows if row.get("suite") == suite], reports, suite=suite)
             + "</section>"
             for suite in suites
         )
