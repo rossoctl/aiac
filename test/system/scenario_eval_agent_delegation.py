@@ -59,7 +59,7 @@ AGENTS: dict[str, dict] = {
         "delegation_scopes": {},
         "roles": {
             "agent-role-dispatcher": (
-                "Covers creating and updating shipment manifests, and delegating "
+                "Covers reading, creating, and updating shipment manifests, and delegating "
                 "agent-scope-broker actions to the customs agent as part of a coordinated "
                 "shipment."
             ),

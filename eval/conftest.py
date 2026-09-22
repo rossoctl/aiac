@@ -69,20 +69,21 @@ run with an uneven pair count per scenario isn't skewed by weighting every scena
 scenario whose own setup failed never recorded these, so it contributes nothing to the pooled row
 (consistent with ``_CORRECTNESS_TEST_MARKERS``'s existing setup-failure handling above).
 
-``test_prb_invariant_to_mechanical_perturbation`` and ``test_prb_sensitive_to_mechanical_edit``
-(``test_policy_pipeline_robustness.py``, spec §4) similarly each ``record_property`` a boolean
+All four test functions in ``test_policy_pipeline_robustness.py`` (spec §4;
+``test_prb_invariant_to_mechanical_perturbation``, ``test_prb_invariant_to_semantic_perturbation``,
+``test_prb_sensitive_to_mechanical_edit``, ``test_prb_sensitive_to_semantic_perturbation`` -- the
+last two of the four added by #2467) each ``record_property`` a boolean
 (``"invariant"``/``"sensitive"``) plus the same ``true_positives``/``denied_total`` raw counts the
 two Correctness suites record -- pooled here by nodeid substring (``_ROBUSTNESS_TEST_MARKERS``,
 mirroring ``_CORRECTNESS_TEST_MARKERS``'s pattern, since the single flat ``eval`` marker spans
-three test functions across two families/tiers that must stay unblended) into its *own* committed
-trend-log row per family -- ``suite="robustness_mechanical_invariance"``/
-``suite="robustness_mechanical_sensitivity"`` -- each carrying that family's own
-precision/recall/denial_precision (``eval/trend_log.py``'s ``pool_correctness_metrics``, the same
-pooling the two Correctness suites use, so the resulting chart is directly comparable to theirs:
-one measuring performance against the *original* inputs, the other against *deliberately edited*
-inputs) plus that family's own pass/fail rate (``invariance_rate``/``sensitivity_rate``). The third
-test in that module, ``test_prb_invariant_to_semantic_perturbation``, is deliberately excluded from
-this wiring -- semantic-tier trend-log wiring is tracked separately as #2467.
+four test functions across two families x two tiers that must stay unblended) into its *own*
+committed trend-log row per family/tier combination -- ``suite="robustness_mechanical_invariance"``/
+``"robustness_semantic_invariance"``/``"robustness_mechanical_sensitivity"``/
+``"robustness_semantic_sensitivity"`` -- each carrying that row's own precision/recall/
+denial_precision (``eval/trend_log.py``'s ``pool_correctness_metrics``, the same pooling the two
+Correctness suites use, so the resulting chart is directly comparable to theirs: two measuring
+performance against the *original* inputs, two against *deliberately edited/reworded* inputs) plus
+that row's own pass/fail rate (``invariance_rate``/``sensitivity_rate``).
 """
 
 from __future__ import annotations
@@ -225,16 +226,16 @@ def _format_pairs_dict(pairs_by_gate: dict) -> str:
 # generic branch and render its actual skip reason instead of a misleading "setup failed".
 _CORRECTNESS_TEST_MARKERS = ("::test_prb_correctness[", "::test_e2e_correctness[")
 
-# Nodeid substrings for all three robustness test functions (mirrors _CORRECTNESS_TEST_MARKERS
-# above, same purpose) -- every one of them, not just the two that feed the trend log
-# (_ROBUSTNESS_TEST_MARKERS below), records precision/recall/etc. via _record_scoring for the
-# report, so a scenario whose setup fails before that call ever runs gets the same
+# Nodeid substrings for all four robustness test functions (mirrors _CORRECTNESS_TEST_MARKERS
+# above, same purpose) -- every one of them records precision/recall/etc. via _record_scoring for
+# the report, so a scenario whose setup fails before that call ever runs gets the same
 # "unavailable, here's why" six-field shape instead of silently falling back to the generic
 # docstring + crash-message rendering.
 _ROBUSTNESS_SCORED_TEST_MARKERS = (
     "::test_prb_invariant_to_mechanical_perturbation[",
     "::test_prb_invariant_to_semantic_perturbation[",
     "::test_prb_sensitive_to_mechanical_edit[",
+    "::test_prb_sensitive_to_semantic_perturbation[",
 )
 
 # Nodeid substring -> trend-log suite name (eval/trend_log.py). With the five former ``eval_*``
@@ -243,9 +244,9 @@ _ROBUSTNESS_SCORED_TEST_MARKERS = (
 # ``::test_e2e_correctness[`` substrings ``_CORRECTNESS_TEST_MARKERS`` already uses. Deliberately
 # scoped to the two Correctness suites for now — the Consistency/Scale suite tickets (#2468-#2470)
 # add their own entries here when they land, reusing the same _write_trend_log/append_row mechanism
-# rather than building a parallel one. Robustness (#2466) is wired separately below
-# (_ROBUSTNESS_TEST_MARKERS) since its three test functions span two families/tiers that must stay
-# unblended (spec §4) — a single nodeid -> suite entry here would conflate them.
+# rather than building a parallel one. Robustness (#2466/#2467) is wired separately below
+# (_ROBUSTNESS_TEST_MARKERS) since its four test functions span two families x two tiers that must
+# stay unblended (spec §4) -- a single nodeid -> suite entry here would conflate them.
 _TREND_LOG_SUITES = {
     "::test_prb_correctness[": "correctness_prb",
     "::test_e2e_correctness[": "correctness_e2e",
@@ -256,19 +257,29 @@ _TREND_LOG_SUITES = {
 # (rather than one shared "robustness_mechanical" bucket) so its pooled precision/recall/
 # denial_precision (from the same true_positives/denied_total counts the two Correctness suites
 # record, see _record_scoring) sits on its own chart, directly comparable in shape to a Correctness
-# chart -- one measuring the PRB against the *original* inputs, the other against *deliberately
-# edited* inputs. Only the mechanical-tier invariance/sensitivity tests feed the trend log — the
-# semantic-tier invariance test (test_prb_invariant_to_semantic_perturbation) is out of scope for
-# #2466 (tracked as #2467) and deliberately excluded here, per that test's own docstring.
+# chart -- one measuring the PRB against the *original* inputs, the others against *deliberately
+# edited/reworded* inputs. All four robustness test functions feed the trend log (#2467 completed
+# the semantic-tier rows -- test_prb_invariant_to_semantic_perturbation and
+# test_prb_sensitive_to_semantic_perturbation -- previously excluded here).
 _ROBUSTNESS_TEST_MARKERS = {
     "::test_prb_invariant_to_mechanical_perturbation[": (
         "invariant",
         "robustness_mechanical_invariance",
         "invariance_rate",
     ),
+    "::test_prb_invariant_to_semantic_perturbation[": (
+        "invariant",
+        "robustness_semantic_invariance",
+        "invariance_rate",
+    ),
     "::test_prb_sensitive_to_mechanical_edit[": (
         "sensitive",
         "robustness_mechanical_sensitivity",
+        "sensitivity_rate",
+    ),
+    "::test_prb_sensitive_to_semantic_perturbation[": (
+        "sensitive",
+        "robustness_semantic_sensitivity",
         "sensitivity_rate",
     ),
 }
@@ -364,20 +375,22 @@ def _render_entry(lines: list[str], nodeid: str, report: pytest.TestReport, cate
 
 def _write_trend_log() -> None:
     """One committed trend-log row per Correctness suite present in this session (PRB-level
-    and/or end-to-end), plus one per Robustness family (invariance/sensitivity) — spec:
-    docs/evaluation/eval-framework.md §9. Pools every scenario's true_positives/denied_total counts
-    (and over_grants/under_grants/incorrectly_denied pair dicts) that reached score_scenario — a
-    scenario whose own setup failed never recorded these, so it contributes nothing to the pooled
-    row, same as _render_metrics_block's unavailable_reason branch above treats it as absent
-    rather than zero.
+    and/or end-to-end), plus one per Robustness family x tier combination (invariance/sensitivity,
+    mechanical/semantic) — spec: docs/evaluation/eval-framework.md §9. Pools every scenario's
+    true_positives/denied_total counts (and over_grants/under_grants/incorrectly_denied pair
+    dicts) that reached score_scenario — a scenario whose own setup failed never recorded these, so
+    it contributes nothing to the pooled row, same as _render_metrics_block's unavailable_reason
+    branch above treats it as absent rather than zero.
 
-    Each Robustness family gets its own row/suite (``robustness_mechanical_invariance``/
-    ``robustness_mechanical_sensitivity``), pooled by ``pool_correctness_metrics`` exactly like the
-    two Correctness suites — so its precision/recall/denial_precision is directly comparable to
-    theirs — plus that family's own pass/fail rate (``invariance_rate``/``sensitivity_rate``).
-    Because each family is now its own row, a ``-k``-filtered run (e.g. ``-k sensitive``) simply
-    produces no row at all for the family it never ran, rather than a shared row mislabeling one
-    family's count against the other's.
+    Each Robustness family/tier combination gets its own row/suite
+    (``robustness_mechanical_invariance``/``robustness_semantic_invariance``/
+    ``robustness_mechanical_sensitivity``/``robustness_semantic_sensitivity``, the semantic-tier
+    rows added by #2467), pooled by ``pool_correctness_metrics`` exactly like the two Correctness
+    suites — so its precision/recall/denial_precision is directly comparable to theirs — plus that
+    row's own pass/fail rate (``invariance_rate``/``sensitivity_rate``). Because each row is
+    independent, a ``-k``-filtered run (e.g. ``-k sensitive``) simply produces no row at all for the
+    combination it never ran, rather than a shared row mislabeling one combination's count against
+    another's.
 
     Always stamped in UTC, independent of ``EVAL_REPORT_TZ`` (that variable only controls the
     gitignored per-run Markdown report's timestamp/filename) — a committed file read by every
