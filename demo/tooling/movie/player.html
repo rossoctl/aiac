@@ -1,0 +1,277 @@
+<!doctype html><html><head><meta charset="utf-8"><title>UC-1 replay</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap">
+<style>
+:root{
+  --bg:#0D1117; --panel:#141A22; --band:#171E27; --rule:#242C36;
+  --ink:#D6DEE8; --dim:#8A95A4; --dim2:#5A6472;
+  --gate:#4FC3CC; --allow:#6BC48C; --deny:#E8796B; --llm:#B49AE0; --warn:#E0B341;
+  --mono:"IBM Plex Mono",ui-monospace,Menlo,monospace;
+  --sans:"IBM Plex Sans",-apple-system,sans-serif;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{width:1920px;height:1080px;background:var(--bg);color:var(--ink);
+  font-family:var(--mono);overflow:hidden;position:relative}
+
+/* window chrome */
+#top{height:50px;display:flex;align-items:center;gap:20px;padding:0 34px;
+  border-bottom:1px solid var(--rule);background:var(--panel)}
+#dots{display:flex;gap:8px}#dots i{width:12px;height:12px;border-radius:50%;background:#39414D}
+#title{font-size:14px;color:var(--dim2);letter-spacing:.02em}
+#prog{margin-left:auto;display:flex;align-items:center;gap:14px}
+#ticks{display:flex;gap:3px}
+#ticks b{width:14px;height:6px;background:#2A3340;border-radius:1px}
+#ticks b.done{background:var(--gate)}#ticks b.now{background:var(--warn)}
+#tno{font-size:13px;color:var(--dim2);font-variant-numeric:tabular-nums}
+
+/* task band — appears with the first command, holds through the task */
+#band{height:96px;background:var(--band);border-bottom:1px solid var(--rule);
+  padding:0 34px;display:flex;flex-direction:column;justify-content:center;
+  opacity:0;transition:opacity .3s}
+#band.on{opacity:1}
+#band.reading{box-shadow:inset 3px 0 0 var(--gate)}
+#band .k{font-family:var(--mono);font-size:12.5px;letter-spacing:.16em;color:var(--gate);font-weight:600}
+#band .c{font-family:var(--sans);font-size:29px;font-weight:600;color:#F0F4F9;
+  margin-top:6px;line-height:1.15;letter-spacing:-.01em}
+
+/* verbatim zone — scrolls upward */
+#term{position:absolute;top:146px;left:0;right:0;bottom:250px;overflow:hidden}
+#scroll{position:absolute;left:34px;right:34px;top:0;padding:22px 0;
+  transition:transform .32s cubic-bezier(.22,.61,.36,1)}
+.blk{margin-bottom:15px}
+.cmd{color:#EAF1F8;white-space:pre-wrap;word-break:break-all;font-size:19px;line-height:1.45}
+.cmd .p{color:var(--gate);font-weight:600;margin-right:10px}
+.cur{display:inline-block;width:11px;height:21px;background:var(--gate);
+  vertical-align:-4px;animation:bl 1s steps(2) infinite}
+@keyframes bl{50%{opacity:0}}
+.out{color:var(--dim);white-space:pre-wrap;margin-top:5px;font-size:17px;line-height:1.42}
+.out .st{color:var(--allow);font-weight:600}
+.out.tbl{color:#C7D1DD;font-size:18px}
+.out .ok{color:var(--allow);font-weight:600}
+.out .no{color:var(--deny);font-weight:600}
+.out .fold{color:var(--dim2);font-style:italic}
+.sent{margin-top:6px;border-left:3px solid var(--gate);
+  background:rgba(79,195,204,.05);padding:8px 14px}
+.sent b{display:block;font-family:var(--mono);font-size:13px;letter-spacing:.09em;
+  text-transform:uppercase;color:var(--gate);font-weight:600;margin-bottom:6px}
+.sent pre{font-family:var(--mono);font-size:15.5px;line-height:1.4;color:#9FB0C2;
+  white-space:pre-wrap;margin:0}
+.exp{margin-top:8px;padding:9px 14px;border-left:3px solid var(--llm);
+  background:rgba(180,154,224,.07);color:#BCA9DE;font-size:16.5px;
+  font-style:italic;white-space:pre-wrap;line-height:1.48}
+.exp.rej{border-left-color:var(--deny);background:rgba(232,121,107,.11);
+  color:#F3AEA3;font-style:normal;padding:13px 16px;font-size:18px}
+.exp b{font-family:var(--mono);font-style:normal;font-weight:700;letter-spacing:.05em}
+.blk.hi{background:rgba(232,121,107,.055);box-shadow:inset 3px 0 0 var(--deny);
+  padding:9px 0 9px 13px;margin-left:-16px}
+
+/* fast-forward */
+#ff{position:absolute;top:166px;right:34px;display:none;align-items:center;gap:11px;
+  padding:8px 16px;background:rgba(224,179,65,.14);border:1px solid var(--warn);
+  border-radius:3px;color:var(--warn);font-size:14px;font-weight:600;letter-spacing:.08em;z-index:5}
+#ff.on{display:flex}
+#ff .g{display:flex;gap:3px}
+#ff .g s{width:0;height:0;border-left:9px solid var(--warn);
+  border-top:7px solid transparent;border-bottom:7px solid transparent;animation:ff .9s linear infinite}
+#ff .g s:nth-child(2){animation-delay:.15s}#ff .g s:nth-child(3){animation-delay:.3s}
+@keyframes ff{0%,100%{opacity:.25}50%{opacity:1}}
+
+/* Slide overlay. Slides render INSIDE the replay page: Playwright's screencast is
+   per-page, so a second page records to its own file and never reaches the film. */
+#slide{position:absolute;inset:0;background:var(--bg);z-index:20;display:none;
+  flex-direction:column}
+#slide.on{display:flex}
+#slide #scap{height:96px;background:var(--band);border-bottom:1px solid var(--rule);
+  padding:0 34px;display:flex;flex-direction:column;justify-content:center;order:-1}
+#slide #scap .k{font-family:var(--mono);font-size:12.5px;letter-spacing:.16em;
+  color:var(--gate);font-weight:600}
+#slide #scap .c{font-family:var(--sans);font-size:29px;font-weight:600;color:#F0F4F9;
+  margin-top:6px;line-height:1.15}
+#slide.bare #scap{display:none}
+#slide #simg{flex:1;min-height:0;width:100%;object-fit:contain;padding:26px 34px;
+  background:#fff}
+#slide.bare #simg{padding:0;background:none}
+
+/* narration zone — bottom, live while speaking */
+#narr{position:absolute;left:0;right:0;bottom:0;height:250px;background:var(--panel);
+  border-top:1px solid var(--rule);padding:24px 34px;opacity:0;transition:opacity .3s}
+#narr.on{opacity:1}
+#narr .h{display:flex;align-items:center;gap:12px}
+#narr .eq{display:flex;align-items:flex-end;gap:3px;height:15px}
+#narr .eq i{width:3px;background:var(--gate);animation:eq .85s ease-in-out infinite}
+#narr .eq i:nth-child(1){height:6px;animation-delay:0s}
+#narr .eq i:nth-child(2){height:13px;animation-delay:.12s}
+#narr .eq i:nth-child(3){height:9px;animation-delay:.24s}
+#narr .eq i:nth-child(4){height:15px;animation-delay:.36s}
+#narr .eq i:nth-child(5){height:7px;animation-delay:.48s}
+@keyframes eq{0%,100%{transform:scaleY(.4)}50%{transform:scaleY(1)}}
+#narr .lb{font-size:12px;letter-spacing:.15em;color:var(--gate);font-weight:600}
+#nsum{font-family:var(--sans);font-size:22px;color:#BEC9D6;margin-top:14px;
+  line-height:1.5;max-width:1720px}
+</style></head><body>
+
+<div id="top">
+  <div id="dots"><i></i><i></i><i></i></div>
+  <div id="title">developer@rossoctl — uc1 onboarding</div>
+  <div id="prog"><div id="ticks"></div><div id="tno"></div></div>
+</div>
+
+<div id="band"><div class="k" id="bk"></div><div class="c" id="bc"></div></div>
+<div id="term"><div id="scroll"></div></div>
+<div id="ff"><div class="g"><s></s><s></s><s></s></div><span>FAST FORWARD</span></div>
+<div id="slide"><img id="simg" alt=""><div id="scap"><div class="k" id="sk"></div><div class="c" id="sc"></div></div></div>
+<div id="narr">
+  <div class="h"><div class="eq"><i></i><i></i><i></i><i></i><i></i></div><div class="lb" id="nlb">NARRATING</div></div>
+  <div id="nsum"></div>
+</div>
+
+<script>
+const $=s=>document.querySelector(s);
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+const TERM_H=1080-146-250;   // visible height of the verbatim zone
+
+function ticks(n,cur){
+  const t=$("#ticks"); t.innerHTML="";
+  for(let i=1;i<=n;i++){const b=document.createElement("b");
+    if(i<cur)b.className="done"; else if(i===cur)b.className="now"; t.appendChild(b);}
+  $("#tno").textContent=cur+" / "+n;
+}
+/* keep the newest content in view: translate the stack up by whatever overflows */
+function scrollDown(){
+  const s=$("#scroll");
+  const over=s.scrollHeight-TERM_H;
+  s.style.transform="translateY("+(over>0?-over:0)+"px)";
+}
+function trim(){
+  const s=$("#scroll");
+  while(s.children.length>30) s.removeChild(s.firstChild);
+}
+/* Unescape the LLM decision out of the chat envelope and fold the token counts. */
+function shapeOutput(txt){
+  let t=txt;
+  const m=t.match(/"content":\s*"((?:[^"\\]|\\.)*)"/);
+  if(m){
+    let inner=m[1];
+    try{ inner=JSON.parse('"'+inner+'"'); }catch(e){}
+    try{ inner=JSON.stringify(JSON.parse(inner),null,2); }catch(e){}
+    const head=t.slice(0,t.indexOf("{")).trim();       // e.g. `200 —`
+    t=head+" "+inner;
+  }else{
+    // fold long token-accounting blocks that carry no meaning on screen
+    t=t.replace(/\n\s*"usage":\s*\{[\s\S]*?\n\s*\}(,?)/,
+                '\n  "usage": { … token counts … }$1');
+  }
+  return t;
+}
+function colorOut(txt){
+  return txt
+    .replace(/&/g,"&amp;").replace(/</g,"&lt;")
+    .replace(/^(\d{3})(\s—)/,'<span class="st">$1</span>$2')
+    .replace(/… token counts …/g,'<span class="fold">… token counts …</span>')
+    .replace(/\ballowed\b/g,'<span class="ok">allowed</span>')
+    .replace(/\b(denied|blocked at inbound)\b/g,'<span class="no">$1</span>')
+    .replace(/"approved":\s*true/g,'"approved": <span class="ok">true</span>')
+    .replace(/"approved":\s*false/g,'"approved": <span class="no">false</span>')
+    .replace(/✓/g,'<span class="ok">✓</span>').replace(/⛔/g,'<span class="no">⛔</span>');
+}
+async function typeCmd(el,text,ms){
+  // Below ~8ms/char a per-character await costs more than the delay itself, so
+  // characters are emitted in batches whose *duration* still matches `ms`.
+  const c=document.createElement("span"); c.className="cur"; el.appendChild(c);
+  const batch=Math.max(1,Math.ceil(8/Math.max(ms,0.05)));
+  for(let i=0;i<text.length;i+=batch){
+    c.insertAdjacentText("beforebegin",text.slice(i,i+batch));
+    if(ms>0) await sleep(ms*batch);
+    if(i%(batch*8)===0) scrollDown();
+  }
+  c.remove(); scrollDown();
+}
+async function runTask(t,total){
+  ticks(total,t.n);
+  // Clear FIRST: the caption must never appear over the previous task's output, and a
+  // slide dismissed just before this point would otherwise reveal a full screen.
+  const s=$("#scroll");
+  s.innerHTML=""; s.style.transform="translateY(0)";
+  // task caption, and it stays for the whole task
+  $("#bk").textContent="TASK "+t.n+" OF "+total;
+  $("#bc").textContent=t.task;
+  $("#band").classList.add("on");
+  // narration covers caption then summary; both are on screen while spoken
+  $("#nsum").textContent=t.summary;
+  $("#narr").classList.add("on");
+  // the driver times audio from here: band and summary are now in the DOM and
+  // their fade has begun. Anything earlier would place the voice before the text.
+  window.__painted=t.n;
+  // the band holds the caption being read at the top of the clip
+  $("#band").classList.add("reading");
+  setTimeout(()=>$("#band").classList.remove("reading"),2600);
+
+  // pacing comes from pace.py: typing speed is fitted to this task's narration,
+  // and fast-forward only engages when even a blur would overrun the voice.
+  const P=t.pace||{cps_normal:0.013,cps_fast:0.001,ff_from:3};
+  for(let i=0;i<t.steps.length;i++){
+    const st=t.steps[i], fast=i>=P.ff_from;
+    $("#ff").classList.toggle("on",fast);
+    const blk=document.createElement("div"); blk.className="blk"; s.appendChild(blk);
+
+    if(st.cmd){                                  // command…
+      const c=document.createElement("div"); c.className="cmd";
+      c.innerHTML='<span class="p">$</span>'; blk.appendChild(c);
+      const ms=(fast?P.cps_fast:P.cps_normal)*1000;
+      await typeCmd(c,st.cmd,ms);
+      await sleep(fast?70:Math.min(240,ms*14));
+    }
+    if(st.sent){    // the request body, where the response carries no substance
+      const w=document.createElement("div"); w.className="sent";
+      w.innerHTML='<b>request body — '+st.sent_bytes.toLocaleString()+' bytes</b>'
+                 +'<pre>'+st.sent.replace(/&/g,"&amp;").replace(/</g,"&lt;")+'</pre>';
+      blk.appendChild(w); scrollDown();
+    }
+    if(st.output){                               // …then its output
+      const o=document.createElement("div");
+      o.className="out"+(st.table?" tbl":"");
+      o.innerHTML=colorOut(shapeOutput(st.output)); blk.appendChild(o);
+      scrollDown();
+    }
+    const rej=st.explain && /^REJECTED/.test(st.explain);
+    if(st.explain){
+      const e=document.createElement("div");
+      e.className="exp"+(rej?" rej":"");
+      e.innerHTML=st.explain.replace(/^(REJECTED|approved)/,'<b>$1</b>');
+      blk.appendChild(e); scrollDown();
+    }
+    if(rej){                                     // the self-correction: hold on it
+      blk.classList.add("hi"); scrollDown();
+      $("#ff").classList.remove("on");
+      await sleep(4200);
+    }
+    trim(); scrollDown();
+    await sleep(fast?100:350);
+  }
+  $("#ff").classList.remove("on");
+  window.__cardShown=true;
+}
+window.__runAll=async(tasks)=>{
+  for(const t of tasks){
+    window.__task=t.n; window.__cardShown=false;
+    await runTask(t,tasks.length);
+    window.__done=t.n;
+    await new Promise(r=>{window.__next=r;});
+  }
+  window.__finished=true;
+};
+window.__start=tasks=>{ window.__runAll(tasks); return true; };
+
+// Show a slide over the replay. The terminal underneath is untouched, so a mid-film
+// slide (State 2, State 3) leaves the scroll position intact for the next task.
+window.__showSlide=(s)=>{
+  const el=$("#slide"), img=$("#simg");
+  el.classList.toggle("bare",!!s.bare);
+  $("#sk").textContent=s.kicker||""; $("#sc").textContent=s.title||"";
+  window.__shown=null;
+  img.onload=()=>{ el.classList.add("on"); window.__shown=s.id; };
+  img.onerror=()=>{ window.__shown="ERR:"+s.id; };
+  img.src=s.src;
+  return true;
+};
+window.__hideSlide=()=>{ $("#slide").classList.remove("on"); window.__shown=null; return true; };
+</script></body></html>

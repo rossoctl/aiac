@@ -44,3 +44,13 @@ venv/
 # Local environment / secrets (LLM + Keycloak creds). Real config values live here;
 # never commit. Moved to repo root from test/integration/.env.
 .env
+
+# macOS
+.DS_Store
+
+# Demo film build: node_modules is a fetched dependency (18 MB, Playwright), and
+# bundle.json holds an absolute path to the capture bundle on one machine.
+demo/tooling/movie/node_modules/
+demo/tooling/movie/bundle.json
+demo/tooling/movie/.*.html
+demo/tooling/movie/.*.mjs
