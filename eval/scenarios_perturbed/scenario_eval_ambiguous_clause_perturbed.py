@@ -26,16 +26,14 @@ AGENTS: dict[str, dict] = {
             "looking up a student's current enrollment status and past enrollment record."
         ),
         "inbound_scopes": {
-            "agent-scope-enrollment-status-access": (
+            "agent-scope-registrar": (
                 "Lets a holder use the registrar agent's current-enrollment-status lookup ability."
             ),
-            "agent-scope-enrollment-history-access": (
-                "Lets a holder use the registrar agent's enrollment-history lookup ability."
-            ),
+            "agent-scope-archivist": ("Lets a holder use the registrar agent's enrollment-history lookup ability."),
         },
         "delegation_scopes": {},
         "roles": {
-            "agent-role-registrar-operations": (
+            "agent-role-registrar": (
                 "Covers looking up a student's current enrollment status and past enrollment record."
             ),
         },
@@ -79,12 +77,12 @@ USER_ROLES: dict[str, str] = {
 # Byte-identical to the original — reworded descriptions above don't change the truth table.
 
 INBOUND_PAIRS: list[tuple[str, str]] = [
-    ("user-role-enrollment-advisor", "agent-scope-enrollment-status-access"),
+    ("user-role-enrollment-advisor", "agent-scope-registrar"),
 ]
 
 OUTBOUND_PAIRS: list[tuple[str, str]] = [
-    ("agent-role-registrar-operations", "tool-scope-enrollment-status"),
-    ("agent-role-registrar-operations", "tool-scope-enrollment-history"),
+    ("agent-role-registrar", "tool-scope-enrollment-status"),
+    ("agent-role-registrar", "tool-scope-enrollment-history"),
 ]
 
 OUTBOUND_SUBJECT_PAIRS: list[tuple[str, str]] = [

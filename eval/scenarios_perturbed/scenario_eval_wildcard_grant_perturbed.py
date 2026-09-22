@@ -25,14 +25,14 @@ AGENTS: dict[str, dict] = {
             "count adjustments, and reorders."
         ),
         "inbound_scopes": {
-            "agent-scope-inventory-access": (
+            "agent-scope-stocker": (
                 "Lets a holder use the inventory agent's complete set of inventory abilities — "
                 "stock-level checks, count adjustments, and reorders."
             ),
         },
         "delegation_scopes": {},
         "roles": {
-            "agent-role-inventory-operations": (
+            "agent-role-stocker": (
                 "Covers every inventory operation against the inventory tool — stock-level "
                 "checks, count adjustments, and reorders."
             ),
@@ -76,13 +76,13 @@ USER_ROLES: dict[str, str] = {
 # Byte-identical to the original — reworded descriptions above don't change the truth table.
 
 INBOUND_PAIRS: list[tuple[str, str]] = [
-    ("user-role-inventory-manager", "agent-scope-inventory-access"),
+    ("user-role-inventory-manager", "agent-scope-stocker"),
 ]
 
 OUTBOUND_PAIRS: list[tuple[str, str]] = [
-    ("agent-role-inventory-operations", "tool-scope-inventory-check"),
-    ("agent-role-inventory-operations", "tool-scope-inventory-adjust"),
-    ("agent-role-inventory-operations", "tool-scope-inventory-reorder"),
+    ("agent-role-stocker", "tool-scope-inventory-check"),
+    ("agent-role-stocker", "tool-scope-inventory-adjust"),
+    ("agent-role-stocker", "tool-scope-inventory-reorder"),
 ]
 
 OUTBOUND_SUBJECT_PAIRS: list[tuple[str, str]] = [

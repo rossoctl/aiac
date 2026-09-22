@@ -4,7 +4,7 @@ Companion to ``scenario_eval_baseline.py`` (Scenario 1) for ``test_policy_pipeli
 ``docs/evaluation/policy-eval-scenarios.md``). Isolates one aspect: a wildcard-phrased
 grant that must be expanded by the PRB to the correct concrete scope set.
 
-Both the user role (``user-role-inventory-manager``) and the agent's own role (``agent-role-inventory-operations``) are
+Both the user role (``user-role-inventory-manager``) and the agent's own role (``agent-role-stocker``) are
 described using an "all inventory operations" wildcard phrase rather than an enumerated scope list.
 Ground truth expands the phrase to all three concrete scopes on ``inventory-tool``
 (``tool-scope-inventory-check``, ``tool-scope-inventory-adjust``, ``tool-scope-inventory-reorder``) on both sides of the per-scope
@@ -31,14 +31,14 @@ AGENTS: dict[str, dict] = {
             "adjusting counts, and placing reorders."
         ),
         "inbound_scopes": {
-            "agent-scope-inventory-access": (
+            "agent-scope-stocker": (
                 "Scope granting use of the inventory agent's full inventory-operations "
                 "capability — checking stock levels, adjusting counts, and placing reorders."
             ),
         },
         "delegation_scopes": {},
         "roles": {
-            "agent-role-inventory-operations": (
+            "agent-role-stocker": (
                 "Covers all inventory operations against the inventory tool — checking stock "
                 "levels, adjusting counts, and placing reorders."
             ),
@@ -80,15 +80,15 @@ USER_ROLES: dict[str, str] = {
 # --- Role -> access facts (name-level; the single source of truth) --------------------------
 
 INBOUND_PAIRS: list[tuple[str, str]] = [
-    ("user-role-inventory-manager", "agent-scope-inventory-access"),
+    ("user-role-inventory-manager", "agent-scope-stocker"),
 ]
 
 # Wildcard phrase "all inventory operations" must expand to all three concrete scopes on both
 # sides of the per-scope AND gate.
 OUTBOUND_PAIRS: list[tuple[str, str]] = [
-    ("agent-role-inventory-operations", "tool-scope-inventory-check"),
-    ("agent-role-inventory-operations", "tool-scope-inventory-adjust"),
-    ("agent-role-inventory-operations", "tool-scope-inventory-reorder"),
+    ("agent-role-stocker", "tool-scope-inventory-check"),
+    ("agent-role-stocker", "tool-scope-inventory-adjust"),
+    ("agent-role-stocker", "tool-scope-inventory-reorder"),
 ]
 
 OUTBOUND_SUBJECT_PAIRS: list[tuple[str, str]] = [

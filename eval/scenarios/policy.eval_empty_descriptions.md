@@ -3,4 +3,4 @@
 Access is granted on a least-privilege basis: only what this document explicitly allows is
 permitted; anything not mentioned here is denied.
 
-Field operators may open and close irrigation valves.
+Field operators, the site's groundskeepers, may open and close irrigation valves.

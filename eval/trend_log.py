@@ -12,11 +12,17 @@ new suite's row simply carries new keys with no shared-header rewrite or backfil
 unlike CSV.
 
 ``append_row`` is the whole write-side API and is suite-agnostic — callers pass their own
-``suite`` name and metrics dict. ``pool_correctness_metrics`` is specific to the Correctness
-suites (``eval/conftest.py``'s ``_write_trend_log``, fed from ``test_prb_correctness``/
-``test_e2e_correctness``'s ``record_property`` calls) and is not meant to be reused as-is by the
-later Robustness/Consistency/Scale tickets — each of those will need its own pooling function for
-its own metric shape, written the same way, then handed to the same ``append_row``.
+``suite`` name and metrics dict. ``pool_correctness_metrics`` pools the ``true_positives``/
+``over_grants``/``under_grants``/``denied_total``/``incorrectly_denied`` shape ``score_scenario``
+(``eval/correctness_scorer.py``) produces into aggregate precision/recall/denial_precision — the
+two Correctness suites (``eval/conftest.py``'s ``_write_trend_log``, fed from
+``test_prb_correctness``/``test_e2e_correctness``) use it directly, and so does the Robustness
+suite's invariance/sensitivity families (``test_prb_invariant_to_mechanical_perturbation``/
+``test_prb_sensitive_to_mechanical_edit``, same ``score_scenario`` shape, pooled per family so
+precision/recall/denial_precision is directly comparable against the two Correctness charts —
+what varies is which family's own pass/fail rate ``_write_trend_log`` adds alongside it). A future
+Consistency/Scale ticket whose metric shape doesn't fit this one will need its own pooling
+function, written the same way, then handed to the same ``append_row``.
 """
 
 from __future__ import annotations

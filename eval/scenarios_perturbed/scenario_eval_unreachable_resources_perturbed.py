@@ -24,14 +24,14 @@ AGENTS: dict[str, dict] = {
             "appointments and reading and updating patient records."
         ),
         "inbound_scopes": {
-            "agent-scope-intake-access": (
+            "agent-scope-receptionist": (
                 "Lets a holder use the intake agent's patient-intake abilities — booking "
                 "appointments and reading and updating patient records."
             ),
         },
         "delegation_scopes": {},
         "roles": {
-            "agent-role-intake-operations": (
+            "agent-role-receptionist": (
                 "Covers both reading and writing patient records — looking at record contents and updating them."
             ),
         },
@@ -41,14 +41,14 @@ AGENTS: dict[str, dict] = {
             "An autonomous agent that handles patient billing and invoicing."
         ),
         "inbound_scopes": {
-            "agent-scope-billing-access": (
+            "agent-scope-biller": (
                 "Lets a holder use the billing agent's invoicing abilities — creating and reading "
                 "patient invoices."
             ),
         },
         "delegation_scopes": {},
         "roles": {
-            "agent-role-billing-operations": (
+            "agent-role-biller": (
                 "Covers both reading and writing patient invoices."
             ),
         },
@@ -101,12 +101,12 @@ USER_ROLES: dict[str, str] = {
 # Byte-identical to the original — reworded descriptions above don't change the truth table.
 
 INBOUND_PAIRS: list[tuple[str, str]] = [
-    ("user-role-front-desk-clerk", "agent-scope-intake-access"),
+    ("user-role-front-desk-clerk", "agent-scope-receptionist"),
 ]
 
 OUTBOUND_PAIRS: list[tuple[str, str]] = [
-    ("agent-role-intake-operations", "tool-scope-records-read"),
-    ("agent-role-intake-operations", "tool-scope-records-write"),
+    ("agent-role-receptionist", "tool-scope-records-read"),
+    ("agent-role-receptionist", "tool-scope-records-write"),
 ]
 
 OUTBOUND_SUBJECT_PAIRS: list[tuple[str, str]] = [

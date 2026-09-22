@@ -26,13 +26,13 @@ AGENTS: dict[str, dict] = {
             "around for internal testing."
         ),
         "inbound_scopes": {
-            "agent-scope-guest-access": (
+            "agent-scope-concierge": (
                 "Lets a holder use the guest-services agent's reservation and guest-notes lookup abilities."
             ),
         },
         "delegation_scopes": {},
         "roles": {
-            "agent-role-guest-operations": (
+            "agent-role-concierge": (
                 "Covers looking up reservation details and guest notes, plus calling the "
                 "diagnostic no-op hook."
             ),
@@ -70,7 +70,7 @@ USER_PASSWORD = "password"
 USER_ROLES: dict[str, str] = {
     "user-role-vip-manager": (
         "VIP Manager: looks up reservation details and guest notes via the guest-services "
-        "agent, and calls the diagnostic no-op hook."
+        "agent."
     ),
     "user-role-front-desk-staff": (
         "Front Desk Staff: looks up reservation details and guest notes via the guest-services agent."
@@ -82,20 +82,19 @@ USER_ROLES: dict[str, str] = {
 # Byte-identical to the original — reworded descriptions above don't change the truth table.
 
 INBOUND_PAIRS: list[tuple[str, str]] = [
-    ("user-role-vip-manager", "agent-scope-guest-access"),
-    ("user-role-front-desk-staff", "agent-scope-guest-access"),
+    ("user-role-vip-manager", "agent-scope-concierge"),
+    ("user-role-front-desk-staff", "agent-scope-concierge"),
 ]
 
 OUTBOUND_PAIRS: list[tuple[str, str]] = [
-    ("agent-role-guest-operations", "tool-scope-reservation-read"),
-    ("agent-role-guest-operations", "tool-scope-guest-notes-read"),
-    ("agent-role-guest-operations", "tool-scope-master-override"),
+    ("agent-role-concierge", "tool-scope-reservation-read"),
+    ("agent-role-concierge", "tool-scope-guest-notes-read"),
+    ("agent-role-concierge", "tool-scope-master-override"),
 ]
 
 OUTBOUND_SUBJECT_PAIRS: list[tuple[str, str]] = [
     ("user-role-vip-manager", "tool-scope-reservation-read"),
     ("user-role-vip-manager", "tool-scope-guest-notes-read"),
-    ("user-role-vip-manager", "tool-scope-master-override"),
     ("user-role-front-desk-staff", "tool-scope-reservation-read"),
     ("user-role-front-desk-staff", "tool-scope-guest-notes-read"),
 ]

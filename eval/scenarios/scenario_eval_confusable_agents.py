@@ -27,13 +27,11 @@ AGENTS: dict[str, dict] = {
     "team1/coach-agent": {
         "description": ("Autonomous Agent acting on a user's behalf to manage team rosters and practice schedules."),
         "inbound_scopes": {
-            "agent-scope-coaching-access": (
-                "Scope granting use of the coaching agent's roster and scheduling capability."
-            ),
+            "agent-scope-coach": ("Scope granting use of the coaching agent's roster and scheduling capability."),
         },
         "delegation_scopes": {},
         "roles": {
-            "agent-role-coaching-operations": "Covers reading team rosters and updating practice schedules.",
+            "agent-role-coach": "Covers reading team rosters and updating practice schedules.",
         },
     },
     "team1/coach-review-agent": {
@@ -42,13 +40,13 @@ AGENTS: dict[str, dict] = {
             "evaluations."
         ),
         "inbound_scopes": {
-            "agent-scope-review-access": (
+            "agent-scope-reviewer": (
                 "Scope granting use of the coach-review agent's performance-evaluation capability."
             ),
         },
         "delegation_scopes": {},
         "roles": {
-            "agent-role-review-operations": ("Covers reading and recording player performance evaluations."),
+            "agent-role-reviewer": ("Covers reading and recording player performance evaluations."),
         },
     },
 }
@@ -101,15 +99,15 @@ USER_ROLES: dict[str, str] = {
 # --- Role -> access facts (name-level; the single source of truth) --------------------------
 
 INBOUND_PAIRS: list[tuple[str, str]] = [
-    ("user-role-team-trainer", "agent-scope-coaching-access"),
-    ("user-role-performance-analyst", "agent-scope-review-access"),
+    ("user-role-team-trainer", "agent-scope-coach"),
+    ("user-role-performance-analyst", "agent-scope-reviewer"),
 ]
 
 OUTBOUND_PAIRS: list[tuple[str, str]] = [
-    ("agent-role-coaching-operations", "tool-scope-roster-read"),
-    ("agent-role-coaching-operations", "tool-scope-schedule-write"),
-    ("agent-role-review-operations", "tool-scope-evaluation-read"),
-    ("agent-role-review-operations", "tool-scope-evaluation-write"),
+    ("agent-role-coach", "tool-scope-roster-read"),
+    ("agent-role-coach", "tool-scope-schedule-write"),
+    ("agent-role-reviewer", "tool-scope-evaluation-read"),
+    ("agent-role-reviewer", "tool-scope-evaluation-write"),
 ]
 
 OUTBOUND_SUBJECT_PAIRS: list[tuple[str, str]] = [
