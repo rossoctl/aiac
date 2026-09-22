@@ -81,7 +81,7 @@ The accelerated typing mode used when a task has more to type than its **narrati
 clip** has time for — entered after the first three steps and marked on-screen so
 the speed change reads as deliberate. It never drops a step, and is suppressed for
 the duration of a **rejection hold**. Engaged only where `pace.py` finds that even
-the fastest legible typing would overrun the voice (2 of 21 tasks in the current
+the fastest legible typing would overrun the voice (3 of 21 tasks in the current
 cut), never as a blanket rule. See `adr/0001-uniform-replay-pacing.md`.
 _Avoid_: montage, skip (both imply omission; every step is shown).
 

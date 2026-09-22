@@ -4,10 +4,28 @@ _Scoped to the UC-1 demo film (`demo/tooling/`), not `aiac/` architecture. Vocab
 
 The UC-1 demo film replays a **capture** by typing each `cmd` and revealing each
 `output`. Step counts per task are wildly uneven (49, 33 and 27 in tasks 2, 5 and
-3 against 1–2 elsewhere), so pacing needs a rule. We chose **one** rule applied
-by step position in every task: the first three steps type at normal speed, the
-remainder type accelerated under an on-screen **fast-forward** marker. No step is
-ever dropped.
+3 against 1–2 elsewhere) and each task is narrated, so pacing needs a rule. No step
+is ever dropped.
+
+**Typing speed is solved for, not fixed.** The narration is the given: `pace.py`
+measures each task's clip, subtracts the fixed costs (per-step output reveals, any
+holds) and a two-second lead, and divides what remains by the task's command
+characters. That per-task speed is what the player types at, so the replay lands
+about two seconds before the voice finishes and the last output stays readable while
+the narration closes.
+
+Two fallbacks, when the fit does not land inside a readable band:
+
+- **Too little to type** — the task cannot fill the voice even at the slowest
+  readable speed, so it types at that speed and the frame holds. Mostly the
+  single-step tasks (8, 13, 16), where the terminal genuinely has nothing more to
+  show.
+- **Too much to type** — even the fastest legible speed would overrun, so the task
+  falls back to the original rule: the first three steps at normal speed, the
+  remainder accelerated under an on-screen **fast-forward** marker. With the
+  narrator's own pacing this fires on 3 of 21 tasks; with the shorter synthesised
+  narration it fired on 2. It was once the primary mechanism (see "How this rule
+  changed" below).
 
 The constraint that matters is **what a rule may key on**:
 
@@ -26,8 +44,35 @@ exception below); the principle above is what it was actually protecting.
 
 ## Status
 
-accepted; the "no special cases" phrasing amended 2026-09-15 after the Pass 1
-render (see "Exception: the rejection hold")
+accepted. Amended twice as the film was built: the "no special cases" phrasing on
+2026-09-15 (see "Exception: the rejection hold"), and the primary mechanism on
+2026-09-22, when fitted pacing replaced fixed speeds (see "How this rule changed").
+
+## How this rule changed
+
+The rule above is the second version. The first fixed typing speed as a constant and
+let the narration be whatever length it was, which produced the worst of both: a task
+would accelerate through its steps under a fast-forward marker and then sit on a
+finished screen waiting for the voice. Measured across the film it was **~190 seconds
+of dead screen**, over half the runtime, and fast-forward fired on **all 21 tasks**
+including 12 where a full-speed replay would have finished before the narration
+anyway.
+
+Inverting it — narration given, speed derived — cut idle time to ~54s and reduced
+fast-forward to 3 tasks. Two consequences worth stating:
+
+- **The fast-forward marker now means something.** It appears only where the replay
+  genuinely has more to show than the voice has time for, which is what the badge
+  always claimed.
+- **Pacing depends on measured audio**, so `pace.py` must run after anything that
+  changes a clip's duration. `mix_voice.py` and `narrate.py` both call it; editing a
+  duration by hand and skipping it leaves the player pacing to stale numbers.
+
+The two-second lead is a **target, not a guarantee**. Tasks 2, 3 and 15 have more
+steps than the voice has time for — task 2's 49 per-step reveals alone are ~25s
+against ~32s of narration — and land fractionally after the voice instead. Forcing
+the target would mean compressing the per-step gap until the steps stop reading as
+separate commands, so they are left as fast as is legible.
 
 ## Considered options
 
@@ -65,6 +110,11 @@ was unescaped (Pass 2), not because content-keyed rules are forbidden.
 - Long outputs are pretty-printed and fast-scrolled rather than truncated, so
   the **verbatim zone** stays complete: 195 of 203 outputs parse as JSON, 4 are
   Rego (passed through unformatted), 4 are bare `204` status lines.
+- Those four `204` steps render their **request body** instead of the status line —
+  up to 12 KB of computed policy that is otherwise invisible, since the substance of
+  such a call is what was sent, not what came back. Keyed on the response carrying no
+  substance (under 12 characters), never on a task number, so it follows the pattern
+  wherever it occurs.
 
 ## Exception: the rejection hold
 
