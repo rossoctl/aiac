@@ -18,6 +18,10 @@ test/integration/rego_out/
 eval/rego_out/
 eval/reports/
 
+# eval results dashboard (eval/dashboard.py, issue #2542) — regenerated per invocation from
+# eval/trend_log.jsonl (committed) + eval/reports/ (gitignored, above), not source of truth itself.
+eval/dashboard.html
+
 # uc1-onboarding demo's captured .rego snapshots — regenerated per run, not source of truth.
 demo/use-cases/uc1-onboarding/generated/
 

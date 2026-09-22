@@ -11,7 +11,9 @@ as an `HTTPException(502, ...)` whose message names the workload and the specifi
 missing/invalid label — actionable, never silent.
 """
 
-import logging
+import os
+import time
+from dataclasses import dataclass
 
 from fastapi import HTTPException
 
@@ -29,11 +31,120 @@ _TYPE_LABEL = "rossoctl.io/type"
 _MCP_LABEL = "protocol.rossoctl.io/mcp"
 
 
+<<<<<<< HEAD
 def _loggable(value: object) -> str:
     """Neutralize a value for single-line logging (drop CR/LF); see
     ``uc.onboarding.orchestrator._loggable``. Applied to any name sourced from Kubernetes
     labels/CRs or an MCP tool manifest — external input, not this process's own naming."""
     return str(value).replace("\r", "").replace("\n", "")
+=======
+@dataclass(frozen=True)
+class _WaitConfig:
+    """A bounded deploy->onboard race-tolerance poll. ``attempts_env``/``backoff_env`` name the
+    environment knobs (read at poll time, falling back to the defaults on an unset / non-numeric /
+    below-minimum value). Bundled so the two onboarding races below share one poll mechanic
+    (``_poll_until_ready``) instead of each repeating the read-env + range + backoff loop."""
+
+    attempts_env: str
+    backoff_env: str
+    default_attempts: int
+    default_backoff: float
+
+
+# Deploy->onboard race tolerance for the operator-applied ``rossoctl.io/type`` label. The onboarding
+# event is triggered by a DIFFERENT operator action (Keycloak client registration -> admin event), so
+# ``classify_service`` can run BEFORE the operator has patched the label onto the pod. A briefly-absent
+# label is therefore a transient not-ready state, re-polled before we give up with a 502. Defaults
+# ≈ 30s of slack (well under the NATS ACK_WAIT and the system-test convergence poll); tests set fast.
+_LABEL_WAIT = _WaitConfig("ONBOARD_LABEL_WAIT_ATTEMPTS", "ONBOARD_LABEL_WAIT_BACKOFF", 15, 2.0)
+
+# Deploy->onboard race tolerance for the AgentCard skill sync — a SECOND, later race than the label one
+# above. The operator syncs the fetched A2A card onto ``status.card.skills`` only AFTER the agent pod is
+# Ready, which lags the Keycloak-client registration that triggers onboarding. So ``analyze_agent`` can
+# run while ``status.card.skills`` is still empty. An absent card / empty skill list is therefore a
+# transient not-ready state, re-polled before we fall back to a default access scope. Same ≈30s slack.
+_CARD_WAIT = _WaitConfig("ONBOARD_CARD_WAIT_ATTEMPTS", "ONBOARD_CARD_WAIT_BACKOFF", 15, 2.0)
+
+
+def _env_num(name: str, default, cast, minimum):
+    """Read ``name`` from the environment, tolerant of an unset / non-numeric / below-``minimum``
+    value — a bad value must not crash onboarding, it falls back to the default."""
+    try:
+        value = cast(os.environ[name])
+    except (KeyError, TypeError, ValueError):
+        return default
+    return value if value >= minimum else default
+
+
+def _poll_until_ready(probe, cfg: _WaitConfig):
+    """Re-poll ``probe`` up to ``cfg`` attempts, backing off between looks (skipped after the last).
+    ``probe`` returns a non-``None`` 'ready' result to stop, or ``None`` to retry; it may raise to fail
+    the whole wait immediately (a real error, never a race). Returns the ready result, or ``None`` once
+    the attempt budget is exhausted — the caller then decides what an exhausted wait means."""
+    attempts = _env_num(cfg.attempts_env, cfg.default_attempts, int, minimum=1)
+    backoff = _env_num(cfg.backoff_env, cfg.default_backoff, float, minimum=0.0)
+    for attempt in range(attempts):
+        result = probe()
+        if result is not None:
+            return result
+        if attempt + 1 < attempts:
+            time.sleep(backoff)
+    return None
+>>>>>>> main
+
+
+@dataclass(frozen=True)
+class _WaitConfig:
+    """A bounded deploy->onboard race-tolerance poll. ``attempts_env``/``backoff_env`` name the
+    environment knobs (read at poll time, falling back to the defaults on an unset / non-numeric /
+    below-minimum value). Bundled so the two onboarding races below share one poll mechanic
+    (``_poll_until_ready``) instead of each repeating the read-env + range + backoff loop."""
+
+    attempts_env: str
+    backoff_env: str
+    default_attempts: int
+    default_backoff: float
+
+
+# Deploy->onboard race tolerance for the operator-applied ``rossoctl.io/type`` label. The onboarding
+# event is triggered by a DIFFERENT operator action (Keycloak client registration -> admin event), so
+# ``classify_service`` can run BEFORE the operator has patched the label onto the pod. A briefly-absent
+# label is therefore a transient not-ready state, re-polled before we give up with a 502. Defaults
+# ≈ 30s of slack (well under the NATS ACK_WAIT and the system-test convergence poll); tests set fast.
+_LABEL_WAIT = _WaitConfig("ONBOARD_LABEL_WAIT_ATTEMPTS", "ONBOARD_LABEL_WAIT_BACKOFF", 15, 2.0)
+
+# Deploy->onboard race tolerance for the AgentCard skill sync — a SECOND, later race than the label one
+# above. The operator syncs the fetched A2A card onto ``status.card.skills`` only AFTER the agent pod is
+# Ready, which lags the Keycloak-client registration that triggers onboarding. So ``analyze_agent`` can
+# run while ``status.card.skills`` is still empty. An absent card / empty skill list is therefore a
+# transient not-ready state, re-polled before we fall back to a default access scope. Same ≈30s slack.
+_CARD_WAIT = _WaitConfig("ONBOARD_CARD_WAIT_ATTEMPTS", "ONBOARD_CARD_WAIT_BACKOFF", 15, 2.0)
+
+
+def _env_num(name: str, default, cast, minimum):
+    """Read ``name`` from the environment, tolerant of an unset / non-numeric / below-``minimum``
+    value — a bad value must not crash onboarding, it falls back to the default."""
+    try:
+        value = cast(os.environ[name])
+    except (KeyError, TypeError, ValueError):
+        return default
+    return value if value >= minimum else default
+
+
+def _poll_until_ready(probe, cfg: _WaitConfig):
+    """Re-poll ``probe`` up to ``cfg`` attempts, backing off between looks (skipped after the last).
+    ``probe`` returns a non-``None`` 'ready' result to stop, or ``None`` to retry; it may raise to fail
+    the whole wait immediately (a real error, never a race). Returns the ready result, or ``None`` once
+    the attempt budget is exhausted — the caller then decides what an exhausted wait means."""
+    attempts = _env_num(cfg.attempts_env, cfg.default_attempts, int, minimum=1)
+    backoff = _env_num(cfg.backoff_env, cfg.default_backoff, float, minimum=0.0)
+    for attempt in range(attempts):
+        result = probe()
+        if result is not None:
+            return result
+        if attempt + 1 < attempts:
+            time.sleep(backoff)
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -112,26 +223,7 @@ def classify_service(state: OnboardingProvisionState) -> dict:
         )
     namespace, workload_name = name.split("/", 1)
 
-    try:
-        pods = list_pods(namespace)
-    except Exception as e:
-        raise HTTPException(502, f"Kubernetes pod LIST failed in namespace {namespace!r}: {e}")
-
-    pod = _select_pod(pods, workload_name)
-    if pod is None:
-        raise HTTPException(
-            502, f"no pod owned by workload {workload_name!r} in namespace {namespace!r}"
-        )
-
-    label = (getattr(pod.metadata, "labels", None) or {}).get(_TYPE_LABEL)
-    try:
-        service_type = ServiceType((label or "").capitalize())
-    except ValueError:
-        raise HTTPException(
-            502,
-            f"workload {workload_name!r}: {_TYPE_LABEL} label missing or invalid "
-            f"(got {label!r}, expected 'agent' or 'tool')",
-        )
+    service_type = _await_service_type(namespace, workload_name)
 
     logger.info(
         "classify_service: service_id=%s -> namespace=%s workload=%s type=%s",
@@ -145,23 +237,63 @@ def classify_service(state: OnboardingProvisionState) -> dict:
     }
 
 
-def analyze_agent(state: OnboardingProvisionState) -> dict:
-    """Derive an agent's roles + scopes from its AgentCard CR (non-LLM).
+def _await_service_type(namespace: str, workload_name: str) -> ServiceType:
+    """Resolve the service type from the operator's ``rossoctl.io/type`` pod label, tolerating the
+    deploy->onboard RACE (the label may not be patched yet — see the module knobs above).
 
-    The operator fetches the agent's A2A card and syncs it onto the CR's ``status.card``; each skill
-    there carries a machine ``id`` (a stable identifier, e.g. ``source_operations``) plus a display
-    ``name`` (which may contain spaces). Scope names are built from the skill ``id`` so they are
-    usable Keycloak scope names, and each skill also gets a **per-skill operator role** mirroring the
-    scope (same name + description): the role's description is what the PRB capability-match reads to
-    confine and grant the agent's outbound access on a domain basis. Falls back to a default access
-    scope + a default operator role when there is no AgentCard CR (legacy deployments) or the CR has
-    no synced skills yet."""
-    namespace, workload = state.namespace, state.workload_name
+    A briefly-absent label — or a not-yet-created pod — is a transient not-ready state, re-polled
+    a bounded number of times. A label present with an INVALID value (not ``agent``/``tool``) is a
+    real misconfiguration that no wait can fix, so it fails immediately. Retries exhausted -> 502
+    naming the workload and the label (unchanged contract for a genuinely never-labelled workload)."""
+    no_pod_detail = f"no pod owned by workload {workload_name!r} in namespace {namespace!r}"
+    detail = no_pod_detail
 
-    try:
-        resp = list_agentcards(namespace)
-    except Exception as e:
-        raise HTTPException(502, f"Kubernetes AgentCard LIST failed in namespace {namespace!r}: {e}")
+    def _probe():
+        nonlocal detail
+        # Re-derive per attempt so the exhausted-wait 502 reflects the LAST-seen state: a pod that
+        # disappears mid-poll must report "no pod", not a stale "label missing" from an earlier attempt.
+        detail = no_pod_detail
+        try:
+            pods = list_pods(namespace)
+        except Exception as e:
+            raise HTTPException(502, f"Kubernetes pod LIST failed in namespace {namespace!r}: {e}")
+
+        pod = _select_pod(pods, workload_name)
+        if pod is not None:
+            label = (getattr(pod.metadata, "labels", None) or {}).get(_TYPE_LABEL)
+            if label:
+                try:
+                    return ServiceType(label.capitalize())
+                except ValueError:
+                    # Present but not agent/tool: a real misconfiguration, never a race — fail now.
+                    raise HTTPException(
+                        502,
+                        f"workload {workload_name!r}: {_TYPE_LABEL} label invalid "
+                        f"(got {label!r}, expected 'agent' or 'tool')",
+                    )
+            detail = (
+                f"workload {workload_name!r}: {_TYPE_LABEL} label missing or invalid "
+                f"(got {label!r}, expected 'agent' or 'tool')"
+            )
+        return None
+
+    service_type = _poll_until_ready(_probe, _LABEL_WAIT)
+    if service_type is None:
+        raise HTTPException(502, detail)
+    return service_type
+
+
+def _await_agent_skills(namespace: str, workload: str):
+    """Resolve an agent's AgentCard + its synced skills, tolerating the deploy->onboard RACE on the
+    card sync (see the module knobs above).
+
+    The operator syncs the fetched A2A card onto ``status.card.skills`` only AFTER the agent pod is
+    Ready — a DIFFERENT, later operator action than the Keycloak-client registration that triggers
+    onboarding. So this node can run before the skills are synced. An absent card, or a card whose
+    ``status.card.skills`` is still empty, is therefore a transient not-ready state, re-polled a
+    bounded number of times. Returns ``(card, skills)`` as soon as skills are present, or the
+    last-seen ``(card, [])`` once the attempt budget is exhausted — the caller then applies the
+    legacy card-less / skill-less fallback (a genuinely card-less workload never converges here)."""
 
     # Link the card to the workload by its ``spec.targetRef`` (the Deployment it describes), since the
     # operator names the CR after the Deployment (e.g. ``<workload>-deployment-card``), not the
@@ -170,8 +302,40 @@ def analyze_agent(state: OnboardingProvisionState) -> dict:
         target = ((c.get("spec") or {}).get("targetRef") or {}).get("name")
         return target == workload or (c.get("metadata") or {}).get("name") == workload
 
-    card = next((c for c in resp.get("items", []) if _targets_workload(c)), None)
-    skills = (((card or {}).get("status") or {}).get("card") or {}).get("skills", [])
+    last_card = None
+
+    def _probe():
+        nonlocal last_card
+        try:
+            resp = list_agentcards(namespace)
+        except Exception as e:
+            raise HTTPException(502, f"Kubernetes AgentCard LIST failed in namespace {namespace!r}: {e}")
+
+        last_card = next((c for c in resp.get("items", []) if _targets_workload(c)), None)
+        skills = (((last_card or {}).get("status") or {}).get("card") or {}).get("skills", [])
+        return (last_card, skills) if skills else None
+
+    result = _poll_until_ready(_probe, _CARD_WAIT)
+    return result if result is not None else (last_card, [])
+
+
+def analyze_agent(state: OnboardingProvisionState) -> dict:
+    """Derive an agent's roles + scopes from its AgentCard CR (non-LLM).
+
+    The operator fetches the agent's A2A card and syncs it onto the CR's ``status.card``; each skill
+    there carries a machine ``id`` (a stable identifier, e.g. ``source_operations``) plus a display
+    ``name`` (which may contain spaces). Scope names are built from the skill ``id`` so they are
+    usable Keycloak scope names, and each skill also gets a **per-skill operator role** mirroring the
+    scope (same name + description): the role's description is what the PRB capability-match reads to
+    confine and grant the agent's outbound access on a domain basis.
+
+    Because the operator syncs the card only after the agent pod is Ready — later than the event that
+    triggers onboarding — the skills are awaited with a bounded retry (``_await_agent_skills``). Falls
+    back to a default access scope + a default operator role only once that wait is exhausted: for a
+    genuinely card-less legacy deployment, or a CR whose skills never sync."""
+    namespace, workload = state.namespace, state.workload_name
+
+    card, skills = _await_agent_skills(namespace, workload)
     if not skills:
         provision = ServiceProvision(
             roles=[RoleDefinition(name=f"{workload}.access", description="Default access scope")],

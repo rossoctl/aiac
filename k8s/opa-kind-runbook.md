@@ -4,8 +4,8 @@
 > to its release as part of the Rossoctl system. On release, this document
 > should be updated accordingly.
 
-This is the AIAC-scoped companion to
-[`authbridge/docs/opa-kind-runbook.md`](../../authbridge/docs/opa-kind-runbook.md).
+This is the AIAC-scoped companion to `authbridge/docs/opa-kind-runbook.md` (in
+the separate AuthBridge repository).
 The underlying mechanism — OPA as an AuthBridge pipeline plugin, policy
 distributed via `bundle-service`, enforcement via the `AuthorizationPolicy`
 CRD — is identical. This document gives the **exact, copy-paste** steps to run
@@ -24,7 +24,7 @@ its downstream tool (`github-tool`):
 
 - **`dev-user` is the allowed user, `alice` is the blocked user.** `dev-user`
   is the canonical scenario username from
-  [`docs/specs/integration-test/policy-pipeline.md`](../docs/specs/integration-test/policy-pipeline.md).
+  [`docs/testing/policy-pipeline.md`](../docs/testing/policy-pipeline.md).
 - **Inbound** authorization is enforced by a **client-scoped**
   `AuthorizationPolicy` targeting `github-agent` alone.
 - **Outbound** shows the token-exchange → OPA leg: the agent's call to
@@ -101,6 +101,35 @@ read the delegation chain (see [Part B](#part-b--outbound-token-exchange--opa)).
   ```
 
   Verify with A.1 below — a good token decodes to `sub = dev-user`.
+
+### Event-driven onboarding path (required by the UC-1 system suite)
+
+The manual probes in Parts A/B assume `github-agent` + `github-tool` are already deployed. The UC-1
+onboarding **system tests** (`test/system/`, `-m system`) instead drive onboarding through the
+**event-driven** path and deploy/undeploy the workloads themselves — deploying a workload is the
+trigger (deploy → the rossoctl operator registers a Keycloak client → Keycloak emits
+`CLIENT_CREATED` → the AIAC SPI `aiac-event-listener` publishes on NATS → the agent's consumer runs
+`onboard_service`). That path needs three additional one-time platform facts, on top of the OPA
+wiring above:
+
+- **NATS event broker** running in `aiac-system` — deploy
+  [`event-broker-deployment.yaml`](event-broker-deployment.yaml) (pod labelled
+  `app=aiac-event-broker`, phase `Running`).
+- **Keycloak SPI installed + the realm listener enabled**: `aiac-event-listener` present in the
+  realm's `eventsListeners`, and `adminEventsEnabled: true` (`CLIENT_CREATED` is an *admin* event).
+  See [`keycloak-spi/README.md`](../keycloak-spi/README.md).
+- **Both demo images built + `kind load`ed** — `localhost/github-tool:latest` and
+  `localhost/github-agent:latest`, produced by [`demo/assets/kind-load.sh`](../demo/assets/kind-load.sh).
+  The suite deploys the manifests itself (it does **not** call `deploy.sh`), so the images must
+  already be in the Kind node.
+
+Failure modes are deliberately asymmetric, so the suite never false-passes:
+
+- **Broker or SPI listener absent → the suite skips cleanly** (`require_event_path` detects it and
+  `pytest.skip`s). The harness never stands the broker/SPI up — that is one-time platform setup.
+- **Images absent → the suite fails loudly.** There is no cheap pre-check; the fixture `kubectl
+  apply`s and waits, so a missing image makes the pod never go Ready (`ImagePullBackOff`) and the
+  deploy/registration wait times out into a hard failure — never a skip, never a pass.
 
 All commands below are run from the repo root.
 

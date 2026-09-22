@@ -1,23 +1,22 @@
 """Per-run pass/fail/skip report for the policy-eval-scenarios, policy-eval-robustness,
 policy-eval-consistency, policy-eval-correctness-prb, and policy-eval-correctness-e2e suites
-(spec: ``docs/specs/eval/policy-eval-scenarios.md``, ``docs/specs/eval/
-policy-eval-robustness-consistency.md``, ``docs/specs/eval/policy-eval-correctness-prb.md``, and
-``docs/specs/eval/policy-eval-correctness-e2e.md``).
+(spec: ``docs/evaluation/policy-eval-scenarios.md``, ``docs/evaluation/
+policy-eval-robustness-consistency.md``, ``docs/evaluation/policy-eval-correctness-prb.md``, and
+``docs/evaluation/policy-eval-correctness-e2e.md``).
 
-Every run of ``test_policy_pipeline_eval.py`` (``@pytest.mark.eval_extended``),
-``test_policy_pipeline_consistency.py`` (``@pytest.mark.eval_consistency``),
-``test_policy_pipeline_robustness.py`` (``@pytest.mark.eval_robustness``),
-``test_policy_pipeline_correctness_prb.py`` (``@pytest.mark.eval_correctness_prb``), or
-``test_policy_pipeline_correctness_e2e.py`` (``@pytest.mark.eval_correctness_e2e``) writes a
-Markdown report to ``reports/`` listing every collected test's outcome — passed, failed, skipped,
-xfailed, xpassed, or a setup/collection error. All six sections are always present (even empty) so
-a reader can see at a glance that nothing was silently omitted. Failed/error entries carry the
-assertion's crash message (pytest's own computed diff, e.g. "assert True == False" or a custom
-mismatch message with expected/actual sets); skipped/xfailed entries carry the skip reason; every
-entry carries the test function's docstring so a reader doesn't have to open the source file to
-know what was actually being checked. The report is scoped to these five markers (not just "any
-test collected while this conftest happens to be loaded"), so running the whole repo's test suite
-from a parent directory does not pull unrelated tests into this suite's report.
+Every run of ``test_policy_pipeline_eval.py``, ``test_policy_pipeline_consistency.py``,
+``test_policy_pipeline_robustness.py``, ``test_policy_pipeline_correctness_prb.py``, or
+``test_policy_pipeline_correctness_e2e.py`` — all now carrying the single flat
+``@pytest.mark.eval`` marker (opt in with ``-m eval``) — writes a Markdown report to ``reports/``
+listing every collected test's outcome — passed, failed, skipped, xfailed, xpassed, or a
+setup/collection error. All six sections are always present (even empty) so a reader can see at a
+glance that nothing was silently omitted. Failed/error entries carry the assertion's crash message
+(pytest's own computed diff, e.g. "assert True == False" or a custom mismatch message with
+expected/actual sets); skipped/xfailed entries carry the skip reason; every entry carries the test
+function's docstring so a reader doesn't have to open the source file to know what was actually
+being checked. The report is scoped to the ``eval`` marker (not just "any test collected while this
+conftest happens to be loaded"), so running the whole repo's test suite from a parent directory
+does not pull unrelated tests into this suite's report.
 
 Filename: ``reports/report_<DD_MM_HH_MM_SS>.md``, timestamped in UTC (override via
 ``EVAL_REPORT_TZ``, e.g. ``Asia/Jerusalem``), e.g. ``report_04_08_16_37_22.md`` for 04 Aug at
@@ -36,15 +35,22 @@ over-grants/under-grants/incorrectly-denied pair breakdown per scenario -- rende
 metrics + detail block, always (pass or fail), since the tracked-but-non-gating under-grant/denial
 detail is otherwise invisible on a passing run. The render branch dispatches generically on the
 presence of ``precision``/``recall`` properties, so it covers both suites with no per-suite
-special-casing.
+special-casing. All three ``test_policy_pipeline_robustness.py`` test functions (invariant-
+mechanical, invariant-semantic, sensitive-mechanical) record the same six fields too, via their own
+``_record_scoring`` helper -- so they hit this exact branch and get the same metrics block, plus
+(robustness only) a leading ``perturbation``/``expected_grants``/``actual_grants`` trio naming what
+actually changed and what was expected/returned, since "did the grant set change" alone doesn't
+say what changed it or how.
 
-A scenario whose own *setup* fails (a Keycloak/PRB/PCE error before ``score_scenario`` ever runs --
-these two suites isolate a failing scenario's setup per-scenario, so this is common, not
-exceptional) never gets those properties recorded at all. Such an entry still gets the crash detail
-*and* the same six-field metrics block, values marked ``unavailable`` with why -- identified by
-nodeid (``::test_prb_correctness[``/``::test_e2e_correctness[``, see ``_CORRECTNESS_TEST_MARKERS``)
-since there are no properties to dispatch on -- rather than silently falling back to the generic
-docstring + crash-message rendering every other test in this suite gets.
+A scenario whose own *setup* fails (a Keycloak/PRB/PCE error, or an uncaught
+``PolicyContradictionError``/``PolicyRulesBuilderError`` from a non-best-effort robustness call,
+before ``score_scenario``/``_record_scoring`` ever ran) never gets those properties recorded at
+all. Such an entry still gets the crash detail *and* the same six-field metrics block, values
+marked ``unavailable`` with why -- identified by nodeid (``::test_prb_correctness[``/
+``::test_e2e_correctness[``/the three robustness test functions, see ``_CORRECTNESS_TEST_MARKERS``/
+``_ROBUSTNESS_SCORED_TEST_MARKERS``) since there are no properties to dispatch on -- rather than
+silently falling back to the generic docstring + crash-message rendering every other test in this
+suite gets.
 
 Both suites also ``record_property("best_effort_notes", ...)`` -- a ``{scope_or_role_name:
 reason}`` dict naming every decision that fell back to a never-approved PRB proposal instead of
@@ -52,6 +58,31 @@ aborting the scenario (``eval.test_policy_pipeline_eval.orchestrate_prb``'s ``be
 by explicit user request so a scenario the auditor partly rejects still scores). When non-empty,
 ``_render_metrics_block`` appends one more field listing them, with an explicit caveat that those
 pairs don't represent real production behavior.
+
+Both suites also ``record_property`` two raw counts alongside the floats above —
+``true_positives`` and ``denied_total`` — not rendered in the Markdown report (the floats and pair
+breakdowns already cover a human reader) but read back here by ``_write_trend_log`` to pool a
+run's precision/recall/denial_precision into one committed, append-only trend-log row per suite
+(``eval/trend_log.py``, spec: ``docs/evaluation/eval-framework.md`` §9) — pooled by summed count
+across every scenario that reached ``score_scenario`` in the run, not averaged per-scenario, so a
+run with an uneven pair count per scenario isn't skewed by weighting every scenario equally. A
+scenario whose own setup failed never recorded these, so it contributes nothing to the pooled row
+(consistent with ``_CORRECTNESS_TEST_MARKERS``'s existing setup-failure handling above).
+
+``test_prb_invariant_to_mechanical_perturbation`` and ``test_prb_sensitive_to_mechanical_edit``
+(``test_policy_pipeline_robustness.py``, spec §4) similarly each ``record_property`` a boolean
+(``"invariant"``/``"sensitive"``) plus the same ``true_positives``/``denied_total`` raw counts the
+two Correctness suites record -- pooled here by nodeid substring (``_ROBUSTNESS_TEST_MARKERS``,
+mirroring ``_CORRECTNESS_TEST_MARKERS``'s pattern, since the single flat ``eval`` marker spans
+three test functions across two families/tiers that must stay unblended) into its *own* committed
+trend-log row per family -- ``suite="robustness_mechanical_invariance"``/
+``suite="robustness_mechanical_sensitivity"`` -- each carrying that family's own
+precision/recall/denial_precision (``eval/trend_log.py``'s ``pool_correctness_metrics``, the same
+pooling the two Correctness suites use, so the resulting chart is directly comparable to theirs:
+one measuring performance against the *original* inputs, the other against *deliberately edited*
+inputs) plus that family's own pass/fail rate (``invariance_rate``/``sensitivity_rate``). The third
+test in that module, ``test_prb_invariant_to_semantic_perturbation``, is deliberately excluded from
+this wiring -- semantic-tier trend-log wiring is tracked separately as #2467.
 """
 
 from __future__ import annotations
@@ -59,21 +90,17 @@ from __future__ import annotations
 import os
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import pytest
 from dotenv import load_dotenv
 
+from eval.trend_log import append_row, pool_correctness_metrics
+
 HERE = Path(__file__).resolve().parent
 REPORTS_DIR = HERE / "reports"
 REPORT_TZ = ZoneInfo(os.environ.get("EVAL_REPORT_TZ", "UTC"))
-MARKERS = {
-    "eval_extended",
-    "eval_consistency",
-    "eval_robustness",
-    "eval_correctness_prb",
-    "eval_correctness_e2e",
-}
 
 # Auto-load the repo-root .env so LLM_BASE_URL/KEYCLOAK_URL/etc. are set without having to
 # `set -a; . .env; set +a` before invoking pytest. Existing environment
@@ -83,10 +110,37 @@ load_dotenv(HERE.parent / ".env", override=False)
 _docstrings: dict[str, str] = {}
 _reports: dict[str, pytest.TestReport] = {}
 
+# Every suite that carries `pytestmark = pytest.mark.eval` lives directly under `eval/` as a
+# `test_policy_pipeline_*.py` module (the scenarios/consistency/robustness/correctness-prb/
+# correctness-e2e/faithfulness suites) -- a plain nodeid-path check for that filename pattern is
+# used instead of an actual marker/collection-based check, for two reasons neither of which is
+# fixable by switching *which* collection-time hook populates a cache:
+#   1. `"eval" in report.keywords` is **always** true for every item under `eval/`, marked or not
+#      -- pytest injects the enclosing package name as a keyword, and the package here is literally
+#      named `eval` -- so it would wrongly scoop the pure-unit helpers (test_dashboard.py,
+#      test_trend_log.py, ...) into this report on a bare offline `pytest`.
+#   2. The actually-correct check, `item.iter_markers()`, needs a live collected `Item`, which only
+#      exists during collection. Under `pytest-xdist` (`-n`), the **controller** process never runs
+#      collection at all -- confirmed empirically that neither `pytest_collection_modifyitems` nor
+#      `pytest_itemcollected` fires there, only forwarded `pytest_runtest_logreport` calls do -- so
+#      any collection-time-populated set (nodeids or markers) is silently empty on the controller,
+#      and every forwarded report gets discarded by that gate: no report, no trend-log row, and no
+#      error either. This is exactly the failure mode `-n 8` (this suite's documented, recommended
+#      invocation) hit in practice. A nodeid-path check needs no collection-time state at all, so it
+#      works identically in the controller, in every worker, and in a plain non-xdist run.
+_EVAL_SUITE_PATH_PREFIX = "eval/test_policy_pipeline_"
+
+
+def _is_eval_suite_nodeid(nodeid: str) -> bool:
+    return nodeid.split("::", 1)[0].startswith(_EVAL_SUITE_PATH_PREFIX)
+
 
 def pytest_collection_modifyitems(session: pytest.Session, config: pytest.Config, items: list) -> None:
+    # `_docstrings` is best-effort under `-n`: this hook does run in every worker (each does its own
+    # full collection), just never in the controller -- so a controller-authored report's "What it
+    # tests" fallback can come up empty there even though the gate above no longer depends on it.
     for item in items:
-        if not (MARKERS & set(item.keywords)):
+        if not _is_eval_suite_nodeid(item.nodeid):
             continue
         func = getattr(item, "obj", None)
         doc = (getattr(func, "__doc__", None) or "").strip()
@@ -98,7 +152,7 @@ def pytest_collection_modifyitems(session: pytest.Session, config: pytest.Config
 def pytest_runtest_logreport(report: pytest.TestReport) -> None:
     if report.when == "teardown" and report.outcome == "passed":
         return
-    if not (MARKERS & set(report.keywords)):
+    if not _is_eval_suite_nodeid(report.nodeid):
         return
     # A later phase (call) supersedes an earlier one (setup) for the same nodeid; a setup or
     # teardown failure has no later phase to supersede it.
@@ -171,6 +225,61 @@ def _format_pairs_dict(pairs_by_gate: dict) -> str:
 # generic branch and render its actual skip reason instead of a misleading "setup failed".
 _CORRECTNESS_TEST_MARKERS = ("::test_prb_correctness[", "::test_e2e_correctness[")
 
+# Nodeid substrings for all three robustness test functions (mirrors _CORRECTNESS_TEST_MARKERS
+# above, same purpose) -- every one of them, not just the two that feed the trend log
+# (_ROBUSTNESS_TEST_MARKERS below), records precision/recall/etc. via _record_scoring for the
+# report, so a scenario whose setup fails before that call ever runs gets the same
+# "unavailable, here's why" six-field shape instead of silently falling back to the generic
+# docstring + crash-message rendering.
+_ROBUSTNESS_SCORED_TEST_MARKERS = (
+    "::test_prb_invariant_to_mechanical_perturbation[",
+    "::test_prb_invariant_to_semantic_perturbation[",
+    "::test_prb_sensitive_to_mechanical_edit[",
+)
+
+# Nodeid substring -> trend-log suite name (eval/trend_log.py). With the five former ``eval_*``
+# markers collapsed to one flat ``eval`` marker, every suite under `eval/` is disambiguated by its
+# own test function's nodeid rather than by marker — the same ``::test_prb_correctness[``/
+# ``::test_e2e_correctness[`` substrings ``_CORRECTNESS_TEST_MARKERS`` already uses. Deliberately
+# scoped to the two Correctness suites for now — the Consistency/Scale suite tickets (#2468-#2470)
+# add their own entries here when they land, reusing the same _write_trend_log/append_row mechanism
+# rather than building a parallel one. Robustness (#2466) is wired separately below
+# (_ROBUSTNESS_TEST_MARKERS) since its three test functions span two families/tiers that must stay
+# unblended (spec §4) — a single nodeid -> suite entry here would conflate them.
+_TREND_LOG_SUITES = {
+    "::test_prb_correctness[": "correctness_prb",
+    "::test_e2e_correctness[": "correctness_e2e",
+}
+
+# Nodeid substring -> (boolean property name, this family's own trend-log suite, its pass/fail
+# rate's metric key), mirroring _CORRECTNESS_TEST_MARKERS above. Each family gets its own suite
+# (rather than one shared "robustness_mechanical" bucket) so its pooled precision/recall/
+# denial_precision (from the same true_positives/denied_total counts the two Correctness suites
+# record, see _record_scoring) sits on its own chart, directly comparable in shape to a Correctness
+# chart -- one measuring the PRB against the *original* inputs, the other against *deliberately
+# edited* inputs. Only the mechanical-tier invariance/sensitivity tests feed the trend log — the
+# semantic-tier invariance test (test_prb_invariant_to_semantic_perturbation) is out of scope for
+# #2466 (tracked as #2467) and deliberately excluded here, per that test's own docstring.
+_ROBUSTNESS_TEST_MARKERS = {
+    "::test_prb_invariant_to_mechanical_perturbation[": (
+        "invariant",
+        "robustness_mechanical_invariance",
+        "invariance_rate",
+    ),
+    "::test_prb_sensitive_to_mechanical_edit[": (
+        "sensitive",
+        "robustness_mechanical_sensitivity",
+        "sensitivity_rate",
+    ),
+}
+
+# Full Correctness corpus size (eval.test_policy_pipeline_eval.SCENARIOS) -- kept as a plain
+# constant rather than imported, so this module (loaded for every eval/ run, marked or not) stays
+# free of that file's heavy Keycloak/launcher imports. A run that scores fewer scenarios than this
+# (a `-k` filter, or most scenarios erroring in setup) is not comparable to a full-corpus run, so
+# it's tagged "partial" rather than "regression" -- see _write_trend_log. Bump if the corpus grows.
+_EXPECTED_SCENARIO_COUNT = 8
+
 
 def _format_best_effort_notes(notes: dict[str, str]) -> str:
     """Render a ``{scope_or_role_name: reason}`` dict (``orchestrate_prb``'s ``best_effort_notes``)
@@ -182,14 +291,20 @@ def _format_best_effort_notes(notes: dict[str, str]) -> str:
 
 def _render_metrics_block(lines: list[str], props: dict, *, unavailable_reason: str | None = None) -> None:
     """Render the precision/recall/denial-precision + over-/under-grant/incorrect-denial breakdown
-    ``test_prb_correctness``/``test_e2e_correctness`` record. When ``unavailable_reason`` is given
-    (the scenario's own setup failed before scoring could run, so ``props`` has none of this),
-    render the same six fields with a uniform placeholder instead — so a reader always sees the
-    same shape, pass or fail, setup-failed or scored."""
+    ``test_prb_correctness``/``test_e2e_correctness`` record, and (the robustness suite only)
+    ``_record_scoring``'s ``perturbation``/``expected_grants``/``actual_grants`` fields first, when
+    present, so a reader sees what changed and what was expected/returned before the numbers.
+    When ``unavailable_reason`` is given (the scenario's own setup failed before scoring could run,
+    so ``props`` has none of this), render the same six metrics fields with a uniform placeholder
+    instead — so a reader always sees the same shape, pass or fail, setup-failed or scored."""
     if unavailable_reason is not None:
         for label in ("Precision", "Recall", "Denial precision", "Over-grants", "Under-grants", "Incorrectly denied"):
             lines.append(f"- **{label}:** unavailable — {unavailable_reason}")
         return
+    if "perturbation" in props:
+        _render_field(lines, "Perturbation", str(props["perturbation"]))
+        _render_field(lines, "Expected grants", _format_pairs_dict(props.get("expected_grants", {})))
+        _render_field(lines, "Actual grants", _format_pairs_dict(props.get("actual_grants", {})))
     lines.append(f"- **Precision:** {props['precision']:.3f}")
     lines.append(f"- **Recall:** {props['recall']:.3f}")
     lines.append(f"- **Denial precision:** {props['denial_precision']:.3f}")
@@ -226,7 +341,9 @@ def _render_entry(lines: list[str], nodeid: str, report: pytest.TestReport, cate
         if description:
             lines.append(f"- **What it tests:** {description}")
         _render_metrics_block(lines, props)
-    elif category in ("failed", "error") and any(marker in nodeid for marker in _CORRECTNESS_TEST_MARKERS):
+    elif category in ("failed", "error") and any(
+        marker in nodeid for marker in _CORRECTNESS_TEST_MARKERS + _ROBUSTNESS_SCORED_TEST_MARKERS
+    ):
         doc = _docstrings.get(nodeid)
         if doc:
             lines.append(f"- **What it tests:** {doc}")
@@ -245,7 +362,66 @@ def _render_entry(lines: list[str], nodeid: str, report: pytest.TestReport, cate
     lines.append("")
 
 
+def _write_trend_log() -> None:
+    """One committed trend-log row per Correctness suite present in this session (PRB-level
+    and/or end-to-end), plus one per Robustness family (invariance/sensitivity) — spec:
+    docs/evaluation/eval-framework.md §9. Pools every scenario's true_positives/denied_total counts
+    (and over_grants/under_grants/incorrectly_denied pair dicts) that reached score_scenario — a
+    scenario whose own setup failed never recorded these, so it contributes nothing to the pooled
+    row, same as _render_metrics_block's unavailable_reason branch above treats it as absent
+    rather than zero.
+
+    Each Robustness family gets its own row/suite (``robustness_mechanical_invariance``/
+    ``robustness_mechanical_sensitivity``), pooled by ``pool_correctness_metrics`` exactly like the
+    two Correctness suites — so its precision/recall/denial_precision is directly comparable to
+    theirs — plus that family's own pass/fail rate (``invariance_rate``/``sensitivity_rate``).
+    Because each family is now its own row, a ``-k``-filtered run (e.g. ``-k sensitive``) simply
+    produces no row at all for the family it never ran, rather than a shared row mislabeling one
+    family's count against the other's.
+
+    Always stamped in UTC, independent of ``EVAL_REPORT_TZ`` (that variable only controls the
+    gitignored per-run Markdown report's timestamp/filename) — a committed file read by every
+    contributor and by downstream trend analysis must not carry a per-contributor UTC offset."""
+    by_suite: dict[str, list[dict]] = {}
+    robustness_flags: dict[str, list[bool]] = {}
+    robustness_entries: dict[str, list[dict]] = {}
+    for nodeid, report in _reports.items():
+        for nodeid_marker, suite in _TREND_LOG_SUITES.items():
+            if nodeid_marker in report.nodeid:
+                props = dict(report.user_properties)
+                if "true_positives" in props:
+                    by_suite.setdefault(suite, []).append(props)
+                break
+        for substring, (prop_name, robustness_suite, _rate_key) in _ROBUSTNESS_TEST_MARKERS.items():
+            if substring in nodeid:
+                props = dict(report.user_properties)
+                if prop_name in props:
+                    robustness_flags.setdefault(robustness_suite, []).append(bool(props[prop_name]))
+                    if "true_positives" in props:
+                        robustness_entries.setdefault(robustness_suite, []).append(props)
+                break
+
+    for suite, entries in by_suite.items():
+        if entries:
+            run_type = "regression" if len(entries) == _EXPECTED_SCENARIO_COUNT else "partial"
+            append_row(suite, pool_correctness_metrics(entries), run_type=run_type)
+
+    for _substring, (_prop_name, robustness_suite, rate_key) in _ROBUSTNESS_TEST_MARKERS.items():
+        flags = robustness_flags.get(robustness_suite, [])
+        if not flags:
+            continue
+        entries = robustness_entries.get(robustness_suite, [])
+        metrics: dict[str, Any] = pool_correctness_metrics(entries) if entries else {"scenarios_scored": 0}
+        metrics[rate_key] = sum(flags) / len(flags)
+        run_type = "regression" if len(flags) == _EXPECTED_SCENARIO_COUNT else "partial"
+        append_row(robustness_suite, metrics, run_type=run_type)
+
+
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    if hasattr(session.config, "workerinput"):
+        return  # xdist worker -- only the controller (which receives every worker's reports via
+        # pytest_runtest_logreport) has the full-session picture; each worker would otherwise
+        # write its own partial trend-log row and Markdown report on top of the controller's.
     if not _reports:
         return  # this session collected none of this suite's tests -- nothing to report
 
@@ -257,6 +433,7 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
         buckets[cat].sort(key=lambda pair: pair[0])
 
     now = datetime.now(REPORT_TZ)
+    _write_trend_log()
     total = len(_reports)
     lines = [
         "# policy-eval-scenarios test report",

@@ -31,13 +31,34 @@ _GENERIC_POLICY = (Path(__file__).parent / "generic_policy.md").read_text(encodi
 def _policy_block(policy_text: str) -> str:
     """Compose the POLICY block in three labeled layers: the least-privilege directive, then the
     generic baseline (explicitly grants-only — never a source of denials), then the scenario policy.
-    The labels let the deny/exclusivity rules bind to the SCENARIO layer only."""
+    The labels keep the grants-only baseline distinct from the scenario policy, so no deny is ever
+    drawn from the baseline."""
     return (
         f"{_GRANT_ACCESS}\n\n"
         f"BASELINE POLICY (grants only — never a source of denials):\n{_GENERIC_POLICY}\n\n"
         f"SCENARIO POLICY:\n{policy_text}"
     )
 
+
+# Digest-aware framing, prepended to BOTH system messages. The policy the PRB now reads is a
+# DIGESTED policy (see docs/specs/digested-policy.md): its statement kinds tell the model how to
+# read each part. Direct grants drive ALLOW/DENY; attribute invariants and role-assignment
+# constraints are CONTEXT only (neither maps to a (role, scope) rule under the unchanged model);
+# domain knowledge resolves which subjects/resources a statement covers. Headings are read when
+# present but never required, so a plain-prose policy still degrades gracefully.
+_DIGEST_FRAMING = (
+    "The SCENARIO policy is a DIGESTED access-control policy. Read its statement kinds like so:\n"
+    "- DIRECT GRANTS (who may — or may not — do what to which resources): the primary evidence for "
+    "grants AND prohibitions.\n"
+    "- ATTRIBUTE INVARIANTS (constraints on a single entity's OWN attributes and the relationships "
+    "between them, e.g. 'managers may not be contractors') and ROLE-ASSIGNMENT CONSTRAINTS (which "
+    "roles a user may not hold at once): CONTEXT ONLY — they inform your reasoning but never by "
+    "themselves add a grant or a prohibition for a (focal, candidate) pair. A statement about who may "
+    "or may not ACCESS a resource is a direct grant, not an attribute invariant.\n"
+    "- DOMAIN KNOWLEDGE (the concepts the policy talks about): use it to resolve which subjects and "
+    "resources a statement covers (e.g. which roles are 'customer-facing').\n"
+    "Section headings may be present; read them when they are, but do not require them.\n"
+)
 
 _SAFETY = (
     "Rules:\n"
@@ -81,7 +102,15 @@ _MAPPING_RULES = (
     "shown to read issues earns an issue-management capability (which covers reading). It NEVER "
     "crosses to a SIBLING operation the candidate is not shown to perform: read access alone earns "
     "no write scope (issues-read does NOT imply issues-write), and write access earns no read-only "
-    "scope. Grant each fine-grained scope strictly on the operation it names. A candidate shown to "
+    "scope. Grant each fine-grained scope strictly on the operation it names. COARSE vs FINE: when a "
+    "scope's description covers SEVERAL operations (e.g. 'read, create, and update issues, comments, "
+    "sub-issues, and pull requests'), a candidate shown to perform AT LEAST ONE of them earns the "
+    "whole coarse scope — that is upward projection, and it holds even for a read-only candidate: a "
+    "role shown only to READ issues still earns a coarse issue capability that includes reading. The "
+    "fact that such a coarse scope ALSO covers operations the candidate is not shown to perform is "
+    "NEVER a reason to withhold it; the SIBLING guard above withholds only a scope whose covered "
+    "operations are ENTIRELY ones the candidate is not shown to perform (a pure-write scope from a "
+    "read-only candidate). A candidate shown to "
     "perform no covered operation is simply not granted (rule 1); that is a non-grant, not a "
     "prohibition.\n"
     "4) A policy may describe several different access relationships over the same entities. Judge "
@@ -90,51 +119,56 @@ _MAPPING_RULES = (
     "and the focal entity; a statement about any OTHER entity — even one sharing the same domain or "
     "theme (e.g. a differently-named role or subject with related access) — concerns a different "
     "relationship and is never evidence for or against the grant, even when it names the focal entity "
-    "or the scope. ONE SANCTIONED EXCEPTION: exclusive/restrictive scoping ABOUT THE FOCAL ENTITY "
-    "(rule 6) is legitimate evidence to deny the complement — that is the only cross-candidate "
-    "inference allowed."
+    "or the scope. There are NO exceptions: a digested policy states each prohibition explicitly "
+    "per pair, so there is no cross-candidate 'only …' inference to make."
 )
 
-# Deny / exclusivity contract — appended to BOTH the proposer and auditor system messages so the
-# two halves of the LLM contract cannot diverge. Deny extraction is SCENARIO-only; the baseline
-# is grants-only.
+# Deny contract — appended to BOTH the proposer and auditor system messages so the two halves of
+# the LLM contract cannot diverge. Denies come only from the scenario policy and the focal entity's
+# own description, never from the grants-only baseline.
 _DENY_RULES = (
-    "\nThe remaining rules concern PROHIBITIONS and apply to the SCENARIO policy ONLY. If the "
-    "scenario policy contains no prohibitive language (rule 5) and no exclusivity wording (rule 6), "
-    "return EMPTY denied lists and exclusivity=false — a purely permissive policy prohibits nothing; "
-    "never invent a prohibition to hedge.\n"
-    "5) EXPLICIT PROHIBITIONS -> deny. Prohibitive language in the SCENARIO policy about a "
-    "specific pair — 'must not', 'cannot', 'may not', 'is forbidden', 'never', 'except', 'but not', "
-    "'read-only' / 'may read but not write' — records that candidate as a PROHIBITION (a durable "
-    "DENY), not merely a non-grant. This applies to the scenario policy ONLY: the baseline policy is "
-    "grants-only and is NEVER a source of prohibitions. Silence about a pair, and a plain "
-    "non-exclusive grant, impose NOTHING on anything else — they never deny.\n"
-    "6) EXCLUSIVITY ('only'). Restrictive/exclusive language about the FOCAL entity — 'only', 'solely', "
-    "'exclusively', 'nothing else' — means the focal entity's access is closed to EXACTLY the granted "
-    "set. Signal this by setting the exclusivity flag true; do NOT enumerate the other candidates "
-    "yourself (the builder derives the complete complement from the candidate set). A non-exclusive "
-    "grant leaves the flag false and denies nothing.\n"
-    "7) The grant list and the prohibition list are MUTUALLY EXCLUSIVE, except when the scenario "
+    "\nThe remaining rules concern PROHIBITIONS. A prohibition has exactly two sources — the SCENARIO "
+    "policy and the FOCAL entity's own description — never a candidate's description, and never the "
+    "grants-only baseline (see rule 5). If neither the scenario policy nor the focal entity's own "
+    "description prohibits a pair (rule 5), return EMPTY denied lists — a "
+    "purely permissive policy prohibits nothing; never invent a prohibition to hedge.\n"
+    "5) EXPLICIT PROHIBITIONS -> deny. Prohibitive language about a specific pair — 'must not', "
+    "'cannot', 'may not', 'is forbidden', 'never', 'except', 'but not', 'read-only' / 'may read but "
+    "not write' — records that candidate as a PROHIBITION (a durable DENY), not merely a non-grant. "
+    "There are exactly TWO deny sources: (a) the SCENARIO POLICY prohibiting a pair, and (b) the "
+    "FOCAL entity's OWN description prohibiting its own access (e.g. a focal role whose description "
+    "says it 'does not manage the issue tracker' denies it the issue-management candidate). A "
+    "CANDIDATE's description that merely says the candidate does not work in — or does not do — some "
+    "domain is background about that candidate's job scope, NOT a prohibition: it yields a SILENT "
+    "NON-GRANT (deny-by-default, no rule at all), never a durable DENY. Do not infer a durable "
+    "cross-DENY for a candidate from its own job description. The grants-only baseline is NEVER a "
+    "source of prohibitions. Silence about a pair imposes NOTHING on anything else — it never denies. "
+    "A digested policy states exclusivity as explicit per-pair denies of exactly this kind, so there "
+    "is no 'only …' wording to interpret and no complement to derive.\n"
+    "6) The grant list and the prohibition list are MUTUALLY EXCLUSIVE, except when the scenario "
     "policy genuinely establishes BOTH a grant and a prohibition for the same candidate (a direct "
     "conflict, or a coarse scope partly permitted and partly forbidden) — then, and only then, list "
     "that candidate in both. That overlap is the contradiction signal; never invent it to hedge."
 )
 
 _PROPOSER_SYSTEM = (
-    "You map an access policy to concrete GRANTS. Your primary task is to select the granted "
+    "You map a digested access policy to concrete GRANTS. Your primary task is to select the granted "
     "candidates for the focal entity under least-privilege. Only when the scenario policy explicitly "
-    "prohibits or restricts access do you also report the prohibited candidates and whether access "
-    "is exclusive; for a purely permissive policy those are empty.\n" + _SAFETY + _MAPPING_RULES + _DENY_RULES
+    "prohibits access do you also report the prohibited candidates; for a purely permissive policy "
+    "the prohibition list is empty.\n" + _DIGEST_FRAMING + _SAFETY + _MAPPING_RULES + _DENY_RULES
 )
 _AUDITOR_SYSTEM = (
-    "You audit a proposed set of grants and prohibitions. Approve only if every granted pair is "
-    "policy-supported — REJECT any grant unsupported by the policy or the descriptions, any grant in "
-    "a domain the candidate is not shown to act in, and any grant for a candidate the policy never "
-    "mentions. Every prohibited pair must be a genuine explicit-prohibition or exclusivity deny, the "
-    "exclusivity flag must be truly asserted by the SCENARIO policy, and for a purely permissive "
-    "policy both denied lists must be empty. When a candidate is named in BOTH lists (a conflict), "
-    "adjudicate it: a genuine grant-and-prohibit collision is a contradiction (report it), a mere "
-    "proposer slip is an ordinary rejection.\n" + _SAFETY + _MAPPING_RULES + _DENY_RULES
+    "You audit a proposed set of grants and prohibitions over a digested access policy. Approve only "
+    "if every granted pair is policy-supported — REJECT any grant unsupported by the policy or the "
+    "descriptions, any grant in a domain the candidate is not shown to act in, and any grant for a "
+    "candidate the policy never mentions. Every prohibited pair must be a genuine explicit-prohibition "
+    "deny, and for a purely permissive policy the denied list must be empty. When a candidate is named "
+    "in BOTH lists (a conflict), adjudicate it: a genuine grant-and-prohibit collision is a "
+    "contradiction (report it), a mere proposer slip is an ordinary rejection.\n"
+    + _DIGEST_FRAMING
+    + _SAFETY
+    + _MAPPING_RULES
+    + _DENY_RULES
 )
 
 

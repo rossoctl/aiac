@@ -1,5 +1,5 @@
 """Semantic-perturbation sibling of ``scenario_eval_unreachable_resources.py`` (spec:
-``docs/specs/eval/policy-eval-robustness-consistency.md``).
+``docs/evaluation/policy-eval-robustness-consistency.md``).
 
 Same structure (names, ``USERS``, all pair-lists, and ``EXPECT_NO_REGO`` are byte-identical to the
 original), reworded prose only. See ``scenario_eval_baseline_perturbed.py`` for the general
@@ -24,14 +24,14 @@ AGENTS: dict[str, dict] = {
             "appointments and reading and updating patient records."
         ),
         "inbound_scopes": {
-            "agent-scope-intake-access": (
+            "agent-scope-receptionist": (
                 "Lets a holder use the intake agent's patient-intake abilities — booking "
                 "appointments and reading and updating patient records."
             ),
         },
         "delegation_scopes": {},
         "roles": {
-            "agent-role-intake-operations": (
+            "agent-role-receptionist": (
                 "Covers both reading and writing patient records — looking at record contents and updating them."
             ),
         },
@@ -43,14 +43,14 @@ AGENTS: dict[str, dict] = {
             "may call it or what it may reach."
         ),
         "inbound_scopes": {
-            "agent-scope-billing-access": (
+            "agent-scope-biller": (
                 "Lets a holder use the billing agent's invoicing abilities — creating and reading "
                 "patient invoices. Not yet handed to any user role in the policy text."
             ),
         },
         "delegation_scopes": {},
         "roles": {
-            "agent-role-billing-operations": (
+            "agent-role-biller": (
                 "Covers both reading and writing patient invoices. Not yet handed to any target in the policy text."
             ),
         },
@@ -105,12 +105,12 @@ USER_ROLES: dict[str, str] = {
 # Byte-identical to the original — reworded descriptions above don't change the truth table.
 
 INBOUND_PAIRS: list[tuple[str, str]] = [
-    ("user-role-front-desk-clerk", "agent-scope-intake-access"),
+    ("user-role-front-desk-clerk", "agent-scope-receptionist"),
 ]
 
 OUTBOUND_PAIRS: list[tuple[str, str]] = [
-    ("agent-role-intake-operations", "tool-scope-records-read"),
-    ("agent-role-intake-operations", "tool-scope-records-write"),
+    ("agent-role-receptionist", "tool-scope-records-read"),
+    ("agent-role-receptionist", "tool-scope-records-write"),
 ]
 
 OUTBOUND_SUBJECT_PAIRS: list[tuple[str, str]] = [

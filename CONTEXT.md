@@ -18,16 +18,21 @@ The pass centred on a scope, fanning candidate roles over it. It is the sole
 **grant authority** for that scope.
 _Avoid_: scope pass, forward pass.
 
-**User-role-focal pass** (a.k.a. **Door B**):
-A pass centred on a `kind=User` role, fanning it over the focus service's own
-scopes to emit the **deny** rules that a user's exclusivity ("Testers may access
-**only** issues") implies — prohibitions the scope-focal pass structurally
-cannot express. Contributes denies only; never broadens access.
+**User-role-focal pass** (a.k.a. **Door B**) — _retired (#2540)_:
+Formerly a pass centred on a `kind=User` role, fanning it over the focus
+service's own scopes to emit the **deny** rules a user's exclusivity ("Testers
+may access **only** issues") implied — prohibitions the scope-focal pass
+structurally could not express. **Removed** once the PRB consumes only
+**digested** policy: the digested language bans "only" and states each
+prohibition as an explicit per-pair deny, which the scope-focal pass reads
+directly, so the derivation is redundant. Retained here only because the term
+appears in git history. See the PRB spec's _digested input retires exclusivity
+handling and Door B_ decision.
 _Avoid_: role pass (ambiguous with the agent-role-focal pass), Door B pass.
 
 **Grant authority**:
 The property that grants on a given scope come from exactly one place — the
-scope-focal pass. Door B adds only prohibitions and never grants.
+scope-focal pass.
 _Avoid_: owner, source of truth.
 
 **Contradiction**:
@@ -46,9 +51,11 @@ _Avoid_: using "contradiction" for this.
 
 **Within-batch conflict**:
 A **conflict** whose two rules are produced in one `build()` call — i.e. one
-`/apply` request. This is the Door B case: at the focus service's own-scope
-onboarding, both the scope-focal grant and the Door B deny (and any collision
-between them) are in hand in the same build. In scope.
+`/apply` request. At the focus service's own-scope onboarding the scope-focal
+pass emits both grants and explicit per-pair denies over those scopes, so a
+grant and a deny colliding on the same `(role, scope)` are in hand in the same
+build. In scope. (Formerly the Door B case, before that pass was retired — see
+**User-role-focal pass**.)
 _Avoid_: intra-request conflict.
 
 **Cross-run conflict** (a.k.a. **cross-service conflict**):
@@ -62,5 +69,43 @@ _Avoid_: cross-request conflict, store conflict.
 **Identify-never-reconcile**:
 The governing principle: a `(role, scope)` carrying both an `Allow` and a `Deny`
 **is** a conflict — surface it, never resolve it. No precedence, no
-"deny wins," no merge. See `docs/adr/0001-identify-never-reconcile.md`.
+"deny wins," no merge. See the engine-layer design decision
+[identify conflicts, never reconcile](docs/specs/components/aiac-agent/policy-rules-builder.md#design-decision-identify-conflicts-never-reconcile).
 _Avoid_: deny-overrides, conflict resolution.
+
+**Source policy**:
+The original human-authored authorization policy as provided — free
+natural-language prose (e.g. the text held in the RAG knowledge base). The raw
+input a digest is derived from.
+_Avoid_: raw policy, input policy.
+
+**Digested policy**:
+A structured restatement of a source policy's intent in the digested-policy
+language — domain knowledge plus three statement kinds (direct grants, attribute
+invariants, role-assignment constraints). An authoring-layer artifact, upstream
+of the engine's `PolicyRule`s. See `docs/specs/digested-policy.md`.
+_Avoid_: parsed policy, normalized policy.
+
+**Policy Digester**:
+The LLM-backed conversion that rewrites a **source policy** into a **digested
+policy**, guided by the digested-policy spec. It is _pure conversion_ — it
+produces the digest and nothing else. Reading the source, storing the digest, and
+detecting authoring-layer conflicts belong to other components, not the digester.
+_Avoid_: converter, normalizer, parser, digest step.
+
+**Faithfulness**:
+The invariant a digest must uphold: it neither **adds**, **drops**, nor
+**broadens** access relative to its source policy. A faithful digest yields
+exactly the access its source granted — never more. Guarded by comparing the
+rules the engine derives from a digest against the source's known-correct rule
+set.
+_Avoid_: correctness, accuracy, fidelity.
+
+**Authoring-layer conflict**:
+Two direct grants _within one digested policy_ with opposite effect whose
+subjects, operations, and resources overlap. Distinct from the engine-level
+**Conflict** (a cross-pass `(role, scope)` allow∩deny): this is among a digested
+policy's own statements, before it becomes `PolicyRule`s. Currently reported,
+never auto-resolved — deny-overrides reserved (see
+[Design decision: authoring vs engine conflict semantics](docs/specs/digested-policy.md#design-decision-authoring-vs-engine-conflict-semantics)).
+_Avoid_: using unqualified "Conflict" for this.

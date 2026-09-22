@@ -8,77 +8,23 @@ exhaustion) -- never a silent []. An auditor-approved empty selection is a valid
 """
 
 import logging
-import os
-from typing import Any, NamedTuple, TypedDict, TypeVar, cast
+from typing import Any, TypedDict, TypeVar, cast
 
 from langchain_core.messages import BaseMessage
-from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, StateGraph
-from pydantic import BaseModel, SecretStr
-from tenacity import Retrying, retry_if_exception, stop_after_attempt, wait_exponential
+from pydantic import BaseModel
 
+from aiac.agent.llm import LLMAccessError as _LLMAccessError
+from aiac.agent.llm import UnparseableLLMResponseError as _UnparseableLLMResponseError
+from aiac.agent.llm import build_llm, call_with_retry, load_llm_settings, raise_sanitized
 from aiac.idp.configuration.models import Role, Scope
 from aiac.policy.model.models import PolicyRule, RuleEffect
-from aiac.shared.upstream import is_transient
 
 from .policy_source import get_policy_source
 from .prompts import build_auditor_messages, build_proposer_messages
 
 logger = logging.getLogger(__name__)
 MAX_AUDIT_RETRIES = 3
-_DEFAULT_LLM_REQUEST_TIMEOUT = 120.0
-
-
-def _request_timeout() -> float:
-    """Per-request LLM timeout (seconds) from ``LLM_REQUEST_TIMEOUT`` (default 120),
-    tolerant of an unset or non-numeric value — a bad value must not crash the request,
-    it falls back to the default (mirrors ``aiac.shared.upstream.max_retries``). Without
-    it a stalled connection never raises and the whole ``/apply`` request wedges forever."""
-    try:
-        value = float(os.getenv("LLM_REQUEST_TIMEOUT", str(_DEFAULT_LLM_REQUEST_TIMEOUT)))
-    except (TypeError, ValueError):
-        return _DEFAULT_LLM_REQUEST_TIMEOUT
-    return value if value > 0 else _DEFAULT_LLM_REQUEST_TIMEOUT
-
-
-_DEFAULT_LLM_MAX_RETRIES = 3
-_DEFAULT_LLM_RETRY_BACKOFF_MIN = 1.0
-_DEFAULT_LLM_RETRY_BACKOFF_MAX = 30.0
-
-_N = TypeVar("_N", int, float)
-
-
-class LLMRetryConfig(NamedTuple):
-    """The PRB LLM seam's dedicated retry cadence (attempt count + backoff bounds)."""
-
-    max_retries: int
-    backoff_min: float
-    backoff_max: float
-
-
-def _env_number(name: str, default: _N, cast: type[_N]) -> _N:
-    """Read env var ``name`` and parse it with ``cast`` (int/float), tolerant of an unset or
-    non-numeric value — a bad value must not crash the request, it falls back to ``default``
-    (mirrors ``_request_timeout`` / ``aiac.shared.upstream.max_retries``). A non-positive value
-    also falls back, so a knob can never disable retries or set a zero/negative backoff."""
-    try:
-        value = cast(os.getenv(name, str(default)))
-    except (TypeError, ValueError):
-        return default
-    return value if value > 0 else default
-
-
-def _llm_retry_config() -> LLMRetryConfig:
-    """The PRB LLM seam's retry cadence, read at call time. DELIBERATELY SEPARATE from the shared
-    ``UPSTREAM_MAX_RETRIES`` (``aiac.shared.upstream.max_retries``, which still governs the
-    IdP/MCP/K8s transport seams): the LLM call is slower and fails in different ways, so it gets
-    its own knobs — ``LLM_MAX_RETRIES`` (default 3), ``LLM_RETRY_BACKOFF_MIN`` (default 1),
-    ``LLM_RETRY_BACKOFF_MAX`` (default 30) — each tolerant of unset / non-numeric values."""
-    return LLMRetryConfig(
-        max_retries=_env_number("LLM_MAX_RETRIES", _DEFAULT_LLM_MAX_RETRIES, int),
-        backoff_min=_env_number("LLM_RETRY_BACKOFF_MIN", _DEFAULT_LLM_RETRY_BACKOFF_MIN, float),
-        backoff_max=_env_number("LLM_RETRY_BACKOFF_MAX", _DEFAULT_LLM_RETRY_BACKOFF_MAX, float),
-    )
 
 
 class _Selection(BaseModel):
@@ -88,19 +34,18 @@ class _Selection(BaseModel):
     reasoning: str
 
 
-# The deny name lists + exclusivity flags default to the allow-only-equivalent values
-# (no prohibition, not exclusive) so allow-only producers and the pre-#123 mocks keep
-# working byte-identically -- the same reason PolicyRule.effect defaults to ALLOW.
+# The deny name lists default to empty (no prohibition) so allow-only producers and the pre-#123
+# mocks keep working byte-identically -- the same reason PolicyRule.effect defaults to ALLOW. A
+# digested policy states every prohibition explicitly per pair, so there is no exclusivity flag and
+# no derived complement (see the PRB spec's "digested input retires exclusivity handling" decision).
 class RoleSelection(_Selection):
     granted_scope_names: list[str]
     denied_scope_names: list[str] = []  # explicit prohibitions about the focal role
-    grant_is_exclusive: bool = False  # focal role's access is closed to exactly the granted set
 
 
 class ScopeSelection(_Selection):
     roles_with_access_names: list[str]
     roles_denied_access_names: list[str] = []  # explicit prohibitions about the focal scope
-    access_is_exclusive: bool = False  # access to the focal scope is closed to exactly the granted set
 
 
 class Contradiction(BaseModel):
@@ -118,17 +63,27 @@ class PolicyRulesBuilderBaseError(Exception): ...
 
 class PolicyRulesBuilderError(PolicyRulesBuilderBaseError): ...
 
-class LLMAccessError(PolicyRulesBuilderBaseError):
+
+class LLMAccessError(_LLMAccessError, PolicyRulesBuilderBaseError):
     """Raised by ``_structured_call`` when the LLM endpoint stays unreachable after the transport
     retry budget is exhausted (a transient failure that never cleared). The message is sanitized --
     it never carries the endpoint / host / API key; the raw transport error is chained on
-    ``__cause__`` for internal logging only."""
+    ``__cause__`` for internal logging only.
 
-class UnparseableLLMResponseError(PolicyRulesBuilderBaseError):
+    Specialises the shared ``aiac.agent.llm.LLMAccessError`` into the PRB's
+    ``PolicyRulesBuilderBaseError`` hierarchy so the controller/eventbus routing that catches PRB
+    errors by type keeps working unchanged."""
+
+
+class UnparseableLLMResponseError(_UnparseableLLMResponseError, PolicyRulesBuilderBaseError):
     """Raised by ``_structured_call`` when the LLM is REACHABLE but its response cannot be parsed /
     fails schema validation (a non-transient failure, so it is not retried). Distinct from
     ``LLMAccessError`` (endpoint unreachable) so a consumer can tell the two apart. Sanitized the
-    same way -- no endpoint / host / API key in the message; original error chained on ``__cause__``."""
+    same way -- no endpoint / host / API key in the message; original error chained on ``__cause__``.
+
+    Specialises the shared ``aiac.agent.llm.UnparseableLLMResponseError`` into the PRB's
+    ``PolicyRulesBuilderBaseError`` hierarchy (see ``LLMAccessError``)."""
+
 
 class PolicyContradictionError(PolicyRulesBuilderBaseError):
     """Raised when the policy GENUINELY both grants and prohibits the same (focal, candidate) pair
@@ -150,7 +105,6 @@ class _PRBWorking(TypedDict):
     selected_names: list[str]
     denied_names: list[str]
     conflict_names: list[str]
-    exclusive: bool
     reasoning: str
     approved: bool
     audit_feedback: str | None
@@ -168,58 +122,33 @@ class ScopeRulesState(_PRBWorking):
     scope: Scope
 
 
-def _build_llm() -> ChatOpenAI:  # lazy -- NEVER called at import
-    return ChatOpenAI(
-        base_url=os.getenv("LLM_BASE_URL"),
-        model=os.getenv("LLM_MODEL", ""),
-        api_key=SecretStr(os.getenv("LLM_API_KEY", "")),
-        temperature=0,
-        # Fail fast on a stalled socket; retries are owned by _structured_call's tenacity
-        # Retrying, so disable the client's own so attempts don't multiply.
-        timeout=_request_timeout(),
-        max_retries=0,
-    )
-
-
 T = TypeVar("T", bound=BaseModel)
 
 
+def _build_llm():  # lazy -- NEVER called at import. Patchable seam kept for the PRB's tests.
+    """Build the PRB's LLM client from its own ``LLM_*`` settings profile."""
+    return build_llm(load_llm_settings())
+
+
 def _structured_call(schema: type[T], messages: list[BaseMessage]) -> T:
-    """THE seam. Behavior tests patch this. Transport-retries each .invoke() via call-time Retrying.
+    """THE seam. Behavior tests patch this. Delegates the client build + transport retry to the
+    shared ``aiac.agent.llm`` seam (on the PRB's own ``LLM_*`` settings profile), then folds any
+    surviving failure into the PRB's own typed, sanitized error subclasses (so consumers that catch
+    ``PolicyRulesBuilderBaseError`` are unaffected).
 
     Only transient failures (connection errors / timeouts / 5xx) are retried — a permanent
     failure (e.g. a bad request or a validation error) fails identically on every attempt, so
     it is surfaced immediately (consistent with ``aiac.shared.upstream``)."""
+    settings = load_llm_settings()  # PRB profile: the bare LLM_* vars
     runnable = _build_llm().with_structured_output(schema)
-    # Dedicated LLM retry cadence (LLM_MAX_RETRIES / LLM_RETRY_BACKOFF_MIN / LLM_RETRY_BACKOFF_MAX),
-    # independent of the shared UPSTREAM_MAX_RETRIES that still governs the IdP/MCP/K8s seams.
-    retry_cfg = _llm_retry_config()
-    retryer = Retrying(
-        retry=retry_if_exception(is_transient),
-        stop=stop_after_attempt(retry_cfg.max_retries),
-        wait=wait_exponential(multiplier=1, min=retry_cfg.backoff_min, max=retry_cfg.backoff_max),
-        reraise=True,
-    )
     try:
-        return cast(T, retryer(runnable.invoke, messages))
+        return cast(T, call_with_retry(runnable, messages, settings=settings))
     except Exception as err:
-        # reraise=True hands back the ORIGINAL last exception (never a tenacity RetryError), so we
-        # classify it exactly as the retry loop did. A still-transient error here means the retry
-        # budget was exhausted against an unreachable LLM -> LLMAccessError. The message is STATIC
-        # (never str(err)) so an endpoint/host/API key embedded in the transport error cannot leak;
-        # the raw error stays reachable via __cause__ (chained with ``from err``) for internal logs.
-        if is_transient(err):
-            raise LLMAccessError("LLM endpoint unreachable after exhausting transport retries") from err
-        # Non-transient: the LLM was reachable but its response could not be parsed / failed schema
-        # validation. Same static, endpoint-free message; original error chained via __cause__.
-        raise UnparseableLLMResponseError("LLM returned an unparseable or schema-invalid response") from err
-
-
-def _loggable(value: object) -> str:
-    """Neutralize a value for single-line logging (drop CR/LF); see
-    ``uc.onboarding.orchestrator._loggable``. Applied to LLM-derived names/reasoning — untrusted
-    free text, not this process's own naming."""
-    return str(value).replace("\r", "").replace("\n", "")
+        # raise_sanitized classifies the ORIGINAL error exactly as the retry loop did (transient
+        # exhaustion -> LLMAccessError; reachable-but-unparseable -> UnparseableLLMResponseError),
+        # with a STATIC endpoint-free message and the raw error chained on __cause__. The PRB
+        # subclasses are passed so the raised type stays inside PolicyRulesBuilderBaseError.
+        raise_sanitized(err, access_error=LLMAccessError, unparseable_error=UnparseableLLMResponseError)
 
 
 # shared node helpers (typed against _PRBWorking; direction specifics passed as kwargs)
@@ -239,7 +168,6 @@ def _propose(
     schema: type[_Selection],
     names_field: str,
     denied_names_field: str,
-    exclusive_field: str,
 ) -> dict[str, Any]:
     msgs = build_proposer_messages(
         state["policy_text"], focal, candidates, contract, state["audit_feedback"], direction=direction
@@ -255,9 +183,8 @@ def _propose(
         _loggable(focal), gate_kind, _loggable(granted), _loggable(denied), exclusive,
     )
     return {
-        "selected_names": granted,
-        "denied_names": denied,
-        "exclusive": exclusive,
+        "selected_names": list(getattr(sel, names_field)),
+        "denied_names": list(getattr(sel, denied_names_field)),
         "reasoning": sel.reasoning,
     }
 
@@ -271,11 +198,12 @@ def _precheck(state: _PRBWorking, *, candidate_names: set[str]) -> dict[str, Any
     dropped_denied = [n for n in state["denied_names"] if n not in candidate_names]
     if dropped or dropped_denied:
         logger.warning("PRB precheck dropped hallucinated names: granted=%s denied=%s", dropped, dropped_denied)
-    # Deterministic overlap signal: a candidate in BOTH lists. The derived exclusivity complement
-    # is disjoint from grants by construction, so overlap can only come from an explicit denied-name
-    # that is also granted -- a direct conflict or coarse-scope mismatch. precheck resolves nothing;
+    # Deterministic overlap signal: a candidate in BOTH lists. Denies are purely the explicit
+    # prohibitions now, so overlap can only come from an explicit denied-name that is also granted
+    # -- a direct conflict or coarse-scope mismatch. precheck resolves nothing;
     # the auditor adjudicates each conflict name as genuine (raise) vs generation error (retry).
-    conflict = [n for n in keep if n in set(keep_denied)]
+    denied_set = set(keep_denied)
+    conflict = [n for n in keep if n in denied_set]
     return {"selected_names": keep, "denied_names": keep_denied, "conflict_names": conflict}
 
 
@@ -346,11 +274,11 @@ def _role_cands(rs: list[Role]) -> str:
 
 _ROLE_CONTRACT = (
     "Return granted_scope_names (subset of candidate scope names), denied_scope_names (explicit "
-    "prohibitions, subset of candidates), grant_is_exclusive + reasoning."
+    "prohibitions, subset of candidates) + reasoning."
 )
 _SCOPE_CONTRACT = (
     "Return roles_with_access_names (subset of candidate role names), roles_denied_access_names "
-    "(explicit prohibitions, subset of candidates), access_is_exclusive + reasoning."
+    "(explicit prohibitions, subset of candidates) + reasoning."
 )
 
 # Explicit gate-direction framing, passed to BOTH the proposer and the auditor (the auditor
@@ -378,17 +306,6 @@ _SCOPE_DIRECTION = (
 )
 
 
-def _denied_names(explicit: list[str], exclusive: bool, candidate_order: list[str], granted: set[str]) -> set[str]:
-    """The set of candidate names to DENY: the explicit prohibitions, plus -- when the grant is
-    exclusive -- the derived complement (every candidate not granted). The complement is DERIVED
-    from the typed candidate set (complete by construction), never LLM-enumerated, and is disjoint
-    from grants by construction."""
-    denied = set(explicit)
-    if exclusive:
-        denied |= {c for c in candidate_order if c not in granted}
-    return denied
-
-
 def _assemble(state_type: type, propose, precheck, audit, build):
     """Wire the shared fetch -> propose -> precheck -> audit -> build shape with the
     audit -> propose retry edge. Both directions differ only in their four closures."""
@@ -407,14 +324,24 @@ def _assemble(state_type: type, propose, precheck, audit, build):
     return g.compile()
 
 
-def build_role_graph(*, deny_only: bool = False):
-    """Role-focal PRB graph. With ``deny_only=True`` this is the **Door B** variant
-    (the user-role-focal deny pass): its build node emits **DENY rules only** — the
-    exclusivity complement plus any explicit prohibitions — and never an ALLOW, so the
-    scope-focal pass remains the single grant authority. The proposer/precheck/audit
-    nodes are byte-identical to the allow+deny variant (the LLM still extracts the
-    "X may access only Y" grant so the complement can be derived); only the build node
-    differs in which effects it keeps."""
+def _assemble_rules(candidates, granted_names, denied_names, make_rule):
+    """The single build-node rule assembly: ALLOW from the granted names, then DENY from the
+    (candidate-filtered) explicit prohibitions -- each in candidate order, every rule rebuilt from
+    the typed candidate (never LLM string fields). ``make_rule(candidate, effect)`` constructs the
+    PolicyRule for the pass's direction (role-focal or scope-focal). Shared by both build nodes AND
+    the eval best-effort replica (``eval.best_effort_rules``) so the assembly lives in ONE place and
+    the eval cannot silently diverge from the real graph."""
+    granted = set(granted_names)
+    denied = set(denied_names)
+    allows = [make_rule(c, RuleEffect.ALLOW) for c in candidates if c.name in granted]
+    denies = [make_rule(c, RuleEffect.DENY) for c in candidates if c.name in denied]
+    return allows + denies
+
+
+def build_role_graph():
+    """Role-focal PRB graph: given a focal role, decide which candidate scopes it is granted and
+    which it is explicitly prohibited. ALLOW from the granted names, DENY from the explicit
+    prohibitions -- no exclusivity complement (digested input states prohibitions per pair)."""
 
     def propose(s: RoleRulesState) -> dict[str, Any]:
         return _propose(
@@ -426,7 +353,6 @@ def build_role_graph(*, deny_only: bool = False):
             schema=RoleSelection,
             names_field="granted_scope_names",
             denied_names_field="denied_scope_names",
-            exclusive_field="grant_is_exclusive",
         )
 
     def precheck(s: RoleRulesState) -> dict[str, Any]:
@@ -438,31 +364,13 @@ def build_role_graph(*, deny_only: bool = False):
         )
 
     def build(s: RoleRulesState) -> dict[str, Any]:
-        # DENY from the exclusivity complement + explicit prohibitions -- every rule rebuilt from
-        # the typed scopes (never LLM string fields), in candidate order.
-        denied = _denied_names(
-            s["denied_names"], s["exclusive"], [sc.name for sc in s["scopes"]], set(s["selected_names"])
+        rules = _assemble_rules(
+            s["scopes"],
+            s["selected_names"],
+            s["denied_names"],
+            lambda sc, effect: PolicyRule(role=s["role"], scope=sc, effect=effect),
         )
-        denies = [
-            PolicyRule(role=s["role"], scope=sc, effect=RuleEffect.DENY) for sc in s["scopes"] if sc.name in denied
-        ]
-        if deny_only:
-            # Door B contributes only prohibitions; a purely permissive policy (no exclusivity,
-            # no explicit deny) yields [] -- a structural no-op that never broadens access.
-            logger.info("PRB build (role, deny-only/Door B): role=%s -> %d deny rule(s): %s",
-                        _loggable(s["role"].name), len(denies), _loggable([d.scope.name for d in denies]))
-            return {"rules": denies}
-        # ALLOW from granted names first, then the denies -- each in candidate order.
-        granted = set(s["selected_names"])
-        allows = [
-            PolicyRule(role=s["role"], scope=sc, effect=RuleEffect.ALLOW) for sc in s["scopes"] if sc.name in granted
-        ]
-        logger.info(
-            "PRB build (role): role=%s -> %d allow + %d deny rule(s): allow=%s deny=%s",
-            _loggable(s["role"].name), len(allows), len(denies),
-            _loggable([a.scope.name for a in allows]), _loggable([d.scope.name for d in denies]),
-        )
-        return {"rules": allows + denies}
+        return {"rules": rules}
 
     return _assemble(RoleRulesState, propose, precheck, audit, build)
 
@@ -478,7 +386,6 @@ def build_scope_graph():
             schema=ScopeSelection,
             names_field="roles_with_access_names",
             denied_names_field="roles_denied_access_names",
-            exclusive_field="access_is_exclusive",
         )
 
     def precheck(s: ScopeRulesState) -> dict[str, Any]:
@@ -490,28 +397,18 @@ def build_scope_graph():
         )
 
     def build(s: ScopeRulesState) -> dict[str, Any]:
-        # ALLOW from granted names, DENY from explicit prohibitions -- every rule rebuilt from the
-        # typed roles (never LLM string fields). Allows first, then denies, each in candidate order.
-        denied = _denied_names(
-            s["denied_names"], s["exclusive"], [r.name for r in s["roles"]], set(s["selected_names"])
+        rules = _assemble_rules(
+            s["roles"],
+            s["selected_names"],
+            s["denied_names"],
+            lambda r, effect: PolicyRule(role=r, scope=s["scope"], effect=effect),
         )
-        granted = set(s["selected_names"])
-        allows = [
-            PolicyRule(role=r, scope=s["scope"], effect=RuleEffect.ALLOW) for r in s["roles"] if r.name in granted
-        ]
-        denies = [PolicyRule(role=r, scope=s["scope"], effect=RuleEffect.DENY) for r in s["roles"] if r.name in denied]
-        logger.info(
-            "PRB build (scope): scope=%s -> %d allow + %d deny rule(s): allow=%s deny=%s",
-            _loggable(s["scope"].name), len(allows), len(denies),
-            _loggable([a.role.name for a in allows]), _loggable([d.role.name for d in denies]),
-        )
-        return {"rules": allows + denies}
+        return {"rules": rules}
 
     return _assemble(ScopeRulesState, propose, precheck, audit, build)
 
 
 ROLE_GRAPH = build_role_graph()  # module-level compile is safe (never builds the LLM)
-ROLE_DENY_GRAPH = build_role_graph(deny_only=True)  # Door B: user-role-focal deny-only variant
 SCOPE_GRAPH = build_scope_graph()
 
 
@@ -525,7 +422,6 @@ def build_role_rules(role: Role, scopes: list[Scope]) -> list[PolicyRule]:
         "selected_names": [],
         "denied_names": [],
         "conflict_names": [],
-        "exclusive": False,
         "reasoning": "",
         "approved": False,
         "audit_feedback": None,
@@ -533,34 +429,6 @@ def build_role_rules(role: Role, scopes: list[Scope]) -> list[PolicyRule]:
         "rules": [],
     }
     return ROLE_GRAPH.invoke(state)["rules"]
-
-
-def build_role_denies(role: Role, scopes: list[Scope]) -> list[PolicyRule]:
-    """Door B -- run the user-role-focal DENY-only pass for ``role`` over ``scopes``.
-
-    Same role-focal graph as :func:`build_role_rules` (propose/precheck/audit), but the
-    build node emits **only DENY rules**: the derived exclusivity complement over ``scopes``
-    plus any explicit prohibitions. It NEVER emits an ALLOW -- the scope-focal pass is the
-    single grant authority. A permissive policy (no exclusivity, no explicit prohibition)
-    returns ``[]``, so Door B is a structural no-op unless a user role's access is exclusive
-    or explicitly restricted."""
-    state: RoleRulesState = {
-        "role": role,
-        "scopes": scopes,
-        # placeholder: the graph's ``fetch`` node (START -> fetch -> propose) populates
-        # this via get_policy_source() before ``propose`` reads it -- do not fetch here.
-        "policy_text": "",
-        "selected_names": [],
-        "denied_names": [],
-        "conflict_names": [],
-        "exclusive": False,
-        "reasoning": "",
-        "approved": False,
-        "audit_feedback": None,
-        "retry_count": 0,
-        "rules": [],
-    }
-    return ROLE_DENY_GRAPH.invoke(state)["rules"]
 
 
 def build_scope_rules(roles: list[Role], scope: Scope) -> list[PolicyRule]:
@@ -573,7 +441,6 @@ def build_scope_rules(roles: list[Role], scope: Scope) -> list[PolicyRule]:
         "selected_names": [],
         "denied_names": [],
         "conflict_names": [],
-        "exclusive": False,
         "reasoning": "",
         "approved": False,
         "audit_feedback": None,

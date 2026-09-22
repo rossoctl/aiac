@@ -1,5 +1,5 @@
 """Semantic-perturbation sibling of ``scenario_eval_empty_descriptions.py`` (spec:
-``docs/specs/eval/policy-eval-robustness-consistency.md``).
+``docs/evaluation/policy-eval-robustness-consistency.md``).
 
 Unlike every other scenario in this directory, this module's descriptions are NOT reworded — they
 are empty in the original by design (that scenario's whole point is that no semantic content is
@@ -24,11 +24,11 @@ AGENTS: dict[str, dict] = {
     "irrigation-agent": {
         "description": "",
         "inbound_scopes": {
-            "agent-scope-irrigation-access": "",
+            "agent-scope-groundskeeper": "",
         },
         "delegation_scopes": {},
         "roles": {
-            "agent-role-irrigation-operations": "",
+            "agent-role-groundskeeper": "",
         },
     },
 }
@@ -60,12 +60,12 @@ USER_ROLES: dict[str, str] = {
 # --- Role -> access facts (name-level; the single source of truth) --------------------------
 
 INBOUND_PAIRS: list[tuple[str, str]] = [
-    ("user-role-field-operator", "agent-scope-irrigation-access"),
+    ("user-role-field-operator", "agent-scope-groundskeeper"),
 ]
 
 OUTBOUND_PAIRS: list[tuple[str, str]] = [
-    ("agent-role-irrigation-operations", "tool-scope-valve-open"),
-    ("agent-role-irrigation-operations", "tool-scope-valve-close"),
+    ("agent-role-groundskeeper", "tool-scope-valve-open"),
+    ("agent-role-groundskeeper", "tool-scope-valve-close"),
 ]
 
 OUTBOUND_SUBJECT_PAIRS: list[tuple[str, str]] = [

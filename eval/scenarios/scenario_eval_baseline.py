@@ -2,7 +2,7 @@
 
 Companion to ``scenario.py`` (the canonical single-agent/single-tool scenario) and to
 ``scenario_uc1.py`` (the UC-1 onboarding oracle) for ``test_policy_pipeline_eval.py`` (spec:
-``docs/specs/eval/policy-eval-scenarios.md``). This is the suite's one deliberately
+``docs/evaluation/policy-eval-scenarios.md``). This is the suite's one deliberately
 code/user-role-devops-flavored (software-engineering) scenario — every other scenario in the family uses a
 non-code domain.
 
@@ -14,7 +14,7 @@ role->access facts (``user-role-developer`` reaches both agents; ``user-role-tes
 
 Unlike ``scenario_eval_baseline.py``'s previous revision, this scenario carries **no**
 agent-to-agent delegation grant — that mechanism now has its own dedicated scenario,
-``scenario_eval_agent_delegation.py`` (``test/integration/``).
+``scenario_eval_agent_delegation.py`` (``test/system/``).
 
 Pure data: no imports beyond ``__future__``, mirroring ``scenario.py``.
 """
@@ -35,14 +35,14 @@ AGENTS: dict[str, dict] = {
             "inspects and changes repository source contents."
         ),
         "inbound_scopes": {
-            "agent-scope-repo-access": (
+            "agent-scope-coder": (
                 "Scope granting use of the repo agent's source-code capability — inspecting and "
                 "modifying repository contents."
             ),
         },
         "delegation_scopes": {},
         "roles": {
-            "agent-role-repo-operations": (
+            "agent-role-coder": (
                 "Covers read and write access to source repository contents — listing, reading, "
                 "creating, and modifying files."
             ),
@@ -54,13 +54,13 @@ AGENTS: dict[str, dict] = {
             "files, and updates issues and their comment threads."
         ),
         "inbound_scopes": {
-            "agent-scope-tracker-access": (
+            "agent-scope-triager": (
                 "Scope granting use of the tracker agent's issue-tracking capability — reading and updating issues."
             ),
         },
         "delegation_scopes": {},
         "roles": {
-            "agent-role-tracker-operations": (
+            "agent-role-triager": (
                 "Covers read and write access to the issue tracker — reading, filing, updating, "
                 "and commenting on issues and their threads."
             ),
@@ -131,17 +131,17 @@ USER_ROLES: dict[str, str] = {
 # exactly, over these scenario's own (unprefixed) scope names.
 
 INBOUND_PAIRS: list[tuple[str, str]] = [
-    ("user-role-developer", "agent-scope-repo-access"),
-    ("user-role-developer", "agent-scope-tracker-access"),
-    ("user-role-tester", "agent-scope-tracker-access"),
+    ("user-role-developer", "agent-scope-coder"),
+    ("user-role-developer", "agent-scope-triager"),
+    ("user-role-tester", "agent-scope-triager"),
     # No row for user-role-devops — deny-by-default, same as UC-1's devops-user.
 ]
 
 OUTBOUND_PAIRS: list[tuple[str, str]] = [
-    ("agent-role-repo-operations", "tool-scope-repo-read"),
-    ("agent-role-repo-operations", "tool-scope-repo-write"),
-    ("agent-role-tracker-operations", "tool-scope-tracker-read"),
-    ("agent-role-tracker-operations", "tool-scope-tracker-write"),
+    ("agent-role-coder", "tool-scope-repo-read"),
+    ("agent-role-coder", "tool-scope-repo-write"),
+    ("agent-role-triager", "tool-scope-tracker-read"),
+    ("agent-role-triager", "tool-scope-tracker-write"),
 ]
 
 OUTBOUND_SUBJECT_PAIRS: list[tuple[str, str]] = [

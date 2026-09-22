@@ -98,38 +98,47 @@ START → classify_service → [analyze_agent | analyze_tool] → provision_serv
 - **`classify_service`**: resolves identity + determines service type from the operator's authoritative `rossoctl.io/type` label (values `agent`/`tool`) — **not** from the `entity_id` format.
   1. Store `service_id = trigger.entity_id` (the Keycloak **internal client UUID** — `Service.id` — **not** the `clientId`/`serviceId`). The `/apply/service/{service_id}` route and every downstream lookup (`get_service` → `admin.get_client`, and the builder's focus resolution) are keyed on this UUID because a `clientId` can be a slash-bearing SPIFFE URI that a single path segment cannot carry.
   2. Resolve identity: call `get_service(service_id)` from `aiac.idp.configuration.api` → `client.name`, which the rossoctl-operator sets to `"{namespace}/{workload_name}"` for every workload (agents and tools, SPIRE-enabled or not). Split on the first `/` → store `namespace` and `workload_name`. `502` if `client.name` has no `/` (namespace unrecoverable).
-  3. LIST pods in `namespace`; select the pod owned by `workload_name` via `ownerReferences` (Deployment → ReplicaSet name prefix, or `StatefulSet`/`Sandbox` name match). `502` on Kubernetes API failure or no matching pod.
+  3. LIST pods in `namespace`; select the pod owned by `workload_name` via `ownerReferences` (Deployment → ReplicaSet name prefix, or `StatefulSet`/`Sandbox` name match). A Kubernetes API failure is an immediate `502`. **No matching pod** (not created yet) is a transient not-ready state — re-polled (step 5), not an immediate failure.
   4. Read the `rossoctl.io/type` label on that pod and normalize it to a `ServiceType`
      member via `ServiceType(label.capitalize())` — the label is lowercase
      (`agent`/`tool`); `ServiceType` values are capitalized (`Agent`/`Tool`):
      - `agent` → `ServiceType.AGENT`; route to `analyze_agent`.
      - `tool` → `ServiceType.TOOL`; route to `analyze_tool`.
-     - Absent or any other value (normalization raises `ValueError`) → `502` (inconsistent deployment).
+     - A **present but invalid** value (not `agent`/`tool`; normalization raises `ValueError`) → **immediate** `502` — a real misconfiguration no wait can fix, so the re-poll loop short-circuits.
+     - A **missing** label is a transient not-ready state — re-polled (step 5).
+  5. **Deploy→onboard race tolerance.** Steps 3–4 run inside a bounded re-poll loop (`_await_service_type`). Onboarding is triggered by a **different** operator action — Keycloak client registration → admin event → NATS — from the label patch, and the two are **not atomic**, so this node can run *before* the operator has patched the `rossoctl.io/type` label onto the pod (or even before the pod exists). A briefly-absent label or a not-yet-created pod is therefore a transient race, re-polled up to `ONBOARD_LABEL_WAIT_ATTEMPTS` times (default `15`) with `ONBOARD_LABEL_WAIT_BACKOFF` seconds between looks (default `2.0` — ≈30s of slack, well under the NATS `AckWait` and the system-test convergence poll). Budget exhausted → `502` naming the workload + label (the unchanged contract for a genuinely never-labelled workload). A Kubernetes API failure (step 3) or a present-but-invalid label (step 4) breaks out immediately — neither is a race.
 
   > K8s access: `list` on `pods` in the target namespace (both paths).
-  > `rossoctl.io/type` is authoritative — applied by the rossoctl-operator (via the AgentRuntime CR) and propagated to pod labels; it is the operator's own agent/tool discriminator (`SkipReason`, rossoctl-operator `internal/clientreg/names.go`). The operator only registers a Keycloak client for a workload that already carries this label, so it is effectively guaranteed for operator-registered clients; a missing/invalid value still fails loud (`502`, naming the workload + label). The service's `clientId` format (SPIFFE vs plain) reflects whether SPIRE is enabled, **not** the service type, so it is not used for classification (and is why `service_id`/`entity_id` is the slash-free internal UUID, not the clientId).
+  > `rossoctl.io/type` is authoritative — applied by the rossoctl-operator (via the AgentRuntime CR) and propagated to pod labels; it is the operator's own agent/tool discriminator (`SkipReason`, rossoctl-operator `internal/clientreg/names.go`). The operator *eventually* applies it to every workload it registers, but the label patch and the Keycloak client registration are **separate, non-atomic** operator actions — and it is the **registration** that fires the onboard event — so the event can reach `classify_service` before the label is patched. This node therefore tolerates a briefly-absent label as a transient race (bounded re-poll, step 5) rather than a hard failure; only a genuinely never-applied label (budget exhausted) or a present-but-invalid value fails loud (`502`, naming the workload + label). The service's `clientId` format (SPIFFE vs plain) reflects whether SPIRE is enabled, **not** the service type, so it is not used for classification (and is why `service_id`/`entity_id` is the slash-free internal UUID, not the clientId).
 
 - **`analyze_agent`**: non-LLM node; reads AgentCard CR.
   1. LIST `AgentCard` CRs (`agent.rossoctl.dev/v1alpha1`) in `namespace`; find the one whose
      `spec.targetRef.name` is `workload_name` (the operator names the CR after the Deployment, e.g.
      `{workload}-deployment-card`, **not** after the workload — so match by `targetRef`, falling back
      to `metadata.name == workload_name` for hand-authored cards).
-  2. **AgentCard with synced skills found** → produce `ServiceProvision`:
-     - `roles`: `[RoleDefinition(name=f"{workloadName}.agent", description="Agent role")]`
-     - `scopes`: `[ScopeDefinition(name=f"{workloadName}.{skill.id}", description=skill.description) for skill in card.status.card.skills]` —
-       the operator syncs the fetched A2A card onto `status.card`; each skill's machine `id`
-       (e.g. `source_operations`) is used for the scope name (a stable identifier), not the display
-       `name` (which may contain spaces).
+  2. **AgentCard with synced skills found** → produce `ServiceProvision`. The operator syncs the fetched
+     A2A card onto `status.card`; each skill's **key** is its machine `id` (e.g. `source_operations`, a
+     stable identifier), or its display `name` as a fallback for a hand-authored card that omits `id` — a
+     skill with **neither** is an unusable card → `502` (naming the workload + the offending skill). From
+     that `skill_key`, **per skill**:
+     - `scopes`: `[ScopeDefinition(name=f"{workloadName}.{skill_key}", description=skill.description) for skill in card.status.card.skills]` —
+       the machine `id` (not the display `name`, which may contain spaces) so the scope name is a stable Keycloak identifier.
+     - `roles`: **one operator role per skill, mirroring the scope** — `[RoleDefinition(name=f"{workloadName}.{skill_key}", description=skill.description) for skill in …]`.
+       Role name == scope name is fine (a realm role and a client scope are distinct Keycloak objects); the **role's
+       description** is what the PRB capability-match reads to confine and grant the agent's outbound access on a domain
+       basis (see [`policy-rules-builder.md`](policy-rules-builder.md)). This **replaces** the prior single generic
+       `{workloadName}.agent`/"Agent role".
      - `reasoning`: `f"derived from AgentCard: {len(skills)} skills"`
-  3. **No AgentCard, or its `status.card` has no synced skills yet** → produce minimal `ServiceProvision`:
-     - `roles`: `[RoleDefinition(name=f"{workloadName}.agent", description="Agent role")]`
+  3. **No AgentCard, or its `status.card` has no synced skills yet** (only once the step-4 card-sync wait is exhausted) → produce minimal `ServiceProvision`:
+     - `roles`: `[RoleDefinition(name=f"{workloadName}.access", description="Default access scope")]`
      - `scopes`: `[ScopeDefinition(name=f"{workloadName}.access", description="Default access scope")]`
      - `reasoning`: `"partial: no AgentCard found, default scope assigned"` (no CR) or
        `"partial: AgentCard has no synced skills, default scope assigned"` (CR present, unsynced).
+  4. **Deploy→onboard race tolerance (AgentCard skill sync).** Steps 1–2 run inside a bounded re-poll loop (`_await_agent_skills`) — a **second, later** race than the `classify_service` label race (step 5 there). The operator syncs the fetched A2A card onto `status.card.skills` only **after** the agent pod is Ready, which lags the Keycloak client registration that fires onboarding, so this node can run while `status.card.skills` is still empty. An absent card, or a card whose skills have not synced yet, is therefore a transient not-ready state, re-polled up to `ONBOARD_CARD_WAIT_ATTEMPTS` times (default `15`) with `ONBOARD_CARD_WAIT_BACKOFF` seconds between looks (default `2.0` — ≈30s of slack, the same budget as the label wait, well under the NATS `AckWait`). It returns as soon as skills appear; the step-3 card-less / skill-less fallback applies **only after** the budget is exhausted — so a genuinely card-less legacy deployment still degrades gracefully, while a real deploy→onboard card-sync race is absorbed rather than mis-provisioned at the default scope. A Kubernetes API failure on the AgentCard LIST is an immediate `502` — not a race.
 
   > K8s access: `list` on `agentcards.agent.rossoctl.dev` in the target namespace.
 
-- **`analyze_tool`**: non-LLM node; discovers MCP tools. `namespace` + `workload_name` are already resolved by `classify_service` (from the `client.name` split). MCP endpoint lookup uses the **hybrid Keycloak→K8s strategy** decided in issue [`6.2`](../../../issues/agent/service-onboarding/6.2-analyze-tool-lookup-strategy.md): the Keycloak client name supplied the key `{namespace, workload_name}`; K8s supplies the reachable endpoint.
+- **`analyze_tool`**: non-LLM node; discovers MCP tools. `namespace` + `workload_name` are already resolved by `classify_service` (from the `client.name` split). MCP endpoint lookup uses the **hybrid Keycloak→K8s strategy** decided in issue `6.2` (analyze-tool lookup strategy): the Keycloak client name supplied the key `{namespace, workload_name}`; K8s supplies the reachable endpoint.
   1. Locate MCP endpoint:
      a. GET the K8s `Service` named `workload_name` in `namespace` (operator convention: Service name == workload name).
      b. Require the `protocol.rossoctl.io/mcp` label present on that Service; `502` (actionable) if absent — the label is applied at deploy time, not stamped by the operator.

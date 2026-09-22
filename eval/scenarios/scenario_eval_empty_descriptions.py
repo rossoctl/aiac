@@ -1,7 +1,7 @@
 """Scenario 10 — empty descriptions: 1 user, 1 agent, 1 tool, agriculture/irrigation domain.
 
 Companion to ``scenario_eval_baseline.py`` (Scenario 1) for ``test_policy_pipeline_eval.py`` (spec:
-``docs/specs/eval/policy-eval-scenarios.md``). Isolates one aspect: entity, role, and
+``docs/evaluation/policy-eval-scenarios.md``). Isolates one aspect: entity, role, and
 scope descriptions are empty or near-empty, so the PRB has no semantic content to infer intent
 from beyond the bare identifiers themselves. Only the policy document's explicit, plainly-worded
 grant sentences carry any meaning in this scenario — every (role, scope) pair below is named
@@ -28,11 +28,11 @@ AGENTS: dict[str, dict] = {
     "team1/irrigation-agent": {
         "description": "",
         "inbound_scopes": {
-            "agent-scope-irrigation-access": "",
+            "agent-scope-groundskeeper": "",
         },
         "delegation_scopes": {},
         "roles": {
-            "agent-role-irrigation-operations": "",
+            "agent-role-groundskeeper": "",
         },
     },
 }
@@ -64,12 +64,12 @@ USER_ROLES: dict[str, str] = {
 # --- Role -> access facts (name-level; the single source of truth) --------------------------
 
 INBOUND_PAIRS: list[tuple[str, str]] = [
-    ("user-role-field-operator", "agent-scope-irrigation-access"),
+    ("user-role-field-operator", "agent-scope-groundskeeper"),
 ]
 
 OUTBOUND_PAIRS: list[tuple[str, str]] = [
-    ("agent-role-irrigation-operations", "tool-scope-valve-open"),
-    ("agent-role-irrigation-operations", "tool-scope-valve-close"),
+    ("agent-role-groundskeeper", "tool-scope-valve-open"),
+    ("agent-role-groundskeeper", "tool-scope-valve-close"),
 ]
 
 OUTBOUND_SUBJECT_PAIRS: list[tuple[str, str]] = [
