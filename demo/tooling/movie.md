@@ -56,6 +56,7 @@ two bundles never overwrite each other's output.
 
 ```
 demo/tooling/movie/          the build (source, versioned)
+  slides-src/*.png  the authored diagrams — source, not build output
   read_capture.py   stage 1
   narrate.py        stage 2
   player.html       the replay page (1920x1080)
@@ -496,8 +497,15 @@ just been walked through, and the outro is argument alone rather than another di
 `i0` and `o1` are **built** (`build_title.py`, `build_outro.py`) rather than supplied,
 so their wording and counts track the film without a re-export.
 
-The six supplied PNGs are copied into `<bundle>/movie/slides/` so the film has no
-dependency on `~/Downloads`.
+The six authored diagrams are **committed** under `demo/tooling/movie/slides-src/`
+(4.5 MB) and staged into `<bundle>/movie/slides/` by `prep_slides.py`. They are source
+in the same sense as `slides.py`: without them a clean checkout cannot rebuild the
+film, and `demo/out/` is ignored precisely because everything in it is reproducible.
+`title.png`, `outro.png` and any `*.crop.png` stay out of git — their generators are
+committed instead.
+
+Verified: emptying `<bundle>/movie/slides/` and running `prep_slides.py`,
+`build_title.py`, `build_outro.py` restores all nine images.
 
 - `slides.py` holds the id, anchor, title, spoken script and optional `crop` for
   each. A `crop` exists because a source PNG can carry something that should not be on
