@@ -101,16 +101,13 @@ USER_PASSWORD = "password"
 # is denied everywhere by deny-by-default.
 USER_ROLES: dict[str, str] = {
     "user-role-developer": (
-        "Developer: an engineer who builds out the codebase and resolves bugs logged in the issue "
-        "tracker."
+        "Developer: an engineer who builds out the codebase and resolves bugs logged in the issue tracker."
     ),
     "user-role-tester": (
         "Tester: a QA specialist whose job is verifying quality and following defects through the "
         "issue tracker — filing them, triaging them, and keeping them updated."
     ),
-    "user-role-devops": (
-        "DevOps: handles deployment infrastructure and the runtime environment."
-    ),
+    "user-role-devops": ("DevOps: handles deployment infrastructure and the runtime environment."),
 }
 
 # --- Role -> access facts (name-level; the single source of truth) --------------------------

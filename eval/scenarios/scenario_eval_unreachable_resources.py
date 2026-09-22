@@ -46,9 +46,7 @@ AGENTS: dict[str, dict] = {
         },
     },
     "team1/billing-agent": {
-        "description": (
-            "Autonomous Agent that manages patient billing and invoicing."
-        ),
+        "description": ("Autonomous Agent that manages patient billing and invoicing."),
         "inbound_scopes": {
             "agent-scope-biller": (
                 "Scope granting use of the billing agent's invoicing capability — creating and "
@@ -57,9 +55,7 @@ AGENTS: dict[str, dict] = {
         },
         "delegation_scopes": {},
         "roles": {
-            "agent-role-biller": (
-                "Covers read and write access to patient invoices."
-            ),
+            "agent-role-biller": ("Covers read and write access to patient invoices."),
         },
     },
 }
@@ -83,9 +79,7 @@ TOOLS: dict[str, dict] = {
             "operations against a patient's insurance details."
         ),
         "scopes": {
-            "tool-scope-insurance-verify": (
-                "Verify a patient's insurance coverage details."
-            ),
+            "tool-scope-insurance-verify": ("Verify a patient's insurance coverage details."),
         },
     },
 }
@@ -100,8 +94,7 @@ USER_PASSWORD = "password"
 
 USER_ROLES: dict[str, str] = {
     "user-role-front-desk-clerk": (
-        "Front Desk Clerk — schedules appointments and reads and updates patient "
-        "records through the intake agent."
+        "Front Desk Clerk — schedules appointments and reads and updates patient records through the intake agent."
     ),
 }
 

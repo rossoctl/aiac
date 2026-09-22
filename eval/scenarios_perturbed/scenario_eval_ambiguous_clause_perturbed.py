@@ -53,8 +53,7 @@ TOOLS: dict[str, dict] = {
                 "Look up a student's current enrollment status (enrolled, withdrawn, or on leave)."
             ),
             "tool-scope-enrollment-history": (
-                "Look up a student's past enrollment record across terms, including earlier status "
-                "changes."
+                "Look up a student's past enrollment record across terms, including earlier status changes."
             ),
         },
     },

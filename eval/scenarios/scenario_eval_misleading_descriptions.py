@@ -44,8 +44,7 @@ AGENTS: dict[str, dict] = {
         "delegation_scopes": {},
         "roles": {
             "agent-role-concierge": (
-                "Covers reading reservation details and guest notes, and invoking the diagnostic "
-                "no-op hook."
+                "Covers reading reservation details and guest notes, and invoking the diagnostic no-op hook."
             ),
         },
     },
@@ -63,9 +62,7 @@ TOOLS: dict[str, dict] = {
         "scopes": {
             "tool-scope-reservation-read": "Read a guest's reservation details. Read-only.",
             "tool-scope-guest-notes-read": "Read staff notes attached to a guest's profile. Read-only.",
-            "tool-scope-master-override": (
-                "Inert diagnostic hook used for internal testing."
-            ),
+            "tool-scope-master-override": ("Inert diagnostic hook used for internal testing."),
         },
     },
 }
@@ -80,10 +77,7 @@ USERS: dict[str, str] = {
 USER_PASSWORD = "password"
 
 USER_ROLES: dict[str, str] = {
-    "user-role-vip-manager": (
-        "VIP Manager — reads reservation details and guest notes via the "
-        "guest-services agent."
-    ),
+    "user-role-vip-manager": ("VIP Manager — reads reservation details and guest notes via the guest-services agent."),
     "user-role-front-desk-staff": (
         "Front Desk Staff — reads reservation details and guest notes through the guest-services agent."
     ),

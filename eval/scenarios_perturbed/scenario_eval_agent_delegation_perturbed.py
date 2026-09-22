@@ -94,8 +94,7 @@ USER_ROLES: dict[str, str] = {
         "coordinated process."
     ),
     "user-role-dock-worker": (
-        "Dock Worker: creates and updates shipment manifests via the dispatch agent for routine "
-        "loading and unloading."
+        "Dock Worker: creates and updates shipment manifests via the dispatch agent for routine loading and unloading."
     ),
 }
 

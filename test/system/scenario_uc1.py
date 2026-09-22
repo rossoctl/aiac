@@ -82,10 +82,7 @@ USER_ROLES: dict[str, str] = {
         "Tester — a quality-assurance user who verifies software quality and tracks defects through "
         "the issue tracker: filing, triaging, and updating issue reports."
     ),
-    "devops": (
-        "DevOps — an operations user who manages deployment infrastructure and runtime "
-        "environments."
-    ),
+    "devops": ("DevOps — an operations user who manages deployment infrastructure and runtime environments."),
 }
 
 # --- Discovered entities (what real UC-1 onboarding provisions) -----------------------------

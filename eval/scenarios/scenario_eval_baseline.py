@@ -117,10 +117,7 @@ USER_ROLES: dict[str, str] = {
         "Tester — a quality-assurance user who verifies software quality and tracks defects through "
         "the issue tracker: filing, triaging, and updating issue reports."
     ),
-    "user-role-devops": (
-        "DevOps — an operations user who manages deployment infrastructure and runtime "
-        "environments."
-    ),
+    "user-role-devops": ("DevOps — an operations user who manages deployment infrastructure and runtime environments."),
 }
 
 # --- Role -> access facts (name-level; the single source of truth) --------------------------

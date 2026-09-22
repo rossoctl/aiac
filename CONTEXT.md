@@ -112,10 +112,10 @@ _Avoid_: using unqualified "Conflict" for this.
 
 **Agentic role/scope** (a.k.a. **system role/scope**):
 The identity an IdP role or scope carries in the running system — what a tool or
-agent *is* or *does* — as stated in its IdP **description**. A **neutral
+agent _is_ or _does_ — as stated in its IdP **description**. A **neutral
 definition**: it names capability and domain, never authorization effect. The
 PRB reads these descriptions as grant / context signals, but the allow/deny
-*effect* comes from the policy, never from the description.
+_effect_ comes from the policy, never from the description.
 _Avoid_: permission, entitlement; calling the description itself a grant or deny.
 
 **Policy role/access**:
@@ -123,7 +123,7 @@ A role or access category the **policy** defines in its own **domain-knowledge**
 section (see **Digested policy**) — e.g. "technical personnel", "customer-facing".
 Distinct from an **agentic role/scope**: a concept the policy reasons over, not an
 IdP object. Also a **neutral definition** — domain knowledge describes what these
-roles/accesses *are*; whether a subject may or may not do something lives only in
+roles/accesses _are_; whether a subject may or may not do something lives only in
 the policy's **direct grants**.
 _Avoid_: conflating with agentic role/scope; encoding effect in the definition.
 
@@ -132,8 +132,8 @@ The precondition that any _definition_ — an **agentic role/scope** description
 a **policy role/access** in domain knowledge — states **identity, never effect**:
 it must not carry approve/deny language ("approves", "denies", and the like).
 Authorization effect lives solely in the policy's grant/deny **statements**. A
-definition that leaks effect (e.g. a role described *"works in issues, not
-source"*) is **malformed input**, not a deny source — which is why a
+definition that leaks effect (e.g. a role described _"works in issues, not
+source"_) is **malformed input**, not a deny source — which is why a
 description-only prohibition yields no durable DENY (see the PRB spec's _digested
 input retires exclusivity handling and Door B_ decision). Enforcement is tracked
 in the neutrality-guard follow-up (`rossoctl/aiac`).

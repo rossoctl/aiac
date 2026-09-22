@@ -64,10 +64,7 @@ USER_ROLES: dict[str, str] = {
     # Deny-by-default control: devops appears in no INBOUND/OUTBOUND pair below. Its description is
     # deliberately unrelated to source and issue work, so the PRB derives no agent or tool scope for
     # it and deny-by-default leaves devops-user denied everywhere.
-    "devops": (
-        "DevOps — an operations user who manages deployment infrastructure and runtime "
-        "environments."
-    ),
+    "devops": ("DevOps — an operations user who manages deployment infrastructure and runtime environments."),
 }
 
 # name -> description. The github-agent's client roles — the per-skill operator roles, named to
