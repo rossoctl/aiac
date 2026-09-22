@@ -180,12 +180,21 @@ def test_parse_report_extracts_passing_robustness_mechanical_entry(tmp_path: Pat
     assert entry.precision == 1.0
 
 
-def test_parse_report_semantic_robustness_entry_has_its_own_display_suite(tmp_path: Path) -> None:
-    """The semantic-tier invariance test doesn't feed the trend log (#2467 is still open), but its
-    entries should still surface in the drill-down under their own label, not vanish."""
+def test_parse_report_semantic_robustness_entries_get_their_own_suites(tmp_path: Path) -> None:
+    """The semantic-tier invariance and sensitivity tests each feed the trend log under their own
+    suite (`robustness_semantic_invariance`/`robustness_semantic_sensitivity`, mirroring
+    `eval/conftest.py`'s `_ROBUSTNESS_TEST_MARKERS`) -- confirming their drill-down entries link up
+    with their trend-log rows instead of falling through to a mismatched or missing suite label."""
     body = (
-        "## passed (1)\n\n"
+        "## passed (2)\n\n"
         "### `eval/test_policy_pipeline_robustness.py::test_prb_invariant_to_semantic_perturbation[baseline]`\n"
+        "- **Precision:** 1.000\n"
+        "- **Recall:** 1.000\n"
+        "- **Denial precision:** 1.000\n"
+        "- **Over-grants:** none\n"
+        "- **Under-grants:** none\n"
+        "- **Incorrectly denied:** none\n\n"
+        "### `eval/test_policy_pipeline_robustness.py::test_prb_sensitive_to_semantic_perturbation[baseline]`\n"
         "- **Precision:** 1.000\n"
         "- **Recall:** 1.000\n"
         "- **Denial precision:** 1.000\n"
@@ -197,7 +206,8 @@ def test_parse_report_semantic_robustness_entry_has_its_own_display_suite(tmp_pa
 
     report = parse_report(path)
 
-    assert report.entries[0].suite == "robustness_semantic"
+    assert report.entries[0].suite == "robustness_semantic_invariance"
+    assert report.entries[1].suite == "robustness_semantic_sensitivity"
 
 
 def test_parse_report_non_correctness_entry_has_no_suite(tmp_path: Path) -> None:
