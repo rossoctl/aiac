@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from eval.trend_log import append_row, pool_correctness_metrics
+from eval.trend_log import append_row, pool_consistency_metrics, pool_correctness_metrics
 
 
 def test_pool_empty_entries_is_vacuously_perfect() -> None:
@@ -116,6 +116,37 @@ def test_pool_multiple_scenarios_pools_by_count_not_average() -> None:
     naive_average = (0.5 + 1.0) / 2
     assert metrics["precision"] != naive_average
     assert metrics["precision"] == 10 / 11
+
+
+def test_pool_consistency_empty_entries_has_zero_disagreement_rate() -> None:
+    metrics = pool_consistency_metrics([])
+
+    assert metrics == {"scenarios_scored": 0, "disagreement_rate": 0.0}
+
+
+def test_pool_consistency_all_consistent_has_zero_disagreement_rate() -> None:
+    entries = [{"inconsistent": False}, {"inconsistent": False}, {"inconsistent": False}]
+
+    metrics = pool_consistency_metrics(entries)
+
+    assert metrics == {"scenarios_scored": 3, "disagreement_rate": 0.0}
+
+
+def test_pool_consistency_one_disagreement_out_of_several() -> None:
+    entries = [{"inconsistent": False}, {"inconsistent": True}, {"inconsistent": False}, {"inconsistent": False}]
+
+    metrics = pool_consistency_metrics(entries)
+
+    assert metrics["scenarios_scored"] == 4
+    assert metrics["disagreement_rate"] == 0.25
+
+
+def test_pool_consistency_all_disagree() -> None:
+    entries = [{"inconsistent": True}, {"inconsistent": True}]
+
+    metrics = pool_consistency_metrics(entries)
+
+    assert metrics == {"scenarios_scored": 2, "disagreement_rate": 1.0}
 
 
 def test_append_row_writes_one_json_line(tmp_path: Path) -> None:
