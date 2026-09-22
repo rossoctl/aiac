@@ -50,23 +50,20 @@ def load_trend_log(path: Path = TREND_LOG_DEFAULT_PATH) -> list[dict[str, Any]]:
 
 # Nodeid substring -> suite label for the drill-down table's "Suite" column, the inverse of
 # ``eval/conftest.py``'s ``_CORRECTNESS_TEST_MARKERS``/``_ROBUSTNESS_TEST_MARKERS``. Every value
-# except `robustness_semantic` matches an actual trend-log `suite` (so a matching row can link to
-# this report's drill-down section, see ``_find_matching_report``) -- the two mechanical-tier
-# robustness tests each get their *own* suite name (`robustness_mechanical_invariance`/
-# `robustness_mechanical_sensitivity`), one per trend-log row/chart, so no separate display-name
-# override is needed to tell them apart the way one used to be. `robustness_semantic` is a
-# display-only label -- that test never writes a trend-log row (semantic-tier wiring is #2467) so
-# it never matches one, but its entries still deserve to *appear* in the drill-down instead of
-# silently vanishing because ``suite`` was `None`. A nodeid matching neither pattern
-# (``eval_extended``'s ``test_inbound``/``test_outbound``, the consistency/faithfulness suites)
-# still gets `suite=None` and is left out of this table -- a pre-existing gap this fix doesn't
-# extend to, since it wasn't reported.
+# matches an actual trend-log `suite` (so a matching row can link to this report's drill-down
+# section, see ``_find_matching_report``) -- each of the four robustness tier x family
+# combinations (mechanical/semantic x invariance/sensitivity) gets its own suite name, one per
+# trend-log row/chart, so no separate display-name override is needed to tell them apart. A
+# nodeid matching neither pattern (``eval_extended``'s ``test_inbound``/``test_outbound``, the
+# consistency/faithfulness suites) still gets `suite=None` and is left out of this table -- a
+# pre-existing gap this fix doesn't extend to, since it wasn't reported.
 _SUITE_BY_NODEID_MARKER = {
     "::test_prb_correctness[": "correctness_prb",
     "::test_e2e_correctness[": "correctness_e2e",
     "::test_prb_invariant_to_mechanical_perturbation[": "robustness_mechanical_invariance",
     "::test_prb_sensitive_to_mechanical_edit[": "robustness_mechanical_sensitivity",
-    "::test_prb_invariant_to_semantic_perturbation[": "robustness_semantic",
+    "::test_prb_invariant_to_semantic_perturbation[": "robustness_semantic_invariance",
+    "::test_prb_sensitive_to_semantic_perturbation[": "robustness_semantic_sensitivity",
 }
 
 _RUN_RE = re.compile(r"^Run: (.+)$")
