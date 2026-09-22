@@ -564,6 +564,16 @@ def test_render_scenario_table_escapes_html_and_preserves_multiline_breaks(monke
     assert "inbound: (&lt;role&gt;, scope)<br>outbound_target: (a, b)" in table
 
 
+def test_expected_scenario_count_matches_conftests_copy() -> None:
+    """`dashboard.py` deliberately keeps its own plain-constant copy of the full corpus size
+    rather than importing `eval.conftest` (see the module docstring), so nothing else catches the
+    two drifting apart if the corpus grows and only one copy gets bumped -- this test is that
+    catch."""
+    from eval import conftest, dashboard
+
+    assert dashboard._EXPECTED_SCENARIO_COUNT == conftest._EXPECTED_SCENARIO_COUNT
+
+
 def test_render_scenario_table_excludes_a_suite_with_fewer_than_the_full_corpus() -> None:
     """A suite with only 1 of the expected 8 scenario entries in this report (a `-k`-filtered
     debug run) is dropped from the drill-down entirely, at the real, unpatched
@@ -582,6 +592,34 @@ def test_render_scenario_table_excludes_a_suite_with_fewer_than_the_full_corpus(
     )
 
     assert render_scenario_table(report) == ""
+
+
+def test_render_scenario_table_keeps_a_suite_with_more_than_the_full_corpus(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A suite with *more* entries than `_EXPECTED_SCENARIO_COUNT` (the corpus grew and this
+    module's copy of the constant hasn't caught up yet) is still a genuinely complete run and must
+    render -- the partial-run filter is "at least the full count", not "exactly", so it never
+    punishes a suite for having grown."""
+    monkeypatch.setattr("eval.dashboard._EXPECTED_SCENARIO_COUNT", 1)
+    entries = [
+        ScenarioEntry(
+            nodeid=f"eval/test_policy_pipeline_correctness_prb.py::test_prb_correctness[{name}]",
+            suite="correctness_prb",
+            scenario=name,
+            category="passed",
+            precision=1.0,
+            recall=1.0,
+            denial_precision=1.0,
+        )
+        for name in ("baseline", "agent_delegation")
+    ]
+    report = ParsedReport(
+        path=Path("report_x.md"), run_at=datetime.fromisoformat("2026-09-10T07:00:00+00:00"), entries=entries
+    )
+
+    table = render_scenario_table(report)
+
+    assert "baseline" in table
+    assert "agent_delegation" in table
 
 
 def test_render_scenario_table_keeps_a_full_suite_but_drops_a_partial_one_in_the_same_report() -> None:

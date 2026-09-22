@@ -391,12 +391,15 @@ def render_scenario_table(report: ParsedReport) -> str:
     produces one scenario's worth of entries for *each* robustness test function it touches). So
     "partial" is decided per (report, suite) here: a suite's entries within this one report are
     dropped if that suite has fewer than ``_EXPECTED_SCENARIO_COUNT`` of them -- mirroring
-    ``_write_trend_log``'s own ``== _EXPECTED_SCENARIO_COUNT`` full-run test, so a report entry
-    the trend chart would have excluded as partial (had it fed the trend log at all) doesn't linger
-    in the drill-down as an unlabeled, easy-to-mistake-for-real debug run."""
+    ``_write_trend_log``'s own ``== _EXPECTED_SCENARIO_COUNT`` full-run test in spirit, but as
+    "at least" rather than "exactly": a suite with *more* than the expected count (an expanded
+    corpus this constant hasn't caught up with yet) is still a genuinely complete run and should
+    render, not vanish. A report entry the trend chart would have excluded as partial (had it fed
+    the trend log at all) doesn't linger in the drill-down as an unlabeled, easy-to-mistake-for-real
+    debug run."""
     all_scored = [e for e in report.entries if e.suite is not None]
     suite_counts = Counter(e.suite for e in all_scored)
-    scored_entries = [e for e in all_scored if suite_counts[e.suite] == _EXPECTED_SCENARIO_COUNT]
+    scored_entries = [e for e in all_scored if suite_counts[e.suite] >= _EXPECTED_SCENARIO_COUNT]
     if not scored_entries:
         return ""
     rows_html = "".join(
