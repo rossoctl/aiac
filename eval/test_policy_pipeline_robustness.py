@@ -1,7 +1,8 @@
-"""PRB robustness suite — invariance and sensitivity families, mechanical tier (spec:
-``docs/evaluation/eval-framework.md`` §4, ``docs/evaluation/policy-eval-robustness-consistency.md``).
+"""PRB robustness suite — invariance and sensitivity families, both mechanical and semantic tiers
+(spec: ``docs/evaluation/eval-framework.md`` §4, ``docs/evaluation/policy-eval-robustness-
+consistency.md``; semantic-tier sensitivity and both tiers' trend-log wiring: #2467).
 
-Three independent checks, each its own test function/metric — never blended into one pass/fail
+Four independent checks, each its own test function/metric — never blended into one pass/fail
 (spec §4's explicit requirement):
 
 1. ``test_prb_invariant_to_mechanical_perturbation`` — **invariance family, mechanical tier**. A
@@ -12,29 +13,35 @@ Three independent checks, each its own test function/metric — never blended in
 2. ``test_prb_invariant_to_semantic_perturbation`` — **invariance family, semantic tier**. A
    hand-authored, meaning-preserving reworded sibling scenario module from
    ``eval/scenarios_perturbed/``. Same ground truth, same pass criterion as (1), kept as its own
-   test/metric so a semantic-tier failure never gets attributed to the mechanical-tier metrics (1)
-   feeds to the trend log (spec §9) — semantic-tier trend-log wiring is out of scope here (tracked
-   separately as #2467).
-3. ``test_prb_sensitive_to_mechanical_edit`` — **sensitivity family, mechanical tier** (new).  A
+   test/metric so a semantic-tier failure never gets attributed to the mechanical-tier metrics.
+3. ``test_prb_sensitive_to_mechanical_edit`` — **sensitivity family, mechanical tier**. A
    deterministic, programmatically-applied minimal edit (``SENSITIVITY_EDITS``) that *deliberately*
    changes meaning — negation, a role swap, an added exception clause, or a restriction word
    ("only"/"just") inserted to narrow an existing grant — so ground truth is *deliberately
    different* from the original. Pass = the output changes to exactly the new, edited ground
    truth. Without this family, "robust" and "broken" (a model that ignores the policy text and
    always emits the same grants) would be indistinguishable — see spec §4.
+4. ``test_prb_sensitive_to_semantic_perturbation`` — **sensitivity family, semantic tier** (#2467).
+   A hand-authored, meaning-*changing* reworded sibling from ``eval/scenarios_perturbed/
+   scenario_eval_<name>_sensitive_perturbed.py`` — the same edit_type and truth delta as (3)'s
+   ``SENSITIVITY_EDITS`` entry for that scenario (reused directly via ``SEMANTIC_SENSITIVITY_
+   SCENARIOS``), expressed as full paraphrase (e.g. "solely"/"exclusively") instead of a literal
+   word insertion. Every one is signed off in ``eval/scenarios_perturbed/SIGNOFF.md`` (enforced by
+   ``eval/test_semantic_signoff.py``) before entering the corpus, per spec §4's human-sign-off
+   requirement for semantic perturbations.
 
-All three call ``orchestrate_prb(..., best_effort=True)``: a mangled/reworded/edited input can read,
+All four call ``orchestrate_prb(..., best_effort=True)``: a mangled/reworded/edited input can read,
 to the auditor, as a genuine contradiction against a coarser-grained inbound scope's own
 description (a partial grant/prohibit within one bundled scope) — best-effort falls back to the
 last-proposed (never-approved) rule instead of aborting the whole scenario, same rationale and
 mechanism as the two correctness suites, so every scenario always scores instead of reporting
 "unavailable." A rejection is itself informative (the PRB failing closed rather than cleanly
-re-deciding), not a harness bug — all three ``record_property("best_effort_notes", ...)`` and print
+re-deciding), not a harness bug — all four ``record_property("best_effort_notes", ...)`` and print
 a summary line when non-empty, same convention as the correctness suites.
 
-All three variants' grant sets are compared against a truth table via ``truth``
-(``eval.test_policy_pipeline_eval``) — for (1)/(2) the *original* scenario's truth, for (3) that
-truth with the edit's known delta applied. Scoped to the PRB's raw output only — see
+All four variants' grant sets are compared against a truth table via ``truth``
+(``eval.test_policy_pipeline_eval``) — for (1)/(2) the *original* scenario's truth, for (3)/(4)
+that truth with the edit's known delta applied. Scoped to the PRB's raw output only — see
 ``test_policy_pipeline_consistency.py`` for the same no-Keycloak rationale, which applies here
 unchanged.
 
@@ -46,18 +53,19 @@ comparing the effect-blind set would make a correct explicit-deny response indis
 an unchanged grant and silently fail a case that should pass (confirmed live: ``empty_descriptions``
 initially failed the sensitivity check this way despite the PRB denying every pair it should have).
 
-(1) and (3) each ``record_property`` a boolean (``"invariant"``/``"sensitive"``) plus, via the
+Each of the four ``record_property``s a boolean (``"invariant"``/``"sensitive"``) plus, via the
 shared ``_record_scoring`` helper, ``"true_positives"``/``"denied_total"`` — the same raw counts
-``test_prb_correctness`` records. ``eval/conftest.py``'s ``_write_trend_log`` pools each family
+``test_prb_correctness`` records. ``eval/conftest.py``'s ``_write_trend_log`` pools each family/tier
 across the run into its *own* committed trend-log row — ``suite="robustness_mechanical_invariance"``
-for (1), ``suite="robustness_mechanical_sensitivity"`` for (3) — carrying that family's own
-precision/recall/denial_precision (``eval.trend_log.pool_correctness_metrics``, the same pooling
-the two Correctness suites use, so the resulting charts are directly comparable to them: one
-measuring performance against the *original* inputs, the other against *deliberately edited*
-inputs) plus that family's own pass/fail rate (``invariance_rate``/``sensitivity_rate`` — spec §9),
-never blended between the two rows.
+for (1), ``robustness_semantic_invariance`` for (2), ``robustness_mechanical_sensitivity`` for (3),
+``robustness_semantic_sensitivity`` for (4) — carrying that row's own precision/recall/
+denial_precision (``eval.trend_log.pool_correctness_metrics``, the same pooling the two
+Correctness suites use, so the resulting charts are directly comparable to them: one measuring
+performance against the *original* inputs, the others against *deliberately edited/reworded*
+inputs) plus that row's own pass/fail rate (``invariance_rate``/``sensitivity_rate`` — spec §9),
+never blended across rows.
 
-All three additionally ``record_property`` (via the shared ``_record_scoring`` helper), purely for
+All four additionally ``record_property`` (via the shared ``_record_scoring`` helper), purely for
 the Markdown report: what the perturbation/edit actually was (``"perturbation"``), the full
 expected and actual (ALLOW-only) per-gate grant lists (``"expected_grants"``/``"actual_grants"``),
 and the same precision/recall/denial-precision/over-grants/under-grants/incorrectly-denied
@@ -90,15 +98,24 @@ sys.path.insert(0, str(SRC))  # so ``import aiac.*`` resolves
 from aiac.policy.model.models import PolicyRule, RuleEffect  # noqa: E402
 from eval.correctness_scorer import score_scenario  # noqa: E402
 from eval.prb_direct import build_roles_and_scopes  # noqa: E402
+from eval.scenarios_digested import digested_policy_path  # noqa: E402
 from eval.scenarios_perturbed import (  # noqa: E402
     scenario_eval_agent_delegation_perturbed,
+    scenario_eval_agent_delegation_sensitive_perturbed,
     scenario_eval_ambiguous_clause_perturbed,
+    scenario_eval_ambiguous_clause_sensitive_perturbed,
     scenario_eval_baseline_perturbed,
+    scenario_eval_baseline_sensitive_perturbed,
     scenario_eval_confusable_agents_perturbed,
+    scenario_eval_confusable_agents_sensitive_perturbed,
     scenario_eval_empty_descriptions_perturbed,
+    scenario_eval_empty_descriptions_sensitive_perturbed,
     scenario_eval_misleading_descriptions_perturbed,
+    scenario_eval_misleading_descriptions_sensitive_perturbed,
     scenario_eval_unreachable_resources_perturbed,
+    scenario_eval_unreachable_resources_sensitive_perturbed,
     scenario_eval_wildcard_grant_perturbed,
+    scenario_eval_wildcard_grant_sensitive_perturbed,
 )
 from eval.test_policy_pipeline_eval import (  # noqa: E402
     SCENARIOS,
@@ -117,6 +134,23 @@ PERTURBED_SCENARIOS: dict[str, ModuleType] = {
     "misleading_descriptions": scenario_eval_misleading_descriptions_perturbed,
     "confusable_agents": scenario_eval_confusable_agents_perturbed,
     "empty_descriptions": scenario_eval_empty_descriptions_perturbed,
+}
+
+# Semantic tier, sensitivity family (#2467): hand-authored, meaning-CHANGING reworded siblings —
+# each realizes the exact same edit type and truth delta as its SENSITIVITY_EDITS counterpart
+# below, expressed as a full natural paraphrase instead of a literal find/replace. Every one of
+# these, and their paired policy .md, has a recorded human sign-off in
+# eval/scenarios_perturbed/SIGNOFF.md (enforced by eval/test_semantic_signoff.py) before entering
+# this corpus, per spec §4.
+SEMANTIC_SENSITIVITY_SCENARIOS: dict[str, ModuleType] = {
+    "baseline": scenario_eval_baseline_sensitive_perturbed,
+    "agent_delegation": scenario_eval_agent_delegation_sensitive_perturbed,
+    "unreachable_resources": scenario_eval_unreachable_resources_sensitive_perturbed,
+    "ambiguous_clause": scenario_eval_ambiguous_clause_sensitive_perturbed,
+    "wildcard_grant": scenario_eval_wildcard_grant_sensitive_perturbed,
+    "misleading_descriptions": scenario_eval_misleading_descriptions_sensitive_perturbed,
+    "confusable_agents": scenario_eval_confusable_agents_sensitive_perturbed,
+    "empty_descriptions": scenario_eval_empty_descriptions_sensitive_perturbed,
 }
 
 
@@ -250,8 +284,7 @@ def test_prb_invariant_to_mechanical_perturbation(
         name: scope.model_copy(update={"description": _mangle_text(scope.description or "")})
         for name, scope in scopes.items()
     }
-    policy_path = Path(scenario.__file__).resolve().parent / scenario.POLICY_FILE
-    mech_policy_text = _mangle_text(policy_path.read_text(encoding="utf-8"))
+    mech_policy_text = _mangle_text(digested_policy_path(scenario).read_text(encoding="utf-8"))
     mech_policy_path = tmp_path / f"{scenario_name}.mechanical.md"
     mech_policy_path.write_text(mech_policy_text)
     monkeypatch.setenv("AIAC_POLICY_FILE", str(mech_policy_path))
@@ -289,9 +322,8 @@ def test_prb_invariant_to_semantic_perturbation(
 ) -> None:
     """Invariance family, semantic tier: the PRB's grant decision is unchanged under a
     hand-authored, meaning-preserving reworded sibling scenario (``eval/scenarios_perturbed/``),
-    compared against the *original* scenario's truth table. Intentionally not wired into the
-    trend log (that suite's ``invariance_rate`` is mechanical-tier only, per this suite's module
-    docstring) — semantic-tier trend-log wiring is tracked separately as #2467. Calls
+    compared against the *original* scenario's truth table. Wired into its own trend-log row
+    (``suite="robustness_semantic_invariance"``, #2467) — see this module's docstring. Calls
     ``orchestrate_prb(..., best_effort=True)`` for the same reason as the mechanical tier and the
     sensitivity test: a rejected decision still scores via the last-proposed, never-approved rule
     instead of aborting the whole scenario."""
@@ -301,8 +333,7 @@ def test_prb_invariant_to_semantic_perturbation(
 
     perturbed = PERTURBED_SCENARIOS[scenario_name]
     p_roles, p_scopes = build_roles_and_scopes(perturbed)
-    p_policy_path = Path(perturbed.__file__).resolve().parent / perturbed.POLICY_FILE
-    monkeypatch.setenv("AIAC_POLICY_FILE", str(p_policy_path))
+    monkeypatch.setenv("AIAC_POLICY_FILE", str(digested_policy_path(perturbed)))
     sem_rules, _, _, best_effort_notes = orchestrate_prb(p_roles, p_scopes, perturbed, best_effort=True)
     granted = _record_scoring(
         record_property,
@@ -318,10 +349,12 @@ def test_prb_invariant_to_semantic_perturbation(
     )
 
     mismatches = {gate: want[gate] ^ granted[gate] for gate in want if want[gate] != granted[gate]}
+    invariant = not mismatches
+    record_property("invariant", invariant)
     record_property("best_effort_notes", best_effort_notes)
     if best_effort_notes:
         print(f"[invariant-semantic] {scenario_name}: best_effort_notes={best_effort_notes}")
-    assert not mismatches, (
+    assert invariant, (
         f"PRB was not invariant to semantic perturbation for scenario '{scenario_name}': mismatches={mismatches}"
     )
 
@@ -369,20 +402,21 @@ class SensitivityEdit:
 SENSITIVITY_EDITS: dict[str, SensitivityEdit] = {
     "baseline": SensitivityEdit(
         edit_type="restriction_word",
-        # Replaces both issue-tracker sentences at once (not just the tester one) so the edited
-        # text stays internally consistent: developers previously had read-only tracker access via
-        # the first sentence, and "only testers may read and write" excludes them entirely --
-        # leaving that first sentence's "read the issue tracker" in place would contradict the new
-        # sentence instead of cleanly superseding it. Testers already had full read+write, so this
-        # narrows eligibility without changing testers' own grant -- a pure revoke for developers
-        # (`removed` below), with no `added` on either side.
+        # Against the DIGESTED policy, each (role, resource, operation) is already its own explicit
+        # direct-grant line -- dropping developers' tracker-read line and replacing the two tester
+        # lines with an explicit "only" narrowing keeps this edit's defining textual signal (the
+        # literal word "only") even though the digested-policy language itself forbids exclusive
+        # language in authored corpus text (see docs/specs/digested-policy.md) -- the mechanical
+        # tier deliberately tests the PRB's raw reaction to that word, not well-formed digested
+        # grammar (the semantic tier's paraphrase, "solely"/"exclusively", is #2467's analog).
+        # Testers already had full read+write, so this narrows eligibility without changing
+        # testers' own grant -- a pure revoke for developers (`removed` below), no `added` either
+        # side.
         policy_find=(
-            "Developers may read and write the source repository and read the issue tracker. "
-            "Testers may read and write the issue tracker."
+            "- Developers may read the Issue tracker. - Testers may read the Issue tracker. "
+            "- Testers may write the Issue tracker."
         ),
-        policy_replace=(
-            "Developers may read and write the source repository. Only testers may read and write the issue tracker."
-        ),
+        policy_replace="Only testers may read and write the Issue tracker.",
         description_edits={
             "user-role-developer": (
                 "who develops the source codebase (writing and maintaining code) and fixes code "
@@ -398,17 +432,26 @@ SENSITIVITY_EDITS: dict[str, SensitivityEdit] = {
     ),
     "agent_delegation": SensitivityEdit(
         edit_type="role_swap",
+        # Against the digested policy, the swap flips which role's initiate_customs_clearance_on_
+        # behalf statement is Allow vs. Deny -- the two dock-worker manifest lines sit between them
+        # in the digested text and are carried through unchanged, included only for contiguity.
         policy_find=(
-            "Shipment coordinators may create and update shipment manifests, and have customs "
-            "clearance carried out on the shipment's behalf as part of a coordinated process. Dock "
-            "workers may create and update shipment manifests for day-to-day loading and unloading; "
-            "they are not authorized to have customs clearance carried out on the shipment's behalf."
+            "- Allow: Subjects in role shipment-coordinator may perform "
+            "initiate_customs_clearance_on_behalf on resources of type shipment when the access "
+            "attribute coordinated_process = true. - Allow: Subjects in role dock-worker may perform "
+            "create_manifest on resources of type shipment_manifest. - Allow: Subjects in role "
+            "dock-worker may perform update_manifest on resources of type shipment_manifest. - Deny: "
+            "Subjects in role dock-worker may not perform initiate_customs_clearance_on_behalf on "
+            "resources of type shipment."
         ),
         policy_replace=(
-            "Shipment coordinators may create and update shipment manifests for day-to-day loading "
-            "and unloading; they are not authorized to have customs clearance carried out on the "
-            "shipment's behalf. Dock workers may create and update shipment manifests, and have "
-            "customs clearance carried out on the shipment's behalf as part of a coordinated process."
+            "- Deny: Subjects in role shipment-coordinator may not perform "
+            "initiate_customs_clearance_on_behalf on resources of type shipment. - Allow: Subjects "
+            "in role dock-worker may perform create_manifest on resources of type shipment_manifest. "
+            "- Allow: Subjects in role dock-worker may perform update_manifest on resources of type "
+            "shipment_manifest. - Allow: Subjects in role dock-worker may perform "
+            "initiate_customs_clearance_on_behalf on resources of type shipment when the access "
+            "attribute coordinated_process = true."
         ),
         description_edits={
             "user-role-shipment-coordinator": (
@@ -430,8 +473,14 @@ SENSITIVITY_EDITS: dict[str, SensitivityEdit] = {
     ),
     "unreachable_resources": SensitivityEdit(
         edit_type="negation",
-        policy_find="Front desk clerks may read and update patient records.",
-        policy_replace="Front desk clerks may not access patient records at all.",
+        policy_find=(
+            "- Allow: front desk clerks may read patient records. - Allow: front desk clerks may "
+            "update patient records."
+        ),
+        policy_replace=(
+            "- Deny: front desk clerks may not read patient records at all. - Deny: front desk "
+            "clerks may not update patient records at all."
+        ),
         description_edits={
             "user-role-front-desk-clerk": (
                 "schedules appointments and reads and updates patient records through the intake agent.",
@@ -463,8 +512,11 @@ SENSITIVITY_EDITS: dict[str, SensitivityEdit] = {
     ),
     "ambiguous_clause": SensitivityEdit(
         edit_type="negation",
-        policy_find="Enrollment advisors may access a student's enrollment information for advisory purposes.",
-        policy_replace="Enrollment advisors may not access a student's enrollment information for advisory purposes.",
+        policy_find=(
+            "1) EnrollmentAdvisor may read enrollment_record - Condition: access.purpose = advisory "
+            "- Condition: enrollment_record.time_scope = current"
+        ),
+        policy_replace="1) EnrollmentAdvisor may not read enrollment_record, under any condition, for any purpose.",
         description_edits={
             "user-role-enrollment-advisor": (
                 "Enrollment Advisor — looks up enrollment information for advising purposes.",
@@ -478,8 +530,14 @@ SENSITIVITY_EDITS: dict[str, SensitivityEdit] = {
     ),
     "wildcard_grant": SensitivityEdit(
         edit_type="negation",
-        policy_find="Inventory managers are cleared for all inventory operations.",
-        policy_replace="Inventory managers are not cleared for any inventory operations.",
+        policy_find=(
+            "- Allow: Subjects = Inventory managers; Operations = all inventory operations; "
+            "Resources = inventory resources; Conditions = none."
+        ),
+        policy_replace=(
+            "- Deny: Subjects = Inventory managers; Operations = all inventory operations; "
+            "Resources = inventory resources; Conditions = none."
+        ),
         description_edits={
             "user-role-inventory-manager": (
                 "performs all inventory operations: checking stock levels, adjusting counts, and placing reorders.",
@@ -497,8 +555,16 @@ SENSITIVITY_EDITS: dict[str, SensitivityEdit] = {
     ),
     "misleading_descriptions": SensitivityEdit(
         edit_type="exception_clause",
-        policy_find="Front desk staff may read reservation details and guest notes.",
-        policy_replace="Everyone except front desk staff may read reservation details and guest notes.",
+        # Keeps the literal "except" exclusivity signal (mechanical tier's defining trait, same
+        # rationale as baseline's literal "only" above) while still landing as an explicit Deny,
+        # matching the digested corpus's own Allow/Deny convention.
+        policy_find=(
+            "- Allow: Front desk staff may read reservation details. - Allow: Front desk staff may read guest notes."
+        ),
+        policy_replace=(
+            "- Deny: Front desk staff may not read reservation details or guest notes -- everyone "
+            "except front desk staff may read reservation details and guest notes."
+        ),
         description_edits={
             "user-role-front-desk-staff": (
                 "reads reservation details and guest notes through the guest-services agent.",
@@ -519,8 +585,8 @@ SENSITIVITY_EDITS: dict[str, SensitivityEdit] = {
     ),
     "confusable_agents": SensitivityEdit(
         edit_type="negation",
-        policy_find="Team trainers may read the team roster and update the practice schedule.",
-        policy_replace="Team trainers may not read the team roster or update the practice schedule.",
+        policy_find="- Team trainers may read the team roster. - Team trainers may update the practice schedule.",
+        policy_replace="- Team trainers may not read the team roster. - Team trainers may not update the practice schedule.",
         description_edits={
             "user-role-team-trainer": (
                 "reads the team roster and updates the practice schedule through the coaching agent.",
@@ -537,25 +603,26 @@ SENSITIVITY_EDITS: dict[str, SensitivityEdit] = {
     ),
     "empty_descriptions": SensitivityEdit(
         edit_type="negation",
-        # The policy sentence itself (not a description -- every description in this scenario is
-        # deliberately "", the whole point per its own docstring) names "the site's groundskeepers"
-        # as who "field operators" are, tying the user role to agent-role-groundskeeper by an
-        # actual textual fact rather than an inferred cascade. Without that phrase, negating only
-        # "field operators ... valves" gives a faithful PRB reading agent-role-groundskeeper's own
-        # (still-empty) description no textual reason to revoke its outbound_target reach --
-        # exactly the gap a prior review caught for this scenario.
-        policy_find="Field operators, the site's groundskeepers, may open and close irrigation valves.",
-        policy_replace="Field operators, the site's groundskeepers, may not open or close irrigation valves at all.",
+        # The user role and the agent role share one name, "grounds-worker" (user-role-grounds-
+        # worker / agent-role-grounds-worker) -- unlike an earlier revision where they were named
+        # user-role-field-operator/agent-role-groundskeeper, two different words for the same
+        # worker, which needed an explicit apposition in the policy text to ground the
+        # outbound_target cascade. With one shared name, "Grounds workers may not ..." directly
+        # names agent-role-grounds-worker too (every description in this scenario is deliberately
+        # "" -- the whole point per its own docstring -- so this policy sentence is the only signal
+        # either role gets).
+        policy_find="Direct grants - Grounds workers may open irrigation valves. - Grounds workers may close irrigation valves.",
+        policy_replace="Direct grants - Grounds workers may not open irrigation valves. - Grounds workers may not close irrigation valves.",
         description_edits={},
         removed={
-            "inbound": {("user-role-field-operator", "agent-scope-groundskeeper")},
+            "inbound": {("user-role-grounds-worker", "agent-scope-grounds-worker")},
             "outbound_subject": {
-                ("user-role-field-operator", "tool-scope-valve-open"),
-                ("user-role-field-operator", "tool-scope-valve-close"),
+                ("user-role-grounds-worker", "tool-scope-valve-open"),
+                ("user-role-grounds-worker", "tool-scope-valve-close"),
             },
             "outbound_target": {
-                ("agent-role-groundskeeper", "tool-scope-valve-open"),
-                ("agent-role-groundskeeper", "tool-scope-valve-close"),
+                ("agent-role-grounds-worker", "tool-scope-valve-open"),
+                ("agent-role-grounds-worker", "tool-scope-valve-close"),
             },
         },
     ),
@@ -590,8 +657,7 @@ def test_prb_sensitive_to_mechanical_edit(
         )
         target[name] = target[name].model_copy(update={"description": new_description})
 
-    policy_path = Path(scenario.__file__).resolve().parent / scenario.POLICY_FILE
-    normalized_text = " ".join(policy_path.read_text(encoding="utf-8").split())
+    normalized_text = " ".join(digested_policy_path(scenario).read_text(encoding="utf-8").split())
     edited_text = normalized_text.replace(edit.policy_find, edit.policy_replace)
     assert edited_text != normalized_text, (
         f"sensitivity edit for '{scenario_name}' did not match the current policy text -- "
@@ -630,4 +696,56 @@ def test_prb_sensitive_to_mechanical_edit(
         print(f"[sensitivity] {scenario_name}: best_effort_notes={best_effort_notes}")
     assert sensitive, (
         f"PRB was not sensitive to edit ({edit.edit_type}) for scenario '{scenario_name}': mismatches={mismatches}"
+    )
+
+
+@pytest.mark.parametrize("scenario_name", sorted(SCENARIOS))
+def test_prb_sensitive_to_semantic_perturbation(
+    scenario_name: str, monkeypatch: pytest.MonkeyPatch, record_property
+) -> None:
+    """Sensitivity family, semantic tier (#2467): the PRB's grant decision changes, in exactly the
+    predicted direction, under a hand-authored, meaning-changing reworded sibling
+    (``eval/scenarios_perturbed/scenario_eval_<name>_sensitive_perturbed.py`` — every one signed
+    off in ``eval/scenarios_perturbed/SIGNOFF.md`` per spec §4), compared against the original
+    scenario's truth table with that same edit's known delta applied. The delta is reused directly
+    from ``SENSITIVITY_EDITS[scenario_name]`` — the mechanical tier's own sensitivity edit for this
+    scenario — since it's a property of the meaning change, not of how it's expressed (literal
+    word insertion there, full paraphrase here). Calls ``orchestrate_prb(..., best_effort=True)``
+    for the same reason as every other test in this module: a rejected decision still scores via
+    the last-proposed, never-approved rule instead of aborting the whole scenario."""
+    require_env_or_skip("LLM_BASE_URL", "LLM_MODEL", "LLM_API_KEY")
+    scenario = SCENARIOS[scenario_name]
+    edit = SENSITIVITY_EDITS[scenario_name]
+
+    sensitive_perturbed = SEMANTIC_SENSITIVITY_SCENARIOS[scenario_name]
+    sp_roles, sp_scopes = build_roles_and_scopes(sensitive_perturbed)
+    monkeypatch.setenv("AIAC_POLICY_FILE", str(digested_policy_path(sensitive_perturbed)))
+    rules, _, _, best_effort_notes = orchestrate_prb(sp_roles, sp_scopes, sensitive_perturbed, best_effort=True)
+
+    want = truth(scenario)
+    want_edited = {gate: (want[gate] - edit.removed.get(gate, set())) | edit.added.get(gate, set()) for gate in want}
+    granted = _record_scoring(
+        record_property,
+        scenario,
+        scenario_name,
+        rules,
+        want_edited,
+        perturbation=(
+            f"Semantic tier: hand-reworded, meaning-changing sibling scenario module "
+            f"`{sensitive_perturbed.__name__}` — realizes the same edit_type ({edit.edit_type}) and "
+            "truth delta as SENSITIVITY_EDITS, expressed as full paraphrase instead of literal word "
+            "insertion. Signed off in eval/scenarios_perturbed/SIGNOFF.md."
+        ),
+    )
+
+    mismatches = {gate: granted[gate] ^ want_edited[gate] for gate in want_edited if granted[gate] != want_edited[gate]}
+    sensitive = not mismatches
+    record_property("sensitive", sensitive)
+    record_property("edit_type", edit.edit_type)
+    record_property("best_effort_notes", best_effort_notes)
+    if best_effort_notes:
+        print(f"[sensitivity-semantic] {scenario_name}: best_effort_notes={best_effort_notes}")
+    assert sensitive, (
+        f"PRB was not sensitive to semantic edit ({edit.edit_type}) for scenario '{scenario_name}': "
+        f"mismatches={mismatches}"
     )

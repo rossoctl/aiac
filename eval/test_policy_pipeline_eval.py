@@ -37,8 +37,11 @@ generalized ``probe_eval.rego`` (parameterized by ``input.agent_id``) rather tha
 
 ``scenario_eval_agent_delegation``'s data file is the one exception to the "everything lives in
 ``eval/``" rule — it sits at ``test/system/scenario_eval_agent_delegation.py`` (sibling of
-``launcher.py``/``scenario_uc1.py``), so each scenario's ``POLICY_FILE`` is resolved relative to
-*that scenario module's own directory*, not the fixed ``eval/`` directory.
+``launcher.py``/``scenario_uc1.py``). Regardless of where a scenario's own source ``POLICY_FILE``
+lives, every scenario's ``AIAC_POLICY_FILE`` is pointed at its **committed digested** counterpart
+in ``eval/scenarios_digested/`` (``digested_policy_path``, same filename) — production feeds the
+PRB only digested policy (see ``docs/specs/digested-policy.md``), so this suite runs against the
+same input shape.
 
 Run (needs KEYCLOAK_URL + admin creds + LLM_* exported, ``opa`` on PATH):
     .venv/bin/pytest eval/test_policy_pipeline_eval.py -m eval -v
@@ -162,6 +165,7 @@ from aiac.idp.configuration.models import Role, Scope  # noqa: E402
 from aiac.policy.computation.engine import compute_and_apply  # noqa: E402
 from aiac.policy.model.models import PolicyRule  # noqa: E402
 from eval.best_effort_rules import _best_effort_rules  # noqa: E402
+from eval.scenarios_digested import digested_policy_path  # noqa: E402
 
 log = logging.getLogger(__name__)
 
@@ -669,8 +673,7 @@ def _provision_scenario(name: str, idp_port: int, store_port: int, opa_port: int
             shutil.rmtree(rego_dir)
         rego_dir.mkdir(parents=True)
         db_path = Path(tempfile.mkdtemp(prefix=f"aiac-store-eval-{name}-")) / "policy_model.db"
-        scenario_dir = Path(scenario.__file__).resolve().parent
-        os.environ["AIAC_POLICY_FILE"] = str(scenario_dir / scenario.POLICY_FILE)
+        os.environ["AIAC_POLICY_FILE"] = str(digested_policy_path(scenario))
         os.environ["AIAC_PDP_CONFIG_URL"] = f"http://{idp_host}:{idp_port}"
         os.environ["AIAC_POLICY_STORE_URL"] = f"http://{store_host}:{store_port}"
         # The model-store client actually reads AIAC_POLICY_MODEL_STORE_URL, not

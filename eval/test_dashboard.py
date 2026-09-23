@@ -11,6 +11,8 @@ import re
 from datetime import datetime
 from pathlib import Path
 
+import pytest
+
 from eval.dashboard import (
     ParsedReport,
     ScenarioEntry,
@@ -27,13 +29,17 @@ from eval.dashboard import (
 
 
 def _report(run_at_iso: str, suite: str | None) -> ParsedReport:
-    entries = [ScenarioEntry(nodeid="n", suite=suite)] if suite else []
+    # precision=1.0 so the entry counts as "scored" -- with _EXPECTED_SCENARIO_COUNT monkeypatched
+    # to 1 (one-entry fixture), that makes this report's suite "full" per `_full_suites`, matchable
+    # by `_find_matching_report`.
+    entries = [ScenarioEntry(nodeid="n", suite=suite, precision=1.0)] if suite else []
     return ParsedReport(
         path=Path(f"report_{run_at_iso}.md"), run_at=datetime.fromisoformat(run_at_iso), entries=entries
     )
 
 
-def test_find_matching_report_picks_nearest_same_suite_within_tolerance() -> None:
+def test_find_matching_report_picks_nearest_same_suite_within_tolerance(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("eval.dashboard._EXPECTED_SCENARIO_COUNT", 1)  # one-entry fixtures below
     row = {"suite": "correctness_prb", "timestamp": "2026-09-10T07:00:05+00:00"}
     far = _report("2026-09-10T01:00:00+00:00", "correctness_prb")
     near = _report("2026-09-10T07:00:00+00:00", "correctness_prb")
@@ -44,18 +50,33 @@ def test_find_matching_report_picks_nearest_same_suite_within_tolerance() -> Non
     assert match is near
 
 
-def test_find_matching_report_returns_none_outside_tolerance() -> None:
+def test_find_matching_report_returns_none_outside_tolerance(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("eval.dashboard._EXPECTED_SCENARIO_COUNT", 1)  # one-entry fixture below
     row = {"suite": "correctness_prb", "timestamp": "2026-09-10T07:00:00+00:00"}
     stale = _report("2026-09-09T00:00:00+00:00", "correctness_prb")
 
     assert _find_matching_report(row, [stale]) is None
 
 
-def test_find_matching_report_returns_none_when_no_same_suite_report() -> None:
+def test_find_matching_report_returns_none_when_no_same_suite_report(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("eval.dashboard._EXPECTED_SCENARIO_COUNT", 1)  # one-entry fixture below
     row = {"suite": "correctness_prb", "timestamp": "2026-09-10T07:00:00+00:00"}
     other = _report("2026-09-10T07:00:00+00:00", "correctness_e2e")
 
     assert _find_matching_report(row, [other]) is None
+
+
+def test_find_matching_report_returns_none_when_suite_is_partial_in_that_report(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A report where the row's suite has fewer than a full corpus of scored entries (a
+    `-k`-filtered debug run that happens to fall within the match tolerance) must not be treated as
+    a match -- linking to it would land on a drill-down section listing none of that suite's
+    scenarios (`render_scenario_table` drops partial suites too, see its docstring)."""
+    row = {"suite": "correctness_prb", "timestamp": "2026-09-10T07:00:00+00:00"}
+    partial = _report("2026-09-10T07:00:00+00:00", "correctness_prb")  # 1 scored entry, not 8
+
+    assert _find_matching_report(row, [partial]) is None
 
 
 REPORT_HEADER = "# policy-eval-scenarios test report\n\nRun: 2026-09-10T07:00:36.717976+00:00\nExit status: 0\nTotal: 1 — passed=1\n\n"
@@ -178,12 +199,21 @@ def test_parse_report_extracts_passing_robustness_mechanical_entry(tmp_path: Pat
     assert entry.precision == 1.0
 
 
-def test_parse_report_semantic_robustness_entry_has_its_own_display_suite(tmp_path: Path) -> None:
-    """The semantic-tier invariance test doesn't feed the trend log (#2467 is still open), but its
-    entries should still surface in the drill-down under their own label, not vanish."""
+def test_parse_report_semantic_robustness_entries_get_their_own_suites(tmp_path: Path) -> None:
+    """The semantic-tier invariance and sensitivity tests each feed the trend log under their own
+    suite (`robustness_semantic_invariance`/`robustness_semantic_sensitivity`, mirroring
+    `eval/conftest.py`'s `_ROBUSTNESS_TEST_MARKERS`) -- confirming their drill-down entries link up
+    with their trend-log rows instead of falling through to a mismatched or missing suite label."""
     body = (
-        "## passed (1)\n\n"
+        "## passed (2)\n\n"
         "### `eval/test_policy_pipeline_robustness.py::test_prb_invariant_to_semantic_perturbation[baseline]`\n"
+        "- **Precision:** 1.000\n"
+        "- **Recall:** 1.000\n"
+        "- **Denial precision:** 1.000\n"
+        "- **Over-grants:** none\n"
+        "- **Under-grants:** none\n"
+        "- **Incorrectly denied:** none\n\n"
+        "### `eval/test_policy_pipeline_robustness.py::test_prb_sensitive_to_semantic_perturbation[baseline]`\n"
         "- **Precision:** 1.000\n"
         "- **Recall:** 1.000\n"
         "- **Denial precision:** 1.000\n"
@@ -195,7 +225,8 @@ def test_parse_report_semantic_robustness_entry_has_its_own_display_suite(tmp_pa
 
     report = parse_report(path)
 
-    assert report.entries[0].suite == "robustness_semantic"
+    assert report.entries[0].suite == "robustness_semantic_invariance"
+    assert report.entries[1].suite == "robustness_semantic_sensitivity"
 
 
 def test_parse_report_non_correctness_entry_has_no_suite(tmp_path: Path) -> None:
@@ -340,7 +371,8 @@ def test_render_svg_chart_tooltip_is_structured_multiline() -> None:
     assert f"<title>{expected_title}</title>" in svg
 
 
-def test_render_svg_chart_links_point_to_matching_report_anchor() -> None:
+def test_render_svg_chart_links_point_to_matching_report_anchor(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("eval.dashboard._EXPECTED_SCENARIO_COUNT", 1)  # one-entry fixture below
     rows = [
         {
             "suite": "correctness_prb",
@@ -390,7 +422,10 @@ def test_render_dashboard_uses_dark_theme_colors() -> None:
     assert "#e8eaed" in page  # bright text
 
 
-def test_render_scenario_table_lists_correctness_entries_anchored_for_chart_links() -> None:
+def test_render_scenario_table_lists_correctness_entries_anchored_for_chart_links(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("eval.dashboard._EXPECTED_SCENARIO_COUNT", 1)  # one-entry fixture below
     entry = ScenarioEntry(
         nodeid="eval/test_policy_pipeline_correctness_prb.py::test_prb_correctness[baseline]",
         suite="correctness_prb",
@@ -411,15 +446,21 @@ def test_render_scenario_table_lists_correctness_entries_anchored_for_chart_link
     assert "1.000" in table
 
 
-def test_render_scenario_table_summary_names_file_and_suite_not_raw_timestamp() -> None:
+def test_render_scenario_table_summary_names_file_and_suite_not_raw_timestamp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """The summary line leads with the report filename and names which suite ran, in parentheses
     -- e.g. ``report_x.md (correctness_prb suite)`` -- rather than the raw ``run_at`` ISO
     timestamp, which was redundant with the report's own filename/sort order."""
+    monkeypatch.setattr("eval.dashboard._EXPECTED_SCENARIO_COUNT", 1)  # one-entry fixture below
     entry = ScenarioEntry(
         nodeid="eval/test_policy_pipeline_correctness_prb.py::test_prb_correctness[baseline]",
         suite="correctness_prb",
         scenario="baseline",
         category="passed",
+        precision=1.0,
+        recall=1.0,
+        denial_precision=1.0,
     )
     report = ParsedReport(
         path=Path("report_16_09_15_41_20.md"),
@@ -433,20 +474,27 @@ def test_render_scenario_table_summary_names_file_and_suite_not_raw_timestamp() 
     assert "2026-09-16T15:41:20" not in table
 
 
-def test_render_scenario_table_summary_lists_multiple_suites() -> None:
+def test_render_scenario_table_summary_lists_multiple_suites(monkeypatch: pytest.MonkeyPatch) -> None:
     """A report with entries from more than one suite names all of them, pluralized."""
+    monkeypatch.setattr("eval.dashboard._EXPECTED_SCENARIO_COUNT", 1)  # one entry per suite below
     entries = [
         ScenarioEntry(
             nodeid="eval/test_policy_pipeline_robustness.py::test_prb_invariant_to_mechanical_perturbation[baseline]",
             suite="robustness_mechanical_invariance",
             scenario="baseline",
             category="passed",
+            precision=1.0,
+            recall=1.0,
+            denial_precision=1.0,
         ),
         ScenarioEntry(
             nodeid="eval/test_policy_pipeline_robustness.py::test_prb_sensitive_to_mechanical_edit[baseline]",
             suite="robustness_mechanical_sensitivity",
             scenario="baseline",
             category="passed",
+            precision=1.0,
+            recall=1.0,
+            denial_precision=1.0,
         ),
     ]
     report = ParsedReport(
@@ -461,10 +509,11 @@ def test_render_scenario_table_summary_lists_multiple_suites() -> None:
     )
 
 
-def test_render_scenario_table_includes_robustness_entries() -> None:
+def test_render_scenario_table_includes_robustness_entries(monkeypatch: pytest.MonkeyPatch) -> None:
     """Regression test for the bug where a report with *only* robustness entries rendered as an
     empty string and vanished from the drill-down entirely, because `_suite_for_nodeid` recognized
     no robustness nodeid pattern and every entry's `suite` stayed `None`."""
+    monkeypatch.setattr("eval.dashboard._EXPECTED_SCENARIO_COUNT", 1)  # one-entry fixture below
     entry = ScenarioEntry(
         nodeid="eval/test_policy_pipeline_robustness.py::test_prb_sensitive_to_mechanical_edit[baseline]",
         suite="robustness_mechanical_sensitivity",
@@ -485,11 +534,14 @@ def test_render_scenario_table_includes_robustness_entries() -> None:
     assert "baseline" in table
 
 
-def test_render_scenario_table_distinguishes_mechanical_invariant_and_sensitive(tmp_path: Path) -> None:
+def test_render_scenario_table_distinguishes_mechanical_invariant_and_sensitive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """The two mechanical-tier test functions each write their own trend-log suite now
     (`robustness_mechanical_invariance`/`robustness_mechanical_sensitivity`), so the drill-down
     table's Suite column tells the two families apart from `entry.suite` alone -- no separate
     display-name override needed."""
+    monkeypatch.setattr("eval.dashboard._EXPECTED_SCENARIO_COUNT", 1)  # one entry per suite below
     body = (
         "## passed (2)\n\n"
         "### `eval/test_policy_pipeline_robustness.py::test_prb_invariant_to_mechanical_perturbation[baseline]`\n"
@@ -521,12 +573,16 @@ def test_render_scenario_table_distinguishes_mechanical_invariant_and_sensitive(
     assert "robustness_mechanical_sensitivity" in table
 
 
-def test_render_scenario_table_escapes_html_and_preserves_multiline_breaks() -> None:
+def test_render_scenario_table_escapes_html_and_preserves_multiline_breaks(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("eval.dashboard._EXPECTED_SCENARIO_COUNT", 1)  # one-entry fixture below
     entry = ScenarioEntry(
         nodeid="eval/test_policy_pipeline_correctness_prb.py::test_prb_correctness[baseline]",
         suite="correctness_prb",
         scenario="baseline",
         category="failed",
+        precision=1.0,
+        recall=0.5,
+        denial_precision=1.0,
         under_grants="inbound: (<role>, scope)\noutbound_target: (a, b)",
     )
     report = ParsedReport(
@@ -538,6 +594,155 @@ def test_render_scenario_table_escapes_html_and_preserves_multiline_breaks() -> 
     assert "<role>" not in table
     assert "&lt;role&gt;" in table
     assert "inbound: (&lt;role&gt;, scope)<br>outbound_target: (a, b)" in table
+
+
+def test_expected_scenario_count_matches_conftests_copy() -> None:
+    """`dashboard.py` deliberately keeps its own plain-constant copy of the full corpus size
+    rather than importing `eval.conftest` (see the module docstring), so nothing else catches the
+    two drifting apart if the corpus grows and only one copy gets bumped -- this test is that
+    catch."""
+    from eval import conftest, dashboard
+
+    assert dashboard._EXPECTED_SCENARIO_COUNT == conftest._EXPECTED_SCENARIO_COUNT
+
+
+def test_render_scenario_table_excludes_a_suite_with_fewer_than_the_full_corpus() -> None:
+    """A suite with only 1 of the expected 8 scenario entries in this report (a `-k`-filtered
+    debug run) is dropped from the drill-down entirely, at the real, unpatched
+    ``_EXPECTED_SCENARIO_COUNT``."""
+    entry = ScenarioEntry(
+        nodeid="eval/test_policy_pipeline_correctness_prb.py::test_prb_correctness[baseline]",
+        suite="correctness_prb",
+        scenario="baseline",
+        category="passed",
+        precision=1.0,
+        recall=1.0,
+        denial_precision=1.0,
+    )
+    report = ParsedReport(
+        path=Path("report_x.md"), run_at=datetime.fromisoformat("2026-09-10T07:00:00+00:00"), entries=[entry]
+    )
+
+    assert render_scenario_table(report) == ""
+
+
+def test_render_scenario_table_drops_a_suite_with_a_setup_failure_even_at_full_entry_count() -> None:
+    """A suite with a full ``_EXPECTED_SCENARIO_COUNT`` of *rendered* report entries, one of which
+    is an "unavailable" setup-failure placeholder (``precision`` never parses to a real float, see
+    ``_parse_metric``), must still be treated as partial and dropped -- same as
+    ``eval/conftest.py``'s ``_write_trend_log`` treats it, which counts only scenarios that
+    actually recorded ``true_positives`` and would mark this same run ``run_type="partial"``,
+    excluding it from the trend chart. Before this fix, ``render_scenario_table`` counted every
+    entry whose nodeid matched a known suite regardless of whether it was actually scored, so this
+    run showed as a complete regression in the drill-down with no matching chart point."""
+    scored_entries = [
+        ScenarioEntry(
+            nodeid=f"eval/test_policy_pipeline_correctness_prb.py::test_prb_correctness[{name}]",
+            suite="correctness_prb",
+            scenario=name,
+            category="passed",
+            precision=1.0,
+            recall=1.0,
+            denial_precision=1.0,
+        )
+        for name in (
+            "baseline",
+            "agent_delegation",
+            "unreachable_resources",
+            "ambiguous_clause",
+            "wildcard_grant",
+            "misleading_descriptions",
+            "confusable_agents",
+        )
+    ]
+    unavailable_entry = ScenarioEntry(
+        nodeid="eval/test_policy_pipeline_correctness_prb.py::test_prb_correctness[empty_descriptions]",
+        suite="correctness_prb",
+        scenario="empty_descriptions",
+        category="error",
+        failure="setup crashed",
+    )
+    report = ParsedReport(
+        path=Path("report_x.md"),
+        run_at=datetime.fromisoformat("2026-09-10T07:00:00+00:00"),
+        entries=scored_entries + [unavailable_entry],
+    )
+
+    assert render_scenario_table(report) == ""
+
+
+def test_render_scenario_table_keeps_a_suite_with_more_than_the_full_corpus(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A suite with *more* entries than `_EXPECTED_SCENARIO_COUNT` (the corpus grew and this
+    module's copy of the constant hasn't caught up yet) is still a genuinely complete run and must
+    render -- the partial-run filter is "at least the full count", not "exactly", so it never
+    punishes a suite for having grown."""
+    monkeypatch.setattr("eval.dashboard._EXPECTED_SCENARIO_COUNT", 1)
+    entries = [
+        ScenarioEntry(
+            nodeid=f"eval/test_policy_pipeline_correctness_prb.py::test_prb_correctness[{name}]",
+            suite="correctness_prb",
+            scenario=name,
+            category="passed",
+            precision=1.0,
+            recall=1.0,
+            denial_precision=1.0,
+        )
+        for name in ("baseline", "agent_delegation")
+    ]
+    report = ParsedReport(
+        path=Path("report_x.md"), run_at=datetime.fromisoformat("2026-09-10T07:00:00+00:00"), entries=entries
+    )
+
+    table = render_scenario_table(report)
+
+    assert "baseline" in table
+    assert "agent_delegation" in table
+
+
+def test_render_scenario_table_keeps_a_full_suite_but_drops_a_partial_one_in_the_same_report() -> None:
+    """One report can mix a full run of one suite with a partial run of another (e.g.
+    `-k baseline` touching both mechanical robustness test functions for just one scenario) --
+    only the full suite's entries survive."""
+    full_suite_entries = [
+        ScenarioEntry(
+            nodeid=f"eval/test_policy_pipeline_correctness_prb.py::test_prb_correctness[{name}]",
+            suite="correctness_prb",
+            scenario=name,
+            category="passed",
+            precision=1.0,
+            recall=1.0,
+            denial_precision=1.0,
+        )
+        for name in (
+            "baseline",
+            "agent_delegation",
+            "unreachable_resources",
+            "ambiguous_clause",
+            "wildcard_grant",
+            "misleading_descriptions",
+            "confusable_agents",
+            "empty_descriptions",
+        )
+    ]
+    partial_suite_entry = ScenarioEntry(
+        nodeid="eval/test_policy_pipeline_robustness.py::test_prb_sensitive_to_mechanical_edit[baseline]",
+        suite="robustness_mechanical_sensitivity",
+        scenario="baseline",
+        category="passed",
+        precision=1.0,
+        recall=1.0,
+        denial_precision=1.0,
+    )
+    report = ParsedReport(
+        path=Path("report_x.md"),
+        run_at=datetime.fromisoformat("2026-09-10T07:00:00+00:00"),
+        entries=full_suite_entries + [partial_suite_entry],
+    )
+
+    table = render_scenario_table(report)
+
+    assert "correctness_prb" in table
+    assert "robustness_mechanical_sensitivity" not in table
 
 
 def test_render_scenario_table_empty_for_report_with_no_correctness_entries() -> None:
@@ -577,6 +782,53 @@ def test_render_dashboard_includes_chart_and_drilldown_sections() -> None:
     assert "correctness_prb" in html
     assert "baseline" in html
     assert "<svg" in html
+
+
+def test_render_dashboard_chart_excludes_partial_runs() -> None:
+    """A `-k`-filtered single-scenario debug row (`run_type="partial"`) must not appear on the
+    chart alongside real full-corpus regression rows -- it pools far fewer scenarios and would
+    otherwise show up as an unlabeled outlier indistinguishable from a genuine regression."""
+    trend_rows = [
+        {
+            "suite": "correctness_prb",
+            "run_type": "regression",
+            "timestamp": "2026-09-10T07:00:00+00:00",
+            "precision": 1.0,
+            "recall": 1.0,
+            "denial_precision": 1.0,
+        },
+        {
+            "suite": "correctness_prb",
+            "run_type": "partial",
+            "timestamp": "2026-09-11T07:00:00+00:00",
+            "precision": 0.0,
+            "recall": 1.0,
+            "denial_precision": 1.0,
+        },
+    ]
+
+    html = render_dashboard(trend_rows, [])
+
+    assert "2026-09-10" in html
+    assert "2026-09-11" not in html
+
+
+def test_render_dashboard_chart_includes_row_with_no_run_type_field() -> None:
+    """A row written before `run_type` existed (or a hand-built test row) has no `run_type` key at
+    all -- must still be treated as a full run, not silently dropped."""
+    trend_rows = [
+        {
+            "suite": "correctness_prb",
+            "timestamp": "2026-09-10T07:00:00+00:00",
+            "precision": 1.0,
+            "recall": 1.0,
+            "denial_precision": 1.0,
+        }
+    ]
+
+    html = render_dashboard(trend_rows, [])
+
+    assert "2026-09-10" in html
 
 
 def test_render_dashboard_empty_state_when_no_data() -> None:
