@@ -215,6 +215,28 @@ def parse_reports(reports_dir: Path) -> list[ParsedReport]:
     return reports
 
 
+# Full Correctness/Robustness corpus size (eval.test_policy_pipeline_eval.SCENARIOS) -- the same
+# value as eval/conftest.py's own _EXPECTED_SCENARIO_COUNT, kept as a separate plain constant
+# rather than imported so this module stays a self-contained, dependency-light tool (see the
+# module docstring). Bump alongside conftest.py's copy if the corpus grows.
+_EXPECTED_SCENARIO_COUNT = 8
+
+
+def _full_suites(report: ParsedReport) -> set[str]:
+    """The suites within ``report`` that have at least ``_EXPECTED_SCENARIO_COUNT`` *scored*
+    entries (``e.precision is not None`` -- see ``render_scenario_table``'s docstring for why that's
+    the same thing ``eval/conftest.py``'s ``_write_trend_log`` counts) -- exactly the suites
+    ``render_scenario_table`` actually renders a row for. Shared with ``_find_matching_report`` so a
+    trend-log row never links to a report where its own suite's entries would be filtered out as
+    partial -- matching by suite *presence* alone (the previous behavior) could link a genuine
+    full-corpus chart point to a `-k`-filtered debug report that happens to fall within the match
+    tolerance, landing the link on a section listing none of that suite's scenarios, or on no
+    section at all if every suite in that report is partial."""
+    scored = [e for e in report.entries if e.suite is not None and e.precision is not None]
+    counts = Counter(e.suite for e in scored)
+    return {suite for suite, count in counts.items() if count >= _EXPECTED_SCENARIO_COUNT}
+
+
 # Both timestamps come from separate ``datetime.now()`` calls inside the same
 # ``pytest_sessionfinish`` (``eval/conftest.py``'s ``_write_trend_log`` then its own report-writing
 # code), normally sub-second apart. The window is generous only to guard against matching a trend
@@ -226,12 +248,14 @@ _MATCH_TOLERANCE = timedelta(hours=6)
 def _find_matching_report(row: dict[str, Any], reports: list[ParsedReport]) -> ParsedReport | None:
     """The parsed report that is this trend-log row's likely evidence, or ``None`` if no
     same-suite report is within tolerance (the chart point still renders, just without a
-    drill-down link)."""
+    drill-down link). Only a report where the row's suite is actually full (``_full_suites``)
+    counts -- otherwise the link would land on a section with none of that suite's scenarios, or on
+    no section at all."""
     row_time = datetime.fromisoformat(row["timestamp"])
     best: ParsedReport | None = None
     best_delta: timedelta | None = None
     for report in reports:
-        if not any(e.suite == row.get("suite") for e in report.entries):
+        if row.get("suite") not in _full_suites(report):
             continue
         delta = abs(report.run_at - row_time)
         if delta > _MATCH_TOLERANCE:
@@ -372,13 +396,6 @@ def _escape_cell(text: str) -> str:
     return html.escape(text).replace("\n", "<br>")
 
 
-# Full Correctness/Robustness corpus size (eval.test_policy_pipeline_eval.SCENARIOS) -- the same
-# value as eval/conftest.py's own _EXPECTED_SCENARIO_COUNT, kept as a separate plain constant
-# rather than imported so this module stays a self-contained, dependency-light tool (see the
-# module docstring). Bump alongside conftest.py's copy if the corpus grows.
-_EXPECTED_SCENARIO_COUNT = 8
-
-
 def render_scenario_table(report: ParsedReport) -> str:
     """One collapsible, anchored drill-down section for a parsed report's scored entries (any
     suite recognized by ``_SUITE_BY_NODEID_MARKER`` -- correctness and robustness today). ``""``
@@ -389,17 +406,17 @@ def render_scenario_table(report: ParsedReport) -> str:
     ``scenarios_scored`` in ``eval/conftest.py``'s ``_write_trend_log``) -- and a single report can
     mix a full run of one suite with a `-k`-filtered partial run of another (e.g. `-k baseline`
     produces one scenario's worth of entries for *each* robustness test function it touches). So
-    "partial" is decided per (report, suite) here: a suite's entries within this one report are
-    dropped if that suite has fewer than ``_EXPECTED_SCENARIO_COUNT`` of them -- mirroring
-    ``_write_trend_log``'s own ``== _EXPECTED_SCENARIO_COUNT`` full-run test in spirit, but as
-    "at least" rather than "exactly": a suite with *more* than the expected count (an expanded
-    corpus this constant hasn't caught up with yet) is still a genuinely complete run and should
-    render, not vanish. A report entry the trend chart would have excluded as partial (had it fed
-    the trend log at all) doesn't linger in the drill-down as an unlabeled, easy-to-mistake-for-real
-    debug run."""
+    "partial" is decided per (report, suite) via ``_full_suites``, counting the *same* thing
+    ``_write_trend_log`` counts -- entries that actually got scored (``e.precision is not None``; a
+    setup-failed scenario's "unavailable" placeholder and a skipped/unrelated-failure entry both
+    parse to ``None``, same as they never reach ``_write_trend_log``'s own ``"true_positives" in
+    props`` check) -- rather than every entry whose nodeid merely matched a known suite. Without
+    this, a report entry a setup failure kept out of the trend log (marking that row
+    ``run_type="partial"`` and dropping it from the chart) would still count toward a *full* corpus
+    here, showing as a complete run in the drill-down with no matching chart point."""
     all_scored = [e for e in report.entries if e.suite is not None]
-    suite_counts = Counter(e.suite for e in all_scored)
-    scored_entries = [e for e in all_scored if suite_counts[e.suite] >= _EXPECTED_SCENARIO_COUNT]
+    full_suites = _full_suites(report)
+    scored_entries = [e for e in all_scored if e.suite in full_suites]
     if not scored_entries:
         return ""
     rows_html = "".join(

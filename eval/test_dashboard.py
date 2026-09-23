@@ -29,13 +29,17 @@ from eval.dashboard import (
 
 
 def _report(run_at_iso: str, suite: str | None) -> ParsedReport:
-    entries = [ScenarioEntry(nodeid="n", suite=suite)] if suite else []
+    # precision=1.0 so the entry counts as "scored" -- with _EXPECTED_SCENARIO_COUNT monkeypatched
+    # to 1 (one-entry fixture), that makes this report's suite "full" per `_full_suites`, matchable
+    # by `_find_matching_report`.
+    entries = [ScenarioEntry(nodeid="n", suite=suite, precision=1.0)] if suite else []
     return ParsedReport(
         path=Path(f"report_{run_at_iso}.md"), run_at=datetime.fromisoformat(run_at_iso), entries=entries
     )
 
 
-def test_find_matching_report_picks_nearest_same_suite_within_tolerance() -> None:
+def test_find_matching_report_picks_nearest_same_suite_within_tolerance(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("eval.dashboard._EXPECTED_SCENARIO_COUNT", 1)  # one-entry fixtures below
     row = {"suite": "correctness_prb", "timestamp": "2026-09-10T07:00:05+00:00"}
     far = _report("2026-09-10T01:00:00+00:00", "correctness_prb")
     near = _report("2026-09-10T07:00:00+00:00", "correctness_prb")
@@ -46,18 +50,33 @@ def test_find_matching_report_picks_nearest_same_suite_within_tolerance() -> Non
     assert match is near
 
 
-def test_find_matching_report_returns_none_outside_tolerance() -> None:
+def test_find_matching_report_returns_none_outside_tolerance(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("eval.dashboard._EXPECTED_SCENARIO_COUNT", 1)  # one-entry fixture below
     row = {"suite": "correctness_prb", "timestamp": "2026-09-10T07:00:00+00:00"}
     stale = _report("2026-09-09T00:00:00+00:00", "correctness_prb")
 
     assert _find_matching_report(row, [stale]) is None
 
 
-def test_find_matching_report_returns_none_when_no_same_suite_report() -> None:
+def test_find_matching_report_returns_none_when_no_same_suite_report(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("eval.dashboard._EXPECTED_SCENARIO_COUNT", 1)  # one-entry fixture below
     row = {"suite": "correctness_prb", "timestamp": "2026-09-10T07:00:00+00:00"}
     other = _report("2026-09-10T07:00:00+00:00", "correctness_e2e")
 
     assert _find_matching_report(row, [other]) is None
+
+
+def test_find_matching_report_returns_none_when_suite_is_partial_in_that_report(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A report where the row's suite has fewer than a full corpus of scored entries (a
+    `-k`-filtered debug run that happens to fall within the match tolerance) must not be treated as
+    a match -- linking to it would land on a drill-down section listing none of that suite's
+    scenarios (`render_scenario_table` drops partial suites too, see its docstring)."""
+    row = {"suite": "correctness_prb", "timestamp": "2026-09-10T07:00:00+00:00"}
+    partial = _report("2026-09-10T07:00:00+00:00", "correctness_prb")  # 1 scored entry, not 8
+
+    assert _find_matching_report(row, [partial]) is None
 
 
 REPORT_HEADER = "# policy-eval-scenarios test report\n\nRun: 2026-09-10T07:00:36.717976+00:00\nExit status: 0\nTotal: 1 — passed=1\n\n"
@@ -352,7 +371,8 @@ def test_render_svg_chart_tooltip_is_structured_multiline() -> None:
     assert f"<title>{expected_title}</title>" in svg
 
 
-def test_render_svg_chart_links_point_to_matching_report_anchor() -> None:
+def test_render_svg_chart_links_point_to_matching_report_anchor(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("eval.dashboard._EXPECTED_SCENARIO_COUNT", 1)  # one-entry fixture below
     rows = [
         {
             "suite": "correctness_prb",
@@ -438,6 +458,9 @@ def test_render_scenario_table_summary_names_file_and_suite_not_raw_timestamp(
         suite="correctness_prb",
         scenario="baseline",
         category="passed",
+        precision=1.0,
+        recall=1.0,
+        denial_precision=1.0,
     )
     report = ParsedReport(
         path=Path("report_16_09_15_41_20.md"),
@@ -460,12 +483,18 @@ def test_render_scenario_table_summary_lists_multiple_suites(monkeypatch: pytest
             suite="robustness_mechanical_invariance",
             scenario="baseline",
             category="passed",
+            precision=1.0,
+            recall=1.0,
+            denial_precision=1.0,
         ),
         ScenarioEntry(
             nodeid="eval/test_policy_pipeline_robustness.py::test_prb_sensitive_to_mechanical_edit[baseline]",
             suite="robustness_mechanical_sensitivity",
             scenario="baseline",
             category="passed",
+            precision=1.0,
+            recall=1.0,
+            denial_precision=1.0,
         ),
     ]
     report = ParsedReport(
@@ -551,6 +580,9 @@ def test_render_scenario_table_escapes_html_and_preserves_multiline_breaks(monke
         suite="correctness_prb",
         scenario="baseline",
         category="failed",
+        precision=1.0,
+        recall=0.5,
+        denial_precision=1.0,
         under_grants="inbound: (<role>, scope)\noutbound_target: (a, b)",
     )
     report = ParsedReport(
@@ -589,6 +621,51 @@ def test_render_scenario_table_excludes_a_suite_with_fewer_than_the_full_corpus(
     )
     report = ParsedReport(
         path=Path("report_x.md"), run_at=datetime.fromisoformat("2026-09-10T07:00:00+00:00"), entries=[entry]
+    )
+
+    assert render_scenario_table(report) == ""
+
+
+def test_render_scenario_table_drops_a_suite_with_a_setup_failure_even_at_full_entry_count() -> None:
+    """A suite with a full ``_EXPECTED_SCENARIO_COUNT`` of *rendered* report entries, one of which
+    is an "unavailable" setup-failure placeholder (``precision`` never parses to a real float, see
+    ``_parse_metric``), must still be treated as partial and dropped -- same as
+    ``eval/conftest.py``'s ``_write_trend_log`` treats it, which counts only scenarios that
+    actually recorded ``true_positives`` and would mark this same run ``run_type="partial"``,
+    excluding it from the trend chart. Before this fix, ``render_scenario_table`` counted every
+    entry whose nodeid matched a known suite regardless of whether it was actually scored, so this
+    run showed as a complete regression in the drill-down with no matching chart point."""
+    scored_entries = [
+        ScenarioEntry(
+            nodeid=f"eval/test_policy_pipeline_correctness_prb.py::test_prb_correctness[{name}]",
+            suite="correctness_prb",
+            scenario=name,
+            category="passed",
+            precision=1.0,
+            recall=1.0,
+            denial_precision=1.0,
+        )
+        for name in (
+            "baseline",
+            "agent_delegation",
+            "unreachable_resources",
+            "ambiguous_clause",
+            "wildcard_grant",
+            "misleading_descriptions",
+            "confusable_agents",
+        )
+    ]
+    unavailable_entry = ScenarioEntry(
+        nodeid="eval/test_policy_pipeline_correctness_prb.py::test_prb_correctness[empty_descriptions]",
+        suite="correctness_prb",
+        scenario="empty_descriptions",
+        category="error",
+        failure="setup crashed",
+    )
+    report = ParsedReport(
+        path=Path("report_x.md"),
+        run_at=datetime.fromisoformat("2026-09-10T07:00:00+00:00"),
+        entries=scored_entries + [unavailable_entry],
     )
 
     assert render_scenario_table(report) == ""
