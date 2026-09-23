@@ -25,6 +25,7 @@ dependencies = [
     # alerts dismissed as not_used. Re-audit these before wiring the RAG server path.
     "chromadb",
     "tenacity",
+    "pytest>=9.1.1",
 ]
 
 [project.optional-dependencies]
