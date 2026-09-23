@@ -30,67 +30,11 @@ logger = logging.getLogger(__name__)
 _TYPE_LABEL = "rossoctl.io/type"
 _MCP_LABEL = "protocol.rossoctl.io/mcp"
 
-
-<<<<<<< HEAD
 def _loggable(value: object) -> str:
     """Neutralize a value for single-line logging (drop CR/LF); see
     ``uc.onboarding.orchestrator._loggable``. Applied to any name sourced from Kubernetes
     labels/CRs or an MCP tool manifest — external input, not this process's own naming."""
     return str(value).replace("\r", "").replace("\n", "")
-=======
-@dataclass(frozen=True)
-class _WaitConfig:
-    """A bounded deploy->onboard race-tolerance poll. ``attempts_env``/``backoff_env`` name the
-    environment knobs (read at poll time, falling back to the defaults on an unset / non-numeric /
-    below-minimum value). Bundled so the two onboarding races below share one poll mechanic
-    (``_poll_until_ready``) instead of each repeating the read-env + range + backoff loop."""
-
-    attempts_env: str
-    backoff_env: str
-    default_attempts: int
-    default_backoff: float
-
-
-# Deploy->onboard race tolerance for the operator-applied ``rossoctl.io/type`` label. The onboarding
-# event is triggered by a DIFFERENT operator action (Keycloak client registration -> admin event), so
-# ``classify_service`` can run BEFORE the operator has patched the label onto the pod. A briefly-absent
-# label is therefore a transient not-ready state, re-polled before we give up with a 502. Defaults
-# ≈ 30s of slack (well under the NATS ACK_WAIT and the system-test convergence poll); tests set fast.
-_LABEL_WAIT = _WaitConfig("ONBOARD_LABEL_WAIT_ATTEMPTS", "ONBOARD_LABEL_WAIT_BACKOFF", 15, 2.0)
-
-# Deploy->onboard race tolerance for the AgentCard skill sync — a SECOND, later race than the label one
-# above. The operator syncs the fetched A2A card onto ``status.card.skills`` only AFTER the agent pod is
-# Ready, which lags the Keycloak-client registration that triggers onboarding. So ``analyze_agent`` can
-# run while ``status.card.skills`` is still empty. An absent card / empty skill list is therefore a
-# transient not-ready state, re-polled before we fall back to a default access scope. Same ≈30s slack.
-_CARD_WAIT = _WaitConfig("ONBOARD_CARD_WAIT_ATTEMPTS", "ONBOARD_CARD_WAIT_BACKOFF", 15, 2.0)
-
-
-def _env_num(name: str, default, cast, minimum):
-    """Read ``name`` from the environment, tolerant of an unset / non-numeric / below-``minimum``
-    value — a bad value must not crash onboarding, it falls back to the default."""
-    try:
-        value = cast(os.environ[name])
-    except (KeyError, TypeError, ValueError):
-        return default
-    return value if value >= minimum else default
-
-
-def _poll_until_ready(probe, cfg: _WaitConfig):
-    """Re-poll ``probe`` up to ``cfg`` attempts, backing off between looks (skipped after the last).
-    ``probe`` returns a non-``None`` 'ready' result to stop, or ``None`` to retry; it may raise to fail
-    the whole wait immediately (a real error, never a race). Returns the ready result, or ``None`` once
-    the attempt budget is exhausted — the caller then decides what an exhausted wait means."""
-    attempts = _env_num(cfg.attempts_env, cfg.default_attempts, int, minimum=1)
-    backoff = _env_num(cfg.backoff_env, cfg.default_backoff, float, minimum=0.0)
-    for attempt in range(attempts):
-        result = probe()
-        if result is not None:
-            return result
-        if attempt + 1 < attempts:
-            time.sleep(backoff)
-    return None
->>>>>>> main
 
 
 @dataclass(frozen=True)
@@ -218,8 +162,7 @@ def classify_service(state: OnboardingProvisionState) -> dict:
     if "/" not in name:
         raise HTTPException(
             502,
-            f"client.name {name!r} for service {service_id!r} has no '/': "
-            "namespace/workload_name unrecoverable",
+            f"client.name {name!r} for service {service_id!r} has no '/': namespace/workload_name unrecoverable",
         )
     namespace, workload_name = name.split("/", 1)
 
@@ -363,14 +306,8 @@ def analyze_agent(state: OnboardingProvisionState) -> dict:
             )
         return key
 
-    scopes = [
-        ScopeDefinition(name=f"{workload}.{_skill_key(s)}", description=s.get("description", ""))
-        for s in skills
-    ]
-    roles = [
-        RoleDefinition(name=f"{workload}.{_skill_key(s)}", description=s.get("description", ""))
-        for s in skills
-    ]
+    scopes = [ScopeDefinition(name=f"{workload}.{_skill_key(s)}", description=s.get("description", "")) for s in skills]
+    roles = [RoleDefinition(name=f"{workload}.{_skill_key(s)}", description=s.get("description", "")) for s in skills]
     provision = ServiceProvision(
         roles=roles,
         scopes=scopes,
@@ -392,9 +329,7 @@ def analyze_tool(state: OnboardingProvisionState) -> dict:
     try:
         svc = read_service(workload, namespace)
     except Exception as e:
-        raise HTTPException(
-            502, f"Kubernetes Service GET failed for {workload!r} in namespace {namespace!r}: {e}"
-        )
+        raise HTTPException(502, f"Kubernetes Service GET failed for {workload!r} in namespace {namespace!r}: {e}")
 
     labels = getattr(svc.metadata, "labels", None) or {}
     if _MCP_LABEL not in labels:
@@ -408,8 +343,7 @@ def analyze_tool(state: OnboardingProvisionState) -> dict:
     if not ports:
         raise HTTPException(
             502,
-            f"Service {workload!r} in namespace {namespace!r} exposes no ports; "
-            "cannot resolve an MCP endpoint",
+            f"Service {workload!r} in namespace {namespace!r} exposes no ports; cannot resolve an MCP endpoint",
         )
     port = ports[0].port
     endpoint = f"http://{workload}.{namespace}.svc.cluster.local:{port}/mcp"
@@ -420,9 +354,7 @@ def analyze_tool(state: OnboardingProvisionState) -> dict:
     try:
         token = _discovery_token(state.service_id)
     except Exception as e:
-        raise HTTPException(
-            502, f"discovery token minting failed for service {state.service_id!r}: {e}"
-        )
+        raise HTTPException(502, f"discovery token minting failed for service {state.service_id!r}: {e}")
 
     try:
         tools = _mcp_tools_list(endpoint, token=token)
@@ -439,10 +371,7 @@ def analyze_tool(state: OnboardingProvisionState) -> dict:
             )
         return name
 
-    scopes = [
-        ScopeDefinition(name=f"{workload}.{_tool_name(t)}", description=t.get("description", ""))
-        for t in tools
-    ]
+    scopes = [ScopeDefinition(name=f"{workload}.{_tool_name(t)}", description=t.get("description", "")) for t in tools]
     provision = ServiceProvision(
         roles=[],
         scopes=scopes,

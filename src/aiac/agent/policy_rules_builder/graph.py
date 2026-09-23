@@ -61,6 +61,7 @@ class AuditVerdict(BaseModel):
 
 class PolicyRulesBuilderBaseError(Exception): ...
 
+
 class PolicyRulesBuilderError(PolicyRulesBuilderBaseError): ...
 
 
@@ -175,12 +176,11 @@ def _propose(
     sel = _structured_call(schema, msgs)
     granted = list(getattr(sel, names_field))
     denied = list(getattr(sel, denied_names_field))
-    exclusive = bool(getattr(sel, exclusive_field))
     # direction's first sentence is "GATE DIRECTION -- <axis> gate. ..." -- pull just "<axis> gate".
     gate_kind = direction.split("--", 1)[-1].split(".", 1)[0].strip()
     logger.info(
         "PRB _propose: focal=%s (%s) -> LLM granted=%s denied=%s exclusive=%s",
-        _loggable(focal), gate_kind, _loggable(granted), _loggable(denied), exclusive,
+        _loggable(focal), gate_kind, _loggable(granted), _loggable(denied), 
     )
     return {
         "selected_names": list(getattr(sel, names_field)),
@@ -359,9 +359,7 @@ def build_role_graph():
         return _precheck(s, candidate_names={sc.name for sc in s["scopes"]})
 
     def audit(s: RoleRulesState) -> dict[str, Any]:
-        return _audit(
-            s, focal=_role_focal(s["role"]), candidates=_scope_cands(s["scopes"]), direction=_ROLE_DIRECTION
-        )
+        return _audit(s, focal=_role_focal(s["role"]), candidates=_scope_cands(s["scopes"]), direction=_ROLE_DIRECTION)
 
     def build(s: RoleRulesState) -> dict[str, Any]:
         rules = _assemble_rules(
@@ -392,9 +390,7 @@ def build_scope_graph():
         return _precheck(s, candidate_names={r.name for r in s["roles"]})
 
     def audit(s: ScopeRulesState) -> dict[str, Any]:
-        return _audit(
-            s, focal=_scope_focal(s["scope"]), candidates=_role_cands(s["roles"]), direction=_SCOPE_DIRECTION
-        )
+        return _audit(s, focal=_scope_focal(s["scope"]), candidates=_role_cands(s["roles"]), direction=_SCOPE_DIRECTION)
 
     def build(s: ScopeRulesState) -> dict[str, Any]:
         rules = _assemble_rules(
