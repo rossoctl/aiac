@@ -37,22 +37,15 @@ AGENTS: dict[str, dict] = {
         },
     },
     "billing-agent": {
-        "description": (
-            "An autonomous agent meant to handle patient billing and invoicing, stood up before "
-            "the access policy that was supposed to cover it — no policy language yet says who "
-            "may call it or what it may reach."
-        ),
+        "description": ("An autonomous agent that handles patient billing and invoicing."),
         "inbound_scopes": {
             "agent-scope-biller": (
-                "Lets a holder use the billing agent's invoicing abilities — creating and reading "
-                "patient invoices. Not yet handed to any user role in the policy text."
+                "Lets a holder use the billing agent's invoicing abilities — creating and reading patient invoices."
             ),
         },
         "delegation_scopes": {},
         "roles": {
-            "agent-role-biller": (
-                "Covers both reading and writing patient invoices. Not yet handed to any target in the policy text."
-            ),
+            "agent-role-biller": ("Covers both reading and writing patient invoices."),
         },
     },
 }
@@ -73,14 +66,10 @@ TOOLS: dict[str, dict] = {
     "insurance-tool": {
         "description": (
             "A capability provider for insurance-coverage verification, performing lookups against "
-            "a patient's insurance details. No agent role is ever handed its scope anywhere in the "
-            "policy text — it's unreachable on purpose."
+            "a patient's insurance details."
         ),
         "scopes": {
-            "tool-scope-insurance-verify": (
-                "Look up a patient's insurance coverage details. No agent role is ever handed this "
-                "scope anywhere in the policy text — it's unreachable on purpose."
-            ),
+            "tool-scope-insurance-verify": ("Look up a patient's insurance coverage details."),
         },
     },
 }
@@ -95,8 +84,7 @@ USER_PASSWORD = "password"
 
 USER_ROLES: dict[str, str] = {
     "user-role-front-desk-clerk": (
-        "Front Desk Clerk: can book appointments and read and update patient records via the "
-        "intake agent. Has nothing to do with billing or insurance verification."
+        "Front Desk Clerk: books appointments and reads and updates patient records via the intake agent."
     ),
 }
 

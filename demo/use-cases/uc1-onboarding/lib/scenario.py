@@ -48,18 +48,13 @@ USER_PROFILE: dict[str, dict[str, str]] = {
 USER_ROLES: dict[str, str] = {
     "developer": (
         "Developer — an engineering user who develops the source codebase (writing and maintaining "
-        "code) and fixes code defects reported in the issue tracker; works primarily in source and "
-        "consults issues for defect reports."
+        "code) and fixes code defects reported in the issue tracker."
     ),
     "tester": (
         "Tester — a quality-assurance user who verifies software quality and tracks defects through "
-        "the issue tracker: filing, triaging, and updating issue reports; works in the issue "
-        "tracker, not in source."
+        "the issue tracker: filing, triaging, and updating issue reports."
     ),
-    "devops": (
-        "DevOps — an operations user who manages deployment infrastructure and runtime "
-        "environments; does not author source code and does not manage the issue tracker."
-    ),
+    "devops": ("DevOps — an operations user who manages deployment infrastructure and runtime environments."),
 }
 
 # --- Discovered entities (what real UC-1 onboarding provisions; recorded here for the oracle) -

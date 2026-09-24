@@ -420,8 +420,7 @@ SENSITIVITY_EDITS: dict[str, SensitivityEdit] = {
         description_edits={
             "user-role-developer": (
                 "who develops the source codebase (writing and maintaining code) and fixes code "
-                "defects reported in the issue tracker; works primarily in source and consults "
-                "issues for defect reports.",
+                "defects reported in the issue tracker.",
                 "who develops the source codebase: writing and maintaining code. Works exclusively "
                 "in source, with no involvement in the issue tracker.",
             ),
@@ -456,19 +455,17 @@ SENSITIVITY_EDITS: dict[str, SensitivityEdit] = {
         ),
         description_edits={
             "user-role-shipment-coordinator": (
-                "authorized to create and update shipment manifests through the dispatch agent, and to "
-                "have customs clearance carried out on the shipment's behalf as part of that coordinated "
-                "process.",
-                "authorized to create and update shipment manifests for day-to-day loading and "
-                "unloading; not authorized to have customs clearance carried out on the shipment's "
-                "behalf.",
+                "creates and updates shipment manifests through the dispatch agent, and has customs "
+                "clearance carried out on the shipment's behalf as part of that coordinated process.",
+                "creates and updates shipment manifests through the dispatch agent for day-to-day "
+                "loading and unloading, without having customs clearance carried out on the "
+                "shipment's behalf.",
             ),
             "user-role-dock-worker": (
-                "authorized to create and update shipment manifests through the dispatch agent for "
-                "day-to-day loading and unloading; not authorized to have customs clearance carried out "
-                "on the shipment's behalf.",
-                "authorized to create and update shipment manifests, and to have customs clearance "
-                "carried out on the shipment's behalf as part of a coordinated process.",
+                "creates and updates shipment manifests through the dispatch agent for day-to-day "
+                "loading and unloading.",
+                "creates and updates shipment manifests through the dispatch agent, and has customs "
+                "clearance carried out on the shipment's behalf as part of a coordinated process.",
             ),
         },
         removed={"outbound_subject": {("user-role-shipment-coordinator", "agent-scope-broker")}},
@@ -486,10 +483,8 @@ SENSITIVITY_EDITS: dict[str, SensitivityEdit] = {
         ),
         description_edits={
             "user-role-front-desk-clerk": (
-                "authorized to schedule appointments and read and update patient records through the "
-                "intake agent; not involved in billing or insurance verification.",
-                "NOT authorized to schedule appointments or access patient records at all. Not "
-                "involved in billing or insurance verification.",
+                "schedules appointments and reads and updates patient records through the intake agent.",
+                "does not schedule appointments or access patient records at all.",
             ),
             # outbound_target (agent-role-receptionist -> tool-scope-records-*) is decided by its
             # own ROLE_GRAPH call over agent-role-receptionist's own description, which the clerk's
@@ -524,8 +519,8 @@ SENSITIVITY_EDITS: dict[str, SensitivityEdit] = {
         policy_replace="1) EnrollmentAdvisor may not read enrollment_record, under any condition, for any purpose.",
         description_edits={
             "user-role-enrollment-advisor": (
-                "Enrollment Advisor — authorized to access enrollment information for advising purposes.",
-                "Enrollment Advisor — NOT authorized to access enrollment information.",
+                "Enrollment Advisor — looks up enrollment information for advising purposes.",
+                "Enrollment Advisor — does not look up enrollment information for any purpose.",
             ),
         },
         removed={
@@ -545,9 +540,8 @@ SENSITIVITY_EDITS: dict[str, SensitivityEdit] = {
         ),
         description_edits={
             "user-role-inventory-manager": (
-                "authorized to perform all inventory operations: checking stock levels, adjusting "
-                "counts, and placing reorders.",
-                "NOT authorized to perform any inventory operations.",
+                "performs all inventory operations: checking stock levels, adjusting counts, and placing reorders.",
+                "performs no inventory operations at all.",
             ),
         },
         removed={
@@ -573,19 +567,13 @@ SENSITIVITY_EDITS: dict[str, SensitivityEdit] = {
         ),
         description_edits={
             "user-role-front-desk-staff": (
-                "authorized to read reservation details and guest notes through the guest-services agent.",
-                "NOT authorized to read reservation details or guest notes at all.",
+                "reads reservation details and guest notes through the guest-services agent.",
+                "does not read reservation details or guest notes at all.",
             ),
-            # user-role-vip-manager's own description literally reads "Real access matches
-            # user-role-front-desk-staff" -- left as-is, a faithful PRB revoking front-desk-staff
-            # would reasonably revoke vip-manager too (it explicitly says its access IS
-            # front-desk-staff's), corrupting this edit's `added={}` expectation that vip-manager
-            # is unaffected. Rewritten to state vip-manager's own grant on its own terms, with no
-            # reference to any other role, so the edit only ever touches the role it names.
-            "user-role-vip-manager": (
-                "Real access matches user-role-front-desk-staff.",
-                "Real access: authorized to read reservation details and guest notes.",
-            ),
+            # user-role-vip-manager needs no description_edit: its neutralized description already
+            # states its own reservation/guest-notes grant on its own terms (no reference to
+            # front-desk-staff), so revoking front-desk-staff never cascades to it -- the edit's
+            # `added={}` (vip-manager unaffected) holds without touching its description.
         },
         removed={
             "inbound": {("user-role-front-desk-staff", "agent-scope-concierge")},
@@ -601,10 +589,8 @@ SENSITIVITY_EDITS: dict[str, SensitivityEdit] = {
         policy_replace="- Team trainers may not read the team roster. - Team trainers may not update the practice schedule.",
         description_edits={
             "user-role-team-trainer": (
-                "authorized to read the team roster and update the practice schedule through the "
-                "coaching agent; not involved in performance evaluations.",
-                "NOT authorized to read the team roster or update the practice schedule at all. Not "
-                "involved in performance evaluations.",
+                "reads the team roster and updates the practice schedule through the coaching agent.",
+                "does not read the team roster or update the practice schedule at all.",
             ),
         },
         removed={

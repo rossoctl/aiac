@@ -89,14 +89,12 @@ USER_PASSWORD = "password"
 
 USER_ROLES: dict[str, str] = {
     "user-role-shipment-coordinator": (
-        "Shipment Coordinator: may create and update shipment manifests via the dispatch agent, "
-        "and may have customs clearance carried out on the shipment's behalf as part of that "
+        "Shipment Coordinator: creates and updates shipment manifests via the dispatch agent, "
+        "and has customs clearance carried out on the shipment's behalf as part of that "
         "coordinated process."
     ),
     "user-role-dock-worker": (
-        "Dock Worker: may create and update shipment manifests via the dispatch agent for routine "
-        "loading and unloading. May not have customs clearance carried out on the shipment's "
-        "behalf."
+        "Dock Worker: creates and updates shipment manifests via the dispatch agent for routine loading and unloading."
     ),
 }
 
