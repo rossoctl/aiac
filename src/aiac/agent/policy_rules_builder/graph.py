@@ -27,6 +27,14 @@ logger = logging.getLogger(__name__)
 MAX_AUDIT_RETRIES = 3
 
 
+def _loggable(value: object) -> str:
+    """Neutralize a value for single-line logging (drop CR/LF); see
+    ``uc.onboarding.orchestrator._loggable``. Applied to the focal/candidate names, which reach
+    here from the policy source and from LLM output — external input, not this process's own
+    naming (mitigates CodeQL ``py/log-injection``)."""
+    return str(value).replace("\r", "").replace("\n", "")
+
+
 class _Selection(BaseModel):
     """Common proposer-output shape; the direction-specific names field is read
     by name (names_field) while reasoning is accessed directly."""
@@ -179,8 +187,8 @@ def _propose(
     # direction's first sentence is "GATE DIRECTION -- <axis> gate. ..." -- pull just "<axis> gate".
     gate_kind = direction.split("--", 1)[-1].split(".", 1)[0].strip()
     logger.info(
-        "PRB _propose: focal=%s (%s) -> LLM granted=%s denied=%s exclusive=%s",
-        _loggable(focal), gate_kind, _loggable(granted), _loggable(denied), 
+        "PRB _propose: focal=%s (%s) -> LLM granted=%s denied=%s",
+        _loggable(focal), gate_kind, _loggable(granted), _loggable(denied),
     )
     return {
         "selected_names": list(getattr(sel, names_field)),
