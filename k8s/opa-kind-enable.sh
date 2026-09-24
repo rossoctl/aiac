@@ -105,7 +105,17 @@ echo "==> Step 1/5: deploying bundle-service (${OPERATOR_DIR})"
 kubectl get pods -n "$RELEASE_NAMESPACE" -l app=bundle-service
 
 echo "==> Step 2/5: building + loading authbridge-proxy (${IMAGE_TAG}) via ${CONTAINER_RUNTIME}"
-( cd "$CORTEX_DIR/authbridge" && "$CONTAINER_RUNTIME" build -t "$IMAGE_TAG" -f cmd/authbridge-proxy/Dockerfile . )
+# The pipeline overlay below wires opa, jwt-validation, token-exchange, and the
+# full parser set — that's the "full" plugin profile (see
+# authbridge/scripts/profile-tags/profiles.go). Plugins are opt-in, so the
+# image must be built with that profile's tags or it registers none. No host
+# Go toolchain is assumed, so resolve the tags with the same golang image the
+# Dockerfile's builder stage uses (scripts/profile-tags has no external deps,
+# so this needs no network access).
+GO_BUILD_TAGS="$("$CONTAINER_RUNTIME" run --rm \
+  -v "$CORTEX_DIR/authbridge/scripts/profile-tags:/pt:ro" -w /pt \
+  golang:1.26-alpine go run . full)"
+( cd "$CORTEX_DIR/authbridge" && "$CONTAINER_RUNTIME" build -t "$IMAGE_TAG" --build-arg GO_BUILD_TAGS="$GO_BUILD_TAGS" -f cmd/authbridge-proxy/Dockerfile . )
 load_image_to_kind "$IMAGE_TAG"
 
 echo "==> Step 3/5: writing throwaway pipeline overlay (${VALUES_FILE} stays untouched)"

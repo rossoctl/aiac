@@ -13,6 +13,8 @@ missing/invalid label — actionable, never silent.
 
 import os
 import time
+import logging
+
 from dataclasses import dataclass
 
 from fastapi import HTTPException
