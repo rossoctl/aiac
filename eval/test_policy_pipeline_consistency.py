@@ -11,7 +11,11 @@ the LLM call boundary, so running the downstream deterministic compiler stages a
 added signal). Reuses the existing 8-scenario corpus (``SCENARIOS``, ``orchestrate_prb``,
 ``grant_sets`` from ``test_policy_pipeline_eval.py``) and builds synthetic, Keycloak-free
 ``Role``/``Scope`` objects via ``prb_direct.build_roles_and_scopes`` — no live IdP needed, since
-``orchestrate_prb`` only reads ``.name``/``.description`` off these objects.
+``orchestrate_prb`` only reads ``.name``/``.description`` off these objects. Runs against each
+scenario's committed **digested** policy (``eval/scenarios_digested/``), not its source prose — see
+``docs/evaluation/policy-eval-robustness-consistency.md``'s "Digested corpus" section — with
+``orchestrate_prb(..., best_effort=True)`` for the same "coarse-scope contradiction" reason the
+robustness suite documents (see this suite's own test docstring).
 
 Run (needs LLM_BASE_URL/LLM_MODEL/LLM_API_KEY exported; no Keycloak/opa needed):
     .venv/bin/pytest eval/test_policy_pipeline_consistency.py \
@@ -37,6 +41,7 @@ sys.path.insert(0, str(REPO_ROOT))  # so ``import test.system.*``/``eval.*`` res
 sys.path.insert(0, str(SRC))  # so ``import aiac.*`` resolves
 
 from eval.prb_direct import build_roles_and_scopes  # noqa: E402
+from eval.scenarios_digested import digested_policy_path  # noqa: E402
 from eval.test_policy_pipeline_eval import (  # noqa: E402
     SCENARIOS,
     grant_sets,
@@ -53,16 +58,25 @@ if N < 2:
 def test_prb_consistent_across_repeats(scenario_name: str, monkeypatch: pytest.MonkeyPatch) -> None:
     """Run the PRB ``PRB_CONSISTENCY_REPEATS`` (default 5) times against the same unperturbed
     scenario input and assert every run's grant sets are exactly equal — no tolerance or
-    majority vote, since this is access control: any run-to-run disagreement is a finding."""
+    majority vote, since this is access control: any run-to-run disagreement is a finding.
+
+    Calls ``orchestrate_prb(..., best_effort=True)``: against the digested policy, ``agent_
+    delegation``'s coarse ``agent-scope-dispatcher`` bundles manifest ops with the explicitly-
+    denied ``initiate_customs_clearance_on_behalf``, which an auditor can read as a genuine
+    partial-grant/partial-deny contradiction on some runs and not others — exactly the same
+    "coarse-scope" failure mode ``test_policy_pipeline_robustness.py`` already documents and
+    handles the same way. Without ``best_effort``, a rejection on any single repeat crashes the
+    whole scenario instead of contributing a comparable (if unapproved) result — and a rejection
+    on some repeats but not others is itself exactly the run-to-run disagreement this suite exists
+    to catch, not a harness failure."""
     require_env_or_skip("LLM_BASE_URL", "LLM_MODEL", "LLM_API_KEY")
     scenario = SCENARIOS[scenario_name]
     roles, scopes = build_roles_and_scopes(scenario)
-    policy_path = Path(scenario.__file__).resolve().parent / scenario.POLICY_FILE
-    monkeypatch.setenv("AIAC_POLICY_FILE", str(policy_path))
+    monkeypatch.setenv("AIAC_POLICY_FILE", str(digested_policy_path(scenario)))
 
     runs = []
     for _ in range(N):
-        rules, _, _, _ = orchestrate_prb(roles, scopes, scenario)
+        rules, _, _, _ = orchestrate_prb(roles, scopes, scenario, best_effort=True)
         runs.append(grant_sets(scenario, rules))
 
     baseline = runs[0]

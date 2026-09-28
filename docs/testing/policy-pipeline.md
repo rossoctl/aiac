@@ -310,10 +310,9 @@ Tracking issue for this test: `testing/5.3-policy-pipeline-integration-test.md`.
 > intact: the descriptions stay generic and drop out of the fact triad, and `devops` stays the pure
 > **deny-by-default / silence** exemplar.
 >
-> Exercising the PRB's ALLOW+DENY path against this fixture — explicit-prohibition prose, the
-> description-driven denies the `tester` (*"…not in source"*) and `devops` descriptions would supply
-> under the PRB's symmetric rule, and a grant-set assertion that compares **deny** sets as well as allow
-> sets — is out of scope here and tracked by #142. Note that the enforced **verdicts** (the truth table)
+> Exercising the PRB's ALLOW+DENY path against this fixture — explicit-prohibition prose and a
+> grant-set assertion that compares **deny** sets as well as allow sets — is out of scope here and
+> tracked by #142. Note that the enforced **verdicts** (the truth table)
 > are the same either way: `tester` is denied source and `devops` is denied everywhere whether by
 > explicit `DENY` or by deny-by-default; only the generated policy's **deny-map content** would differ.
 
@@ -383,9 +382,9 @@ description prose.
 
 ### Realm roles (provisioned by the fixture)
 
-- `developer` — "Developer — an engineering user who develops the source codebase (writing and maintaining code) and fixes code defects reported in the issue tracker; works primarily in source and consults issues for defect reports."
-- `tester` — "Tester — a quality-assurance user who verifies software quality and tracks defects through the issue tracker: filing, triaging, and updating issue reports; works in the issue tracker, not in source."
-- `devops` — "DevOps — an operations user who manages deployment infrastructure and runtime environments; does not author source code and does not manage the issue tracker."
+- `developer` — "Developer — an engineering user who develops the source codebase (writing and maintaining code) and fixes code defects reported in the issue tracker."
+- `tester` — "Tester — a quality-assurance user who verifies software quality and tracks defects through the issue tracker: filing, triaging, and updating issue reports."
+- `devops` — "DevOps — an operations user who manages deployment infrastructure and runtime environments."
 
 > The `devops` description is deliberately **unrelated** to source and issue work, so the PRB derives no
 > agent or tool scope for it and deny-by-default leaves `devops-user` denied everywhere — the inbound

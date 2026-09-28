@@ -18,6 +18,7 @@ from __future__ import annotations
 import html
 import json
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -49,23 +50,20 @@ def load_trend_log(path: Path = TREND_LOG_DEFAULT_PATH) -> list[dict[str, Any]]:
 
 # Nodeid substring -> suite label for the drill-down table's "Suite" column, the inverse of
 # ``eval/conftest.py``'s ``_CORRECTNESS_TEST_MARKERS``/``_ROBUSTNESS_TEST_MARKERS``. Every value
-# except `robustness_semantic` matches an actual trend-log `suite` (so a matching row can link to
-# this report's drill-down section, see ``_find_matching_report``) -- the two mechanical-tier
-# robustness tests each get their *own* suite name (`robustness_mechanical_invariance`/
-# `robustness_mechanical_sensitivity`), one per trend-log row/chart, so no separate display-name
-# override is needed to tell them apart the way one used to be. `robustness_semantic` is a
-# display-only label -- that test never writes a trend-log row (semantic-tier wiring is #2467) so
-# it never matches one, but its entries still deserve to *appear* in the drill-down instead of
-# silently vanishing because ``suite`` was `None`. A nodeid matching neither pattern
-# (``eval_extended``'s ``test_inbound``/``test_outbound``, the consistency/faithfulness suites)
-# still gets `suite=None` and is left out of this table -- a pre-existing gap this fix doesn't
-# extend to, since it wasn't reported.
+# matches an actual trend-log `suite` (so a matching row can link to this report's drill-down
+# section, see ``_find_matching_report``) -- each of the four robustness tier x family
+# combinations (mechanical/semantic x invariance/sensitivity) gets its own suite name, one per
+# trend-log row/chart, so no separate display-name override is needed to tell them apart. A
+# nodeid matching neither pattern (``eval_extended``'s ``test_inbound``/``test_outbound``, the
+# consistency/faithfulness suites) still gets `suite=None` and is left out of this table -- a
+# pre-existing gap this fix doesn't extend to, since it wasn't reported.
 _SUITE_BY_NODEID_MARKER = {
     "::test_prb_correctness[": "correctness_prb",
     "::test_e2e_correctness[": "correctness_e2e",
     "::test_prb_invariant_to_mechanical_perturbation[": "robustness_mechanical_invariance",
     "::test_prb_sensitive_to_mechanical_edit[": "robustness_mechanical_sensitivity",
-    "::test_prb_invariant_to_semantic_perturbation[": "robustness_semantic",
+    "::test_prb_invariant_to_semantic_perturbation[": "robustness_semantic_invariance",
+    "::test_prb_sensitive_to_semantic_perturbation[": "robustness_semantic_sensitivity",
 }
 
 _RUN_RE = re.compile(r"^Run: (.+)$")
@@ -217,6 +215,28 @@ def parse_reports(reports_dir: Path) -> list[ParsedReport]:
     return reports
 
 
+# Full Correctness/Robustness corpus size (eval.test_policy_pipeline_eval.SCENARIOS) -- the same
+# value as eval/conftest.py's own _EXPECTED_SCENARIO_COUNT, kept as a separate plain constant
+# rather than imported so this module stays a self-contained, dependency-light tool (see the
+# module docstring). Bump alongside conftest.py's copy if the corpus grows.
+_EXPECTED_SCENARIO_COUNT = 8
+
+
+def _full_suites(report: ParsedReport) -> set[str]:
+    """The suites within ``report`` that have at least ``_EXPECTED_SCENARIO_COUNT`` *scored*
+    entries (``e.precision is not None`` -- see ``render_scenario_table``'s docstring for why that's
+    the same thing ``eval/conftest.py``'s ``_write_trend_log`` counts) -- exactly the suites
+    ``render_scenario_table`` actually renders a row for. Shared with ``_find_matching_report`` so a
+    trend-log row never links to a report where its own suite's entries would be filtered out as
+    partial -- matching by suite *presence* alone (the previous behavior) could link a genuine
+    full-corpus chart point to a `-k`-filtered debug report that happens to fall within the match
+    tolerance, landing the link on a section listing none of that suite's scenarios, or on no
+    section at all if every suite in that report is partial."""
+    scored = [e for e in report.entries if e.suite is not None and e.precision is not None]
+    counts = Counter(e.suite for e in scored)
+    return {suite for suite, count in counts.items() if count >= _EXPECTED_SCENARIO_COUNT}
+
+
 # Both timestamps come from separate ``datetime.now()`` calls inside the same
 # ``pytest_sessionfinish`` (``eval/conftest.py``'s ``_write_trend_log`` then its own report-writing
 # code), normally sub-second apart. The window is generous only to guard against matching a trend
@@ -228,12 +248,14 @@ _MATCH_TOLERANCE = timedelta(hours=6)
 def _find_matching_report(row: dict[str, Any], reports: list[ParsedReport]) -> ParsedReport | None:
     """The parsed report that is this trend-log row's likely evidence, or ``None`` if no
     same-suite report is within tolerance (the chart point still renders, just without a
-    drill-down link)."""
+    drill-down link). Only a report where the row's suite is actually full (``_full_suites``)
+    counts -- otherwise the link would land on a section with none of that suite's scenarios, or on
+    no section at all."""
     row_time = datetime.fromisoformat(row["timestamp"])
     best: ParsedReport | None = None
     best_delta: timedelta | None = None
     for report in reports:
-        if not any(e.suite == row.get("suite") for e in report.entries):
+        if row.get("suite") not in _full_suites(report):
             continue
         delta = abs(report.run_at - row_time)
         if delta > _MATCH_TOLERANCE:
@@ -377,9 +399,24 @@ def _escape_cell(text: str) -> str:
 def render_scenario_table(report: ParsedReport) -> str:
     """One collapsible, anchored drill-down section for a parsed report's scored entries (any
     suite recognized by ``_SUITE_BY_NODEID_MARKER`` -- correctness and robustness today). ``""``
-    when the report has none (e.g. an ``eval_extended``-only run) -- nothing for
-    ``render_dashboard`` to show for that report."""
-    scored_entries = [e for e in report.entries if e.suite is not None]
+    when the report has none (e.g. an ``eval_extended``-only run, or one left with none after the
+    partial-run filter below) -- nothing for ``render_dashboard`` to show for that report.
+
+    A report has no ``run_type`` field of its own (that's a trend-log-only concept, computed from
+    ``scenarios_scored`` in ``eval/conftest.py``'s ``_write_trend_log``) -- and a single report can
+    mix a full run of one suite with a `-k`-filtered partial run of another (e.g. `-k baseline`
+    produces one scenario's worth of entries for *each* robustness test function it touches). So
+    "partial" is decided per (report, suite) via ``_full_suites``, counting the *same* thing
+    ``_write_trend_log`` counts -- entries that actually got scored (``e.precision is not None``; a
+    setup-failed scenario's "unavailable" placeholder and a skipped/unrelated-failure entry both
+    parse to ``None``, same as they never reach ``_write_trend_log``'s own ``"true_positives" in
+    props`` check) -- rather than every entry whose nodeid merely matched a known suite. Without
+    this, a report entry a setup failure kept out of the trend log (marking that row
+    ``run_type="partial"`` and dropping it from the chart) would still count toward a *full* corpus
+    here, showing as a complete run in the drill-down with no matching chart point."""
+    all_scored = [e for e in report.entries if e.suite is not None]
+    full_suites = _full_suites(report)
+    scored_entries = [e for e in all_scored if e.suite in full_suites]
     if not scored_entries:
         return ""
     rows_html = "".join(
@@ -430,12 +467,21 @@ def render_dashboard(trend_rows: list[dict[str, Any]], reports: list[ParsedRepor
     """The full static dashboard page: one trend chart per suite present in ``trend_rows``
     (generic over suite name -- not hardcoded to the two Correctness suites, so a future suite
     gets its own chart the moment it starts writing trend-log rows), then one scenario drill-down
-    section per parsed report."""
-    suites = sorted({row["suite"] for row in trend_rows if "suite" in row})
+    section per parsed report.
+
+    Charts only ever plot **full** runs (``run_type != "partial"`` -- a row with no ``run_type`` at
+    all, e.g. one written before that field existed, still counts as full). A `-k`-filtered
+    single-scenario debug run pools its precision/recall from far fewer scenarios than a real
+    8-scenario regression row and would otherwise show up as an unlabeled outlier on the same line,
+    indistinguishable from a genuine regression -- see ``eval/conftest.py``'s ``_write_trend_log``
+    for where ``run_type`` is set. Excluded rows are dropped only from the *chart*; nothing here
+    rewrites ``trend_log.jsonl`` itself."""
+    full_run_rows = [row for row in trend_rows if row.get("run_type") != "partial"]
+    suites = sorted({row["suite"] for row in full_run_rows if "suite" in row})
     if suites:
         chart_sections = "".join(
             f'<section class="trend-section"><h3>{suite}</h3>'
-            + render_svg_chart([row for row in trend_rows if row.get("suite") == suite], reports, suite=suite)
+            + render_svg_chart([row for row in full_run_rows if row.get("suite") == suite], reports, suite=suite)
             + "</section>"
             for suite in suites
         )

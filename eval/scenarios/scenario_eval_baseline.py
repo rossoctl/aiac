@@ -111,18 +111,13 @@ USER_PASSWORD = "password"
 USER_ROLES: dict[str, str] = {
     "user-role-developer": (
         "Developer — an engineering user who develops the source codebase (writing and maintaining "
-        "code) and fixes code defects reported in the issue tracker; works primarily in source and "
-        "consults issues for defect reports."
+        "code) and fixes code defects reported in the issue tracker."
     ),
     "user-role-tester": (
         "Tester — a quality-assurance user who verifies software quality and tracks defects through "
-        "the issue tracker: filing, triaging, and updating issue reports; works in the issue "
-        "tracker, not in source."
+        "the issue tracker: filing, triaging, and updating issue reports."
     ),
-    "user-role-devops": (
-        "DevOps — an operations user who manages deployment infrastructure and runtime "
-        "environments; does not author source code and does not manage the issue tracker."
-    ),
+    "user-role-devops": ("DevOps — an operations user who manages deployment infrastructure and runtime environments."),
 }
 
 # --- Role -> access facts (name-level; the single source of truth) --------------------------

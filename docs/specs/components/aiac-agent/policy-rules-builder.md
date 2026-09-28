@@ -481,6 +481,28 @@ user-role-focal deny-only pass whose sole purpose was deriving that complement.
   description prohibition into a durable deny; under the digested model a prohibition that must be
   durable belongs in the policy, not a description.
 
+### Description neutrality (precondition)
+
+The "durable user-role denies are policy-stated" property above rests on a
+**precondition**: an entity's IdP **description** (its *agentic role/scope*) and
+the policy's own **domain-knowledge** roles/accesses (its *policy role/access*
+definitions) state **identity, never authorization effect** — they carry no
+approve/deny language. Allow/deny effect lives solely in the policy's grant/deny
+statements. A prohibition left only in a description (e.g. *"works in issues, not
+source"*) is therefore **malformed input**, not a lost deny — which is why
+rossoctl/rossoctl#2562 resolves as *keep-as-is* rather than restoring a
+role-focal user-role deny pass (that pass would derive a durable deny *from a
+description*, precisely what the precondition forbids).
+
+This leaves one **known asymmetry** with the deny-extraction rule above: a
+*focal* entity's own description prohibition (e.g. an agent role *"does not manage
+the issue tracker"*) still yields a durable `DENY`, while a *candidate* user
+role's disclaimer is a non-grant. Under the neutrality precondition the focal
+phrasing is *also* malformed input, so the focal-description deny path is the
+anomaly. Per rossoctl/rossoctl#2562 the code is **left unchanged for now**;
+enforcing the precondition (linting both namespaces) and making focal denies
+policy-only are deferred to the neutrality-guard follow-up.
+
 ### Trade-off considered
 
 The alternative was to *keep* Door B but strip it to explicit-denies-only (a conservative

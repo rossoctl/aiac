@@ -29,13 +29,14 @@ except `agent_delegation`:**
   lives at the **top level** of `test/system/` (sibling of `launcher.py`/`scenario_uc1.py`),
   not under `eval/` like the other seven. It isolates the agent-to-agent `target_scopes`
   delegation mechanism, which is conceptually closer to the top-level fixed-scenario family than to
-  the `eval/` catalog's silent-gap/ambiguity/adversarial-authoring aspects. The harness's `pipeline`
-  fixture resolves each scenario's `AIAC_POLICY_FILE` relative to *that scenario module's own
-  directory* (`Path(scenario.__file__).resolve().parent / scenario.POLICY_FILE`), not a fixed
-  `eval/` path, specifically to accommodate this.
-- A matching `policy.eval_<name>.md` next to each scenario module above — the scenario's policy
-  text, read by the PRB via `AIAC_POLICY_FILE` (these **are** load-bearing at runtime, unlike the
-  two light-scenario `.md` files below).
+  the `eval/` catalog's silent-gap/ambiguity/adversarial-authoring aspects.
+- A matching `policy.eval_<name>.md` next to each scenario module above — the scenario's *source*
+  policy text. Not read directly at runtime: the harness's `pipeline` fixture points
+  `AIAC_POLICY_FILE` at that scenario's **committed digested** counterpart in
+  `eval/scenarios_digested/` instead (`digested_policy_path(scenario)`, same filename regardless of
+  which directory the source lives in — see `eval/scenarios_digested/__init__.py` and
+  `docs/specs/digested-policy.md`), since production feeds the PRB only digested policy. These
+  digested files **are** load-bearing at runtime, unlike the two light-scenario `.md` files below.
 - `eval/probe_eval.rego` — a generalized outbound probe, parameterized by
   `input.agent_id`, serving every agent in every heavy scenario (see
   [Testing Decisions](#testing-decisions)).
@@ -297,7 +298,7 @@ both directions (`service-account-coach-agent` against `coach-review-agent`'s ga
 
 ### Scenario 10 — empty descriptions
 
-Realm `aiac-pp-eval-empty-descriptions`. 1 user (`user-role-field-operator`), 1 agent
+Realm `aiac-pp-eval-empty-descriptions`. 1 user (`user-role-grounds-worker`), 1 agent
 (`irrigation-agent`), 1 tool (`valve-tool`, scopes `tool-scope-valve-open`/`tool-scope-valve-close`). Every entity, role,
 and scope description is the empty string — the PRB has no semantic content to infer intent from
 beyond the bare identifiers, so every (role, scope) pair is named explicitly in
@@ -335,7 +336,7 @@ scenarios (`KEYCLOAK_URL`, `KEYCLOAK_ADMIN_USERNAME`/`PASSWORD`, `AIAC_PDP_CONFI
 | Variable | Difference from `policy-pipeline.md` |
 |----------|----------------------------------------|
 | `KEYCLOAK_REALM` | Set per scenario module (`scenario.REALM_DEFAULT`), not a single fixed realm — eight distinct realms across the session. |
-| `AIAC_POLICY_FILE` | Set per scenario to `<scenario module's own directory>/<scenario.POLICY_FILE>` (heavy scenarios only) — resolved relative to that module's `__file__`, not a fixed `eval/` path, since `scenario_eval_agent_delegation.py` lives one level up from the rest (see [Location](#location)). |
+| `AIAC_POLICY_FILE` | Set per scenario to its **digested** policy in `eval/scenarios_digested/` (heavy scenarios only) — `digested_policy_path(scenario)`, same filename as `scenario.POLICY_FILE` regardless of which directory that scenario's source lives in, so `scenario_eval_agent_delegation.py` living one level up from the rest (see [Location](#location)) needs no special-casing here. |
 
 The light scenarios (2, 5) need only `LLM_BASE_URL`/`LLM_MODEL`/`LLM_API_KEY` — no Keycloak, store,
 or OPA URLs, no `opa` binary.

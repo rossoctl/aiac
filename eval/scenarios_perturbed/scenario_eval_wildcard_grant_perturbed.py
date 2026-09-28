@@ -66,7 +66,7 @@ USER_PASSWORD = "password"
 
 USER_ROLES: dict[str, str] = {
     "user-role-inventory-manager": (
-        "Inventory Manager: may carry out every inventory operation — stock-level checks, count "
+        "Inventory Manager: carries out every inventory operation — stock-level checks, count "
         "adjustments, and reorders."
     ),
 }

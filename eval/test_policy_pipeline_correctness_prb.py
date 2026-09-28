@@ -59,6 +59,7 @@ sys.path.insert(0, str(SRC))  # so ``import aiac.*`` resolves
 from aiac.policy.model.models import RuleEffect  # noqa: E402
 from eval.correctness_scorer import score_scenario  # noqa: E402
 from eval.prb_direct import build_roles_and_scopes  # noqa: E402
+from eval.scenarios_digested import digested_policy_path  # noqa: E402
 from eval.test_policy_pipeline_eval import (  # noqa: E402
     SCENARIOS,
     grant_sets,
@@ -76,8 +77,7 @@ def test_prb_correctness(scenario_name: str, monkeypatch: pytest.MonkeyPatch, re
     require_env_or_skip("LLM_BASE_URL", "LLM_MODEL", "LLM_API_KEY")
     scenario = SCENARIOS[scenario_name]
     roles, scopes = build_roles_and_scopes(scenario)
-    policy_path = Path(scenario.__file__).resolve().parent / scenario.POLICY_FILE
-    monkeypatch.setenv("AIAC_POLICY_FILE", str(policy_path))
+    monkeypatch.setenv("AIAC_POLICY_FILE", str(digested_policy_path(scenario)))
 
     # best_effort=True: a scope/role decision the auditor rejects contributes a best-effort
     # (never-approved) fallback rule instead of aborting the whole scenario — see
