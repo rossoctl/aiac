@@ -16,7 +16,9 @@ import pytest
 from eval.dashboard import (
     ParsedReport,
     ScenarioEntry,
+    _expected_count,
     _find_matching_report,
+    _full_suites,
     _report_anchor,
     build_dashboard,
     load_trend_log,
@@ -623,6 +625,71 @@ def test_render_scenario_table_excludes_a_suite_with_fewer_than_the_full_corpus(
         path=Path("report_x.md"), run_at=datetime.fromisoformat("2026-09-10T07:00:00+00:00"), entries=[entry]
     )
 
+    assert render_scenario_table(report) == ""
+
+
+def test_expected_count_defaults_to_the_shared_corpus_size_for_an_unknown_suite() -> None:
+    assert _expected_count("correctness_prb") == 8
+    assert _expected_count("some_future_suite_not_yet_added") == 8
+
+
+def test_expected_count_is_one_for_every_scale_suite() -> None:
+    # Each Scale correctness test function (#2469) is one fixture-backed test case -- a generated
+    # total-corpus/per-decision scenario per dimension/level -- never a sweep over 8 named
+    # scenarios, so its own "full" count is 1, not the shared corpus's 8.
+    for suite in (
+        "scale_total_corpus_prb",
+        "scale_total_corpus_e2e",
+        "scale_per_decision_prb",
+        "scale_per_decision_e2e",
+    ):
+        assert _expected_count(suite) == 1
+
+
+def test_render_scenario_table_includes_a_scale_suite_with_only_one_entry() -> None:
+    """A Scale suite report needs no ``_EXPECTED_SCENARIO_COUNT`` monkeypatch at all -- its own
+    override in ``_EXPECTED_COUNT_BY_SUITE`` makes a single scored entry already "full". Before
+    this fix, every Scale entry was unconditionally excluded here: the shared 8-scenario threshold
+    a Scale suite's single fixture-backed test case can never reach."""
+    entry = ScenarioEntry(
+        nodeid="eval/test_policy_pipeline_scale.py::test_scale_total_corpus_correctness_prb",
+        suite="scale_total_corpus_prb",
+        precision=1.0,
+        recall=0.99,
+        denial_precision=1.0,
+    )
+    report = ParsedReport(
+        path=Path("report_x.md"), run_at=datetime.fromisoformat("2026-09-10T07:00:00+00:00"), entries=[entry]
+    )
+
+    assert _full_suites(report) == {"scale_total_corpus_prb"}
+    assert "scale_total_corpus_prb" in render_scenario_table(report)
+
+
+def test_find_matching_report_links_a_scale_suite_row_with_only_one_entry() -> None:
+    """Mirrors ``test_find_matching_report_picks_nearest_same_suite_within_tolerance``, but for a
+    Scale suite -- no ``_EXPECTED_SCENARIO_COUNT`` monkeypatch needed, since ``_full_suites`` treats
+    one entry as already full for this suite."""
+    row = {"suite": "scale_per_decision_e2e", "timestamp": "2026-09-10T07:00:05+00:00"}
+    near = _report("2026-09-10T07:00:00+00:00", "scale_per_decision_e2e")
+
+    assert _find_matching_report(row, [near]) is near
+
+
+def test_render_scenario_table_drops_a_setup_failure_scale_run() -> None:
+    """A Scale suite whose scored entry never actually reached ``score_scenario`` (e.g. a fixture
+    setup error) has no float ``precision`` to parse -- ``_full_suites`` correctly reports 0 scored
+    entries for it, same "unavailable" handling every other suite gets."""
+    entry = ScenarioEntry(
+        nodeid="eval/test_policy_pipeline_scale.py::test_scale_total_corpus_correctness_e2e",
+        suite="scale_total_corpus_e2e",
+        category="error",
+    )
+    report = ParsedReport(
+        path=Path("report_x.md"), run_at=datetime.fromisoformat("2026-09-10T07:00:00+00:00"), entries=[entry]
+    )
+
+    assert _full_suites(report) == set()
     assert render_scenario_table(report) == ""
 
 

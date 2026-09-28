@@ -1,0 +1,137 @@
+"""Concurrent PRB fan-out for the Scale suite (spec: ``docs/evaluation/policy-eval-scale.md``).
+
+The total-corpus dimension's whole point is stressing *many* PRB decisions (one per generated
+agent inbound scope, tool/target scope, and agent role -- ~100-150 calls at the fixed-100 size).
+``eval.test_policy_pipeline_eval.orchestrate_prb`` makes exactly that set of calls, but
+sequentially (production code, not modified here). Running them one after another would pay
+~100-150x one call's LLM round-trip latency for no benefit: each call is independent -- its own
+fresh state dict, its own freshly-built ``ChatOpenAI`` client (``_build_llm()`` is called fresh
+per ``_structured_call``) -- so nothing about them shares mutable state across calls.
+``run_concurrently``/``orchestrate_prb_concurrent`` fan the same call set out across a
+``ThreadPoolExecutor`` instead, capped by ``SCALE_CONCURRENCY`` (mirrors
+``EVAL_PIPELINE_PARALLELISM``'s existing override convention) to stay under a typical LLM
+endpoint's rate limits. ``run_concurrently`` is the shared primitive, reused as-is by the e2e
+level's Keycloak provisioning loops (independent per-entity admin-API calls) in
+``eval/test_policy_pipeline_scale.py``.
+
+**Usage-metadata tracking under threads**: LangChain's ``get_usage_metadata_callback()`` is a
+context-var-scoped callback handler. Confirmed empirically (not merely assumed) that its context
+var does **not** propagate into ``ThreadPoolExecutor`` worker threads -- wrapping it around the
+whole pool submission block sees zero usage recorded. Scoping one *inside* each worker task (this
+module's ``_invoke_with_usage``) instead correctly captures that task's own usage, which the caller
+then aggregates on the main thread -- see ``eval.scale_structural`` for the aggregation.
+"""
+
+from __future__ import annotations
+
+import os
+from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
+from typing import Any, Callable, TypeVar
+
+from langchain_core.callbacks.usage import get_usage_metadata_callback
+
+from aiac.agent.policy_rules_builder.graph import ROLE_GRAPH, SCOPE_GRAPH
+from aiac.idp.configuration.models import Role, Scope
+from aiac.policy.model.models import PolicyRule
+from eval.test_policy_pipeline_eval import _invoke_graph
+
+DEFAULT_CONCURRENCY = 20
+T = TypeVar("T")
+
+
+def concurrency() -> int:
+    """``SCALE_CONCURRENCY`` env override (default ``DEFAULT_CONCURRENCY``), floored at 1 -- same
+    floor rationale as ``test_policy_pipeline_eval.py``'s ``EVAL_PIPELINE_PARALLELISM`` read."""
+    return max(1, int(os.environ.get("SCALE_CONCURRENCY", str(DEFAULT_CONCURRENCY))))
+
+
+def run_concurrently(fns: list[Callable[[], T]], *, max_workers: int | None = None) -> list[T]:
+    """Run each zero-arg callable in ``fns`` on a thread pool, returning results in the same order
+    as ``fns`` (``ThreadPoolExecutor.map`` preserves input order while still executing
+    concurrently). The shared fan-out primitive both ``orchestrate_prb_concurrent`` below and the
+    e2e provisioning loops (``eval/test_policy_pipeline_scale.py``) build on."""
+    if not fns:
+        return []
+    with ThreadPoolExecutor(max_workers=max_workers or concurrency()) as executor:
+        return list(executor.map(lambda fn: fn(), fns))
+
+
+def _invoke_with_usage(
+    graph: Any, *, best_effort: bool, **entity: object
+) -> tuple[list[PolicyRule], str, str | None, dict[str, Any]]:
+    """``_invoke_graph``, with its own dedicated ``get_usage_metadata_callback()`` scope -- see the
+    module docstring for why this must be scoped per-call, not around the whole pool."""
+    with get_usage_metadata_callback() as cb:
+        rules, reasoning, note = _invoke_graph(graph, best_effort=best_effort, **entity)
+    return rules, reasoning, note, dict(cb.usage_metadata)
+
+
+def orchestrate_prb_concurrent(
+    roles: dict[str, Role],
+    scopes: dict[str, Scope],
+    scenario: SimpleNamespace,
+    *,
+    best_effort: bool = True,
+    max_workers: int | None = None,
+) -> tuple[list[PolicyRule], dict[str, str], dict[str, str], dict[str, str], dict[str, dict]]:
+    """Concurrent counterpart of ``eval.test_policy_pipeline_eval.orchestrate_prb`` -- same call
+    set (one ``SCOPE_GRAPH`` call per agent inbound scope and per tool/agent-target scope, one
+    ``ROLE_GRAPH`` call per agent role), fanned out via ``run_concurrently`` instead of run one
+    after another. Returns the same four values ``orchestrate_prb`` does, plus a fifth,
+    ``usage_by_name`` (``{scope_or_role_name: usage_metadata}``), for the cost structural check
+    (``eval.scale_structural``) to sum.
+
+    ``best_effort`` defaults to ``True`` here (unlike ``orchestrate_prb``'s ``False`` default) --
+    at ~100-150 decisions per total-corpus run, one auditor rejection must not discard every other
+    decision's real result; every sibling correctness/robustness/consistency suite already makes
+    this same choice at its own call sites.
+    """
+    user_roles = [roles[name] for name in scenario.USER_ROLES]
+
+    inbound_scope_names = [n for agent in scenario.AGENTS.values() for n in agent["inbound_scopes"]]
+    target_scope_names = [n for tool in scenario.TOOLS.values() for n in tool["scopes"]]
+    target_scope_names += [n for agent in scenario.AGENTS.values() for n in agent.get("delegation_scopes", {})]
+    agent_role_names = [n for agent in scenario.AGENTS.values() for n in agent["roles"]]
+
+    inbound_scopes = [scopes[n] for n in inbound_scope_names]
+    target_scopes = [scopes[n] for n in target_scope_names]
+    agent_roles = [roles[n] for n in agent_role_names]
+
+    def _scope_job(scope: Scope) -> Callable[[], tuple[str, str, list[PolicyRule], str, str | None, dict]]:
+        def _run() -> tuple[str, str, list[PolicyRule], str, str | None, dict]:
+            job_rules, reasoning, note, usage = _invoke_with_usage(
+                SCOPE_GRAPH, roles=user_roles, scope=scope, best_effort=best_effort
+            )
+            return "scope", scope.name, job_rules, reasoning, note, usage
+
+        return _run
+
+    def _role_job(role: Role) -> Callable[[], tuple[str, str, list[PolicyRule], str, str | None, dict]]:
+        def _run() -> tuple[str, str, list[PolicyRule], str, str | None, dict]:
+            job_rules, reasoning, note, usage = _invoke_with_usage(
+                ROLE_GRAPH, role=role, scopes=target_scopes, best_effort=best_effort
+            )
+            return "role", role.name, job_rules, reasoning, note, usage
+
+        return _run
+
+    jobs = [_scope_job(s) for s in inbound_scopes + target_scopes] + [_role_job(r) for r in agent_roles]
+    results = run_concurrently(jobs, max_workers=max_workers)
+
+    rules: list[PolicyRule] = []
+    reasoning_by_scope: dict[str, str] = {}
+    reasoning_by_agent_role: dict[str, str] = {}
+    best_effort_notes: dict[str, str] = {}
+    usage_by_name: dict[str, dict] = {}
+    for kind, name, job_rules, reasoning, note, usage in results:
+        rules += job_rules
+        if kind == "scope":
+            reasoning_by_scope[name] = reasoning
+        else:
+            reasoning_by_agent_role[name] = reasoning
+        if note is not None:
+            best_effort_notes[name] = note
+        usage_by_name[name] = usage
+
+    return rules, reasoning_by_scope, reasoning_by_agent_role, best_effort_notes, usage_by_name
