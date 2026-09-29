@@ -25,7 +25,7 @@ N (repeats per scenario) is overridable via ``PRB_CONSISTENCY_REPEATS`` (default
 
 Feeds the committed trend log (spec §9): ``record_property("inconsistent", bool)`` per scenario is
 read back by ``eval/conftest.py``'s ``_write_trend_log`` (``_CONSISTENCY_TEST_MARKERS``) and pooled
-via ``eval/trend_log.py``'s ``pool_consistency_metrics`` into a ``disagreement_rate`` — recorded
+via ``eval/trend_log.py``'s ``pool_consistency_metrics`` into an ``agreement_rate`` — recorded
 even on a fully-passing run, per spec §6, so an occasional flake against a live LLM stays visible
 over time instead of only showing up as a one-off failure.
 """
@@ -95,13 +95,14 @@ def test_prb_consistent_across_repeats(scenario_name: str, monkeypatch: pytest.M
                 mismatches.append(f"gate={gate} run=0 vs run={run_index}: differing pairs={sorted(diff)}")
 
     record_property("inconsistent", bool(mismatches))
-    # Full mismatch detail (empty list when consistent) -- read back by eval/conftest.py's
-    # _render_entry to show "Inconsistent: Yes/No" + detail in the Markdown report on every run,
-    # pass or fail, not just via the crash message when the assert below fires. "inconsistent"
-    # alone is also read back by _write_trend_log (_CONSISTENCY_TEST_MARKERS) and pooled via
-    # eval/trend_log.py's pool_consistency_metrics into this run's disagreement_rate (spec:
-    # docs/evaluation/eval-framework.md §6/§9).
-    record_property("mismatches", mismatches)
+    # Full mismatch detail, newline-joined into a single string (empty when consistent) -- not a
+    # list, since record_property is primarily a JUnit-XML mechanism and a list isn't a valid XML
+    # attribute scalar. Read back by eval/conftest.py's _render_entry to show "Inconsistent: Yes/No"
+    # + detail in the Markdown report on every run, pass or fail, not just via the crash message
+    # when the assert below fires. "inconsistent" alone is also read back by _write_trend_log
+    # (_CONSISTENCY_TEST_MARKERS) and pooled via eval/trend_log.py's pool_consistency_metrics into
+    # this run's agreement_rate (spec: docs/evaluation/eval-framework.md §6/§9).
+    record_property("mismatches", "\n".join(mismatches))
 
     assert not mismatches, f"PRB was inconsistent across {N} repeats for scenario '{scenario_name}':\n" + "\n".join(
         mismatches

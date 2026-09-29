@@ -118,18 +118,18 @@ def test_pool_multiple_scenarios_pools_by_count_not_average() -> None:
     assert metrics["precision"] == 10 / 11
 
 
-def test_pool_consistency_empty_entries_has_zero_disagreement_rate() -> None:
+def test_pool_consistency_empty_entries_has_full_agreement_rate() -> None:
     metrics = pool_consistency_metrics([])
 
-    assert metrics == {"scenarios_scored": 0, "disagreement_rate": 0.0}
+    assert metrics == {"scenarios_scored": 0, "agreement_rate": 1.0}
 
 
-def test_pool_consistency_all_consistent_has_zero_disagreement_rate() -> None:
+def test_pool_consistency_all_consistent_has_full_agreement_rate() -> None:
     entries = [{"inconsistent": False}, {"inconsistent": False}, {"inconsistent": False}]
 
     metrics = pool_consistency_metrics(entries)
 
-    assert metrics == {"scenarios_scored": 3, "disagreement_rate": 0.0}
+    assert metrics == {"scenarios_scored": 3, "agreement_rate": 1.0}
 
 
 def test_pool_consistency_one_disagreement_out_of_several() -> None:
@@ -138,15 +138,15 @@ def test_pool_consistency_one_disagreement_out_of_several() -> None:
     metrics = pool_consistency_metrics(entries)
 
     assert metrics["scenarios_scored"] == 4
-    assert metrics["disagreement_rate"] == 0.25
+    assert metrics["agreement_rate"] == 0.75
 
 
-def test_pool_consistency_all_disagree() -> None:
+def test_pool_consistency_all_disagree_has_zero_agreement_rate() -> None:
     entries = [{"inconsistent": True}, {"inconsistent": True}]
 
     metrics = pool_consistency_metrics(entries)
 
-    assert metrics == {"scenarios_scored": 2, "disagreement_rate": 1.0}
+    assert metrics == {"scenarios_scored": 2, "agreement_rate": 0.0}
 
 
 def test_append_row_writes_one_json_line(tmp_path: Path) -> None:

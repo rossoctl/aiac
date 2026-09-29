@@ -406,11 +406,12 @@ mislabeling one row's count against another's. See `docs/evaluation/eval-framewo
 **Consistency (#2468)** gets its own single row, `suite="consistency"`, pooled by
 `eval/trend_log.py`'s `pool_consistency_metrics` — not `pool_correctness_metrics`, since there's no
 truth table here (Consistency compares PRB runs to each other, not to ground truth), just each
-scenario's own `inconsistent` boolean rolled up into a `disagreement_rate` (the fraction of the
-corpus's scenarios that disagreed across their `PRB_CONSISTENCY_REPEATS` repeats). Recorded whether
-the run passed or failed — spec §6's whole point is that an occasional disagreement should stay
-visible on the trend chart over time, not just show up as a one-off failed run with no lasting
-record.
+scenario's own `inconsistent` boolean rolled up into an `agreement_rate` (the fraction of the
+corpus's scenarios that agreed across all of their `PRB_CONSISTENCY_REPEATS` repeats). Framed as
+*agreement*, not *disagreement*, so "higher is better" holds on this metric the same way it does
+for every other rate the dashboard plots on its shared 0-1 axis. Recorded whether the run passed or
+failed — spec §6's whole point is that an occasional disagreement should stay visible on the trend
+chart over time, not just show up as a one-off failed run with no lasting record.
 
 ## Testing Decisions
 

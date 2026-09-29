@@ -23,7 +23,7 @@
 {"timestamp": "2026-09-22T11:10:35+00:00", "suite": "robustness_semantic_invariance", "run_type": "regression", "model": "Azure/gpt-5-mini-2025-08-07", "scenarios_scored": 8, "precision": 1.0, "recall": 1.0, "denial_precision": 0.75, "invariance_rate": 1.0}
 {"timestamp": "2026-09-22T11:10:35+00:00", "suite": "robustness_mechanical_sensitivity", "run_type": "regression", "model": "Azure/gpt-5-mini-2025-08-07", "scenarios_scored": 8, "precision": 0.927, "recall": 1.0, "denial_precision": 0.85, "sensitivity_rate": 0.875}
 {"timestamp": "2026-09-22T11:10:35+00:00", "suite": "robustness_semantic_sensitivity", "run_type": "regression", "model": "Azure/gpt-5-mini-2025-08-07", "scenarios_scored": 8, "precision": 1.0, "recall": 0.974, "denial_precision": 0.971, "sensitivity_rate": 0.875}
-{"timestamp": "2026-09-22T14:04:33+00:00", "suite": "consistency", "run_type": "regression", "model": "Azure/gpt-5-mini-2025-08-07", "scenarios_scored": 8, "disagreement_rate": 0.0}
-{"timestamp": "2026-09-28T06:54:27+00:00", "suite": "consistency", "run_type": "regression", "model": "Azure/gpt-5-mini-2025-08-07", "scenarios_scored": 8, "disagreement_rate": 0.0}
+{"timestamp": "2026-09-22T14:04:33+00:00", "suite": "consistency", "run_type": "regression", "model": "Azure/gpt-5-mini-2025-08-07", "scenarios_scored": 8, "agreement_rate": 1.0}
+{"timestamp": "2026-09-28T06:54:27+00:00", "suite": "consistency", "run_type": "regression", "model": "Azure/gpt-5-mini-2025-08-07", "scenarios_scored": 8, "agreement_rate": 1.0}
 {"timestamp": "2026-09-28T07:20:25+00:00", "suite": "correctness_prb", "run_type": "regression", "model": "Azure/gpt-5-mini-2025-08-07", "scenarios_scored": 8, "precision": 1.0, "recall": 1.0, "denial_precision": 0.75}
 {"timestamp": "2026-09-28T07:25:44+00:00", "suite": "correctness_prb", "run_type": "regression", "model": "Azure/gpt-5-mini-2025-08-07", "scenarios_scored": 8, "precision": 1.0, "recall": 1.0, "denial_precision": 0.75}
