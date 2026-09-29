@@ -376,7 +376,9 @@ best-effort, never-approved proposal (see [Testing Decisions](#testing-decisions
 
 `test_prb_consistent_across_repeats` (#2468) is the one exception to "falls through to the generic
 docstring + crash-message rendering" above: it `record_property("inconsistent", bool)` +
-`record_property("mismatches", [...])` (the full mismatch detail, empty when consistent), and
+`record_property("mismatches", "...")` (the full mismatch detail, newline-joined into a single
+string, empty when consistent — not a list, since `record_property` is primarily a JUnit-XML
+mechanism and a list isn't a valid XML attribute scalar), and
 `_render_entry` dispatches on `"inconsistent" in props` to render an explicit "Inconsistent:
 Yes/No" line (plus mismatch detail when `True`) via `_render_consistency_block` — on *every* entry,
 pass or fail, not just inferred from the crash message when the assertion fires. `"inconsistent"`
