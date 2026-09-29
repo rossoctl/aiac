@@ -9,14 +9,6 @@ All paths below are relative to the repository root.
 
 For current file list, `ls docs/specs/` and `ls docs/specs/components/`.
 
-## Requirements directory — link-following policy
-
-When a document under `docs/specs/` contains a markdown link to another file, use the AskUserQuestion tool to ask before reading it — present "Yes" and "No" as clickable options. If the user picks Yes, read the file normally. If No, treat the link as a label and continue without reading it.
-
-## Issue tracking — codebase inspection policy
-
-When working on an issue would benefit from inspecting the relevant source code, use the AskUserQuestion tool to ask before doing so — present "Yes" and "No" as clickable options. If the user picks Yes, inspect the codebase normally. If No, work from the issue description and existing context only.
-
 ## Handoffs
 
 Per-task handoff documents live under `docs/handoffs/` — one markdown file per task, numeric-prefixed (e.g. `01-update-issues.md`, `02-update-source-and-tests.md`). When asked to generate a handoff, write it here (not a scratch/temp path). Each handoff must be self-contained — background, task, exact files, and acceptance criteria — so a fresh session can execute it without the originating conversation.
@@ -86,7 +78,10 @@ this ladder (first match wins):
    the cluster/env is missing — gate on the env with `require_env_or_skip`
    (never `require_env`, which hard-exits), so it never false-passes offline.
 4. **Heavy policy-pipeline evaluation** → **eval**. Put it under `eval/` and tag
-   it `@pytest.mark.eval`. Same clean-skip discipline.
+   it `@pytest.mark.eval`. Same clean-skip discipline. Exception: offline tests
+   of the eval harness's own helpers (scorer, dashboard, trend log, …) also live
+   under `eval/` but stay **untagged**, so a bare `pytest` runs them in the unit
+   lane.
 
 Then, **orthogonally**: if the test calls a real external LLM but needs no
 cluster, add the `llm` tag as well (a unit or integration test can be

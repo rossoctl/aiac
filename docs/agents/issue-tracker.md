@@ -7,8 +7,9 @@ Projects commands are account-scoped — they take `--owner rossoctl` (and
 `--project-id` for item updates), and need the `project` scope on the token
 (`gh auth refresh -s project`).
 
-This file exists so the engineering skills (`to-tickets`, `to-spec`, and
-`triage` when installed) have a single place to read the convention from.
+This file exists so the engineering skills (`to-tickets`, `to-spec`, `triage`,
+`close-issue`, `code-review`) have a single place to read the convention from.
+The triage-role → label/board mapping is in `docs/agents/triage-labels.md`.
 
 > **Migration note (2026-09-09).** The `aiac`-labelled issues were migrated here
 > from `s-and-p-team/cortex`. GitHub cannot transfer issues across orgs, so they
@@ -83,8 +84,8 @@ The five canonical roles (`needs-triage`, `needs-info`, `ready-for-agent`,
 **and** the matching option on the board's `Triage Status` field (see Project
 board above); the board adds `blocked` / `deferred` / `resolved` beyond the five.
 Apply the `status:<role>` label with `gh issue edit` and set the `Triage Status`
-field to the same value. There is no `docs/agents/triage-labels.md` (the `triage`
-skill is not installed here) — this section is the mapping.
+field to the same value. The full mapping (including the terminal values
+`close-issue` sets) is in `docs/agents/triage-labels.md`.
 
 Filtered web list:
 <https://github.com/rossoctl/aiac/issues?q=is%3Aissue+label%3Aaiac>
