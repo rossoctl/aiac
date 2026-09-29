@@ -182,8 +182,10 @@ corpus already carries.
 all 5 runs; any single disagreement fails. This is access control; "usually
 reproducible" is not a real guarantee.
 
-**Trend reporting:** even on a passing run, the disagreement rate (if any)
-is recorded to the trend log (§9) so an occasional flake that stays under
+**Trend reporting:** even on a passing run, the agreement rate is recorded
+to the trend log (§9) — framed as *agreement* (higher is better) rather than
+*disagreement* (lower is better) so it reads the same direction as every
+other rate the trend log tracks — so an occasional flake that stays under
 the gate doesn't silently worsen over time without anyone noticing. This
 also acknowledges that LLM APIs at temperature=0 are not literally
 guaranteed bit-identical across calls (provider-side batching, nondeterministic
@@ -253,7 +255,7 @@ Two artifacts, at different durability levels:
 - **Structured trend log** (**committed to git**) — a small append-only
   file (JSON or CSV) per suite, one row per run, holding model version,
   timestamp, and key metrics only (over-grant rate, under-grant rate,
-  invariance rate, sensitivity rate, consistency disagreement rate,
+  invariance rate, sensitivity rate, consistency agreement rate,
   scale structural/correctness results) — not verbose per-cell reasoning
   text. Small enough to not bloat the repo; durable enough to actually plot
   drift over time across machines and contributors.
