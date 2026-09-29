@@ -1,11 +1,22 @@
-# uc1-onboarding demo — AIAC discovers an agent and a tool, reads a two-line plain-English
-# policy, and generates enforceable least-privilege authorization. Strictly live: every target
-# talks to a real cluster/Keycloak/LLM, no offline replay and no fixtures.
+# UC-1 demo — AIAC discovers an agent and a tool, reads a two-line plain-English policy, and
+# generates enforceable least-privilege authorization. Strictly live: every target talks to a real
+# cluster/Keycloak/LLM, no offline replay and no fixtures. Full narrative: demo.md.
 #
-#   make demo   # init (00-03) -> onboard (04-05) -> run (dev/test/devops)
-#   make dev    # drive dev-user's intents through the after-tool snapshot
+# Two ways through the same scenario (demo.md walks both):
 #
-# How the demo sources generated Rego (see demo.md "How the demo sources the generated Rego"):
+#   The live path (demo.md Parts 1-5) — deploying the workloads IS the onboarding trigger, and a
+#   real HTTP request through the live AuthBridge OPA plugin decides allow/deny:
+#     make enable && make users && make e2e
+#
+#   The narrated walkthrough (demo.md Part 6) — manual onboarding calls + offline `opa eval`, for
+#   inspecting what was generated step by step. Needs the workloads already deployed:
+#     make demo   # init (00-03) -> onboard (04-05) -> run (dev/test/devops)
+#     make dev    # drive dev-user's intents through the after-tool snapshot
+#
+# `make users` is `setup` minus the steps that need the workloads deployed — the live path
+# provisions users/roles/policy BEFORE the deploy that triggers onboarding. See init/03-setup.py.
+#
+# How the demo sources generated Rego (see demo.md "How this sources the generated Rego"):
 # the reworked PDP Policy Writer is CR-backed — production writes AuthorizationPolicy CRs only, no
 # /rego file dump. So `make agent`/`tool` read the agent's Rego straight from its
 # `authorizationpolicies.agent.rossoctl.dev/github-agent` CR (spec.policies[].content) into
@@ -21,11 +32,12 @@
 # The discover script is bash (arrays, [[, BASH_SOURCE) — make's default /bin/sh can't source it.
 SHELL := /bin/bash
 
-.PHONY: help keycloak prereqs clear setup agent tool show diff dev test devops init onboard run demo
+.PHONY: help keycloak prereqs clear setup users agent tool show diff dev test devops \
+        init onboard run demo enable e2e trigger enforce replay restore
 
 .DEFAULT_GOAL := help
 
-# AIAC_ROOT is fixed relative to this Makefile's location (demo/use-cases/uc1-onboarding/), not
+# AIAC_ROOT is fixed relative to this Makefile's location (demo/use-cases/onboarding/), not
 # an override knob — the scripts resolve their own paths the same way.
 AIAC_ROOT := ../../..
 VENV      := $(AIAC_ROOT)/.venv
@@ -38,12 +50,17 @@ PYTHON    ?= $(VENV)/bin/python
 KC_ENV := . init/00-discover-keycloak.sh &&
 
 help:  ## Show this menu
-	@printf "\nuc1-onboarding demo — live AIAC onboarding of a real agent + tool.\n\n"
-	@printf "Run:\n  \033[1mmake demo\033[0m   (init 00-03 -> onboard 04-05 -> run)\n"
+	@printf "\nUC-1 demo — live AIAC onboarding of a real agent + tool. Full narrative: demo.md\n\n"
+	@printf "Live path (demo.md Parts 1-5) — deploying IS the trigger, real OPA enforces:\n"
+	@printf "  \033[1mmake enable\033[0m   (AIAC stack + NATS broker + Keycloak SPI)\n"
+	@printf "  \033[1mmake users\033[0m    (users/roles/policy — before the deploy that triggers onboarding)\n"
+	@printf "  \033[1mmake e2e\033[0m      (deploy -> verify trigger -> wire -> live enforce)\n\n"
+	@printf "Narrated walkthrough (demo.md Part 6) — manual onboarding + offline opa eval:\n"
+	@printf "  \033[1mmake demo\033[0m     (init 00-03 -> onboard 04-05 -> run)\n"
 	@printf "  \033[1mmake init / make onboard / make run\033[0m   (one phase at a time)\n"
 	@printf "  \033[1mmake dev / make test / make devops\033[0m   (drive one user's intents)\n\n"
 	@printf "Targets:\n"
-	@awk 'BEGIN{FS=":.*## "} /^[a-zA-Z_-]+:.*## /{printf "  \033[36m%-16s\033[0m %s\n",$$1,$$2}' $(MAKEFILE_LIST)
+	@awk 'BEGIN{FS=":.*## "} /^[a-zA-Z0-9_-]+:.*## /{printf "  \033[36m%-16s\033[0m %s\n",$$1,$$2}' $(MAKEFILE_LIST)
 	@printf "\nVars: PYTHON(=%s)\n\n" "$(PYTHON)"
 
 keycloak:  ## Port-forward the in-cluster Keycloak and discover admin creds (runs before prereqs)
@@ -57,6 +74,9 @@ clear:  ## Reset to a clean slate: Keycloak roles/scopes, Policy Store, the agen
 
 setup:  ## Provision users/roles, mount policy.md, configure token exchange; prints both UUIDs
 	$(KC_ENV) $(PYTHON) init/03-setup.py
+
+users:  ## Like setup, minus the steps needing deployed workloads — the live path's Part 3
+	$(KC_ENV) $(PYTHON) init/03-setup.py --skip-service-ids
 
 agent:  ## POST /apply/service on github-agent; captures generated/01-after-agent/
 	$(KC_ENV) $(PYTHON) onboard/04-onboard-agent.py
@@ -87,6 +107,31 @@ onboard: agent tool  ## Phase 2 (steps 04-05): onboard the agent, then the tool
 
 run: dev test devops  ## Phase 3: drive all three users (developer, tester, devops)
 
-demo: init onboard run  ## Full end-to-end: init -> onboard -> run
+demo: init onboard run  ## Full narrated walkthrough: init -> onboard -> run
 	@echo
 	@echo "Demo complete. Re-drive a single user with: make dev / make test / make devops"
+
+# --- the live path (demo.md Parts 1-5) --------------------------------------------------------
+# Thin wrappers over the scripts, so `make help` lists the whole demo in one place. These are NOT
+# aggregated into a single target on purpose: OPA must be wired into both AuthBridge legs
+# (k8s/opa-kind-enable.sh, a one-time cluster change owned by k8s/, not by this demo) between
+# `enable` and `e2e`, and driver.sh's preflight fails loudly with that exact instruction if it isn't.
+
+enable:  ## Part 1: install the AIAC stack + NATS broker + Keycloak SPI listener
+	./enable.sh
+
+e2e:  ## Parts 4-5: deploy (the trigger) -> verify trigger -> wire outbound -> live enforce
+	./driver.sh
+
+trigger:  ## Part 4 alone: deploy the workloads and verify the live trigger fired
+	./driver.sh --only-deploy
+
+enforce:  ## Part 5 alone: wire the outbound leg, then probe the live OPA plugin
+	./driver.sh --only-wire-outbound
+	./driver.sh --only-enforce
+
+replay:  ## Optional: re-prove the trigger against ALREADY-deployed workloads (forced replay)
+	./driver.sh --only-replay-trigger
+
+restore:  ## Tear down the workloads + their Keycloak clients (add ARGS=--include-infra for the SPI)
+	./restore.sh $(ARGS)

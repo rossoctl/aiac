@@ -26,7 +26,7 @@ from typing import Iterator
 import requests
 import scenario as scn
 
-HERE = Path(__file__).resolve().parent.parent  # lib/ -> uc1-onboarding/
+HERE = Path(__file__).resolve().parent.parent  # lib/ -> onboarding/
 GENERATED = HERE / "generated"
 
 # The reworked PDP Policy Writer (OPA) is CR-backed: it server-side-applies one

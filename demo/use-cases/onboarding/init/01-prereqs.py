@@ -28,7 +28,7 @@ import scenario as scn
 from _lib import Config, abort, kubectl, kubectl_get_json, kubectl_rollout_status, load_config, note, ok, rule, say
 
 HERE = Path(__file__).resolve().parent
-AIAC_ROOT = HERE.parents[3]  # demo/use-cases/uc1-onboarding/init/ -> aiac/
+AIAC_ROOT = HERE.parents[3]  # demo/use-cases/onboarding/init/ -> aiac/
 ASSETS_DIR = HERE.parents[2] / "assets"  # demo/assets/
 
 AIAC_NAMESPACE = "aiac-system"
