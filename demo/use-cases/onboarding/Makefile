@@ -1,4 +1,4 @@
-# UC-1 demo — AIAC discovers an agent and a tool, reads a two-line plain-English policy, and
+# onboarding demo — AIAC discovers an agent and a tool, reads a two-line plain-English policy, and
 # generates enforceable least-privilege authorization. Strictly live: every target talks to a real
 # cluster/Keycloak/LLM, no offline replay and no fixtures. Full narrative: demo.md.
 #
@@ -50,7 +50,7 @@ PYTHON    ?= $(VENV)/bin/python
 KC_ENV := . init/00-discover-keycloak.sh &&
 
 help:  ## Show this menu
-	@printf "\nUC-1 demo — live AIAC onboarding of a real agent + tool. Full narrative: demo.md\n\n"
+	@printf "\nonboarding demo — live AIAC onboarding of a real agent + tool. Full narrative: demo.md\n\n"
 	@printf "Live path (demo.md Parts 1-5) — deploying IS the trigger, real OPA enforces:\n"
 	@printf "  \033[1mmake enable\033[0m   (AIAC stack + NATS broker + Keycloak SPI)\n"
 	@printf "  \033[1mmake users\033[0m    (users/roles/policy — before the deploy that triggers onboarding)\n"
@@ -135,3 +135,9 @@ replay:  ## Optional: re-prove the trigger against ALREADY-deployed workloads (f
 
 restore:  ## Tear down the workloads + their Keycloak clients (add ARGS=--include-infra for the SPI)
 	./restore.sh $(ARGS)
+
+teardown:  ## Remove the demo ENTIRELY — back to the post-install state (ARGS=--dry-run to preview)
+	./teardown.sh $(ARGS)
+
+uninstall-aiac:  ## Uninstall just AIAC: delete the aiac-system namespace, nothing else (inverse of enable)
+	./teardown.sh --aiac-only $(ARGS)

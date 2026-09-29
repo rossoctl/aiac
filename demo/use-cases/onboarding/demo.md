@@ -1,13 +1,13 @@
-# UC-1 — Onboarding an agent and a tool, end to end
+# Onboarding an agent and a tool, end to end
 
-**Nobody wrote these access rules.** AIAC discovers a GitHub agent and a GitHub tool running in the
+**Auto generated access rules.** AIAC discovers a GitHub agent and a GitHub tool running in the
 cluster, reads a two-line plain-English policy, and generates enforceable least-privilege
 authorization for both — who may call the agent, and what the agent may do on the tool on their
 behalf. Then a real HTTP request through the live OPA plugin is allowed or denied by it.
 
-This is one runbook for the whole thing: installing AIAC, wiring enforcement, onboarding, and
+This runbook includes: installing AIAC, wiring enforcement, onboarding, and
 proving the result. Everything is live — a real cluster, a real Keycloak, a real LLM call, a real
-RFC 8693 token exchange. There is no offline mode and no fixtures.
+RFC 8693 token exchange.
 
 Two claims are worth stating up front, because the demo is built to prove them rather than assert
 them:
@@ -49,49 +49,8 @@ may do downstream — derived from the policy text plus the realm-role descripti
 Keycloak and the tool's own discovered capabilities. Both use the fixed AuthBridge packages
 (`authbridge.client.{inbound,outbound}.request`) the live OPA plugin evaluates, keyed on the
 plugin's real input shape (`input.identity.subject`, `input.identity.service_id`,
-`input.mcp.params.name`). The generated outbound gate, in full:
+`input.mcp.params.name`). 
 
-```rego
-package authbridge.client.outbound.request
-import rego.v1
-
-subject_roles := {
-    "dev-user": ["developer"],
-    "test-user": ["tester"],
-}
-subject_role_allow_scopes := {
-    "developer": ["source-write", "source-read", "issues-read"],
-    "tester": ["issues-write", "issues-read"],
-}
-subject_role_deny_scopes := {}
-target_allow_scopes := {
-    "spiffe://localtest.me/ns/team1/sa/github-tool": ["source-write", "source-read", "issues-write", "issues-read"],
-}
-target_deny_scopes := {}
-
-subject_allow_ok if {
-    some role in subject_roles[input.identity.subject]
-    input.mcp.params.name in subject_role_allow_scopes[role]
-}
-target_allow_ok if {
-    input.mcp.params.name in target_allow_scopes[input.identity.service_id]
-}
-# ... subject_deny_ok / target_deny_ok, same shape against the *_deny_scopes maps
-
-default allow := false
-allow if { subject_allow_ok; target_allow_ok; not subject_deny_ok; not target_deny_ok }
-```
-
-Every access decision is a two-gate AND on the same invoked tool (`input.mcp.params.name`, the
-**bare** MCP tool name such as `source-read`), with the deny maps as overrides: the calling user's
-role must be granted the scope (`subject_allow_ok`), *and* the target service the exchanged token
-was minted for must expose it (`target_allow_ok`, keyed by the full `input.identity.service_id`
-SPIFFE id), *and* neither deny map may claim it. A developer can read and write source and read
-issues; a tester can read and write issues but never touches source — exactly the two-line policy,
-and nothing it didn't say.
-
-`agent_role_scopes` also appears in the generated file, commented as informational only; `allow`
-does not reference it.
 
 ## Architecture
 
@@ -103,12 +62,15 @@ does not reference it.
         │  access_token                    │ RFC 8693 token exchange
         ▼                                  │ (subject token -> tool-audience token)
   [inbound gate: may this user call        │
-   the agent? — generated from policy.md]  ▼
-        │                            [outbound gate: may the agent reach
-        ▼                             this tool scope, for this user? —
-   github-agent                       generated from policy.md + tool capabilities]
+   the agent? — generated from policy.md]  │
         │                                  │
-        └──────────────────────────────────┴──► github-tool
+        ▼                                  │
+   github-agent                            ▼
+        └──────────────────────────────────│───────────────────► github-tool
+                                           ▲
+                         [outbound gate: may the agent reach
+                          this tool scope, for this user? —
+                          generated from policy.md + tool capabilities]
 ```
 
 In Parts 4–5 both gates are evaluated by the **deployed AuthBridge OPA plugin**, in the request
@@ -274,7 +236,7 @@ The split matters for the claim. [`demo/assets/kind-load.sh`](../../assets/kind-
 `kind load`s the images and **applies nothing** — it cannot register a Keycloak client.
 [`demo/assets/deploy.sh`](../../assets/deploy.sh) then does the `kubectl apply` + `rollout status`.
 So the trigger is isolated to that second call. Both scripts are used unmodified, exactly as the
-UC-1 system suite uses them.
+`-m system` suite uses them.
 
 ### Why deploying is the trigger
 
@@ -448,7 +410,7 @@ The driver narrates to stdout, but the operations play out across several in-clu
 
 Logs are written at the end of a successful run **and on any `die()` failure** — the most useful
 time to have them, since a failed run becomes debuggable without re-running. The directory is
-printed at the end; by default it lands under `/tmp/uc1-logs-<timestamp>/`:
+printed at the end; by default it lands under `/tmp/onboarding-logs-<timestamp>/`:
 
 | File | Component | What it shows |
 |---|---|---|
@@ -488,15 +450,86 @@ and the Keycloak StatefulSet image):
 ./restore.sh --include-infra    # or: make restore ARGS=--include-infra
 ```
 
-For a fully clean slate, drop the namespace and revert the OPA pipeline:
+### Which teardown do you want?
+
+Four levels, narrowest first. Each is idempotent and safe to re-run.
+
+| Want | Use | Keeps |
+|---|---|---|
+| Re-run the narrated walkthrough from a clean baseline | `make clear` | everything deployed; just resets generated roles/scopes, the Policy Store, the CR, and `generated/` |
+| Re-run the live path so DEPLOY is a genuine first trigger again | `./restore.sh` | the AIAC stack, NATS broker, Keycloak SPI, demo users/roles |
+| Uninstall **just AIAC** — the inverse of `./enable.sh` | `./teardown.sh --aiac-only` | everything except `aiac-system`: the workloads, all Keycloak state, the SPI, the OPA overlay |
+| Remove the demo entirely — the **post-install state** | `./teardown.sh` | only platform state: the `team1` namespace, the Prerequisites' `rossoctl` client changes, the operator's `*-aud` scopes |
+
+### Full teardown — back to the post-install state
+
+`restore.sh` is deliberately *not* a full teardown: it keeps the AIAC stack, the NATS broker and the
+demo's Keycloak users/roles, because re-running the demo needs them. Nothing in `restore.sh` or
+`make clear` removes the `aiac-system` namespace, the three demo users, the
+`developer`/`tester`/`devops` realm roles (`cleanup_provisioned` leaves those on purpose so a re-run
+can reuse them), or the `aiac-demo-cli` ROPC client. `teardown.sh` closes exactly that gap:
 
 ```bash
-kubectl delete namespace aiac-system
-ROSSOCTL_DIR=../rossoctl ../../../k8s/opa-kind-restore.sh
+./teardown.sh --dry-run      # list everything that would be removed; change nothing
+./teardown.sh                # tear down (prompts; --yes skips the prompt)
+./teardown.sh --include-opa   # also revert the OPA pipeline overlay (needs ROSSOCTL_DIR)
 ```
 
-The Keycloak realm/user changes from the Prerequisites are shared, cluster-wide state and are
-harmless to leave in place.
+Or `make teardown` / `make teardown ARGS=--dry-run`. It delegates the overlapping surface to
+`restore.sh --include-infra` rather than duplicating it, then additionally removes:
+
+- the `team1` ConfigMaps the demo's own manifest created (`authbridge-config`, `authproxy-routes`)
+- the whole `aiac-system` namespace — AIAC stack, NATS broker, the Policy Model Store PVC,
+  `aiac-agent-secret`, `aiac-policy`
+- the demo's Keycloak users, the three realm roles, and the `aiac-demo-cli` client
+
+**What it deliberately leaves**, because the demo does not own it:
+
+- **the `team1` namespace itself.** The Rossoctl installer creates and owns it
+  ([`demo/assets/INSTALL.md`](../../assets/INSTALL.md): "a precondition, not an output"). A fresh
+  install gives you an *empty* `team1`, not no `team1` — so emptying it *is* the post-install state.
+  Deleting the namespace would force an installer re-run.
+- **the Prerequisites' `rossoctl` client changes** (Direct Access Grants, the `username → sub`
+  mapper). One-time cluster-wide state that `k8s/opa-kind-runbook.md`'s probes and the `-m system`
+  suite both depend on, and which that runbook calls harmless to leave.
+- **the operator's `*-aud` audience client scopes**, which it owns and recreates.
+- **the OPA pipeline overlay**, unless you pass `--include-opa` — it is a cluster-level change owned
+  by `k8s/`, and reverting it needs the `ROSSOCTL_DIR` chart clone.
+- **container images already in the Kind node.** Inert; the script prints the `docker image rm` line
+  if you want the disk back.
+
+> **One caveat on `authproxy-routes`.** The demo's `configmaps.yaml` declares that ConfigMap in
+> `team1`, so `teardown.sh` deletes it as the symmetric inverse of `deploy.sh`. If *your* platform
+> also seeds an `authproxy-routes` there (some installs add one for the weather tool), the demo
+> overwrote it at deploy time and there is no saved copy to restore — re-apply the installer's
+> version afterwards.
+
+Run `./teardown.sh --dry-run` first if you are unsure: it surveys what is actually present and lists
+every deletion without performing any.
+
+### Uninstalling just AIAC
+
+Part 1 installs AIAC in separable steps (`--stack-only`, `--broker-only`, `--spi-only`), so there is
+a matching way to uninstall only that. `restore.sh --include-infra` reverts just the *Keycloak-side*
+half of `enable.sh` (the SPI listener and image) — never the stack itself, which lives in
+`aiac-system`. To remove the stack:
+
+```bash
+./teardown.sh --aiac-only              # or: make uninstall-aiac
+./teardown.sh --aiac-only --dry-run    # preview
+```
+
+This deletes the `aiac-system` namespace and everything in it — the Agent, Interface Pod, NATS
+broker, the Policy Model Store **and its PVC**, `aiac-agent-secret`, `aiac-policy` — and touches
+nothing else. It needs no Keycloak credentials. Reinstall with `./enable.sh`.
+
+It is **not** a route back to the post-install state: the workloads stay deployed and registered, the
+demo's Keycloak users/roles/client stay, the SPI stays installed, and the OPA overlay stays wired.
+Use the plain `./teardown.sh` for that. (`--aiac-only` and `--include-opa` are rejected together —
+the OPA overlay lives in `team1`, not `aiac-system`.)
+
+> Deleting the namespace destroys the Policy Model Store's PVC, and its SQLite with it. `make clear`
+> is the non-destructive way to reset that store's **contents** while leaving the stack running.
 
 ## Troubleshooting
 

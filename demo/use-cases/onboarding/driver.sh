@@ -116,7 +116,7 @@ for arg in "$@"; do
   esac
 done
 # Fix the destination once, so the end-of-run and die()-path collections write to the same directory.
-[ "$DO_COLLECT" -eq 1 ] && COLLECT_DIR="${COLLECT_ROOT}/uc1-logs-$(date -u +%Y%m%dT%H%M%SZ)"
+[ "$DO_COLLECT" -eq 1 ] && COLLECT_DIR="${COLLECT_ROOT}/onboarding-logs-$(date -u +%Y%m%dT%H%M%SZ)"
 
 # ── Output helpers (same palette/shape as k8s/opa-kind-driver.sh) ───────
 if [ -t 1 ]; then
@@ -197,7 +197,7 @@ delete_client() {
 # point-in-time snapshots. Every command is best-effort: a missing component leaves a note in its
 # file rather than aborting, so this is safe to call from die() mid-failure.
 collect_logs() {
-  local dir="${1:-$COLLECT_ROOT/uc1-logs-$(date -u +%Y%m%dT%H%M%SZ)}"
+  local dir="${1:-$COLLECT_ROOT/onboarding-logs-$(date -u +%Y%m%dT%H%M%SZ)}"
   # Default window: RUN_START_TS minus COLLECT_LOOKBACK_MIN (default 10m). The margin matters for the
   # die() path — an early/instant failure would otherwise pin --since-time to the run-start instant
   # and capture an EMPTY window (exactly when the logs are most wanted). A little pre-run history is
@@ -250,7 +250,7 @@ collect_logs() {
 }
 
 # ── Preflight ────────────────────────────────────────────────────────────────
-printf '%s%sUC-1 E2E driver (deploying the agent IS the live trigger)%s\n' "$C_BLD" "$C_CYN" "$C_RST"
+printf '%s%sonboarding demo driver (deploying the agent IS the live trigger)%s\n' "$C_BLD" "$C_CYN" "$C_RST"
 
 step "Preflight"
 for c in kubectl curl python3; do
@@ -311,7 +311,7 @@ phase_deploy() {
   # claim: kind-load.sh is the *images precondition* (build + `kind load`, applies nothing, fires
   # nothing), and deploy.sh is the `kubectl apply` + rollout. So the trigger is isolated to the
   # second call — the first cannot register a Keycloak client. Both scripts are used unmodified,
-  # exactly as the UC-1 system suite uses them.
+  # exactly as the `-m system` suite uses them.
   step "Loading the workload images (demo/assets/kind-load.sh — precondition, applies nothing)"
   CLUSTER_NAME="$KIND_CLUSTER" bash "$ASSETS_DIR/kind-load.sh"
   pass "github-agent + github-tool images present in the Kind node"
@@ -327,8 +327,8 @@ phase_deploy() {
     || die "github-tool did not become Ready after deploy"
   pass "both workloads Ready"
 
-  export UC1_BEFORE_RV="$BEFORE_RV"
-  export UC1_DEPLOY_START_TS="$DEPLOY_START_TS"
+  export ONBOARDING_BEFORE_RV="$BEFORE_RV"
+  export ONBOARDING_DEPLOY_START_TS="$DEPLOY_START_TS"
 }
 
 # ── Phase VERIFY-TRIGGER ──────────────────────────────────────────────────────
@@ -387,7 +387,7 @@ print("yes" if os.environ["SCOPE"] in names else "")' 2>/dev/null || true)
   # Supplementary: surface the direct NATS-consumption log lines if the verbose-trace logs haven't
   # rotated them out yet (informational only — the provisioned scopes above are the durable proof).
   local logs
-  logs=$(kubectl logs deployment/aiac-agent -n "$AIAC_NS" --since-time="${UC1_DEPLOY_START_TS}" 2>/dev/null || true)
+  logs=$(kubectl logs deployment/aiac-agent -n "$AIAC_NS" --since-time="${ONBOARDING_DEPLOY_START_TS}" 2>/dev/null || true)
   if printf '%s\n' "$logs" | grep -q "$AGENT_UUID" && printf '%s\n' "$logs" | grep -q "$TOOL_UUID"; then
     info "aiac-agent logs still show both aiac.apply.service.<uuid> events (direct NATS-consumption evidence)"
   else
@@ -395,7 +395,7 @@ print("yes" if os.environ["SCOPE"] in names else "")' 2>/dev/null || true)
   fi
 
   step "Confirming a fresh AuthorizationPolicy CR for github-agent"
-  local before_rv="${UC1_BEFORE_RV:-<none>}" cr_deadline=$((SECONDS + POLL_SECS))
+  local before_rv="${ONBOARDING_BEFORE_RV:-<none>}" cr_deadline=$((SECONDS + POLL_SECS))
   AFTER_RV=""
   while :; do
     AFTER_RV=$(kubectl get "$POLICY_CR" github-agent -n "$NS" -o jsonpath='{.metadata.resourceVersion}' 2>/dev/null || echo "")
@@ -479,7 +479,7 @@ probe_tool() {
   pod="$(latest_pod "$AGENT_LABEL")"
   [ -n "$pod" ] || { echo "ERROR"; return 0; }
   tok="$(mint_token "$user")"
-  py="$(mktemp /tmp/uc1-probe.XXXXXX.py)"
+  py="$(mktemp /tmp/onboarding-probe.XXXXXX.py)"
   cat > "$py" <<PY
 import urllib.request, urllib.error, json
 tok = """$tok"""

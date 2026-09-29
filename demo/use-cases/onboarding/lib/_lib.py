@@ -1,4 +1,4 @@
-"""Shared machinery for the UC-1 onboarding demo's numbered scripts: config, kubectl/opa helpers,
+"""Shared machinery for the onboarding demo's numbered scripts: config, kubectl/opa helpers,
 Keycloak helpers, and terminal narration. Standalone by design (some overlap with
 ``test/system/launcher.py`` and ``uc1_onboard.py`` is deliberate) — this demo ships and runs
 independently of the ``test/`` tree.
@@ -337,7 +337,7 @@ def resolve_service_id(admin, cfg: Config, client_name: str) -> str:
 
 
 def cleanup_provisioned(admin, cfg: Config) -> None:
-    """Delete the realm roles + client scopes UC-1 onboarding provisions (prefixed
+    """Delete the realm roles + client scopes onboarding provisions (prefixed
     ``github-agent.``/``github-tool.``). Leaves the demo's own developer/tester/devops roles and the
     operator's audience client scopes (``*-aud``) in place."""
     from keycloak.exceptions import KeycloakError

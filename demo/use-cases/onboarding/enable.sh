@@ -79,7 +79,7 @@ load_image_to_kind() {
   local image="$1"
   if [ "$CONTAINER_RUNTIME" = "podman" ]; then
     local tar_file
-    tar_file="$(mktemp "${TMPDIR:-/tmp}/uc1-image.XXXXXX")"
+    tar_file="$(mktemp "${TMPDIR:-/tmp}/onboarding-image.XXXXXX")"
     TMPFILES+=("$tar_file")
     "$CONTAINER_RUNTIME" save "$image" -o "$tar_file"
     kind load image-archive "$tar_file" --name "$CLUSTER_NAME"
@@ -183,14 +183,14 @@ step_spi() {
   local mvn_mirror_mount=()
   if [ -n "${MAVEN_MIRROR_URL:-}" ]; then
     local settings_file
-    settings_file="$(mktemp "${TMPDIR:-/tmp}/uc1-mvn-settings.XXXXXX.xml")"
+    settings_file="$(mktemp "${TMPDIR:-/tmp}/onboarding-mvn-settings.XXXXXX.xml")"
     TMPFILES+=("$settings_file")
     cat > "$settings_file" <<SETTINGS
 <settings xmlns="http://maven.apache.org/SETTINGS/1.0.0">
   <mirrors>
     <mirror>
-      <id>uc1-mirror</id>
-      <name>uc1 configured Maven mirror</name>
+      <id>onboarding-mirror</id>
+      <name>onboarding configured Maven mirror</name>
       <url>${MAVEN_MIRROR_URL}</url>
       <mirrorOf>central</mirrorOf>
     </mirror>
@@ -222,7 +222,7 @@ SETTINGS
   echo "==> [spi] Deriving a Keycloak image from ${base_image}"
 
   local build_dir
-  build_dir="$(mktemp -d "${TMPDIR:-/tmp}/uc1-kc-image.XXXXXX")"
+  build_dir="$(mktemp -d "${TMPDIR:-/tmp}/onboarding-kc-image.XXXXXX")"
   TMPFILES+=("$build_dir")
   cp "$jar" "$build_dir/aiac-event-listener.jar"
   cat > "$build_dir/Dockerfile" <<DOCKERFILE

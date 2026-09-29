@@ -1,5 +1,5 @@
 # shellcheck shell=bash
-# 00-discover-keycloak.sh — set up the environment the UC-1 onboarding demo needs.
+# 00-discover-keycloak.sh — set up the environment the onboarding demo needs.
 #
 #   source init/00-discover-keycloak.sh     # from demo/use-cases/onboarding/
 #   source ./00-discover-keycloak.sh        # from within init/

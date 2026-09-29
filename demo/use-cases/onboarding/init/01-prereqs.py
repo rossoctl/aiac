@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify (and, where safe, install) everything the UC-1 onboarding demo needs before ``make
+"""Verify (and, where safe, install) everything the onboarding demo needs before ``make
 setup`` touches Keycloak. Two classes of check, per the handoff:
 
   1. VERIFY ONLY, else abort with a pointer to the installer: cluster reachable, the
@@ -219,7 +219,7 @@ def verify_mcp_label(namespace: str) -> None:
     if label != "true":
         abort(
             f"Service {scn.TOOL_WORKLOAD!r} in {namespace!r} is missing the "
-            f"protocol.rossoctl.io/mcp='true' LABEL (found: {label!r}) — UC-1's analyze_tool will "
+            f"protocol.rossoctl.io/mcp='true' LABEL (found: {label!r}) — onboarding's analyze_tool will "
             f"502 during onboarding. See demo/assets/INSTALL.md."
         )
     ok(f"Service {scn.TOOL_WORKLOAD!r} carries protocol.rossoctl.io/mcp='true'")
