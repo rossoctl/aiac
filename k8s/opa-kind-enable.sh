@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# opa-kind-enable.sh — authbridge/docs/opa-kind-runbook.md Steps 1-5, on the fly.
+# opa-kind-enable.sh — k8s/opa-kind-runbook.md Step 1 (the enable Steps 1-5), on the fly.
 #
 # Wires the OPA plugin into every agent's inbound AND outbound AuthBridge
 # pipeline on a Kind cluster, alongside the full parser set (a2a-parser,
@@ -17,7 +17,10 @@
 #
 # Requires: kubectl, helm, kind, docker (or podman), python3 not needed here.
 # Env vars:
-#   OPERATOR_DIR        path to the rossoctl/operator repo clone (bundle-service)
+#   OPERATOR_DIR        path to the rossoctl/operator repo clone; Step 1 builds
+#                       the operator image (which carries the bundle-service
+#                       binary) and renders the bundle-service templates from
+#                       its local chart                   (default: ../operator)
 #   ROSSOCTL_DIR        path to the rossoctl/rossoctl repo clone (the chart)
 #   CORTEX_DIR          path to the rossoctl/cortex repo clone; the authbridge
 #                       source built in Step 2 lives there, not in this repo
@@ -27,6 +30,8 @@
 #   RELEASE_NAMESPACE   namespace the chart is installed in (default: rossoctl-system)
 #   AGENT_NAMESPACE     namespace to restart agent pods in (default: team1)
 #   IMAGE_TAG           local authbridge-proxy image tag  (default: localhost/authbridge:local)
+#   OPERATOR_IMAGE      local operator image (bundle-service runs from it)
+#                       (default: localhost/rossoctl-operator:<operator HEAD short sha>)
 #   CONTAINER_RUNTIME   docker | podman                   (default: docker, auto-falls back to podman)
 
 set -euo pipefail
@@ -46,20 +51,24 @@ RELEASE_NAMESPACE="${RELEASE_NAMESPACE:-rossoctl-system}"
 AGENT_NAMESPACE="${AGENT_NAMESPACE:-team1}"
 IMAGE_TAG="${IMAGE_TAG:-localhost/authbridge:local}"
 
-if [ -z "$OPERATOR_DIR" ] || [ ! -d "$OPERATOR_DIR" ]; then
+if [ -z "$OPERATOR_DIR" ] || [ ! -f "$OPERATOR_DIR/operator/Dockerfile" ] || [ ! -d "$OPERATOR_DIR/charts/operator/templates/bundleservice" ]; then
   echo "ERROR: Set OPERATOR_DIR to point to your rossoctl/operator repo clone" >&2
+  echo "       (Step 1 needs \$OPERATOR_DIR/operator/Dockerfile and the bundle-service" >&2
+  echo "        templates in \$OPERATOR_DIR/charts/operator/templates/bundleservice/)" >&2
   exit 1
 fi
 if [ -z "$ROSSOCTL_DIR" ] || [ ! -d "$ROSSOCTL_DIR" ]; then
   echo "ERROR: Set ROSSOCTL_DIR to point to your rossoctl/rossoctl repo clone" >&2
   exit 1
 fi
-if [ -z "$CORTEX_DIR" ] || [ ! -d "$CORTEX_DIR/authbridge" ]; then
+if [ -z "$CORTEX_DIR" ] || [ ! -f "$CORTEX_DIR/cmd/authbridge-proxy/Dockerfile" ]; then
   echo "ERROR: Set CORTEX_DIR to point to your rossoctl/cortex repo clone" >&2
-  echo "       (Step 2 builds the authbridge-proxy image from \$CORTEX_DIR/authbridge," >&2
-  echo "        which lives in the cortex monorepo, not in this repo)" >&2
+  echo "       (Step 2 builds the authbridge-proxy image from" >&2
+  echo "        \$CORTEX_DIR/cmd/authbridge-proxy/Dockerfile, which lives in the cortex" >&2
+  echo "        monorepo, not in this repo)" >&2
   exit 1
 fi
+OPERATOR_IMAGE="${OPERATOR_IMAGE:-localhost/rossoctl-operator:$(git -C "$OPERATOR_DIR" rev-parse --short HEAD)}"
 
 VALUES_FILE="${ROSSOCTL_DIR}/charts/rossoctl/values.yaml"
 CHART_DIR="${ROSSOCTL_DIR}/charts/rossoctl"
@@ -100,12 +109,48 @@ load_image_to_kind() {
 OVERLAY_FILE="$(mktemp "${TMPDIR:-/tmp}/opa-kind-enable-overlay.XXXXXX")"
 TMPFILES+=("$OVERLAY_FILE")
 
-echo "==> Step 1/5: deploying bundle-service (${OPERATOR_DIR})"
-( cd "$OPERATOR_DIR" && ./operator/hack/bundle-service-kind.sh "$CLUSTER_NAME" "$RELEASE_NAMESPACE" )
+echo "==> Step 1/5: deploying bundle-service from the operator chart (${OPERATOR_DIR}, image ${OPERATOR_IMAGE})"
+# The bundle service ships inside the operator image (selected by the container
+# `command:`) and is installed by the operator chart behind
+# bundleService.enabled. No released operator chart carries it yet, so — like
+# operator/hack/kind-reload-all.sh — build the image from the clone and render
+# only the bundle-service templates from its local chart. The rest of the
+# operator (the controller-manager) is left as installed.
+"$CONTAINER_RUNTIME" build -t "$OPERATOR_IMAGE" -f "$OPERATOR_DIR/operator/Dockerfile" "$OPERATOR_DIR/operator"
+load_image_to_kind "$OPERATOR_IMAGE"
+kubectl apply -f "$OPERATOR_DIR/operator/config/crd/bases/agent.rossoctl.dev_authorizationpolicies.yaml"
+# A bundle-service from the removed operator/hack/bundle-service-kind.sh selects
+# on `app: bundle-service` only. The chart's selector adds the
+# app.kubernetes.io/{name,instance} labels, and a Deployment selector is
+# immutable, so delete that legacy Deployment before the apply.
+#
+# The chart's bundle-service NetworkPolicy is NOT applied: it admits only pods
+# labelled rossoctl.dev/authbridge=true, and nothing (operator webhook, chart,
+# AuthBridge) sets that label today. On a CNI that enforces NetworkPolicy it
+# would block every AuthBridge bundle fetch. The removed hack script applied no
+# NetworkPolicy either, so this keeps the earlier dev-cluster behavior.
+if kubectl get deployment bundle-service -n "$RELEASE_NAMESPACE" >/dev/null 2>&1 \
+  && [ -z "$(kubectl get deployment bundle-service -n "$RELEASE_NAMESPACE" \
+        -o jsonpath='{.spec.selector.matchLabels.app\.kubernetes\.io/instance}')" ]; then
+  kubectl delete deployment bundle-service -n "$RELEASE_NAMESPACE" --wait=true
+fi
+helm template rossoctl-operator "$OPERATOR_DIR/charts/operator" \
+  --namespace "$RELEASE_NAMESPACE" \
+  --set bundleService.enabled=true \
+  --set bundleService.container.image.repository="${OPERATOR_IMAGE%:*}" \
+  --set bundleService.container.image.tag="${OPERATOR_IMAGE##*:}" \
+  --set bundleService.container.image.pullPolicy=Never \
+  --show-only templates/bundleservice/serviceaccount.yaml \
+  --show-only templates/bundleservice/rbac.yaml \
+  --show-only templates/bundleservice/deployment.yaml \
+  --show-only templates/bundleservice/service.yaml \
+  --show-only templates/bundleservice/default-policy.yaml \
+  | kubectl apply -f -
+kubectl rollout status deployment/bundle-service -n "$RELEASE_NAMESPACE" --timeout=180s
 kubectl get pods -n "$RELEASE_NAMESPACE" -l app=bundle-service
 
 echo "==> Step 2/5: building + loading authbridge-proxy (${IMAGE_TAG}) via ${CONTAINER_RUNTIME}"
-( cd "$CORTEX_DIR/authbridge" && "$CONTAINER_RUNTIME" build -t "$IMAGE_TAG" -f cmd/authbridge-proxy/Dockerfile . )
+( cd "$CORTEX_DIR" && "$CONTAINER_RUNTIME" build -t "$IMAGE_TAG" -f cmd/authbridge-proxy/Dockerfile . )
 load_image_to_kind "$IMAGE_TAG"
 
 echo "==> Step 3/5: writing throwaway pipeline overlay (${VALUES_FILE} stays untouched)"
