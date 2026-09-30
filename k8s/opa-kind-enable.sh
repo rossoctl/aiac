@@ -28,6 +28,11 @@
 #   AGENT_NAMESPACE     namespace to restart agent pods in (default: team1)
 #   IMAGE_TAG           local authbridge-proxy image tag  (default: localhost/authbridge:local)
 #   CONTAINER_RUNTIME   docker | podman                   (default: docker, auto-falls back to podman)
+#   AUTHBRIDGE_PROFILE  plugin profile for the Step 2 build (default: full — the
+#                       proxy-sidecar set, the only one carrying the opa plugin)
+#   GO_BUILD_TAGS       explicit include_plugin_* tag list, bypassing the
+#                       profile-tags helper entirely (default: derived from
+#                       AUTHBRIDGE_PROFILE)
 
 set -euo pipefail
 
@@ -105,7 +110,47 @@ echo "==> Step 1/5: deploying bundle-service (${OPERATOR_DIR})"
 kubectl get pods -n "$RELEASE_NAMESPACE" -l app=bundle-service
 
 echo "==> Step 2/5: building + loading authbridge-proxy (${IMAGE_TAG}) via ${CONTAINER_RUNTIME}"
-( cd "$CORTEX_DIR/authbridge" && "$CONTAINER_RUNTIME" build -t "$IMAGE_TAG" -f cmd/authbridge-proxy/Dockerfile . )
+# AuthBridge plugins are all opt-in build tags, so cmd/authbridge-proxy/Dockerfile REQUIRES
+# --build-arg GO_BUILD_TAGS and hard-fails without it ("plugins are opt-in and an untagged build
+# registers none"). An untagged image would silently register no opa plugin at all, which is the one
+# thing this script exists to install — so the Dockerfile failing the build early is correct, and we
+# must pass the tag list here.
+#
+# The authoritative tag list comes from authbridge/scripts/profile-tags, never hand-copied: the
+# profile membership changes upstream in cortex, and a stale literal list here would quietly build an
+# image missing plugins the Step 3 overlay wires. `full` is the profile for the Kubernetes
+# proxy-sidecar image and the only non-envoy profile carrying `opa`.
+#
+# Resolved via a golang container when the host has no `go`, matching how the onboarding demo builds
+# the Keycloak SPI jar in a maven container — this repo's scripts assume kubectl/helm/kind/docker,
+# not a Go toolchain. The helper is a dependency-free module, so the container needs no network.
+PROFILE_TAGS_DIR="$CORTEX_DIR/authbridge/scripts/profile-tags"
+AUTHBRIDGE_PROFILE="${AUTHBRIDGE_PROFILE:-full}"
+if [ -z "${GO_BUILD_TAGS:-}" ]; then
+  if [ ! -d "$PROFILE_TAGS_DIR" ]; then
+    echo "ERROR: ${PROFILE_TAGS_DIR} not found — check CORTEX_DIR" >&2
+    exit 1
+  fi
+  if command -v go > /dev/null 2>&1; then
+    GO_BUILD_TAGS="$(go -C "$PROFILE_TAGS_DIR" run . "$AUTHBRIDGE_PROFILE")"
+  else
+    echo "    no host 'go' — resolving the '${AUTHBRIDGE_PROFILE}' profile in a golang container"
+    GO_BUILD_TAGS="$("$CONTAINER_RUNTIME" run --rm \
+      -v "${PROFILE_TAGS_DIR}":/profile-tags:ro -w /profile-tags \
+      -e GOCACHE=/tmp/gocache -e GOFLAGS=-mod=mod \
+      golang:1.26-alpine go run . "$AUTHBRIDGE_PROFILE")"
+  fi
+fi
+[ -n "$GO_BUILD_TAGS" ] || { echo "ERROR: could not resolve GO_BUILD_TAGS for profile '${AUTHBRIDGE_PROFILE}'" >&2; exit 1; }
+case "$GO_BUILD_TAGS" in
+  *include_plugin_opa*) ;;
+  *) echo "ERROR: profile '${AUTHBRIDGE_PROFILE}' does not carry the opa plugin, which this script installs." >&2
+     echo "       Resolved tags: ${GO_BUILD_TAGS}" >&2
+     exit 1 ;;
+esac
+echo "    plugin profile '${AUTHBRIDGE_PROFILE}': ${GO_BUILD_TAGS}"
+( cd "$CORTEX_DIR/authbridge" && "$CONTAINER_RUNTIME" build -t "$IMAGE_TAG" \
+    --build-arg GO_BUILD_TAGS="$GO_BUILD_TAGS" -f cmd/authbridge-proxy/Dockerfile . )
 load_image_to_kind "$IMAGE_TAG"
 
 echo "==> Step 3/5: writing throwaway pipeline overlay (${VALUES_FILE} stays untouched)"

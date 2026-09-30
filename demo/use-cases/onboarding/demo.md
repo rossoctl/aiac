@@ -1,0 +1,784 @@
+# Onboarding an agent and a tool, end to end
+
+**Auto generated access rules.** AIAC discovers a GitHub agent and a GitHub tool running in the
+cluster, reads a two-line plain-English policy, and generates enforceable least-privilege
+authorization for both — who may call the agent, and what the agent may do on the tool on their
+behalf. Then a real HTTP request through the live OPA plugin is allowed or denied by it.
+
+This runbook includes: installing AIAC, wiring enforcement, onboarding, and
+proving the result. Everything is live — a real cluster, a real Keycloak, a real LLM call, a real
+RFC 8693 token exchange.
+
+Two claims are worth stating up front, because the demo is built to prove them rather than assert
+them:
+
+- **Deploying the workload is the trigger.** No human runs an onboarding command. The first-ever
+  `kubectl apply` of `github-agent`/`github-tool` is what causes AIAC to generate their policy.
+- **The generated policy is what enforces.** The allow/deny verdicts in Part 5 come from the
+  deployed AuthBridge OPA plugin reading the `AuthorizationPolicy` CR AIAC wrote — not from
+  evaluating a file on the side.
+
+| Part | What happens | Command |
+|---|---|---|
+| [1](#part-1--install-the-aiac-stack) | Install AIAC (stack, NATS broker, Keycloak SPI) | `./enable.sh` |
+| [2](#part-2--wire-opa-into-both-authbridge-legs) | Wire OPA into both AuthBridge legs | `k8s/opa-kind-enable.sh` |
+| [3](#part-3--provision-the-scenario) | Provision users/roles/policy | `make keycloak && make users` |
+| [4](#part-4--onboard-by-deploying) | Deploy the workloads — **the trigger** | `./driver.sh --only-deploy` |
+| [5](#part-5--enforce-live) | Probe the live OPA plugin | `./driver.sh --only-wire-outbound && ./driver.sh --only-enforce` |
+| [6](#part-6--the-narrated-walkthrough-optional) | Inspect what was generated, step by step | `make setup && make agent && make tool` |
+
+Parts 4–5 in one go: `./driver.sh` (or `make e2e`).
+
+---
+
+## The policy
+
+This is the entire input a human wrote. No YAML, no scope tables, no per-endpoint rules:
+
+```
+Grant access on a least-privilege basis: allow only what this policy states; deny by default.
+
+- Developers may read and modify source, and read issues.
+- Testers may read and modify issues.
+```
+
+## What comes out the other side
+
+AIAC turns that into two Rego policies per agent — one gating who may call it, one gating what it
+may do downstream — derived from the policy text plus the realm-role descriptions already in
+Keycloak and the tool's own discovered capabilities. Both use the fixed AuthBridge packages
+(`authbridge.client.{inbound,outbound}.request`) the live OPA plugin evaluates, keyed on the
+plugin's real input shape (`input.identity.subject`, `input.identity.service_id`,
+`input.mcp.params.name`). 
+
+
+## Architecture
+
+```
+ dev-user / test-user / devops-user
+        │  grant_type=password
+        ▼
+   Keycloak  ──────────────────────────────┐
+        │  access_token                    │ RFC 8693 token exchange
+        ▼                                  │ (subject token -> tool-audience token)
+  [inbound gate: may this user call        │
+   the agent? — generated from policy.md]  │
+        │                                  │
+        ▼                                  │
+   github-agent                            ▼
+        └──────────────────────────────────│───────────────────► github-tool
+                                           ▲
+                         [outbound gate: may the agent reach
+                          this tool scope, for this user? —
+                          generated from policy.md + tool capabilities]
+```
+
+In Parts 4–5 both gates are evaluated by the **deployed AuthBridge OPA plugin**, in the request
+path:
+
+```
+Inbound:   caller ─► jwt-validation ─► OPA ─► github-agent app
+Outbound:  github-agent app ─► token-exchange ─► OPA ─► github-tool
+```
+
+Policies reach the plugin via the bundle service every AuthBridge workload polls
+(`http://bundle-service.rossoctl-system.svc.cluster.local:8080`). On the outbound leg OPA sits
+**after** `token-exchange`, so policies can read the delegation chain and the synthesized
+`input.identity`. Part 6 instead evaluates the same Rego with `opa eval`, for inspection.
+
+---
+
+## Prerequisites
+
+- **A Kind cluster named `rossoctl`** with the rossoctl platform installed — SPIRE, Keycloak, and
+  the rossoctl operator. Namespace `team1` must exist; the Rossoctl installer owns it, nothing here
+  creates it.
+- **Three sibling repo clones** the OPA wiring scripts need — siblings of the `aiac` repo root, not
+  of your current directory. Each is auto-detected from the script's own location, so you normally set
+  none of these; override only if a clone lives elsewhere, and then use an **absolute** path (a
+  relative one is resolved against your shell's cwd, and the scripts `cd` into these directories):
+  - `OPERATOR_DIR` → `rossoctl/operator` clone (bundle-service)
+  - `ROSSOCTL_DIR` → `rossoctl/rossoctl` clone, i.e. the Helm chart
+  - `CORTEX_DIR` → `rossoctl/cortex` clone; Part 2 builds the AuthBridge proxy image from
+    `$CORTEX_DIR/authbridge`, which lives in the cortex monorepo, not in this repo
+- **`kubectl`, `helm`, `kind`, `curl`, `python3`**, and `docker` or `podman` on `PATH`.
+- **An OpenAI-compatible LLM endpoint + API key** for AIAC's Policy Rules Builder. `enable.sh`
+  defaults to reusing the key already in `team1/openai-secret`, reading its **`apikey`** data key (see
+  its `OPENAI_SECRET_NS` / `OPENAI_SECRET_NAME` / `LLM_BASE_URL` / `LLM_MODEL` env vars). The script
+  has no way to take the key directly, so if that Secret does not exist yet, create it:
+
+  ```bash
+  kubectl create secret generic openai-secret -n team1 --from-literal=apikey="$LLM_API_KEY"
+  ```
+
+- **`aiac-system/keycloak-admin-secret`, created before Part 1.** Nothing in this demo creates it, and
+  two separate things hard-fail without it: `aiac-interface` carries a **non-optional** `secretRef` on
+  it (`k8s/pdp-interface-deployment.yaml`, whose own header calls it a precondition "pre-provisioned
+  out-of-band"), so the pod never leaves `ContainerCreating`; and `init/00-discover-keycloak.sh` reads
+  the admin credentials from it, so every `make` target that touches Keycloak aborts. Create the
+  namespace yourself here: `enable.sh` does create it, but then applies the Deployment that mounts this
+  Secret in the same run, leaving you no window to add it in between.
+
+  ```bash
+  kubectl create namespace aiac-system
+  kubectl create secret generic keycloak-admin-secret -n aiac-system \
+    --from-literal=KEYCLOAK_ADMIN_USERNAME=<admin-user> \
+    --from-literal=KEYCLOAK_ADMIN_PASSWORD=<admin-password>
+  ```
+
+  Both key names are exact — `00-discover-keycloak.sh` looks up
+  `KEYCLOAK_ADMIN_USERNAME`/`KEYCLOAK_ADMIN_PASSWORD` by name. Override the location with `KC_SECRET_NS`
+  / `KC_SECRET` if you keep it elsewhere.
+- **`github-agent`/`github-tool` NOT already deployed in `team1`.** Part 4's whole point is that a
+  first-time deploy triggers onboarding, so it needs a clean slate. If you have run this demo
+  before, `./restore.sh` first.
+- **A one-time Keycloak realm fix-up**, if the realm was freshly provisioned: the `rossoctl` client
+  needs Direct Access Grants enabled and a `username → sub` protocol mapper, or token minting fails
+  with `unauthorized_client` (grants disabled) or yields a token with no `sub` (mapper missing).
+  `make users` (Part 3) sets the demo users' passwords and login profile; the client-level change is
+  platform state:
+
+  ```bash
+  KC=http://keycloak.localtest.me:8080
+  ADMIN=$(curl -s -X POST "$KC/realms/master/protocol/openid-connect/token" \
+    -d client_id=admin-cli -d username=admin -d password=admin -d grant_type=password \
+    | python3 -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')
+
+  CID=$(curl -s -H "Authorization: Bearer $ADMIN" "$KC/admin/realms/rossoctl/clients?clientId=rossoctl" \
+    | python3 -c 'import sys,json;print(json.load(sys.stdin)[0]["id"])')
+  curl -s -H "Authorization: Bearer $ADMIN" "$KC/admin/realms/rossoctl/clients/$CID" \
+    | python3 -c 'import sys,json;d=json.load(sys.stdin);d["directAccessGrantsEnabled"]=True;print(json.dumps(d))' \
+    | curl -s -o /dev/null -w "enable DAG HTTP %{http_code}\n" -X PUT -H "Authorization: Bearer $ADMIN" \
+      -H "Content-Type: application/json" "$KC/admin/realms/rossoctl/clients/$CID" --data-binary @-
+  curl -s -o /dev/null -w "add sub mapper HTTP %{http_code}\n" -X POST -H "Authorization: Bearer $ADMIN" \
+    -H "Content-Type: application/json" \
+    "$KC/admin/realms/rossoctl/clients/$CID/protocol-mappers/models" \
+    -d '{"name":"username-to-sub","protocol":"openid-connect",
+         "protocolMapper":"oidc-usermodel-property-mapper",
+         "config":{"user.attribute":"username","claim.name":"sub","jsonType.label":"String",
+                   "id.token.claim":"true","access.token.claim":"true","userinfo.token.claim":"true"}}'
+  ```
+
+Run every command below from **this directory** (`demo/use-cases/onboarding/`) unless a path
+says otherwise; `k8s/…` paths are relative to the repo root.
+
+You do **not** need to export the Keycloak variables by hand. `make keycloak`
+(`init/00-discover-keycloak.sh`) port-forwards the in-cluster Keycloak to a local port and reads the
+admin credentials from `keycloak-admin-secret`, exporting `KEYCLOAK_URL` /
+`KEYCLOAK_ADMIN_USERNAME` / `KEYCLOAK_ADMIN_PASSWORD` for the step that runs it. Every
+Keycloak-touching target self-runs it first, so you rarely call it directly — the forward is set up
+once and reused. If you already export those three variables, your values win. To tear the forward
+down afterwards: `pkill -f 'port-forward .*keycloak-service'`.
+
+---
+
+## Part 1 — Install the AIAC stack
+
+AIAC is not deployed by default. One command builds its four images, wires the LLM configuration,
+applies the manifests, deploys the NATS event broker, and installs the Keycloak event-listener SPI:
+
+```bash
+OPENAI_SECRET_NS=team1 OPENAI_SECRET_NAME=openai-secret ./enable.sh
+```
+
+Or `make enable`. This automates [`k8s/aiac-deployment-guide.md`](../../../k8s/aiac-deployment-guide.md)
+for a Kind cluster; the [appendix](#appendix--installing-aiac-by-hand) has the equivalent
+copy-paste commands for environments it doesn't fit. Three independently runnable steps:
+
+| Step | Flag | What it does |
+|---|---|---|
+| AIAC stack | `--stack-only` | Builds/loads `aiac-pdp-config`, `aiac-pdp-policy-opa`, `aiac-policy-model-store`, `aiac-agent`; creates `aiac-agent-secret` from the OpenAI key; provisions the `aiac-policy` ConfigMap from `lib/scenario.py`'s policy text; applies `pdp-interface-deployment.yaml`, `policy-model-store-statefulset.yaml`, `agent-deployment.yaml`; points `aiac-agent-config` at your LLM endpoint |
+| NATS broker | `--broker-only` | Applies `event-broker-deployment.yaml`, creating `aiac-event-broker-service` in `aiac-system`. The SPI's compiled-in default `NATS_URL` (`nats://aiac-event-broker-service:4222`) is a **bare name that cannot resolve from the `keycloak` namespace**, so `--spi-only` sets the cross-namespace FQDN (`....aiac-system.svc.cluster.local`) on the Keycloak StatefulSet — the two sides agree because the script makes them agree, not by default |
+| Keycloak SPI | `--spi-only` | Builds the shaded jar in a Maven container (no JDK needed on your machine), builds a derived Keycloak image with the jar in `/opt/keycloak/providers/` + `kc.sh build`, `kind load`s it, `kubectl set image`s the live `keycloak` StatefulSet (including the `NATS_URL` FQDN above), and enables the listener on the realm's admin-events config |
+
+The Keycloak change is a **live, reversible patch**, not a chart edit — a later `helm upgrade` of the
+`rossoctl` release would revert it (same spirit as `opa-kind-enable.sh`'s overlay). Undo it
+deliberately with `./restore.sh --include-infra`.
+
+`enable.sh` deliberately does **not** deploy `github-agent`/`github-tool`. They stay undeployed so
+Part 4 is a genuine first-time trigger.
+
+Verify:
+
+```bash
+kubectl get deployment aiac-agent aiac-interface aiac-event-broker -n aiac-system
+kubectl get statefulset aiac-policy-model-store -n aiac-system
+kubectl logs statefulset/keycloak -n keycloak | grep -i "aiac-event-listener\|providers changed"
+```
+
+## Part 2 — Wire OPA into both AuthBridge legs
+
+Enforcement is an opt-in AuthBridge pipeline plugin. This rebuilds `localhost/authbridge:local` from
+the current tree, loads it into Kind, and `helm upgrade`s the chart with a temporary overlay
+inserting `opa` (after `token-exchange` on the outbound leg) plus the parser set into every `team1`
+agent's pipeline. It does **not** modify `charts/rossoctl/values.yaml` on disk.
+
+```bash
+../../../k8s/opa-kind-enable.sh
+```
+
+The clone paths are auto-detected (see Prerequisites) — passing `OPERATOR_DIR=../operator` from this
+directory does **not** work, since that resolves against your cwd, not the script's. AuthBridge
+plugins are opt-in build tags, so the image build passes `GO_BUILD_TAGS` resolved from the `full`
+profile in `cortex/authbridge/scripts/profile-tags` — the only non-envoy profile carrying `opa`. It is
+resolved in a `golang` container when the host has no `go`; override with `AUTHBRIDGE_PROFILE` or an
+explicit `GO_BUILD_TAGS`.
+
+Confirm OPA is in **both** legs — expect `2`:
+
+```bash
+kubectl get configmap authbridge-runtime-config -n team1 \
+  -o jsonpath='{.data.config\.yaml}' | grep -c 'name: opa'
+```
+
+`driver.sh`'s preflight checks this and refuses to run without it. Full background, including the
+exact `input` document the plugin builds on each leg, is in
+[`k8s/opa-kind-runbook.md`](../../../k8s/opa-kind-runbook.md).
+
+## Part 3 — Provision the scenario
+
+```bash
+make keycloak && make users
+```
+
+`make users` provisions the three demo users and their realm roles — with the role **descriptions**
+the Policy Rules Builder reads, and the `email`/`firstName`/`lastName` Keycloak 26's declarative
+user profile requires before `grant_type=password` will succeed — and mounts `policy.md` on the
+Controller.
+
+| User | Realm role |
+|---|---|
+| `dev-user` | `developer` |
+| `test-user` | `tester` |
+| `devops-user` | `devops` |
+
+**Order matters here, and it is the one non-obvious thing about this runbook.** `make users` is
+`make setup` minus the two steps that resolve the workloads' Keycloak client UUIDs — those abort if
+the workloads aren't deployed, and deploying them is exactly what Part 4 does as the trigger. So the
+realm must hold the users, roles and policy *before* the deploy fires onboarding, or the Policy
+Rules Builder has no role descriptions to reason about. Part 6 runs the full `make setup` later, once
+the clients exist.
+
+## Part 4 — Onboard by deploying
+
+```bash
+./driver.sh --only-deploy      # or: make trigger
+```
+
+This runs two phases. **DEPLOY** loads the workload images and applies their manifests;
+**VERIFY-TRIGGER** proves the apply caused onboarding.
+
+The split matters for the claim. [`demo/assets/kind-load.sh`](../../assets/kind-load.sh) builds and
+`kind load`s the images and **applies nothing** — it cannot register a Keycloak client.
+[`demo/assets/deploy.sh`](../../assets/deploy.sh) then does the `kubectl apply` + `rollout status`.
+So the trigger is isolated to that second call. Both scripts are used unmodified, exactly as the
+`-m system` suite uses them.
+
+### Why deploying is the trigger
+
+The operator's `AgentRuntimeReconciler` stamps `rossoctl.io/type=agent|tool` onto a Deployment's
+pod-template labels the first time its `AgentRuntime` CR resolves. That label is precisely what the
+`ClientRegistrationReconciler`'s watch predicate keys on, and *that* is what calls
+`RegisterOrFetchClientWithToken` — producing a genuine Keycloak `CLIENT_CREATE` admin event. The
+SPI listener from Part 1 publishes it on NATS as `aiac.apply.service.<uuid>`, and `aiac-agent`'s
+consumer runs `onboard_service`. So the first-ever apply of the workload plus its `AgentRuntime` CR
+— both already checked into `demo/assets/` — *is* the trigger. Nothing else creates it.
+
+VERIFY-TRIGGER polls, in order, until each is true:
+
+1. `team1/github-agent` and `team1/github-tool` appear as Keycloak clients (first registration
+   ever — no before/after diffing needed).
+2. `aiac-agent`'s logs show it consumed `aiac.apply.service.<uuid>` for both, over NATS.
+3. The `authorizationpolicies.agent.rossoctl.dev/github-agent` CR exists.
+4. That CR's **outbound gate is actually populated** — `target_allow_scopes` carries the tool's
+   scopes — then prints its content.
+
+Step 4 exists because step 3 is not sufficient. If the tool's onboarding loses a deploy race while
+the agent's succeeds, AIAC still writes a CR, but its outbound maps are all empty and *every*
+outbound request denies. Asserting only that the CR exists passes that state and defers the blow-up
+to ENFORCE, where the cause is far harder to see.
+
+There is no `POST /apply/service/{id}` call anywhere in this path.
+
+> Expect this to take a few minutes. The agent publishes its A2A AgentCard skills only *after* the
+> deploy, so onboarding redelivers over JetStream until `source_operations`/`issue_operations`
+> resolve and AIAC writes the CR. `POLL_SECS` (default 720) bounds it; each phase breaks the instant
+> its condition is met, so a healthy run is faster than the ceiling.
+>
+> That default is deliberately **above** the consumer's `ACK_WAIT` (600 s). A deploy-race failure
+> leaves its NATS message unacked, and JetStream only redelivers it after `ACK_WAIT` — a redelivery
+> that usually succeeds. Any `POLL_SECS` below 600 makes such a failure unrecoverable within the run:
+> the driver quits while the retry that would have fixed it is still pending.
+
+## Part 5 — Enforce live
+
+```bash
+./driver.sh --only-wire-outbound
+./driver.sh --only-enforce
+```
+
+Or both with `make enforce`. **WIRE** configures AuthBridge's own outbound leg — the `github-tool`
+route in the `authproxy-routes` ConfigMap, and the `agent-team1-github-tool-aud` client scope as an
+*optional* scope on `github-agent`'s client, which is what makes AuthBridge's `client_credentials`
+exchange work. AIAC's onboarding does not configure this; it is the same two sub-steps as
+`k8s/opa-kind-runbook.md` Part B.1/B.2, and it is a different exchange path from the direct RFC 8693
+proof Part 6 uses.
+
+**ENFORCE** then drives real HTTP probes through the live plugin:
+
+| Request | Inbound | Outbound (via the agent) |
+|---|---|---|
+| `dev-user` → `github-agent` | ✅ allowed | `source-read`, `source-write`, `issues-read` allowed; `issues-write` denied |
+| `test-user` → `github-agent` | ✅ allowed | `issues-read`, `issues-write` allowed; `source-read`/`source-write` denied |
+| `devops-user` → `github-agent` | ❌ denied (403) | never reached |
+
+`devops-user`'s denial is the intended story, not a failure: nothing in the policy grants it access
+to the agent at all. The driver hard-fails on the two decisive outbound checks
+(`dev-user`→`source-read` must be allowed, `test-user`→`source-read` must not be) and reports the
+rest of the matrix, then prints the matching OPA decision-log lines.
+
+> **Reading outbound verdicts.** Because the outbound pipeline includes `mcp-parser`, a denial comes
+> back the MCP-correct way: a JSON-RPC 2.0 error frame at **HTTP 200** (`error.code: -32000`,
+> `error.data.plugin: "opa"`), not an HTTP error status. Classify by the response **body** — an
+> `error` frame is denied, a `result` frame is allowed. The request never reaches `github-tool`.
+
+The whole of Parts 4–5 in one command: `./driver.sh` (or `make e2e`).
+
+## Part 6 — The narrated walkthrough (optional)
+
+Everything above is automated and fails loudly. This part is the opposite: it walks the same
+scenario in small steps so you can watch what AIAC generates and when. It needs the workloads
+deployed and registered — true now, after Part 4.
+
+It differs from Parts 4–5 in two ways, both deliberate: onboarding is invoked **manually**
+(`POST /apply/service/{id}`), and the verdicts come from evaluating the generated Rego with
+`opa eval` rather than from the live plugin. Same policy, same generated files, inspected instead of
+enforced.
+
+```bash
+make setup    # the full version: adds client-UUID resolution + direct token-exchange config
+make clear    # reset to a clean slate — deletes the AuthorizationPolicy CR and generated/
+make show
+```
+
+**Pause 1 — baseline.** `make show` reports three users with roles, no `github-*` roles or scopes
+yet, and no generated `.rego` at all. Nothing has been onboarded; there is nothing to enforce.
+
+```bash
+make agent    # AIAC discovers github-agent, reads policy.md, generates the inbound gate
+make show
+```
+
+**Pause 2 — the agent alone.** The inbound gate is populated: developers and testers can reach the
+agent's discovered scopes. The outbound gate exists but every map in it is still empty — there is no
+tool yet for the agent to act on.
+
+```bash
+make tool     # AIAC discovers github-tool's capabilities and completes the outbound gate
+make diff PRIOR=01-after-agent
+```
+
+**Pause 3 — both onboarded.** The diff shows the outbound gate's maps filling in:
+`target_allow_scopes` keyed by the tool's SPIFFE identity, and per-role grants for every discovered
+tool scope. This is the moment least-privilege access to a downstream tool exists — generated, not
+hand-written.
+
+Now drive real users through it:
+
+```bash
+make dev      # dev-user: read a file, commit a fix, read an issue (allowed) / close an issue (denied)
+make test     # test-user: read/file issues (allowed) / read source (denied)
+make devops   # devops-user: blocked at the inbound gate — no role sources any agent scope
+```
+
+Each target performs a real `grant_type=password` login, checks the inbound gate, performs a real
+RFC 8693 token exchange for the tool's audience, and checks the outbound gate per intent — printing
+a result table. The verdicts should match Part 5's live ones.
+
+Phase aggregates: `make init` (steps 00–03), `make onboard` (04–05), `make run` (all three users),
+and `make demo` chaining all three with no pauses.
+
+### How this sources the generated Rego
+
+The PDP Policy Writer is **CR-backed**: for each onboarded agent it server-side-applies a single
+`AuthorizationPolicy` custom resource (`agent.rossoctl.dev/v1alpha1`, named `<name>` in namespace
+`<ns>` — here `github-agent` in `team1`) whose `spec.policies[]` carry the inbound and outbound Rego
+as `content`. In production it writes **CRs only** — no `.rego` files on disk
+(`k8s/pdp-interface-deployment.yaml` keeps `POLICY_WRITER_DUMP_REGO` off and mounts no `/rego`).
+
+So this demo reads its Rego **straight from the CR** — the same artifact the live enforcement point
+consumes — rather than from a debug file dump:
+
+```bash
+kubectl get authorizationpolicies.agent.rossoctl.dev github-agent -n team1 -o json
+```
+
+`onboard/04`/`05` fetch that CR and write each `spec.policies[].content` into
+`generated/<snapshot>/team1/github-agent/{inbound,outbound}/request.rego` (mirroring the CR's
+`policies[].path`), then `opa eval` those files. `make clear` deletes the CR; a re-onboard
+server-side-applies a fresh one.
+
+> The committed snapshots under `generated/` come from the real generator
+> (`src/aiac/pdp/service/policy/opa/rego.py`) against a hand-built model of this scenario, so they
+> match the CR content the live writer emits (byte-for-byte with `docs/examples/opa-team1-policy.yaml`
+> for the after-tool state, modulo the cluster's actual trust domain). A live `make onboard`
+> overwrites them and is the authoritative source of truth.
+
+## Optional — re-prove the trigger without a teardown
+
+Parts 4–5 prove the trigger by onboarding something genuinely new, which needs the workloads
+undeployed first. On a cluster where they are already deployed and you don't want to tear them down,
+you can force a replay instead:
+
+```bash
+./driver.sh --only-replay-trigger      # or: make replay
+```
+
+This records both clients' current Keycloak UUIDs, deletes the clients via the Admin API, deletes
+both pods, and polls until the operator re-registers **new** UUIDs — then checks that `aiac-agent`
+consumed the fresh events and rewrote the CR (new `resourceVersion`). It works because
+`ClientRegistrationReconciler` calls `RegisterOrFetchClientWithToken` unconditionally on every
+reconcile; it does not skip because a credentials Secret already exists. If a pod restart doesn't
+wake the reconciler within half the timeout, the driver restarts the operator, which re-lists every
+`AgentRuntime`.
+
+This is **weaker evidence** than Part 4 — it replays the path against workloads that were already
+onboarded once — which is why it is opt-in and never part of a default run. Prefer
+`./restore.sh` followed by a normal `./driver.sh` when you can afford the teardown.
+
+## Capturing every operation
+
+The driver narrates to stdout, but the operations play out across several in-cluster components. Add
+`--collect-logs` to dump all of them into one per-run directory. It composes with any phase flag:
+
+```bash
+./driver.sh --collect-logs
+./driver.sh --only-enforce --collect-logs
+```
+
+Logs are written at the end of a successful run **and on any `die()` failure** — the most useful
+time to have them, since a failed run becomes debuggable without re-running. The directory is
+printed at the end; by default it lands under `/tmp/onboarding-logs-<timestamp>/`:
+
+| File | Component | What it shows |
+|---|---|---|
+| `operator-controller-manager.log` | `rossoctl-controller-manager` (`rossoctl-system`) | client registration, `rossoctl.io/type` labelling |
+| `aiac-agent.log` | `aiac-agent` (`aiac-system`) | the onboarding pipeline consuming `aiac.apply.service.<uuid>` |
+| `aiac-event-broker.log` | NATS broker (`aiac-system`) | the event bus |
+| `keycloak.log` | `keycloak` (`keycloak`) | the `aiac-event-listener` SPI emitting events |
+| `github-agent-authbridge-proxy.log` | AuthBridge sidecar (`team1`) | **the OPA inbound/outbound allow/deny decisions** |
+| `github-agent-app.log`, `github-tool.log` | workload app containers (`team1`) | app-side behaviour |
+| `authorizationpolicy-github-agent.yaml` | the CR AIAC wrote | the generated Rego (snapshot) |
+| `cm-authproxy-routes.yaml`, `cm-authbridge-runtime-config.yaml`, `pods-*.txt` | routing/runtime config + pod listings | current desired/observed state |
+
+Component logs are time-scoped to the run, so log volume can't push evidence out of view. When
+collecting after a `--only-*` run whose interesting history predates the invocation, widen the
+window with `COLLECT_SINCE` (an RFC3339 timestamp). `COLLECT_ROOT` changes the parent directory and
+`KC_NS` the Keycloak namespace.
+
+---
+
+## Cleanup
+
+```bash
+./restore.sh                    # or: make restore
+```
+
+Removes `github-agent`/`github-tool` **completely** — Deployments, Services, ServiceAccounts,
+`AgentRuntime` CRs, their Keycloak clients, credentials Secrets, leftover client-scopes and realm
+roles, and the `AuthorizationPolicy` CR AIAC wrote — and reverts Part 5's outbound wiring. That
+completeness is the point: the next `./driver.sh` DEPLOY phase must be a genuine first-time trigger
+again, not a no-op against clients that are still registered.
+
+By default the AIAC stack, NATS broker and Keycloak SPI stay in place, since re-running the demo
+needs them. To also reverse Part 1's Keycloak-side changes (the realm's `aiac-event-listener` config
+and the Keycloak StatefulSet image):
+
+```bash
+./restore.sh --include-infra    # or: make restore ARGS=--include-infra
+```
+
+### Which teardown do you want?
+
+Four levels, narrowest first. Each is idempotent and safe to re-run.
+
+| Want | Use | Keeps |
+|---|---|---|
+| Re-run the narrated walkthrough from a clean baseline | `make clear` | everything deployed; just resets generated roles/scopes, the Policy Store, the CR, and `generated/` |
+| Re-run the live path so DEPLOY is a genuine first trigger again | `./restore.sh` | the AIAC stack, NATS broker, Keycloak SPI, demo users/roles |
+| Uninstall **just AIAC** — the inverse of `./enable.sh` | `./teardown.sh --aiac-only` | everything except `aiac-system`: the workloads, all Keycloak state, the SPI, the OPA overlay |
+| Remove the demo entirely — the **post-install state** | `./teardown.sh` | only platform state: the `team1` namespace, the Prerequisites' `rossoctl` client changes, the operator's `*-aud` scopes |
+
+### Full teardown — back to the post-install state
+
+`restore.sh` is deliberately *not* a full teardown: it keeps the AIAC stack, the NATS broker and the
+demo's Keycloak users/roles, because re-running the demo needs them. Nothing in `restore.sh` or
+`make clear` removes the `aiac-system` namespace, the three demo users, the
+`developer`/`tester`/`devops` realm roles (`cleanup_provisioned` leaves those on purpose so a re-run
+can reuse them), or the `aiac-demo-cli` ROPC client. `teardown.sh` closes exactly that gap:
+
+```bash
+./teardown.sh --dry-run      # list everything that would be removed; change nothing
+./teardown.sh                # tear down (prompts; --yes skips the prompt)
+./teardown.sh --include-opa   # also revert the OPA pipeline overlay (needs the chart clone)
+```
+
+Or `make teardown` / `make teardown ARGS=--dry-run`. It delegates the overlapping surface to
+`restore.sh --include-infra` rather than duplicating it, then additionally removes:
+
+- the `team1` ConfigMaps the demo's own manifest created (`authbridge-config`, `authproxy-routes`)
+- the whole `aiac-system` namespace — AIAC stack, NATS broker, the Policy Model Store PVC,
+  `aiac-agent-secret`, `aiac-policy`
+- the demo's Keycloak users, the three realm roles, and the `aiac-demo-cli` client
+
+**What it deliberately leaves**, because the demo does not own it:
+
+- **the `team1` namespace itself.** The Rossoctl installer creates and owns it
+  ([`demo/assets/INSTALL.md`](../../assets/INSTALL.md): "a precondition, not an output"). A fresh
+  install gives you an *empty* `team1`, not no `team1` — so emptying it *is* the post-install state.
+  Deleting the namespace would force an installer re-run.
+- **the Prerequisites' `rossoctl` client changes** (Direct Access Grants, the `username → sub`
+  mapper). One-time cluster-wide state that `k8s/opa-kind-runbook.md`'s probes and the `-m system`
+  suite both depend on, and which that runbook calls harmless to leave.
+- **the operator's `*-aud` audience client scopes**, which it owns and recreates.
+- **the OPA pipeline overlay**, unless you pass `--include-opa` — it is a cluster-level change owned
+  by `k8s/`, and reverting it needs the `rossoctl` chart clone (`ROSSOCTL_DIR`).
+- **container images already in the Kind node.** Inert; the script prints the `docker image rm` line
+  if you want the disk back.
+
+> **One caveat on `authproxy-routes`.** The demo's `configmaps.yaml` declares that ConfigMap in
+> `team1`, so `teardown.sh` deletes it as the symmetric inverse of `deploy.sh`. If *your* platform
+> also seeds an `authproxy-routes` there (some installs add one for the weather tool), the demo
+> overwrote it at deploy time and there is no saved copy to restore — re-apply the installer's
+> version afterwards.
+
+Run `./teardown.sh --dry-run` first if you are unsure: it surveys what is actually present and lists
+every deletion without performing any.
+
+### Uninstalling just AIAC
+
+Part 1 installs AIAC in separable steps (`--stack-only`, `--broker-only`, `--spi-only`), so there is
+a matching way to uninstall only that. `restore.sh --include-infra` reverts just the *Keycloak-side*
+half of `enable.sh` (the SPI listener and image) — never the stack itself, which lives in
+`aiac-system`. To remove the stack:
+
+```bash
+./teardown.sh --aiac-only              # or: make uninstall-aiac
+./teardown.sh --aiac-only --dry-run    # preview
+```
+
+This deletes the `aiac-system` namespace and everything in it — the Agent, Interface Pod, NATS
+broker, the Policy Model Store **and its PVC**, `aiac-agent-secret`, `aiac-policy` — and touches
+nothing else. It needs no Keycloak credentials. Reinstall with `./enable.sh`.
+
+It is **not** a route back to the post-install state: the workloads stay deployed and registered, the
+demo's Keycloak users/roles/client stay, the SPI stays installed, and the OPA overlay stays wired.
+Use the plain `./teardown.sh` for that. (`--aiac-only` and `--include-opa` are rejected together —
+the OPA overlay lives in `team1`, not `aiac-system`.)
+
+> Deleting the namespace destroys the Policy Model Store's PVC, and its SQLite with it. `make clear`
+> is the non-destructive way to reset that store's **contents** while leaving the stack running.
+
+## Troubleshooting
+
+> **First move on any driver failure:** re-run it with `--collect-logs`. On a `die()` it dumps every
+> component's logs — including the AuthBridge OPA decision log — into one directory, so you can
+> diagnose from captured output instead of racing the live logs.
+
+- **`driver.sh` refuses to run DEPLOY, saying the workloads already exist.** That guard exists so
+  this demo can never silently degrade into a forced replay. Run `./restore.sh` first, or use
+  `--only-replay-trigger` if you meant the replay.
+- **`--only-replay-trigger` refuses, saying the workloads aren't deployed.** The mirror image of the
+  same guard. Run a normal `./driver.sh` — its DEPLOY phase is the real trigger.
+- **Keycloak never registers the new clients.** Check the operator reconciled the `AgentRuntime`
+  CRs (`kubectl logs deployment/rossoctl-controller-manager -n rossoctl-system`) and that the
+  pod-template picked up the label:
+  `kubectl get deployment github-agent -n team1 -o jsonpath='{.spec.template.metadata.labels}'`.
+- **`aiac-agent` never logs the consumed event.** Check the SPI provider actually attached
+  (`kubectl logs statefulset/keycloak -n keycloak | grep -i aiac-event-listener`) and that the
+  realm's admin-events config still lists it
+  (`GET .../admin/realms/rossoctl/events/config`). A `helm upgrade` or Keycloak restart between
+  Part 1 and here needs `./enable.sh --spi-only` re-run.
+- **An inbound probe is denied when it should be allowed.** The generated inbound gate's
+  `source_allow_ok` admits the `rossoctl` platform client. `driver.sh` logs users in through
+  `ROPC_CLIENT_ID` (default `rossoctl`) for exactly that reason — `aiac-demo-cli`, which Part 6's
+  `run-*.py` use, is not accepted as a source, so probing through it is denied on the `azp`.
+- **An outbound probe returns the wrong verdict.** The OPA SDK's bundle poller can take up to ~120 s
+  to pick up a fresh CR write. The driver's probes already retry within `POLL_SECS` (default 720);
+  if you are probing by hand, wait and retry before concluding anything.
+- **Every outbound probe denies, for every user.** That is the signature of an outbound gate whose
+  maps are empty — the agent onboarded but the tool did not, so no `target_allow_scopes` entry exists
+  to match. VERIFY-TRIGGER now catches this, but if you reach ENFORCE in this state, look for a
+  deploy-race 502 rather than suspecting the policy text:
+  `kubectl logs deployment/aiac-agent -n aiac-system | grep -iE 'label missing|MCP tools/list'`.
+  A failed onboard is redelivered by JetStream after `ACK_WAIT` (600 s) and usually succeeds on the
+  retry, so the cure is often simply to wait and re-run `./driver.sh --only-enforce`.
+- **`make prereqs` hangs waiting on client registration.** Registration is asynchronous after the
+  operator injects a workload; give it a couple of minutes, then check the operator's webhook logs.
+- **`make agent`/`make tool` times out.** Onboarding drives the Policy Rules Builder's LLM calls and
+  can genuinely take minutes; re-run with a larger `AIAC_ONBOARD_TIMEOUT` if your endpoint is slow.
+- **`make setup`/`make dev` fails with a Keycloak profile error.** Keycloak 26's declarative user
+  profile requires `email`/`firstName`/`lastName` before `grant_type=password` succeeds;
+  `03-setup.py` sets these, so this points at a realm provisioned some other way.
+- **A `run-*` target aborts with "no policy found".** Those drivers always read
+  `generated/02-after-tool/`; run `make agent && make tool` first.
+- **`kubectl` reports `connection refused`.** The Kind node was probably restarted and reassigned
+  its API-server host port, leaving the kubeconfig stale: `kind export kubeconfig --name rossoctl`.
+  `driver.sh` does this automatically in preflight.
+
+## Known gaps
+
+- **"Direct user → tool" is not enforced *by the generated policy*.** A fourth acceptance row —
+  `dev-user` calling `github-tool` **directly**, bypassing the agent — is not covered by anything
+  AIAC generates, and the driver does not probe it rather than report a fabricated result.
+
+  What actually guards that path depends on your cluster, so check rather than assume.
+  `github-tool` (`demo/assets/tools/github_tool/server.py`) is a bare FastMCP stub with **no
+  authentication of its own** — no audience check anywhere in its code. Whether it gets an AuthBridge
+  sidecar in front of it is **the operator's decision**, driven by its `AgentRuntime` CR and the
+  operator's injection configuration; it may or may not be injected, and
+  [`demo/assets/INSTALL.md`](../../assets/INSTALL.md) documents the port-shifting the sidecar imposes
+  when it is (which is why the manifest declares `PORT: 9095`, not `9090`). Check with:
+
+  ```bash
+  kubectl get pod -n team1 -l app=github-tool -o jsonpath='{.items[*].spec.containers[*].name}'
+  ```
+
+  - **Sidecar injected** (two containers — `github-tool` plus `authbridge-proxy`): the tool inherits
+    `team1`'s shared `authbridge-runtime-config`, whose *inbound* pipeline carries both
+    `jwt-validation` and `opa`. An unauthenticated direct call is rejected with **401** at the
+    sidecar. But AIAC writes an `AuthorizationPolicy` CR for **`github-agent` only** — there is none
+    for `github-tool` — so that inbound OPA has no tool-specific generated policy to read and falls
+    back to the cluster-wide `default` CR. Nothing derived from `policy.md` constrains it.
+  - **No sidecar** (one container): the endpoint is wide open, and a direct in-cluster call to
+    `github-tool.team1.svc.cluster.local:9090` succeeds unconditionally.
+
+  Closing the gap properly means AIAC generating a tool-inbound policy, not merely having a sidecar
+  present. Note that AIAC's own discovery already assumes a sidecar may be there: `analyze_tool` mints
+  a **tool-audienced** token before calling `tools/list` precisely so a sidecar-fronted endpoint
+  returns a manifest instead of a 401.
+- **Part 6 does not sit in the request path.** Its verdicts come from `opa eval` against the
+  generated Rego, mirroring how a gateway would query it. Parts 4–5 are the in-path proof.
+- **Part 6's token exchange stops short of a call.** `run-*.py` performs a real RFC 8693 exchange to
+  prove the flow, but does not feed the exchanged token into a live call against `github-tool`; the
+  outbound verdict is read from the generated Rego, not an intercepted request.
+
+---
+
+## Appendix — installing AIAC by hand
+
+What `./enable.sh` automates, from
+[`k8s/aiac-deployment-guide.md`](../../../k8s/aiac-deployment-guide.md). Use this when `enable.sh`'s
+assumptions don't hold — a non-Kind cluster, a remote registry, or an LLM key that isn't already in
+`team1/openai-secret`. Run from the **repo root**.
+
+| Manifest | Contents | Port(s) |
+|---|---|---|
+| `pdp-interface-deployment.yaml` | Interface Pod (IdP Configuration Service + PDP Policy Writer) + 2 ClusterIP Services | 7071, 7072 |
+| `policy-model-store-statefulset.yaml` | Policy Model Store StatefulSet + 1 Gi PVC + headless + ClusterIP Service | 7074 |
+| `event-broker-deployment.yaml` | NATS JetStream Event Broker + ClusterIP Service | 4222 |
+| `agent-deployment.yaml` | Agent Pod (`aiac-init` init container + AIAC Agent) + ClusterIP Service | 7070 |
+
+**1 — Build the images.** Note the differing build contexts.
+
+```bash
+docker build -f src/aiac/idp/service/configuration/keycloak/Dockerfile \
+  -t localhost/aiac-pdp-config:local src/aiac/idp/service/configuration/keycloak/
+docker build -f src/aiac/pdp/service/policy/opa/Dockerfile \
+  -t localhost/aiac-pdp-policy-opa:local src/
+docker build -f src/aiac/policy/model_store/service/Dockerfile \
+  -t localhost/aiac-policy-model-store:local src/
+docker build -f src/aiac/agent/controller/Dockerfile \
+  -t localhost/aiac-agent:local src/
+```
+
+The Event Broker uses stock `nats:2.14-alpine` — no build step.
+
+**2 — Load them into the cluster.**
+
+```bash
+for i in aiac-pdp-config aiac-pdp-policy-opa aiac-policy-model-store aiac-agent; do
+  kind load docker-image "localhost/$i:local" --name rossoctl
+done
+```
+
+For a fully air-gapped Kind cluster also `docker pull nats:2.14-alpine` and `kind load` it;
+`event-broker-deployment.yaml` uses `imagePullPolicy: IfNotPresent`, so a networked cluster pulls it
+directly. For a remote registry: tag, push, and update the `image:` fields in the manifests.
+
+**3 — Create the namespace and secrets.**
+
+```bash
+kubectl create namespace aiac-system
+
+kubectl create secret generic keycloak-admin-secret -n aiac-system \
+  --from-literal=KEYCLOAK_ADMIN_USERNAME=<admin-user> \
+  --from-literal=KEYCLOAK_ADMIN_PASSWORD=<admin-password>
+
+# The LLM key. agent-deployment.yaml only *references* this Secret — create it before step 5.
+kubectl create secret generic aiac-agent-secret -n aiac-system \
+  --from-literal=LLM_API_KEY=<your-api-key>
+```
+
+> `pdp-interface-deployment.yaml` carries placeholder credentials for reference only. For any
+> non-local environment create the secret manually and remove the `stringData` block.
+
+**4 — Review the environment.** `aiac-pdp-config` in `pdp-interface-deployment.yaml` holds the
+service URLs (`KEYCLOAK_URL`, `KEYCLOAK_REALM`, `AIAC_PDP_CONFIG_URL`, `AIAC_PDP_POLICY_URL`,
+`AIAC_POLICY_MODEL_STORE_URL`, `SERVICEPOLICY_DB_PATH`, `NATS_URL`); the defaults match the
+in-cluster Service names used here. `aiac-init` treats `AIAC_RAG_INGEST_URL` as optional and skips
+the RAG health check when unset, which is correct for the current phase.
+
+**5 — Apply, in dependency order.**
+
+```bash
+kubectl apply -f k8s/pdp-interface-deployment.yaml          # namespace, ConfigMap, Services
+kubectl apply -f k8s/event-broker-deployment.yaml           # no dependencies
+kubectl apply -f k8s/policy-model-store-statefulset.yaml
+kubectl apply -f k8s/agent-deployment.yaml                  # aiac-init waits for NATS + Interface
+
+kubectl wait deployment/aiac-interface    -n aiac-system --for=condition=Available --timeout=120s
+kubectl wait deployment/aiac-event-broker -n aiac-system --for=condition=Available --timeout=120s
+kubectl wait statefulset/aiac-policy-model-store -n aiac-system \
+  --for=jsonpath='{.status.readyReplicas}'=1 --timeout=120s
+kubectl wait deployment/aiac-agent        -n aiac-system --for=condition=Available --timeout=120s
+```
+
+**6 — Point the Agent at your LLM.** `agent-deployment.yaml` ships placeholders on purpose, so patch
+the live ConfigMap after applying it. Both values are read at startup, so a change needs a restart.
+
+```bash
+kubectl patch configmap aiac-agent-config -n aiac-system --type merge \
+  -p '{"data":{"LLM_BASE_URL":"https://<your-endpoint>/v1","LLM_MODEL":"<model>"}}'
+kubectl rollout restart deployment/aiac-agent -n aiac-system
+```
+
+**7 — Mount the scenario policy.** The Policy Rules Builder reads `policy.md` from the `aiac-policy`
+ConfigMap. Generate it from this demo's own constant so the two cannot drift:
+
+```bash
+python3 -c 'import sys; sys.path.insert(0, "demo/use-cases/onboarding/lib"); import scenario; sys.stdout.write(scenario.POLICY_ABSTRACT)' > /tmp/policy.md
+kubectl create configmap aiac-policy -n aiac-system --from-file=policy.md=/tmp/policy.md \
+  --dry-run=client -o yaml | kubectl apply -f -
+```
+
+**8 — Install the Keycloak SPI listener.** This is the one part with no concise manual equivalent —
+it builds a shaded jar, derives a Keycloak image from it, and enables the listener on the realm. See
+[`keycloak-spi/README.md`](../../../keycloak-spi/README.md) for the build, and prefer
+`./enable.sh --spi-only`.
+
+**9 — Verify.** Each service exposes `/health` returning `{"status":"ok"}`:
+
+```bash
+for p in 7071 7072 7074 7070; do
+  case $p in
+    7071) svc=aiac-pdp-config-service ;;
+    7072) svc=aiac-pdp-policy-service ;;
+    7074) svc=aiac-policy-model-store-service ;;
+    7070) svc=aiac-agent-service ;;
+  esac
+  kubectl port-forward "svc/$svc" "$p:$p" -n aiac-system >/dev/null 2>&1 &
+  pf=$!; sleep 2; printf '%s: ' "$svc"; curl -s "http://localhost:$p/health"; echo
+  kill $pf
+done
+```

@@ -19,7 +19,7 @@ from fastapi import HTTPException
 
 from aiac.idp.configuration.api import Configuration
 from aiac.idp.configuration.models import ServiceType
-from aiac.shared.upstream import run_upstream
+from aiac.shared.upstream import is_transient, run_upstream
 
 from .kube import list_agentcards, list_pods, read_service
 from .state import OnboardingProvisionState
@@ -45,9 +45,11 @@ class _WaitConfig:
 # Deploy->onboard race tolerance for the operator-applied ``rossoctl.io/type`` label. The onboarding
 # event is triggered by a DIFFERENT operator action (Keycloak client registration -> admin event), so
 # ``classify_service`` can run BEFORE the operator has patched the label onto the pod. A briefly-absent
-# label is therefore a transient not-ready state, re-polled before we give up with a 502. Defaults
-# ≈ 30s of slack (well under the NATS ACK_WAIT and the system-test convergence poll); tests set fast.
-_LABEL_WAIT = _WaitConfig("ONBOARD_LABEL_WAIT_ATTEMPTS", "ONBOARD_LABEL_WAIT_BACKOFF", 15, 2.0)
+# label is therefore a transient not-ready state, re-polled before we give up with a 502. Budgeted at
+# 30 attempts after a ~30s budget was observed losing this race by about a second: a tool's pod was
+# created at 14:28:17Z and the wait gave up at 14:28:46Z, because the operator had not yet reconciled
+# its AgentRuntime. Still well under the NATS ACK_WAIT; tests set fast.
+_LABEL_WAIT = _WaitConfig("ONBOARD_LABEL_WAIT_ATTEMPTS", "ONBOARD_LABEL_WAIT_BACKOFF", 30, 2.0)
 
 # Deploy->onboard race tolerance for the AgentCard skill sync — a SECOND, later race than the label one
 # above. The operator syncs the fetched A2A card onto ``status.card.skills`` only AFTER the agent pod is
@@ -55,6 +57,17 @@ _LABEL_WAIT = _WaitConfig("ONBOARD_LABEL_WAIT_ATTEMPTS", "ONBOARD_LABEL_WAIT_BAC
 # run while ``status.card.skills`` is still empty. An absent card / empty skill list is therefore a
 # transient not-ready state, re-polled before we fall back to a default access scope. Same ≈30s slack.
 _CARD_WAIT = _WaitConfig("ONBOARD_CARD_WAIT_ATTEMPTS", "ONBOARD_CARD_WAIT_BACKOFF", 15, 2.0)
+
+# Deploy->onboard race tolerance for the tool's MCP endpoint — the THIRD race, and the one with the
+# least slack available to it. Onboarding is triggered by the Keycloak client registration, which the
+# operator performs while the tool's pod is still starting, so ``analyze_tool`` can query
+# ``tools/list`` seconds before anything is listening. A refused/5xx probe is therefore a transient
+# not-ready state, re-polled before we give up with a 502. Budgeted at DOUBLE the attempts of the two
+# waits above (≈60s of backoff, and more in wall-clock since each look also spends
+# ``_mcp_tools_list``'s own bounded transport retries) because a tool pod additionally has to bring up
+# its injected AuthBridge sidecar — which fronts this very endpoint — so it starts serving later than
+# an agent's AgentCard sync does. Still well under the NATS ACK_WAIT, same as the others.
+_MCP_WAIT = _WaitConfig("ONBOARD_MCP_WAIT_ATTEMPTS", "ONBOARD_MCP_WAIT_BACKOFF", 30, 2.0)
 
 
 def _env_num(name: str, default, cast, minimum):
@@ -338,10 +351,28 @@ def analyze_tool(state: OnboardingProvisionState) -> dict:
     except Exception as e:
         raise HTTPException(502, f"discovery token minting failed for service {state.service_id!r}: {e}")
 
-    try:
-        tools = _mcp_tools_list(endpoint, token=token)
-    except Exception as e:
-        raise HTTPException(502, f"MCP tools/list failed at {endpoint}: {e}")
+    # Re-poll the endpoint while it is merely not-listening-yet (see _MCP_WAIT). A TRANSIENT failure
+    # (connection refused / timeout / 5xx) is the deploy race and returns None to retry; anything else
+    # — a 401 from a bad discovery token, a wrong path — is a real fault and propagates on the first
+    # look, so a genuine misconfiguration fails fast instead of stalling for the whole budget.
+    # An EMPTY manifest is also treated as not-ready: a tool contributing zero scopes yields an empty
+    # outbound gate, which is the silent half-policy this wait exists to prevent, so it is better to
+    # keep looking and then fail loudly than to accept it.
+    def _probe():
+        try:
+            return _mcp_tools_list(endpoint, token=token) or None
+        except Exception as e:
+            if is_transient(e):
+                return None
+            raise HTTPException(502, f"MCP tools/list failed at {endpoint}: {e}")
+
+    tools = _poll_until_ready(_probe, _MCP_WAIT)
+    if tools is None:
+        raise HTTPException(
+            502,
+            f"MCP tools/list at {endpoint} never returned a non-empty tool manifest within the "
+            f"{_MCP_WAIT.attempts_env} budget (tool not serving, or it exposes no tools)",
+        )
 
     def _tool_name(t: dict) -> str:
         name = t.get("name")

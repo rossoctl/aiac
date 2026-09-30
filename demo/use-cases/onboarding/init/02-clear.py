@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reset the demo to a clean slate: delete UC-1's provisioned Keycloak roles/scopes, clear the
+"""Reset the demo to a clean slate: delete onboarding's provisioned Keycloak roles/scopes, clear the
 Policy Store (non-optional — its SQLite survives on a PV and onboarding appends with
 ``override=False``), delete the agent's ``AuthorizationPolicy`` CR (the reworked writer is
 CR-backed — there is no ``/rego`` file to wipe), and clear the local ``generated/`` copy.
