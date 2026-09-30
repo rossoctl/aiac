@@ -153,10 +153,15 @@ expect_eq() {
 }
 
 # ── Keycloak admin helpers ───────────────────────────────────────────────────
+# Prints "" (exit 0) rather than raising when Keycloak returns a non-JSON/empty body — under
+# `set -euo pipefail` a raising python3 would abort the phase with a traceback instead of letting the
+# caller report a missing token. Same hardening as mint_token below.
 admin_token() {
   curl -s -X POST "${KC}/realms/master/protocol/openid-connect/token" \
     -d client_id=admin-cli -d username=admin -d password=admin -d grant_type=password \
-    | python3 -c 'import sys,json;print(json.load(sys.stdin).get("access_token",""))'
+    | python3 -c 'import sys,json
+try: print(json.load(sys.stdin).get("access_token","") or "")
+except Exception: print("")'
 }
 
 mint_token() {

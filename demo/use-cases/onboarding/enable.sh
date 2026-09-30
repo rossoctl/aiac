@@ -89,10 +89,16 @@ load_image_to_kind() {
   fi
 }
 
+# Prints the token, or "" when Keycloak isn't serving yet — and ALWAYS exits 0. Callers run under
+# `set -euo pipefail`, so a raising python3 here would fail the whole `$(admin_token)` assignment and
+# abort the script instead of letting the caller's retry loop poll (step_spi hits exactly this while
+# Keycloak warms up after the rollout). Matches driver.sh's mint_token.
 admin_token() {
   curl -s -X POST "${KC}/realms/master/protocol/openid-connect/token" \
     -d client_id=admin-cli -d username=admin -d password=admin -d grant_type=password \
-    | python3 -c 'import sys,json;print(json.load(sys.stdin).get("access_token",""))'
+    | python3 -c 'import sys,json
+try: print(json.load(sys.stdin).get("access_token","") or "")
+except Exception: print("")'
 }
 
 # ── Step 1 — The AIAC stack ─────────────────────────────────────────────────

@@ -49,10 +49,15 @@ esac
 AGENT_LABEL="app.kubernetes.io/name=github-agent"
 POLICY_CR="authorizationpolicies.agent.rossoctl.dev"
 
+# Prints "" (exit 0) rather than raising when Keycloak is unreachable or returns a non-JSON body.
+# Restore must survive a half-torn-down cluster, and under `set -euo pipefail` a raising python3 would
+# abort here — the `[ -n "$ADMIN" ]` guard below is what's meant to handle a missing token.
 admin_token() {
   curl -s -X POST "${KC}/realms/master/protocol/openid-connect/token" \
     -d client_id=admin-cli -d username=admin -d password=admin -d grant_type=password \
-    | python3 -c 'import sys,json;print(json.load(sys.stdin).get("access_token",""))'
+    | python3 -c 'import sys,json
+try: print(json.load(sys.stdin).get("access_token","") or "")
+except Exception: print("")'
 }
 
 echo "==> 1. Reverting authproxy-routes (dropping the github-tool route)"
