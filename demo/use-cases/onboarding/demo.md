@@ -93,9 +93,14 @@ Policies reach the plugin via the bundle service every AuthBridge workload polls
 - **A Kind cluster named `rossoctl`** with the rossoctl platform installed — SPIRE, Keycloak, and
   the rossoctl operator. Namespace `team1` must exist; the Rossoctl installer owns it, nothing here
   creates it.
-- **Two sibling repo clones** the OPA wiring scripts need:
-  - `OPERATOR_DIR` → `rossoctl/operator` clone (default `../operator`)
-  - `ROSSOCTL_DIR` → `rossoctl/rossoctl` clone, i.e. the Helm chart (default `../rossoctl`)
+- **Three sibling repo clones** the OPA wiring scripts need — siblings of the `aiac` repo root, not
+  of your current directory. Each is auto-detected from the script's own location, so you normally set
+  none of these; override only if a clone lives elsewhere, and then use an **absolute** path (a
+  relative one is resolved against your shell's cwd, and the scripts `cd` into these directories):
+  - `OPERATOR_DIR` → `rossoctl/operator` clone (bundle-service)
+  - `ROSSOCTL_DIR` → `rossoctl/rossoctl` clone, i.e. the Helm chart
+  - `CORTEX_DIR` → `rossoctl/cortex` clone; Part 2 builds the AuthBridge proxy image from
+    `$CORTEX_DIR/authbridge`, which lives in the cortex monorepo, not in this repo
 - **`kubectl`, `helm`, `kind`, `curl`, `python3`**, and `docker` or `podman` on `PATH`.
 - **An OpenAI-compatible LLM endpoint + API key** for AIAC's Policy Rules Builder. `enable.sh`
   defaults to reusing the key already in `team1/openai-secret`, reading its **`apikey`** data key (see
@@ -209,8 +214,15 @@ inserting `opa` (after `token-exchange` on the outbound leg) plus the parser set
 agent's pipeline. It does **not** modify `charts/rossoctl/values.yaml` on disk.
 
 ```bash
-OPERATOR_DIR=../operator ROSSOCTL_DIR=../rossoctl ../../../k8s/opa-kind-enable.sh
+../../../k8s/opa-kind-enable.sh
 ```
+
+The clone paths are auto-detected (see Prerequisites) — passing `OPERATOR_DIR=../operator` from this
+directory does **not** work, since that resolves against your cwd, not the script's. AuthBridge
+plugins are opt-in build tags, so the image build passes `GO_BUILD_TAGS` resolved from the `full`
+profile in `cortex/authbridge/scripts/profile-tags` — the only non-envoy profile carrying `opa`. It is
+resolved in a `golang` container when the host has no `go`; override with `AUTHBRIDGE_PROFILE` or an
+explicit `GO_BUILD_TAGS`.
 
 Confirm OPA is in **both** legs — expect `2`:
 
@@ -508,7 +520,7 @@ can reuse them), or the `aiac-demo-cli` ROPC client. `teardown.sh` closes exactl
 ```bash
 ./teardown.sh --dry-run      # list everything that would be removed; change nothing
 ./teardown.sh                # tear down (prompts; --yes skips the prompt)
-./teardown.sh --include-opa   # also revert the OPA pipeline overlay (needs ROSSOCTL_DIR)
+./teardown.sh --include-opa   # also revert the OPA pipeline overlay (needs the chart clone)
 ```
 
 Or `make teardown` / `make teardown ARGS=--dry-run`. It delegates the overlapping surface to
@@ -530,7 +542,7 @@ Or `make teardown` / `make teardown ARGS=--dry-run`. It delegates the overlappin
   suite both depend on, and which that runbook calls harmless to leave.
 - **the operator's `*-aud` audience client scopes**, which it owns and recreates.
 - **the OPA pipeline overlay**, unless you pass `--include-opa` — it is a cluster-level change owned
-  by `k8s/`, and reverting it needs the `ROSSOCTL_DIR` chart clone.
+  by `k8s/`, and reverting it needs the `rossoctl` chart clone (`ROSSOCTL_DIR`).
 - **container images already in the Kind node.** Inert; the script prints the `docker image rm` line
   if you want the disk back.
 

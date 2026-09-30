@@ -45,8 +45,11 @@
 #                  is unreachable — a Kind node reassigns its API-server host port
 #                  on restart, which leaves the exported kubeconfig stale.
 #
-# Run from the repo root:
-#   OPERATOR_DIR=../operator ROSSOCTL_DIR=../rossoctl ./k8s/opa-kind-driver.sh
+# Run from the repo root. The operator/rossoctl/cortex clone paths are auto-detected from the
+# script's own location as siblings of the repo root, so they normally need no override; if one
+# lives elsewhere, pass an ABSOLUTE path (a relative one resolves against your cwd, not the
+# script's, and these get `cd`ed into):
+#   ./k8s/opa-kind-driver.sh
 #   SKIP_ENABLE=1 ./k8s/opa-kind-driver.sh   # skip the rebuild, just re-test
 
 set -euo pipefail

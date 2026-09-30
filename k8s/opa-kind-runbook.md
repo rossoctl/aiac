@@ -138,14 +138,26 @@ All commands below are run from the repo root.
 ## Step 1 — Enable OPA in both legs
 
 ```bash
-OPERATOR_DIR=../operator ROSSOCTL_DIR=../rossoctl ./aiac/k8s/opa-kind-enable.sh
+./aiac/k8s/opa-kind-enable.sh
 ```
+
+No `OPERATOR_DIR`/`ROSSOCTL_DIR`/`CORTEX_DIR` needed when the `operator`,
+`rossoctl` and `cortex` clones are siblings of `aiac` — the script derives them
+from its own location. Set them only if your clones live elsewhere, and then use
+**absolute** paths: a relative override is resolved against your shell's cwd, not
+the script's, and the script `cd`s into these directories in subshells.
 
 This rebuilds `localhost/authbridge:local` from the current tree, loads it into
 the `rossoctl` Kind cluster, and `helm upgrade`s the chart with a temporary
 overlay that inserts `opa` (after `token-exchange` on the outbound leg) and the
 parser set into every `team1` agent's pipeline. It does **not** modify
 `charts/rossoctl/values.yaml` on disk.
+
+AuthBridge plugins are opt-in build tags, so the image build passes
+`GO_BUILD_TAGS` resolved from the `full` profile in
+`cortex/authbridge/scripts/profile-tags` (the only non-envoy profile carrying
+`opa`). The script resolves it in a `golang` container when the host has no `go`;
+override with `AUTHBRIDGE_PROFILE` or an explicit `GO_BUILD_TAGS`.
 
 Confirm OPA is wired into **both** legs (expect **2**):
 
@@ -565,7 +577,7 @@ curl -s -o /dev/null -w "remove scope HTTP %{http_code}\n" -X DELETE -H "Authori
   "$KC/admin/realms/rossoctl/clients/$CID/optional-client-scopes/$SID"
 
 # 4. revert the pipeline (removes the OPA overlay, restarts the agents)
-ROSSOCTL_DIR=../rossoctl ./aiac/k8s/opa-kind-restore.sh
+./aiac/k8s/opa-kind-restore.sh
 ```
 
 Confirm OPA is gone from the pipeline (expect **0**):
