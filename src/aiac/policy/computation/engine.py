@@ -34,9 +34,25 @@ whose policy changed. It is keyed by the **clientId (SPM key)**, not the Keycloa
 client is deleted, ``get_services()`` can no longer resolve UUID→clientId.
 
 Fire-and-forget — ``compute_and_apply`` and ``decommission`` re-raise dependency failures.
+
+Serialization (the PCE lock). Every public operation reads SPMs, changes them, and writes them
+back. The store has no versions, and its own write lock protects one write, not a
+read-modify-write. So two runs that route rules into one shared SPM (for example two agents
+granted on one tool's scope) would both read the old SPM, and the second write would silently
+remove the first run's rules. One module-level lock, ``_pce_lock``, is held for the whole body of
+``compute_and_apply`` and ``decommission``. The PRB (the LLM work) runs before
+``compute_and_apply``, outside the lock, so concurrent onboardings still build their rules in
+parallel; the part under the lock makes no LLM call. Known limits:
+
+- It serializes one process only (one Controller replica, as for the orchestrator's per-service
+  lock). More replicas need store versions or a distributed lock.
+- When two onboardings overlap, a pair between the two new services can stay unjudged (each
+  service's resolver read the catalog before the other's Provision). That pair then gives no
+  grant (fail closed).
 """
 
 import logging
+import threading
 from typing import TypeVar
 
 from aiac.idp.configuration.api import Configuration
@@ -57,6 +73,9 @@ from aiac.policy.model_store.library.api import (
 )
 
 logger = logging.getLogger(__name__)
+
+# The PCE lock — see "Serialization" in the module docstring.
+_pce_lock = threading.Lock()
 
 _Entity = TypeVar("_Entity", Role, Scope)
 
@@ -250,7 +269,8 @@ def compute_and_apply(
     while silently applying nothing.
     """
     try:
-        _run(rules, override)
+        with _pce_lock:
+            _run(rules, override)
     except Exception:
         logger.exception("compute_and_apply failed for %d rule(s)", len(rules))
         raise
@@ -274,7 +294,8 @@ def decommission(service_id: str) -> None:
     Controller surfaces the failure instead of reporting a phantom success.
     """
     try:
-        _decommission(service_id)
+        with _pce_lock:
+            _decommission(service_id)
     except Exception:
         # Strip CR/LF before logging so a hostile service_id cannot forge log records.
         safe_id = service_id.replace("\r", "").replace("\n", "")

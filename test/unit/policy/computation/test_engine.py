@@ -15,6 +15,7 @@ Store library (fresh-empty SPM on 404, ``get_service_policies_by_role`` scanning
 """
 
 import os
+import threading
 from contextlib import ExitStack, contextmanager
 from unittest.mock import patch
 
@@ -1059,3 +1060,119 @@ def test_derived_apm_carries_no_default_effect():
 
     apm = store.pushed_agent("github-agent")
     assert "default_effect" not in apm.model_dump()
+
+
+# --------------------------------------------------------------------------- #
+# PCE lock — one module-level lock serializes every read-modify-write of the   #
+# store (compute_and_apply, decommission, quarantine). Without it two runs     #
+# that route rules into one shared SPM both read the old SPM, and the second   #
+# write removes the first run's rules (a lost update, no error).               #
+# --------------------------------------------------------------------------- #
+class PausingStore(FakeStore):
+    """A ``FakeStore`` whose first read of ``pause_on`` waits (bounded) for a second reader.
+
+    Without a lock the second run reads the same, not-yet-written SPM while the first waits, so the
+    two runs interleave read → read → write → write. With the lock the second run cannot read until
+    the first has written; the first waits only until ``timeout`` and then continues."""
+
+    def __init__(self, pause_on, timeout=0.5, initial=None):
+        super().__init__(initial)
+        self.pause_on = pause_on
+        self.timeout = timeout
+        self.first_read = threading.Event()
+        self.second_read = threading.Event()
+        self._reads = 0
+        self._reads_lock = threading.Lock()
+
+    def get_service_policy(self, service_id):
+        model = super().get_service_policy(service_id)
+        if service_id == self.pause_on:
+            with self._reads_lock:
+                self._reads += 1
+                reads = self._reads
+            if reads == 1:
+                self.first_read.set()
+                self.second_read.wait(self.timeout)
+            else:
+                self.second_read.set()
+        return model
+
+
+def _two_agents_one_tool():
+    A1 = _agent_role("r-a1", "a1-src", owner="agent-1")
+    A2 = _agent_role("r-a2", "a2-src", owner="agent-2")
+    TS = _scope("s-tool-read", "tool-read", service_id="github-tool")
+    catalog = [
+        _agent("agent-1", roles=[A1]),
+        _agent("agent-2", roles=[A2]),
+        _tool("github-tool", scopes=[TS]),
+    ]
+    return A1, A2, TS, catalog
+
+
+def _run_in_threads(*calls):
+    errors = []
+
+    def wrap(fn):
+        def target():
+            try:
+                fn()
+            except Exception as exc:  # surfaced to the test thread below
+                errors.append(exc)
+
+        return target
+
+    threads = [threading.Thread(target=wrap(fn)) for fn in calls]
+    threads[0].start()
+    return threads, errors
+
+
+def test_concurrent_runs_into_one_shared_spm_keep_both_rules():
+    A1, A2, TS, catalog = _two_agents_one_tool()
+    store = PausingStore(pause_on="github-tool")
+    with engine_env(catalog, store) as compute_and_apply:
+        threads, errors = _run_in_threads(
+            lambda: compute_and_apply([_rule(A1, TS)]),
+            lambda: compute_and_apply([_rule(A2, TS)]),
+        )
+        assert store.first_read.wait(2)  # run 1 is between its read and its write of SPM(tool)
+        threads[1].start()
+        for t in threads:
+            t.join(5)
+        assert not errors
+
+    assert _pairs(_inbound(store.data["github-tool"])) == [("r-a1", "s-tool-read"), ("r-a2", "s-tool-read")]
+
+
+def _blocks_while_pce_lock_held(fn) -> None:
+    """Hold the PCE lock in the test thread; ``fn`` in a worker must not finish until it is released."""
+    from aiac.policy.computation import engine
+
+    done = threading.Event()
+
+    def target():
+        fn()
+        done.set()
+
+    with engine._pce_lock:
+        worker = threading.Thread(target=target)
+        worker.start()
+        assert not done.wait(0.3), "ran while another holder had the PCE lock"
+    worker.join(5)
+    assert done.is_set()
+
+
+def test_compute_and_apply_holds_the_pce_lock():
+    AR, UR, AS, TS, catalog = _repro()
+    store = FakeStore()
+    with engine_env(catalog, store) as compute_and_apply:
+        _blocks_while_pce_lock_held(lambda: compute_and_apply([_rule(UR, AS)]))
+
+
+def test_decommission_holds_the_pce_lock():
+    store = FakeStore()
+    _onboard_repro(store)
+    with engine_env([_agent("github-agent")], store):
+        from aiac.policy.computation.engine import decommission
+
+        _blocks_while_pce_lock_held(lambda: decommission("github-tool"))
