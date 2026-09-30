@@ -16,7 +16,9 @@ is always ``False`` (append; existing roles keep their other access).
 **Replay safety (at-least-once delivery):** Provision IdP writes are idempotent and the PCE
 reconcile is idempotent, so a crash between stages simply re-runs the full pipeline to
 convergence on NATS redelivery. A build **failure**, however, triggers a **compensating
-rollback** (UC1-only) before the error propagates — see :func:`_rollback`.
+rollback** (UC1-only) and then the PCE ``quarantine`` before the error propagates — see
+:func:`_rollback` and :func:`onboard_service`. The PCE owns the PDP: this module never imports
+``aiac.pdp.policy.library``.
 """
 
 import contextlib
@@ -33,6 +35,7 @@ from aiac.agent.uc.onboarding.policy_builder.builder import ServicePolicyBuilder
 from aiac.agent.uc.onboarding.provision.graph import build_provision_graph
 from aiac.agent.uc.onboarding.provision.state import OnboardingProvisionState, Trigger
 from aiac.idp.configuration.api import Configuration
+from aiac.policy.computation import quarantine
 from aiac.policy.model.models import PolicyRule
 
 logger = logging.getLogger(__name__)
@@ -133,15 +136,20 @@ def _loggable(value: object) -> str:
 
 
 def _rollback(config: Configuration, service_id: str, created_roles, created_scopes) -> None:
-    """Compensating rollback (UC1-only): tear down exactly what Provision created on this run,
-    unset the client type, then disable the client as a failed-service marker.
+    """Compensating rollback (UC1-only): tear down exactly what Provision created on this run, then
+    disable the client as a failed-service marker.
 
     ``created_roles`` / ``created_scopes`` are the **created-manifest** — only the entities this
     run added (reused-by-name entities are absent, so a role/scope another service shares is never
     removed). Each ``delete_service_*`` unmaps-then-deletes and is idempotent, so a retry that
     finds an object already gone does not crash. The disable lands **last**, after the teardown,
     so an interrupted rollback never leaves a disabled-but-still-provisioned client. Actions are
-    logged at INFO."""
+    logged at INFO.
+
+    The client **type is kept**: the rollback removes only what this run created, and the type
+    was not created by it. (The IdP primitive ``unset_service_type`` stays, with no caller.) The
+    policy side of the teardown is the PCE's :func:`~aiac.policy.computation.quarantine`, which
+    the caller runs next."""
     service = config.get_service(service_id)
     safe_id = _loggable(service_id)
     for role in created_roles:
@@ -150,8 +158,6 @@ def _rollback(config: Configuration, service_id: str, created_roles, created_sco
     for scope in created_scopes:
         config.delete_service_scope(service, scope)
         logger.info("UC1 rollback: deleted scope %r (service %s)", _loggable(getattr(scope, "name", scope)), safe_id)
-    config.unset_service_type(service)
-    logger.info("UC1 rollback: unset client type (service %s)", safe_id)
     config.set_service_enabled(service, False)
     logger.info("UC1 rollback: disabled client — failed-service marker (service %s)", safe_id)
 
@@ -173,8 +179,14 @@ def reenable_service(service_id: str) -> None:
 def onboard_service(service_id: str) -> tuple[list[PolicyRule], bool]:
     """Sequence Provision → Policy Builder and return ``(rules, override=False)``.
 
-    On any of the four typed build failures (see ``_ROLLBACK_ERRORS``) the Orchestrator runs the
-    compensating :func:`_rollback` (UC1-only) and **re-raises** the original error unchanged. On
+    On any of the four typed build failures (see ``_ROLLBACK_ERRORS``, for agents and tools, on the
+    first failure — also the retryable ``LLMAccessError``) the Orchestrator runs the compensating
+    :func:`_rollback` (delete this run's created roles/scopes; disable the client last), then the
+    PCE's ``quarantine(service_id)`` (delete the SPM, remove the service's roles from the other SPMs,
+    replace an agent's CR with a no-rules CR, re-derive the affected agents), and **re-raises** the
+    original error unchanged. The disable comes before the quarantine, so no run after the teardown
+    sees the service as enabled. A quarantine failure propagates in place of the build error. The
+    quarantine is lifted only by a successful re-onboarding. On
     success it does **not** re-enable the client here: the client is re-enabled by the caller via
     :func:`reenable_service`, but only AFTER the caller's ``compute_and_apply`` (PCE) call succeeds,
     so a PCE failure leaves the client disabled rather than enabled-with-no-policy.
@@ -196,6 +208,7 @@ def onboard_service(service_id: str) -> tuple[list[PolicyRule], bool]:
             rules = ServicePolicyBuilder.build(service_id, service_type)
         except _ROLLBACK_ERRORS:
             _rollback(config, service_id, created_roles, created_scopes)
+            quarantine(service_id)
             raise
 
         return rules, False

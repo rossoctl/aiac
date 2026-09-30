@@ -102,13 +102,31 @@ def test_dispatch_acks_on_success():
     ):
         asyncio.run(consumer._dispatch(msg))
 
-    # _dispatch forwards the handler's (rules, override) pair to the PCE.
-    pce.assert_called_once_with([], False)
+    # _dispatch forwards the handler's (rules, override) pair to the PCE, with the focus service's
+    # Keycloak UUID for the routing guard.
+    pce.assert_called_once_with([], False, focus_service="svc-1")
     # UC1 service-onboarding subject: the client is re-enabled with the derived service_id, only
     # after the PCE apply succeeds.
     reenable.assert_called_once_with("svc-1")
     msg.ack.assert_called_once()
     msg.term.assert_not_called()
+
+
+def test_dispatch_passes_no_focus_service_for_a_role_subject():
+    consumer = AiacEventConsumer()
+    consumer._nc = AsyncMock()
+    msg = _fake_msg("aiac.apply.role.role-1")
+
+    with (
+        patch("aiac.agent.eventbus.consumer.update_role", return_value=([], True)),
+        patch("aiac.agent.eventbus.consumer.compute_and_apply") as pce,
+        patch("aiac.agent.eventbus.consumer.reenable_service") as reenable,
+    ):
+        asyncio.run(consumer._dispatch(msg))
+
+    pce.assert_called_once_with([], True, focus_service=None)
+    reenable.assert_not_called()
+    msg.ack.assert_called_once()
 
 
 def test_dispatch_does_not_reenable_when_pce_apply_raises():

@@ -114,7 +114,9 @@ def health() -> dict[str, str]:
 @app.post("/apply/service/{service_id}")
 def apply_service(service_id: str) -> Response:
     rules, override = onboard_service(service_id)
-    compute_and_apply(rules, override)
+    # service_id is the Keycloak UUID of the focus service: the PCE routing guard keeps its rules
+    # while its client is still disabled (a re-onboarding of a quarantined service).
+    compute_and_apply(rules, override, focus_service=service_id)
     # Re-enable the client only AFTER the PCE apply succeeds — a compute_and_apply failure above
     # propagates and leaves the client disabled (the failed-service marker), never enabled-with-no-policy.
     reenable_service(service_id)

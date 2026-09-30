@@ -51,11 +51,11 @@ def _scope(name, *, scope_id=None, service_id="", aiac_managed=True):
     )
 
 
-def _service(service_id, *, ref=None, roles=None, scopes=None, service_type=ServiceType.TOOL):
+def _service(service_id, *, ref=None, roles=None, scopes=None, service_type=ServiceType.TOOL, enabled=True):
     return Service(
         id=service_id,
         serviceId=ref or service_id,
-        enabled=True,
+        enabled=enabled,
         type=service_type,
         roles=roles or [],
         scopes=scopes or [],
@@ -190,3 +190,53 @@ class TestErrors:
         with pytest.raises(HTTPException) as ei:
             _resolve(ServiceType.TOOL, services=[focus, other], subjects=[], service_id=client_id)
         assert ei.value.status_code == 404
+
+
+class TestDisabledServices:
+    """A disabled client is a failed (quarantined) service: its roles and scopes are not candidates,
+    so no build grants anything to or from it. The focus service still resolves while it is disabled
+    (a re-onboarding runs before ``reenable_service``)."""
+
+    def test_disabled_service_roles_and_scopes_are_not_candidates(self):
+        focus = _service(FOCUS_ID, service_type=ServiceType.AGENT)
+        live = _service(
+            OTHER_ID,
+            roles=[_role("live.agent", kind=RoleKind.AGENT)],
+            scopes=[_scope("live.read", service_id=OTHER_ID)],
+        )
+        failed = _service(
+            "svc-failed",
+            roles=[_role("failed.agent", kind=RoleKind.AGENT)],
+            scopes=[_scope("failed.read", service_id="svc-failed")],
+            enabled=False,
+        )
+
+        result = _resolve(ServiceType.AGENT, services=[focus, live, failed], subjects=[])
+
+        assert [r.name for r in result.candidate_roles] == ["live.agent"]
+        assert [s.name for s in result.other_scopes] == ["live.read"]
+
+    def test_disabled_service_role_held_by_a_user_is_not_a_user_candidate(self):
+        # The disabled service still owns its roles: a user holding one does not turn it into a
+        # user-kind candidate.
+        failed_role = _role("failed.agent", kind=RoleKind.AGENT)
+        focus = _service(FOCUS_ID, service_type=ServiceType.AGENT)
+        failed = _service("svc-failed", roles=[failed_role], enabled=False)
+
+        result = _resolve(
+            ServiceType.AGENT, services=[focus, failed], subjects=[_subject("alice", roles=[failed_role])]
+        )
+
+        assert result.candidate_roles == []
+
+    def test_disabled_focus_service_still_resolves_its_own_entities(self):
+        own_role = _role("focus.agent")
+        own_scope = _scope("focus.read", service_id=FOCUS_ID)
+        focus = _service(FOCUS_ID, roles=[own_role], scopes=[own_scope], service_type=ServiceType.AGENT, enabled=False)
+        other = _service(OTHER_ID, scopes=[_scope("other.read", service_id=OTHER_ID)])
+
+        result = _resolve(ServiceType.AGENT, services=[focus, other], subjects=[])
+
+        assert [r.name for r in result.own_roles] == ["focus.agent"]
+        assert [s.name for s in result.own_scopes] == ["focus.read"]
+        assert [s.name for s in result.other_scopes] == ["other.read"]

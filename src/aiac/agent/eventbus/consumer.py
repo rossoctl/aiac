@@ -146,7 +146,10 @@ class AiacEventConsumer:
             # threadpool so the loop stays free to answer ``/health`` while onboarding runs.
             loop = asyncio.get_running_loop()
             rules, override = await loop.run_in_executor(None, _handle, msg.subject)
-            await loop.run_in_executor(None, functools.partial(compute_and_apply, rules, override))
+            # UC1 only: the focus service's Keycloak UUID, so the PCE routing guard keeps its rules
+            # while its client is still disabled (a re-onboarding of a quarantined service).
+            focus = msg.subject[len(_SERVICE_PREFIX) :] if msg.subject.startswith(_SERVICE_PREFIX) else None
+            await loop.run_in_executor(None, functools.partial(compute_and_apply, rules, override, focus_service=focus))
             # UC1 only: re-enable the client AFTER a successful compute_and_apply, mirroring the
             # HTTP route. If compute_and_apply raised above, this is skipped and the client stays
             # disabled (the failed-service marker), never enabled-with-no-policy.

@@ -62,7 +62,8 @@ def test_apply_service_dispatches_to_orchestrator_and_calls_pce_once():
 
     assert resp.status_code == 200
     orch.assert_called_once_with("svc-123")
-    pce.assert_called_once_with([], False)
+    # The focus service (the Keycloak UUID) reaches the PCE routing guard.
+    pce.assert_called_once_with([], False, focus_service="svc-123")
     # The client is re-enabled only after the PCE apply succeeds.
     reenable.assert_called_once_with("svc-123")
 
@@ -79,7 +80,7 @@ def test_apply_service_ignores_a_default_effect_env():
 
     assert resp.status_code == 200
     orch.assert_called_once_with("svc-123")
-    pce.assert_called_once_with([], False)
+    pce.assert_called_once_with([], False, focus_service="svc-123")
     assert not hasattr(routes, "DEFAULT_EFFECT_ENV")
     assert not hasattr(routes, "_default_effect_from_env")
 
@@ -163,7 +164,7 @@ def test_controller_forwards_handler_rules_and_override_verbatim():
 
     assert resp.status_code == 200
     # Exactly one PCE call, with the handler's own rules object and flag — not a rebuilt/empty one.
-    pce.assert_called_once_with(rules, False)
+    pce.assert_called_once_with(rules, False, focus_service="svc-9")
     forwarded_rules, forwarded_override = pce.call_args.args
     assert forwarded_rules is rules
     assert forwarded_override is False

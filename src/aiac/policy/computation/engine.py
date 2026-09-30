@@ -33,14 +33,22 @@ signal (not the catalog-miss guard), tears down X's entire footprint, and re-der
 whose policy changed. It is keyed by the **clientId (SPM key)**, not the Keycloak UUID — after the
 client is deleted, ``get_services()`` can no longer resolve UUID→clientId.
 
-Fire-and-forget — ``compute_and_apply`` and ``decommission`` re-raise dependency failures.
+Quarantine. ``quarantine(service_uuid)`` is the UC1 failure-path counterpart of ``decommission``:
+a failed onboarding leaves the service in the catalog (disabled), so it is keyed by the Keycloak
+UUID. It tears down the same store footprint, but replaces an agent's CR with a no-rules CR (deny
+everything) instead of deleting it. ``compute_and_apply``'s routing guard then drops every later
+rule that touches a disabled service, so a build that started before the quarantine cannot write
+its rules back.
+
+Fire-and-forget — ``compute_and_apply``, ``decommission`` and ``quarantine`` re-raise dependency
+failures.
 
 Serialization (the PCE lock). Every public operation reads SPMs, changes them, and writes them
 back. The store has no versions, and its own write lock protects one write, not a
 read-modify-write. So two runs that route rules into one shared SPM (for example two agents
 granted on one tool's scope) would both read the old SPM, and the second write would silently
 remove the first run's rules. One module-level lock, ``_pce_lock``, is held for the whole body of
-``compute_and_apply`` and ``decommission``. The PRB (the LLM work) runs before
+``compute_and_apply``, ``decommission`` and ``quarantine``. The PRB (the LLM work) runs before
 ``compute_and_apply``, outside the lock, so concurrent onboardings still build their rules in
 parallel; the part under the lock makes no LLM call. Known limits:
 
@@ -57,7 +65,7 @@ from typing import TypeVar
 
 from aiac.idp.configuration.api import Configuration
 from aiac.idp.configuration.models import Role, RoleKind, Scope, Service, ServiceType
-from aiac.pdp.policy.library.api import apply_policy, delete_agent_policy
+from aiac.pdp.policy.library.api import apply_agent_policy, apply_policy, delete_agent_policy
 from aiac.policy.model.models import (
     AgentPolicyModel,
     PolicyModel,
@@ -251,6 +259,7 @@ def _fresh_apm(agent_id: str) -> AgentPolicyModel:
 def compute_and_apply(
     rules: list[PolicyRule],
     override: bool = False,
+    focus_service: str | None = None,
 ) -> None:
     """Route, persist, derive, and apply ``rules`` — fire-and-forget.
 
@@ -264,13 +273,22 @@ def compute_and_apply(
     There is no default effect to pass: the deployed Rego always denies a ``(role, scope)`` pair
     that no rule mentions, so every re-derivation of an agent gives the same behavior.
 
+    Routing guard. A disabled client is a failed (quarantined) service. Under the PCE lock, after
+    the catalog read, the run drops each rule whose scope owner is disabled, or whose agent role
+    belongs to a disabled service (``role.actorIds``), so a build that started before a quarantine
+    cannot write rules back into the torn-down footprint. ``focus_service`` — the Keycloak internal
+    client UUID (``Service.id``) of the service this onboarding builds — is exempt: a re-onboarding
+    applies while its client is still disabled (``reenable_service`` runs after the apply). The
+    onboarding route and the NATS consumer pass it; every other caller passes nothing, so every
+    rule that touches a disabled service is dropped.
+
     Exceptions from any dependency (IdP, Policy Store, PDP) are logged and **re-raised** so the
     caller (the Controller) surfaces the failure — e.g. as a 500 — instead of returning success
     while silently applying nothing.
     """
     try:
         with _pce_lock:
-            _run(rules, override)
+            _run(rules, override, focus_service)
     except Exception:
         logger.exception("compute_and_apply failed for %d rule(s)", len(rules))
         raise
@@ -297,18 +315,73 @@ def decommission(service_id: str) -> None:
         with _pce_lock:
             _decommission(service_id)
     except Exception:
-        # Strip CR/LF before logging so a hostile service_id cannot forge log records.
-        safe_id = service_id.replace("\r", "").replace("\n", "")
-        logger.exception("decommission failed for service %r", safe_id)
+        logger.exception("decommission failed for service %r", _loggable(service_id))
         raise
 
 
-def _run(rules: list[PolicyRule], override: bool) -> None:
+def _disabled_services(catalog: dict[str, Service], focus_service: str | None) -> set[str]:
+    """The ``serviceId`` of every disabled (quarantined) service in ``catalog``, except the focus
+    service (given by its Keycloak UUID, ``Service.id``)."""
+    return {sid for sid, svc in catalog.items() if not svc.enabled and svc.id != focus_service}
+
+
+def _touches(rule: PolicyRule, service_ids: set[str]) -> bool:
+    """True iff ``rule``'s scope owner, or the owner of its agent role, is in ``service_ids``."""
+    if rule.scope.serviceId in service_ids:
+        return True
+    return rule.role.kind == RoleKind.AGENT and any(actor in service_ids for actor in rule.role.actorIds)
+
+
+def quarantine(service_uuid: str) -> None:
+    """Tear down a failed onboarding's policy footprint — the UC1 failure path (after the rollback).
+
+    ``service_uuid`` is the **Keycloak internal client UUID** (``Service.id``) that the onboarding
+    carries; the failed service X is still in the catalog (disabled), so its ``serviceId`` (the SPM
+    key) is resolved there. Holds the PCE lock. For X:
+
+    1. delete ``SPM(X)`` from the store;
+    2. remove X's roles from the other SPMs (as ``decommission`` step 4 does);
+    3. for an agent, **replace** its CR with a CR that has no rules (the ``_fresh_apm`` shell), which
+       denies every request — not a delete, because the bundle-service combiner allows a missing CR;
+       a tool gets no CR (it has none);
+    4. re-derive the affected agents (those that targeted X, and those whose SPMs lost X's roles)
+       and apply them in one call.
+
+    Idempotent: a second call finds no SPM and no edges, and writes the same no-rules CR. An
+    unknown ``service_uuid`` is a logged no-op. The quarantine is lifted only by a successful
+    re-onboarding (its ``compute_and_apply`` writes the real CR over the no-rules CR with the same
+    SSA field manager, then ``reenable_service`` re-enables the client).
+
+    Exceptions from any dependency are logged and **re-raised**.
+    """
+    try:
+        with _pce_lock:
+            _quarantine(service_uuid)
+    except Exception:
+        logger.exception("quarantine failed for service %r", _loggable(service_uuid))
+        raise
+
+
+def _loggable(value: str) -> str:
+    """Strip CR/LF so a hostile id cannot forge log records."""
+    return value.replace("\r", "").replace("\n", "")
+
+
+def _run(rules: list[PolicyRule], override: bool, focus_service: str | None = None) -> None:
     config = Configuration.for_default_realm()
 
     # (1) Catalog once — the only runtime IdP read. Carries each service's type (agent vs tool,
     # for P4) and its own roles/scopes (embedded on the APM for P2, filtered to aiac.managed).
     catalog = {svc.serviceId: svc for svc in config.get_services()}
+
+    # (1.5) Routing guard — drop every rule that touches a disabled (quarantined) service, except
+    # the focus service (see ``compute_and_apply``).
+    disabled = _disabled_services(catalog, focus_service)
+    if disabled:
+        kept = [rule for rule in rules if not _touches(rule, disabled)]
+        if len(kept) != len(rules):
+            logger.info("routing guard dropped %d rule(s) that touch a disabled service", len(rules) - len(kept))
+        rules = kept
 
     # SPM cache: fetch each SPM from the store at most once, seed its identity from the catalog,
     # mutate in place, and persist the changed ones.
@@ -377,9 +450,7 @@ def _run(rules: list[PolicyRule], override: bool) -> None:
 
     # (6) Derive each affected agent's APM (zero IdP) and partial-upsert once. Tools get an SPM
     # but no APM (P4).
-    derived = [_derive(agent_id, spm) for agent_id in sorted(affected) if is_agent(agent_id)]
-    if derived:
-        apply_policy(PolicyModel(agents=derived))
+    _apply_derived(affected, spm, is_agent)
 
 
 def _decommission(service_id: str) -> None:
@@ -396,6 +467,53 @@ def _decommission(service_id: str) -> None:
     spm_x = spm(service_id)
     if not (spm_x.owned_roles or spm_x.owned_scopes or spm_x.inbound_allow_rules or spm_x.inbound_deny_rules):
         return
+
+    # (3)-(6) Tear down X's footprint in the store (see ``_remove_footprint``).
+    was_agent = spm_x.service_type == ServiceType.AGENT
+    affected = _remove_footprint(service_id, spms, spm, is_agent)
+
+    # (7) Delete APM(X) from the PDP iff X was an agent (tools have an SPM but no APM).
+    if was_agent:
+        delete_agent_policy(service_id)
+
+    # (8) Re-derive every affected agent (X excluded) in one partial upsert.
+    _apply_derived(affected, spm, is_agent)
+
+
+def _quarantine(service_uuid: str) -> None:
+    config = Configuration.for_default_realm()
+
+    # (1) Catalog once. X is still in it (the rollback disables the client, it does not delete it),
+    # so resolve its SPM key (serviceId) from its Keycloak UUID. spm() seeds X's current roles from
+    # the catalog, so step 4 removes the roles X still has. The edges of the roles that the rollback
+    # deleted are dropped by ``_reconcile`` when a later run touches those SPMs.
+    catalog = {svc.serviceId: svc for svc in config.get_services()}
+    service_id = next((sid for sid, svc in catalog.items() if svc.id == service_uuid), None)
+    if service_id is None:
+        logger.warning("quarantine: service %r is not in the IdP catalog — nothing to do", _loggable(service_uuid))
+        return
+    spms, spm, is_agent = _spm_cache(catalog)
+
+    # (3)-(6) Tear down X's footprint in the store (see ``_remove_footprint``).
+    was_agent = is_agent(service_id)
+    affected = _remove_footprint(service_id, spms, spm, is_agent)
+
+    # (7) An agent's CR is REPLACED with a no-rules CR (the ``_fresh_apm`` shell), which denies
+    # every inbound and outbound request. Not a delete, on purpose: the bundle-service combiner
+    # allows a pod that has no client CR, so a delete would open the agent. A tool has no CR — its
+    # rules leave its callers' outbound packages through the re-derive below.
+    if was_agent:
+        apply_agent_policy(service_id, _fresh_apm(service_id))
+
+    # (8) Re-derive every affected agent (X excluded) in one partial upsert.
+    _apply_derived(affected, spm, is_agent)
+
+
+def _remove_footprint(service_id: str, spms, spm, is_agent) -> set[str]:
+    """Tear down service X's footprint in the store — the steps ``decommission`` and ``quarantine``
+    share. Returns the affected agents (X excluded):
+    the agents that targeted X, and the agents whose SPMs lost X's roles."""
+    spm_x = spm(service_id)
 
     # (3) Targeters — agents whose outbound loses X: they hold an Agent-kind inbound edge (allow or
     # deny) on SPM(X) (their_role → X_scope), which vanishes when SPM(X) is deleted in step 5.
@@ -419,7 +537,6 @@ def _decommission(service_id: str) -> None:
 
     # (5) Delete SPM(X) — removes every user→X and agent→X inbound edge in one shot — and evict it
     # from the cache so re-derive cannot resurrect it.
-    was_agent = spm_x.service_type == ServiceType.AGENT
     delete_service_policy(service_id)
     spms.pop(service_id, None)
 
@@ -427,13 +544,13 @@ def _decommission(service_id: str) -> None:
     for changed_id in changed:
         apply_service_policy(changed_id, spms[changed_id])
 
-    # (7) Delete APM(X) from the PDP iff X was an agent (tools have an SPM but no APM).
-    if was_agent:
-        delete_agent_policy(service_id)
-
-    # (8) Re-derive every affected agent (X excluded) from the freshly-persisted, X-deleted store —
-    # outbound/target_scopes/source_roles referencing X drop automatically. One partial upsert.
     affected.discard(service_id)
+    return affected
+
+
+def _apply_derived(affected: set[str], spm, is_agent) -> None:
+    """Derive each affected agent's APM from the freshly-persisted store and partial-upsert them in
+    one call (outbound/target_scopes/source_roles referencing a removed service drop out)."""
     derived = [_derive(agent_id, spm) for agent_id in sorted(affected) if is_agent(agent_id)]
     if derived:
         apply_policy(PolicyModel(agents=derived))

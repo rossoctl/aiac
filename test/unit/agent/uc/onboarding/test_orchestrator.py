@@ -10,10 +10,13 @@ single `compute_and_apply` call afterwards.
 
 Issue 171 adds a compensating rollback (UC1-only): on any of the four typed build
 failures the Orchestrator tears down exactly what Provision *created this run* (the
-created-manifest), unsets the client type, disables the client (failed-service marker),
-and re-raises. On success it re-enables the client (idempotent).
+created-manifest) and disables the client (failed-service marker). The client type is
+kept (handoff 11 B2). Then it calls the PCE's ``quarantine`` (the policy teardown) and
+re-raises. The caller re-enables the client after a successful apply (idempotent).
 """
 
+import ast
+import inspect
 import threading
 from unittest.mock import MagicMock, patch
 
@@ -31,6 +34,14 @@ from aiac.agent.uc.onboarding import orchestrator
 from aiac.idp.configuration.models import Role, Scope, ServiceType
 
 SERVICE_ID = "svc-1"
+
+
+@pytest.fixture(autouse=True)
+def quarantine():
+    """The PCE ``quarantine`` seam — patched for every test, so the failure path never reaches a
+    live PCE. Tests that check it request this fixture by name."""
+    with patch.object(orchestrator, "quarantine") as mock:
+        yield mock
 
 
 def _graph(*, created_roles=(), created_scopes=(), service_type=ServiceType.AGENT):
@@ -171,13 +182,17 @@ class TestReenableService:
 
 
 class TestRollbackOnBuildFailure:
+    @pytest.mark.parametrize("service_type", [ServiceType.AGENT, ServiceType.TOOL])
     @pytest.mark.parametrize("error", _rollback_errors(), ids=lambda e: type(e).__name__)
-    def test_rollback_tears_down_created_disables_and_reraises(self, error):
+    def test_rollback_then_quarantine_then_reraise(self, error, service_type, quarantine):
         role = Role(id="r1", name="weather.forecast", composite=False)
         scope = Scope(id="s1", name="weather.history")
         service = object()
         config = _config_returning(service)
-        graph = _graph(created_roles=[role], created_scopes=[scope])
+        graph = _graph(created_roles=[role], created_scopes=[scope], service_type=service_type)
+        order = MagicMock()
+        order.attach_mock(config, "config")
+        order.attach_mock(quarantine, "quarantine")
 
         with (
             patch.object(orchestrator, "build_provision_graph", return_value=graph),
@@ -191,15 +206,26 @@ class TestRollbackOnBuildFailure:
         # The ORIGINAL error instance is re-raised, not swallowed or re-wrapped.
         assert ei.value is error
         # Teardown of exactly what this run created (unmap-then-delete is done inside the
-        # Configuration primitives), then unset type, then disable (failed-service marker).
+        # Configuration primitives), then disable (failed-service marker), then the PCE quarantine
+        # keyed by the Keycloak UUID. The client type is kept.
         config.delete_service_role.assert_called_once_with(service, role)
         config.delete_service_scope.assert_called_once_with(service, scope)
-        config.unset_service_type.assert_called_once_with(service)
         config.set_service_enabled.assert_called_once_with(service, False)
+        config.unset_service_type.assert_not_called()
+        quarantine.assert_called_once_with(SERVICE_ID)
+        calls = [c[0] for c in order.method_calls if c[0] != "config.get_service"]
+        assert calls == [
+            "config.delete_service_role",
+            "config.delete_service_scope",
+            "config.set_service_enabled",
+            "quarantine",
+        ]
 
     def test_disable_is_the_last_rollback_action(self):
         # The failed-service marker (enabled=false) must land AFTER the teardown, so a
-        # crash mid-teardown never leaves a disabled-but-still-provisioned client.
+        # crash mid-teardown never leaves a disabled-but-still-provisioned client. It lands
+        # BEFORE the quarantine (asserted above), so no run after the teardown sees the service
+        # as enabled.
         role = Role(id="r1", name="weather.forecast", composite=False)
         scope = Scope(id="s1", name="weather.history")
         service = object()
@@ -218,7 +244,25 @@ class TestRollbackOnBuildFailure:
         names = [c[0] for c in config.method_calls]
         assert names.index("set_service_enabled") > names.index("delete_service_role")
         assert names.index("set_service_enabled") > names.index("delete_service_scope")
-        assert names.index("set_service_enabled") > names.index("unset_service_type")
+        assert "unset_service_type" not in names
+
+    def test_quarantine_failure_propagates_after_the_rollback(self, quarantine):
+        # A failed quarantine (e.g. the PDP is down) surfaces loudly — it is not swallowed. The
+        # rollback already ran, so the client is disabled.
+        service = object()
+        config = _config_returning(service)
+        quarantine.side_effect = RuntimeError("PDP unreachable")
+
+        with (
+            patch.object(orchestrator, "build_provision_graph", return_value=_graph()),
+            patch.object(orchestrator, "ServicePolicyBuilder") as spb,
+            patch.object(orchestrator, "_config", return_value=config),
+        ):
+            spb.build.side_effect = LLMAccessError("boom")
+            with pytest.raises(RuntimeError, match="PDP unreachable"):
+                orchestrator.onboard_service(SERVICE_ID)
+
+        config.set_service_enabled.assert_called_once_with(service, False)
 
 
 class TestRollbackLogInjectionSanitized:
@@ -279,7 +323,7 @@ class TestRollbackDeletesOnlyCreated:
 
 
 class TestRollbackScopedToFourErrors:
-    def test_non_rollback_builder_error_propagates_without_teardown(self):
+    def test_non_rollback_builder_error_propagates_without_teardown(self, quarantine):
         # A builder error that is NOT one of the four typed failures (e.g. an HTTPException
         # from IdP focus resolution) propagates untouched -- no teardown, no disable.
         service = object()
@@ -305,6 +349,7 @@ class TestRollbackScopedToFourErrors:
         config.delete_service_scope.assert_not_called()
         config.unset_service_type.assert_not_called()
         config.set_service_enabled.assert_not_called()
+        quarantine.assert_not_called()
 
 
 class TestRetryableReRunRollsBackIdempotently:
@@ -528,3 +573,14 @@ class TestPerServiceSerialization:
                 assert not t.is_alive(), "onboard_service thread hung"
 
         assert errors == [], "different service_ids did not run concurrently"
+
+
+class TestPceOwnsThePdp:
+    def test_orchestrator_does_not_import_the_pdp_library(self):
+        # The PCE owns the PDP: the orchestrator reaches it only through the PCE (quarantine).
+        tree = ast.parse(inspect.getsource(orchestrator))
+        imported = {node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)} | {
+            alias.name for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names
+        }
+        assert not any(name and name.startswith("aiac.pdp") for name in imported)
+        assert "aiac.policy.computation" in imported
