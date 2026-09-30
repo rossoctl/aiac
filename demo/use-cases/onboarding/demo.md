@@ -98,8 +98,32 @@ Policies reach the plugin via the bundle service every AuthBridge workload polls
   - `ROSSOCTL_DIR` → `rossoctl/rossoctl` clone, i.e. the Helm chart (default `../rossoctl`)
 - **`kubectl`, `helm`, `kind`, `curl`, `python3`**, and `docker` or `podman` on `PATH`.
 - **An OpenAI-compatible LLM endpoint + API key** for AIAC's Policy Rules Builder. `enable.sh`
-  defaults to reusing the key already in `team1/openai-secret` (see its `OPENAI_SECRET_NS` /
-  `OPENAI_SECRET_NAME` / `LLM_BASE_URL` / `LLM_MODEL` env vars).
+  defaults to reusing the key already in `team1/openai-secret`, reading its **`apikey`** data key (see
+  its `OPENAI_SECRET_NS` / `OPENAI_SECRET_NAME` / `LLM_BASE_URL` / `LLM_MODEL` env vars). The script
+  has no way to take the key directly, so if that Secret does not exist yet, create it:
+
+  ```bash
+  kubectl create secret generic openai-secret -n team1 --from-literal=apikey="$LLM_API_KEY"
+  ```
+
+- **`aiac-system/keycloak-admin-secret`, created before Part 1.** Nothing in this demo creates it, and
+  two separate things hard-fail without it: `aiac-interface` carries a **non-optional** `secretRef` on
+  it (`k8s/pdp-interface-deployment.yaml`, whose own header calls it a precondition "pre-provisioned
+  out-of-band"), so the pod never leaves `ContainerCreating`; and `init/00-discover-keycloak.sh` reads
+  the admin credentials from it, so every `make` target that touches Keycloak aborts. Create the
+  namespace yourself here: `enable.sh` does create it, but then applies the Deployment that mounts this
+  Secret in the same run, leaving you no window to add it in between.
+
+  ```bash
+  kubectl create namespace aiac-system
+  kubectl create secret generic keycloak-admin-secret -n aiac-system \
+    --from-literal=KEYCLOAK_ADMIN_USERNAME=<admin-user> \
+    --from-literal=KEYCLOAK_ADMIN_PASSWORD=<admin-password>
+  ```
+
+  Both key names are exact — `00-discover-keycloak.sh` looks up
+  `KEYCLOAK_ADMIN_USERNAME`/`KEYCLOAK_ADMIN_PASSWORD` by name. Override the location with `KC_SECRET_NS`
+  / `KC_SECRET` if you keep it elsewhere.
 - **`github-agent`/`github-tool` NOT already deployed in `team1`.** Part 4's whole point is that a
   first-time deploy triggers onboarding, so it needs a clean slate. If you have run this demo
   before, `./restore.sh` first.
@@ -159,8 +183,8 @@ copy-paste commands for environments it doesn't fit. Three independently runnabl
 | Step | Flag | What it does |
 |---|---|---|
 | AIAC stack | `--stack-only` | Builds/loads `aiac-pdp-config`, `aiac-pdp-policy-opa`, `aiac-policy-model-store`, `aiac-agent`; creates `aiac-agent-secret` from the OpenAI key; provisions the `aiac-policy` ConfigMap from `lib/scenario.py`'s policy text; applies `pdp-interface-deployment.yaml`, `policy-model-store-statefulset.yaml`, `agent-deployment.yaml`; points `aiac-agent-config` at your LLM endpoint |
-| NATS broker | `--broker-only` | Applies `event-broker-deployment.yaml`. The SPI's default `NATS_URL` (`nats://aiac-event-broker-service:4222`) already matches this Service, so nothing needs configuring on either side |
-| Keycloak SPI | `--spi-only` | Builds the shaded jar in a Maven container (no JDK needed on your machine), builds a derived Keycloak image with the jar in `/opt/keycloak/providers/` + `kc.sh build`, `kind load`s it, `kubectl set image`s the live `keycloak` StatefulSet, and enables the listener on the realm's admin-events config |
+| NATS broker | `--broker-only` | Applies `event-broker-deployment.yaml`, creating `aiac-event-broker-service` in `aiac-system`. The SPI's compiled-in default `NATS_URL` (`nats://aiac-event-broker-service:4222`) is a **bare name that cannot resolve from the `keycloak` namespace**, so `--spi-only` sets the cross-namespace FQDN (`....aiac-system.svc.cluster.local`) on the Keycloak StatefulSet — the two sides agree because the script makes them agree, not by default |
+| Keycloak SPI | `--spi-only` | Builds the shaded jar in a Maven container (no JDK needed on your machine), builds a derived Keycloak image with the jar in `/opt/keycloak/providers/` + `kc.sh build`, `kind load`s it, `kubectl set image`s the live `keycloak` StatefulSet (including the `NATS_URL` FQDN above), and enables the listener on the realm's admin-events config |
 
 The Keycloak change is a **live, reversible patch**, not a chart edit — a later `helm upgrade` of the
 `rossoctl` release would revert it (same spirit as `opa-kind-enable.sh`'s overlay). Undo it
@@ -253,14 +277,26 @@ VERIFY-TRIGGER polls, in order, until each is true:
 1. `team1/github-agent` and `team1/github-tool` appear as Keycloak clients (first registration
    ever — no before/after diffing needed).
 2. `aiac-agent`'s logs show it consumed `aiac.apply.service.<uuid>` for both, over NATS.
-3. The `authorizationpolicies.agent.rossoctl.dev/github-agent` CR exists — printing its content.
+3. The `authorizationpolicies.agent.rossoctl.dev/github-agent` CR exists.
+4. That CR's **outbound gate is actually populated** — `target_allow_scopes` carries the tool's
+   scopes — then prints its content.
+
+Step 4 exists because step 3 is not sufficient. If the tool's onboarding loses a deploy race while
+the agent's succeeds, AIAC still writes a CR, but its outbound maps are all empty and *every*
+outbound request denies. Asserting only that the CR exists passes that state and defers the blow-up
+to ENFORCE, where the cause is far harder to see.
 
 There is no `POST /apply/service/{id}` call anywhere in this path.
 
 > Expect this to take a few minutes. The agent publishes its A2A AgentCard skills only *after* the
 > deploy, so onboarding redelivers over JetStream until `source_operations`/`issue_operations`
-> resolve and AIAC writes the CR. `POLL_SECS` (default 420) bounds it; each phase breaks the instant
+> resolve and AIAC writes the CR. `POLL_SECS` (default 720) bounds it; each phase breaks the instant
 > its condition is met, so a healthy run is faster than the ceiling.
+>
+> That default is deliberately **above** the consumer's `ACK_WAIT` (600 s). A deploy-race failure
+> leaves its NATS message unacked, and JetStream only redelivers it after `ACK_WAIT` — a redelivery
+> that usually succeeds. Any `POLL_SECS` below 600 makes such a failure unrecoverable within the run:
+> the driver quits while the retry that would have fixed it is still pending.
 
 ## Part 5 — Enforce live
 
@@ -556,8 +592,15 @@ the OPA overlay lives in `team1`, not `aiac-system`.)
   `ROPC_CLIENT_ID` (default `rossoctl`) for exactly that reason — `aiac-demo-cli`, which Part 6's
   `run-*.py` use, is not accepted as a source, so probing through it is denied on the `azp`.
 - **An outbound probe returns the wrong verdict.** The OPA SDK's bundle poller can take up to ~120 s
-  to pick up a fresh CR write. The driver's probes already retry within `POLL_SECS` (default 420);
+  to pick up a fresh CR write. The driver's probes already retry within `POLL_SECS` (default 720);
   if you are probing by hand, wait and retry before concluding anything.
+- **Every outbound probe denies, for every user.** That is the signature of an outbound gate whose
+  maps are empty — the agent onboarded but the tool did not, so no `target_allow_scopes` entry exists
+  to match. VERIFY-TRIGGER now catches this, but if you reach ENFORCE in this state, look for a
+  deploy-race 502 rather than suspecting the policy text:
+  `kubectl logs deployment/aiac-agent -n aiac-system | grep -iE 'label missing|MCP tools/list'`.
+  A failed onboard is redelivered by JetStream after `ACK_WAIT` (600 s) and usually succeeds on the
+  retry, so the cure is often simply to wait and re-run `./driver.sh --only-enforce`.
 - **`make prereqs` hangs waiting on client registration.** Registration is asynchronous after the
   operator injects a workload; give it a couple of minutes, then check the operator's webhook logs.
 - **`make agent`/`make tool` times out.** Onboarding drives the Policy Rules Builder's LLM calls and
@@ -573,16 +616,35 @@ the OPA overlay lives in `team1`, not `aiac-system`.)
 
 ## Known gaps
 
-- **"Direct user → tool" is not enforced.** A fourth acceptance row — `dev-user` calling
-  `github-tool` **directly**, bypassing the agent — should be denied, and is not.
-  `github-tool` (`demo/assets/tools/github_tool/server.py`) is a bare FastMCP stub with no
-  authentication of its own: no AuthBridge sidecar (deliberately — see
-  [`demo/assets/INSTALL.md`](../../assets/INSTALL.md)'s "do not add sidecars to this tool"
-  invariant) and no audience check in its own code. A direct in-cluster call to
-  `github-tool.team1.svc.cluster.local:9090` succeeds unconditionally today. Enforcing it would need
-  either an inbound AuthBridge+OPA leg on the tool or the tool doing its own audience check, both
-  out of scope for this stub. The driver does not probe this row rather than report a fabricated
-  result.
+- **"Direct user → tool" is not enforced *by the generated policy*.** A fourth acceptance row —
+  `dev-user` calling `github-tool` **directly**, bypassing the agent — is not covered by anything
+  AIAC generates, and the driver does not probe it rather than report a fabricated result.
+
+  What actually guards that path depends on your cluster, so check rather than assume.
+  `github-tool` (`demo/assets/tools/github_tool/server.py`) is a bare FastMCP stub with **no
+  authentication of its own** — no audience check anywhere in its code. Whether it gets an AuthBridge
+  sidecar in front of it is **the operator's decision**, driven by its `AgentRuntime` CR and the
+  operator's injection configuration; it may or may not be injected, and
+  [`demo/assets/INSTALL.md`](../../assets/INSTALL.md) documents the port-shifting the sidecar imposes
+  when it is (which is why the manifest declares `PORT: 9095`, not `9090`). Check with:
+
+  ```bash
+  kubectl get pod -n team1 -l app=github-tool -o jsonpath='{.items[*].spec.containers[*].name}'
+  ```
+
+  - **Sidecar injected** (two containers — `github-tool` plus `authbridge-proxy`): the tool inherits
+    `team1`'s shared `authbridge-runtime-config`, whose *inbound* pipeline carries both
+    `jwt-validation` and `opa`. An unauthenticated direct call is rejected with **401** at the
+    sidecar. But AIAC writes an `AuthorizationPolicy` CR for **`github-agent` only** — there is none
+    for `github-tool` — so that inbound OPA has no tool-specific generated policy to read and falls
+    back to the cluster-wide `default` CR. Nothing derived from `policy.md` constrains it.
+  - **No sidecar** (one container): the endpoint is wide open, and a direct in-cluster call to
+    `github-tool.team1.svc.cluster.local:9090` succeeds unconditionally.
+
+  Closing the gap properly means AIAC generating a tool-inbound policy, not merely having a sidecar
+  present. Note that AIAC's own discovery already assumes a sidecar may be there: `analyze_tool` mints
+  a **tool-audienced** token before calling `tools/list` precisely so a sidecar-fronted endpoint
+  returns a manifest instead of a 401.
 - **Part 6 does not sit in the request path.** Its verdicts come from `opa eval` against the
   generated Rego, mirroring how a gateway would query it. Parts 4–5 are the in-path proof.
 - **Part 6's token exchange stops short of a call.** `run-*.py` performs a real RFC 8693 exchange to

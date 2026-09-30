@@ -157,6 +157,27 @@ step_stack() {
   kubectl rollout restart deployment/aiac-agent -n "$AIAC_NAMESPACE"
   kubectl wait deployment/aiac-interface -n "$AIAC_NAMESPACE" --for=condition=Available --timeout=180s
   kubectl wait statefulset/aiac-policy-model-store -n "$AIAC_NAMESPACE" --for=jsonpath='{.status.readyReplicas}'=1 --timeout=180s
+  # NOTE: aiac-agent is deliberately NOT waited on here — see step_wait_agent. Its aiac-init
+  # container blocks on NATS, which step_broker deploys AFTER this function returns.
+  echo "==> [stack] AIAC stack applied (aiac-agent still initializing — it needs the broker below)."
+}
+
+# ── Step 1b — aiac-agent readiness (ordering-sensitive) ─────────────────────
+# Split out of step_stack on purpose. aiac-agent's `aiac-init` container waits for NATS at
+# aiac-event-broker-service:4222, which step_broker only deploys afterwards — so waiting inside
+# step_stack could never succeed on a clean install, and `set -e` turned that timeout into an
+# abort that skipped the broker AND the SPI, leaving Part 1 a third done. Waiting here, after
+# the broker, matches the real dependency order.
+step_wait_agent() {
+  # --stack-only skips step_broker, so the broker may legitimately not exist yet. Waiting then would
+  # burn the full timeout and abort for a reason the operator already knows, so say so and move on
+  # instead; a later `./enable.sh --broker-only` is what unblocks the agent.
+  if ! kubectl get deployment aiac-event-broker -n "$AIAC_NAMESPACE" > /dev/null 2>&1; then
+    echo "==> [stack] AIAC stack applied. Skipping the aiac-agent wait: no aiac-event-broker in"
+    echo "    '${AIAC_NAMESPACE}', and its init container blocks on NATS. Run './enable.sh --broker-only'."
+    return 0
+  fi
+  echo "==> [stack] Waiting for aiac-agent (its init container needed the broker to exist)"
   kubectl wait deployment/aiac-agent -n "$AIAC_NAMESPACE" --for=condition=Available --timeout=180s
   echo "==> [stack] AIAC stack up."
 }
@@ -166,7 +187,8 @@ step_broker() {
   echo "==> [broker] Applying the NATS event broker (${AIAC_NAMESPACE})"
   kubectl apply -f "$AIAC_DIR/k8s/event-broker-deployment.yaml"
   kubectl rollout status deployment/aiac-event-broker -n "$AIAC_NAMESPACE" --timeout=120s
-  echo "==> [broker] aiac-event-broker up. Default NATS_URL (nats://aiac-event-broker-service:4222) matches — no override needed."
+  echo "==> [broker] aiac-event-broker up. The SPI's bare default NATS_URL does NOT resolve from the"
+  echo "    Keycloak namespace — step_spi sets the cross-namespace FQDN on the StatefulSet instead."
 }
 
 # ── Step 3 — The Keycloak SPI listener ──────────────────────────────────────
@@ -275,6 +297,8 @@ DOCKERFILE
 
 [ "$DO_STACK" -eq 1 ] && step_stack
 [ "$DO_BROKER" -eq 1 ] && step_broker
+# After the broker, never before — aiac-init blocks on NATS (see step_wait_agent).
+[ "$DO_STACK" -eq 1 ] && step_wait_agent
 [ "$DO_SPI" -eq 1 ] && step_spi
 
 cat <<EOF

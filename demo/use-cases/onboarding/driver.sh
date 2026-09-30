@@ -50,10 +50,12 @@
 #                         so inbound probes through it are denied with the wrong azp.
 #   USER_PASSWORD         shared demo-user password (default: password) — see scenario.py
 #   POLL_SECS             max seconds a polling phase waits for trigger evidence / a bundle-service
-#                         poll (default: 420). Sized for the slowest convergence: the agent publishes
+#                         poll (default: 720). Sized for the slowest convergence: the agent publishes
 #                         its A2A AgentCard skills only AFTER the deploy trigger, so onboarding
 #                         redelivers (JetStream) for a few minutes until source_operations/
-#                         issue_operations resolve and AIAC writes the AuthorizationPolicy CR. Each
+#                         issue_operations resolve and AIAC writes the AuthorizationPolicy CR. Keep it
+#                         ABOVE the consumer's ACK_WAIT (600s) — a deploy-race 502 is only retried
+#                         after that, so a smaller value makes the failure unrecoverable in-run. Each
 #                         phase still breaks the instant its condition is met, so a healthy run is fast.
 #   DEPLOY_WAIT_SECS      max seconds to wait for pods to become Ready after deploy   (default: 180)
 #   TRIGGER_WAIT_SECS     max seconds --only-replay-trigger waits for the operator to re-register
@@ -80,7 +82,12 @@ KC="${KC:-http://keycloak.localtest.me:8080}"
 REALM="${REALM:-rossoctl}"
 ROPC_CLIENT_ID="${ROPC_CLIENT_ID:-rossoctl}"
 USER_PASSWORD="${USER_PASSWORD:-password}"
-POLL_SECS="${POLL_SECS:-420}"
+# MUST exceed the consumer's ACK_WAIT (600s, src/aiac/agent/eventbus/stream.py) or this driver cannot
+# survive a first-delivery failure: a deploy-race 502 leaves the message unacked, JetStream redelivers
+# it only after ACK_WAIT, and that redelivery usually succeeds. At the old 420s the driver quit ~5
+# minutes BEFORE the retry it was waiting for — observed 2026-09-30, where onboarding self-healed at
+# 14:38 having failed at 14:28, but the run had already died at 14:33. 720s leaves room for one.
+POLL_SECS="${POLL_SECS:-720}"
 DEPLOY_WAIT_SECS="${DEPLOY_WAIT_SECS:-180}"
 TRIGGER_WAIT_SECS="${TRIGGER_WAIT_SECS:-180}"
 KIND_CLUSTER="${KIND_CLUSTER:-rossoctl}"
@@ -406,6 +413,37 @@ print("yes" if os.environ["SCOPE"] in names else "")' 2>/dev/null || true)
     sleep 5
   done
   pass "github-agent AuthorizationPolicy CR written by AIAC: resourceVersion ${before_rv} -> ${AFTER_RV} (nobody hand-wrote this CR)"
+
+  # The CR EXISTING is not the same as the CR being COMPLETE. If the tool's onboarding failed (a
+  # deploy-race 502 in classify_service/analyze_tool) while the agent's succeeded, AIAC still writes a
+  # CR — but its outbound gate is all empty maps, and every outbound request then denies. That state
+  # passed this phase twice before this check existed, and only blew up later in ENFORCE, where the
+  # cause is much harder to see. So wait for the outbound gate to actually carry the tool's scopes:
+  # target_allow_scopes keyed by the tool's SPIFFE id is what "the tool was onboarded" looks like.
+  # The wait matters because a failed onboard is REDELIVERED by JetStream (ACK_WAIT) and succeeds on a
+  # later attempt — POLL_SECS is sized to outlast one such redelivery.
+  step "Confirming the outbound gate carries the tool's scopes (not just that the CR exists) [timeout ${POLL_SECS}s]"
+  local gate_deadline=$((SECONDS + POLL_SECS)) cr_content=""
+  while :; do
+    cr_content=$(kubectl get "$POLICY_CR" github-agent -n "$NS" -o jsonpath='{.spec.policies[*].content}' 2>/dev/null || true)
+    # `target_allow_scopes` appears ONLY in the outbound policy, so no section-splitting is needed.
+    # The generator renders it as `:= {}` on one line when the tool was never onboarded, and as `:= {`
+    # followed by newline-separated entries when it was — so the EMPTY LITERAL is the exact signal.
+    # Test for it first (`:= {` matches both forms), and require the key to be present at all, which
+    # guards against a CR that somehow carries no outbound policy.
+    if printf '%s' "$cr_content" | grep -q 'target_allow_scopes := {}'; then
+      : # key present but empty -> the tool has not been onboarded yet
+    elif printf '%s' "$cr_content" | grep -q 'target_allow_scopes := {'; then
+      break
+    fi
+    if [ "$SECONDS" -ge "$gate_deadline" ]; then
+      die "github-agent's outbound gate still has an EMPTY target_allow_scopes after ${POLL_SECS}s — the agent onboarded but the tool did not, so every outbound request would deny. Check for a deploy-race 502 in: kubectl logs deployment/aiac-agent -n ${AIAC_NS} | grep -iE 'label missing|MCP tools/list'"
+    fi
+    info "outbound gate still empty (tool not onboarded yet) — retrying..."
+    sleep 10
+  done
+  pass "outbound gate populated: target_allow_scopes carries the tool's scopes"
+
   info "content:"
   kubectl get "$POLICY_CR" github-agent -n "$NS" -o jsonpath='{.spec.policies[*].content}' | sed 's/^/    /'
 }
@@ -609,7 +647,21 @@ phase_enforce() {
   kubectl logs -n "$NS" "$pod" -c authbridge-proxy --tail=500 2>/dev/null \
     | grep 'path=authbridge/outbound/request' | grep 'allow:false' | tail -1 | sed 's/^/    /'
 
-  warn "known gap: 'direct dev-user -> github-tool, no agent' (row 4 of #646's table) is NOT enforced by this deployment — github-tool has no AuthBridge sidecar and no auth of its own (see demo.md's 'Known gaps' section). Not probed here to avoid reporting a fabricated result."
+  # Report what THIS cluster actually does rather than asserting the tool is unprotected: whether a
+  # sidecar fronts github-tool is the operator's choice (AgentRuntime + injection config), and with one
+  # injected the inbound leg does validate JWTs. Either way AIAC generates no tool-inbound policy — that
+  # is the real gap — so the row stays unprobed. See demo.md's 'Known gaps' section.
+  local tool_containers
+  tool_containers="$(kubectl get pod -n "$NS" -l "$TOOL_LABEL" \
+    -o jsonpath='{.items[0].spec.containers[*].name}' 2>/dev/null || true)"
+  case "$tool_containers" in
+    *authbridge-proxy*)
+      warn "known gap: 'direct dev-user -> github-tool, no agent' (row 4 of #646's table) is NOT enforced by the GENERATED policy — github-tool has an AuthBridge sidecar here (containers: ${tool_containers}), so its inbound leg validates JWTs, but AIAC writes an AuthorizationPolicy CR for github-agent only, so no policy derived from policy.md constrains it. Not probed here to avoid reporting a fabricated result." ;;
+    "")
+      warn "known gap: 'direct dev-user -> github-tool, no agent' (row 4 of #646's table) is NOT enforced, and the tool's containers could not be read to say how it is fronted. AIAC generates no tool-inbound policy either way. Not probed here to avoid reporting a fabricated result." ;;
+    *)
+      warn "known gap: 'direct dev-user -> github-tool, no agent' (row 4 of #646's table) is NOT enforced at all — github-tool has no AuthBridge sidecar in this deployment (containers: ${tool_containers}) and no auth of its own, so a direct in-cluster call succeeds unconditionally. Not probed here to avoid reporting a fabricated result." ;;
+  esac
 }
 
 # ── Phase REPLAY-TRIGGER (opt-in) ─────────────────────────────────────────────
