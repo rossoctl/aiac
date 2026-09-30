@@ -53,7 +53,7 @@ import pytest
 
 pytestmark = [
     pytest.mark.system,
-    pytest.mark.skip(reason="isolated/disabled — moved to test/system/disabled/"),
+    pytest.mark.skip(reason="disabled — needs the ALLOW default effect, which is removed (handoff 11 B3: always DENY)"),
 ]
 
 HERE = Path(__file__).resolve().parent  # test/system/disabled/
@@ -61,8 +61,8 @@ REPO_ROOT = HERE.parents[2]  # -> aiac/
 sys.path.insert(0, str(REPO_ROOT))  # so ``import test.system.*`` resolves
 
 from test.system import scenario_uc1 as scn  # noqa: E402
-from test.system import scenario_uc1_denyworld as scn_b  # noqa: E402
 from test.system import uc1_onboard as uc1  # noqa: E402
+from test.system.disabled import scenario_uc1_denyworld as scn_b  # noqa: E402
 
 # The expected verdicts come straight from the #148 Policy-B oracle (``scenario_uc1_denyworld``), keyed
 # on the **bare** runtime tool names AuthBridge sends (``source-read``). These thin adapters only turn

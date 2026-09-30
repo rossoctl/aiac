@@ -28,7 +28,6 @@ from aiac.agent.policy_rules_builder.graph import (
     PolicyRulesBuilderError,
     UnparseableLLMResponseError,
 )
-from aiac.policy.model.models import RuleEffect
 
 
 def _fake_msg(subject: str, num_delivered: int = 1) -> MagicMock:
@@ -50,26 +49,19 @@ def _fake_nc() -> MagicMock:
 
 
 def test_handle_routes_service_subject_to_onboard_service():
-    # onboard_service is the one handler that returns its own (rules, override, default_effect),
-    # so _handle forwards its 3-tuple verbatim (only onboarding carries a caller-set default_effect).
-    with patch(
-        "aiac.agent.eventbus.consumer.onboard_service",
-        return_value=([], False, RuleEffect.ALLOW),
-    ) as onboard:
+    with patch("aiac.agent.eventbus.consumer.onboard_service", return_value=([], False)) as onboard:
         result = _handle("aiac.apply.service.svc-1")
 
     onboard.assert_called_once_with("svc-1")
-    assert result == ([], False, RuleEffect.ALLOW)
+    assert result == ([], False)
 
 
 def test_handle_routes_role_subject_to_update_role():
-    # update_role returns (rules, override); _handle normalizes it to a 3-tuple with the
-    # least-privilege DENY default (role updates carry no caller-requestable default_effect).
     with patch("aiac.agent.eventbus.consumer.update_role", return_value=([], True)) as role:
         result = _handle("aiac.apply.role.role-1")
 
     role.assert_called_once_with("role-1")
-    assert result == ([], True, RuleEffect.DENY)
+    assert result == ([], True)
 
 
 def test_handle_decodes_percent_encoded_dotted_role_name():
@@ -79,17 +71,15 @@ def test_handle_decodes_percent_encoded_dotted_role_name():
         result = _handle("aiac.apply.role.team%2Eadmin")
 
     role.assert_called_once_with("team.admin")
-    assert result == ([], True, RuleEffect.DENY)
+    assert result == ([], True)
 
 
 def test_handle_routes_policy_build_subject():
-    # build_policy returns (rules, override); _handle normalizes it to a 3-tuple with the
-    # least-privilege DENY default (policy builds carry no caller-requestable default_effect).
     with patch("aiac.agent.eventbus.consumer.build_policy", return_value=([], False)) as build:
         result = _handle("aiac.apply.policy.build")
 
     build.assert_called_once_with()
-    assert result == ([], False, RuleEffect.DENY)
+    assert result == ([], False)
 
 
 def test_handle_raises_for_unknown_subject():
@@ -105,15 +95,15 @@ def test_dispatch_acks_on_success():
     with (
         patch(
             "aiac.agent.eventbus.consumer.onboard_service",
-            return_value=([], False, RuleEffect.DENY),
+            return_value=([], False),
         ),
         patch("aiac.agent.eventbus.consumer.compute_and_apply") as pce,
         patch("aiac.agent.eventbus.consumer.reenable_service") as reenable,
     ):
         asyncio.run(consumer._dispatch(msg))
 
-    # _dispatch forwards the normalized (rules, override, default_effect) triple to the PCE.
-    pce.assert_called_once_with([], False, RuleEffect.DENY)
+    # _dispatch forwards the handler's (rules, override) pair to the PCE.
+    pce.assert_called_once_with([], False)
     # UC1 service-onboarding subject: the client is re-enabled with the derived service_id, only
     # after the PCE apply succeeds.
     reenable.assert_called_once_with("svc-1")
@@ -132,7 +122,7 @@ def test_dispatch_does_not_reenable_when_pce_apply_raises():
     with (
         patch(
             "aiac.agent.eventbus.consumer.onboard_service",
-            return_value=([], False, RuleEffect.DENY),
+            return_value=([], False),
         ),
         patch("aiac.agent.eventbus.consumer.compute_and_apply", side_effect=RuntimeError("pce boom")),
         patch("aiac.agent.eventbus.consumer.reenable_service") as reenable,

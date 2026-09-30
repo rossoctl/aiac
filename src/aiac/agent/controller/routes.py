@@ -11,8 +11,6 @@ failures are raised as FastAPI ``HTTPException``s by the handlers; the status
 code is authoritative (the accompanying default JSON error body is incidental).
 """
 
-import os
-
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
@@ -36,7 +34,6 @@ from aiac.agent.uc.policy_update.build import build_policy
 from aiac.agent.uc.policy_update.rebuild import rebuild_policy
 from aiac.agent.uc.role_update.role import update_role
 from aiac.policy.computation import compute_and_apply, decommission
-from aiac.policy.model.models import RuleEffect
 
 app = FastAPI(lifespan=lifespan)
 
@@ -105,21 +102,6 @@ def _policy_builder_base_error(_request: Request, exc: PolicyRulesBuilderBaseErr
     return _sanitized(exc, 500, "The policy build failed unexpectedly.")
 
 
-# Live on-ramp for the per-onboarding default_effect. The PCE-threading side (#146) exposes
-# default_effect as an onboard_service parameter; the integration harness (#149) requests a
-# non-default value by patching AIAC_DEFAULT_EFFECT ("Allow"/"Deny") onto the Controller
-# deployment before onboarding. This is the single point where those two halves meet. Absent or
-# unrecognised env → DENY, today's least-privilege default, so existing deployments are unchanged.
-DEFAULT_EFFECT_ENV = "AIAC_DEFAULT_EFFECT"
-
-
-def _default_effect_from_env() -> RuleEffect:
-    try:
-        return RuleEffect(os.environ.get(DEFAULT_EFFECT_ENV, RuleEffect.DENY.value))
-    except ValueError:
-        return RuleEffect.DENY
-
-
 @app.get("/health")
 def health() -> dict[str, str]:
     # The Controller is stateless — it holds no local state and opens no
@@ -131,8 +113,8 @@ def health() -> dict[str, str]:
 
 @app.post("/apply/service/{service_id}")
 def apply_service(service_id: str) -> Response:
-    rules, override, default_effect = onboard_service(service_id, _default_effect_from_env())
-    compute_and_apply(rules, override, default_effect)
+    rules, override = onboard_service(service_id)
+    compute_and_apply(rules, override)
     # Re-enable the client only AFTER the PCE apply succeeds — a compute_and_apply failure above
     # propagates and leaves the client disabled (the failed-service marker), never enabled-with-no-policy.
     reenable_service(service_id)

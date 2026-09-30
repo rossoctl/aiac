@@ -28,7 +28,7 @@ from test.system import uc1_onboard as uc1  # noqa: E402
 
 pytestmark = [
     pytest.mark.system,
-    pytest.mark.skip(reason="isolated/disabled — moved to test/system/disabled/"),
+    pytest.mark.skip(reason="disabled — needs the ALLOW default effect, which is removed (handoff 11 B3: always DENY)"),
 ]
 
 # --- ReadySignal: the parametrized convergence probe --------------------------------------------

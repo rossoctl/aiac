@@ -33,7 +33,7 @@ from aiac.agent.uc.onboarding.policy_builder.builder import ServicePolicyBuilder
 from aiac.agent.uc.onboarding.provision.graph import build_provision_graph
 from aiac.agent.uc.onboarding.provision.state import OnboardingProvisionState, Trigger
 from aiac.idp.configuration.api import Configuration
-from aiac.policy.model.models import PolicyRule, RuleEffect
+from aiac.policy.model.models import PolicyRule
 
 logger = logging.getLogger(__name__)
 
@@ -170,22 +170,14 @@ def reenable_service(service_id: str) -> None:
     config.set_service_enabled(config.get_service(service_id), True)
 
 
-def onboard_service(
-    service_id: str, default_effect: RuleEffect = RuleEffect.DENY
-) -> tuple[list[PolicyRule], bool, RuleEffect]:
-    """Sequence Provision → Policy Builder and return ``(rules, override=False, default_effect)``.
+def onboard_service(service_id: str) -> tuple[list[PolicyRule], bool]:
+    """Sequence Provision → Policy Builder and return ``(rules, override=False)``.
 
     On any of the four typed build failures (see ``_ROLLBACK_ERRORS``) the Orchestrator runs the
     compensating :func:`_rollback` (UC1-only) and **re-raises** the original error unchanged. On
     success it does **not** re-enable the client here: the client is re-enabled by the caller via
     :func:`reenable_service`, but only AFTER the caller's ``compute_and_apply`` (PCE) call succeeds,
     so a PCE failure leaves the client disabled rather than enabled-with-no-policy.
-
-    ``default_effect`` is passed straight back to the Controller so it reaches the single
-    ``compute_and_apply`` call and lands on every derived ``AgentPolicyModel``. It defaults to
-    ``DENY`` (least-privilege); a caller onboarding a service that should default to ``ALLOW``
-    supplies it here. This is the caller-facing surface for requesting a permissive default
-    end-to-end (onboard → PCE → derived APM → OPA).
 
     The full provision → build → rollback lifecycle is serialized per ``service_id`` (see
     :func:`_service_lock`): a concurrent same-service run cannot corrupt the created-manifest
@@ -206,4 +198,4 @@ def onboard_service(
             _rollback(config, service_id, created_roles, created_scopes)
             raise
 
-        return rules, False, default_effect
+        return rules, False

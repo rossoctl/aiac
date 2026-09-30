@@ -91,7 +91,7 @@ NAMESPACE = os.environ.get("AIAC_DEMO_NAMESPACE", scn.DEMO_NAMESPACE_DEFAULT)
 ADMIN_REALM = os.environ.get("KEYCLOAK_ADMIN_REALM", "master")
 
 # Controller (in-cluster) namespace — the ns whose Controller Deployment the test patches (policy.md
-# mount, default_effect). The onboarding trigger is event-driven (deploy fires it), so the harness no
+# mount). The onboarding trigger is event-driven (deploy fires it), so the harness no
 # longer port-forwards to the Controller to POST /apply.
 CONTROLLER_NAMESPACE = os.environ.get("AIAC_CONTROLLER_NAMESPACE", "aiac-system")
 
@@ -146,21 +146,6 @@ WORKLOAD_MANIFESTS: dict[str, list[Path]] = {
         REPO_ROOT / "demo/assets/tools/github_tool/k8s/github-tool-deployment.yaml",
     ],
 }
-
-# --- default_effect onboarding hook (#146 coupling seam; see ``_set_controller_default_effect``) ----
-#
-# The derived ``AgentPolicyModel.default_effect`` decides whether the generated Rego is deny-by-default
-# (the shipped ``Deny``) or allow-by-default (``Allow``). It lives on the *derived* APM built in-cluster
-# by the PCE (``engine._fresh_apm``) and defaults to ``Deny``, so a policy-agnostic onboarding run that
-# needs allow-by-default must set it **before** onboarding and reset it on teardown. These are plain
-# strings (matching ``RuleEffect``'s wire values ``"Allow"`` / ``"Deny"``) so the harness keeps its "no
-# ``aiac`` import" property — importable before the env-before-import dance, like ``scenario_uc1``.
-DEFAULT_EFFECT_ALLOW = "Allow"
-DEFAULT_EFFECT_DENY = "Deny"  # the shipped default; the harness never patches this onto the stack
-# The Controller/PCE env the #146 hook reads where it mints the APM. Overridable so this test tracks
-# whatever name #146 ships without a code edit (verify the shape against #146 — handoff §3).
-DEFAULT_EFFECT_ENV = os.environ.get("AIAC_DEFAULT_EFFECT_ENV", "AIAC_DEFAULT_EFFECT")
-
 
 # ======================================================================================
 # Expected-verdict oracle (pure functions over the scenario_uc1 truth table)
@@ -426,44 +411,6 @@ def ensure_agent_policy(namespace: str, policy_md: str = scn.POLICY_ABSTRACT) ->
         "-p",
         json.dumps(patch),
     )
-    kubectl_rollout_status(f"deployment/{CONTROLLER_DEPLOYMENT}", namespace=namespace)
-
-
-def _set_controller_default_effect(namespace: str, effect: str) -> None:
-    """Apply the ``default_effect`` onboarding hook: set the Controller/PCE env the engine reads when
-    it mints the ``AgentPolicyModel`` (``engine._fresh_apm``), then roll the Controller so the new
-    value is live **before** the next ``onboard`` derives a policy under it. Mirrors
-    ``ensure_agent_policy``'s patch-and-rollout precondition-fixup — a test-owned mutation of the
-    running Controller, never written into a committed manifest.
-
-    This is the single hard coupling to Task 1 (#146), which owns the reader side. The env **name**
-    (``DEFAULT_EFFECT_ENV``, default ``AIAC_DEFAULT_EFFECT``) and the string values (``"Allow"`` /
-    ``"Deny"``) are #146's contract — verify/realign them once #146 lands (handoff §3). The strategic
-    merge patch is keyed on the env-var ``name``, so it upserts just this one var and leaves the
-    Controller's other env untouched."""
-    patch = {
-        "spec": {
-            "template": {
-                "spec": {
-                    "containers": [
-                        {"name": CONTROLLER_DEPLOYMENT, "env": [{"name": DEFAULT_EFFECT_ENV, "value": effect}]}
-                    ]
-                }
-            }
-        }
-    }
-    kubectl(
-        "patch",
-        "deployment",
-        CONTROLLER_DEPLOYMENT,
-        "-n",
-        namespace,
-        "--type",
-        "strategic",
-        "-p",
-        json.dumps(patch),
-    )
-    kubectl("rollout", "restart", f"deployment/{CONTROLLER_DEPLOYMENT}", "-n", namespace)
     kubectl_rollout_status(f"deployment/{CONTROLLER_DEPLOYMENT}", namespace=namespace)
 
 
@@ -911,7 +858,6 @@ def onboarded_stack(
     workloads: list[str],
     *,
     policy_md: str = scn.POLICY_ABSTRACT,
-    default_effect: str = DEFAULT_EFFECT_DENY,
     ready_signals: Sequence[ReadySignal] | None = None,
 ) -> Iterator[dict]:
     """Run one rung's whole live flow and yield a probe ``ctx`` for its assertions.
@@ -941,11 +887,6 @@ def onboarded_stack(
     * ``policy_md`` — the ``policy.md`` prose to mount before onboarding (default: Policy A's
       ``POLICY_ABSTRACT``). Forwarded to ``ensure_agent_policy``; a prose change reloads the Controller
       via the existing content-diff rollout.
-    * ``default_effect`` — the derived ``AgentPolicyModel.default_effect`` this run onboards under
-      (default: ``DEFAULT_EFFECT_DENY``, the shipped deny-by-default). A non-default value is applied to
-      the Controller **before** onboarding via ``_set_controller_default_effect`` and **reset to
-      ``Deny`` on teardown** so a subsequent Policy-A run on the shared stack is unaffected. ``Deny`` is
-      a no-op (the stack is never patched), keeping Policy-A runs from touching the Controller env.
     * ``ready_signals`` — the convergence probe set to poll before yielding (default: the Policy-A
       ``_default_ready_signals``). A policy whose truth differs from Policy A (e.g. denyworld, where
       ``devops-user`` inbound is *allow*, not *deny*) supplies its own deterministic signals so the run
@@ -992,13 +933,7 @@ def onboarded_stack(
 
     tool_onboarded = scn.TOOL_WORKLOAD in workloads
     signals = list(ready_signals) if ready_signals is not None else _default_ready_signals(tool_onboarded)
-    # A non-default effect is patched onto the Controller here and reset in ``finally``; ``Deny`` (the
-    # shipped default) never touches the stack, so Policy-A runs are unchanged. Tracked so teardown
-    # only resets what this run actually applied.
-    default_effect_applied = default_effect != DEFAULT_EFFECT_DENY
     try:
-        if default_effect_applied:
-            _set_controller_default_effect(CONTROLLER_NAMESPACE, default_effect)  # BEFORE deploying
         ensure_agent_policy(CONTROLLER_NAMESPACE, policy_md=policy_md)  # mount this run's policy.md BEFORE deploying
 
         # Minimal probe ctx for the per-workload agent convergence gate: the inbound leg reaches the
@@ -1131,9 +1066,6 @@ def onboarded_stack(
         yield ctx
     finally:
         # Teardown — full-to-pristine, best-effort per step (each helper tolerates already-absent objects).
-        if default_effect_applied:
-            # Reset the shared stack to the shipped default so a later Policy-A run is unaffected.
-            _set_controller_default_effect(CONTROLLER_NAMESPACE, DEFAULT_EFFECT_DENY)
         for workload in reversed(workloads):  # undeploy in reverse deploy order
             undeploy_workload(workload)
         # Explicit scrub — do not trust an unverified operator cascade. Same reset the pre-run slate runs.

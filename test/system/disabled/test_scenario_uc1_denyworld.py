@@ -26,11 +26,11 @@ REPO_ROOT = Path(__file__).resolve().parents[3]  # -> aiac/
 sys.path.insert(0, str(REPO_ROOT))
 
 from test.system import scenario_uc1 as scn  # noqa: E402
-from test.system import scenario_uc1_denyworld as scn_b  # noqa: E402
+from test.system.disabled import scenario_uc1_denyworld as scn_b  # noqa: E402
 
 pytestmark = [
     pytest.mark.system,
-    pytest.mark.skip(reason="isolated/disabled — moved to test/system/disabled/"),
+    pytest.mark.skip(reason="disabled — needs the ALLOW default effect, which is removed (handoff 11 B3: always DENY)"),
 ]
 
 # ======================================================================================

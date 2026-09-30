@@ -195,10 +195,10 @@ def engine_env(catalog, store):
         yield compute_and_apply
 
 
-def run_engine(rules, *, catalog=None, store_initial=None, override=False, default_effect=RuleEffect.DENY) -> FakeStore:
+def run_engine(rules, *, catalog=None, store_initial=None, override=False) -> FakeStore:
     store = FakeStore(store_initial)
     with engine_env(catalog or [], store) as compute_and_apply:
-        compute_and_apply(rules, override=override, default_effect=default_effect)
+        compute_and_apply(rules, override=override)
     return store
 
 
@@ -1042,42 +1042,20 @@ def test_derive_agent_deny_target_scope_and_outbound_subject_deny_gate():
 
 
 # --------------------------------------------------------------------------- #
-# default_effect threading — PCE stamps default_effect onto every derived APM. #
-# The value is produced at derive time (the APM is a pure projection), defaults #
-# to least-privilege DENY, and an explicitly requested ALLOW propagates.        #
+# always DENY — the PCE carries no default effect.                            #
 # --------------------------------------------------------------------------- #
-def test_default_effect_defaults_to_deny_on_derived_apm():
-    # When no default_effect is passed, every emitted APM carries the least-privilege DENY default,
-    # reproducing today's `default allow := false` Rego (byte-for-byte-compatible default).
+def test_compute_and_apply_takes_no_default_effect():
+    import inspect
+
+    from aiac.policy.computation import engine
+
+    for fn in (engine.compute_and_apply, engine._run, engine._derive, engine._fresh_apm):
+        assert "default_effect" not in inspect.signature(fn).parameters, fn.__name__
+
+
+def test_derived_apm_carries_no_default_effect():
     AR, UR, AS, TS, catalog = _repro()
     store = run_engine([_rule(UR, AS)], catalog=catalog)
 
     apm = store.pushed_agent("github-agent")
-    assert apm.default_effect == RuleEffect.DENY
-
-
-def test_default_effect_allow_propagates_to_derived_apm():
-    # A caller-requested ALLOW threads compute_and_apply -> _run -> _derive and lands on the APM.
-    AR, UR, AS, TS, catalog = _repro()
-    store = run_engine([_rule(UR, AS)], catalog=catalog, default_effect=RuleEffect.ALLOW)
-
-    apm = store.pushed_agent("github-agent")
-    assert apm.default_effect == RuleEffect.ALLOW
-
-
-def test_default_effect_stamped_on_every_emitted_apm():
-    # The default_effect rides onto EVERY APM a single recompute emits, not just the first.
-    A1 = _agent_role("r-a1", "a1-src", owner="agent-1")
-    A2 = _agent_role("r-a2", "a2-src", owner="agent-2")
-    U = _user_role("r-user", "dev", users=["dev-user"])
-    S1 = _scope("s-a1-in", "a1-inbound", service_id="agent-1")
-    S2 = _scope("s-a2-in", "a2-inbound", service_id="agent-2")
-    catalog = [
-        _agent("agent-1", roles=[A1], scopes=[S1]),
-        _agent("agent-2", roles=[A2], scopes=[S2]),
-    ]
-    store = run_engine([_rule(U, S1), _rule(U, S2)], catalog=catalog, default_effect=RuleEffect.ALLOW)
-
-    assert store.pushed_agent_ids == {"agent-1", "agent-2"}
-    for agent_id in ("agent-1", "agent-2"):
-        assert store.pushed_agent(agent_id).default_effect == RuleEffect.ALLOW
+    assert "default_effect" not in apm.model_dump()

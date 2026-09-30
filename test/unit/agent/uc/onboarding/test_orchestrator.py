@@ -5,7 +5,7 @@ Service Provision (a compiled StateGraph) -> Service Policy Builder. Both are mo
 here via the module-level `build_provision_graph` / `ServicePolicyBuilder` seams, and the
 idp-library `Configuration` is mocked via the `_config` seam -- no live graph, IdP,
 Kubernetes, or LLM. The Orchestrator applies nothing (no PCE call); it returns
-`(list[PolicyRule], override=False, default_effect)` to the Controller, which makes the
+`(list[PolicyRule], override=False)` to the Controller, which makes the
 single `compute_and_apply` call afterwards.
 
 Issue 171 adds a compensating rollback (UC1-only): on any of the four typed build
@@ -29,7 +29,6 @@ from aiac.agent.policy_rules_builder.graph import (
 )
 from aiac.agent.uc.onboarding import orchestrator
 from aiac.idp.configuration.models import Role, Scope, ServiceType
-from aiac.policy.model.models import RuleEffect
 
 SERVICE_ID = "svc-1"
 
@@ -84,27 +83,14 @@ class TestBothStagesSucceed:
 
         # service_type produced by Provision is fed into the Service Policy Builder
         spb.build.assert_called_once_with(SERVICE_ID, ServiceType.AGENT)
-        # Orchestrator returns the builder's rules paired with the append flag and the
-        # default_effect (least-privilege DENY when the caller does not request otherwise).
-        assert result == (rules, False, RuleEffect.DENY)
+        # Orchestrator returns the builder's rules paired with the append flag. There is no
+        # default effect to forward: the deployed Rego always denies an unmentioned pair.
+        assert result == (rules, False)
 
+    def test_onboard_service_takes_no_default_effect(self):
+        import inspect
 
-class TestDefaultEffectForwarding:
-    def test_caller_requested_default_effect_is_returned_for_forwarding(self):
-        # A caller onboarding a service that should default to ALLOW passes default_effect through;
-        # the orchestrator returns it verbatim so the Controller forwards it to compute_and_apply.
-        graph = _graph(service_type=ServiceType.AGENT)
-
-        with (
-            patch.object(orchestrator, "build_provision_graph", return_value=graph),
-            patch.object(orchestrator, "ServicePolicyBuilder") as spb,
-            patch.object(orchestrator, "_config", return_value=_config_returning(object())),
-        ):
-            spb.build.return_value = [object()]
-            rules, override, default_effect = orchestrator.onboard_service(SERVICE_ID, default_effect=RuleEffect.ALLOW)
-
-        assert override is False
-        assert default_effect is RuleEffect.ALLOW
+        assert "default_effect" not in inspect.signature(orchestrator.onboard_service).parameters
 
     def test_provision_graph_invoked_with_service_id_in_trigger(self):
         # The service_id must reach Provision as the trigger's entity_id (Keycloak

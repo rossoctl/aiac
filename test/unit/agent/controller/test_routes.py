@@ -4,12 +4,12 @@ The orchestrator/sub-agent handlers and the Policy Computation Engine are
 mocked at the routes module boundary — no live services, no real graphs.
 """
 
-import os
 from unittest.mock import patch
 
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
+from aiac.agent.controller import routes
 from aiac.agent.controller.routes import app
 from aiac.agent.policy_rules_builder.conflict_detection import (
     PolicyConflictError,
@@ -53,36 +53,24 @@ def test_health_returns_ok_without_touching_handlers_or_pce():
 
 
 def test_apply_service_dispatches_to_orchestrator_and_calls_pce_once():
-    # No AIAC_DEFAULT_EFFECT env → the on-ramp resolves DENY (today's least-privilege default),
-    # which the route passes to onboard_service and forwards to the PCE.
     with (
-        patch(
-            "aiac.agent.controller.routes.onboard_service",
-            return_value=([], False, RuleEffect.DENY),
-        ) as orch,
+        patch("aiac.agent.controller.routes.onboard_service", return_value=([], False)) as orch,
         patch("aiac.agent.controller.routes.compute_and_apply") as pce,
         patch("aiac.agent.controller.routes.reenable_service") as reenable,
-        patch.dict("os.environ", {}, clear=False) as _env,
     ):
-        os.environ.pop("AIAC_DEFAULT_EFFECT", None)
         resp = client.post("/apply/service/svc-123")
 
     assert resp.status_code == 200
-    orch.assert_called_once_with("svc-123", RuleEffect.DENY)
-    # The onboard route forwards the orchestrator's default_effect to the PCE (least-privilege here).
-    pce.assert_called_once_with([], False, RuleEffect.DENY)
+    orch.assert_called_once_with("svc-123")
+    pce.assert_called_once_with([], False)
     # The client is re-enabled only after the PCE apply succeeds.
     reenable.assert_called_once_with("svc-123")
 
 
-def test_apply_service_default_effect_env_allow_reaches_orchestrator_and_pce():
-    # The #149 harness patches AIAC_DEFAULT_EFFECT=Allow onto the Controller before onboarding;
-    # the on-ramp translates it to RuleEffect.ALLOW and threads it to onboard_service + the PCE.
+def test_apply_service_ignores_a_default_effect_env():
+    # The default effect is always DENY: a stale AIAC_DEFAULT_EFFECT on the Controller has no effect.
     with (
-        patch(
-            "aiac.agent.controller.routes.onboard_service",
-            return_value=([], False, RuleEffect.ALLOW),
-        ) as orch,
+        patch("aiac.agent.controller.routes.onboard_service", return_value=([], False)) as orch,
         patch("aiac.agent.controller.routes.compute_and_apply") as pce,
         patch("aiac.agent.controller.routes.reenable_service"),
         patch.dict("os.environ", {"AIAC_DEFAULT_EFFECT": "Allow"}, clear=False),
@@ -90,26 +78,10 @@ def test_apply_service_default_effect_env_allow_reaches_orchestrator_and_pce():
         resp = client.post("/apply/service/svc-123")
 
     assert resp.status_code == 200
-    orch.assert_called_once_with("svc-123", RuleEffect.ALLOW)
-    pce.assert_called_once_with([], False, RuleEffect.ALLOW)
-
-
-def test_apply_service_default_effect_env_unrecognised_falls_back_to_deny():
-    # A garbage/empty env value must not crash onboarding — it degrades to the safe DENY default.
-    with (
-        patch(
-            "aiac.agent.controller.routes.onboard_service",
-            return_value=([], False, RuleEffect.DENY),
-        ) as orch,
-        patch("aiac.agent.controller.routes.compute_and_apply") as pce,
-        patch("aiac.agent.controller.routes.reenable_service"),
-        patch.dict("os.environ", {"AIAC_DEFAULT_EFFECT": "banana"}, clear=False),
-    ):
-        resp = client.post("/apply/service/svc-123")
-
-    assert resp.status_code == 200
-    orch.assert_called_once_with("svc-123", RuleEffect.DENY)
-    pce.assert_called_once_with([], False, RuleEffect.DENY)
+    orch.assert_called_once_with("svc-123")
+    pce.assert_called_once_with([], False)
+    assert not hasattr(routes, "DEFAULT_EFFECT_ENV")
+    assert not hasattr(routes, "_default_effect_from_env")
 
 
 def test_apply_policy_build_dispatches_to_build_subagent():
@@ -182,7 +154,7 @@ def test_controller_forwards_handler_rules_and_override_verbatim():
     with (
         patch(
             "aiac.agent.controller.routes.onboard_service",
-            return_value=(rules, False, RuleEffect.DENY),
+            return_value=(rules, False),
         ),
         patch("aiac.agent.controller.routes.compute_and_apply") as pce,
         patch("aiac.agent.controller.routes.reenable_service"),
@@ -191,11 +163,10 @@ def test_controller_forwards_handler_rules_and_override_verbatim():
 
     assert resp.status_code == 200
     # Exactly one PCE call, with the handler's own rules object and flag — not a rebuilt/empty one.
-    pce.assert_called_once_with(rules, False, RuleEffect.DENY)
-    forwarded_rules, forwarded_override, forwarded_default_effect = pce.call_args.args
+    pce.assert_called_once_with(rules, False)
+    forwarded_rules, forwarded_override = pce.call_args.args
     assert forwarded_rules is rules
     assert forwarded_override is False
-    assert forwarded_default_effect is RuleEffect.DENY
 
 
 def test_handler_upstream_error_surfaces_status_and_skips_pce():
@@ -219,7 +190,7 @@ def test_apply_service_does_not_reenable_when_pce_apply_raises():
     with (
         patch(
             "aiac.agent.controller.routes.onboard_service",
-            return_value=([], False, RuleEffect.DENY),
+            return_value=([], False),
         ),
         patch(
             "aiac.agent.controller.routes.compute_and_apply",

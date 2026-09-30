@@ -217,14 +217,11 @@ def _spm_cache(catalog: dict[str, Service]):
     return spms, spm, is_agent
 
 
-def _fresh_apm(agent_id: str, default_effect: RuleEffect = RuleEffect.DENY) -> AgentPolicyModel:
+def _fresh_apm(agent_id: str) -> AgentPolicyModel:
     # Identity/aggregate maps are the only required fields; the split target maps and the eight
-    # entity x effect rule lists default to empty and are filled by ``_derive``. ``default_effect``
-    # rides through onto the derived projection (see ``_derive``); it defaults to ``DENY`` so every
-    # existing caller keeps today's least-privilege behavior.
+    # entity x effect rule lists default to empty and are filled by ``_derive``.
     return AgentPolicyModel(
         agent_id=agent_id,
-        default_effect=default_effect,
         agent_roles=[],
         agent_scopes=[],
         source_roles={},
@@ -235,7 +232,6 @@ def _fresh_apm(agent_id: str, default_effect: RuleEffect = RuleEffect.DENY) -> A
 def compute_and_apply(
     rules: list[PolicyRule],
     override: bool = False,
-    default_effect: RuleEffect = RuleEffect.DENY,
 ) -> None:
     """Route, persist, derive, and apply ``rules`` — fire-and-forget.
 
@@ -246,25 +242,15 @@ def compute_and_apply(
     input-role set is purged from **both** inbound lists of **every** SPM containing it, once,
     up-front, before the fresh rules are appended (role-level revocation).
 
-    ``default_effect`` is stamped onto **every** ``AgentPolicyModel`` this run derives — it decides
-    how the deployed Rego treats a ``(role, scope)`` pair that no rule mentions. It defaults to
-    ``DENY`` (today's least-privilege behavior), so all existing call sites — the four Controller
-    ``/apply/*`` routes and the eventbus consumer — keep compiling unchanged; a caller opts into
-    ``ALLOW`` explicitly (e.g. the onboarding path forwarding a caller-requested value).
-
-    NON-DURABILITY CAVEAT: ``AgentPolicyModel`` is a pure derived projection, rebuilt from the
-    persisted SPMs on every relevant recompute — ``default_effect`` is **not** persisted here. A
-    later, *unrelated* recompute that re-derives the same agent (another onboarding, a role update)
-    rebuilds its APM with ``DENY`` unless that call also passes ``ALLOW``. Making the value survive
-    independent re-derivation would require persisting it on ``ServicePolicyModel`` — a separate,
-    out-of-scope decision.
+    There is no default effect to pass: the deployed Rego always denies a ``(role, scope)`` pair
+    that no rule mentions, so every re-derivation of an agent gives the same behavior.
 
     Exceptions from any dependency (IdP, Policy Store, PDP) are logged and **re-raised** so the
     caller (the Controller) surfaces the failure — e.g. as a 500 — instead of returning success
     while silently applying nothing.
     """
     try:
-        _run(rules, override, default_effect)
+        _run(rules, override)
     except Exception:
         logger.exception("compute_and_apply failed for %d rule(s)", len(rules))
         raise
@@ -296,7 +282,7 @@ def decommission(service_id: str) -> None:
         raise
 
 
-def _run(rules: list[PolicyRule], override: bool, default_effect: RuleEffect = RuleEffect.DENY) -> None:
+def _run(rules: list[PolicyRule], override: bool) -> None:
     config = Configuration.for_default_realm()
 
     # (1) Catalog once — the only runtime IdP read. Carries each service's type (agent vs tool,
@@ -370,7 +356,7 @@ def _run(rules: list[PolicyRule], override: bool, default_effect: RuleEffect = R
 
     # (6) Derive each affected agent's APM (zero IdP) and partial-upsert once. Tools get an SPM
     # but no APM (P4).
-    derived = [_derive(agent_id, spm, default_effect) for agent_id in sorted(affected) if is_agent(agent_id)]
+    derived = [_derive(agent_id, spm) for agent_id in sorted(affected) if is_agent(agent_id)]
     if derived:
         apply_policy(PolicyModel(agents=derived))
 
@@ -427,9 +413,6 @@ def _decommission(service_id: str) -> None:
     # (8) Re-derive every affected agent (X excluded) from the freshly-persisted, X-deleted store —
     # outbound/target_scopes/source_roles referencing X drop automatically. One partial upsert.
     affected.discard(service_id)
-    # Re-derive with the ``DENY`` default: decommission carries no caller-supplied ``default_effect``,
-    # and per the non-durability caveat (``compute_and_apply``) an unrelated recompute like this one
-    # rebuilds each APM at least-privilege unless ``default_effect`` is persisted on the SPM.
     derived = [_derive(agent_id, spm) for agent_id in sorted(affected) if is_agent(agent_id)]
     if derived:
         apply_policy(PolicyModel(agents=derived))
@@ -445,19 +428,16 @@ def _register_identity(apm: AgentPolicyModel, edge: PolicyRule) -> None:
         _add_by_id(target.setdefault(actor, []), edge.role)
 
 
-def _derive(agent_id, spm, default_effect: RuleEffect = RuleEffect.DENY) -> AgentPolicyModel:
+def _derive(agent_id, spm) -> AgentPolicyModel:
     """Build ``APM(agent_id)`` entirely from the persisted SPMs (zero IdP).
 
     Each inbound edge on ``SPM(A)`` is classified by ``role.kind`` (User → subject, Agent → source)
     **and** ``effect`` (allow/deny) into one of four inbound buckets; each outbound edge (one of A's
     own roles referenced on another SPM) is classified by ``effect`` into the target allow/deny
     bucket and grows ``target_allow_scopes`` / ``target_deny_scopes``. Identity/aggregate maps stay
-    effect-agnostic — a deny-only role or subject still registers into them.
-
-    ``default_effect`` is stamped onto the emitted APM (via ``_fresh_apm``); it is derived data, not
-    read back from any store (see the non-durability caveat on ``compute_and_apply``)."""
+    effect-agnostic — a deny-only role or subject still registers into them."""
     sa = spm(agent_id)
-    apm = _fresh_apm(agent_id, default_effect)
+    apm = _fresh_apm(agent_id)
 
     # Identity (P2) — the agent's own aiac.managed roles/scopes, seeded from the catalog.
     apm.agent_roles = list(sa.owned_roles)

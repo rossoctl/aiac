@@ -41,7 +41,7 @@ from aiac.agent.uc.onboarding.orchestrator import onboard_service, reenable_serv
 from aiac.agent.uc.policy_update.build import build_policy
 from aiac.agent.uc.role_update.role import update_role
 from aiac.policy.computation import compute_and_apply
-from aiac.policy.model.models import PolicyRule, RuleEffect
+from aiac.policy.model.models import PolicyRule
 
 logger = logging.getLogger(__name__)
 
@@ -69,9 +69,7 @@ _PERMANENT_ERRORS: tuple[type[Exception], ...] = (
 )
 
 
-def _handle(subject: str) -> tuple[list[PolicyRule], bool, RuleEffect]:
-    # Normalize every handler to ``(rules, override, default_effect)``. Only onboarding carries a
-    # caller-requestable ``default_effect``; the others always emit least-privilege ``DENY``.
+def _handle(subject: str) -> tuple[list[PolicyRule], bool]:
     if subject.startswith(_SERVICE_PREFIX):
         return onboard_service(subject[len(_SERVICE_PREFIX) :])
     if subject.startswith(_ROLE_PREFIX):
@@ -79,11 +77,9 @@ def _handle(subject: str) -> tuple[list[PolicyRule], bool, RuleEffect]:
         # contain '.', which NATS treats as a token separator, so the SPI percent-encodes them
         # into a single token before publishing. unquote() is the general-purpose inverse; safe
         # here because every literal '%' in the original name was itself escaped to "%25".
-        rules, override = update_role(unquote(subject[len(_ROLE_PREFIX) :]))
-        return rules, override, RuleEffect.DENY
+        return update_role(unquote(subject[len(_ROLE_PREFIX) :]))
     if subject == _POLICY_BUILD_SUBJECT:
-        rules, override = build_policy()
-        return rules, override, RuleEffect.DENY
+        return build_policy()
     raise ValueError(f"no handler for subject {subject!r}")
 
 
@@ -149,8 +145,8 @@ class AiacEventConsumer:
             # redelivered the unacked message and the race repeated). Offload both to the default
             # threadpool so the loop stays free to answer ``/health`` while onboarding runs.
             loop = asyncio.get_running_loop()
-            rules, override, default_effect = await loop.run_in_executor(None, _handle, msg.subject)
-            await loop.run_in_executor(None, functools.partial(compute_and_apply, rules, override, default_effect))
+            rules, override = await loop.run_in_executor(None, _handle, msg.subject)
+            await loop.run_in_executor(None, functools.partial(compute_and_apply, rules, override))
             # UC1 only: re-enable the client AFTER a successful compute_and_apply, mirroring the
             # HTTP route. If compute_and_apply raised above, this is skipped and the client stays
             # disabled (the failed-service marker), never enabled-with-no-policy.

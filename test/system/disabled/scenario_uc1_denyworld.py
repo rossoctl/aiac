@@ -1,4 +1,8 @@
-"""Policy-B ("denyworld") oracle — the pure-data truth for the ``default_effect=ALLOW`` full-deployment
+"""Policy-B ("denyworld") oracle — DISABLED: it needs the ALLOW default effect, which handoff 11 (B3)
+removed (the deployed Rego is always deny-by-default). Kept under ``test/system/disabled/`` with the
+tests that use it; nothing in the active suites imports it.
+
+The pure-data truth for the ``default_effect=ALLOW`` full-deployment
 integration test (``test_policy_pipeline_denyworld.py``). Source of truth:
 ``aiac/docs/handoffs/02-policy-b-deny-full-deployment.md`` §5, §6, §7.1.
 
