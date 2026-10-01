@@ -342,6 +342,8 @@ allow if { input.mcp.method == "tools/call"; subject_allow_ok; target_allow_ok; 
 allow if { input.mcp.method in session_methods; some tool in target_allow_scopes[input.identity.service_id]; tool_ok(tool) }
 ```
 
+**Known limit — A2A and LLM calls through the outbound proxy are denied.** The outbound package allows only a granted `tools/call` and the MCP session messages. Every other request falls to `default allow := false`. An A2A call (`input.a2a`, for example `message/send`) and an LLM call (an OpenAI-shaped chat request) carry no MCP method, so the agent's outbound OPA denies them with HTTP `403` (`policy.forbidden`, `plugin: opa`). This applies to every call that crosses the agent's outbound proxy. The demo `github-agent` sends its LLM traffic through it (`HTTP_PROXY=http://127.0.0.1:8081`, plain-HTTP `LLM_API_BASE`). Checked on the Kind cluster (handoff 11, 2026-10-01): an A2A `message/send` and an LLM `/v1/chat/completions` request from the agent container both got `403` from OPA. This handoff does not change the behavior. Until the outbound package has rules for A2A and inference traffic, wire the outbound OPA only where the agent's LLM endpoint does not cross the proxy (for example HTTPS passthrough, or `NO_PROXY`).
+
 A worked example (agent `github-agent`, users `developer`/`tester`, tool `github-tool`) is maintained alongside the tests. The `docs/examples/opa-team1-policy.yaml` mirror shows the split ALLOW/DENY gates; it predates the removal of the default effect and the session rule, so this spec and `rego.py` are authoritative.
 
 ### `AuthorizationPolicy` Custom Resource (Q6)
