@@ -204,10 +204,11 @@ class Configuration:
 
     def set_service_type(self, service: Service, service_type: ServiceType) -> Service: ...
 
-    # Teardown + disable — consumed by the UC1 compensating rollback. The two deletes obey
-    # unmap-then-delete order and shared-object safety (see the note below); unset/enable reuse
-    # the set_service_type read-merge pattern. All four use the same _request / run_upstream
-    # transport (retry + backoff) as the methods above.
+    # Teardown + disable — the two deletes and the enable/disable are consumed by the UC1
+    # compensating rollback. The two deletes obey unmap-then-delete order and shared-object safety
+    # (see the note below); unset/enable reuse the set_service_type read-merge pattern.
+    # unset_service_type has no caller (the rollback keeps the type). All four use the same
+    # _request / run_upstream transport (retry + backoff) as the methods above.
     def delete_service_role(self, service: Service, role: Role) -> None: ...
     def delete_service_scope(self, service: Service, scope: Scope) -> None: ...
     def unset_service_type(self, service: Service) -> Service: ...
@@ -365,7 +366,7 @@ class Configuration:
 4. Subject to shared-object safety (below): a scope that another service still references is **not** deleted — it is at most unmapped from this service.
 5. Raises `RuntimeError` on non-2xx HTTP status. Returns `None`.
 
-`unset_service_type(service: Service) -> Service`: clears the service type.
+`unset_service_type(service: Service) -> Service`: clears the service type. This primitive has no caller: the UC1 rollback keeps the type.
 1. Issues the clear-type request against `{AIAC_PDP_CONFIG_URL}/services/{service.id}/type` (an empty/clear type), appending `?realm=<self.realm>`.
 2. The service clears the **`client.type`** attribute with the same read-merge-`update_client` pattern `set_service_type` uses.
 3. Idempotent: clearing an already-clear type is not an error.
@@ -384,9 +385,11 @@ class Configuration:
 > that no other service still references. As defense in depth, the delete path (enforced in the IdP
 > Configuration Service — see `idp-configuration-service.md`) refuses to delete a role or scope that is
 > still mapped to another client: such an object is at most unmapped from the caller, never deleted.
-> The **consumer** of these four operations is the UC1 compensating rollback (see the AIAC Agent UC1
-> spec, `aiac-agent/uc1-service-onboarding.md`), which deletes what Provision created, unsets the
-> type, and disables the client as a failed-service marker.
+> The **consumer** of `delete_service_role`, `delete_service_scope` and `set_service_enabled` is the
+> UC1 compensating rollback (see the AIAC Agent UC1 spec, `aiac-agent/uc1-service-onboarding.md`),
+> which deletes what Provision created and then disables the client as a failed-service marker. The
+> rollback **keeps** the client type, because this run did not create it. `unset_service_type`
+> stays in the library, with no caller.
 
 ### Configuration
 

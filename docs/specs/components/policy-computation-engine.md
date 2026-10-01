@@ -23,7 +23,7 @@ A **two-layer** model (see the policy-model component spec, handoff 01):
 
 - **`ServicePolicyModel` (SPM)** — one per service, **persistent**, the **source of truth**. It carries the service's own identity (`owned_roles` / `owned_scopes` / `service_type`) and its inbound edges — split by effect into `inbound_allow_rules` + `inbound_deny_rules`: every `(role → scope)` rule whose `scope` this service owns, routed to the allow or deny list by `rule.effect`. `UR→TS` lives durably on `SPM(T)`.
 
-**Two-sided rules (ALLOW / DENY).** Rules carry a `RuleEffect` (`Allow` / `Deny`; see the policy-model spec, handoff 01). The PCE treats effect as a routing/derivation dimension throughout: routing files each rule into the owning SPM's allow or deny list; `override`, reconcile, and `decommission` operate on **both** lists; and derivation classifies each inbound edge by `role.kind` **and** `effect` into the matching APM bucket while still registering deny-edge roles into the effect-agnostic identity maps. Under the no-conflict assumption the PCE applies **no** precedence logic — the two lists are carried through independently and deny-overrides is enforced downstream in generated Rego. The PCE also stamps each derived APM's `default_effect` (default `DENY`), the per-policy switch between least-privilege and permissive-by-default deny-overrides — see [Per-policy default effect](#per-policy-default-effect-threading-default_effect).
+**Two-sided rules (ALLOW / DENY).** Rules carry a `RuleEffect` (`Allow` / `Deny`; see the policy-model spec, handoff 01). The PCE treats effect as a routing/derivation dimension throughout: routing files each rule into the owning SPM's allow or deny list; `override`, reconcile, and `decommission` operate on **both** lists; and derivation classifies each inbound edge by `role.kind` **and** `effect` into the matching APM bucket while still registering deny-edge roles into the effect-agnostic identity maps. Under the no-conflict assumption the PCE applies **no** precedence logic — the two lists are carried through independently and deny-overrides is enforced downstream in generated Rego. There is no default effect: the deployed Rego always denies a `(role, scope)` pair that no rule mentions (always DENY).
 - **`AgentPolicyModel` (APM)** — **derived on demand** from the relevant SPMs and **partial-upserted** to the PDP. Never persisted as source of truth.
 
 `compute_and_apply` routes each incoming rule to the effect-appropriate list of `SPM(scope.serviceId)` (`inbound_allow_rules` / `inbound_deny_rules`), persists the changed SPMs, computes the set of **affected agents** from the batch, re-derives each affected agent's APM **entirely from SPMs (zero IdP)**, and partial-upserts them to the PDP in a single `apply_policy` call.
@@ -54,7 +54,8 @@ These AIAC invariants (from the policy-model spec, handoff 01) are relied on by 
 6. As the Policy Computation Engine, I want to partial-upsert only the affected agents' packages to the PDP, so unaffected agents are left untouched.
 7. As a developer, I want exceptions from the computation logged **and re-raised**, so a failed IdP / store / PDP interaction surfaces to the caller (the Controller returns HTTP 500; a NATS consumer nacks → at-least-once redelivery) instead of being silently dropped while nothing is applied.
 8. As a developer, I want a stable import path, so the calling convention does not change as the module grows.
-9. As an onboarding caller, I want to pass a `default_effect` that lands on every derived APM this batch emits, so I can deploy a permissive-by-default (or the default least-privilege) policy without the PRB or the rule lists changing — and with `DENY` as the default so existing callers are unaffected.
+9. As the Policy Computation Engine, I want one run at a time to change the SPMs, so two concurrent onboardings that route rules into one shared SPM do not lose the rules of one run.
+10. As the UC1 Orchestrator, I want to quarantine a failed onboarding by its Keycloak UUID, so its policy footprint is removed, a failed agent denies every request, and no later run writes rules back into that footprint.
 
 ---
 
@@ -69,30 +70,34 @@ These AIAC invariants (from the policy-model spec, handoff 01) are relied on by 
 ```
 src/aiac/policy/
 └── computation/
-    ├── __init__.py   # empty
-    └── engine.py     # compute_and_apply
+    ├── __init__.py   # exports compute_and_apply, decommission, quarantine
+    └── engine.py     # compute_and_apply, decommission, quarantine
 ```
 
 No FastAPI. No Kubernetes deployment. No container image. Imported as a library by AIAC Agent sub-UC agents.
 
 ### Public API
 
-Two entry points — an incremental fold and an authoritative offboard:
+Three entry points — an incremental fold, an authoritative offboard, and the teardown of a failed onboarding:
 
 ```python
 def compute_and_apply(
     rules: list[PolicyRule],
     override: bool = False,
-    default_effect: RuleEffect = RuleEffect.DENY,
+    focus_service: str | None = None,   # Keycloak internal client UUID of the service this onboarding builds
 ) -> None
 def decommission(service_id: str) -> None   # service_id = clientId (SPM key), not the Keycloak UUID
+def quarantine(service_uuid: str) -> None   # service_uuid = Keycloak internal client UUID (Service.id)
 ```
 
-- **No return value; failures propagate:** on success the caller receives no return value. Both functions log exceptions and **re-raise** them — a failure in IdP resolution, Policy Model Store I/O, or PDP Policy Writer push surfaces to the caller (the Controller returns HTTP 500; a NATS consumer nacks → at-least-once redelivery) rather than being silently swallowed while nothing is applied.
+- **No return value; failures propagate:** on success the caller receives no return value. All three functions log exceptions and **re-raise** them — a failure in IdP resolution, Policy Model Store I/O, or PDP Policy Writer push surfaces to the caller (the Controller returns HTTP 500; a NATS consumer nacks → at-least-once redelivery) rather than being silently swallowed while nothing is applied.
 - **`override`:** selects the merge mode (see [Merge Semantics](#merge-semantics)). `False` (default) appends additively at the SPM layer; `True` authoritatively replaces every input role's mappings **across all SPMs** (role-level revocation). Set by the caller (the Controller) from the producing UC's choice — UC1 = `False`, UC3 = `True`, UC2 Rebuild = `True`, UC2 Build = TBD.
-- **`default_effect`:** the per-policy default stamped onto every derived APM this batch emits (see [Per-policy default effect](#per-policy-default-effect-threading-default_effect)). `RuleEffect.DENY` (default) reproduces today's least-privilege Rego byte-for-byte; a caller opts into a permissive-by-default policy by passing `RuleEffect.ALLOW`. The default keeps all existing call sites (the four `/apply/*` Controller routes and the NATS consumer) compiling and behaving unchanged.
+- **`focus_service`:** the Keycloak internal client UUID (`Service.id`) of the service that this onboarding builds. The [routing guard](#routing-guard-disabled-services) does not drop the rules of this service while its client is disabled. The onboarding route (`POST /apply/service/{id}`) and the NATS consumer (`aiac.apply.service.<uuid>`) pass it. Other callers pass nothing.
+- **No default effect:** there is no default-effect parameter. A `(role, scope)` pair that no rule mentions is always DENY.
 - **`decommission`:** the authoritative service **offboard** — tears down a decommissioned service's entire policy footprint (see [Decommission (service offboard)](#decommission-service-offboard)). Keyed by the **clientId (SPM key)**, since an offboarded client is gone from `get_services()` and its UUID can no longer be resolved.
-- Import path: `from aiac.policy.computation.engine import compute_and_apply, decommission`
+- **`quarantine`:** the UC1 failure-path teardown of a failed onboarding (see [Quarantine (failed onboarding)](#quarantine-failed-onboarding)). Keyed by the **Keycloak internal client UUID**, because the failed service stays in the catalog (disabled).
+- **Serialization:** all three functions hold one PCE lock for their whole body (see [Serialization (the PCE lock)](#serialization-the-pce-lock)).
+- Import path: `from aiac.policy.computation import compute_and_apply, decommission, quarantine`
 
 ### Rule-builder input contract (upstream)
 
@@ -103,9 +108,11 @@ Each incoming `PolicyRule` arrives with `scope.serviceId`, `role.kind`, and `rol
 
 ### Algorithm
 
-Given `rules: list[PolicyRule]` and an `override` flag, `compute_and_apply` executes:
+Given `rules: list[PolicyRule]`, an `override` flag and an optional `focus_service`, `compute_and_apply` executes these steps under the [PCE lock](#serialization-the-pce-lock):
 
 1. **Catalog once.** Call `Configuration.get_services()` — the **only** runtime IdP read. For every service touched this batch, seed its SPM's `service_type` / `owned_roles` / `owned_scopes` from its catalog `Service` record, keeping only **AIAC-provisioned** entities (the `aiac.managed` marker on `Role.aiac_managed` / `Scope.aiac_managed`; Keycloak built-ins — the default client scopes `profile`, `email`, `roles`, `web-origins`, `acr`, `basic`, `service_account`, and the `default-roles-<realm>` composite — are dropped). This seed drives **P2** identity and the **P4** "only agents modelled" rule. It is a seed, **not** a per-derive dependency.
+
+1b. **Routing guard.** Drop every rule that touches a disabled service, except the focus service (see [Routing guard (disabled services)](#routing-guard-disabled-services)).
 
 2. **Route each rule to its owning service's SPM, by effect.** For each rule `(role, scope, effect)`, append it to `SPM(scope.serviceId).inbound_allow_rules` (if `effect == Allow`) or `.inbound_deny_rules` (if `effect == Deny`) — fetch the SPM via `get_service_policy_by_scope` / `get_service_policy`. **Append-dedup by `role.id + scope.id + effect`.** There is **no** write-time 3-way P5b classification (the old (user,agent-scope)/(user,tool-scope)/(agent,tool-scope) routing table is gone) — a rule always lands on the effect-appropriate list of the SPM that owns its scope, whatever the kinds.
 
@@ -128,7 +135,7 @@ Given `rules: list[PolicyRule]` and an `override` flag, `compute_and_apply` exec
 Let `R_A = SPM(A).owned_roles` (A's client roles) and `S_A = SPM(A).owned_scopes`.
 
 - **Identity (P2):** `agent_roles` ← `R_A`; `agent_scopes` ← `S_A`.
-- **Default effect:** `default_effect` ← the value threaded into `_derive` (default `DENY`; see [Per-policy default effect](#per-policy-default-effect-threading-default_effect)).
+- **No default effect:** the APM carries no default effect. The generated Rego always denies a pair that no rule mentions.
 - **Inbound:** iterate **both** of `SPM(A)`'s inbound lists. Split each edge by `role.kind` **and** `effect` into the matching APM bucket:
   - `User` + `Allow` → `inbound_subject_allow_rules`; `User` + `Deny` → `inbound_subject_deny_rules`;
   - `Agent` + `Allow` → `inbound_source_allow_rules`; `Agent` + `Deny` → `inbound_source_deny_rules`.
@@ -137,22 +144,6 @@ Let `R_A = SPM(A).owned_roles` (A's client roles) and `S_A = SPM(A).owned_scopes
 - **Outbound subject gate:** for each target `(X, s)` in the target maps — where `X` is the callee, a **tool or another agent** — take the **User**-kind inbound rules `(u → s)` on `SPM(X)`, route each by effect into `outbound_subject_allow_rules` / `outbound_subject_deny_rules`, and register `subject_roles += u.actorIds` (effect-agnostic). The gate's range is tool ∪ agent scopes.
 
 **Relevance is directional.** An SPM contributes to `A` **iff** it *is* `SPM(A)` (contributes inbound) **or** it contains a rule whose role is one of A's **agent** roles `R_A` (contributes outbound). A merely *shared user role* never confers relevance — this is what prevents a **false outbound edge** to a target (a tool or another agent) `A` does not actually target. This is a **derivation-layer** relevance rule: it does **not** imply the outbound user gate is empty. When the agent holds a per-skill operator role that the PRB maps (by capability-match) to a target's scope, the agent *does* target that callee, and the nested derivation then surfaces the shared-user edges.
-
-### Per-policy default effect (threading `default_effect`)
-
-`AgentPolicyModel.default_effect` (policy-model spec, handoff 01) decides how the generated Rego treats a `(role, scope)` pair that **no rule mentions** — `DENY` = today's least-privilege default, `ALLOW` = permissive default with deny-overrides preserved. Because the APM is a **pure derived projection** rebuilt on every relevant recompute — never read back from a store — the value must be **produced by the PCE at derive time**; it cannot be stored on the APM and recovered later.
-
-The **minimal** design threads one optional parameter, default `DENY`, without touching the PRB:
-
-1. **`compute_and_apply(rules, override=False, default_effect=RuleEffect.DENY)`** takes the parameter. The `DENY` default keeps the four Controller `/apply/*` call sites and the NATS consumer compiling and behaving unchanged.
-2. **`_run(rules, override, default_effect)`** receives it and passes it into each `_derive(...)` call.
-3. **`_derive(agent_id, spm, default_effect)`** sets `apm.default_effect = default_effect` on the APM it builds (either by giving `_fresh_apm` the parameter or by assigning on the returned APM), so **every** APM this batch emits carries the value.
-
-A caller **requests `ALLOW`** by forwarding it from the onboarding entry (`onboard_service` → `compute_and_apply`), derived from the onboarding input. The request surface stays tiny: a single optional argument that defaults to `DENY` on every path that does not explicitly opt in.
-
-> **Caveat — not durable.** With the parameter-only path the value is **not persisted**. A later, *unrelated* recompute that re-derives this agent (another service onboarding, a role update) rebuilds the APM with the default `DENY` unless that call also passes `ALLOW`. If `default_effect` must **survive independent re-derivation**, persist it on the **`ServicePolicyModel`** instead (add `default_effect: RuleEffect = RuleEffect.DENY` to SPM, seed it from onboarding input when the SPM is created/updated, and have `_derive` copy `SPM(agent_id).default_effect` onto the APM). That durable origin is the only one that reproduces across recomputes; adopt it only if durability is a stated requirement.
-
-The **PRB is untouched** — it never sets `default_effect`. Whichever origin is chosen, the default is `DENY` end-to-end and the value lands on every derived APM.
 
 ### P2 / P4 / P5b reconciliation
 
@@ -218,6 +209,47 @@ Steps:
 
 **Invariants preserved:** still exactly one IdP read (`get_services()`); still a per-agent partial upsert. **Not covered** (follow-ups): NATS `aiac.apply.offboard.{id}` consumer wiring; dropped-target GC where the source service survives (via `override=True` re-onboard); batch offboard.
 
+#### Quarantine (failed onboarding)
+
+`quarantine(service_uuid)` is the UC1 failure-path counterpart of `decommission`. The UC1 Orchestrator calls it after the compensating rollback and before it re-raises the build error (see [`aiac-agent/uc1-service-onboarding.md` → Failure & Rollback](aiac-agent/uc1-service-onboarding.md#failure--rollback)). The Orchestrator never calls the PDP library itself. The PCE owns the PDP.
+
+**Keyed by the Keycloak UUID, not the clientId.** The rollback disables the client. It does not delete it. So the failed service `X` is still in the catalog, and the PCE resolves the `serviceId` (the SPM key) from the catalog.
+
+Steps (under the PCE lock):
+
+1. **Catalog once** (`get_services()`). Find `X` by `Service.id == service_uuid`. An unknown UUID is a logged no-op.
+2. **Targeters** — the agents that targeted `X` (the `actorIds` of every Agent-kind inbound edge on `SPM(X)`, allow and deny).
+3. **Remove `X`'s roles from the other SPMs** — the same purge as decommission step 4. `X`'s SPM is seeded from the catalog, so this removes the roles that `X` still has. The edges of the roles that the rollback deleted are removed later by [reconcile](#reconcile-drift-gc), when a run touches those SPMs.
+4. **Delete `SPM(X)`** and persist each changed SPM.
+5. **Agent: replace its CR with a no-rules CR.** For an agent, write the `_fresh_apm` shell (identity maps only, no rules) through `apply_agent_policy`. Under always-DENY this CR denies every request. This is **not** a delete, on purpose: the bundle-service combiner allows a pod that has no client CR, so a delete would open the agent (see [`pdp-policy-writer-opa.md` → Quarantined agent — the no-rules CR](pdp-policy-writer-opa.md#quarantined-agent--the-no-rules-cr)). A tool gets no CR (a tool has none).
+6. **Re-derive** the affected agents (the targeters, and the agents whose SPMs lost `X`'s roles; `X` excluded) and apply them in one `apply_policy` call.
+
+Steps 2–4 and 6 are the steps that `decommission` also runs (shared helpers `_remove_footprint` and `_apply_derived`). `quarantine` is idempotent: a second call finds no SPM and no edges, and writes the same no-rules CR.
+
+**The lift.** Only a successful re-onboarding lifts a quarantine. Its PRB rebuilds the rules, `compute_and_apply` (with `focus_service` = `X`) writes the real CR over the no-rules CR with the same SSA field manager (`aiac-pdp-policy-writer`), and then `reenable_service` re-enables the client. The UC2 rebuild route is a stub, so it does not lift a quarantine.
+
+#### Routing guard (disabled services)
+
+A disabled client is a failed (quarantined) service. Under the PCE lock, after the catalog read, `compute_and_apply` drops every rule that:
+
+- has a scope whose owner (`scope.serviceId`) is disabled, or
+- has an Agent-kind role that belongs to a disabled service (`role.actorIds`).
+
+The focus service is the exception. A re-onboarding applies while its client is still disabled, because `reenable_service` runs after the apply. So the rules of the focus service are kept. Without a `focus_service`, the guard drops every rule that touches a disabled service.
+
+The guard prevents a build that started before a quarantine from writing its rules back into the removed footprint. The focal resolver applies the same rule on the build side (see [`aiac-agent/uc1-service-onboarding.md` → Service Policy Builder](aiac-agent/uc1-service-onboarding.md#sub-agent-service-policy-builder)).
+
+### Serialization (the PCE lock)
+
+Each public operation reads SPMs, changes them, and writes them back (a read-modify-write). The store has no versions, and its write lock protects one write, not a read-modify-write. Thus two onboardings that route rules into one shared SPM (for example, two agents granted on one tool's scope) both read the old SPM, and the second write removes the rules of the first run.
+
+One module-level `threading.Lock` (`_pce_lock`) is held for the whole body of `compute_and_apply`, `decommission` and `quarantine`. The PRB (the LLM work) runs before `compute_and_apply`, outside the lock. So concurrent onboardings still do their LLM work in parallel. The part under the lock makes no LLM call.
+
+Known limits:
+
+- **One Controller replica only.** The lock serializes one process, like the Orchestrator's per-service lock. More replicas need store versions or a distributed lock.
+- **Overlapping onboardings can leave a pair unjudged.** When two onboardings overlap, the resolver of each service reads the catalog before the Provision of the other service. So a pair between the two new services can stay unjudged. That pair gives no grant (fail closed).
+
 ### Dependencies
 
 | Module | Purpose |
@@ -225,7 +257,7 @@ Steps:
 | `aiac.policy.model` | `PolicyRule`, `RuleEffect`, `ServicePolicyModel`, `AgentPolicyModel`, `PolicyModel` |
 | `aiac.idp.configuration` | `Configuration.get_services` — the **only** runtime IdP read (catalog: `service_type` + own roles/scopes for the P2 seed) |
 | `aiac.policy.model_store.library` | `get_service_policy` / `get_service_policy_by_scope` (fetch SPM), `get_service_policies_by_role` (SPMs containing a role — override purge + outbound derivation), `apply_service_policy` (persist SPM), `delete_service_policy` (offboard) |
-| `aiac.pdp.policy.library` | `apply_policy` — partial-upsert derived APMs to OPA; `delete_agent_policy` — remove an offboarded agent's APM/Rego |
+| `aiac.pdp.policy.library` | `apply_policy` — partial-upsert derived APMs to OPA; `delete_agent_policy` — remove an offboarded agent's APM/Rego; `apply_agent_policy` — write the no-rules CR of a quarantined agent |
 
 Note: the PCE no longer calls `get_services_by_role` / `get_services_by_scope` / `get_subjects_by_role` at routing or classification time — those facts arrive on the rules (input contract) and derivation reads SPMs. The single IdP read is `get_services()` for the identity seed.
 
@@ -251,7 +283,7 @@ Good tests assert external behavior — what the engine writes to the Policy Mod
 
 - `aiac.idp.configuration` — mock `Configuration.get_services` (the catalog: `service_type` + each service's own roles/scopes for the P2 seed).
 - `aiac.policy.model_store.library` — mock `get_service_policy` / `get_service_policy_by_scope`, `get_service_policies_by_role`, `apply_service_policy`, `delete_service_policy`.
-- `aiac.pdp.policy.library` — mock `apply_policy`, `delete_agent_policy`.
+- `aiac.pdp.policy.library` — mock `apply_policy`, `delete_agent_policy`, `apply_agent_policy`.
 
 **Un-freeze `test/unit/policy/computation/`.** These tests were excluded (frozen imports caused collection errors). With the SPM redesign landed, un-freeze the directory so the suite runs under the default `pytest` (marker-only selection; the unit lane is untagged).
 
@@ -275,8 +307,10 @@ Key behaviors to assert:
 - **Override purges both lists.** `override=True` with an input role present in a target SPM's allow **and** deny lists purges it from both before re-appending.
 - **Reconcile prunes both lists.** A dangling deny edge (retired scope / churned role) is GC'd exactly as a dangling allow edge; a live deny edge survives; the pass is idempotent.
 - **Decommission clears both lists.** Offboard tears down the target's own inbound (allow + deny) and its outbound footprint (allow + deny edges keyed by its roles on other SPMs).
-- **`default_effect` threaded onto every derived APM.** `compute_and_apply(..., default_effect=RuleEffect.ALLOW)` yields derived APMs whose `default_effect == ALLOW`; omitting the argument (and every existing call site) yields `DENY`. Assert the value reaches **every** agent in the emitted `PolicyModel`, and that `decommission` re-derivations are unaffected.
-- **Failures propagate.** An exception from any dependency is logged and **re-raised** (it propagates to the caller, which surfaces it — e.g. the Controller returns HTTP 500); on success `compute_and_apply` / `decommission` return `None`.
+- **PCE lock.** Two concurrent runs that route rules into one shared SPM keep the rules of both runs. `compute_and_apply`, `decommission` and `quarantine` each hold the PCE lock.
+- **Routing guard.** A rule whose scope owner is disabled, or whose agent role belongs to a disabled service, is dropped. The rules of the focus service are kept while it is disabled. Without a focus service, every rule that touches a disabled service is dropped. When all services are enabled, every rule is kept.
+- **Quarantine.** For an agent: `SPM(X)` is deleted, its roles are removed from the other SPMs, its CR is replaced with the no-rules CR, and the affected agents are re-derived in one call. For a tool: no CR is written, and its callers are re-derived. A second call gives the same result. An unknown UUID is a no-op.
+- **Failures propagate.** An exception from any dependency is logged and **re-raised** (it propagates to the caller, which surfaces it — e.g. the Controller returns HTTP 500); on success `compute_and_apply` / `decommission` / `quarantine` return `None`.
 
 **Prior art:** `3.14-unit-tests-write-api.md` (mock boundary pattern — apply the same approach at the library import boundary here).
 

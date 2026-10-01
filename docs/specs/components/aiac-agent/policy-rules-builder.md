@@ -580,6 +580,12 @@ and is **not yet enforced** here.
 | UC3 — Role Update | Role sub-agent | `build_role_rules(role, all_scopes)` — one call |
 | Conflict diagnostic (folded into `/apply`, [identify conflicts, never reconcile](#design-decision-identify-conflicts-never-reconcile) / #2503) | Apply path | A parallel diagnostic assembly reusing propose / precheck / audit (record-not-raise + a terminal `explain` node); returns a `422` `ConflictReport` |
 
+> **Disabled services are not candidates.** The UC1 caller and the conflict diagnostic get their
+> candidates from one shared resolver, `resolve_focal_entities` (`agent/shared/focal_entities.py`).
+> It skips the roles and scopes of every disabled service (`Service.enabled == False`, a quarantined
+> failed onboarding), except the focus service. So the PRB never judges a pair with a quarantined
+> service. See [`uc1-service-onboarding.md` → Service Policy Builder](uc1-service-onboarding.md#sub-agent-service-policy-builder).
+
 > **Door B removed (#2540).** UC1 previously also ran a user-role-focal **deny-only** pass
 > (`build_role_denies` over each `RoleKind.USER` candidate role, alongside the scope-focal pass) to
 > derive user-role exclusivity denies. Under digested input that pass is redundant and has been

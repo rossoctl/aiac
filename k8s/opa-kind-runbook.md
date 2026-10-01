@@ -4,18 +4,19 @@
 > to its release as part of the Rossoctl system. On release, this document
 > should be updated accordingly.
 
-This is the AIAC-scoped companion to `authbridge/docs/opa-kind-runbook.md` (in
-the separate AuthBridge repository).
+The OPA plugin itself lives in the separate cortex repository
+(`core/plugins/opa/`, see its `README.md`).
 The underlying mechanism — OPA as an AuthBridge pipeline plugin, policy
 distributed via `bundle-service`, enforcement via the `AuthorizationPolicy`
 CRD — is identical. This document gives the **exact, copy-paste** steps to run
 the AIAC scenario end-to-end on a local Kind cluster, using the two helper
 scripts that wire OPA in and out:
 
-- [`opa-kind-enable.sh`](opa-kind-enable.sh) — rebuilds
-  the `authbridge-proxy` image from the current tree, loads it into Kind, and
-  wires the `opa` plugin (plus the parser set) into **both** the inbound and
-  outbound pipeline of every `team1` agent.
+- [`opa-kind-enable.sh`](opa-kind-enable.sh) — builds the
+  operator image from the operator clone and deploys the bundle service from
+  the operator chart, builds the `authbridge-proxy` image from the cortex clone,
+  loads both images into Kind, and wires the `opa` plugin (plus the parser set)
+  into **both** the inbound and outbound pipeline of every `team1` agent.
 - [`opa-kind-restore.sh`](opa-kind-restore.sh) — reverts
   the pipeline to its shipped state (no OPA overlay) and restarts the agents.
 
@@ -49,10 +50,19 @@ read the delegation chain (see [Part B](#part-b--outbound-token-exchange--opa)).
 
 - A Kind cluster named `rossoctl` with the `rossoctl` platform installed and
   `github-agent` + `github-tool` deployed in namespace `team1`.
-- The two sibling repo clones the enable/restore scripts need:
-  - `OPERATOR_DIR` → `rossoctl/operator` clone (default: `../operator`)
+- The three sibling repo clones the enable/restore scripts need:
+  - `OPERATOR_DIR` → `rossoctl/operator` clone (default: `../operator`). The
+    enable script builds the operator image from `operator/Dockerfile` and
+    renders the bundle-service templates from `charts/operator`. It needs a
+    clone at or after operator commit `5e4c991`, which puts the bundle service
+    in the operator image.
   - `ROSSOCTL_DIR` → `rossoctl/rossoctl` clone, i.e. the Helm chart
     (default: `../rossoctl`)
+  - `CORTEX_DIR` → `rossoctl/cortex` clone (default: `../cortex`). The enable
+    script builds the `authbridge-proxy` image from
+    `cmd/authbridge-proxy/Dockerfile` at the cortex repo root. This clone is
+    required: the enable script stops if it is missing. The restore script does
+    not need it.
 - `kubectl`, `helm`, `kind`, and `docker` (or `podman`) on `PATH`.
   - If `kubectl` reports `connection refused` reaching the API server, the Kind
     node was likely restarted and reassigned its API-server host port, leaving
@@ -138,14 +148,35 @@ All commands below are run from the repo root.
 ## Step 1 — Enable OPA in both legs
 
 ```bash
-OPERATOR_DIR=../operator ROSSOCTL_DIR=../rossoctl ./aiac/k8s/opa-kind-enable.sh
+OPERATOR_DIR=../operator ROSSOCTL_DIR=../rossoctl CORTEX_DIR=../cortex ./k8s/opa-kind-enable.sh
 ```
 
-This rebuilds `localhost/authbridge:local` from the current tree, loads it into
-the `rossoctl` Kind cluster, and `helm upgrade`s the chart with a temporary
-overlay that inserts `opa` (after `token-exchange` on the outbound leg) and the
-parser set into every `team1` agent's pipeline. It does **not** modify
-`charts/rossoctl/values.yaml` on disk.
+The script does these steps:
+
+1. **Bundle service.** No released operator chart carries the bundle service
+   yet, so the script deploys it from the operator clone:
+   - It builds the operator image from `$OPERATOR_DIR/operator/Dockerfile`
+     (`OPERATOR_IMAGE`, default `localhost/rossoctl-operator:<operator HEAD short sha>`)
+     and loads it into Kind. The bundle service runs from this image.
+   - It applies the `AuthorizationPolicy` CRD from the operator clone.
+   - It deletes a legacy `bundle-service` Deployment whose selector is only
+     `app: bundle-service` (from the removed `operator/hack/bundle-service-kind.sh`).
+     The chart selector adds `app.kubernetes.io` labels, and a Deployment
+     selector is immutable.
+   - It renders and applies only the bundle-service templates from
+     `$OPERATOR_DIR/charts/operator` (`bundleService.enabled=true`, the local
+     image, `pullPolicy: Never`). The rest of the operator stays as installed.
+   - It does **not** apply the chart's bundle-service NetworkPolicy. That policy
+     admits only pods labelled `rossoctl.dev/authbridge=true`, and nothing sets
+     that label today. On a CNI that enforces NetworkPolicy it would block every
+     AuthBridge bundle fetch.
+2. **AuthBridge image.** It builds `localhost/authbridge:local` from
+   `$CORTEX_DIR/cmd/authbridge-proxy/Dockerfile` (build context: the cortex repo
+   root) and loads it into the `rossoctl` Kind cluster.
+3. **Pipeline.** It `helm upgrade`s the chart with a temporary overlay that
+   inserts `opa` (after `token-exchange` on the outbound leg) and the parser set
+   into every `team1` agent's pipeline. It does **not** modify
+   `charts/rossoctl/values.yaml` on disk.
 
 Confirm OPA is wired into **both** legs (expect **2**):
 
@@ -429,20 +460,28 @@ kubectl exec -i -n team1 "$POD" -c agent -- python3 - < /tmp/probe.py
 > `method` and an `id`) as an application-layer error frame so the caller's MCP
 > client sees a single failed tool call rather than a transport break — see
 > `writeMCPRejection` in
-> `authbridge/authlib/listener/httpx/render.go`. The request is **denied and
+> `core/listener/httpx/render.go` in the cortex repo. The request is **denied and
 > never reaches `github-tool`**; the `HTTP 200` is only the JSON-RPC transport
 > envelope. Classify the outcome by the response **body** (an `error` frame =
 > denied, a `result` frame = allowed), not the HTTP status.
 >
-> The rule admits a call only when the delegated user's role and the target
-> service both list the request's `input.mcp.params.name` (the invoked tool).
-> A `tools/list` call carries no `params.name`, so neither gate matches and
-> `allow` is `false`. A non-MCP-shaped rejection (no parser, or a JSON-RPC
+> The example CR predates the MCP session rule, so it admits only a
+> `tools/call` whose `input.mcp.params.name` (the invoked tool) both the
+> delegated user's role and the target service list. It denies `tools/list`.
+> The outbound rego that AIAC generates today (`generate_outbound_rego`, see
+> [`pdp-policy-writer-opa.md`](../docs/specs/components/pdp-policy-writer-opa.md#outbound-package-authbridgeclientoutboundrequest))
+> also allows the MCP session messages (`initialize`,
+> `notifications/initialized`, `ping`, `tools/list`) to a target when the user
+> holds a grant on at least one tool of that target. So with a generated CR,
+> this `tools/list` probe as `dev-user` is **allowed** (a `result` frame), and
+> the same probe as a user with no grant on a `github-tool` tool is
+> **denied**. A non-MCP-shaped rejection (no parser, or a JSON-RPC
 > *notification* with no `id`) instead falls through to a plain HTTP `403`; a
 > `token-exchange` failure surfaces as `503` before OPA is even consulted. To
-> see the full allow path (a `result` frame at HTTP 200), apply only the inbound
-> tier of the CR, or drive a real tool invocation whose tool name is present in
-> `subject_role_scopes` and `target_scopes` in the outbound rego.
+> see the full allow path (a `result` frame at HTTP 200) with the example CR,
+> apply only the inbound tier of the CR, or drive a real `tools/call` whose
+> tool name is present in `subject_role_allow_scopes` and `target_allow_scopes`
+> in the outbound rego.
 
 ## B.5 — The outbound OPA input, exactly
 
@@ -510,7 +549,7 @@ built:
     inbound identity, where `jwt-validation` surfaces the validated JWT's
     audience; on the outbound leg the equivalent "who is this token for" signal
     is the exchange target, exposed as `service_id`. A policy keys on it via
-    `target_scopes[input.identity.service_id]`. Omitted when the last hop is a
+    `target_allow_scopes[input.identity.service_id]`. Omitted when the last hop is a
     non-exchange hop that recorded no audience.
 - `input.delegation` carries the full RFC 8693 chain for policies that need
   per-hop detail (`audience`, `strategy`, `from_cache`, `depth`).
@@ -525,13 +564,17 @@ emits on this leg: the synthesized `input.identity.subject`,
 as shown above), and `input.mcp.params.name` (the specific tool being invoked).
 It gates **per tool**: allowing only when the delegated user's role **and** the
 target service both admit the invoked tool — an AND across the user→tool and
-service→tool gates. The `subject_role_scopes` / `target_scopes` maps in the
-example are keyed by the actual MCP tool names exposed by the deployed
+service→tool gates. The `subject_role_allow_scopes` / `target_allow_scopes` maps
+in the example are keyed by the actual MCP tool names exposed by the deployed
 github-tool (`demo/assets/tools/github_tool`): `source-read`,
-`source-write`, `issues-read`, `issues-write`. (Because the gate is on
-`params.name`, MCP methods that don't invoke a specific tool — like the
-`tools/list` probe below — carry no `params.name`, so they never match and are
-denied.)
+`source-write`, `issues-read`, `issues-write`. The example predates the MCP
+session rule, so MCP methods that don't invoke a specific tool — like the
+`tools/list` probe above — carry no `params.name`, never match, and are denied.
+The generated outbound rego also reads `input.mcp.method` (always set by the
+plugin). It allows a `tools/call` per tool, and it allows the session messages
+(`initialize`, `notifications/initialized`, `ping`, `tools/list`) to a target
+iff at least one tool of that target passes the full per-tool check for this
+user. It denies every other MCP method.
 
 ---
 
@@ -565,7 +608,7 @@ curl -s -o /dev/null -w "remove scope HTTP %{http_code}\n" -X DELETE -H "Authori
   "$KC/admin/realms/rossoctl/clients/$CID/optional-client-scopes/$SID"
 
 # 4. revert the pipeline (removes the OPA overlay, restarts the agents)
-ROSSOCTL_DIR=../rossoctl ./aiac/k8s/opa-kind-restore.sh
+ROSSOCTL_DIR=../rossoctl ./k8s/opa-kind-restore.sh
 ```
 
 Confirm OPA is gone from the pipeline (expect **0**):

@@ -124,7 +124,7 @@ The Controller is a FastAPI routes layer (`controller/routes.py`). Its responsib
 - Parse the trigger type and entity ID from the request path.
 - Dispatch to the Service Onboarding Orchestrator (UC1) or directly to the Policy Update / Role Update sub-agents (UC2, UC3).
 - Receive the `list[PolicyRule]` returned by the Orchestrator or sub-agent (already merged by the sub-agent).
-- Call `compute_and_apply(merged_rules)` from `aiac.policy.computation` (PCE) once.
+- Call `compute_and_apply(merged_rules)` from `aiac.policy.computation` (PCE) once. For UC1, the onboarding route and the NATS consumer also pass `override` and `focus_service` (the Keycloak UUID of the service being onboarded), so the PCE routing guard keeps the rules of a disabled (quarantined) service that re-onboards.
 - Return a bare HTTP status code to the caller; write summary and debug info to the log.
 
 No per-use-case business logic, retry handling, or state assembly lives in the Controller. PRB calls are owned by the producing sub-agents; the Controller's shared step is the single PCE call.
@@ -265,7 +265,7 @@ src/aiac/
 ├── shared/                             ← project-level shared: run_upstream (upstream.py) — transport retry primitive
 └── agent/
     ├── controller/
-    ├── shared/                         ← flatten_role (roles.py); focal_entities.py (resolve_focal_entities — D13, shared by live build() + diagnostic); error_logging.py (log_by_type — per-persona named-logger router)
+    ├── shared/                         ← flatten_role (roles.py); focal_entities.py (resolve_focal_entities — D13, shared by live build() + diagnostic; skips the roles and scopes of every disabled service, except the focus service); error_logging.py (log_by_type — per-persona named-logger router)
     ├── uc/
     │   ├── onboarding/
     │   │   ├── orchestrator.py         ← sequences provision → policy_builder, returns list[PolicyRule]
