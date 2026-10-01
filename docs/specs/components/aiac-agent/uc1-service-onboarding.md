@@ -81,6 +81,8 @@ The disable comes before the quarantine, so no run after the teardown sees the s
 
 **Only a successful re-onboarding lifts a quarantine.** The PRB rebuilds the rules. The routing guard of the PCE keeps them, because the service is the `focus_service` (its client is still disabled at this time). `compute_and_apply` writes the real CR over the no-rules CR (same SSA field manager). Then `reenable_service` re-enables the client. The UC2 rebuild route is a stub, so it does not lift a quarantine.
 
+**Known limit — a quarantined tool cannot be lifted today.** Tool Provision mints its discovery token with the tool client's own secret (`client_credentials`, `GET /services/{id}/discovery-token`). A disabled client cannot get a token, so the re-onboarding of a quarantined tool fails in Provision (a retryable `HTTPException(502)`) before the build. The lift works for an agent only. Lifting a tool needs a decision (for example: mint the discovery token without the tool client, or re-enable the client before Provision).
+
 **Rollback is UC1-only.** UC2 (Policy Update) and UC3 (Role Update) provision nothing, so they have nothing to tear down and never disable a client.
 
 ---

@@ -11,8 +11,8 @@ Two halves, both live here so a single module import serves every launcher:
 * **Live-cluster half** — drive a real rossoctl/Kind cluster with the AuthBridge OPA pipeline wired
   in (see ``k8s/opa-kind-runbook.md``). ``kubectl`` wrappers + ``port_forward`` + ``resolve_pod``
   onboard through the in-cluster Controller; ``mint_token`` / ``jwt_claim`` / ``inbound_probe`` /
-  ``outbound_probe`` send **real HTTP requests through AuthBridge** and classify the **real OPA
-  plugin's** allow/deny; ``poll_until`` waits for ``bundle-service`` to reflect a CR change; and the
+  ``outbound_probe`` / ``outbound_session_probe`` send **real HTTP requests through AuthBridge** and
+  classify the **real OPA plugin's** allow/deny; ``poll_until`` waits for ``bundle-service`` to reflect a CR change; and the
   skip gates (``require_env_or_skip`` / ``require_pipeline`` / ``verify_subject_mapper``) make the
   suite skip cleanly — never false-pass — when the cluster is not wired.
 
@@ -514,6 +514,93 @@ def outbound_probe(
         stderr = getattr(exc, "stderr", "") or getattr(exc, "output", "") or str(exc)
         return None, f"outbound probe exec failed: {stderr}".strip()
     return _parse_curl_output(out)
+
+
+def outbound_session_probe(
+    token: str,
+    frames: list[dict],
+    *,
+    namespace: str,
+    agent_pod: str,
+    tool_url: str = "http://github-tool:9090/mcp",
+    container: str = "agent",
+    timeout: float = 120.0,
+) -> list[tuple[int | None, str]]:
+    """Send a sequence of JSON-RPC ``frames`` (an MCP session: ``initialize``,
+    ``notifications/initialized``, ``tools/list``, ``tools/call`` …) through AuthBridge's forward proxy,
+    in order, from one ``kubectl exec`` into the agent pod; return one ``(http_code, body)`` per frame.
+
+    The same request shaping as ``outbound_probe`` (proxy ``127.0.0.1:8081``, the user bearer as the
+    token-exchange subject token, the MCP ``Accept`` header), but the frames are sent as given, so a
+    method that carries no tool name reaches the outbound OPA session rule. Each frame's output starts
+    with an ``AB_MSG:<i>`` line and carries the ``AB_HTTP:<n>`` / ``AB_ERR:<msg>`` markers that
+    ``_parse_curl_output`` reads. An exec failure returns ``(None, <message>)`` for every frame."""
+    script = (
+        "import urllib.request, urllib.error, json\n"
+        f"tok = {json.dumps(token)}\n"
+        f"url = {json.dumps(tool_url)}\n"
+        f"frames = json.loads({json.dumps(json.dumps(frames))})\n"
+        "op = urllib.request.build_opener("
+        'urllib.request.ProxyHandler({"http": "http://127.0.0.1:8081"}))\n'
+        "for i, frame in enumerate(frames):\n"
+        '    print("AB_MSG:%d" % i)\n'
+        "    req = urllib.request.Request(url, data=json.dumps(frame).encode(), headers={"
+        '"Content-Type": "application/json",'
+        ' "Accept": "application/json, text/event-stream",'
+        ' "Authorization": "Bearer " + tok})\n'
+        "    try:\n"
+        "        r = op.open(req, timeout=15)\n"
+        '        print("AB_HTTP:%d" % r.status)\n'
+        '        print(r.read().decode("utf-8", "replace"))\n'
+        "    except urllib.error.HTTPError as e:\n"
+        '        print("AB_HTTP:%d" % e.code)\n'
+        '        print(e.read().decode("utf-8", "replace"))\n'
+        "    except Exception as e:\n"
+        '        print("AB_ERR:%s" % e)\n'
+    )
+    try:
+        out = kubectl(
+            "exec",
+            "-i",
+            "-n",
+            namespace,
+            agent_pod,
+            "-c",
+            container,
+            "--",
+            "python3",
+            "-",
+            input_text=script,
+            timeout=timeout,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+        stderr = getattr(exc, "stderr", "") or getattr(exc, "output", "") or str(exc)
+        return [(None, f"outbound session probe exec failed: {stderr}".strip())] * len(frames)
+    chunks: dict[int, list[str]] = {}
+    current: int | None = None
+    for line in out.splitlines():
+        if line.strip().startswith("AB_MSG:"):
+            current = int(line.strip()[len("AB_MSG:") :])
+            chunks[current] = []
+        elif current is not None:
+            chunks[current].append(line)
+    return [
+        _parse_curl_output("\n".join(chunks[i])) if i in chunks else (None, "no output for frame")
+        for i in range(len(frames))
+    ]
+
+
+def notification_outcome(code: int | None) -> str:
+    """Classify the response to a JSON-RPC **notification** (a frame with no ``id``, e.g.
+    ``notifications/initialized``) sent through the outbound proxy. A notification has no JSON-RPC
+    reply to carry an error frame, so AuthBridge renders a rejection as a plain HTTP ``403`` (runbook
+    B.4). HTTP 200/202 (the MCP server accepted it) -> ``"allow"``; 403 -> ``"deny"``; anything else
+    -> ``"error"``."""
+    if code in (200, 202):
+        return "allow"
+    if code == 403:
+        return "deny"
+    return "error"
 
 
 def inbound_outcome(code: int | None) -> str:

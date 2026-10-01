@@ -300,7 +300,9 @@ requests through AuthBridge + OPA):
   - the tool has **no CR** (a tool never has one) and **no SPM**;
   - the agent's outbound **denies** a call to the tool.
 - **Lift:** a successful re-onboarding writes the **real CR** over the no-rules CR and **re-enables** the
-  client.
+  client. The test proves the lift on the agent only: a quarantined tool cannot be re-onboarded today
+  (see the known limit in `docs/specs/components/aiac-agent/uc1-service-onboarding.md`), so the failed-tool
+  phase runs last.
 - **Outbound MCP session:** through the agent's outbound leg, `initialize`, `tools/list` and `tools/call`
   work for a granted user (a user who holds a grant on at least one tool of the target).
 
