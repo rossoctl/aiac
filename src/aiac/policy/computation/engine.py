@@ -334,6 +334,13 @@ def _disabled_services(catalog: dict[str, Service], focus_service: str | None) -
     return {sid for sid, svc in catalog.items() if not svc.enabled and sid != focus_service}
 
 
+def _live_services(catalog: dict[str, Service], focus_service: str | None = None) -> set[str]:
+    """The ``serviceId`` of every live service: in ``catalog`` and not disabled (the focus service
+    counts as live). Only a live agent is derived: an agent absent from the catalog is deleted, and a
+    disabled one is quarantined — its no-rules CR must stay until a re-onboarding replaces it."""
+    return catalog.keys() - _disabled_services(catalog, focus_service)
+
+
 def _routable(rule: PolicyRule, catalog: dict[str, Service], disabled: set[str]) -> bool:
     """True iff every service ``rule`` touches — its scope owner, and the owner of its agent role —
     is live: present in ``catalog`` and not in ``disabled``. A service absent from the catalog is
@@ -356,12 +363,13 @@ def quarantine(service_id: ClientId, deleted_roles: Iterable[Role] = ()) -> None
     2. remove X's roles from the other SPMs (as ``decommission`` step 4 does) — the roles X still
        has in the catalog, plus ``deleted_roles``: the roles the rollback already deleted from the
        IdP (the run's created-manifest). The catalog no longer lists those, but a concurrent run can
-       have stored their grants on another SPM, which would keep allowing X;
+       have stored their grants on another SPM, which would keep allowing X. A role that another
+       service also holds (a realm role reused by name) is kept: its grants are that service's too;
     3. for an agent, **replace** its CR with a CR that has no rules (the ``_fresh_apm`` shell), which
        denies every request — not a delete, because the bundle-service combiner allows a missing CR;
        a tool gets no CR (it has none);
-    4. re-derive the affected agents (those that targeted X, and those whose SPMs lost X's roles)
-       and apply them in one call.
+    4. re-derive the affected live agents (those that targeted X, and those whose SPMs lost X's
+       roles; not a deleted or disabled agent) and apply them in one call.
 
     Idempotent: a second call finds no SPM and no edges, and writes the same no-rules CR. A
     ``service_id`` that is not in the catalog is a logged no-op. The quarantine is lifted only by a
@@ -390,6 +398,13 @@ def _run(rules: list[PolicyRule], override: bool, focus_service: str | None = No
     # for P4) and its own roles/scopes (embedded on the APM for P2, filtered to aiac.managed).
     catalog = {svc.serviceId: svc for svc in config.get_services()}
 
+    # Distinct input roles (dedup by id) — the set purged under override and the seed of the
+    # affected-agent set. Built from the input BEFORE the routing guard: under override, a role
+    # whose every new rule the guard drops must still lose its old grants.
+    distinct_roles: dict[str, Role] = {}
+    for rule in rules:
+        distinct_roles.setdefault(rule.role.id, rule.role)
+
     # (1.5) Routing guard — drop every rule that touches a service that is not live: disabled
     # (quarantined, except the focus service) or absent from the catalog (deleted). See
     # ``compute_and_apply``.
@@ -404,12 +419,6 @@ def _run(rules: list[PolicyRule], override: bool, focus_service: str | None = No
     # SPM cache: fetch each SPM from the store at most once, seed its identity from the catalog,
     # mutate in place, and persist the changed ones.
     spms, spm, is_agent = _spm_cache(catalog)
-
-    # Distinct input roles (dedup by id) — the set purged under override and the seed of the
-    # affected-agent set.
-    distinct_roles: dict[str, Role] = {}
-    for rule in rules:
-        distinct_roles.setdefault(rule.role.id, rule.role)
 
     changed: set[str] = set()
 
@@ -467,10 +476,10 @@ def _run(rules: list[PolicyRule], override: bool, focus_service: str | None = No
                 affected.update(edge.role.actorIds)
 
     # (6) Derive each affected agent's APM (zero IdP) and partial-upsert once. Tools get an SPM
-    # but no APM (P4). Only agents in the catalog: an agent absent from it is deleted, and its
+    # but no APM (P4). Only live agents: an agent absent from the catalog is deleted, and its
     # stored SPM (or the store's 404 placeholder, typed AGENT) must not bring its CR back —
-    # removing it is ``decommission``'s job.
-    _apply_derived(affected & catalog.keys(), spm, is_agent)
+    # removing it is ``decommission``'s job; a disabled agent keeps its no-rules CR.
+    _apply_derived(affected & _live_services(catalog, focus_service), spm, is_agent)
 
 
 def _decommission(service_id: str) -> None:
@@ -490,14 +499,14 @@ def _decommission(service_id: str) -> None:
 
     # (3)-(6) Tear down X's footprint in the store (see ``_remove_footprint``).
     was_agent = spm_x.service_type == ServiceType.AGENT
-    affected = _remove_footprint(service_id, spms, spm, is_agent)
+    affected = _remove_footprint(service_id, catalog, spms, spm, is_agent)
 
     # (7) Delete APM(X) from the PDP iff X was an agent (tools have an SPM but no APM).
     if was_agent:
         delete_agent_policy(service_id)
 
-    # (8) Re-derive every affected agent (X excluded) in one partial upsert.
-    _apply_derived(affected, spm, is_agent)
+    # (8) Re-derive every affected live agent (X excluded) in one partial upsert.
+    _apply_derived(affected & _live_services(catalog), spm, is_agent)
 
 
 def _quarantine(service_id: str, deleted_roles: list[Role]) -> None:
@@ -516,7 +525,7 @@ def _quarantine(service_id: str, deleted_roles: list[Role]) -> None:
 
     # (3)-(6) Tear down X's footprint in the store (see ``_remove_footprint``).
     was_agent = is_agent(service_id)
-    affected = _remove_footprint(service_id, spms, spm, is_agent, deleted_roles)
+    affected = _remove_footprint(service_id, catalog, spms, spm, is_agent, deleted_roles)
 
     # (7) An agent's CR is REPLACED with a no-rules CR (the ``_fresh_apm`` shell), which denies
     # every inbound and outbound request. Not a delete, on purpose: the bundle-service combiner
@@ -525,15 +534,19 @@ def _quarantine(service_id: str, deleted_roles: list[Role]) -> None:
     if was_agent:
         apply_agent_policy(service_id, _fresh_apm(service_id))
 
-    # (8) Re-derive every affected agent (X excluded) in one partial upsert.
-    _apply_derived(affected, spm, is_agent)
+    # (8) Re-derive every affected live agent (X excluded) in one partial upsert.
+    _apply_derived(affected & _live_services(catalog), spm, is_agent)
 
 
-def _remove_footprint(service_id: str, spms, spm, is_agent, extra_roles: list[Role] = ()) -> set[str]:
+def _remove_footprint(
+    service_id: str, catalog: dict[str, Service], spms, spm, is_agent, extra_roles: list[Role] = ()
+) -> set[str]:
     """Tear down service X's footprint in the store — the steps ``decommission`` and ``quarantine``
     share. ``extra_roles`` are X's roles that ``SPM(X)`` no longer lists (``quarantine``'s
-    rollback-deleted roles); their edges are purged as X's own. Returns the affected agents (X
-    excluded): the agents that targeted X, and the agents whose SPMs lost X's roles."""
+    rollback-deleted roles); their edges are purged as X's own. A role that another service in
+    ``catalog`` also holds (a realm role reused by name) is not purged: its grants are that
+    service's grants too. Returns the affected agents (X excluded): the agents that targeted X, and
+    the agents whose SPMs lost X's roles."""
     spm_x = spm(service_id)
 
     # (3) Targeters — agents whose outbound loses X: they hold an Agent-kind inbound edge (allow or
@@ -545,8 +558,12 @@ def _remove_footprint(service_id: str, spms, spm, is_agent, extra_roles: list[Ro
     changed: set[str] = set()
 
     # (4) Purge X's outbound footprint — X_role → other_scope edges (allow AND deny) stored on OTHER
-    # services' SPMs. Dedup by id: an extra role can also still be on SPM(X).
-    roles = {role.id: role for role in [*spm_x.owned_roles, *extra_roles]}
+    # services' SPMs. Dedup by id: an extra role can also still be on SPM(X). Skip a role that
+    # another service holds: the edges are keyed by role id, so a purge would also remove that
+    # service's grants. X itself stays denied — a quarantined agent's CR has no rules, and an
+    # offboarded client cannot authenticate.
+    held_elsewhere = {r.id for sid, svc in catalog.items() if sid != service_id for r in svc.roles}
+    roles = {role.id: role for role in [*spm_x.owned_roles, *extra_roles] if role.id not in held_elsewhere}
     for role in roles.values():
         for stored in get_service_policies_by_role(role):
             if stored.service_id == service_id:

@@ -53,7 +53,7 @@ flowchart TD
 `onboarding/orchestrator.py`
 
 **Sequence:**
-0. Read the `Service` once (`get_service(service_id)`, by the UUID) and take its clientId (`Service.serviceId`) — the only service id the PCE takes. This read comes before Provision, so if it fails, nothing exists yet that needs compensation. The rollback reuses this `Service`.
+0. Read the `Service` once (`get_service(service_id)`, by the UUID) and take its clientId (`Service.serviceId`) — the only service id the PCE takes. This read comes before Provision, so if it fails, nothing exists yet that needs compensation: the Orchestrator raises `HTTPException(502)`, as Provision does for the same read. The rollback reuses this `Service`.
 1. Call `ServiceProvisionGraph.invoke()` → get back `ServiceProvision { roles, scopes }` + `service_type`.
 2. Call `ServicePolicyBuilder.build(service_id, service_type)` → get back `list[PolicyRule]`. Service Policy Builder re-resolves the focus service from the IdP catalog by its internal client UUID (`service_id`; Provision has already persisted its roles/scopes), so it needs only the id, not the `ServiceProvision`.
 3. Return `(list[PolicyRule], override=False, client_id)` to the Controller. `onboard_service(service_id)` returns this 3-tuple; the caller passes `client_id` to the PCE as `focus_service`, so it makes no second IdP read. It takes no default-effect argument: a pair that no rule mentions is always DENY.

@@ -26,6 +26,8 @@ import contextlib
 import logging
 import threading
 
+from fastapi import HTTPException
+
 from aiac.agent.policy_rules_builder.conflict_detection import PolicyConflictError
 from aiac.agent.policy_rules_builder.graph import (
     LLMAccessError,
@@ -184,8 +186,8 @@ def onboard_service(service_id: ServiceUuid) -> tuple[list[PolicyRule], bool, Cl
     reads the ``Service`` from the IdP **once**, before Provision, and resolves its clientId
     (``Service.serviceId``) — the only service id the PCE takes. The caller passes the returned
     ``client_id`` to ``compute_and_apply`` as ``focus_service``, so it makes no second IdP read. If
-    the read fails, nothing exists yet that needs compensation: the error propagates before
-    Provision.
+    the read fails, nothing exists yet that needs compensation: it raises ``HTTPException(502)``
+    (as Provision's ``classify_service`` does) before Provision.
 
     On any of the four typed build failures (see ``_ROLLBACK_ERRORS``, for agents and tools, on the
     first failure — also the retryable ``LLMAccessError``) the Orchestrator runs the compensating
@@ -213,7 +215,12 @@ def onboard_service(service_id: ServiceUuid) -> tuple[list[PolicyRule], bool, Cl
     lock (one agent replica only); cross-replica serialization is out of scope."""
     with _service_lock(service_id):
         config = _config()
-        service = config.get_service(service_id)
+        try:
+            service = config.get_service(service_id)
+        except Exception as e:
+            # The same boundary as Provision's classify_service: an IdP outage or an unknown UUID
+            # is a 502, not a raw error that the Controller turns into a 500.
+            raise HTTPException(502, f"IdP config unavailable resolving service {service_id!r}: {e}") from e
         client_id = ClientId(service.serviceId)
 
         provision = build_provision_graph().invoke(OnboardingProvisionState(trigger=Trigger(entity_id=service_id)))

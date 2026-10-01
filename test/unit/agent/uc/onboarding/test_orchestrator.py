@@ -151,8 +151,10 @@ class TestServiceReadFails:
     def test_nothing_is_provisioned_or_quarantined_when_the_service_read_fails(self, quarantine):
         # The clientId is resolved before Provision, so a failed IdP read happens before anything
         # exists that needs compensation: no Provision, no build, no rollback, no quarantine.
+        # A raw IdP error (the Configuration library raises RuntimeError) becomes the same
+        # HTTPException(502) that Provision raises, not a generic 500.
         config = MagicMock()
-        config.get_service.side_effect = HTTPException(502, "IdP config unavailable")
+        config.get_service.side_effect = RuntimeError("IdP config unavailable")
         graph = _graph()
 
         with (

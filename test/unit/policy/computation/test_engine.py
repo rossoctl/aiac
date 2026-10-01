@@ -1467,3 +1467,93 @@ def test_run_never_derives_an_agent_that_is_absent_from_the_catalog():
     assert _inbound(store.data["ghost-agent"]) == []  # the purge still lands
     assert "ghost-agent" not in store.pushed_agent_ids
     assert store.pushed_agent_ids == {"github-agent"}
+
+
+# --------------------------------------------------------------------------- #
+# PR 227 review fixes — the override purge set comes from the unfiltered input; #
+# quarantine and decommission derive only live agents, and keep the grants of   #
+# a role that another service also holds.                                       #
+# --------------------------------------------------------------------------- #
+def test_override_purges_a_role_whose_every_new_rule_the_guard_drops():
+    # The only new rule for r-user-dev targets the disabled tool, so the guard drops it. Under
+    # override the role's old grant on SPM(github-agent) must still go.
+    AR, UR, AS, TS, catalog = _guard_catalog(tool_enabled=False)
+    initial = {"github-agent": _spm("github-agent", owned_roles=[AR], owned_scopes=[AS], inbound=[_rule(UR, AS)])}
+
+    store = run_engine([_rule(UR, TS)], catalog=catalog, store_initial=initial, override=True)
+
+    assert _inbound(store.data["github-agent"]) == []
+    assert "github-tool" not in store.data
+    assert store.pushed_agent("github-agent").inbound_subject_allow_rules == []
+
+
+def _shared_role_fixture():
+    """r-shared is one realm role on the service accounts of github-agent (X) and other-agent. Its
+    grant on the tool is other-agent's grant too."""
+    catalog, initial = _quarantine_fixture()
+    SX = _agent_role("r-shared", "shared", owner="github-agent")
+    SB = _agent_role("r-shared", "shared", owner="other-agent")
+    TS = initial["github-tool"].owned_scopes[0]
+    catalog[0].roles.append(SX)
+    catalog[1].roles.append(SB)
+    initial["github-agent"].owned_roles.append(SX)
+    initial["github-tool"].inbound_allow_rules.append(_rule(SB, TS))
+    return catalog, initial
+
+
+def test_quarantine_keeps_the_grants_of_a_role_another_service_also_holds():
+    catalog, initial = _shared_role_fixture()
+    store = run_quarantine("github-agent", catalog=catalog, store=FakeStore(initial))
+
+    assert ("r-shared", "s-tool-read") in _pairs(_inbound(store.data["github-tool"]))
+    assert ("r-x-src", "s-tool-read") not in _pairs(_inbound(store.data["github-tool"]))
+    assert ("r-shared", "s-tool-read") in _pairs(store.pushed_agent("other-agent").outbound_target_allow_rules)
+
+
+def test_decommission_keeps_the_grants_of_a_role_another_service_also_holds():
+    catalog, initial = _shared_role_fixture()
+    live = [svc for svc in catalog if svc.serviceId != "github-agent"]  # X was offboarded
+    store = run_decommission("github-agent", catalog=live, store=FakeStore(initial))
+
+    assert ("r-shared", "s-tool-read") in _pairs(_inbound(store.data["github-tool"]))
+    assert ("r-x-src", "s-tool-read") not in _pairs(_inbound(store.data["github-tool"]))
+
+
+def _ghost_target_fixture(*, ghost_in_catalog, ghost_enabled=False):
+    """X (github-agent) holds a grant on ghost-agent, whose stored SPM remains. ghost-agent is
+    either absent from the catalog (its client was deleted without an offboard) or disabled."""
+    catalog, initial = _quarantine_fixture()
+    AR = catalog[0].roles[0]
+    GS = _scope("s-ghost-in", "ghost-inbound", service_id="ghost-agent")
+    initial["ghost-agent"] = _spm("ghost-agent", owned_scopes=[GS], inbound=[_rule(AR, GS)])
+    if ghost_in_catalog:
+        catalog.append(_agent("ghost-agent", scopes=[GS], enabled=ghost_enabled))
+    return catalog, initial
+
+
+def test_quarantine_never_derives_an_agent_that_is_absent_from_the_catalog():
+    catalog, initial = _ghost_target_fixture(ghost_in_catalog=False)
+    store = run_quarantine("github-agent", catalog=catalog, store=FakeStore(initial))
+
+    assert _inbound(store.data["ghost-agent"]) == []  # the purge still lands
+    assert "ghost-agent" not in store.pushed_agent_ids
+    assert store.pushed_agent_ids == {"other-agent"}
+
+
+def test_quarantine_never_derives_a_disabled_agent():
+    # A disabled agent keeps its no-rules CR: a re-derive must not write over it.
+    catalog, initial = _ghost_target_fixture(ghost_in_catalog=True)
+    store = run_quarantine("github-agent", catalog=catalog, store=FakeStore(initial))
+
+    assert _inbound(store.data["ghost-agent"]) == []
+    assert "ghost-agent" not in store.pushed_agent_ids
+
+
+def test_decommission_never_derives_an_agent_that_is_absent_from_the_catalog():
+    catalog, initial = _ghost_target_fixture(ghost_in_catalog=False)
+    live = [svc for svc in catalog if svc.serviceId != "github-agent"]  # X was offboarded
+    store = run_decommission("github-agent", catalog=live, store=FakeStore(initial))
+
+    assert _inbound(store.data["ghost-agent"]) == []
+    assert "ghost-agent" not in store.pushed_agent_ids
+    assert store.pushed_agent_ids == {"other-agent"}
