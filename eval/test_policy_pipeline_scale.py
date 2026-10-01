@@ -665,14 +665,29 @@ def test_scale_per_decision_structural_e2e(per_decision_e2e_result: dict, record
     role_invalid = invalid_selected_names(r["role_candidate_names"], r["role_selected"], r["role_denied"])
     scope_duplicates = duplicate_rule_triples(r["scope_rules"])
     role_duplicates = duplicate_rule_triples(r["role_rules"])
-    # Only these two files are ever expected: PER_DECISION_SCOPE_AGENT_ID has no outbound-side
-    # roles/target-scopes at all, and PER_DECISION_ROLE_AGENT_ID has no inbound scope -- both by
-    # design, not a gap, so this is an explicit list rather than every agent x direction
-    # combination.
-    rego_paths = [
-        (f"{PER_DECISION_SCOPE_AGENT_ID}/inbound", _rego_path(r["rego_dir"], PER_DECISION_SCOPE_AGENT_ID, "inbound")),
-        (f"{PER_DECISION_ROLE_AGENT_ID}/outbound", _rego_path(r["rego_dir"], PER_DECISION_ROLE_AGENT_ID, "outbound")),
-    ]
+    # PER_DECISION_SCOPE_AGENT_ID has no outbound-side roles/target-scopes at all, and
+    # PER_DECISION_ROLE_AGENT_ID has no inbound scope -- both by design, not a gap, so at most
+    # these two files are ever expected. But a file is expected only once the PRB actually
+    # produced at least one rule for that direction: the PCE writes a CR/Rego only for a
+    # scope/role some rule touches, and a live LLM can legitimately return zero rules for a
+    # direction (a pure under-grant, or an exhausted best-effort fallback) -- that's a correctness
+    # finding (already tracked, non-gating, by the correctness test's under_grants), not a
+    # structural defect. Mirrors the total-corpus structural test's own agents_with_rules gating.
+    rego_paths = []
+    if r["scope_rules"]:
+        rego_paths.append(
+            (
+                f"{PER_DECISION_SCOPE_AGENT_ID}/inbound",
+                _rego_path(r["rego_dir"], PER_DECISION_SCOPE_AGENT_ID, "inbound"),
+            )
+        )
+    if r["role_rules"]:
+        rego_paths.append(
+            (
+                f"{PER_DECISION_ROLE_AGENT_ID}/outbound",
+                _rego_path(r["rego_dir"], PER_DECISION_ROLE_AGENT_ID, "outbound"),
+            )
+        )
     missing_files = missing_rego(rego_paths)
     cost = summarize_usage(r["usage_by_name"])
     best_effort_notes = {k: v for k, v in (("scope_decision", r["scope_note"]), ("role_decision", r["role_note"])) if v}
