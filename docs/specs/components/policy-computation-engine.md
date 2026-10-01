@@ -237,7 +237,9 @@ A disabled client is a failed (quarantined) service. Under the PCE lock, after t
 
 The focus service is the exception. A re-onboarding applies while its client is still disabled, because `reenable_service` runs after the apply. So the rules of the focus service are kept. Without a `focus_service`, the guard drops every rule that touches a disabled service.
 
-The guard prevents a build that started before a quarantine from writing its rules back into the removed footprint. The focal resolver applies the same rule on the build side (see [`aiac-agent/uc1-service-onboarding.md` → Service Policy Builder](aiac-agent/uc1-service-onboarding.md#sub-agent-service-policy-builder)).
+**Deleted services.** A service that is absent from the catalog is deleted (its client was removed, for example offboarded while its onboarding was still building). The guard also drops every rule whose scope owner, or the owner of whose Agent-kind role, is absent from the catalog. There is no focus exception for this case. The run also derives only agents that are in the catalog: the store returns a placeholder SPM typed `Agent` on a 404, so without this check a late onboarding of a deleted tool wrote a CR for it, and a run that touched the stored SPM of a deleted agent wrote its CR again. Removing a deleted service's footprint is `decommission`'s job.
+
+The guard prevents a build that started before a quarantine or an offboard from writing its rules back into the removed footprint. The focal resolver applies the disabled-service rule on the build side (see [`aiac-agent/uc1-service-onboarding.md` → Service Policy Builder](aiac-agent/uc1-service-onboarding.md#sub-agent-service-policy-builder)).
 
 ### Serialization (the PCE lock)
 

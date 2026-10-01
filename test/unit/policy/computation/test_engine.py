@@ -729,13 +729,16 @@ def test_reconcile_preserves_live_edges_and_is_idempotent():
 
 def test_reconcile_skips_when_service_absent_from_catalog():
     # A transient catalog miss (owning service not returned by get_services()) must never wipe an
-    # SPM — reconcile is skipped and the stale edge is left intact rather than dropped.
+    # SPM — reconcile is skipped and the stale edge is left intact rather than dropped. Called
+    # directly: compute_and_apply's routing guard already drops a rule for an absent owner.
+    from aiac.policy.computation.engine import _reconcile
+
     UR = _user_role("r-user-dev", "developer", users=["dev-user"])
     orphan_scope = _scope("s-orphan", "orphan", service_id="orphan")
-    initial = {"orphan": _spm("orphan", owned_scopes=[orphan_scope], inbound=[_rule(UR, orphan_scope)])}
-    store = run_engine([_rule(UR, orphan_scope)], catalog=[], store_initial=initial)
+    model = _spm("orphan", owned_scopes=[], inbound=[_rule(UR, orphan_scope)])
 
-    assert _pairs(_inbound(store.data["orphan"])) == [("r-user-dev", "s-orphan")]
+    assert _reconcile(model, {}, set(), {UR.id}) is False
+    assert _pairs(_inbound(model)) == [("r-user-dev", "s-orphan")]
 
 
 # --------------------------------------------------------------------------- #
@@ -1376,3 +1379,44 @@ def test_quarantine_holds_the_pce_lock():
         from aiac.policy.computation import quarantine
 
         _blocks_while_pce_lock_held(lambda: quarantine("uuid-github-agent"))
+
+
+# --------------------------------------------------------------------------- #
+# Absent services — a service missing from the catalog (its client was deleted, #
+# e.g. offboarded while its onboarding was still building) is treated like a    #
+# disabled one: its rules are dropped, and _run never derives (writes a CR for) #
+# an agent that is not in the catalog. The store's 404 placeholder SPM says     #
+# service_type=AGENT, so without this a deleted tool got a CR.                  #
+# --------------------------------------------------------------------------- #
+def test_guard_drops_rule_whose_scope_owner_is_absent_from_the_catalog():
+    AR, UR, AS, TS, catalog = _guard_catalog()
+    live = [svc for svc in catalog if svc.serviceId != "github-tool"]  # the tool's client was deleted
+    store = run_engine([_rule(AR, TS), _rule(UR, TS)], catalog=live, focus_service="uuid-github-tool")
+
+    assert "github-tool" not in store.data
+    assert store.service_writes == []
+    assert "github-tool" not in store.pushed_agent_ids
+
+
+def test_guard_drops_rule_whose_agent_role_owner_is_absent_from_the_catalog():
+    AR, UR, AS, TS, catalog = _guard_catalog()
+    live = [svc for svc in catalog if svc.serviceId != "github-agent"]  # the agent's client was deleted
+    store = run_engine([_rule(AR, TS), _rule(UR, TS)], catalog=live)
+
+    assert _pairs(_inbound(store.data["github-tool"])) == [("r-user-dev", "s-tool-read")]
+    assert "github-agent" not in store.pushed_agent_ids
+
+
+def test_run_never_derives_an_agent_that_is_absent_from_the_catalog():
+    # Override-purge touches the stored SPM of a deleted agent (its persisted type is AGENT). The
+    # purge is persisted, but no CR is written for the deleted agent.
+    UR = _user_role("r-user-dev", "developer", users=["dev-user"])
+    ghost_scope = _scope("s-ghost-in", "ghost-inbound", service_id="ghost-agent")
+    AR, _, AS, _, catalog = _repro()
+    initial = {"ghost-agent": _spm("ghost-agent", owned_scopes=[ghost_scope], inbound=[_rule(UR, ghost_scope)])}
+
+    store = run_engine([_rule(UR, AS)], catalog=catalog, store_initial=initial, override=True)
+
+    assert _inbound(store.data["ghost-agent"]) == []  # the purge still lands
+    assert "ghost-agent" not in store.pushed_agent_ids
+    assert store.pushed_agent_ids == {"github-agent"}

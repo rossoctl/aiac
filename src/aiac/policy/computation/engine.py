@@ -273,10 +273,11 @@ def compute_and_apply(
     There is no default effect to pass: the deployed Rego always denies a ``(role, scope)`` pair
     that no rule mentions, so every re-derivation of an agent gives the same behavior.
 
-    Routing guard. A disabled client is a failed (quarantined) service. Under the PCE lock, after
-    the catalog read, the run drops each rule whose scope owner is disabled, or whose agent role
-    belongs to a disabled service (``role.actorIds``), so a build that started before a quarantine
-    cannot write rules back into the torn-down footprint. ``focus_service`` — the Keycloak internal
+    Routing guard. A disabled client is a failed (quarantined) service; a service absent from the
+    catalog is deleted. Under the PCE lock, after the catalog read, the run drops each rule whose
+    scope owner, or the owner of whose agent role (``role.actorIds``), is disabled or absent, so a
+    build that started before a quarantine or an offboard cannot write rules back into the removed
+    footprint. The run also derives only agents that are in the catalog. ``focus_service`` — the Keycloak internal
     client UUID (``Service.id``) of the service this onboarding builds — is exempt: a re-onboarding
     applies while its client is still disabled (``reenable_service`` runs after the apply). The
     onboarding route and the NATS consumer pass it; every other caller passes nothing, so every
@@ -325,11 +326,14 @@ def _disabled_services(catalog: dict[str, Service], focus_service: str | None) -
     return {sid for sid, svc in catalog.items() if not svc.enabled and svc.id != focus_service}
 
 
-def _touches(rule: PolicyRule, service_ids: set[str]) -> bool:
-    """True iff ``rule``'s scope owner, or the owner of its agent role, is in ``service_ids``."""
-    if rule.scope.serviceId in service_ids:
-        return True
-    return rule.role.kind == RoleKind.AGENT and any(actor in service_ids for actor in rule.role.actorIds)
+def _routable(rule: PolicyRule, catalog: dict[str, Service], disabled: set[str]) -> bool:
+    """True iff every service ``rule`` touches — its scope owner, and the owner of its agent role —
+    is live: present in ``catalog`` and not in ``disabled``. A service absent from the catalog is
+    gone (its client was deleted, e.g. offboarded while its onboarding was still building)."""
+    owners = {rule.scope.serviceId}
+    if rule.role.kind == RoleKind.AGENT:
+        owners.update(rule.role.actorIds)
+    return all(owner in catalog and owner not in disabled for owner in owners)
 
 
 def quarantine(service_uuid: str) -> None:
@@ -374,14 +378,16 @@ def _run(rules: list[PolicyRule], override: bool, focus_service: str | None = No
     # for P4) and its own roles/scopes (embedded on the APM for P2, filtered to aiac.managed).
     catalog = {svc.serviceId: svc for svc in config.get_services()}
 
-    # (1.5) Routing guard — drop every rule that touches a disabled (quarantined) service, except
-    # the focus service (see ``compute_and_apply``).
+    # (1.5) Routing guard — drop every rule that touches a service that is not live: disabled
+    # (quarantined, except the focus service) or absent from the catalog (deleted). See
+    # ``compute_and_apply``.
     disabled = _disabled_services(catalog, focus_service)
-    if disabled:
-        kept = [rule for rule in rules if not _touches(rule, disabled)]
-        if len(kept) != len(rules):
-            logger.info("routing guard dropped %d rule(s) that touch a disabled service", len(rules) - len(kept))
-        rules = kept
+    kept = [rule for rule in rules if _routable(rule, catalog, disabled)]
+    if len(kept) != len(rules):
+        logger.warning(
+            "routing guard dropped %d rule(s) that touch a disabled or deleted service", len(rules) - len(kept)
+        )
+    rules = kept
 
     # SPM cache: fetch each SPM from the store at most once, seed its identity from the catalog,
     # mutate in place, and persist the changed ones.
@@ -449,8 +455,10 @@ def _run(rules: list[PolicyRule], override: bool, focus_service: str | None = No
                 affected.update(edge.role.actorIds)
 
     # (6) Derive each affected agent's APM (zero IdP) and partial-upsert once. Tools get an SPM
-    # but no APM (P4).
-    _apply_derived(affected, spm, is_agent)
+    # but no APM (P4). Only agents in the catalog: an agent absent from it is deleted, and its
+    # stored SPM (or the store's 404 placeholder, typed AGENT) must not bring its CR back —
+    # removing it is ``decommission``'s job.
+    _apply_derived(affected & catalog.keys(), spm, is_agent)
 
 
 def _decommission(service_id: str) -> None:
