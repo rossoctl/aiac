@@ -469,23 +469,17 @@ kubectl exec -i -n team1 "$POD" -c agent -- python3 - < /tmp/probe.py
 > envelope. Classify the outcome by the response **body** (an `error` frame =
 > denied, a `result` frame = allowed), not the HTTP status.
 >
-> The example CR predates the MCP session rule, so it admits only a
-> `tools/call` whose `input.mcp.params.name` (the invoked tool) both the
-> delegated user's role and the target service list. It denies `tools/list`.
-> The outbound rego that AIAC generates today (`generate_outbound_rego`, see
-> [`pdp-policy-writer-opa.md`](../docs/specs/components/pdp-policy-writer-opa.md#outbound-package-authbridgeclientoutboundrequest))
-> also allows the MCP session messages (`initialize`,
-> `notifications/initialized`, `ping`, `tools/list`) to a target when the user
-> holds a grant on at least one tool of that target. So with a generated CR,
-> this `tools/list` probe as `dev-user` is **allowed** (a `result` frame), and
-> the same probe as a user with no grant on a `github-tool` tool is
-> **denied**. A non-MCP-shaped rejection (no parser, or a JSON-RPC
+> The example CR is generated output (`generate_outbound_rego`, see
+> [`pdp-policy-writer-opa.md`](../docs/specs/components/pdp-policy-writer-opa.md#outbound-package-authbridgeclientoutboundrequest)).
+> It admits a `tools/call` whose `input.mcp.params.name` (the invoked tool) both
+> the delegated user's role and the target service list. It also allows the MCP
+> session messages (`initialize`, `notifications/initialized`, `ping`,
+> `tools/list`) to a target when the user holds a grant on at least one tool of
+> that target. So this `tools/list` probe as `dev-user` is **allowed** (a
+> `result` frame), and the same probe as a user with no grant on a
+> `github-tool` tool is **denied**. A non-MCP-shaped rejection (no parser, or a JSON-RPC
 > *notification* with no `id`) instead falls through to a plain HTTP `403`; a
-> `token-exchange` failure surfaces as `503` before OPA is even consulted. To
-> see the full allow path (a `result` frame at HTTP 200) with the example CR,
-> apply only the inbound tier of the CR, or drive a real `tools/call` whose
-> tool name is present in `subject_role_allow_scopes` and `target_allow_scopes`
-> in the outbound rego.
+> `token-exchange` failure surfaces as `503` before OPA is even consulted.
 
 ## B.5 — The outbound OPA input, exactly
 
@@ -571,11 +565,8 @@ target service both admit the invoked tool — an AND across the user→tool and
 service→tool gates. The `subject_role_allow_scopes` / `target_allow_scopes` maps
 in the example are keyed by the actual MCP tool names exposed by the deployed
 github-tool (`demo/assets/tools/github_tool`): `source-read`,
-`source-write`, `issues-read`, `issues-write`. The example predates the MCP
-session rule, so MCP methods that don't invoke a specific tool — like the
-`tools/list` probe above — carry no `params.name`, never match, and are denied.
-The generated outbound rego also reads `input.mcp.method` (always set by the
-plugin). It allows a `tools/call` per tool, and it allows the session messages
+`source-write`, `issues-read`, `issues-write`. The outbound rego also reads
+`input.mcp.method` (always set by the plugin). It allows a `tools/call` per tool, and it allows the session messages
 (`initialize`, `notifications/initialized`, `ping`, `tools/list`) to a target
 iff at least one tool of that target passes the full per-tool check for this
 user. It denies every other MCP method.
