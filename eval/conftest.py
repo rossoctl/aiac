@@ -597,8 +597,18 @@ def _write_trend_log() -> None:
         # just one of the two test functions produces a row that isn't comparable to a full run
         # of the suite, same "partial" convention every dict above already uses.
         run_type = "regression" if structural and correctness else "partial"
-        metrics = {**pool_scale_metrics(structural), **pool_correctness_metrics(correctness)}
-        append_row(scale_suite, metrics, run_type=run_type)
+        # Skip whichever half didn't run rather than pooling an empty list: pool_scale_metrics([])
+        # and pool_correctness_metrics([]) each report a vacuous "nothing failed" for a half that
+        # was never measured (structural_pass_rate / precision+recall+denial_precision = 1.0), and
+        # merging both unconditionally also let whichever ran second clobber the other half's real
+        # scenarios_scored with its own 0 -- same "skip the empty one" convention the Robustness
+        # branch above already uses.
+        scale_metrics: dict[str, Any] = {}
+        if structural:
+            scale_metrics.update(pool_scale_metrics(structural))
+        if correctness:
+            scale_metrics.update(pool_correctness_metrics(correctness))
+        append_row(scale_suite, scale_metrics, run_type=run_type)
 
 
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
