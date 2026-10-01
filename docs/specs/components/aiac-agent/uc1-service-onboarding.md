@@ -160,6 +160,12 @@ START → classify_service → [analyze_agent | analyze_tool] → provision_serv
      naming the service id) if minting fails.
   3. Call `tools/list` (HTTP POST, MCP protocol) on the resolved endpoint, sending the minted token as
      `Authorization: Bearer <token>`.
+     **Wait for the endpoint.** The operator registers the tool's client (which fires the onboarding
+     event) while it still rolls the tool pod onto the AuthBridge-injected template, so the endpoint can
+     be not ready for some seconds. Discovery tries `tools/list` again every 3 s while the endpoint is not
+     ready — a connection error (refused, reset, connect timeout) or a `502`/`503`/`504` from the sidecar —
+     until `AIAC_MCP_DISCOVERY_READY_TIMEOUT` ends (default 120 s, well below the NATS `ACK_WAIT` of 600 s).
+     A `4xx` or a read timeout fails at once.
   4. Produce `ServiceProvision`:
      - `roles`: `[]` (tools do not initiate further calls)
      - `scopes`: `[ScopeDefinition(name=f"{workload_name}.{tool.name}", description=tool.description) for tool in manifest.tools]`
