@@ -41,7 +41,7 @@ The relationship maps (`source_roles`, `subject_roles`, `target_allow_scopes` / 
 
 **Two-sided rules (ALLOW / DENY).** Every rule carries a `RuleEffect` — `Allow` or `Deny` — and both kinds are stored side by side as first-class facts in **explicitly separated** parallel lists (never one intermixed list). A DENY rule is a durable prohibition that **subtracts** from what the ALLOW rules grant, honored uniformly at every gate (inbound subject, inbound source, outbound subject, outbound target). Generated policy applies **deny-overrides**: a request is allowed only if some ALLOW gate passes **and** no DENY gate matches, so a later broad grant can no longer silently re-open a denied path. For now the model assumes **no conflict** — no `(role, scope)` is ever both ALLOW and DENY for the same subject — so there is **no precedence/tie-break logic**; DENY simply subtracts. Cross-role conflict resolution is a deliberate later concern (see [Out of Scope](#out-of-scope)).
 
-**Per-policy default effect.** `AgentPolicyModel` carries a `default_effect: RuleEffect` (default `Deny`) that decides how the deployed Rego treats a `(role, scope)` pair that **no rule mentions**. Three states exist per pair: **explicitly ALLOWed** (an allow rule names it), **explicitly DENYed** (a deny rule names it), and **unspecified** (no rule names it → resolves to `default_effect`). `default_effect = Deny` reproduces today's least-privilege behavior exactly (`default allow := false`, granting only what an allow gate matches); `default_effect = Allow` opens the default while explicit denies still override via deny-overrides. The allow/deny rule lists and the effect-agnostic identity maps are emitted **identically** in both modes — only the generated decision block differs (see [`pdp-policy-writer-opa.md`](pdp-policy-writer-opa.md)). `default_effect` is itself effect-agnostic: it is **not** an allow/deny rule split.
+**Always DENY by default.** `AgentPolicyModel` has no default-effect field. The deployed Rego always denies a `(role, scope)` pair that **no rule mentions** (`default allow := false`, granting only what an allow gate matches). A legacy payload that still carries `default_effect` is accepted and the field is ignored (`extra='ignore'`). `RuleEffect` stays: each rule is still `Allow` or `Deny` (see [`pdp-policy-writer-opa.md`](pdp-policy-writer-opa.md)).
 
 ---
 
@@ -59,8 +59,8 @@ The relationship maps (`source_roles`, `subject_roles`, `target_allow_scopes` / 
 10. As a consumer, I want `PolicyRule.effect` to default to `Allow`, so that existing allow-only producers keep working without change.
 11. As a consumer, I want ALLOW and DENY rule sets held in separate lists, so that a gate can evaluate each side without filtering an intermixed list by effect.
 12. As the PDP Policy Writer, I want a role that appears **only** in DENY edges still registered into the effect-agnostic identity maps (`subject_roles` / `source_roles`), so that the Rego deny lookup can resolve it at request time.
-13. As a policy author, I want to choose a policy's **default effect** (allow or deny for pairs no rule mentions), so that I can deploy a permissive-by-default policy that still honors explicit denies, without touching the allow/deny rule lists.
-14. As a consumer, I want `AgentPolicyModel.default_effect` to default to `Deny`, so that existing constructions and serialized models keep today's least-privilege behavior unchanged.
+13. As a policy author, I want a pair that no rule mentions to be always denied, so that every re-derivation of an agent gives the same least-privilege behavior.
+14. As a consumer, I want a legacy `AgentPolicyModel` payload that still carries `default_effect` to load, so that old serialized models do not break deserialization (the field is ignored).
 
 ---
 
@@ -138,7 +138,6 @@ classDiagram
     }
     class AgentPolicyModel {
         +agent_id : str
-        +default_effect : RuleEffect
         +agent_scopes : Scope[]
         +target_allow_scopes : Dict~str,Scope[]~
         +target_deny_scopes : Dict~str,Scope[]~
@@ -163,7 +162,6 @@ classDiagram
 
     PolicyModel "1" *-- "0..*" AgentPolicyModel : agents
     AgentPolicyModel "1" o-- "0..*" PolicyRule : inbound_subject/source_allow/deny_rules · outbound_target/subject_allow/deny_rules
-    AgentPolicyModel --> RuleEffect : default_effect
     PolicyRule --> RuleEffect : effect
 ```
 
@@ -230,7 +228,6 @@ The rule lists split into **8 entity×effect lists** — {inbound subject, inbou
 | Field | Type | Description |
 |-------|------|-------------|
 | `agent_id` | `str` | Service ID from the AIAC trigger event (`aiac.apply.service.{id}`) |
-| `default_effect` | `RuleEffect` | How the deployed Rego treats a `(role, scope)` pair that **no rule mentions**: `Allow` / `Deny`. Defaults to `Deny` (least-privilege — reproduces today's `default allow := false` byte-for-byte). Effect-agnostic — not an allow/deny rule split. See **Per-policy default effect** above and [`pdp-policy-writer-opa.md`](pdp-policy-writer-opa.md). |
 | `agent_roles` | `list[Role]` | Realm roles assigned to this agent. **Effect-agnostic identity.** |
 | `agent_scopes` | `list[Scope]` | Scopes this agent exposes. **Effect-agnostic identity.** |
 | `source_roles` | `dict[str, list[Role]]` | Inbound: source (calling service) **id** → roles held. **Optional** gate input — an absent source passes. **Effect-agnostic identity** (see deny-inclusion note). |
@@ -248,7 +245,7 @@ The rule lists split into **8 entity×effect lists** — {inbound subject, inbou
 
 > **Effect-agnostic identity maps must include deny-edge roles.** `subject_roles` / `source_roles` (and `agent_roles` / `agent_scopes`) carry **no** allow/deny split — the split lives only in the rule lists and target maps. A role or subject that appears **only** in DENY edges **must still be registered** into `subject_roles` / `source_roles`, or the Rego deny lookup (`subject_roles[input.subject]` → deny-scope map) cannot resolve the role and the prohibition silently fails to fire.
 
-> **`default_effect` is PCE-produced, not stored.** Because `AgentPolicyModel` is a **pure derived projection** rebuilt on every relevant recompute, `default_effect` must be set by the PCE at derive time — it is never read back from a store. The minimal design threads an optional `default_effect: RuleEffect = RuleEffect.DENY` through `compute_and_apply` → `_run` → `_derive`, so every existing call site keeps the `Deny` default and only a caller that explicitly opts in (e.g. an onboarding request) asks for `Allow`. The Policy Rules Builder is **not** involved — it never sets `default_effect`. **Caveat:** this parameter path is **not durable** — an unrelated later recompute that re-derives this agent rebuilds the APM with the `Deny` default unless that call also passes `Allow`. If the value must survive independent re-derivation, persist it on `ServicePolicyModel` (add the field there, seed from onboarding input, and have `_derive` copy it onto the APM); that is the only origin that reproduces across recomputes.
+> **No default effect.** The model has no default-effect field, so the PCE sets none at derive time. A pair that no rule mentions is always DENY.
 
 **Inbound rule semantics (deny-overrides):** a subject holding realm role `role` is permitted to invoke this agent for the agent scope `scope` iff an `inbound_subject_allow` edge grants it **and no** `inbound_subject_deny` edge prohibits it; the same allow-and-not-deny logic applies to the source gate. The PDP Policy Writer consumes the allow/deny lists as separate role → agent-scope maps; its inbound gate is keyed on the subject id (mandatory), with the calling source id optional.
 
@@ -330,7 +327,7 @@ The two-layer model rests on three invariants. All three are **AIAC invariants**
 Key behaviors to assert:
 - `Scope.serviceId` is present; `Role.kind` (a `RoleKind`) and `Role.actorIds` (a `list[str]`) are present; the `Role` `model_validator` accepts a valid `kind` + `list[str]` `actorIds` and rejects a malformed one.
 - `RuleEffect` values serialize as `"Allow"` / `"Deny"`; `PolicyRule.effect` defaults to `RuleEffect.ALLOW` when omitted.
-- `AgentPolicyModel.default_effect` defaults to `RuleEffect.DENY` when omitted (existing constructions and serialized models unchanged), accepts `RuleEffect.ALLOW`, and round-trips as `"Deny"` / `"Allow"`.
+- `AgentPolicyModel` has no `default_effect` field; a legacy payload that carries `default_effect` validates, and the field is dropped (`extra='ignore'`).
 - The same `(role, scope)` coexists as one `Allow` and one `Deny` rule (dedup identity `(role.id, scope.id, effect)` keeps them distinct).
 - `ServicePolicyModel` constructs with `service_id`, `service_type`, `owned_roles`, `owned_scopes`, `inbound_allow_rules`, `inbound_deny_rules`, and round-trips via `model_dump(mode="json")` / `model_validate()` (string keys only) with typed `Role` / `Scope` / `PolicyRule` values preserved.
 - `PolicyRule` accepts typed `Role` and `Scope` objects; rejects plain `str` where `Role`/`Scope` is expected.

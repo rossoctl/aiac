@@ -256,7 +256,10 @@ def upsert_policy(policy: PolicyModel):
     return _run_write(_op)
 
 
-@app.post("/policy/agents/{agent_id}", status_code=204)
+# Both by-id routes take ``{agent_id:path}``: the id is a SPIFFE URI or ``<ns>/<name>``, and the
+# server decodes the library's ``%2F`` back to ``/`` before routing, so a single-segment
+# ``{agent_id}`` never matches it (HTTP 404).
+@app.post("/policy/agents/{agent_id:path}", status_code=204)
 def upsert_agent(agent_id: str, model: AgentPolicyModel):
     # The ``{agent_id}`` path segment is intentionally ignored: the request
     # body is authoritative. ``_upsert_agent`` derives namespace/name from
@@ -267,7 +270,7 @@ def upsert_agent(agent_id: str, model: AgentPolicyModel):
     return _run_write(lambda: _upsert_agent(model))
 
 
-@app.delete("/policy/agents/{agent_id}", status_code=204)
+@app.delete("/policy/agents/{agent_id:path}", status_code=204)
 def delete_agent(agent_id: str):
     return _run_write(lambda: _delete_agent(agent_id))
 

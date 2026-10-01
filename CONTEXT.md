@@ -138,3 +138,25 @@ description-only prohibition yields no durable DENY (see the PRB spec's _digeste
 input retires exclusivity handling and Door B_ decision). Enforcement is tracked
 in the neutrality-guard follow-up (`rossoctl/aiac`).
 _Avoid_: description-driven deny, effect-in-description.
+
+**Quarantine**:
+The policy teardown of a failed onboarding, done by the PCE after the UC1
+rollback disables the client. Keyed by the clientId, as every PCE operation
+is. It deletes the service's SPM, removes its roles
+from the other SPMs, replaces a failed agent's CR with a no-rules CR (which
+denies every request), and re-derives the affected agents. A disabled client
+_is_ a quarantined service: the routing guard drops every rule that touches it,
+and the focal resolver gives it no candidate role or scope. Only a successful
+re-onboarding lifts it. Distinct from **decommission** (the offboard teardown of
+a deleted client, keyed by clientId).
+_Avoid_: rollback (the IdP-side teardown that comes before it), block, ban.
+
+**Focus service**:
+The service that the current onboarding builds rules for — the `focus_service`
+the onboarding route and the NATS consumer pass to the PCE, as its clientId
+(never its Keycloak UUID). It is the one
+disabled service that the routing guard and the focal resolver do not skip,
+because a re-onboarding of a quarantined service builds and applies while its
+client is still disabled (`reenable_service` runs after the apply).
+_Avoid_: target service (a target is the service an agent calls), focal entity
+(the per-pass subject inside one build).

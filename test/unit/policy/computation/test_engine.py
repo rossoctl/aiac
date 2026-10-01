@@ -15,6 +15,7 @@ Store library (fresh-empty SPM on 404, ``get_service_policies_by_role`` scanning
 """
 
 import os
+import threading
 from contextlib import ExitStack, contextmanager
 from unittest.mock import patch
 
@@ -56,23 +57,23 @@ def _scope(id, name=None, *, service_id="", aiac_managed=True) -> Scope:
     return Scope(id=id, name=name or id, attributes=attributes, serviceId=service_id)
 
 
-def _service(service_id, *, type=None, roles=None, scopes=None) -> Service:
+def _service(service_id, *, type=None, roles=None, scopes=None, enabled=True) -> Service:
     return Service(
         id=f"uuid-{service_id}",
         serviceId=service_id,
-        enabled=True,
+        enabled=enabled,
         type=type,
         roles=roles or [],
         scopes=scopes or [],
     )
 
 
-def _agent(service_id, *, roles=None, scopes=None) -> Service:
-    return _service(service_id, type=ServiceType.AGENT, roles=roles, scopes=scopes)
+def _agent(service_id, *, roles=None, scopes=None, enabled=True) -> Service:
+    return _service(service_id, type=ServiceType.AGENT, roles=roles, scopes=scopes, enabled=enabled)
 
 
-def _tool(service_id, *, roles=None, scopes=None) -> Service:
-    return _service(service_id, type=ServiceType.TOOL, roles=roles, scopes=scopes)
+def _tool(service_id, *, roles=None, scopes=None, enabled=True) -> Service:
+    return _service(service_id, type=ServiceType.TOOL, roles=roles, scopes=scopes, enabled=enabled)
 
 
 def _rule(role, scope, effect=RuleEffect.ALLOW) -> PolicyRule:
@@ -115,6 +116,7 @@ class FakeStore:
         self.policy_pushes = []  # [PolicyModel] captured from apply_policy
         self.service_deletes = []  # [service_id] captured from delete_service_policy
         self.agent_deletes = []  # [agent_id] captured from delete_agent_policy
+        self.agent_applies = []  # [(agent_id, APM)] captured from apply_agent_policy
 
     def get_service_policy(self, service_id):
         if service_id in self.data:
@@ -142,6 +144,9 @@ class FakeStore:
 
     def delete_agent_policy(self, agent_id):
         self.agent_deletes.append(agent_id)
+
+    def apply_agent_policy(self, agent_id, model):
+        self.agent_applies.append((agent_id, model.model_copy(deep=True)))
 
     # ---- assertion helpers ------------------------------------------------ #
     @property
@@ -190,15 +195,21 @@ def engine_env(catalog, store):
         stack.enter_context(
             patch("aiac.policy.computation.engine.delete_agent_policy", side_effect=store.delete_agent_policy)
         )
+        stack.enter_context(
+            patch("aiac.policy.computation.engine.apply_agent_policy", side_effect=store.apply_agent_policy)
+        )
         from aiac.policy.computation.engine import compute_and_apply
 
         yield compute_and_apply
 
 
-def run_engine(rules, *, catalog=None, store_initial=None, override=False, default_effect=RuleEffect.DENY) -> FakeStore:
+def run_engine(rules, *, catalog=None, store_initial=None, override=False, focus_service=None) -> FakeStore:
     store = FakeStore(store_initial)
     with engine_env(catalog or [], store) as compute_and_apply:
-        compute_and_apply(rules, override=override, default_effect=default_effect)
+        if focus_service is None:
+            compute_and_apply(rules, override=override)
+        else:
+            compute_and_apply(rules, override=override, focus_service=focus_service)
     return store
 
 
@@ -718,13 +729,16 @@ def test_reconcile_preserves_live_edges_and_is_idempotent():
 
 def test_reconcile_skips_when_service_absent_from_catalog():
     # A transient catalog miss (owning service not returned by get_services()) must never wipe an
-    # SPM — reconcile is skipped and the stale edge is left intact rather than dropped.
+    # SPM — reconcile is skipped and the stale edge is left intact rather than dropped. Called
+    # directly: compute_and_apply's routing guard already drops a rule for an absent owner.
+    from aiac.policy.computation.engine import _reconcile
+
     UR = _user_role("r-user-dev", "developer", users=["dev-user"])
     orphan_scope = _scope("s-orphan", "orphan", service_id="orphan")
-    initial = {"orphan": _spm("orphan", owned_scopes=[orphan_scope], inbound=[_rule(UR, orphan_scope)])}
-    store = run_engine([_rule(UR, orphan_scope)], catalog=[], store_initial=initial)
+    model = _spm("orphan", owned_scopes=[], inbound=[_rule(UR, orphan_scope)])
 
-    assert _pairs(_inbound(store.data["orphan"])) == [("r-user-dev", "s-orphan")]
+    assert _reconcile(model, {}, set(), {UR.id}) is False
+    assert _pairs(_inbound(model)) == [("r-user-dev", "s-orphan")]
 
 
 # --------------------------------------------------------------------------- #
@@ -1042,42 +1056,504 @@ def test_derive_agent_deny_target_scope_and_outbound_subject_deny_gate():
 
 
 # --------------------------------------------------------------------------- #
-# default_effect threading — PCE stamps default_effect onto every derived APM. #
-# The value is produced at derive time (the APM is a pure projection), defaults #
-# to least-privilege DENY, and an explicitly requested ALLOW propagates.        #
+# always DENY — the PCE carries no default effect.                            #
 # --------------------------------------------------------------------------- #
-def test_default_effect_defaults_to_deny_on_derived_apm():
-    # When no default_effect is passed, every emitted APM carries the least-privilege DENY default,
-    # reproducing today's `default allow := false` Rego (byte-for-byte-compatible default).
+def test_compute_and_apply_takes_no_default_effect():
+    import inspect
+
+    from aiac.policy.computation import engine
+
+    for fn in (engine.compute_and_apply, engine._run, engine._derive, engine._fresh_apm):
+        assert "default_effect" not in inspect.signature(fn).parameters, fn.__name__
+
+
+def test_derived_apm_carries_no_default_effect():
     AR, UR, AS, TS, catalog = _repro()
     store = run_engine([_rule(UR, AS)], catalog=catalog)
 
     apm = store.pushed_agent("github-agent")
-    assert apm.default_effect == RuleEffect.DENY
+    assert "default_effect" not in apm.model_dump()
 
 
-def test_default_effect_allow_propagates_to_derived_apm():
-    # A caller-requested ALLOW threads compute_and_apply -> _run -> _derive and lands on the APM.
-    AR, UR, AS, TS, catalog = _repro()
-    store = run_engine([_rule(UR, AS)], catalog=catalog, default_effect=RuleEffect.ALLOW)
+# --------------------------------------------------------------------------- #
+# PCE lock — one module-level lock serializes every read-modify-write of the   #
+# store (compute_and_apply, decommission, quarantine). Without it two runs     #
+# that route rules into one shared SPM both read the old SPM, and the second   #
+# write removes the first run's rules (a lost update, no error).               #
+# --------------------------------------------------------------------------- #
+class PausingStore(FakeStore):
+    """A ``FakeStore`` whose first read of ``pause_on`` waits (bounded) for a second reader.
 
-    apm = store.pushed_agent("github-agent")
-    assert apm.default_effect == RuleEffect.ALLOW
+    Without a lock the second run reads the same, not-yet-written SPM while the first waits, so the
+    two runs interleave read → read → write → write. With the lock the second run cannot read until
+    the first has written; the first waits only until ``timeout`` and then continues."""
+
+    def __init__(self, pause_on, timeout=0.5, initial=None):
+        super().__init__(initial)
+        self.pause_on = pause_on
+        self.timeout = timeout
+        self.first_read = threading.Event()
+        self.second_read = threading.Event()
+        self._reads = 0
+        self._reads_lock = threading.Lock()
+
+    def get_service_policy(self, service_id):
+        model = super().get_service_policy(service_id)
+        if service_id == self.pause_on:
+            with self._reads_lock:
+                self._reads += 1
+                reads = self._reads
+            if reads == 1:
+                self.first_read.set()
+                self.second_read.wait(self.timeout)
+            else:
+                self.second_read.set()
+        return model
 
 
-def test_default_effect_stamped_on_every_emitted_apm():
-    # The default_effect rides onto EVERY APM a single recompute emits, not just the first.
+def _two_agents_one_tool():
     A1 = _agent_role("r-a1", "a1-src", owner="agent-1")
     A2 = _agent_role("r-a2", "a2-src", owner="agent-2")
-    U = _user_role("r-user", "dev", users=["dev-user"])
-    S1 = _scope("s-a1-in", "a1-inbound", service_id="agent-1")
-    S2 = _scope("s-a2-in", "a2-inbound", service_id="agent-2")
+    TS = _scope("s-tool-read", "tool-read", service_id="github-tool")
     catalog = [
-        _agent("agent-1", roles=[A1], scopes=[S1]),
-        _agent("agent-2", roles=[A2], scopes=[S2]),
+        _agent("agent-1", roles=[A1]),
+        _agent("agent-2", roles=[A2]),
+        _tool("github-tool", scopes=[TS]),
     ]
-    store = run_engine([_rule(U, S1), _rule(U, S2)], catalog=catalog, default_effect=RuleEffect.ALLOW)
+    return A1, A2, TS, catalog
 
-    assert store.pushed_agent_ids == {"agent-1", "agent-2"}
-    for agent_id in ("agent-1", "agent-2"):
-        assert store.pushed_agent(agent_id).default_effect == RuleEffect.ALLOW
+
+def _run_in_threads(*calls):
+    errors = []
+
+    def wrap(fn):
+        def target():
+            try:
+                fn()
+            except Exception as exc:  # surfaced to the test thread below
+                errors.append(exc)
+
+        return target
+
+    threads = [threading.Thread(target=wrap(fn)) for fn in calls]
+    threads[0].start()
+    return threads, errors
+
+
+def test_concurrent_runs_into_one_shared_spm_keep_both_rules():
+    A1, A2, TS, catalog = _two_agents_one_tool()
+    store = PausingStore(pause_on="github-tool")
+    with engine_env(catalog, store) as compute_and_apply:
+        threads, errors = _run_in_threads(
+            lambda: compute_and_apply([_rule(A1, TS)]),
+            lambda: compute_and_apply([_rule(A2, TS)]),
+        )
+        assert store.first_read.wait(2)  # run 1 is between its read and its write of SPM(tool)
+        threads[1].start()
+        for t in threads:
+            t.join(5)
+        assert not errors
+
+    assert _pairs(_inbound(store.data["github-tool"])) == [("r-a1", "s-tool-read"), ("r-a2", "s-tool-read")]
+
+
+def _blocks_while_pce_lock_held(fn) -> None:
+    """Hold the PCE lock in the test thread; ``fn`` in a worker must not finish until it is released."""
+    from aiac.policy.computation import engine
+
+    done = threading.Event()
+
+    def target():
+        fn()
+        done.set()
+
+    with engine._pce_lock:
+        worker = threading.Thread(target=target)
+        worker.start()
+        assert not done.wait(0.3), "ran while another holder had the PCE lock"
+    worker.join(5)
+    assert done.is_set()
+
+
+def test_compute_and_apply_holds_the_pce_lock():
+    AR, UR, AS, TS, catalog = _repro()
+    store = FakeStore()
+    with engine_env(catalog, store) as compute_and_apply:
+        _blocks_while_pce_lock_held(lambda: compute_and_apply([_rule(UR, AS)]))
+
+
+def test_decommission_holds_the_pce_lock():
+    store = FakeStore()
+    _onboard_repro(store)
+    with engine_env([_agent("github-agent")], store):
+        from aiac.policy.computation.engine import decommission
+
+        _blocks_while_pce_lock_held(lambda: decommission("github-tool"))
+
+
+# --------------------------------------------------------------------------- #
+# Routing guard — under the PCE lock, after the catalog read, drop each rule    #
+# that touches a disabled (quarantined) service: its scope owner is disabled,   #
+# or its agent role belongs to a disabled service. The focus service (the one   #
+# this onboarding builds, passed as its clientId) is exempt: its client is      #
+# still disabled while a re-onboarding applies.                                 #
+# --------------------------------------------------------------------------- #
+def _guard_catalog(*, agent_enabled=True, tool_enabled=True):
+    AR = _agent_role("r-agent-src", "agent-source", owner="github-agent")
+    UR = _user_role("r-user-dev", "developer", users=["dev-user"])
+    AS = _scope("s-agent-inbound", "agent-inbound", service_id="github-agent")
+    TS = _scope("s-tool-read", "tool-read", service_id="github-tool")
+    catalog = [
+        _agent("github-agent", roles=[AR], scopes=[AS], enabled=agent_enabled),
+        _tool("github-tool", scopes=[TS], enabled=tool_enabled),
+    ]
+    return AR, UR, AS, TS, catalog
+
+
+def test_guard_drops_rule_whose_scope_owner_is_disabled():
+    AR, UR, AS, TS, catalog = _guard_catalog(tool_enabled=False)
+    store = run_engine([_rule(AR, TS), _rule(UR, TS), _rule(UR, AS)], catalog=catalog, focus_service="github-agent")
+
+    assert "github-tool" not in store.data
+    assert _pairs(_inbound(store.data["github-agent"])) == [("r-user-dev", "s-agent-inbound")]
+    assert store.pushed_agent("github-agent").target_allow_scopes == {}
+
+
+def test_guard_drops_rule_whose_agent_role_belongs_to_a_disabled_service():
+    AR, UR, AS, TS, catalog = _guard_catalog(agent_enabled=False)
+    store = run_engine([_rule(AR, TS), _rule(UR, TS)], catalog=catalog, focus_service="github-tool")
+
+    assert _pairs(_inbound(store.data["github-tool"])) == [("r-user-dev", "s-tool-read")]
+    assert "github-agent" not in store.pushed_agent_ids
+
+
+def test_guard_keeps_the_focus_service_rules_while_it_is_disabled():
+    AR, UR, AS, TS, catalog = _guard_catalog(agent_enabled=False)
+    store = run_engine([_rule(AR, TS), _rule(UR, AS)], catalog=catalog, focus_service="github-agent")
+
+    assert _pairs(_inbound(store.data["github-tool"])) == [("r-agent-src", "s-tool-read")]
+    assert _pairs(_inbound(store.data["github-agent"])) == [("r-user-dev", "s-agent-inbound")]
+    assert _pairs(store.pushed_agent("github-agent").outbound_target_allow_rules) == [("r-agent-src", "s-tool-read")]
+
+
+def test_guard_does_not_exempt_a_focus_service_given_by_its_keycloak_uuid():
+    # focus_service is the clientId (the catalog key). A Keycloak UUID matches no catalog key, so
+    # the disabled agent is not exempt and its rules are dropped.
+    AR, UR, AS, TS, catalog = _guard_catalog(agent_enabled=False)
+    store = run_engine([_rule(AR, TS), _rule(UR, AS)], catalog=catalog, focus_service="uuid-github-agent")
+
+    assert "github-agent" not in store.data
+    assert "github-tool" not in store.data
+    assert store.apply_policy_count == 0
+
+
+def test_guard_without_focus_drops_every_rule_that_touches_a_disabled_service():
+    AR, UR, AS, TS, catalog = _guard_catalog(agent_enabled=False)
+    store = run_engine([_rule(AR, TS), _rule(UR, AS), _rule(UR, TS)], catalog=catalog)
+
+    assert "github-agent" not in store.data
+    assert _pairs(_inbound(store.data["github-tool"])) == [("r-user-dev", "s-tool-read")]
+    assert store.apply_policy_count == 0
+
+
+def test_guard_keeps_every_rule_when_all_services_are_enabled():
+    AR, UR, AS, TS, catalog = _guard_catalog()
+    store = run_engine([_rule(AR, TS), _rule(UR, AS)], catalog=catalog)
+
+    assert _pairs(_inbound(store.data["github-tool"])) == [("r-agent-src", "s-tool-read")]
+    assert _pairs(_inbound(store.data["github-agent"])) == [("r-user-dev", "s-agent-inbound")]
+
+
+# --------------------------------------------------------------------------- #
+# quarantine — the failure-path teardown of a failed onboarding. Keyed by the   #
+# clientId (the SPM key), as decommission is; the service is still in the       #
+# catalog (disabled). Deletes SPM(X), removes X's roles from the other SPMs,    #
+# replaces an agent's CR with a no-rules CR (not a delete: today's combiner     #
+# allows a missing CR), and re-derives the affected agents in one call.         #
+# --------------------------------------------------------------------------- #
+def _quarantine_fixture():
+    """X = github-agent (failed, disabled). It targets the tool and other-agent; other-agent targets X."""
+    AR = _agent_role("r-x-src", "x-source", owner="github-agent")
+    BR = _agent_role("r-b-src", "b-source", owner="other-agent")
+    UR = _user_role("r-user-dev", "developer", users=["dev-user"])
+    AS = _scope("s-x-in", "x-inbound", service_id="github-agent")
+    BS = _scope("s-b-in", "b-inbound", service_id="other-agent")
+    TS = _scope("s-tool-read", "tool-read", service_id="github-tool")
+    initial = {
+        "github-agent": _spm(
+            "github-agent", owned_roles=[AR], owned_scopes=[AS], inbound=[_rule(UR, AS), _rule(BR, AS)]
+        ),
+        "github-tool": _spm(
+            "github-tool",
+            type=ServiceType.TOOL,
+            owned_scopes=[TS],
+            inbound=[_rule(AR, TS), _rule(BR, TS), _rule(UR, TS)],
+        ),
+        "other-agent": _spm("other-agent", owned_roles=[BR], owned_scopes=[BS], inbound=[_rule(AR, BS), _rule(UR, BS)]),
+    }
+    catalog = [
+        _agent("github-agent", roles=[AR], scopes=[AS], enabled=False),
+        _agent("other-agent", roles=[BR], scopes=[BS]),
+        _tool("github-tool", scopes=[TS]),
+    ]
+    return catalog, initial
+
+
+def run_quarantine(service_id, *, catalog, store) -> FakeStore:
+    with engine_env(catalog, store):
+        from aiac.policy.computation import quarantine
+
+        quarantine(service_id)
+    return store
+
+
+def test_quarantine_agent_deletes_its_spm_and_removes_its_roles_from_other_spms():
+    catalog, initial = _quarantine_fixture()
+    store = run_quarantine("github-agent", catalog=catalog, store=FakeStore(initial))
+
+    assert store.service_deletes == ["github-agent"]
+    assert "github-agent" not in store.data
+    assert _pairs(_inbound(store.data["github-tool"])) == [("r-b-src", "s-tool-read"), ("r-user-dev", "s-tool-read")]
+    assert _pairs(_inbound(store.data["other-agent"])) == [("r-user-dev", "s-b-in")]
+
+
+def test_quarantine_agent_replaces_its_cr_with_the_no_rules_cr():
+    from aiac.policy.computation.engine import _fresh_apm
+
+    catalog, initial = _quarantine_fixture()
+    store = run_quarantine("github-agent", catalog=catalog, store=FakeStore(initial))
+
+    assert store.agent_applies == [("github-agent", _fresh_apm("github-agent"))]
+    assert store.agent_deletes == []  # not a delete: the combiner allows a missing CR
+
+
+def test_quarantine_rederives_the_affected_agents_in_one_call():
+    catalog, initial = _quarantine_fixture()
+    store = run_quarantine("github-agent", catalog=catalog, store=FakeStore(initial))
+
+    assert store.apply_policy_count == 1
+    assert store.pushed_agent_ids == {"other-agent"}
+    other = store.pushed_agent("other-agent")
+    assert "github-agent" not in other.target_allow_scopes  # targeted X: outbound to X dropped
+    assert "github-agent" not in other.source_roles  # X's role lost on SPM(other-agent)
+    assert _pairs(other.inbound_subject_allow_rules) == [("r-user-dev", "s-b-in")]
+
+
+def test_quarantine_tool_writes_no_cr_and_rederives_its_callers():
+    AR = _agent_role("r-agent-src", "agent-source", owner="github-agent")
+    UR = _user_role("r-user-dev", "developer", users=["dev-user"])
+    TS = _scope("s-tool-read", "tool-read", service_id="github-tool")
+    initial = {
+        "github-tool": _spm(
+            "github-tool", type=ServiceType.TOOL, owned_scopes=[TS], inbound=[_rule(AR, TS), _rule(UR, TS)]
+        )
+    }
+    catalog = [_agent("github-agent", roles=[AR]), _tool("github-tool", scopes=[TS], enabled=False)]
+
+    store = run_quarantine("github-tool", catalog=catalog, store=FakeStore(initial))
+
+    assert "github-tool" not in store.data
+    assert store.agent_applies == []
+    assert store.agent_deletes == []
+    assert store.apply_policy_count == 1
+    assert store.pushed_agent("github-agent").target_allow_scopes == {}
+
+
+def test_quarantine_twice_gives_the_same_result():
+    catalog, initial = _quarantine_fixture()
+    store = run_quarantine("github-agent", catalog=catalog, store=FakeStore(initial))
+    after_first = {sid: m.model_dump() for sid, m in store.data.items()}
+    cr_first = store.agent_applies[-1]
+
+    run_quarantine("github-agent", catalog=catalog, store=store)
+
+    assert {sid: m.model_dump() for sid, m in store.data.items()} == after_first
+    assert store.agent_applies[-1] == cr_first
+
+
+def test_quarantine_unknown_service_is_a_no_op():
+    catalog, initial = _quarantine_fixture()
+    store = run_quarantine("not-there", catalog=catalog, store=FakeStore(initial))
+
+    assert store.service_deletes == []
+    assert store.service_writes == []
+    assert store.agent_applies == []
+    assert store.apply_policy_count == 0
+
+
+def test_quarantine_given_a_keycloak_uuid_is_a_no_op():
+    # The PCE takes only the clientId: a Keycloak UUID is not an SPM key, so it finds nothing.
+    catalog, initial = _quarantine_fixture()
+    store = run_quarantine("uuid-github-agent", catalog=catalog, store=FakeStore(initial))
+
+    assert store.service_deletes == []
+    assert store.agent_applies == []
+    assert store.apply_policy_count == 0
+
+
+def test_quarantine_removes_the_grants_of_roles_the_rollback_deleted():
+    # X's first onboarding created r-x-new. A concurrent run stored its grant on SPM(other-agent)
+    # (r-x-new → s-b-in). Then X's build failed and the rollback deleted r-x-new, so the catalog no
+    # longer lists it. The orchestrator passes it as a deleted role: the quarantine must remove the
+    # grant and re-derive other-agent, or other-agent keeps allowing X.
+    XR = _agent_role("r-x-new", "x-new", owner="github-agent")
+    catalog, initial = _quarantine_fixture()
+    initial["other-agent"].inbound_allow_rules.append(_rule(XR, initial["other-agent"].owned_scopes[0]))
+    store = FakeStore(initial)
+    with engine_env(catalog, store):
+        from aiac.policy.computation import quarantine
+
+        quarantine("github-agent", [XR])
+
+    assert _pairs(_inbound(store.data["other-agent"])) == [("r-user-dev", "s-b-in")]
+    assert "github-agent" not in store.pushed_agent("other-agent").source_roles
+
+
+def test_quarantine_without_the_deleted_roles_keeps_their_grants():
+    # The gap the deleted_roles argument closes: the catalog alone does not name r-x-new.
+    XR = _agent_role("r-x-new", "x-new", owner="github-agent")
+    catalog, initial = _quarantine_fixture()
+    initial["other-agent"].inbound_allow_rules.append(_rule(XR, initial["other-agent"].owned_scopes[0]))
+    store = run_quarantine("github-agent", catalog=catalog, store=FakeStore(initial))
+
+    assert ("r-x-new", "s-b-in") in _pairs(_inbound(store.data["other-agent"]))
+
+
+def test_quarantine_holds_the_pce_lock():
+    catalog, initial = _quarantine_fixture()
+    store = FakeStore(initial)
+    with engine_env(catalog, store):
+        from aiac.policy.computation import quarantine
+
+        _blocks_while_pce_lock_held(lambda: quarantine("github-agent"))
+
+
+# --------------------------------------------------------------------------- #
+# Absent services — a service missing from the catalog (its client was deleted, #
+# e.g. offboarded while its onboarding was still building) is treated like a    #
+# disabled one: its rules are dropped, and _run never derives (writes a CR for) #
+# an agent that is not in the catalog. The store's 404 placeholder SPM says     #
+# service_type=AGENT, so without this a deleted tool got a CR.                  #
+# --------------------------------------------------------------------------- #
+def test_guard_drops_rule_whose_scope_owner_is_absent_from_the_catalog():
+    AR, UR, AS, TS, catalog = _guard_catalog()
+    live = [svc for svc in catalog if svc.serviceId != "github-tool"]  # the tool's client was deleted
+    store = run_engine([_rule(AR, TS), _rule(UR, TS)], catalog=live, focus_service="github-tool")
+
+    assert "github-tool" not in store.data
+    assert store.service_writes == []
+    assert "github-tool" not in store.pushed_agent_ids
+
+
+def test_guard_drops_rule_whose_agent_role_owner_is_absent_from_the_catalog():
+    AR, UR, AS, TS, catalog = _guard_catalog()
+    live = [svc for svc in catalog if svc.serviceId != "github-agent"]  # the agent's client was deleted
+    store = run_engine([_rule(AR, TS), _rule(UR, TS)], catalog=live)
+
+    assert _pairs(_inbound(store.data["github-tool"])) == [("r-user-dev", "s-tool-read")]
+    assert "github-agent" not in store.pushed_agent_ids
+
+
+def test_run_never_derives_an_agent_that_is_absent_from_the_catalog():
+    # Override-purge touches the stored SPM of a deleted agent (its persisted type is AGENT). The
+    # purge is persisted, but no CR is written for the deleted agent.
+    UR = _user_role("r-user-dev", "developer", users=["dev-user"])
+    ghost_scope = _scope("s-ghost-in", "ghost-inbound", service_id="ghost-agent")
+    AR, _, AS, _, catalog = _repro()
+    initial = {"ghost-agent": _spm("ghost-agent", owned_scopes=[ghost_scope], inbound=[_rule(UR, ghost_scope)])}
+
+    store = run_engine([_rule(UR, AS)], catalog=catalog, store_initial=initial, override=True)
+
+    assert _inbound(store.data["ghost-agent"]) == []  # the purge still lands
+    assert "ghost-agent" not in store.pushed_agent_ids
+    assert store.pushed_agent_ids == {"github-agent"}
+
+
+# --------------------------------------------------------------------------- #
+# PR 227 review fixes — the override purge set comes from the unfiltered input; #
+# quarantine and decommission derive only live agents, and keep the grants of   #
+# a role that another service also holds.                                       #
+# --------------------------------------------------------------------------- #
+def test_override_purges_a_role_whose_every_new_rule_the_guard_drops():
+    # The only new rule for r-user-dev targets the disabled tool, so the guard drops it. Under
+    # override the role's old grant on SPM(github-agent) must still go.
+    AR, UR, AS, TS, catalog = _guard_catalog(tool_enabled=False)
+    initial = {"github-agent": _spm("github-agent", owned_roles=[AR], owned_scopes=[AS], inbound=[_rule(UR, AS)])}
+
+    store = run_engine([_rule(UR, TS)], catalog=catalog, store_initial=initial, override=True)
+
+    assert _inbound(store.data["github-agent"]) == []
+    assert "github-tool" not in store.data
+    assert store.pushed_agent("github-agent").inbound_subject_allow_rules == []
+
+
+def _shared_role_fixture():
+    """r-shared is one realm role on the service accounts of github-agent (X) and other-agent. Its
+    grant on the tool is other-agent's grant too."""
+    catalog, initial = _quarantine_fixture()
+    SX = _agent_role("r-shared", "shared", owner="github-agent")
+    SB = _agent_role("r-shared", "shared", owner="other-agent")
+    TS = initial["github-tool"].owned_scopes[0]
+    catalog[0].roles.append(SX)
+    catalog[1].roles.append(SB)
+    initial["github-agent"].owned_roles.append(SX)
+    initial["github-tool"].inbound_allow_rules.append(_rule(SB, TS))
+    return catalog, initial
+
+
+def test_quarantine_keeps_the_grants_of_a_role_another_service_also_holds():
+    catalog, initial = _shared_role_fixture()
+    store = run_quarantine("github-agent", catalog=catalog, store=FakeStore(initial))
+
+    assert ("r-shared", "s-tool-read") in _pairs(_inbound(store.data["github-tool"]))
+    assert ("r-x-src", "s-tool-read") not in _pairs(_inbound(store.data["github-tool"]))
+    assert ("r-shared", "s-tool-read") in _pairs(store.pushed_agent("other-agent").outbound_target_allow_rules)
+
+
+def test_decommission_keeps_the_grants_of_a_role_another_service_also_holds():
+    catalog, initial = _shared_role_fixture()
+    live = [svc for svc in catalog if svc.serviceId != "github-agent"]  # X was offboarded
+    store = run_decommission("github-agent", catalog=live, store=FakeStore(initial))
+
+    assert ("r-shared", "s-tool-read") in _pairs(_inbound(store.data["github-tool"]))
+    assert ("r-x-src", "s-tool-read") not in _pairs(_inbound(store.data["github-tool"]))
+
+
+def _ghost_target_fixture(*, ghost_in_catalog, ghost_enabled=False):
+    """X (github-agent) holds a grant on ghost-agent, whose stored SPM remains. ghost-agent is
+    either absent from the catalog (its client was deleted without an offboard) or disabled."""
+    catalog, initial = _quarantine_fixture()
+    AR = catalog[0].roles[0]
+    GS = _scope("s-ghost-in", "ghost-inbound", service_id="ghost-agent")
+    initial["ghost-agent"] = _spm("ghost-agent", owned_scopes=[GS], inbound=[_rule(AR, GS)])
+    if ghost_in_catalog:
+        catalog.append(_agent("ghost-agent", scopes=[GS], enabled=ghost_enabled))
+    return catalog, initial
+
+
+def test_quarantine_never_derives_an_agent_that_is_absent_from_the_catalog():
+    catalog, initial = _ghost_target_fixture(ghost_in_catalog=False)
+    store = run_quarantine("github-agent", catalog=catalog, store=FakeStore(initial))
+
+    assert _inbound(store.data["ghost-agent"]) == []  # the purge still lands
+    assert "ghost-agent" not in store.pushed_agent_ids
+    assert store.pushed_agent_ids == {"other-agent"}
+
+
+def test_quarantine_never_derives_a_disabled_agent():
+    # A disabled agent keeps its no-rules CR: a re-derive must not write over it.
+    catalog, initial = _ghost_target_fixture(ghost_in_catalog=True)
+    store = run_quarantine("github-agent", catalog=catalog, store=FakeStore(initial))
+
+    assert _inbound(store.data["ghost-agent"]) == []
+    assert "ghost-agent" not in store.pushed_agent_ids
+
+
+def test_decommission_never_derives_an_agent_that_is_absent_from_the_catalog():
+    catalog, initial = _ghost_target_fixture(ghost_in_catalog=False)
+    live = [svc for svc in catalog if svc.serviceId != "github-agent"]  # X was offboarded
+    store = run_decommission("github-agent", catalog=live, store=FakeStore(initial))
+
+    assert _inbound(store.data["ghost-agent"]) == []
+    assert "ghost-agent" not in store.pushed_agent_ids
+    assert store.pushed_agent_ids == {"other-agent"}

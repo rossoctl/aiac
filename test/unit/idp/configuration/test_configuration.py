@@ -1311,66 +1311,6 @@ class TestDeleteServiceScope:
 
 
 # ---------------------------------------------------------------------------
-# unset_service_type — clears the client.type attribute
-#
-# Reuses the set_service_type POST /services/{id}/type pattern with an empty/clear
-# type; the service clears client.type via the same read-merge-update_client path.
-# Returns the updated Service (type now None). Idempotent — clearing an
-# already-clear type is not an error.
-# ---------------------------------------------------------------------------
-
-
-class TestUnsetServiceType:
-    def _make_service(self, **kwargs):
-        defaults = {"id": "svc-uuid", "clientId": "svc-uuid", "name": "my-svc", "enabled": True}
-        return Service.model_validate({**defaults, **kwargs})
-
-    def test_returns_service_with_type_cleared(self, monkeypatch):
-        monkeypatch.setenv("AIAC_PDP_CONFIG_URL", BASE)
-        service = self._make_service(attributes={"client.type": "Agent"})
-        # The service returns the updated client with client.type gone → type resolves to None.
-        updated = {"id": "svc-uuid", "clientId": "svc-uuid", "name": "my-svc", "enabled": True}
-        with patch("aiac.idp.configuration.api.requests.post", return_value=_ok(updated, 200)):
-            result = Configuration.for_realm(REALM).unset_service_type(service)
-        assert isinstance(result, Service)
-        assert result.type is None
-
-    def test_posts_to_type_endpoint_with_empty_type_body(self, monkeypatch):
-        monkeypatch.setenv("AIAC_PDP_CONFIG_URL", BASE)
-        service = self._make_service()
-        updated = {"id": "svc-uuid", "clientId": "svc-uuid", "name": "my-svc", "enabled": True}
-        with patch("aiac.idp.configuration.api.requests.post", return_value=_ok(updated, 200)) as m:
-            Configuration.for_realm(REALM).unset_service_type(service)
-        assert m.call_args[0][0] == f"{BASE}/services/svc-uuid/type"
-        assert m.call_args[1].get("json") == {"type": ""}
-
-    def test_forwards_realm_as_query_param(self, monkeypatch):
-        monkeypatch.setenv("AIAC_PDP_CONFIG_URL", BASE)
-        service = self._make_service()
-        updated = {"id": "svc-uuid", "clientId": "svc-uuid", "name": "my-svc", "enabled": True}
-        with patch("aiac.idp.configuration.api.requests.post", return_value=_ok(updated, 200)) as m:
-            Configuration.for_realm(REALM).unset_service_type(service)
-        assert m.call_args[1].get("params") == {"realm": REALM}
-
-    def test_raises_on_non_2xx(self, monkeypatch):
-        monkeypatch.setenv("AIAC_PDP_CONFIG_URL", BASE)
-        service = self._make_service()
-        with patch("aiac.idp.configuration.api.requests.post", return_value=_err(502)):
-            with pytest.raises(RuntimeError):
-                Configuration.for_realm(REALM).unset_service_type(service)
-
-    def test_idempotent_clearing_already_clear_type_does_not_raise(self, monkeypatch):
-        # A service with no client.type: clearing is a no-op the service reports as
-        # success; the returned Service still has type None and no error is raised.
-        monkeypatch.setenv("AIAC_PDP_CONFIG_URL", BASE)
-        service = self._make_service()  # type already None
-        updated = {"id": "svc-uuid", "clientId": "svc-uuid", "name": "my-svc", "enabled": True}
-        with patch("aiac.idp.configuration.api.requests.post", return_value=_ok(updated, 200)):
-            result = Configuration.for_realm(REALM).unset_service_type(service)
-        assert result.type is None
-
-
-# ---------------------------------------------------------------------------
 # set_service_enabled — the writer for Service.enabled
 #
 # POST /services/{id}/enabled with {"enabled": bool} → the service calls

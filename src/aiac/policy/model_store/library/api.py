@@ -28,8 +28,9 @@ def _fresh_empty(service_id: str) -> ServicePolicyModel:
     # The "engine creates a fresh model on 404" convention: the first time a service is
     # seen the store has no row, so callers get an empty SPM to append to. ``service_type``
     # is required by the model but genuinely unknown here; the PCE re-seeds it (along with
-    # ``owned_roles`` / ``owned_scopes``) from the IdP catalog before it is ever consulted,
-    # so the placeholder below never reaches a policy decision.
+    # ``owned_roles`` / ``owned_scopes``) from the IdP catalog when the service is in it. For a
+    # service absent from the catalog (deleted) the placeholder AGENT type would stay, so the PCE
+    # drops every rule for such a service and never derives it (routing guard in ``_run``).
     return ServicePolicyModel(
         service_id=service_id,
         service_type=ServiceType.AGENT,

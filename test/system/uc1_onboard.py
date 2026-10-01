@@ -36,6 +36,12 @@ This module owns:
   real plugin's response).
 * **``onboarded_stack``** — the whole per-rung fixture flow, parameterised by the ordered workload
   list; each rung wraps it in a one-line session fixture and yields a probe context.
+* **Failure path (rung 5)** — ``pristine_stack`` (the slate + teardown of ``onboarded_stack`` with no
+  deploy / convergence, for a flow that must not converge), ``controller_llm_unusable`` (the LLM-seam
+  failure injection, restored on exit), ``publish_service_event`` (re-fire the onboarding trigger for
+  an existing client), and the quarantine readers (``workload_client``, ``authpolicy_policies``,
+  ``cr_has_no_grants`` / ``cr_has_grants``, ``spm_present``, ``controller_logs``) plus the MCP session
+  probe ``mcp_session_decisions``.
 
 It imports only stdlib + ``requests`` + ``launcher`` + the pure-data ``scenario_uc1`` (never
 ``aiac``), so it is importable before the env-before-import dance, exactly like ``scenario_uc1`` and
@@ -44,9 +50,11 @@ It imports only stdlib + ``requests`` + ``launcher`` + the pure-data ``scenario_
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 from contextlib import contextmanager
@@ -71,8 +79,10 @@ from test.system.launcher import (  # noqa: E402
     kubectl_delete,
     kubectl_rollout_status,
     mint_token,
+    notification_outcome,
     outbound_outcome,
     outbound_probe,
+    outbound_session_probe,
     poll_until,
     port_forward,
     require_env,
@@ -91,7 +101,7 @@ NAMESPACE = os.environ.get("AIAC_DEMO_NAMESPACE", scn.DEMO_NAMESPACE_DEFAULT)
 ADMIN_REALM = os.environ.get("KEYCLOAK_ADMIN_REALM", "master")
 
 # Controller (in-cluster) namespace — the ns whose Controller Deployment the test patches (policy.md
-# mount, default_effect). The onboarding trigger is event-driven (deploy fires it), so the harness no
+# mount). The onboarding trigger is event-driven (deploy fires it), so the harness no
 # longer port-forwards to the Controller to POST /apply.
 CONTROLLER_NAMESPACE = os.environ.get("AIAC_CONTROLLER_NAMESPACE", "aiac-system")
 
@@ -146,21 +156,6 @@ WORKLOAD_MANIFESTS: dict[str, list[Path]] = {
         REPO_ROOT / "demo/assets/tools/github_tool/k8s/github-tool-deployment.yaml",
     ],
 }
-
-# --- default_effect onboarding hook (#146 coupling seam; see ``_set_controller_default_effect``) ----
-#
-# The derived ``AgentPolicyModel.default_effect`` decides whether the generated Rego is deny-by-default
-# (the shipped ``Deny``) or allow-by-default (``Allow``). It lives on the *derived* APM built in-cluster
-# by the PCE (``engine._fresh_apm``) and defaults to ``Deny``, so a policy-agnostic onboarding run that
-# needs allow-by-default must set it **before** onboarding and reset it on teardown. These are plain
-# strings (matching ``RuleEffect``'s wire values ``"Allow"`` / ``"Deny"``) so the harness keeps its "no
-# ``aiac`` import" property — importable before the env-before-import dance, like ``scenario_uc1``.
-DEFAULT_EFFECT_ALLOW = "Allow"
-DEFAULT_EFFECT_DENY = "Deny"  # the shipped default; the harness never patches this onto the stack
-# The Controller/PCE env the #146 hook reads where it mints the APM. Overridable so this test tracks
-# whatever name #146 ships without a code edit (verify the shape against #146 — handoff §3).
-DEFAULT_EFFECT_ENV = os.environ.get("AIAC_DEFAULT_EFFECT_ENV", "AIAC_DEFAULT_EFFECT")
-
 
 # ======================================================================================
 # Expected-verdict oracle (pure functions over the scenario_uc1 truth table)
@@ -426,44 +421,6 @@ def ensure_agent_policy(namespace: str, policy_md: str = scn.POLICY_ABSTRACT) ->
         "-p",
         json.dumps(patch),
     )
-    kubectl_rollout_status(f"deployment/{CONTROLLER_DEPLOYMENT}", namespace=namespace)
-
-
-def _set_controller_default_effect(namespace: str, effect: str) -> None:
-    """Apply the ``default_effect`` onboarding hook: set the Controller/PCE env the engine reads when
-    it mints the ``AgentPolicyModel`` (``engine._fresh_apm``), then roll the Controller so the new
-    value is live **before** the next ``onboard`` derives a policy under it. Mirrors
-    ``ensure_agent_policy``'s patch-and-rollout precondition-fixup — a test-owned mutation of the
-    running Controller, never written into a committed manifest.
-
-    This is the single hard coupling to Task 1 (#146), which owns the reader side. The env **name**
-    (``DEFAULT_EFFECT_ENV``, default ``AIAC_DEFAULT_EFFECT``) and the string values (``"Allow"`` /
-    ``"Deny"``) are #146's contract — verify/realign them once #146 lands (handoff §3). The strategic
-    merge patch is keyed on the env-var ``name``, so it upserts just this one var and leaves the
-    Controller's other env untouched."""
-    patch = {
-        "spec": {
-            "template": {
-                "spec": {
-                    "containers": [
-                        {"name": CONTROLLER_DEPLOYMENT, "env": [{"name": DEFAULT_EFFECT_ENV, "value": effect}]}
-                    ]
-                }
-            }
-        }
-    }
-    kubectl(
-        "patch",
-        "deployment",
-        CONTROLLER_DEPLOYMENT,
-        "-n",
-        namespace,
-        "--type",
-        "strategic",
-        "-p",
-        json.dumps(patch),
-    )
-    kubectl("rollout", "restart", f"deployment/{CONTROLLER_DEPLOYMENT}", "-n", namespace)
     kubectl_rollout_status(f"deployment/{CONTROLLER_DEPLOYMENT}", namespace=namespace)
 
 
@@ -911,7 +868,6 @@ def onboarded_stack(
     workloads: list[str],
     *,
     policy_md: str = scn.POLICY_ABSTRACT,
-    default_effect: str = DEFAULT_EFFECT_DENY,
     ready_signals: Sequence[ReadySignal] | None = None,
 ) -> Iterator[dict]:
     """Run one rung's whole live flow and yield a probe ``ctx`` for its assertions.
@@ -941,11 +897,6 @@ def onboarded_stack(
     * ``policy_md`` — the ``policy.md`` prose to mount before onboarding (default: Policy A's
       ``POLICY_ABSTRACT``). Forwarded to ``ensure_agent_policy``; a prose change reloads the Controller
       via the existing content-diff rollout.
-    * ``default_effect`` — the derived ``AgentPolicyModel.default_effect`` this run onboards under
-      (default: ``DEFAULT_EFFECT_DENY``, the shipped deny-by-default). A non-default value is applied to
-      the Controller **before** onboarding via ``_set_controller_default_effect`` and **reset to
-      ``Deny`` on teardown** so a subsequent Policy-A run on the shared stack is unaffected. ``Deny`` is
-      a no-op (the stack is never patched), keeping Policy-A runs from touching the Controller env.
     * ``ready_signals`` — the convergence probe set to poll before yielding (default: the Policy-A
       ``_default_ready_signals``). A policy whose truth differs from Policy A (e.g. denyworld, where
       ``devops-user`` inbound is *allow*, not *deny*) supplies its own deterministic signals so the run
@@ -992,13 +943,7 @@ def onboarded_stack(
 
     tool_onboarded = scn.TOOL_WORKLOAD in workloads
     signals = list(ready_signals) if ready_signals is not None else _default_ready_signals(tool_onboarded)
-    # A non-default effect is patched onto the Controller here and reset in ``finally``; ``Deny`` (the
-    # shipped default) never touches the stack, so Policy-A runs are unchanged. Tracked so teardown
-    # only resets what this run actually applied.
-    default_effect_applied = default_effect != DEFAULT_EFFECT_DENY
     try:
-        if default_effect_applied:
-            _set_controller_default_effect(CONTROLLER_NAMESPACE, default_effect)  # BEFORE deploying
         ensure_agent_policy(CONTROLLER_NAMESPACE, policy_md=policy_md)  # mount this run's policy.md BEFORE deploying
 
         # Minimal probe ctx for the per-workload agent convergence gate: the inbound leg reaches the
@@ -1131,9 +1076,6 @@ def onboarded_stack(
         yield ctx
     finally:
         # Teardown — full-to-pristine, best-effort per step (each helper tolerates already-absent objects).
-        if default_effect_applied:
-            # Reset the shared stack to the shipped default so a later Policy-A run is unaffected.
-            _set_controller_default_effect(CONTROLLER_NAMESPACE, DEFAULT_EFFECT_DENY)
         for workload in reversed(workloads):  # undeploy in reverse deploy order
             undeploy_workload(workload)
         # Explicit scrub — do not trust an unverified operator cascade. Same reset the pre-run slate runs.
@@ -1147,6 +1089,325 @@ def onboarded_stack(
                 f"teardown did not restore pristine: Keycloak client(s) still present="
                 f"{workload_clients_present(admin)}, AuthorizationPolicy CR(s) remain={not no_authpolicies_remain()} "
                 f"in {NAMESPACE!r}. See handoff 03 teardown (full-to-pristine)."
+            )
+            if sys.exc_info()[0] is not None:
+                log.error("%s [suppressed — a prior error is propagating]", msg)
+            else:
+                raise RuntimeError(msg)
+
+
+# ======================================================================================
+# Failure path (rung 5) — LLM-seam injection, re-fired trigger, quarantine readers, pristine stack
+# ======================================================================================
+#
+# A failed onboarding does not converge to a live allow, so ``onboarded_stack`` (which polls for the
+# happy path) cannot drive it. These helpers let a failure-path flow compose the same building blocks:
+# the pristine slate + teardown (``pristine_stack``), a Controller-side failure injection that is always
+# undone (``controller_llm_unusable``), a re-fire of the onboarding trigger for an existing client
+# (``publish_service_event``), and read-only views of the state a rollback + quarantine leaves.
+
+# The Controller pod selector (``app: aiac-agent`` in ``k8s/agent-deployment.yaml``) and the PRB's
+# endpoint env (``aiac.agent.llm.load_llm_settings`` reads the bare ``LLM_BASE_URL``).
+CONTROLLER_SELECTOR = os.environ.get("AIAC_CONTROLLER_SELECTOR", f"app={CONTROLLER_DEPLOYMENT}")
+LLM_BASE_URL_ENV = "LLM_BASE_URL"
+
+# The PRB endpoint the failure injection points the Controller at: a path the Controller's own FastAPI
+# app (port 7070, same pod) does not serve, so every chat-completions call gets an immediate HTTP 404.
+# A 4xx is not transient (``aiac.shared.upstream.is_transient``), so the PRB does not retry it and
+# raises ``UnparseableLLMResponseError`` — a PERMANENT consumer error (dead-lettered on the first
+# delivery). See the rung-5 test's module docstring for why this is preferred over an unreachable host.
+UNUSABLE_LLM_BASE_URL = os.environ.get("AIAC_UNUSABLE_LLM_BASE_URL", "http://127.0.0.1:7070/aiac-system-test-no-llm/v1")
+
+# The CR's two policy paths (``aiac.pdp.service.policy.opa.main._build_cr``) and the Rego bindings that
+# carry every grant in each. A no-rules CR (``engine._fresh_apm`` — the quarantine shell) renders each
+# of them empty (``[]`` / ``{}``); a real CR has a non-empty ``agent_scopes`` + subject allow map.
+CR_INBOUND_PATH = "inbound/request.rego"
+CR_OUTBOUND_PATH = "outbound/request.rego"
+INBOUND_GRANT_BINDINGS = ("agent_scopes", "subject_role_allow_scopes", "source_role_allow_scopes")
+OUTBOUND_GRANT_BINDINGS = ("subject_role_allow_scopes", "target_allow_scopes")
+
+
+def resolve_controller_pod() -> str:
+    """The current live Controller pod (newest Ready, non-terminating — see ``resolve_pod``)."""
+    return resolve_pod(CONTROLLER_SELECTOR, namespace=CONTROLLER_NAMESPACE)
+
+
+def _wait_controller_rolled() -> None:
+    """Wait for the Controller rollout AND for every old Controller pod to be gone. ``rollout status``
+    returns while the old pod may still be ``Terminating`` with its NATS consumer bound; an event it
+    takes then runs on the OLD env (or is lost to the kill and redelivered only after ``ACK_WAIT``), so
+    the injection is in force only once no terminating pod remains."""
+    kubectl_rollout_status(f"deployment/{CONTROLLER_DEPLOYMENT}", namespace=CONTROLLER_NAMESPACE)
+
+    def _no_terminating() -> bool:
+        doc = json.loads(kubectl("get", "pods", "-n", CONTROLLER_NAMESPACE, "-l", CONTROLLER_SELECTOR, "-o", "json"))
+        items = doc.get("items", [])
+        return bool(items) and not any(p.get("metadata", {}).get("deletionTimestamp") for p in items)
+
+    if not poll_until(_no_terminating, timeout=DEPLOY_TIMEOUT, interval=3):
+        raise RuntimeError(f"old {CONTROLLER_DEPLOYMENT} pod(s) still terminating after {DEPLOY_TIMEOUT:.0f}s")
+
+
+@contextmanager
+def controller_env(overrides: dict[str, str]) -> Iterator[None]:
+    """Set explicit env ``overrides`` on the Controller container for the duration of the block, then
+    restore the container's **exact** original ``env`` list (or its absence) in ``finally`` — so a later
+    test on the shared stack never sees the override, even when the block raises.
+
+    An explicit container ``env`` entry wins over the ``envFrom`` ConfigMap/Secret, so the committed
+    ``aiac-agent-config`` is never edited. Both the set and the restore are one JSON patch of the pod
+    template's ``env`` list (a template change rolls the Controller), and both wait for the old pod to
+    be gone (``_wait_controller_rolled``). Like ``ensure_agent_policy``, a test-owned mutation of the
+    running Controller, never written into a committed manifest."""
+    dep = json.loads(
+        kubectl("get", "deployment", CONTROLLER_DEPLOYMENT, "-n", CONTROLLER_NAMESPACE, "-o", "json", timeout=30)
+    )
+    containers = dep["spec"]["template"]["spec"]["containers"]
+    index = next((i for i, c in enumerate(containers) if c.get("name") == CONTROLLER_DEPLOYMENT), None)
+    if index is None:
+        raise RuntimeError(f"no container {CONTROLLER_DEPLOYMENT!r} in deployment/{CONTROLLER_DEPLOYMENT}")
+    original = containers[index].get("env")  # None when the container declares no explicit env
+    patched = [e for e in (original or []) if e.get("name") not in overrides]
+    patched += [{"name": name, "value": value} for name, value in overrides.items()]
+    path = f"/spec/template/spec/containers/{index}/env"
+
+    def _patch(ops: list[dict]) -> None:
+        kubectl(
+            "patch",
+            "deployment",
+            CONTROLLER_DEPLOYMENT,
+            "-n",
+            CONTROLLER_NAMESPACE,
+            "--type",
+            "json",
+            "-p",
+            json.dumps(ops),
+        )
+
+    _patch([{"op": "add", "path": path, "value": patched}])  # JSON-patch "add" replaces an existing member
+    try:
+        _wait_controller_rolled()
+        yield
+    finally:
+        _patch(
+            [{"op": "add", "path": path, "value": original}]
+            if original is not None
+            else [{"op": "remove", "path": path}]
+        )
+        _wait_controller_rolled()
+
+
+def controller_llm_unusable():
+    """The rung-5 failure injection: point the Controller's PRB at ``UNUSABLE_LLM_BASE_URL`` for the
+    block (``ServicePolicyBuilder.build`` then raises after Provision has run), restored on exit."""
+    return controller_env({LLM_BASE_URL_ENV: UNUSABLE_LLM_BASE_URL})
+
+
+def controller_logs() -> str:
+    """The current Controller pod's full log (the app container). The consumer logs each PRB failure
+    (``log_by_type``) and each dead-letter move at ERROR, so both reach the pod's stderr."""
+    return kubectl(
+        "logs", "-n", CONTROLLER_NAMESPACE, resolve_controller_pod(), "-c", CONTROLLER_DEPLOYMENT, timeout=60
+    )
+
+
+def publish_service_event(service_uuid: str) -> None:
+    """Re-fire the onboarding trigger for an EXISTING Keycloak client: publish on
+    ``aiac.apply.service.<uuid>`` (the subject + ``{"id": ...}`` payload the ``aiac-event-listener`` SPI
+    publishes on ``CLIENT_CREATED``), so the agent consumer runs the same ``onboard_service`` →
+    ``compute_and_apply(focus_service=client_id)`` → ``reenable_service`` path a deploy fires.
+
+    A redeploy cannot do this — the SPI publishes only on client CREATE, and a re-created client has a
+    new UUID (a new service, not the quarantined one). The publish runs from INSIDE the Controller pod,
+    which already carries ``nats-py`` and resolves the in-cluster broker (``NATS_URL`` or the
+    ``aiac-event-broker-service`` default), so the pytest host needs no NATS client or port-forward.
+    Raises when the JetStream publish is not acknowledged."""
+    subject = f"aiac.apply.service.{service_uuid}"
+    script = (
+        "import asyncio, os, nats\n"
+        f"subject = {json.dumps(subject)}\n"
+        f"payload = {json.dumps(json.dumps({'id': service_uuid}))}.encode()\n"
+        "async def main():\n"
+        "    nc = await nats.connect(os.environ.get('NATS_URL', 'nats://aiac-event-broker-service:4222'))\n"
+        "    try:\n"
+        "        ack = await nc.jetstream().publish(subject, payload)\n"
+        "        print('AB_PUB:%d' % ack.seq)\n"
+        "    finally:\n"
+        "        await nc.close()\n"
+        "asyncio.run(main())\n"
+    )
+    out = kubectl(
+        "exec",
+        "-i",
+        "-n",
+        CONTROLLER_NAMESPACE,
+        resolve_controller_pod(),
+        "-c",
+        CONTROLLER_DEPLOYMENT,
+        "--",
+        "python",
+        "-",
+        input_text=script,
+        timeout=60,
+    )
+    if "AB_PUB:" not in out:
+        raise RuntimeError(f"publish on {subject!r} was not acknowledged by JetStream: {out.strip()[:300]!r}")
+
+
+def workload_client(admin, workload: str) -> dict | None:
+    """The Keycloak client representation (``id`` UUID, ``clientId``, ``enabled``, ``attributes``) of
+    ``{ns}/{workload}``, keyed on the client ``name`` like ``wait_for_registration``; ``None`` if absent."""
+    admin.change_current_realm(TEST_REALM)
+    return next((c for c in admin.get_clients() if c.get("name") == f"{NAMESPACE}/{workload}"), None)
+
+
+def authpolicy_policies(name: str) -> dict[str, str] | None:
+    """The ``AuthorizationPolicy`` CR ``name``'s policies as ``{path: rego}`` (``spec.policies[]``), or
+    ``None`` when no such CR exists. ``--ignore-not-found`` makes an absent CR an empty output, so an
+    unreachable API still raises instead of reading as "no CR"."""
+    out = kubectl("get", "authorizationpolicy", name, "-n", NAMESPACE, "-o", "json", "--ignore-not-found", timeout=30)
+    if not out.strip():
+        return None
+    spec = json.loads(out).get("spec", {})
+    return {p.get("path", ""): p.get("content", "") for p in spec.get("policies", [])}
+
+
+def rego_binding_empty(rego: str, var: str) -> bool | None:
+    """Whether the top-level Rego binding ``var := …`` is an empty list/map (``[]`` / ``{}``) — the
+    form ``rego._render_list`` / ``_render_map`` emit for no entries. ``None`` when ``var`` is not
+    bound at all (a CR format change, surfaced by the caller rather than read as empty)."""
+    if not re.search(rf"^{re.escape(var)}\s*:=", rego, re.M):
+        return None
+    return re.search(rf"^{re.escape(var)}\s*:=\s*(\[\s*\]|\{{\s*\}})", rego, re.M) is not None
+
+
+def cr_has_no_grants(policies: dict[str, str] | None) -> bool:
+    """True when ``policies`` is a present no-rules CR (the quarantine shell): both packages carry
+    ``default allow := false`` and every grant binding (``INBOUND_GRANT_BINDINGS`` /
+    ``OUTBOUND_GRANT_BINDINGS``) is bound and empty — so every inbound and outbound request is denied."""
+    if not policies:
+        return False
+    inbound, outbound = policies.get(CR_INBOUND_PATH, ""), policies.get(CR_OUTBOUND_PATH, "")
+    if "default allow := false" not in inbound or "default allow := false" not in outbound:
+        return False
+    return all(rego_binding_empty(inbound, v) is True for v in INBOUND_GRANT_BINDINGS) and all(
+        rego_binding_empty(outbound, v) is True for v in OUTBOUND_GRANT_BINDINGS
+    )
+
+
+def cr_has_grants(policies: dict[str, str] | None) -> bool:
+    """True when ``policies`` is a real agent CR: the inbound package names the agent's scopes and
+    grants some user role one of them (non-empty ``agent_scopes`` + ``subject_role_allow_scopes``)."""
+    if not policies:
+        return False
+    inbound = policies.get(CR_INBOUND_PATH, "")
+    return all(rego_binding_empty(inbound, v) is False for v in ("agent_scopes", "subject_role_allow_scopes"))
+
+
+def spm_present(client_id: str) -> bool:
+    """Whether the Policy Store holds an SPM for the service keyed ``client_id`` (the SPM key is the
+    client's ``clientId``). ``GET /policy/services/{id}`` takes the id as unpadded base64url
+    (``aiac.policy.model_store.keying.encode_service_id``): 200 -> True, 404 -> False; any other
+    answer raises, so an unreachable store is never read as "no SPM"."""
+    encoded = base64.urlsafe_b64encode(client_id.encode("utf-8")).decode("ascii").rstrip("=")
+    with port_forward(
+        STORE_TARGET,
+        namespace=STORE_NAMESPACE,
+        local_port=STORE_LOCAL_PORT,
+        remote_port=STORE_REMOTE_PORT,
+        ready_url=f"http://127.0.0.1:{STORE_LOCAL_PORT}/health",
+    ) as base_url:
+        resp = requests.get(f"{base_url}/policy/services/{encoded}", timeout=30)
+    if resp.status_code == 200:
+        return True
+    if resp.status_code == 404:
+        return False
+    raise AssertionError(f"GET /policy/services/<{client_id}> returned HTTP {resp.status_code}: {resp.text[:300]}")
+
+
+def mcp_session_frames(tool_bare: str) -> list[dict]:
+    """One MCP session against the tool, in protocol order: ``initialize``, the
+    ``notifications/initialized`` notification (no ``id``), ``tools/list``, then a ``tools/call`` of the
+    **bare** ``tool_bare``. The demo tool is a stateless JSON-response FastMCP server, so each frame is
+    answered on its own (no ``Mcp-Session-Id`` to carry)."""
+    return [
+        {
+            "jsonrpc": "2.0",
+            "id": "1",
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "aiac-system-test", "version": "0"},
+            },
+        },
+        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+        {"jsonrpc": "2.0", "id": "2", "method": "tools/list", "params": {}},
+        {"jsonrpc": "2.0", "id": "3", "method": "tools/call", "params": {"name": tool_bare, "arguments": {}}},
+    ]
+
+
+def mcp_session_decisions(ctx: dict, user: str, tool_bare: str) -> dict[str, tuple[str, int | None, str]]:
+    """Mint a fresh ``user`` token, send one MCP session (``mcp_session_frames``) through the agent's
+    outbound (token-exchange → OPA), and return ``{method: (decision, http_code, body)}``. A request
+    frame is classified by its body (``outbound_outcome``: a ``result`` frame = allow, an OPA error frame
+    = deny); the notification by its status (``notification_outcome``: 202 = allow, 403 = deny)."""
+    token = mint_token(user, scn.USER_PASSWORD, keycloak_url=ctx["keycloak_url"], realm=ctx["realm"])
+    frames = mcp_session_frames(tool_bare)
+    raw = outbound_session_probe(token, frames, namespace=ctx["namespace"], agent_pod=resolve_agent_pod())
+    return {
+        frame["method"]: (
+            (outbound_outcome(code, body) if "id" in frame else notification_outcome(code)),
+            code,
+            body,
+        )
+        for frame, (code, body) in zip(frames, raw)
+    }
+
+
+@contextmanager
+def pristine_stack(workloads: Sequence[str], *, policy_md: str = scn.POLICY_ABSTRACT) -> Iterator[dict]:
+    """The slate + teardown half of ``onboarded_stack`` with NO deploy and NO convergence poll, for a
+    flow whose onboarding is meant to fail (``onboarded_stack`` would wait for a happy-path allow that
+    never comes). Yields ``ctx = {"admin", "namespace", "keycloak_url", "realm"}``; the caller deploys.
+
+    Same skip gates (pipeline wiring, env, event path — before any mutation), same no-workloads slate
+    (undeploy + ``_scrub_to_pristine`` + ``reenable_provisioned_clients`` + clients-gone poll), same
+    realm/users provisioning + ``sub`` mapper gate, ``policy.md`` mount and image load for
+    ``workloads``; and the same full-to-pristine teardown, verified (clients gone, no CR left)."""
+    require_pipeline(namespace=NAMESPACE, workloads=[])
+    creds = require_env_or_skip("KEYCLOAK_URL", "KEYCLOAK_ADMIN_USERNAME", "KEYCLOAK_ADMIN_PASSWORD")
+    keycloak_url = creds["KEYCLOAK_URL"]
+    admin = connect_admin()
+    require_event_path(admin=admin, realm=TEST_REALM)
+
+    undeploy_workload(scn.AGENT_WORKLOAD)
+    undeploy_workload(scn.TOOL_WORKLOAD)
+    _scrub_to_pristine(admin)
+    reenable_provisioned_clients(admin, TEST_REALM)
+    if not poll_until(lambda: not workload_clients_present(admin), timeout=DEPLOY_TIMEOUT, interval=5):
+        raise RuntimeError(
+            f"pre-run cleanup left Keycloak client(s) {workload_clients_present(admin)} for {NAMESPACE!r} — the "
+            "fresh deploy would not re-fire CLIENT_CREATED, so event-driven onboarding would never trigger."
+        )
+    provision_realm_and_users(admin, TEST_REALM)
+    verify_subject_mapper(keycloak_url=keycloak_url, realm=TEST_REALM, user="dev-user", password=scn.USER_PASSWORD)
+
+    try:
+        ensure_agent_policy(CONTROLLER_NAMESPACE, policy_md=policy_md)
+        load_workload_images(list(workloads))
+        yield {"admin": admin, "namespace": NAMESPACE, "keycloak_url": keycloak_url, "realm": TEST_REALM}
+    finally:
+        for workload in reversed(list(workloads)):
+            undeploy_workload(workload)
+        _scrub_to_pristine(admin)
+        if not poll_until(
+            lambda: not workload_clients_present(admin) and no_authpolicies_remain(), timeout=DEPLOY_TIMEOUT, interval=5
+        ):
+            msg = (
+                f"teardown did not restore pristine: Keycloak client(s) still present="
+                f"{workload_clients_present(admin)}, AuthorizationPolicy CR(s) remain={not no_authpolicies_remain()} "
+                f"in {NAMESPACE!r}."
             )
             if sys.exc_info()[0] is not None:
                 log.error("%s [suppressed — a prior error is propagating]", msg)

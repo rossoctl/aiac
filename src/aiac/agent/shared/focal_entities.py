@@ -17,6 +17,12 @@ excluded/included by **ownership** (role id / ``scope.serviceId``), never by nam
 - ``other_scopes`` — other services' ``aiac.managed`` scopes, sourced from ``get_services()``
   so each scope carries its owning ``serviceId`` (the SPM routing key the PCE needs).
 
+A **disabled** service (``Service.enabled`` is false — the UC1 failed-service marker set by the
+rollback) contributes no candidate role and no other-scope, so no build grants anything to or from
+a quarantined service. The focus service is the exception: it resolves while it is disabled,
+because a re-onboarding builds its rules before ``reenable_service`` runs. A disabled service
+still *owns* its roles, so a user holding one does not turn it into a user-kind candidate.
+
 IdP access is via the **idp-library** ``Configuration`` seam. Callers that already hold a
 ``Configuration`` (e.g. the live builder, whose ``_config`` seam existing tests patch) pass it
 in via ``config``; callers that don't (e.g. the diagnostic) let the resolver create the
@@ -97,10 +103,12 @@ def resolve_focal_entities(
     own_roles = [r for r in focus.roles if r.aiac_managed]
     own_scopes = [s for s in focus.scopes if s.aiac_managed]
 
+    # The other services that can take part in a rule: every enabled service except the focus. A
+    # disabled one is a failed (quarantined) service — see the module docstring.
+    others = [s for s in services if s.serviceId != focus.serviceId and s.enabled]
+
     # kind=Agent rides through unchanged from get_services() → routes to source_roles in the PCE.
-    other_agent_roles = [
-        r for other in services if other.serviceId != focus.serviceId for r in other.roles if r.aiac_managed
-    ]
+    other_agent_roles = [r for other in others for r in other.roles if r.aiac_managed]
 
     # User roles are membership-derived, not aiac.managed: a realm role qualifies iff a user
     # holds it directly or via a composite parent they hold, and no service owns it.
@@ -121,9 +129,7 @@ def resolve_focal_entities(
     # PCE needs. The global get_scopes() endpoint returns scopes with an empty serviceId, which
     # would both (a) fail to exclude the focus's own scopes (``"" != focus.serviceId`` is always
     # true) and (b) route any resulting rule to ``SPM("")``, a 422 dead-end.
-    other_scopes = [
-        s for other in services if other.serviceId != focus.serviceId for s in other.scopes if s.aiac_managed
-    ]
+    other_scopes = [s for other in others for s in other.scopes if s.aiac_managed]
 
     candidate_roles = _flatten_dedup(user_roles + other_agent_roles)
 
