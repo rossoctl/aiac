@@ -6,14 +6,13 @@ cluster); every test patches that module-level ``_api`` with a ``MagicMock`` so
 no real Kubernetes API is contacted. The additive ``POLICY_WRITER_DUMP_REGO``
 local-dump toggle is covered here too (it never gates or replaces the CR write).
 
-Note on the delete-by-id endpoint: its route param ``{agent_id}`` is a single
-path segment, and a valid namespaced id (``<ns>/<name>`` or a SPIFFE URI) carries
-slashes. The library client percent-encodes them and the ASGI server decodes the
-segment back, but the ``TestClient``/httpx transport collapses ``%2F`` -> ``/``
-before the request is sent, so a namespaced id cannot reach the param through
-``TestClient``. Those cases therefore call the route handler function directly
-(the FastAPI decorators leave the functions callable), which still exercises the
-full write + error-mapping path through the mocked ``_api``.
+Note on the by-id endpoints: a valid namespaced id (``<ns>/<name>`` or a SPIFFE
+URI) carries slashes. The library client percent-encodes them as one segment
+(``%2F``), but the server decodes ``%2F`` back to ``/`` before routing — the live
+uvicorn server and the ``TestClient`` alike — so both routes take the id with the
+``{agent_id:path}`` converter. ``TestLibraryEncodedAgentId`` drives each route with
+the exact URL the library builds. The other delete cases call the route handler
+function directly (the FastAPI decorators leave the functions callable).
 """
 
 import json
@@ -23,6 +22,7 @@ import pytest
 from fastapi.testclient import TestClient
 from kubernetes.client import ApiException
 
+from aiac.pdp.policy.library.api import _agent_id_segment
 from aiac.pdp.service.policy.opa import main
 from aiac.pdp.service.policy.opa.main import app
 from aiac.policy.model.models import AgentPolicyModel
@@ -174,6 +174,32 @@ class TestDeleteAgent:
         resp = main.delete_agent("team1/github-agent")
         assert resp.status_code == 502
         assert "error" in _body(resp)
+
+
+# ---------------------------------------------------------------------------
+# The by-id routes, driven with the exact URL the library client builds
+# ---------------------------------------------------------------------------
+
+
+class TestLibraryEncodedAgentId:
+    """The library sends ``/policy/agents/<quote(agent_id, safe="")>``. A SPIFFE id has slashes,
+    which the server decodes back before routing, so a single-segment route returns 404 — the
+    live failure of the PCE ``quarantine`` (``apply_agent_policy``) and ``decommission``
+    (``delete_agent_policy``)."""
+
+    @pytest.mark.parametrize("agent_id", [SPIFFE, "team1/github-agent"])
+    def test_upsert_by_id_reaches_the_route(self, api, agent_id):
+        resp = TestClient(app).post(f"/policy/agents/{_agent_id_segment(agent_id)}", json=_agent(agent_id))
+        assert resp.status_code == 204
+        kwargs = api.patch_namespaced_custom_object.call_args.kwargs
+        assert (kwargs["namespace"], kwargs["name"]) == ("team1", "github-agent")
+
+    @pytest.mark.parametrize("agent_id", [SPIFFE, "team1/github-agent"])
+    def test_delete_by_id_reaches_the_route(self, api, agent_id):
+        resp = TestClient(app).delete(f"/policy/agents/{_agent_id_segment(agent_id)}")
+        assert resp.status_code == 204
+        kwargs = api.delete_namespaced_custom_object.call_args.kwargs
+        assert (kwargs["namespace"], kwargs["name"]) == ("team1", "github-agent")
 
 
 # ---------------------------------------------------------------------------
