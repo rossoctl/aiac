@@ -11,7 +11,7 @@
 #
 # ALWAYS DENY BY DEFAULT. Both tiers emit `default allow := false`: a request that
 # no rule allows is denied. Each tier has *_allow_ok gates and mirrored *_deny_ok
-# gates and applies deny-overrides. The identity maps (subject_roles,
+# gates; a matching deny gate blocks the request. The identity maps (subject_roles,
 # source_roles) are effect-agnostic. In this demo the deny maps are empty
 # (an allow-only policy).
 #

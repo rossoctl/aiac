@@ -158,7 +158,7 @@ Accepts JSON body `{"enabled": true | false}` (rejected with `422` otherwise). I
 2. Idempotent — disabling an already-disabled client (or enabling an already-enabled one) is not an error.
 3. Returns `200 OK` with the updated client JSON (re-fetched via `admin.get_client`); `502 Bad Gateway` with `{"error": ...}` on `KeycloakError`.
 
-The UC1 compensating rollback (see the AIAC Agent UC1 spec) consumes the two deletes and the enable/disable: it deletes the roles and scopes Provision created, and then disables the client as a failed-service marker. The rollback keeps the client type. The unset-type endpoint stays, but the rollback does not call it (the library primitive `unset_service_type` has no caller).
+The UC1 compensating rollback (see the AIAC Agent UC1 spec) consumes the two deletes and the enable/disable: it deletes the roles and scopes Provision created, and then disables the client as a failed-service marker. The rollback keeps the client type. The empty-type clear on `POST /services/{id}/type` stays in the service, but no library primitive or rollback calls it.
 
 All endpoints except `/health` require a `?realm=<realm>` query parameter specifying the Keycloak realm to operate in. Returns `422 Unprocessable Entity` if the parameter is absent. `/health` accepts no realm parameter — it calls `_get_or_create_admin(os.environ["KEYCLOAK_ADMIN_REALM"])` directly.
 

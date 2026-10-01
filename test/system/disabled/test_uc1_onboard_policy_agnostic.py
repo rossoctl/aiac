@@ -8,8 +8,8 @@ bare ``pytest`` unit lane deselects it exactly as it does the other disabled sys
 
 The point of these tests is the #149 acceptance property: **every new parameter defaults to today's
 Policy-A behavior**, so the existing rung callers (which pass only a positional ``workloads`` list)
-stay byte-for-byte unchanged, while a second policy can drive the same harness under a different
-default effect and its own convergence probe.
+stay byte-for-byte unchanged, while a second policy can drive the same harness with its own
+convergence probe.
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ from test.system import uc1_onboard as uc1  # noqa: E402
 
 pytestmark = [
     pytest.mark.system,
-    pytest.mark.skip(reason="disabled — needs the ALLOW default effect, which is removed (handoff 11 B3: always DENY)"),
+    pytest.mark.skip(reason="isolated/disabled — moved to test/system/disabled/"),
 ]
 
 # --- ReadySignal: the parametrized convergence probe --------------------------------------------
@@ -105,13 +105,10 @@ def test_ensure_agent_policy_defaults_to_policy_a_abstract() -> None:
 
 
 def test_onboarded_stack_new_params_default_to_policy_a_behavior() -> None:
-    """``onboarded_stack`` gains ``policy_md`` / ``default_effect`` / ``ready_signals`` but every new
-    parameter defaults to today's Policy-A behavior, so the rung callers stay unchanged."""
+    """``onboarded_stack`` gains ``policy_md`` / ``ready_signals`` but every new parameter defaults
+    to today's Policy-A behavior, so the rung callers stay unchanged. There is no ``default_effect``
+    parameter: the default is always DENY (handoff 11 B3)."""
     params = inspect.signature(uc1.onboarded_stack).parameters
     assert params["policy_md"].default == scn.POLICY_ABSTRACT
-    assert params["default_effect"].default == uc1.DEFAULT_EFFECT_DENY
     assert params["ready_signals"].default is None
-    # The shipped default effect is DENY (deny-by-default least-privilege) — the value the harness
-    # never patches onto the stack, keeping Policy-A runs from touching the Controller env.
-    assert uc1.DEFAULT_EFFECT_DENY == "Deny"
-    assert uc1.DEFAULT_EFFECT_ALLOW == "Allow"
+    assert "default_effect" not in params

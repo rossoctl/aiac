@@ -147,7 +147,7 @@ def _rollback(config: Configuration, service_id: str, created_roles, created_sco
     logged at INFO.
 
     The client **type is kept**: the rollback removes only what this run created, and the type
-    was not created by it. (The IdP primitive ``unset_service_type`` stays, with no caller.) The
+    was not created by it. The
     policy side of the teardown is the PCE's :func:`~aiac.policy.computation.quarantine`, which
     the caller runs next."""
     service = config.get_service(service_id)
@@ -185,7 +185,12 @@ def onboard_service(service_id: str) -> tuple[list[PolicyRule], bool]:
     PCE's ``quarantine(service_id)`` (delete the SPM, remove the service's roles from the other SPMs,
     replace an agent's CR with a no-rules CR, re-derive the affected agents), and **re-raises** the
     original error unchanged. The disable comes before the quarantine, so no run after the teardown
-    sees the service as enabled. A quarantine failure propagates in place of the build error. The
+    sees the service as enabled. The quarantine runs even when the rollback raises, so a failed
+    rollback never leaves a first onboarding fail-open. A rollback or quarantine failure
+    propagates in place of the build error (the build error stays on its ``__context__``): the
+    compensation failure is not in the consumer's permanent set, so NATS redelivers and the next
+    run tries the compensation again. If the build error won, a permanent build error would
+    ``term()`` the message and leave the half-compensated service fail-open. The
     quarantine is lifted only by a successful re-onboarding. On
     success it does **not** re-enable the client here: the client is re-enabled by the caller via
     :func:`reenable_service`, but only AFTER the caller's ``compute_and_apply`` (PCE) call succeeds,
@@ -207,8 +212,11 @@ def onboard_service(service_id: str) -> tuple[list[PolicyRule], bool]:
         try:
             rules = ServicePolicyBuilder.build(service_id, service_type)
         except _ROLLBACK_ERRORS:
-            _rollback(config, service_id, created_roles, created_scopes)
-            quarantine(service_id)
+            try:
+                _rollback(config, service_id, created_roles, created_scopes)
+            finally:
+                # A failed rollback must not leave a first onboarding fail-open.
+                quarantine(service_id)
             raise
 
         return rules, False

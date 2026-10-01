@@ -121,7 +121,7 @@ def _mcp_ready_timeout() -> float:
     return value if value >= 0 else _MCP_READY_TIMEOUT_DEFAULT
 
 
-def _endpoint_not_ready(exc: BaseException) -> bool:
+def _endpoint_not_ready(exc: Exception) -> bool:
     """True for the failures of an MCP endpoint that is not ready yet: a connection-level error
     (refused, reset, connect timeout) or a 502/503/504 from the sidecar. A read timeout (the tool
     accepted the connection and hangs) and any other status are not waited for."""
@@ -160,7 +160,7 @@ def _mcp_tools_list(endpoint: str, token: str | None = None) -> list[dict]:
     while True:
         try:
             return run_upstream(_do)
-        except Exception as exc:
+        except requests.RequestException as exc:
             if not _endpoint_not_ready(exc) or time.monotonic() >= deadline:
                 raise
         time.sleep(_MCP_READY_INTERVAL)

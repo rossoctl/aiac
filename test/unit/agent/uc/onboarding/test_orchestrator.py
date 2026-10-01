@@ -161,7 +161,6 @@ class TestSuccessDoesNotReEnableClient:
         config.set_service_enabled.assert_not_called()
         config.delete_service_role.assert_not_called()
         config.delete_service_scope.assert_not_called()
-        config.unset_service_type.assert_not_called()
 
 
 class TestReenableService:
@@ -178,7 +177,6 @@ class TestReenableService:
         config.set_service_enabled.assert_called_once_with(service, True)
         config.delete_service_role.assert_not_called()
         config.delete_service_scope.assert_not_called()
-        config.unset_service_type.assert_not_called()
 
 
 class TestRollbackOnBuildFailure:
@@ -207,11 +205,10 @@ class TestRollbackOnBuildFailure:
         assert ei.value is error
         # Teardown of exactly what this run created (unmap-then-delete is done inside the
         # Configuration primitives), then disable (failed-service marker), then the PCE quarantine
-        # keyed by the Keycloak UUID. The client type is kept.
+        # keyed by the Keycloak UUID.
         config.delete_service_role.assert_called_once_with(service, role)
         config.delete_service_scope.assert_called_once_with(service, scope)
         config.set_service_enabled.assert_called_once_with(service, False)
-        config.unset_service_type.assert_not_called()
         quarantine.assert_called_once_with(SERVICE_ID)
         calls = [c[0] for c in order.method_calls if c[0] != "config.get_service"]
         assert calls == [
@@ -244,25 +241,49 @@ class TestRollbackOnBuildFailure:
         names = [c[0] for c in config.method_calls]
         assert names.index("set_service_enabled") > names.index("delete_service_role")
         assert names.index("set_service_enabled") > names.index("delete_service_scope")
-        assert "unset_service_type" not in names
 
     def test_quarantine_failure_propagates_after_the_rollback(self, quarantine):
         # A failed quarantine (e.g. the PDP is down) surfaces loudly — it is not swallowed. The
-        # rollback already ran, so the client is disabled.
+        # rollback already ran, so the client is disabled. The quarantine error replaces even a
+        # permanent build error, so the consumer retries (and quarantines again) instead of
+        # term()ing a fail-open service; the build error stays on __context__.
         service = object()
         config = _config_returning(service)
         quarantine.side_effect = RuntimeError("PDP unreachable")
+        build_error = PolicyRulesBuilderError("auditor rejected after retries")
 
         with (
             patch.object(orchestrator, "build_provision_graph", return_value=_graph()),
             patch.object(orchestrator, "ServicePolicyBuilder") as spb,
             patch.object(orchestrator, "_config", return_value=config),
         ):
-            spb.build.side_effect = LLMAccessError("boom")
-            with pytest.raises(RuntimeError, match="PDP unreachable"):
+            spb.build.side_effect = build_error
+            with pytest.raises(RuntimeError, match="PDP unreachable") as ei:
                 orchestrator.onboard_service(SERVICE_ID)
 
         config.set_service_enabled.assert_called_once_with(service, False)
+        assert ei.value.__context__ is build_error
+
+    def test_rollback_failure_still_quarantines(self, quarantine):
+        # A failed rollback (e.g. Keycloak is down) must not skip the quarantine: else a failed
+        # first onboarding stays fail-open. The rollback error propagates (a retryable error), and
+        # the build error stays on its __context__.
+        config = _config_returning(object())
+        config.delete_service_role.side_effect = RuntimeError("Keycloak unreachable")
+        build_error = PolicyRulesBuilderError("auditor rejected after retries")
+        graph = _graph(created_roles=[Role(id="r1", name="weather.forecast", composite=False)])
+
+        with (
+            patch.object(orchestrator, "build_provision_graph", return_value=graph),
+            patch.object(orchestrator, "ServicePolicyBuilder") as spb,
+            patch.object(orchestrator, "_config", return_value=config),
+        ):
+            spb.build.side_effect = build_error
+            with pytest.raises(RuntimeError, match="Keycloak unreachable") as ei:
+                orchestrator.onboard_service(SERVICE_ID)
+
+        quarantine.assert_called_once_with(SERVICE_ID)
+        assert ei.value.__context__ is build_error
 
 
 class TestRollbackLogInjectionSanitized:
@@ -347,7 +368,6 @@ class TestRollbackScopedToFourErrors:
         graph.invoke.assert_called_once()
         config.delete_service_role.assert_not_called()
         config.delete_service_scope.assert_not_called()
-        config.unset_service_type.assert_not_called()
         config.set_service_enabled.assert_not_called()
         quarantine.assert_not_called()
 

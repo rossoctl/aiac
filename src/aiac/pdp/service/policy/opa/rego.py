@@ -22,7 +22,7 @@ The Rego ``input`` follows the live plugin shape:
 - ``input.mcp.params.name`` — the **bare** invoked MCP tool name (e.g.
   ``source-read``); outbound only, carried by ``tools/call``.
 
-**ALLOW/DENY (deny-overrides), always deny by default.** Each gate is emitted
+**ALLOW gates and DENY gates, always deny by default.** Each gate is emitted
 twice — an ``*_allow_ok`` gate driven by the ALLOW scope maps and a symmetric
 ``*_deny_ok`` gate driven by the DENY scope maps. ``default allow := false``: a
 request that no rule allows is denied. A request is permitted iff every ALLOW
@@ -259,8 +259,8 @@ def _inbound_source_deny_gate() -> str:
 # Each gate is emitted twice (allow/deny) as a Rego FUNCTION over a bare tool
 # name, so ``tools/call`` (the invoked ``input.mcp.params.name``) and the MCP
 # session (any tool of the target) use one definition of the per-tool check.
-# ``allow`` is deny-overrides: both ALLOW gates pass on the tool and neither DENY
-# gate matches it.
+# ``allow`` holds only when both ALLOW gates pass on the tool and neither DENY gate
+# matches it.
 
 # The MCP messages that carry no tool name and open / keep a session with a target.
 _SESSION_METHODS = ("initialize", "notifications/initialized", "ping", "tools/list")
@@ -316,7 +316,7 @@ def _decision_block(*allow_bodies: str) -> str:
 def generate_inbound_rego(model: AgentPolicyModel, platform_clients: tuple[str, ...] = ("rossoctl",)) -> str:
     """Render the fixed ``authbridge.client.inbound.request`` Rego package.
 
-    Gates a caller reaching the agent. The decision is deny-overrides:
+    Gates a caller reaching the agent. A matching DENY gate blocks the request:
     ``allow`` requires ``subject_allow_ok`` (the subject holds a role granting
     >=1 of ``agent_scopes`` via the ALLOW map) AND ``source_allow_ok``, and
     fires only when neither ``subject_deny_ok`` nor ``source_deny_ok`` matches.
@@ -371,7 +371,7 @@ def generate_outbound_rego(model: AgentPolicyModel) -> str:
     """Render the fixed ``authbridge.client.outbound.request`` Rego package.
 
     Gates the agent's token-exchanged call to a downstream target, per invoked
-    tool. The decision is deny-overrides on the **same** ``input.mcp.params.name``:
+    tool. A matching DENY gate blocks the request, on the **same** ``input.mcp.params.name``:
     ``allow`` requires ``subject_allow_ok`` (the delegated user's role admits the
     tool, via de-prefixed ``subject_role_allow_scopes``) AND ``target_allow_ok``
     (the target service — keyed by the full ``input.identity.service_id`` SPIFFE
