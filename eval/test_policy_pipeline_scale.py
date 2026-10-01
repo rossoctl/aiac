@@ -34,10 +34,12 @@ PRB-level cases need only ``LLM_BASE_URL``/``LLM_MODEL``/``LLM_API_KEY``
 ``KEYCLOAK_URL``+admin creds and ``opa`` on ``PATH``.
 
 Size overrides (mirrors ``PRB_CONSISTENCY_REPEATS``'s existing convention -- use a small size while
-iterating, the full fixed-100 size for an actual regression run):
+iterating, the full fixed-100 size for an actual regression run). Selection stays marker-only, same
+as every other suite -- never a file path -- so ``-k scale`` narrows to this suite's own
+``test_scale_*`` functions within the ``eval`` marker:
 
     SCALE_TOTAL_CORPUS_SIZE=10 SCALE_TOTAL_CORPUS_ROLES=4 SCALE_PER_DECISION_CANDIDATES=20 \\
-        .venv/bin/pytest eval/test_policy_pipeline_scale.py -m eval -k prb -v -s
+        .venv/bin/pytest -m eval -k "scale and prb" -v -s
 """
 
 from __future__ import annotations
@@ -442,7 +444,14 @@ def total_corpus_e2e_result(tmp_path_factory: pytest.TempPathFactory) -> dict:
     ``eval.test_policy_pipeline_eval``'s ``provision_keycloak_admin``/``provision_via_config``/
     ``_read_back`` **unmodified** -- both provisioning functions are already generic over any
     scenario's own ``AGENTS``/``TOOLS``/``USER_ROLES`` dicts, so the generated corpus needs no
-    special-casing there."""
+    special-casing there.
+
+    Deliberately pays for the full ~100-150-call PRB run a second time rather than reusing
+    ``total_corpus_prb_result``'s already-computed rules: this fixture's own PRB run is against
+    Keycloak-sourced ``Role``/``Scope`` objects (``read_back_idp``), not the PRB-level fixture's
+    locally-constructed ones, and the two levels are meant to measure independent samples of LLM
+    run-to-run variance rather than share one run's output -- so this is the deliberate cost of
+    checking the PRB-level and e2e-level results separately, not an oversight to dedupe."""
     require_env_or_skip(
         "KEYCLOAK_URL", "KEYCLOAK_ADMIN_USERNAME", "KEYCLOAK_ADMIN_PASSWORD", "LLM_BASE_URL", "LLM_MODEL", "LLM_API_KEY"
     )
@@ -466,8 +475,8 @@ def total_corpus_e2e_result(tmp_path_factory: pytest.TempPathFactory) -> dict:
         start = time.perf_counter()
         orchestrated = orchestrate_prb_concurrent(roles, scopes, scenario, best_effort=True)
         rules, reasoning_by_scope, reasoning_by_agent_role, best_effort_notes, usage_by_name = orchestrated
-        elapsed = time.perf_counter() - start
         compute_and_apply(rules, override=False)
+        elapsed = time.perf_counter() - start
 
     return {
         "corpus": corpus,
@@ -633,9 +642,8 @@ def per_decision_e2e_result(tmp_path_factory: pytest.TempPathFactory) -> dict:
         role_rules, _, role_note, role_usage = _invoke_with_usage(
             ROLE_GRAPH, role=focal_role_obj, scopes=candidate_scope_objs, best_effort=True
         )
-        elapsed = time.perf_counter() - start
-
         compute_and_apply(scope_rules + role_rules, override=False)
+        elapsed = time.perf_counter() - start
 
     return {
         "corpus": corpus,

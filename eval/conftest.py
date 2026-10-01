@@ -363,6 +363,25 @@ _EXPECTED_SCENARIO_COUNT = 8
 # consistency suite's own parametrization count changes.
 _EXPECTED_CONSISTENCY_SCENARIO_COUNT = 8
 
+# Scale suite size overrides (eval.test_policy_pipeline_scale.py's own env-var reads) and their
+# documented fixed-100 defaults. Mirrored here as plain strings, not imported, so this module
+# doesn't need to import a live-LLM test module just to read three constants.
+_SCALE_FIXED_100_DEFAULTS = {
+    "SCALE_TOTAL_CORPUS_SIZE": "100",
+    "SCALE_TOTAL_CORPUS_ROLES": "10",
+    "SCALE_PER_DECISION_CANDIDATES": "100",
+}
+
+
+def _scale_run_matches_fixed_100() -> bool:
+    """True only when every Scale suite size override is unset or still at its documented
+    fixed-100 default. A reduced-size run (``SCALE_TOTAL_CORPUS_SIZE=10 ...``, used while
+    iterating per the suite's own module docstring) produces precision/recall/latency/cost numbers
+    that are not comparable to the fixed-100 regression baseline, regardless of whether both
+    halves of a dimension/level ran -- so it must never be tagged "regression" alongside real
+    fixed-100 runs on the same trend-log line."""
+    return all(os.environ.get(var, default) == default for var, default in _SCALE_FIXED_100_DEFAULTS.items())
+
 
 def _format_best_effort_notes(notes: dict[str, str]) -> str:
     """Render a ``{scope_or_role_name: reason}`` dict (``orchestrate_prb``'s ``best_effort_notes``)
@@ -593,10 +612,11 @@ def _write_trend_log() -> None:
     for scale_suite in sorted(set(scale_structural_entries) | set(scale_correctness_entries)):
         structural = scale_structural_entries.get(scale_suite, [])
         correctness = scale_correctness_entries.get(scale_suite, [])
-        # "regression" only once both halves ran in this session -- a -k filter that exercised
-        # just one of the two test functions produces a row that isn't comparable to a full run
-        # of the suite, same "partial" convention every dict above already uses.
-        run_type = "regression" if structural and correctness else "partial"
+        # "regression" only once both halves ran in this session (a -k filter that exercised just
+        # one of the two test functions produces a row that isn't comparable to a full run of the
+        # suite, same "partial" convention every dict above already uses) AND the run used the
+        # documented fixed-100 sizes, not a reduced size overridden while iterating.
+        run_type = "regression" if structural and correctness and _scale_run_matches_fixed_100() else "partial"
         # Skip whichever half didn't run rather than pooling an empty list: pool_scale_metrics([])
         # and pool_correctness_metrics([]) each report a vacuous "nothing failed" for a half that
         # was never measured (structural_pass_rate / precision+recall+denial_precision = 1.0), and

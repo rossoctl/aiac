@@ -208,19 +208,23 @@ written to a `tmp_path`, per call.
 
 ## Runbook
 
+Selection stays marker-only, same as every other suite (never a file path) -- `-k scale` narrows
+to this suite's eight `test_scale_*` functions within the `eval` marker, same convention as
+`CLAUDE.md`'s own `-m system -k uc1_onboard` example:
+
 ```bash
 # PRB-level only -- needs only LLM_BASE_URL/LLM_MODEL/LLM_API_KEY:
-.venv/bin/pytest eval/test_policy_pipeline_scale.py -m eval -k prb -v -s
+.venv/bin/pytest -m eval -k "scale and prb" -v -s
 
 # End-to-end only -- additionally needs KEYCLOAK_URL+admin creds and opa on PATH:
-.venv/bin/pytest eval/test_policy_pipeline_scale.py -m eval -k e2e -v -s
+.venv/bin/pytest -m eval -k "scale and e2e" -v -s
 
 # Small size while iterating (mirrors PRB_CONSISTENCY_REPEATS' existing override convention):
 SCALE_TOTAL_CORPUS_SIZE=10 SCALE_TOTAL_CORPUS_ROLES=4 SCALE_PER_DECISION_CANDIDATES=20 \
-    .venv/bin/pytest eval/test_policy_pipeline_scale.py -m eval -v -s
+    .venv/bin/pytest -m eval -k scale -v -s
 
 # Full fixed-100 regression run (both dimensions, both check types, both levels):
-.venv/bin/pytest eval/test_policy_pipeline_scale.py -m eval -v -s
+.venv/bin/pytest -m eval -k scale -v -s
 ```
 
 Each dimension/level pair shares one expensive fixture between its structural and correctness test

@@ -326,6 +326,14 @@ _ROW_BOOKKEEPING_KEYS = {
     "structural_issue_count",
 }
 
+# Belt-and-suspenders beyond the explicit names above: a future pooling function's metric name
+# ending in one of these unit/tally suffixes is unbounded by construction (a raw token count, a
+# wall-clock duration, an issue tally) and must never share this chart's fixed 0-1 y-axis with a
+# precision/recall/rate/coverage metric -- excluded by shape, not only by an exact name someone
+# remembered to add to _ROW_BOOKKEEPING_KEYS after the fact (that denylist-by-name is exactly how
+# `total_tokens` first plotted at y ≈ -1.7 billion before being named above).
+_UNBOUNDED_METRIC_SUFFIXES = ("_tokens", "_seconds", "_count")
+
 # Fixed palette metrics are assigned from, in first-seen order, so the same metric name gets the
 # same color across repeated calls/renders for one suite. Cycles if a suite ever reports more
 # metrics than colors (unlikely: no suite has needed more than 3 so far).
@@ -337,11 +345,13 @@ _AXIS_COLOR = "#9aa0a6"  # legible against the dark chart background, but not co
 
 def _metric_colors(rows: list[dict[str, Any]]) -> dict[str, str]:
     """Discover every metric key actually present across ``rows`` (first-seen order, skipping
-    ``_ROW_BOOKKEEPING_KEYS`` and any non-numeric value) and assign each a stable palette color."""
+    ``_ROW_BOOKKEEPING_KEYS``, any key shaped like an unbounded metric
+    (``_UNBOUNDED_METRIC_SUFFIXES``), and any non-numeric value) and assign each a stable palette
+    color."""
     names: list[str] = []
     for row in rows:
         for key, value in row.items():
-            if key in _ROW_BOOKKEEPING_KEYS or key in names:
+            if key in _ROW_BOOKKEEPING_KEYS or key in names or key.endswith(_UNBOUNDED_METRIC_SUFFIXES):
                 continue
             if isinstance(value, (int, float)):
                 names.append(key)
