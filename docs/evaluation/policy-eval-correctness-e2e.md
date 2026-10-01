@@ -2,7 +2,7 @@
 
 > **One spec among several.** This document specifies **one** integration test.
 > Eval specs live **one spec per test** under `docs/evaluation/`
-> (a sibling of `components/`), and the master PRD's *Integration test specifications* section
+> (a sibling of `components/`), and the master PRD's *Test & evaluation specifications* section
 > ([../PRD.md](../specs/PRD.md)) is the index of them. This is a **companion to**, not a replacement
 > for, [policy-eval-scenarios.md](policy-eval-scenarios.md) and
 > [policy-eval-correctness-prb.md](policy-eval-correctness-prb.md): all three families reuse the
@@ -20,13 +20,13 @@
   their unmarked unit tests, runs in the default fast pass. Mirrors
   `eval/correctness_scorer.py`/`eval/test_correctness_scorer.py`'s logic-module/test-module split.
 - `aiac/eval/test_policy_pipeline_correctness_e2e.py` — the suite itself,
-  `@pytest.mark.eval_correctness_e2e`.
+  `@pytest.mark.eval`.
 - `aiac/eval/best_effort_rules.py` — the best-effort fallback's own pure-logic helper
   (`_best_effort_rules`); `aiac/eval/test_best_effort_rules.py` — its unmarked unit tests. See
   [Best-effort proposals](#best-effort-proposals).
 - Reuses, unmodified, from `eval.test_policy_pipeline_eval`: `SCENARIOS`, the `pipeline` fixture
-  (re-exported by import — see [Runbook](#runbook)), `_require_scenario`, `_rego_path`, `opa_bin`,
-  `opa_eval`, `truth`.
+  (re-exported by import — see [Runbook](#runbook)), `_require_scenario`, `_rego_path`,
+  `_user_role_names`, `opa_bin`, `opa_eval`, `truth`.
 
 ## Description
 
@@ -48,27 +48,29 @@ over-grants, under-grants/incorrect denials reported only.
 `opa eval` is queried directly against the plain data documents the Rego generator already
 declares — `subject_role_allow_scopes`/`subject_role_deny_scopes` (inbound and outbound-subject)
 and `agent_role_scopes` (outbound-target, ALLOW only) — rather than exhaustively probing every
-`(role, scope)` pair's `allow`/`deny_ok` decision. Two `opa eval` calls per agent per direction
-return the entire role→scopes table in one shot; `_pairs_from_map` flattens each into `(role,
-scope)` pairs, and `_accumulate_agent_gates` unions every agent's pairs into the three top-level
-gate buckets `score_scenario` expects. Both maps are already keyed by bare (deprefixed) role/scope
-names — the same names the truth tables use — so no re-prefixing logic is needed.
+`(role, scope)` pair's `allow`/`deny_ok` decision. Two `opa eval` calls per agent for inbound, and
+three for outbound, return the entire role→scopes table in one shot; `_pairs_from_map` flattens
+each into `(role, scope)` pairs, and `_accumulate_agent_gates` unions every agent's pairs into the three top-level
+gate buckets `score_scenario` expects. The outbound maps are de-prefixed; the inbound maps keep the
+full scope names. The scenario scope names have no `<owner>.` prefix, so both match the names the
+truth tables use — no re-prefixing logic is needed.
 
 | Gate | Direction | ALLOW map | DENY map |
 |---|---|---|---|
 | `inbound` | inbound rego | `subject_role_allow_scopes` | `subject_role_deny_scopes` |
 | `outbound_subject` | outbound rego | `subject_role_allow_scopes` | `subject_role_deny_scopes` |
-| `outbound_target` | outbound rego | `agent_role_scopes` (deprefixed `outbound_target_allow_rules`) | **none** — see below |
+| `outbound_target` | outbound rego | `agent_role_scopes` (deprefixed `outbound_target_allow_rules`) | **none queried** — see below |
 
-### Known gap: `outbound_target` denial is unrenderable, not just untested
+### Known gap: `outbound_target` denial is not scored
 
-`AgentPolicyModel.outbound_target_deny_rules` is computed by the PCE, but
-`aiac.pdp.service.policy.opa.rego.generate_outbound_rego` never renders it into any queryable Rego
-document — only the ALLOW side (`agent_role_scopes`) is emitted. So for the `outbound_target` gate,
+`AgentPolicyModel.outbound_target_deny_rules` is computed by the PCE, and
+`aiac.pdp.service.policy.opa.rego.generate_outbound_rego` renders it only as the service-keyed
+`target_deny_scopes` map. There is no role-keyed counterpart of `agent_role_scopes`, and this suite
+does not query `target_deny_scopes`. So for the `outbound_target` gate,
 `denied` is always `set()`, and that gate's `denial_precision` reads vacuously `1.0`.
 `over_grants`/`under_grants` for `outbound_target` are unaffected (they depend only on
-`granted`/`expected`, not `denied`). **This is a pre-existing production Rego-generator gap, not
-introduced by this suite and not fixed by it** — see [Out of Scope](#out-of-scope).
+`granted`/`expected`, not `denied`). **This is a scoring gap of this suite, not fixed by it** — see
+[Out of Scope](#out-of-scope).
 
 ## Configuration (env)
 
@@ -85,9 +87,9 @@ directly.
 
 ## Parallelization
 
-The shared `pipeline` fixture (`eval/test_policy_pipeline_eval.py`, also used by the `eval_extended`
-suite) provisions all 8 scenarios **concurrently**, one `ProcessPoolExecutor` worker per scenario —
-not `pytest-xdist`'s `-n` (still unsupported/unneeded here: the parallelism lives inside the
+The shared `pipeline` fixture (`eval/test_policy_pipeline_eval.py`, also used by the scenarios
+suite in that file) provisions all 8 scenarios **concurrently**, one `ProcessPoolExecutor` worker
+per scenario — not `pytest-xdist`'s `-n` (still unsupported/unneeded here: the parallelism lives inside the
 fixture, across scenarios, not across pytest's own test-collection workers).
 
 Separate **processes**, not threads, because the fixture's per-scenario setup mutates
@@ -109,8 +111,8 @@ scenario — the LLM-heavy `orchestrate_prb` calls and the idp/store/opa subproc
 fully concurrently; realm provisioning is a small fraction of one scenario's wall-clock next to the
 PRB's several sequential LLM calls.
 
-This benefits every suite that shares the `pipeline` fixture (`eval_extended` primarily, plus this
-suite), not just `eval_correctness_e2e` — see [Relationship to other integration
+This benefits every suite that shares the `pipeline` fixture (the scenarios suite in
+`test_policy_pipeline_eval.py` primarily, plus this suite) — see [Relationship to other integration
 tests](#relationship-to-other-integration-tests).
 
 ## Best-effort proposals
@@ -145,13 +147,13 @@ mechanism (same underlying `orchestrate_prb` parameter).
 .venv/bin/pytest eval/test_correctness_e2e_helpers.py -v
 
 # The suite itself — needs KEYCLOAK_URL + admin creds + LLM_* + opa on PATH:
-.venv/bin/pytest eval/test_policy_pipeline_correctness_e2e.py -m eval_correctness_e2e -v -s
+.venv/bin/pytest eval/test_policy_pipeline_correctness_e2e.py -m eval -v -s
 
 # Sanity-check the fixture's primary consumer still passes against the now-parallelized fixture:
-.venv/bin/pytest eval/test_policy_pipeline_eval.py -m eval_extended -v
+.venv/bin/pytest eval/test_policy_pipeline_eval.py -m eval -v
 ```
 
-`require_env(...)` is the first line of the parametrized test function; `opa_bin()` skips the test
+`require_env_or_skip(...)` is the first line of the parametrized test function; `opa_bin()` skips the test
 cleanly (not a failure) if `opa` isn't resolvable. Same skip-clean philosophy as every sibling
 suite — this suite never false-passes when its infra isn't available.
 
@@ -160,15 +162,10 @@ suite — this suite never false-passes when its infra isn't available.
 Parametrized over all 8 scenario names (`sorted(SCENARIOS)`); expects all 8 to pass (zero
 over-grants) given a healthy Keycloak instance and a well-behaved LLM endpoint. Before
 `best_effort=True` was wired in (see [Best-effort proposals](#best-effort-proposals)), a real run
-against the rossoctl kind cluster showed 6/8 passing and 2/8 failing at the *setup* stage
-(`PolicyContradictionError`/`PolicyRulesBuilderError` from the PRB's own audit/retry loop,
-`aiac.agent.policy_rules_builder.graph._audit`) — the **pre-existing, already-deferred**
-audit/retry-convergence bug (confirmed to reproduce identically in the PRB-direct
-`test_policy_pipeline_correctness_prb.py` suite, no Keycloak/PCE/OPA involved at all — unrelated
-to this suite or its parallelization). `best_effort=True` doesn't fix that bug (still not this
-ticket's job — see [Out of Scope](#out-of-scope)), it changes what a rejected scenario reports:
-instead of "setup failed" with nothing else, it now scores (real, possibly imperfect
-precision/recall) with `best_effort_notes` naming exactly which decisions weren't auditor-approved.
+against the rossoctl kind cluster showed 6/8 passing and 2/8 failing at the *setup* stage, from the
+pre-existing PRB audit/retry-convergence bug (see [Out of Scope](#out-of-scope)). With
+`best_effort=True`, such a scenario now scores, and `best_effort_notes` names each decision that was
+not auditor-approved.
 Each test case `record_property`s `precision`, `recall`, `denial_precision`, `over_grants`,
 `under_grants`, `incorrectly_denied` (the latter three as `{gate: sorted(pairs)}`), and
 `best_effort_notes`, and prints:
@@ -188,8 +185,8 @@ pairs per gate.
 
 Covered by `eval/conftest.py`'s existing Markdown report and its generic
 `"precision" in props and "recall" in props` render-branch dispatch (already used by
-`test_prb_correctness`) — no per-suite special-casing was needed; `eval_correctness_e2e` was simply
-added to the `MARKERS` set. See
+`test_prb_correctness`) — no per-suite special-casing was needed; the report picks up every
+`eval/test_policy_pipeline_*.py` nodeid. See
 [policy-eval-correctness-prb.md § Test report](policy-eval-correctness-prb.md#test-report) for the
 render behavior itself.
 
@@ -205,7 +202,7 @@ the same committed `eval/trend_log.jsonl`, distinct from the PRB-level suite's
 ## Relationship to other integration tests
 
 This is **one** integration-test spec among several indexed by the master PRD
-([../PRD.md](../specs/PRD.md), § *Integration test specifications*).
+([../PRD.md](../specs/PRD.md), § *Test & evaluation specifications*).
 
 - **Companion to, not a replacement for,
   [policy-eval-correctness-prb.md](policy-eval-correctness-prb.md).** Same corpus, same scorer,
@@ -213,18 +210,12 @@ This is **one** integration-test spec among several indexed by the master PRD
   Keycloak/PCE/OPA in the loop; this suite scores the same corpus one layer further downstream,
   through the full pipeline, and is the only one of the two that can catch a PCE-merge or
   Rego-rendering bug.
-- **Shares the `pipeline` fixture with `eval_extended`** (`test_policy_pipeline_eval.py`) — the
-  parallelization work described above (see [Parallelization](#parallelization)) speeds up both
-  suites, since it lives in the shared fixture, not in this suite's own file. The
-  [best-effort fallback](#best-effort-proposals) is the same story: it's a property of the shared
-  fixture, so `eval_extended`'s own per-cell tests (`test_inbound`/`test_outbound`/
-  `test_grant_set_matches_truth_table`) are affected too, not just `test_e2e_correctness` — a
-  scenario whose PRB rejects a decision no longer gets a clean scenario-level skip; it runs
-  through with a best-effort fallback for *that* decision only, so those specific per-cell
-  assertions can show a real (and possibly wrong) result instead of a skip. Confirmed as the
-  accepted tradeoff with the user, not treated as a regression to fix.
-- **New marker, registered in `pyproject.toml`** (`eval_correctness_e2e`), distinct from
-  `eval_extended`/`eval_consistency`/`eval_robustness`/`eval_correctness_prb`.
+- **Shares the `pipeline` fixture with the scenarios suite** (`test_policy_pipeline_eval.py`), so
+  the [parallelization](#parallelization) and the [best-effort fallback](#best-effort-proposals)
+  apply to both suites. The scenarios suite's per-cell tests (`test_inbound`/`test_outbound`/
+  `test_grant_set_matches_truth_table`) can therefore show a real (and possibly wrong) result for a
+  best-effort decision, instead of a skip. Confirmed as the accepted tradeoff with the user.
+- **Carries the single flat `eval` marker** (`pyproject.toml`), like every suite under `eval/`.
 
 ## Out of Scope
 
@@ -233,15 +224,15 @@ This is **one** integration-test spec among several indexed by the master PRD
   `confusable_agents` — which scenario(s) hit it varies with LLM sampling, but at least one of
   `agent_delegation`/`confusable_agents` reproduces consistently) to reject a scope/role decision
   with `PolicyContradictionError`/`PolicyRulesBuilderError`. Confirmed pre-existing and unrelated
-  to this suite (reproduces identically in the PRB-direct `eval_correctness_prb` suite).
+  to this suite (reproduces identically in the PRB-direct `test_policy_pipeline_correctness_prb.py`
+  suite).
   `best_effort=True` (see [Best-effort proposals](#best-effort-proposals)) changes how a rejection
   is *reported* (scored with a caveat instead of "setup failed") — it does not fix the underlying
   bug. The user has already deferred fixing `graph.py` itself as a separate follow-up — not this
   ticket's job.
-- **Fixing the `outbound_target` denial-rendering gap** in
-  `aiac.pdp.service.policy.opa.rego.generate_outbound_rego` — see
-  [Known gap](#known-gap-outbound_target-denial-is-unrenderable-not-just-untested). This is
-  production code, unrelated to this eval suite's own scope; the gap is documented and reported
+- **Scoring the `outbound_target` denial side** (the service-keyed `target_deny_scopes` map that
+  `aiac.pdp.service.policy.opa.rego.generate_outbound_rego` renders) — see
+  [Known gap](#known-gap-outbound_target-denial-is-not-scored). The gap is documented and reported
   (vacuous `denial_precision=1.0` for that one gate), not silently hidden.
 - **An under-grant tolerance threshold.** Still TBD per the originating spec; under-grants are
   tracked/reported only, never gated.

@@ -1,7 +1,7 @@
 # Demo Spec: `github-tool` (MCP) — minimal source + issue tool for UC-1 onboarding
 
-> **Status:** spec (design source of truth). This document describes the files to be built;
-> it does not create them.
+> **Status:** implemented under `demo/assets/tools/github_tool/` (`server.py`, `Dockerfile`,
+> `k8s/github-tool-deployment.yaml`).
 >
 > **This is a demo/reference tool**, not part of the AIAC service tree (`src/aiac/`). It is a
 > self-contained, deployable MCP tool server whose sole job is to make **UC-1 service onboarding**
@@ -13,13 +13,13 @@
 
 ## 1. Purpose & scenario mapping
 
-The AIAC phase-1 deliverable ([`../../gh-issues/sub-issue-phase-1.md`](../../gh-issues/sub-issue-phase-1.md))
-demonstrates **service onboarding (UC-1)** end-to-end for one agent (`github-agent`) and one tool
+The AIAC phase-1 deliverable demonstrates **service onboarding (UC-1)** end-to-end for one agent (`github-agent`) and one tool
 (`github-tool`): AIAC classifies each service, discovers its capabilities, provisions the identities
-they need, models access, and emits rules — which are then validated by **rule evaluation**, not by
-live traffic. Phase 1 is explicitly **"Deploy + discover + evaluate": no live A2A traffic and no live
-enforcement.** The tool is onboarded and its scopes are evaluated; it is **never actually driven by
-the agent.**
+they need, models access, and emits rules — which are then validated by **live requests** through
+AuthBridge to the deployed OPA plugin (no `opa eval`, no `.rego` dump). Phase 1 is explicitly **"Deploy + discover + evaluate".** The tool is onboarded and its
+scopes are evaluated. The agent's CrewAI app does not call this tool. The system tests send live MCP
+`tools/call` requests to this tool from the `github-agent` pod through AuthBridge, and assert the
+decisions of the deployed OPA plugin (`test/system/launcher.py`, `outbound_probe`).
 
 This spec defines the **tool half** of that demo: a **real, deployable MCP endpoint** that answers
 `tools/list` with exactly four tools, so that UC-1's `analyze_tool` node derives exactly the four
@@ -35,8 +35,9 @@ From `analyze_tool` (`../components/aiac-agent/uc1-service-onboarding.md`):
    pod label. It **must be `tool`** → routes to `analyze_tool`.
 2. **`analyze_tool`** does `read_service(workload_name, namespace)` (the K8s Service named
    `workload_name`), **requires the `protocol.rossoctl.io/mcp` label** on that Service (a deploy-time
-   prerequisite — the operator does **not** stamp it), takes the Service's **first port**, and POSTs
-   JSON-RPC `tools/list` to
+   prerequisite — the operator does **not** stamp it), takes the Service's **first port**, mints a
+   discovery token (`Configuration.mint_discovery_token(service_id)`), and POSTs JSON-RPC
+   `tools/list` with `Authorization: Bearer <token>` to
    `http://{workload_name}.{namespace}.svc.cluster.local:{port}/mcp`.
 3. UC-1 derives **one scope per returned tool**:
    `ScopeDefinition(name=f"{workload_name}.{tool.name}", description=tool.description)`.
@@ -59,11 +60,10 @@ exactly the four MCP tools whose names + descriptions make UC-1 reproduce them:
 | `issues-read` | `issues-read` | `github-tool.issues-read` |
 | `issues-write` | `issues-write` | `github-tool.issues-write` |
 
-The tool does **not** know or enforce these scopes — AIAC/OPA + AuthBridge do (in later phases).
-Phase 1 only discovers and evaluates them.
+The tool does **not** know or enforce these scopes — AIAC/OPA + AuthBridge do. The outbound OPA
+package of the calling agent allows a `tools/call` only for a granted tool.
 
 ### Related artefacts
-- Phase-1 deliverable: [`../../gh-issues/sub-issue-phase-1.md`](../../gh-issues/sub-issue-phase-1.md)
 - UC-1 `analyze_tool`: [`../components/aiac-agent/uc1-service-onboarding.md`](../components/aiac-agent/uc1-service-onboarding.md)
 - Scenario fixture (`TOOL_SCOPES`): [`../../../test/system/scenario.py`](../../../test/system/scenario.py)
 - Scenario spec: [`../../testing/policy-pipeline.md`](../../testing/policy-pipeline.md)
@@ -87,14 +87,16 @@ intentional:
    scenario tool scopes and nothing else. The production 44-tool catalog would yield 44 fine-grained
    scopes that do not match the scenario truth table.
 2. **Stub handlers, no GitHub.** Tool **calls** are trivial no-op/echo stubs; there are no real GitHub
-   API calls, no PAT, and no MitM. Phase 1 drives no live traffic, so nothing calls the tools.
+   API calls, no PAT, and no MitM. The system tests call the stubs through AuthBridge, but they do
+   not examine the stub result.
 3. **Workload name `github-tool`, not `github-tool-mcp`.** See §6 (naming invariants). The scenario
    entity id is `github-tool`, which keeps UC-1 identity resolution clean.
 
 In short: this is a **purpose-built, minimal stand-in** used ONLY to make UC-1's discovery deterministic
 for the phase-1 demo. It is distinct from — and not a replacement for — the production 44-tool
-`github-tool` referenced by [`github-agent.md`](github-agent.md). When later phases wire live traffic,
-they use the production tool; this stand-in serves the discover-and-evaluate loop only.
+`github-tool` referenced by [`github-agent.md`](github-agent.md). The agent app's `MCP_URL` uses the
+production tool. The live OPA probes in `test/system/` use this stand-in
+(`http://github-tool:9090/mcp`).
 
 ---
 
@@ -148,7 +150,7 @@ answers `tools/list` with the four tools of §3.
 ```
  UC-1 analyze_tool ──(JSON-RPC POST /mcp: tools/list)──► github-tool (:PORT) ──► 4 tools
    (resolves http://github-tool.team1.svc.cluster.local:{first-port}/mcp)
- (phase 1: no tools/call traffic — stub handlers are never exercised by the agent)
+ (system tests send tools/call here through the agent pod's AuthBridge outbound proxy)
 ```
 
 ---
@@ -163,8 +165,9 @@ Minimal env, adapted to the tiny server:
 | `LOG_LEVEL` | Log level | `INFO` |
 
 No Keycloak, LLM, GitHub PAT, JWKS, or audience config — the demo tool performs no auth and no upstream
-calls (contrast the github-issue demo's `github-tool`, which needs PATs + issuer/JWKS/audience). Any
-auth enforcement in front of this tool is AuthBridge/MitM's job in later phases, not this container's.
+calls (contrast the github-issue demo's `github-tool`, which needs PATs + issuer/JWKS/audience). Auth
+enforcement in front of this tool is the job of the injected AuthBridge sidecar (inbound
+`jwt-validation` + `opa`), not of this container.
 
 ---
 
@@ -203,10 +206,10 @@ Manifests live under `demo/assets/tools/github_tool/k8s/`, adapted from the sibl
 github-issue demo's `github-tool-deployment.yaml`. Namespace **`team1`** (installer-provided
 ConfigMaps/secrets assumed present), consistent with the agent spec.
 
-- **`github-tool-deployment.yaml`** — `Deployment` + `Service` + `AgentRuntime`:
+- **`github-tool-deployment.yaml`** — `ServiceAccount` + `Deployment` + `Service` + `AgentRuntime`:
   - **`Deployment`** named `github-tool`. Container port serves `/mcp`; the image's own default is
     `9090`, but the in-cluster manifest overrides `PORT` to **`9095`** (see the port-shift invariant
-    below). Env `PORT`, `LOG_LEVEL`. Image `github-tool:latest`, `imagePullPolicy: IfNotPresent`
+    below). Env `PORT`, `LOG_LEVEL`. Image `localhost/github-tool:latest`, `imagePullPolicy: IfNotPresent`
     (kind-load; name is a documented knob). No GitHub PAT / issuer / JWKS / audience env (unlike the
     github-issue tool).
   - **Pod label `rossoctl.io/type: tool`** — this is what `classify_service` reads. Applied by the
@@ -232,8 +235,12 @@ ConfigMaps/secrets assumed present), consistent with the agent spec.
     (which omits `rossoctl.io/type` to skip AuthBridge entirely), this demo **needs** `type: tool` so the
     pod carries `rossoctl.io/type=tool` for UC-1 `classify_service`.
 
-- **No `configmaps.yaml` needed here** — the tool has no `authbridge-config` / `authproxy-routes`
-  dependency (it neither validates inbound JWTs nor does outbound token exchange in phase 1). The agent
+- **No `configmaps.yaml` needed here** — the tool container itself neither validates JWTs nor
+  exchanges tokens. The operator injects the AuthBridge sidecar into the tool pod
+  (`injectTools=true`, set by `k8s/opa-kind-enable.sh`). The sidecar's inbound pipeline
+  (`a2a-parser`, `mcp-parser`, `inference-parser`, `jwt-validation`, `opa`) comes from the namespace
+  `authbridge-runtime-config`, so each `/mcp` call needs a JWT whose `aud` is the tool's client-id
+  (UC-1 `analyze_tool` sends a discovery token). The agent
   spec's `authproxy-routes` still targets the **production** `github-tool-mcp` host and is unrelated to
   this stand-in.
 
@@ -257,6 +264,7 @@ port; the operator-applied pod label is `rossoctl.io/type=tool`; the operator-re
    ```bash
    curl -s -X POST localhost:9090/mcp \
      -H 'Content-Type: application/json' \
+     -H 'Accept: application/json' \
      -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' \
    | jq -r '.result.tools[].name' | sort
    # → issues-read, issues-write, source-read, source-write
@@ -265,7 +273,8 @@ port; the operator-applied pod label is `rossoctl.io/type=tool`; the operator-re
    `scenario.py` (e.g. `jq '.result.tools[] | {name, description}'`).
 
 **Cluster (HITL — live Rossoctl + Keycloak + operator):**
-4. `kind load docker-image github-tool:latest --name rossoctl`.
+4. `demo/assets/kind-load.sh --tool-only` (builds `localhost/github-tool:latest` if absent and loads
+   it into the `rossoctl` Kind cluster).
 5. `kubectl apply -f k8s/github-tool-deployment.yaml`.
 6. Confirm the operator applied the pod label: `kubectl get pod -l app=github-tool -n team1
    -o jsonpath='{.items[0].metadata.labels.rossoctl\.io/type}'` → `tool`.
@@ -274,12 +283,14 @@ port; the operator-applied pod label is `rossoctl.io/type=tool`; the operator-re
 8. Confirm the operator registered a Keycloak client with `client.name = "team1/github-tool"` (via the
    Keycloak admin API / IdP `Configuration` library).
 9. From inside the cluster (or via `kubectl port-forward svc/github-tool 9090:9090 -n team1`), POST
-   `tools/list` to `http://github-tool.team1.svc.cluster.local:9090/mcp` and confirm the four tools —
-   the exact call UC-1 `analyze_tool` makes.
+   `tools/list` to `http://github-tool.team1.svc.cluster.local:9090/mcp` with
+   `-H 'Accept: application/json'` and `-H 'Authorization: Bearer <token>'` (a token from
+   `Configuration.mint_discovery_token(<service id>)`; the sidecar's `jwt-validation` rejects a call
+   without it), and confirm the four tools — the exact call UC-1 `analyze_tool` makes.
 10. (End-to-end) Trigger UC-1 onboarding for `github-tool` and confirm it provisions scopes
     `github-tool.source-read` / `github-tool.source-write` / `github-tool.issues-read` /
-    `github-tool.issues-write`, and writes **no rules for the tool alone** (per the phase-1 acceptance
-    criteria).
+    `github-tool.issues-write`. For the tool alone, it writes the (user role → tool scope) rules onto
+    `SPM(github-tool)`, but no APM and no `AuthorizationPolicy` CR.
 
 ---
 
@@ -287,13 +298,14 @@ port; the operator-applied pod label is `rossoctl.io/type=tool`; the operator-re
 
 - **Real GitHub API calls / real source & issue operations** — tool-call handlers are stubs; there is
   no GitHub PAT and no upstream.
-- **Auth enforcement inside the tool** — no inbound JWT validation, no outbound token exchange, no
-  audience/scope checks. AuthBridge / the MitM handle enforcement in later phases.
+- **Auth enforcement inside the tool container** — the container does no JWT validation, no token
+  exchange, and no audience/scope checks. The injected AuthBridge sidecar enforces inbound
+  `jwt-validation` + `opa`.
 - **The production 44-tool federation** — this stand-in exposes only the four canonical scenario tools
-  (see §2); the real `github-tool` (`github-tool-mcp:9090/mcp`) is unchanged and used by the live-traffic
-  path.
-- **Being agent-executable** — phase 1 drives no A2A traffic, so the tool is discovered and evaluated but
-  never invoked by `github-agent`.
+  (see §2); the real `github-tool` (`github-tool-mcp:9090/mcp`) is unchanged and used by the agent app's
+  `MCP_URL`. The live OPA probes in `test/system/` target this stand-in.
+- **Being agent-executable** — the agent's CrewAI app never calls this tool. Only the system-test
+  probes call it, from the `github-agent` pod.
 - **Any changes to the AIAC pipeline, UC-1, `policy-pipeline.md`, or the integration test** — this tool
   is an input to UC-1 discovery, not a change to it.
 - **Building this tool into `agent-examples` CI** — demo images build independently (as with the

@@ -5,19 +5,16 @@
 
 ## Description
 A FastAPI web service that translates a **Policy Model** into OPA Rego packages and, for each agent, **server-side-applies** the two generated packages into a per-agent `AuthorizationPolicy` Kubernetes Custom Resource (`agent.rossoctl.dev/v1alpha1`, `scope: client` — one CR per agent). The `bundle-service` (operator repo) composes those per-agent CRs into per-pod OPA bundles; the OPA plugin embedded in each AuthBridge instance polls the bundle relevant to its pod and evaluates it.
-A FastAPI web service that translates a **Policy Model** into OPA Rego packages and, for each agent, **server-side-applies** the two generated packages into a per-agent `AuthorizationPolicy` Kubernetes Custom Resource (`agent.rossoctl.dev/v1alpha1`, `scope: client` — one CR per agent). The `bundle-service` (operator repo) composes those per-agent CRs into per-pod OPA bundles; the OPA plugin embedded in each AuthBridge instance polls the bundle relevant to its pod and evaluates it.
 
 The service is deployed as a container in the **Rossoctl Interface Pod** alongside the IdP Configuration Service, behind the `aiac-pdp-policy-service:7072` ClusterIP.
-The service is deployed as a container in the **Rossoctl Interface Pod** alongside the IdP Configuration Service, behind the `aiac-pdp-policy-service:7072` ClusterIP.
 
-The service has no dependency on Keycloak. All Keycloak operations (entity reads) are handled by the **IdP Configuration Service** and its library (`aiac.idp.configuration`). The legacy Keycloak composite / authorization-services policy writer has been **removed** (handoff 04); this OPA CR writer is the sole policy-writer surface.
-The service has no dependency on Keycloak. All Keycloak operations (entity reads) are handled by the **IdP Configuration Service** and its library (`aiac.idp.configuration`). The legacy Keycloak composite / authorization-services policy writer has been **removed** (handoff 04); this OPA CR writer is the sole policy-writer surface.
+The service has no dependency on Keycloak. All Keycloak operations (entity reads) are handled by the **IdP Configuration Service** and its library (`aiac.idp.configuration`). The legacy Keycloak composite / authorization-services policy writer has been **removed**; this OPA CR writer is the sole policy-writer surface.
 
 ---
 
 ## Pydantic models (`aiac.policy.model.models`)
 
-The Policy Writer deserializes the **canonical** `PolicyModel` / `AgentPolicyModel` / `PolicyRule` defined in [policy-model.md](policy-model.md) and imported from `aiac.policy.model.models`. This service does **not** define its own copies; the tables below summarize the fields the Rego generator consumes. (The former `aiac.pdp.library.models` module is deprecated — see policy-model.md "Replaces".)
+The Policy Writer deserializes the **canonical** `PolicyModel` / `AgentPolicyModel` / `PolicyRule` defined in [policy-model.md](policy-model.md) and imported from `aiac.policy.model.models`. This service does **not** define its own copies; the tables below summarize the fields the Rego generator consumes. (The former `aiac.pdp.library.models` module has been removed — see policy-model.md "Replaces".)
 
 All models use `model_config = ConfigDict(extra='ignore')`.
 
@@ -39,7 +36,7 @@ Complete policy definition for a single agent (service). Contains two sets of `P
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `agent_id` | `str` | Service ID from the AIAC trigger event (`aiac.apply.service.{id}`) |
+| `agent_id` | `str` | The agent's clientId (`<ns>/<name>` or a SPIFFE URI); `identity_ref` maps it to the CR's `(namespace, name)`. Not the Keycloak UUID that the `aiac.apply.service.{id}` trigger carries. |
 | `agent_roles` | `list[Role]` | Realm roles assigned to this agent. Effect-agnostic identity. |
 | `agent_scopes` | `list[Scope]` | Scopes this agent exposes. Effect-agnostic identity. |
 | `source_roles` | `dict[str, list[Role]]` | Inbound: source (calling service) **id** → roles held. Keyed by the inbound `input.identity.client_id`. **Optional** gate input — an absent `client_id`, or a platform bypass client, passes. Effect-agnostic; **includes deny-edge roles**. |
@@ -86,9 +83,9 @@ No `?realm=` parameter — the service operates on a Kubernetes CR, not a Keyclo
 | Method | Path | Body | Operation |
 |--------|------|------|-----------|
 | `POST` | `/policy` | `PolicyModel` | Upsert Rego packages for all agents in the partial model |
-| `POST` | `/policy/agents/{agent_id}` | `AgentPolicyModel` | Upsert Rego packages for a single agent |
-| `DELETE` | `/policy/agents/{agent_id}` | — | Remove all Rego packages for a specific agent (off-boarding) |
-| `DELETE` | `/policy` | — | Clear all Rego packages from the CR (rebuild pre-step) |
+| `POST` | `/policy/agents/{agent_id:path}` | `AgentPolicyModel` | Upsert Rego packages for a single agent (the URL segment is ignored; the body `agent_id` selects the CR) |
+| `DELETE` | `/policy/agents/{agent_id:path}` | — | Remove all Rego packages for a specific agent (off-boarding) |
+| `DELETE` | `/policy` | — | Delete every writer-managed CR, cluster-wide (meant as the rebuild pre-step — **Status: not built yet** — `rebuild_policy()` is a stub and no code calls `delete_policy()`) |
 | `GET` | `/health` | — | Readiness probe |
 
 ### Status codes
@@ -96,17 +93,8 @@ No `?realm=` parameter — the service operates on a Kubernetes CR, not a Keyclo
 | Endpoint | Success | Error |
 |----------|---------|-------|
 | `POST /policy` | `204 No Content` | **400** `{"error": …}` for a malformed / namespace-less `agent_id` (batch aborts, naming the bad agent; agents already applied stay written — no rollback); **502** `{"error": …}` for a Kubernetes API failure (or the additive dump's `OSError`) |
-| `POST /policy/agents/{agent_id}` | `204 No Content` | **400** for a malformed `agent_id`; **502** for a Kubernetes API / dump failure |
-| `DELETE /policy/agents/{agent_id}` | `204 No Content` | **400** for a malformed `agent_id`; **502** for a Kubernetes API failure. Deleting a **missing** agent is a no-op **204** (k8s 404 treated as success — idempotent) |
-| `DELETE /policy` | `204 No Content` | **502** for a Kubernetes API failure |
-| `GET /health` | `200 OK` `{"status": "ok"}` | `503 Service Unavailable` `{"status": "unavailable", "error": …}` if the bounded CR list fails |
-
-`GET /health` performs a bounded (`limit=1`) cluster-wide list of the CRD: a successful list — **including an empty one** — is `200`; any failure (unreachable API, RBAC-forbidden, CRD not served) is `503`.
-
-**400 vs 502 (Q11).** `400` is reserved strictly for a malformed / namespace-less `agent_id` — the `identity_ref` `ValueError`, whose message names the bad id. `502` is strictly for Kubernetes API failures and the additive rego dump's `OSError`. The two are never conflated.
-| `POST /policy` | `204 No Content` | **400** `{"error": …}` for a malformed / namespace-less `agent_id` (batch aborts, naming the bad agent; agents already applied stay written — no rollback); **502** `{"error": …}` for a Kubernetes API failure (or the additive dump's `OSError`) |
-| `POST /policy/agents/{agent_id}` | `204 No Content` | **400** for a malformed `agent_id`; **502** for a Kubernetes API / dump failure |
-| `DELETE /policy/agents/{agent_id}` | `204 No Content` | **400** for a malformed `agent_id`; **502** for a Kubernetes API failure. Deleting a **missing** agent is a no-op **204** (k8s 404 treated as success — idempotent) |
+| `POST /policy/agents/{agent_id:path}` | `204 No Content` | **400** for a malformed `agent_id`; **502** for a Kubernetes API / dump failure |
+| `DELETE /policy/agents/{agent_id:path}` | `204 No Content` | **400** for a malformed `agent_id`; **502** for a Kubernetes API failure. Deleting a **missing** agent is a no-op **204** (k8s 404 treated as success — idempotent) |
 | `DELETE /policy` | `204 No Content` | **502** for a Kubernetes API failure |
 | `GET /health` | `200 OK` `{"status": "ok"}` | `503 Service Unavailable` `{"status": "unavailable", "error": …}` if the bounded CR list fails |
 
@@ -130,20 +118,8 @@ For each `AgentPolicyModel`, the service generates **two Rego packages** — one
 Each package begins with `import rego.v1`. The names never contain a slug: the `bundle-service` combiner requires the **exact** path `data.authbridge.client.<tier>`, so a per-agent package name would break the composition. Per-agent isolation is achieved at the **CR / bundle level** — bundle-service looks a CR up by namespace + name — not in the package name.
 
 **`identity_ref` drives the CR metadata, not a package name (Q3).** `identity_ref(agent_id) -> (namespace, name)` accepts a SPIFFE URI (`spiffe://<trust-domain>/ns/<ns>/sa/<name>`) or a plain `<ns>/<name>` clientId, validates both segments as DNS-1123 labels (`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`, ≤63 chars), and returns the `(namespace, name)` used for the CR's `metadata`. There is **no** fallback — a bare `github-agent` (no derivable namespace) or an invalid label raises `ValueError` (→ 400). This function replaces the former per-package slug: it feeds `metadata`, never a package name.
-For each `AgentPolicyModel`, the service generates **two Rego packages** — one for the inbound pipeline and one for the outbound pipeline — and server-side-applies them as the two `policies[]` entries of the agent's `AuthorizationPolicy` CR.
 
-**Fixed package names — no slug (Q2).** Both packages use **fixed** names, regardless of agent:
-
-| Tier | Package | CR `policies[].path` |
-|------|---------|----------------------|
-| inbound | `authbridge.client.inbound.request` | `inbound/request.rego` |
-| outbound | `authbridge.client.outbound.request` | `outbound/request.rego` |
-
-Each package begins with `import rego.v1`. The names never contain a slug: the `bundle-service` combiner requires the **exact** path `data.authbridge.client.<tier>`, so a per-agent package name would break the composition. Per-agent isolation is achieved at the **CR / bundle level** — bundle-service looks a CR up by namespace + name — not in the package name.
-
-**`identity_ref` drives the CR metadata, not a package name (Q3).** `identity_ref(agent_id) -> (namespace, name)` accepts a SPIFFE URI (`spiffe://<trust-domain>/ns/<ns>/sa/<name>`) or a plain `<ns>/<name>` clientId, validates both segments as DNS-1123 labels (`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`, ≤63 chars), and returns the `(namespace, name)` used for the CR's `metadata`. There is **no** fallback — a bare `github-agent` (no derivable namespace) or an invalid label raises `ValueError` (→ 400). This function replaces the former per-package slug: it feeds `metadata`, never a package name.
-
-> **Two identifiers, two layers (no contradiction).** UC-1 onboarding and the Trigger use the internal Keycloak **client UUID** (`service.id` / `Trigger.entity_id`) purely to *look up* a service in the IdP — that UUID **never reaches this writer**. What flows down the policy pipeline into `PolicyRule.scope.serviceId` / `Role.actorIds` and lands as `AgentPolicyModel.agent_id` is the **clientId** (the `<ns>/<name>` / SPIFFE form), which `identity_ref` maps to the CR's `(namespace, name)`. The UUID→clientId resolution happens once, in the IdP Configuration Service, before the AgentPolicyModel is ever built.
+> **Two identifiers, two layers (no contradiction).** UC-1 onboarding and the Trigger use the internal Keycloak **client UUID** (`service.id` / `Trigger.entity_id`) purely to *look up* a service in the IdP — that UUID **never reaches this writer**. What flows down the policy pipeline into `PolicyRule.scope.serviceId` / `Role.actorIds` and lands as `AgentPolicyModel.agent_id` is the **clientId** (the `<ns>/<name>` / SPIFFE form), which `identity_ref` maps to the CR's `(namespace, name)`. The UC-1 Orchestrator resolves the UUID to the clientId once (one `get_service()` read), before the AgentPolicyModel is ever built.
 
 ### Live plugin input shape (Q4)
 
@@ -178,7 +154,7 @@ De-prefixing (Q9) is **outbound-only**: provisioned scope names are prefixed wit
 
 ### Always DENY by default
 
-Each package ends with `default allow := false` and one or more `allow if { … }` rules. A request that no rule allows is denied. There is no permissive default and there are no `allow := false` rules. Each `allow` body carries inline `not …_deny_ok` guards (deny-overrides).
+Each package ends with `default allow := false` and one or more `allow if { … }` rules. A request that no rule allows is denied. There is no permissive default and there are no `allow := false` rules. The inbound body and the outbound `tools/call` body carry inline `not …_deny_ok` guards (deny-overrides); the outbound session body applies the denies through `tool_ok(tool)`.
 
 **The generator assumes disjoint allow/deny per `(role, scope)` and never reconciles an overlap.** A genuine grant/deny overlap on the same pair is a real policy conflict surfaced **upstream** as HTTP 422 (the PRB raises `PolicyContradictionError`); the PCE assumes a conflict-free model. The generator therefore adds **no** logic that silently reconciles an allow-vs-deny overlap — doing so would mask a conflict that is *supposed* to surface as a 422. The inline `not …_deny_ok` guards are **not** conflict reconciliation: they let a deny on **one** of a subject's several roles — or on **one** of the two outbound gates — beat an allow arriving from a *different* role / the *other* gate. Each individual `(role, scope)` stays allow-XOR-deny; the denies merely co-occur within a single request.
 
@@ -377,7 +353,7 @@ spec:
 
 ### Both tiers always emitted; delete = off-boarding (Q7)
 
-Every upsert writes **both** tiers, each with `default allow := false`. The shipped global combiner allows a tier only when `ns_ok AND client_ok`, where `client_ok` comes from this package's `allow` — **except** that a tier with **no** CR falls back to allow via the combiner's `client_ok if not data.authbridge.client.<tier>` rule.
+Every upsert writes **both** tiers, each with `default allow := false`. The shipped global combiner allows a tier when a namespace CR sets `override`, or when `ns_ok AND client_ok`, where `client_ok` comes from this package's `allow` — **except** that a tier with **no** CR falls back to allow via the combiner's `client_ok if not data.authbridge.client.<tier>.request` rule.
 
 Consequently **deleting a CR is off-boarding, not lockdown**: removing an agent's CR returns that agent to the combiner's **allow-fallback**, it does *not* deny the agent. To actually block an agent while keeping it in the system, **upsert** a CR with empty maps (so `allow` stays `false`) rather than deleting it.
 
@@ -388,7 +364,7 @@ When a UC1 onboarding of an agent fails, the PCE `quarantine` replaces the agent
 - **Inbound:** `subject_roles` and `agent_scopes` are empty, so `subject_allow_ok` never passes. Every inbound request is denied. This is also true for the `rossoctl` platform client: the bypass sets only `source_allow_ok`, and `allow` also needs `subject_allow_ok`.
 - **Outbound:** `target_allow_scopes` and `subject_roles` are empty, so no `tools/call` passes and no target has a tool for the session rule. Every outbound request is denied.
 
-**Why not a delete.** The shipped combiner allows a pod that has no client CR (`client_ok if not data.authbridge.client.<tier>`, see [Q7](#both-tiers-always-emitted-delete--off-boarding-q7)). A delete would open the failed agent. A tool has no CR, so a quarantined tool gets none. Its callers lose it through their re-derived outbound packages.
+**Why not a delete.** The shipped combiner allows a pod that has no client CR (`client_ok if not data.authbridge.client.<tier>.request`, see [Q7](#both-tiers-always-emitted-delete--off-boarding-q7)). A delete would open the failed agent. A tool has no CR, so a quarantined tool gets none. Its callers lose it through their re-derived outbound packages.
 
 **The lift.** A successful re-onboarding writes the real CR over the no-rules CR. Both writes use the same SSA field manager (`aiac-pdp-policy-writer`), so the second write replaces the first.
 
@@ -426,8 +402,8 @@ python-dotenv
 from aiac.pdp.policy.library.api import apply_policy, apply_agent_policy, delete_agent_policy, delete_policy
 from aiac.policy.model.models import PolicyModel, AgentPolicyModel, PolicyRule
 
-apply_agent_policy("weather-agent", agent_model)
-delete_policy()
+apply_agent_policy("team1/weather-agent", agent_model)
+delete_policy()      # rebuild pre-step — not built yet (no code calls it)
 apply_policy(full_model)
 ```
 
@@ -456,7 +432,7 @@ The **CR server-side-apply is always active** — it is never gated by an env va
 - Framework: FastAPI
 - Server: uvicorn
 - Bind: `0.0.0.0:7072`
-- Base image: `python:3.12-slim`
+- Base image: `python:3.13-slim` (digest-pinned)
 - Kubernetes ClusterIP Service: `aiac-pdp-policy-service:7072`
 - Deployment: co-located with IdP Configuration Service as a container in the **Rossoctl Interface Pod** (`pdp-interface-deployment.yaml`)
 
@@ -467,7 +443,7 @@ The **CR server-side-apply is always active** — it is never gated by an env va
 ```
 fastapi
 uvicorn[standard]
-kubernetes
+kubernetes>=36.0.3,<37
 pydantic
 ```
 
@@ -500,7 +476,7 @@ There is **no** `stub.py` and no separate filesystem-writer module: `main.py` is
 Build command:
 ```bash
 docker build -f src/aiac/pdp/service/policy/opa/Dockerfile \
-  -t aiac-pdp-policy-opa:latest src/
+  -t localhost/aiac-pdp-policy-opa:local src/
 ```
 
 ---
@@ -512,7 +488,6 @@ docker build -f src/aiac/pdp/service/policy/opa/Dockerfile \
 - **`identity_ref(agent_id) -> (namespace, name)`** (in `rego.py`): SPIFFE or `<ns>/<name>` → DNS-1123-validated `(namespace, name)`; raises `ValueError` (→ 400) when no namespace is derivable or a segment is an invalid label — no fallback.
 - **`generate_inbound_rego(model, platform_clients)` / `generate_outbound_rego(model)`** (in `rego.py`): render the two fixed-package strings under the ALLOW/DENY model (always DENY by default). The inbound generator emits `subject_roles` / `source_roles` (effect-agnostic) plus the grouped `subject_role_allow_scopes` / `subject_role_deny_scopes` (from `inbound_subject_{allow,deny}_rules`) and `source_role_allow_scopes` / `source_role_deny_scopes` (from `inbound_source_{allow,deny}_rules`), one `source_allow_ok` bypass rule per `platform_clients` entry (plus the no-`client_id` and role-based rules), and the mirrored `subject_deny_ok` / `source_deny_ok` gates; `allow` applies deny-overrides. The outbound generator emits `subject_role_allow_scopes` / `subject_role_deny_scopes` (from `outbound_subject_{allow,deny}_rules`), the single informational `agent_role_scopes` (from `outbound_target_allow_rules`), and `target_allow_scopes` / `target_deny_scopes`, de-prefixing its map values; the four outbound gates are functions over a bare tool name (`subject_allows` / `subject_denies` / `target_allows` / `target_denies`), with `tool_ok(tool)` and `session_methods`; `allow` is a per-tool AND with deny-overrides for `tools/call`, plus the MCP session rule. Both generators emit `default allow := false` and `allow if { … }` rule(s) only — there is no default-effect branch. The generator never reconciles an allow-vs-deny overlap (a genuine overlap is an upstream 422; see [Always DENY by default](#always-deny-by-default)).
 
-> **Rollout impact.** These identifier renames are symmetric with **no alias / no back-compat**. All generated `.rego` **golden fixtures must be regenerated** to match the split gates. The demo helper `demo/use-cases/uc1-onboarding/lib/_lib.py` (which reads the `target_scopes` Rego map) must **retarget to `target_allow_scopes`**.
 - **`_build_cr(model)`:** assemble the CR body — `metadata.name`/`.namespace` from `identity_ref`, the managed-by label, `spec.scope: client`, `spec.clientID` = the display name, and `policies[]` = the two rendered packages. Raises `ValueError` (via `identity_ref`) on a malformed `agent_id`.
 - **`_upsert_agent(model)`:** server-side apply via `patch_namespaced_custom_object` (`_content_type="application/apply-patch+yaml"`, `field_manager=_FIELD_MANAGER`, `force=True`); then, if the dump is enabled, `_dump_cr`.
 - **`_delete_agent(agent_id)`:** `delete_namespaced_custom_object` for the single `(name, namespace)`; a k8s **404 is swallowed** (idempotent → 204); then dump-clear the agent's tree if enabled.

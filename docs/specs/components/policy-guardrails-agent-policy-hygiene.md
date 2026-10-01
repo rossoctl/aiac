@@ -1,5 +1,7 @@
 # Component Sub-PRD: Policy Hygiene
 
+> **Status: not built yet** — this is a design only. The parent Policy Guardrails Agent is not built.
+
 > **Depends on:** [policy-guardrails-agent.md](policy-guardrails-agent.md) — module placement, the verification contract, the LangGraph design, the shared findings/verdict model, and Configuration. This sub-PRD specifies **Check 1 (Policy hygiene)** of the `policy` API family only; it does not restate the parent's architecture.
 
 ## Scope

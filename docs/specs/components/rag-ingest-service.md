@@ -1,5 +1,7 @@
 # Component PRD: RAG Ingest Service
 
+> **Status: not built yet** — no RAG Ingest Service code, image or k8s manifest exists. It is planned for Phase 3 (RAG Pod, issue 4.20).
+
 ## Description
 A FastAPI REST service co-located with ChromaDB and the Policy Guardrails Agent in the RAG Pod. Accepts knowledge documents for any configured collection, chunks and embeds them, and writes the resulting vectors into the ChromaDB instance in the same Pod. Supports both access control policies (`aiac-policies`) and org/business domain context (`aiac-domain-knowledge`) through a single collection-parameterized API surface. Developer-driven ingestion is performed via `kubectl port-forward`.
 

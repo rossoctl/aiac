@@ -8,7 +8,7 @@
 
 | Source | Subject / Path |
 |---|---|
-| Event Broker (NATS) | `aiac.apply.role.{id}` (originated by Keycloak SPI role created/updated) |
+| Event Broker (NATS) | `aiac.apply.role.{name}` (percent-encoded role name; originated by Keycloak SPI role created/updated) |
 | HTTP (debug) | `POST /apply/role/{role_id}` |
 
 ## Architecture
@@ -17,13 +17,13 @@ Single path, no create/update branch. The sub-agent is **deterministic** (non-LL
 
 ```mermaid
 flowchart TD
-    NATS["Event Broker\nNATS JetStream\naiac.apply.role.{id}"]
+    NATS["Event Broker\nNATS JetStream\naiac.apply.role.{name}"]
     NATS_CONSUMER["NATS Consumer\nasyncio background task\nthin adapter"]
     TRIGGERS["HTTP Triggers\nPOST /apply/role/{role_id}\n(debug)"]
     CTRL["Controller\nroutes.py"]
 
     NATS -->|"durable queue group\naiac-agent-consumer"| NATS_CONSUMER
-    NATS_CONSUMER -->|"calls internal handler"| CTRL
+    NATS_CONSUMER -->|"mirrors the routes:\ncalls the same handler + PCE"| CTRL
     TRIGGERS --> CTRL
 
     subgraph RR["Role Update"]
@@ -41,6 +41,8 @@ flowchart TD
 ```
 
 ## Sub-agent: Role sub-agent
+
+**Status: not built yet** — `update_role(role_id)` is a stub that returns `([], True)`; it reads no IdP data and calls no PRB.
 
 **Nature:** deterministic, non-LLM. Pure IdP reader.
 
@@ -76,13 +78,11 @@ performs no further flattening.
 src/aiac/agent/uc/
 └── role_update/
     ├── __init__.py
-    ├── graph.py      ← Role sub-agent StateGraph (deterministic)
-    ├── nodes.py      ← fetch_role, fetch_all_scopes, package_tuple
-    └── state.py      ← RoleUpdateState
+    └── role.py       ← update_role(role_id) stub → ([], True)
 ```
 
 ## Out of scope
 
 - PRB internals — see [`policy-rules-builder.md`](policy-rules-builder.md).
 - PCE override (role-keyed replace) mechanics — see [`../policy-computation-engine.md`](../policy-computation-engine.md).
-- Response body shape — no success body; handlers return bare HTTP status codes (error responses carry FastAPI's default JSON error body from the raised `HTTPException`). Summary + debug go to the log.
+- Response body shape — no success body; handlers return bare HTTP status codes (error responses carry a `{"detail": …}` body from a raised `HTTPException` or a Controller exception handler, or a `ConflictReport` (`422`)). Summary + debug go to the log.

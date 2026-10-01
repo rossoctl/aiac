@@ -96,8 +96,9 @@ returned `ServicePolicyModel` is always the original, decoded form.
 
 **Removed** (APMs are no longer persisted): `get_agent_policy`, `apply_agent_policy`, and the
 prior whole-collection `get_policy` / `apply_policy` / `delete_policy` / `delete_agent_policy`
-functions. The only legitimate consumer is the Policy Computation Engine, which is migrated to the
-functions above.
+functions. The consumers are the Policy Computation Engine (read and write), which is migrated to the
+functions above, and the UC1 Service Policy Builder's cross-service conflict check
+(`get_service_policy`, read only).
 
 ### Why by-role must be a store query (not an IdP lookup)
 
@@ -115,6 +116,7 @@ Read from `AIAC_POLICY_MODEL_STORE_URL` environment variable (or `.env` file co-
 | Variable | Default |
 |----------|---------|
 | `AIAC_POLICY_MODEL_STORE_URL` | `http://127.0.0.1:7074` |
+| `AIAC_HTTP_TIMEOUT` | `10` (seconds, per request) |
 
 ### Usage
 
@@ -146,8 +148,6 @@ apply_service_policy("weather-service", updated_spm)
 ## Testing Decisions
 
 **Seam:** HTTP boundary — mock responses from `AIAC_POLICY_MODEL_STORE_URL`.
-
-**Prior art:** `3.14-unit-tests-write-api.md` (mock PDP Policy Writer HTTP; cover module-level functions).
 
 Key behaviors to assert:
 - `get_service_policy(id)` issues `GET /policy/services/{id}`; response body deserialized to `ServicePolicyModel` (hit).

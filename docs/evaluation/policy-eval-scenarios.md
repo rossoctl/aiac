@@ -2,23 +2,23 @@
 
 > **One spec among several.** This document specifies a **family** of integration tests.
 > Eval specs live **one spec per test** under `docs/evaluation/`
-> (a sibling of `components/`), and the master PRD's *Integration test specifications* section
+> (a sibling of `components/`), and the master PRD's *Test & evaluation specifications* section
 > ([../PRD.md](../specs/PRD.md)) is the index of them. This is the **policy-eval-scenarios** family — a
 > generalized, multi-scenario evaluation of the identity→policy pipeline — not the definition of
 > integration testing in general, and not the only integration-test PRD. It is a **companion to**,
 > not a replacement for, [policy-pipeline.md](../testing/policy-pipeline.md): that test's single-agent/
 > single-tool `github-agent` scenario stays exactly as it is, as a regression baseline, and none of
-> its files (`test_policy_pipeline.py`, `scenario.py`, `probe.rego`, `launcher.py`) are touched by
+> its files (`test_policy_pipeline.py`, `scenario.py`, `launcher.py`) are touched by
 > this work.
 
 ## Location
 
 Two independent groups of files, split by cost tier:
 
-**Heavy scenarios (1, 3, 4, 6-10) — full pipeline, new marker — under `eval/`,
+**Heavy scenarios (1, 3, 4, 6-10) — full pipeline, `eval` marker — under `eval/`,
 except `agent_delegation`:**
-- `eval/test_policy_pipeline_eval.py` — the test module, `@pytest.mark.eval_extended`.
-- `eval/scenario_eval_baseline.py` (Scenario 1),
+- `eval/test_policy_pipeline_eval.py` — the test module, `@pytest.mark.eval`.
+- `eval/scenarios/scenario_eval_baseline.py` (Scenario 1),
   `scenario_eval_unreachable_resources.py` (Scenario 4), `scenario_eval_ambiguous_clause.py`
   (Scenario 6), `scenario_eval_wildcard_grant.py` (Scenario 7),
   `scenario_eval_misleading_descriptions.py` (Scenario 8), `scenario_eval_confusable_agents.py`
@@ -27,8 +27,8 @@ except `agent_delegation`:**
   exactly one aspect at the minimal entity count that aspect needs.
 - **`test/system/scenario_eval_agent_delegation.py`** (Scenario 3) — the one exception:
   lives at the **top level** of `test/system/` (sibling of `launcher.py`/`scenario_uc1.py`),
-  not under `eval/` like the other seven. It isolates the agent-to-agent `target_scopes`
-  delegation mechanism, which is conceptually closer to the top-level fixed-scenario family than to
+  not under `eval/` like the other seven. It isolates the agent-to-agent delegation
+  (`delegation_scopes`) mechanism, which is conceptually closer to the top-level fixed-scenario family than to
   the `eval/` catalog's silent-gap/ambiguity/adversarial-authoring aspects.
 - A matching `policy.eval_<name>.md` next to each scenario module above — the scenario's *source*
   policy text. Not read directly at runtime: the harness's `pipeline` fixture points
@@ -37,12 +37,14 @@ except `agent_delegation`:**
   which directory the source lives in — see `eval/scenarios_digested/__init__.py` and
   `docs/specs/digested-policy.md`), since production feeds the PRB only digested policy. These
   digested files **are** load-bearing at runtime, unlike the two light-scenario `.md` files below.
-- `eval/probe_eval.rego` — a generalized outbound probe, parameterized by
-  `input.agent_id`, serving every agent in every heavy scenario (see
+- `eval/probe_eval.rego` — a generalized outbound probe over the fixed
+  `authbridge.client.outbound.request` package (input `subject`/`target`/`function_name`), loaded
+  beside each agent's own outbound Rego, serving every agent in every heavy scenario (see
   [Testing Decisions](#testing-decisions)).
 - `eval/conftest.py` — writes a per-run pass/fail/skip/error report
-  (`reports/report_<DD_MM_HH_MM>.md`, Asia/Jerusalem local time) after every session that
-  collects at least one `eval_extended`-marked test (see [Test report](#test-report)).
+  (`reports/report_<DD_MM_HH_MM_SS>.md`, UTC by default, `EVAL_REPORT_TZ` to change it) after
+  every session that collects at least one `eval/test_policy_pipeline_*.py` test (see
+  [Test report](#test-report)).
 - `test/system/launcher.py` (unmoved, stays in `test/system/`) — reused
   **unmodified** from `policy-pipeline.md`.
 
@@ -81,16 +83,16 @@ both an aspect and a domain.
 
 | # | Name | Users | Agents | Tools | Domain | Character | Marker | Assertion shape |
 |---|------|---|---|---|---|---|---|---|
-| 1 | Baseline-scale | 3 | 2 | 2 | Software engineering | Clean, unambiguous, fully specified, at UC1 scale — reuses UC1's `user-role-developer`/`user-role-tester`/`user-role-devops` roles verbatim. | `eval_extended` | Full per-cell `opa eval` truth table |
+| 1 | Baseline-scale | 3 | 2 | 2 | Software engineering | Clean, unambiguous, fully specified, at UC1 scale — reuses UC1's `user-role-developer`/`user-role-tester`/`user-role-devops` roles verbatim. | `eval` | Full per-cell `opa eval` truth table |
 | 2 | Ambiguous-and-contradictory | 2 (conceptual) | — | — | — | Policy text that both grants and permanently revokes the same `(role, scope)` pair — a direct, unresolvable contradiction. | `llm` | Single whole-document-reject `xfail` |
-| 3 | Agent-to-agent delegation | 2 | 2 | 1 | Logistics/shipping | Isolates the `target_scopes` delegation mechanism: one agent owns a target scope delegated to it via another agent's role, with no tools of its own. | `eval_extended` | Full per-cell `opa eval` truth table |
-| 4 | Unreachable resources | 1 | 2 | 2 | Healthcare/clinic | Silent authoring gaps → **emergent** unreachable agent and unreachable tool, under deny-by-default. | `eval_extended` | Full per-cell `opa eval` truth table |
+| 3 | Agent-to-agent delegation | 2 | 2 | 1 | Logistics/shipping | Isolates the delegation (`delegation_scopes`) mechanism: one agent owns a target scope delegated to it via another agent's role, with no tools of its own. | `eval` | Full per-cell `opa eval` truth table |
+| 4 | Unreachable resources | 1 | 2 | 2 | Healthcare/clinic | Silent authoring gaps → **emergent** unreachable agent and unreachable tool, under deny-by-default. | `eval` | Full per-cell `opa eval` truth table |
 | 5 | Adversarial-injection-and-edge-cases | (conceptual) | — | — | — | A literal prompt-injection string embedded in a clause, plus a duplicate-role-name structural edge case. | `llm` | Whole-document-reject `xfail` + one plain (non-xfail) over-grant assertion |
-| 6 | Ambiguous clause | 1 | 1 | 1 | Education/registrar | A broad-sounding grant clause narrowed by an explicit in-clause qualifier. | `eval_extended` | Full per-cell `opa eval` truth table |
-| 7 | Wildcard grant | 1 | 1 | 1 | Retail/inventory | A wildcard-phrased grant ("all inventory operations") that must expand to the correct concrete scope set. | `eval_extended` | Full per-cell `opa eval` truth table |
-| 8 | Misleading descriptions | 2 | 1 | 1 | Hospitality/hotel | A name-bait role (broad-sounding name, narrow description) and an inert, scary-named scope that grants nothing beyond itself. | `eval_extended` | Full per-cell `opa eval` truth table |
-| 9 | Confusable agents | 2 | 2 | 2 | Sports/coaching | Two agents with deliberately similar names and non-overlapping access, plus an identity/boundary-confusion probe. | `eval_extended` | Full per-cell `opa eval` truth table |
-| 10 | Empty descriptions | 1 | 1 | 1 | Agriculture/irrigation | Every entity/role/scope description is the empty string; only the policy document's plain grant sentences carry meaning. | `eval_extended` | Full per-cell `opa eval` truth table |
+| 6 | Ambiguous clause | 1 | 1 | 1 | Education/registrar | A broad-sounding grant clause narrowed by an explicit in-clause qualifier. | `eval` | Full per-cell `opa eval` truth table |
+| 7 | Wildcard grant | 1 | 1 | 1 | Retail/inventory | A wildcard-phrased grant ("all inventory operations") that must expand to the correct concrete scope set. | `eval` | Full per-cell `opa eval` truth table |
+| 8 | Misleading descriptions | 2 | 1 | 1 | Hospitality/hotel | A name-bait role (broad-sounding name, narrow description) and an inert, scary-named scope that grants nothing beyond itself. | `eval` | Full per-cell `opa eval` truth table |
+| 9 | Confusable agents | 2 | 2 | 2 | Sports/coaching | Two agents with deliberately similar names and non-overlapping access, plus an identity/boundary-confusion probe. | `eval` | Full per-cell `opa eval` truth table |
+| 10 | Empty descriptions | 1 | 1 | 1 | Agriculture/irrigation | Every entity/role/scope description is the empty string; only the policy document's plain grant sentences carry meaning. | `eval` | Full per-cell `opa eval` truth table |
 
 Ground-truth rules used throughout, all mechanical (no per-cell subjective calls):
 - **Direct conflicts → deny-wins.** (Scenario 2's intended future contract.)
@@ -105,16 +107,15 @@ Ground-truth rules used throughout, all mechanical (no per-cell subjective calls
 
 ### What it does — heavy scenarios (1, 3, 4, 6-10)
 
-`test_policy_pipeline_eval.py` drives the same pipeline as `test_policy_pipeline.py`, generalized
-from one agent/tool to N, and run **once per scenario module** (eight full pipeline runs per
-session, each against its own realm):
+`test_policy_pipeline_eval.py` drives the Keycloak → PRB → PCE → OPA Policy Writer pipeline
+in-process, for N agents/tools, and runs it **once per scenario module** (eight full pipeline runs
+per session, each against its own realm):
 
 1. **Env setup, same ordering constraint as `policy-pipeline.md`.** Service URLs are set via
    `os.environ.setdefault` before the `aiac` libraries are imported.
 2. **Spawn the three services per scenario** via `launcher.py`'s `Service`/`running_services` —
    unmodified from `policy-pipeline.md`. Because every scenario uses its own realm, nothing is kept
-   warm across them (unlike `policy-pipeline.md`'s two variants, which share one realm and one IdP
-   process).
+   warm across them.
 3. **Provision Keycloak**, generalized to loop over every entry in the scenario module's
    `USERS`/`USER_ROLES`/`AGENTS`/`TOOLS` dicts (`provision_keycloak_admin`), then create every
    scope/role and its service mapping through the IdP `Configuration` library
@@ -129,25 +130,25 @@ session, each against its own realm):
    target scope owned by another agent is handled identically to one owned by a tool.
 5. **Run the PCE** (`compute_and_apply`) and assert every expected `.rego` file actually landed on
    disk — **except** agents a scenario declares in `EXPECT_NO_REGO` (Scenario 4's `billing-agent`).
-   `compute_and_apply` is fire-and-forget and swallows dependency errors, so this check turns a
-   silent pipeline failure into a clear `RuntimeError` naming the missing file(s), rather than a
-   confusing wall of unrelated per-test failures.
-6. **Assert the truth table with `opa eval`**, generalized from `github_agent`-literal paths and
-   queries to per-agent slugs derived from each scenario's own agent ids
-   (`agent_id.replace("-", "_")`):
+   `compute_and_apply` re-raises dependency errors; this check also turns a run that completes but
+   leaves an expected file missing into a clear `RuntimeError` naming the missing file(s), rather
+   than a confusing wall of unrelated per-test failures.
+6. **Assert the truth table with `opa eval`**, with each `.rego` path derived from the agent id's
+   `<ns>/<name>` (`<rego_dir>/<ns>/<name>/{inbound,outbound}/request.rego`) and queries against the
+   fixed `authbridge.client.{inbound,outbound}.request` packages:
    - **Inbound** — one node per `(scenario × agent × subject)`, against
-     `data.authz.{slug}.inbound.allow`.
+     `data.authbridge.client.inbound.request.allow` with input `{"identity": {"subject": ...}}`.
    - **Outbound** — one node per `(scenario × agent × subject × scope)`, via the generalized probe
-     `data.probe.outbound_eval.allow` (`probe_eval.rego`), which takes `input.agent_id` so a single
-     probe file serves every agent across every heavy scenario. Same token soft-match logic as
-     `probe.rego` (see [Testing Decisions](#testing-decisions)).
-   - **Grant-set equivalence** (`test_grant_set_matches_truth_table`) — the same second-layer check
-     `policy-pipeline.md` uses (step 8 there): the PRB's raw `list[PolicyRule]`, classified into
-     `inbound`/`outbound_subject`/`outbound_target` grant sets, must equal the scenario's pair-lists
-     exactly. This catches verdict-neutral under/over-grants the coarse `opa eval` truth table
+     `data.probe.outbound_eval.allow` (`probe_eval.rego`), which is loaded beside each agent's own
+     outbound Rego so a single probe file serves every agent across every heavy scenario. It uses a
+     token soft-match (see [Testing Decisions](#testing-decisions)).
+   - **Grant-set equivalence** (`test_grant_set_matches_truth_table`) — the PRB's raw
+     `list[PolicyRule]`, classified into `inbound`/`outbound_subject`/`outbound_target` grant sets,
+     must equal the scenario's pair-lists exactly. This catches verdict-neutral under/over-grants the coarse `opa eval` truth table
      cannot see.
-   - **Unknown-target and soft-match-overbreadth guards** — one node per scenario asserting an
-     otherwise-plausible call to an unknown target, or a function name matching no scope, is denied.
+   - **Unknown-target and soft-match-overbreadth guards** — one node per `(scenario × agent)`
+     asserting an otherwise-plausible call to an unknown target, or a function name matching no
+     scope, is denied.
    - **Identity-confusion probes** (Scenario 9, `confusable_agents`, only) —
      `scenario.IDENTITY_CONFUSION_PROBES`, asserted via `test_identity_confusion_probes`; skipped
      for scenarios that define none.
@@ -189,11 +190,14 @@ alongside the injection attempt: the candidate role list passes `temp-user` twic
 different, merely redundant (non-contradictory) descriptions — a duplicate-name data-quality
 artifact a real IdP export could plausibly produce.
 
-Both light-scenario tests are `@pytest.mark.llm` (not `_extended`) — LLM-only, no live
+Both light-scenario tests are `@pytest.mark.llm` (not `eval`) — LLM-only, no live
 Keycloak/`opa`/multi-service pipeline, matching `test_auditor_dimension_integration.py`'s existing
 cost tier in the same directory — and skip via `pytest.skip` when `LLM_BASE_URL` is unset.
 
 ## Expected output
+
+Every agent id in the heavy scenarios is in the `team1` namespace (`team1/<agent>`, for example
+`team1/repo-agent`). The text below gives the short name.
 
 ### Scenario 1 — baseline-scale
 
@@ -215,7 +219,7 @@ deny-by-default, mirroring UC1's own `devops-user`.
 reaches nothing.
 
 Files left on disk per agent under `eval/rego_out/policy_pipeline_eval/baseline/`:
-`repo_agent.{inbound,outbound}.rego`, `tracker_agent.{inbound,outbound}.rego`.
+`team1/repo-agent/{inbound,outbound}/request.rego`, `team1/tracker-agent/{inbound,outbound}/request.rego`.
 
 ### Scenario 3 — agent-to-agent delegation
 
@@ -223,7 +227,7 @@ Realm `aiac-pp-eval-agent-delegation`. 2 users, 2 agents (`dispatch-agent`, `cus
 tool (`manifest-tool`). `customs-agent` deliberately has **zero `inbound_scopes` of its own** —
 its only scope, `agent-scope-broker`, is a `delegation_scopes` entry on `customs-agent`'s own
 fixture definition, delegated through `dispatch-agent` (it also appears in `dispatch-agent`'s
-**derived** `AgentPolicyModel.target_scopes` map, keyed by `customs-agent`'s service id — the
+**derived** `AgentPolicyModel.target_allow_scopes` map, keyed by `customs-agent`'s service id — the
 production, caller's-perspective sense of that name). `user-role-shipment-coordinator` holds
 `agent-scope-broker` as a subject; `user-role-dock-worker` does not.
 
@@ -240,13 +244,13 @@ Realm `aiac-pp-eval-unreachable-resources`. 1 user (`user-role-front-desk-clerk`
 
 - **`billing-agent` produces no `.rego` at all** (`EXPECT_NO_REGO`) — provisioned like any other
   agent (real client, inbound scope, client role) but never mentioned in the policy document's
-  grant sections, and no other agent has a `target_scopes` entry pointing at it. `test_inbound`/
+  grant sections, and no other agent has a `target_allow_scopes` entry pointing at it. `test_inbound`/
   `test_outbound` special-case this: when the expected `.rego` file is absent, they assert ground
   truth agrees no one reaches it, rather than skipping silently.
 - **`insurance-tool`** exists with a real scope (`tool-scope-insurance-verify`) that no agent role is ever
   granted anywhere in the policy text — unreachable, but `insurance-tool` isn't itself an agent, so
   there's no `.rego` file for it to be missing from; the scope simply never appears in any
-  `target_scopes` map.
+  `target_allow_scopes` map.
 
 ### Scenario 6 — ambiguous clause
 
@@ -294,7 +298,7 @@ Also carries the suite's **identity/boundary-confusion probe** (`IDENTITY_CONFUS
 Keycloak auto-creates a `service-account-<clientId>` user for each confidential client with
 `serviceAccountsEnabled`. That user is real but holds no realm role, so under deny-by-default it
 must be refused by **every** agent's inbound gate — including the *other* agent's, asserted in
-both directions (`service-account-coach-agent` against `coach-review-agent`'s gate and vice versa).
+both directions (`service-account-team1/coach-agent` against `coach-review-agent`'s gate and vice versa).
 
 ### Scenario 10 — empty descriptions
 
@@ -345,14 +349,14 @@ or OPA URLs, no `opa` binary.
 
 ```bash
 # Heavy scenarios (needs KEYCLOAK_URL + admin creds + LLM_* + opa on PATH):
-.venv/bin/pytest eval/test_policy_pipeline_eval.py -m eval_extended -v
+.venv/bin/pytest eval/test_policy_pipeline_eval.py -m eval -v
 # A failing node names the exact scenario/agent/subject(/scope) cell, e.g.:
-#   test_inbound[baseline-repo-agent-user-role-tester-user] — expected allow, opa denied
+#   test_inbound[baseline-team1/repo-agent-test-user] — expected allow, opa denied
 # .rego left on disk per scenario for eyeballing:
 #   eval/rego_out/policy_pipeline_eval/{baseline,agent_delegation,unreachable_resources,
-#     ambiguous_clause,wildcard_grant,misleading_descriptions,confusable_agents,empty_descriptions}/{slug}.{inbound,outbound}.rego
+#     ambiguous_clause,wildcard_grant,misleading_descriptions,confusable_agents,empty_descriptions}/team1/<agent>/{inbound,outbound}/request.rego
 # A pass/fail/skip/error report for the run is written alongside it:
-#   eval/reports/report_<DD_MM_HH_MM>.md (Asia/Jerusalem local time; see Test report below)
+#   eval/reports/report_<DD_MM_HH_MM_SS>.md (UTC by default; see Test report below)
 
 # Light scenarios (needs only LLM_BASE_URL/LLM_MODEL/LLM_API_KEY):
 .venv/bin/pytest test/unit/agent/policy_rules_builder/test_guardrail_conflicts.py \
@@ -365,15 +369,16 @@ or OPA URLs, no `opa` binary.
 
 `eval/conftest.py` hooks `pytest_runtest_logreport`/`pytest_sessionfinish` to
 write a Markdown report after every session that collects at least one
-`eval_extended`-marked test (i.e. any run touching `test_policy_pipeline_eval.py`,
-regardless of whether it was invoked directly or as part of a broader `pytest test/` run — the
-report is scoped by marker, not by which conftest happened to load). It is **not** produced for
+`eval/test_policy_pipeline_*.py` test (i.e. any run touching `test_policy_pipeline_eval.py` or a
+sibling eval suite, regardless of whether it was invoked directly or as part of a broader `pytest`
+run — the report is scoped by the nodeid prefix `eval/test_policy_pipeline_`, not by marker and
+not by which conftest happened to load). It is **not** produced for
 the light scenarios (2, 5), which live outside `eval/` under the `llm`
 marker.
 
-- **Location and filename:** `eval/reports/report_<DD_MM_HH_MM>.md`, e.g.
-  `report_04_08_16_37.md` for 04 Aug at 16:37, timestamped in `Asia/Jerusalem` local time (not
-  UTC) — regenerated per run, not appended.
+- **Location and filename:** `eval/reports/report_<DD_MM_HH_MM_SS>.md`, e.g.
+  `report_04_08_16_37_22.md` for 04 Aug at 16:37:22, timestamped in UTC by default (set
+  `EVAL_REPORT_TZ`, e.g. `Asia/Jerusalem`, to change it) — regenerated per run, not appended.
 - **Contents:** all six outcome sections (`failed`, `error`, `xpassed`, `xfailed`, `skipped`,
   `passed`) are always present, most-actionable first, even when empty (`_none_`) — so a reader
   can tell "nothing skipped" from "the report didn't capture skips". `failed`/`error` entries
@@ -386,7 +391,7 @@ marker.
   spotting which cell did what. Instead of the docstring + crash-message fallback, each entry
   shows:
   - **What it tests:** a concrete sentence naming the actual subject/agent(/scope) under test
-    (e.g. `Can 'analyst-user' (subject, role 'user-role-performance-analyst') access 'coach-agent' (agent) in
+    (e.g. `Can 'analyst-user' (subject, role 'user-role-performance-analyst') access 'team1/coach-agent' (agent) in
     the 'confusable_agents' scenario?`).
   - **Expected output:** `True`/`False` plus a short mechanical explanation derived from the
     scenario's truth table (which `INBOUND_PAIRS`/`OUTBOUND_PAIRS`/`OUTBOUND_SUBJECT_PAIRS` row
@@ -413,24 +418,25 @@ scenarios; the heavy scenarios additionally need Keycloak + `opa`, same discover
 
 ## Testing Decisions
 
-- **Additive, not a rewrite.** `test_policy_pipeline.py`, `scenario.py`, `probe.rego`, and
+- **Additive, not a rewrite.** `test_policy_pipeline.py`, `scenario.py`, and
   `launcher.py` are untouched. The new heavy-scenario harness reuses `launcher.py` as-is and derives
   everything scenario-specific from data, so the existing single-agent/single-tool suite keeps
   serving as an independent regression baseline — a break in either suite is unrelated to a break in
   the other by construction.
-- **Slug-derived paths and queries, not hardcoded ids.** `test_policy_pipeline.py` hardcodes literal
-  `"github_agent"` strings. Because this harness runs eight scenarios with many agents each, every
-  `.rego` path and `opa eval` query is instead derived from each scenario's own agent id via
-  `agent_id.replace("-", "_")`, matching `slugify()`'s behavior in
-  `src/aiac/pdp/service/policy/opa/rego.py`.
-- **A generalized probe, parameterized by agent id.** `probe.rego` hardcodes `github_agent`. The new
-  `probe_eval.rego` takes `input.agent_id` and reads `data.authz[input.agent_id].outbound`, so one
-  probe file serves every agent across all eight heavy scenarios rather than needing one probe per
-  agent. Same token soft-match logic (split on `[._-]+`, lowercase, set equality).
-  `outbound_subject_pairs`/`agent_allowed` are unioned as OPA `contains` sets — since the outbound
-  package's `subject_role_scopes`/`agent_role_scopes` gates can never distinguish "may reach the
-  agent's own scope" from "may reach a delegated target's scope" (see the next point), a single probe
-  covers both mechanisms uniformly.
+- **Namespace/name paths and fixed packages, not hardcoded ids.** Because this harness runs eight
+  scenarios with many agents each, every `.rego` path is derived from each scenario's own agent id
+  through its `<ns>/<name>` split (`<rego_dir>/<ns>/<name>/{inbound,outbound}/request.rego`, the
+  same split `identity_ref()` in `src/aiac/pdp/service/policy/opa/rego.py` does), and every
+  `opa eval` query uses the fixed `authbridge.client.{inbound,outbound}.request` packages.
+- **A generalized probe, one file for every agent.** `probe_eval.rego` reads the fixed
+  `data.authbridge.client.outbound.request` package and takes `input.subject`/`input.target`/
+  `input.function_name`; it is loaded beside each agent's own outbound Rego, so one probe file
+  serves every agent across all eight heavy scenarios rather than needing one probe per agent. It
+  uses a token soft-match (split on `[._-]+`, lowercase, set equality). `allow` needs both
+  `subject_ok` (a role of the subject, via `subject_roles` and `subject_role_allow_scopes`, matches
+  the function name) and `target_ok` (`target_allow_scopes[input.target]` matches it). A target
+  scope owned by another agent is in `target_allow_scopes` exactly like a tool's scope (see the next
+  point), so a single probe covers both mechanisms uniformly.
 - **`delegation_scopes` and `inbound_scopes` are indistinguishable at the real system's data-model
   level — this is a property of the system, not a scenario defect.** The PCE resolves an agent's
   `agent_scopes` (the inbound audience gate) directly from the IdP `Service` record's owned scopes
@@ -472,16 +478,15 @@ scenarios; the heavy scenarios additionally need Keycloak + `opa`, same discover
 ## Relationship to other integration tests
 
 This is **one** integration-test spec (covering ten scenarios across two test modules) among
-several indexed by the master PRD ([../PRD.md](../specs/PRD.md), § *Integration test specifications*).
+several indexed by the master PRD ([../PRD.md](../specs/PRD.md), § *Test & evaluation specifications*).
 
 - **Companion to, not a replacement for, [policy-pipeline.md](../testing/policy-pipeline.md).** That test's
   fixed `github-agent` scenario remains the reviewable, hand-checkable regression baseline; this
   family generalizes the same pipeline+`opa eval` approach to scale, delegation, ambiguity,
   adversarial input, and the guardrail gap, using new files only.
-- **Heavy scenarios share the `@pytest.mark.system` + `opa eval` oracle flavor** with
-  `policy-pipeline.md`, under the new `eval_extended` marker (registered in `pyproject.toml`)
-  to signal the added cost (eight full pipeline runs, many more PRB/LLM calls per session) rather
-  than conflating it with the existing single-run suite.
+- **Heavy scenarios use an `opa eval` oracle over the dumped Rego** and carry the single `eval`
+  marker (registered in `pyproject.toml`), to signal the added cost (eight full pipeline runs, many
+  more PRB/LLM calls per session) rather than conflating it with the existing single-run suite.
 - **Light scenarios share the direct-PRB-call, no-Keycloak/no-opa flavor** with
   `test_auditor_dimension_integration.py`, staying on the plain `llm` marker since their cost
   profile (LLM-only) matches that sibling test exactly.
@@ -500,8 +505,8 @@ several indexed by the master PRD ([../PRD.md](../specs/PRD.md), § *Integration
   structure or internal PRB reasoning.
 - **The Kubernetes-CR Policy Writer.** Like `policy-pipeline.md`, the heavy scenarios target the
   filesystem stub only.
-- **Default-CI wiring.** Both markers keep this family out of the default `-m "not integration"` unit
-  run; `eval_extended` additionally separates it from `policy-pipeline.md`'s existing
+- **Default-CI wiring.** The `eval` and `llm` markers keep this family out of the default run
+  (`addopts` deselects both); `eval` additionally separates it from `policy-pipeline.md`'s existing
   `system` run so the two can be invoked independently.
 - **Reconciling `policy.eval_conflicts.md`/`policy.eval_injection.md` with their tests' inline
   `_POLICY` strings into a single source of truth.** This duplication (see [Location](#location)) is
@@ -534,12 +539,7 @@ several indexed by the master PRD ([../PRD.md](../specs/PRD.md), § *Integration
   run-to-run — that variability is exactly what these scenarios are designed to surface, and is
   expected to need re-confirmation across runs rather than being "fixed" by rewording the scenario.
 - **The ambiguous clause in Scenario 6 (`ambiguous_clause`) has a determinate reading, not a
-  tolerated ambiguity.** `user-role-enrollment-advisor`'s "access to enrollment information" reads
-  broadly on its own, but the same clause's qualifier ("current enrollment status only") makes the
-  narrow reading the only one the text supports. A real LLM-backed PRB run landing on the broader
-  reading (i.e. also granting `tool-scope-enrollment-history`, not just
-  `tool-scope-enrollment-status`) has missed that qualifier — a genuine over-grant bug worth
-  investigating, not a pre-excused finding.
+  tolerated ambiguity.** See Scenario 6 under [Expected output](#expected-output).
 
 ## Blocked-by
 

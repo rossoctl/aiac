@@ -2,7 +2,7 @@
 
 > **One spec among several.** This document specifies **one** integration test.
 > Eval specs live **one spec per test** under `docs/evaluation/`
-> (a sibling of `components/`), and the master PRD's *Integration test specifications* section
+> (a sibling of `components/`), and the master PRD's *Test & evaluation specifications* section
 > ([../PRD.md](../specs/PRD.md)) is the index of them. This is a **companion to**, not a replacement
 > for, [policy-eval-scenarios.md](policy-eval-scenarios.md) and
 > [policy-eval-robustness-consistency.md](policy-eval-robustness-consistency.md): all three
@@ -19,7 +19,7 @@
 - `aiac/eval/test_correctness_scorer.py` — unmarked unit tests for the scorer (runs in the
   default fast pass; `testpaths` already includes `eval/`).
 - `aiac/eval/test_policy_pipeline_correctness_prb.py` — the suite itself,
-  `@pytest.mark.eval_correctness_prb`.
+  `@pytest.mark.eval`.
 - Reuses `aiac/eval/prb_direct.py`'s `build_roles_and_scopes` (the same no-Keycloak,
   synthetic-`Role`/`Scope` builder `policy-eval-robustness-consistency.md`'s two suites use) and
   imports `SCENARIOS`, `orchestrate_prb`, `grant_sets`, `truth` from
@@ -86,9 +86,9 @@ zero-tolerance, matching the spec's own security-first philosophy (an over-grant
 security defect; an under-grant is, at worst, an availability defect, and the spec's own
 threshold for tolerating those is still TBD/deferred).
 
-This module is designed to be reused, unmodified, by the future end-to-end correctness suite
-(#2090) — that suite need only build its own `granted`/`denied`/`expected` dicts from whatever it
-observes downstream of Keycloak+OPA and hand them to the same `score_scenario`.
+This module is reused, unmodified, by the end-to-end correctness suite
+(`test_policy_pipeline_correctness_e2e.py`, #2090) — that suite need only build its own
+`granted`/`denied`/`expected` dicts from whatever it observes downstream of Keycloak+OPA and hand them to the same `score_scenario`.
 
 ## Denial precision
 
@@ -119,7 +119,7 @@ already-approved rules along with it — one bad scope used to mean the whole sc
 This suite calls `orchestrate_prb(..., best_effort=True)`: a rejected decision instead falls back
 to whatever was last proposed (before the auditor rejected it) — a real, if never-approved, guess
 at the grant/deny set for that one scope/role, built the same way the PRB's own `build` node would
-have (`aiac.agent.policy_rules_builder.graph._denied_names` reused; see
+have (`aiac.agent.policy_rules_builder.graph._assemble_rules` reused; see
 `eval.best_effort_rules._best_effort_rules`, unit-tested unmarked in
 `eval/test_best_effort_rules.py`). Every other decision in the scenario proceeds normally.
 
@@ -129,16 +129,15 @@ real pipeline run would never emit it. `record_property("best_effort_notes", ...
 `{scope_or_role_name: reason}` dict — and the printed summary line name exactly which decisions
 this applies to, so a reader can tell which numbers are "real" and which are best-effort. The
 report (`eval/conftest.py`) renders this as an extra field with an explicit caveat whenever
-non-empty. `eval_consistency`/`eval_robustness` keep `best_effort=False` (the default, at their
-own direct `orchestrate_prb` call sites) — a rejected decision still aborts their scenario/repeat
-as before. `eval_extended` is the one exception: it shares the same session-scoped `pipeline`
-fixture `test_e2e_correctness` uses, and that fixture's `orchestrate_prb` call hardcodes
-`best_effort=True` unconditionally (confirmed with the user — see
+non-empty. The consistency and robustness suites also call `orchestrate_prb(...,
+best_effort=True)` at their own call sites. The shared session-scoped `pipeline` fixture (used by
+`test_policy_pipeline_eval.py` and `test_e2e_correctness`) hardcodes `best_effort=True` too
+(confirmed with the user — see
 [policy-eval-correctness-e2e.md § Best-effort
 proposals](policy-eval-correctness-e2e.md#best-effort-proposals) and
 `eval.test_policy_pipeline_eval`'s module docstring for why this couldn't cleanly be made
-e2e-only), so `eval_extended`'s own per-cell tests are affected too, not just this suite or
-`test_e2e_correctness`.
+e2e-only), so `test_policy_pipeline_eval.py`'s own per-cell tests are affected too, not just this
+suite or `test_e2e_correctness`.
 
 ## Expected output
 
@@ -146,10 +145,14 @@ Parametrized over all 8 scenario names (`sorted(SCENARIOS)`); expects **all 8 to
 over-grants) given a well-behaved LLM endpoint. Each test case `record_property`s `precision`,
 `recall`, `denial_precision`, `over_grants`, `under_grants`, `incorrectly_denied` (each of the
 latter three as `{gate: sorted(pairs)}`), and `best_effort_notes` (see [Best-effort
-proposals](#best-effort-proposals)), and prints a one-line summary:
+proposals](#best-effort-proposals)), and prints a summary:
 
 ```text
 [correctness] wildcard_grant: precision=1.000 recall=1.000 denial_precision=1.000
+  over_grants={}
+  under_grants={}
+  incorrectly_denied={}
+  best_effort_notes={}
 ```
 
 A failing case's assertion message names the scenario and the exact over-granted `(role, scope)`
@@ -214,11 +217,13 @@ mirroring.
 **No `.py` file changed as part of this rewrite.** `INBOUND_PAIRS`/`OUTBOUND_PAIRS`/
 `OUTBOUND_SUBJECT_PAIRS` truth tables, agent/tool/scope ids, and the `AGENTS`/`TOOLS`/
 `USER_ROLES` description dicts are untouched — only the natural-language `.md` policy text
-changed. This is shared infrastructure: the rewritten `.md` files are read by this suite,
-`policy-eval-scenarios.md`'s heavy scenarios, and both of
-`policy-eval-robustness-consistency.md`'s suites (`eval_extended`/`eval_consistency`/
-`eval_robustness`) alike, since all four families read the same `policy.eval_*.md` files off disk
-via `AIAC_POLICY_FILE`. The regression risk of the rewrite — that a reworded, header-free document
+changed. This is shared infrastructure: the rewritten `.md` files are the source of the committed
+digests in `eval/scenarios_digested/`, and this suite, `policy-eval-scenarios.md`'s heavy
+scenarios, and both of `policy-eval-robustness-consistency.md`'s suites
+(`test_policy_pipeline_eval.py`/`test_policy_pipeline_consistency.py`/
+`test_policy_pipeline_robustness.py`) alike read those digests via `AIAC_POLICY_FILE`
+(`digested_policy_path`). After a source edit, re-run `eval/scenarios_digested/convert_scenarios.py`
+to regenerate the digests. The regression risk of the rewrite — that a reworded, header-free document
 might produce different grant decisions than the old mechanical-template text did — is exactly
 what running those other suites against the rewritten text checks (see
 [Runbook](#runbook)).
@@ -228,7 +233,7 @@ what running those other suites against the rewritten text checks (see
 | Variable | Purpose |
 |---|---|
 | `LLM_BASE_URL` / `LLM_MODEL` / `LLM_API_KEY` | The only required variables — the suite calls the PRB directly against a real LLM endpoint. |
-| `AIAC_POLICY_FILE` | Set per test call (via `monkeypatch.setenv`), pointed at the scenario's own `policy.eval_<name>.md`. |
+| `AIAC_POLICY_FILE` | Set per test call (via `monkeypatch.setenv`), pointed at the scenario's committed digested policy, `eval/scenarios_digested/policy.eval_<name>.md` (`digested_policy_path`). |
 
 No `KEYCLOAK_URL`, Keycloak admin creds, `AIAC_PDP_CONFIG_URL`/`AIAC_POLICY_STORE_URL`/
 `AIAC_PDP_POLICY_URL`, or `OPA_BIN` are read — see
@@ -242,24 +247,24 @@ which applies here unchanged.
 .venv/bin/pytest eval/test_correctness_scorer.py -v
 
 # The suite itself — needs only LLM_BASE_URL/LLM_MODEL/LLM_API_KEY, no Keycloak/opa:
-.venv/bin/pytest eval/test_policy_pipeline_correctness_prb.py -m eval_correctness_prb -v -s
+.venv/bin/pytest eval/test_policy_pipeline_correctness_prb.py -m eval -v -s
 
 # Regression-check the rewritten policy text against the suites that already depend on this
 # corpus (the real risk of the rewrite — that reworded text still produces the same decisions):
-.venv/bin/pytest eval/test_policy_pipeline_consistency.py -m eval_consistency -v
-.venv/bin/pytest eval/test_policy_pipeline_robustness.py -m eval_robustness -v
+.venv/bin/pytest eval/test_policy_pipeline_consistency.py -m eval -v
+.venv/bin/pytest eval/test_policy_pipeline_robustness.py -m eval -v
 ```
 
-Like every sibling suite, `require_env("LLM_BASE_URL", "LLM_MODEL", "LLM_API_KEY")` is the first
-line of the parametrized test function, raising `SystemExit(2)` if any is unset/empty.
+Like every sibling suite, `require_env_or_skip("LLM_BASE_URL", "LLM_MODEL", "LLM_API_KEY")` is the
+first line of the parametrized test function; it `pytest.skip`s the case if any is unset/empty.
 
 ## Test report
 
 Widens `eval/conftest.py`'s Markdown report described in
 [policy-eval-scenarios.md § Test report](policy-eval-scenarios.md#test-report) to also collect
-`eval_correctness_prb`-marked tests (`eval/conftest.py`'s `MARKERS` set now covers all four
-markers). Unlike `eval_consistency`/`eval_robustness` (which fall through to that report's generic
-docstring + crash-message rendering), `test_prb_correctness` gets its **own** render branch: each
+this suite's tests (the report covers every `eval/test_policy_pipeline_*.py` nodeid).
+`test_prb_correctness` gets the metrics render branch (it shares this branch with the four
+robustness tests and `test_e2e_correctness`; the consistency test has its own block): each
 entry shows precision, recall, and denial precision, plus the over-grants/under-grants/
 incorrectly-denied pair breakdown per gate — always, pass or fail, since the tracked-but-non-gating
 under-grant/incorrect-denial detail (the whole point of this suite over a plain grant-set-equality
@@ -269,7 +274,7 @@ stdout per scenario (`-s`) for live inspection without waiting on the written re
 ## Relationship to other integration tests
 
 This is **one** integration-test spec among several indexed by the master PRD
-([../PRD.md](../specs/PRD.md), § *Integration test specifications*).
+([../PRD.md](../specs/PRD.md), § *Test & evaluation specifications*).
 
 - **Companion to, not a replacement for, [policy-eval-scenarios.md](policy-eval-scenarios.md) and
   [policy-eval-robustness-consistency.md](policy-eval-robustness-consistency.md).** All three
@@ -277,10 +282,7 @@ This is **one** integration-test spec among several indexed by the master PRD
   (correctness with a precision/recall/denial-precision breakdown here, vs. plain grant-set
   equality downstream of the full pipeline in the former, vs. consistency/robustness in the
   latter).
-- **New marker, registered in `pyproject.toml`** (`eval_correctness_prb`), distinct from
-  `eval_extended`/`eval_consistency`/`eval_robustness`, named deliberately to leave room for a
-  future `eval_correctness_e2e` marker (#2090) without ambiguity between the two correctness
-  suites' infra requirements.
+- **Carries the single flat `eval` marker** (`pyproject.toml`), like every suite under `eval/`.
 
 ## Trend log
 
@@ -295,8 +297,9 @@ cross-gate aggregation. See `docs/evaluation/eval-framework.md` §9.
 
 ## Out of Scope
 
-- **End-to-end (Keycloak+OPA) correctness scoring.** Deferred to #2090 — `correctness_scorer.py`
-  is designed to be reusable there; the wiring itself is not this ticket's scope.
+- **End-to-end (Keycloak+OPA) correctness scoring.** Covered by #2090,
+  [policy-eval-correctness-e2e.md](policy-eval-correctness-e2e.md), which reuses
+  `correctness_scorer.py` unmodified.
 - **An under-grant tolerance threshold.** Per the originating spec, still TBD — under-grants are
   tracked/reported via `record_property` and the printed summary line, never gated.
 - **New scenarios.** The taxonomy cross-check above confirms the existing 8-scenario corpus

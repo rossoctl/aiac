@@ -40,7 +40,7 @@ These AIAC invariants (from the policy-model spec, handoff 01) are relied on by 
 
 1. **No role spans both kinds.** A role is held by users *or* by agent service accounts, never both. This is what lets `Role.actorIds` be a single list and lets the PCE split inbound rules cleanly by `role.kind`. AIAC invariant, *not* a Keycloak guarantee.
 2. **No scope shared across services.** A scope has exactly one owner, so `Scope.serviceId` is single-valued and `SPM(scope.serviceId)` is unambiguous. (Keycloak client scopes are realm-level and assignable to many clients; for AIAC-managed scopes the owner set is always length 1.)
-3. **Agent role ⇔ Keycloak client role; user role ⇔ Keycloak realm role.** `Role.kind` is populated from Keycloak's `clientRole` flag by the IdP config service; agent roles come from a service's **client** roles (`Service.roles`).
+3. **Agent role ⇔ a client role on the agent's client, or an `aiac.managed` realm role on its service account; user role ⇔ a realm role held by users.** The IdP config service sets `Role.kind`: `GET /services/{id}/roles` marks agent roles `Agent`, and `GET /roles` marks realm roles `User`. Agent roles come from `Service.roles`.
 
 ---
 
@@ -106,7 +106,7 @@ def quarantine(service_id: ClientId, deleted_roles: Iterable[Role] = ()) -> None
 Each incoming `PolicyRule` arrives with `scope.serviceId`, `role.kind`, and `role.actorIds` **already populated**, and with roles **already flattened** to their closure (role + descendants, dedup by `role.id`). The PCE performs **no IdP lookup for routing or classification** and **no role flattening** — it treats each rule's `role` and `scope` as-is.
 
 - The boundary that **derives** `scope.serviceId` / `role.kind` / `role.actorIds` from Keycloak facts is the **Keycloak IdP config service (handoff 02)**.
-- The rule-builder (`src/aiac/agent/policy/api.py` — `role_to_scopes` / `roles_to_scope`, `PolicyRule`) merely **carries those fields through**. Ensure it does (add the pass-through if missing); it does not compute them.
+- The rule-builder (the Policy Rules Builder, `src/aiac/agent/policy_rules_builder/graph.py`) merely **carries those fields through** on the IdP `Role` / `Scope` that it puts in each `PolicyRule`; it does not compute them.
 
 ### Algorithm
 
@@ -114,9 +114,9 @@ Given `rules: list[PolicyRule]`, an `override` flag and an optional `focus_servi
 
 1. **Catalog once.** Call `Configuration.get_services()` — the **only** runtime IdP read. For every service touched this batch, seed its SPM's `service_type` / `owned_roles` / `owned_scopes` from its catalog `Service` record, keeping only **AIAC-provisioned** entities (the `aiac.managed` marker on `Role.aiac_managed` / `Scope.aiac_managed`; Keycloak built-ins — the default client scopes `profile`, `email`, `roles`, `web-origins`, `acr`, `basic`, `service_account`, and the `default-roles-<realm>` composite — are dropped). This seed drives **P2** identity and the **P4** "only agents modelled" rule. It is a seed, **not** a per-derive dependency.
 
-1b. **Routing guard.** Drop every rule that touches a disabled service, except the focus service (see [Routing guard (disabled services)](#routing-guard-disabled-services)).
+1b. **Routing guard.** Drop every rule that touches a disabled service (except the focus service) or a service absent from the catalog (see [Routing guard (disabled services)](#routing-guard-disabled-services)).
 
-2. **Route each rule to its owning service's SPM, by effect.** For each rule `(role, scope, effect)`, append it to `SPM(scope.serviceId).inbound_allow_rules` (if `effect == Allow`) or `.inbound_deny_rules` (if `effect == Deny`) — fetch the SPM via `get_service_policy_by_scope` / `get_service_policy`. **Append-dedup by `role.id + scope.id + effect`.** There is **no** write-time 3-way P5b classification (the old (user,agent-scope)/(user,tool-scope)/(agent,tool-scope) routing table is gone) — a rule always lands on the effect-appropriate list of the SPM that owns its scope, whatever the kinds.
+2. **Route each rule to its owning service's SPM, by effect.** For each rule `(role, scope, effect)`, append it to `SPM(scope.serviceId).inbound_allow_rules` (if `effect == Allow`) or `.inbound_deny_rules` (if `effect == Deny`) — fetch the SPM via `get_service_policy(scope.serviceId)`. **Append-dedup by `role.id + scope.id + effect`.** There is **no** write-time 3-way P5b classification (the old (user,agent-scope)/(user,tool-scope)/(agent,tool-scope) routing table is gone) — a rule always lands on the effect-appropriate list of the SPM that owns its scope, whatever the kinds.
 
 3. **Override (`override=True`) — role-level revocation.** *Before* appending, purge the **distinct input-role set** (taken from the input **before** the routing guard, so a role whose every new rule the guard drops still loses its old grants) from **both** lists (`inbound_allow_rules` + `inbound_deny_rules`) of **every** SPM that contains any of them: one up-front pass using `get_service_policies_by_role` per distinct input role, removing every stored rule (allow or deny) whose `role.id` matches. Then append the fresh rules. Purging once, up-front, ensures a role shared across the input is not wiped after being added. The old algorithm's `target_scopes` reconciliation is **deleted** — the target maps (`target_allow_scopes` / `target_deny_scopes`) are derived, never-stored quantities.
 
@@ -126,15 +126,15 @@ Given `rules: list[PolicyRule]`, an `override` flag and an optional `focus_servi
 
 5. **Compute the affected-agent set from the batch** — from the batch's roles/scopes, **not** by scanning all agents:
    - For each input (or purged) role `r` with `r.kind == Agent`: the owning agents in `r.actorIds` are affected (their outbound changed).
-   - For each touched scope `s` with owner `X = s.serviceId`:
+   - For each touched owner `X` (the scope owner of each routed rule, plus every SPM that the override purge or reconcile changed):
      - if `X` is an **Agent**, `X` is affected (its inbound changed); **and**
-     - every agent **targeting** `s` is affected — namely the owners (`actorIds`) of the **Agent-kind** inbound rules on `SPM(X)` whose scope is `s`.
+     - every agent **targeting** `SPM(X)` is affected — namely the owners (`actorIds`) of every **Agent-kind** inbound rule (allow and deny) on `SPM(X)`, for any scope (a superset of the exact-scope match).
 
-6. **Derive** each affected **live** agent's APM (in the catalog and not disabled; the focus service counts as live) (see below), collect them into one `PolicyModel`, and **partial-upsert** via `aiac.pdp.policy.library.apply_policy` **exactly once**. Exceptions are logged and re-raised (they propagate to the caller). **Tools get an SPM but no APM** (P4).
+6. **Derive** each affected **live** agent's APM (in the catalog and not disabled; the focus service counts as live) (see below), collect them into one `PolicyModel`, and **partial-upsert** via `aiac.pdp.policy.library.apply_policy` **at most once** (no call when no live agent is affected). Exceptions are logged and re-raised (they propagate to the caller). **Tools get an SPM but no APM** (P4).
 
 ### Derivation of `APM(A)` — 100% from SPMs, zero IdP
 
-Let `R_A = SPM(A).owned_roles` (A's client roles) and `S_A = SPM(A).owned_scopes`.
+Let `R_A = SPM(A).owned_roles` (A's own `aiac.managed` roles, from `Service.roles`) and `S_A = SPM(A).owned_scopes`.
 
 - **Identity (P2):** `agent_roles` ← `R_A`; `agent_scopes` ← `S_A`.
 - **No default effect:** the APM carries no default effect. The generated Rego always denies a pair that no rule mentions.
@@ -149,8 +149,8 @@ Let `R_A = SPM(A).owned_roles` (A's client roles) and `S_A = SPM(A).owned_scopes
 
 ### P2 / P4 / P5b reconciliation
 
-- **P2 (identity embed):** copy `owned_roles` / `owned_scopes` from `SPM(A)` onto the APM's `agent_roles` / `agent_scopes`. AIAC-managed filter applied at catalog-seed time. Without the embed both generated gates would deny-all (inbound `subject_allow_ok` needs a non-empty `agent_scopes`; outbound `target_allow_ok` needs a non-empty `agent_roles`).
-- **P4 (only agents modelled):** emit an APM / Rego only for SPMs with `service_type == Agent`. Tools keep an SPM (durable `inbound_allow_rules` / `inbound_deny_rules`) but never get an APM — no `github_tool.*.rego` is emitted.
+- **P2 (identity embed):** copy `owned_roles` / `owned_scopes` from `SPM(A)` onto the APM's `agent_roles` / `agent_scopes`. AIAC-managed filter applied at catalog-seed time. Without the embed the inbound gate would deny-all (inbound `subject_allow_ok` needs a non-empty `agent_scopes`), and outbound derivation would find no edges (it iterates `R_A`). The outbound Rego emits `agent_roles` for debugging only; its `allow` does not use it.
+- **P4 (only agents modelled):** emit an APM / CR only for a live service whose catalog `Service.type == Agent` (the SPM's `service_type` is used only for a service that is absent from the catalog). Tools keep an SPM (durable `inbound_allow_rules` / `inbound_deny_rules`) but never get an APM — no CR is written for a tool.
 - **P5b (classification):** now expressed purely as `role.kind` + `scope.serviceId`. The write-time 3-way routing table is gone; classification happens at **derive** time by splitting inbound rules on `role.kind`.
 
 ### Agent → agent access — in scope, for free
@@ -166,10 +166,10 @@ Add a test for this.
 
 ### Two implementation-time verification gates
 
-Confirm both while coding (they gate correctness of the whole approach):
+Both gates are confirmed (they gate correctness of the whole approach):
 
-1. **`apply_policy` must be a partial (per-agent) upsert.** The PCE upserts only the affected agents. If `apply_policy` rewrites the **whole** policy set instead of replacing per-agent packages, partial upsert would delete every non-affected agent. If so, either make `apply_policy` per-agent, or push a full snapshot. Check `aiac.pdp.policy.library` / the pdp-policy library + writer specs.
-2. **Rego must consume `source_roles`** for the inbound gate (not only `subject_roles`), or agent→agent inbound is *modelled but not enforced*. `source_roles` already exists on `AgentPolicyModel`, so the path likely exists — confirm.
+1. **`apply_policy` must be a partial (per-agent) upsert.** The PCE upserts only the affected agents. Confirmed: `POST /policy` server-side-applies one CR per agent in the batch, so the CRs of the other agents stay.
+2. **Rego must consume `source_roles`** for the inbound gate (not only `subject_roles`), or agent→agent inbound is *modelled but not enforced*. Confirmed: the inbound source gate reads `source_roles[input.identity.client_id]`.
 
 ### Merge Semantics
 
@@ -182,7 +182,7 @@ The `override` flag (set by the caller from the producing UC's choice) selects t
 
 #### Reconcile (drift GC)
 
-SPM identity keys on Keycloak UUIDs, which **churn on delete/recreate**. Because append-dedup keys on `role.id + scope.id`, a re-onboarded service whose Keycloak roles/scopes were recreated presents *new* UUIDs, so its edges are treated as new and pile up **beside** the superseded generations — nothing removes the old ones. (`override=True` does not close this: it purges by the *input* role's id, so a role whose UUID already churned out of the batch is never matched.) A live diagnostic once found a single agent SPM carrying 53 inbound edges across two role-id generations, retired `*-aud` scopes, an impossible self-reference, and duplicate same-name roles — all replayed into every regenerated APM/Rego.
+SPM edges key on Keycloak role/scope UUIDs, which **churn on delete/recreate**. Because append-dedup keys on `role.id + scope.id + effect`, a re-onboarded service whose Keycloak roles/scopes were recreated presents *new* UUIDs, so its edges are treated as new and pile up **beside** the superseded generations — nothing removes the old ones. (`override=True` does not close this: it purges by the *input* role's id, so a role whose UUID already churned out of the batch is never matched.) A live diagnostic once found a single agent SPM carrying 53 inbound edges across two role-id generations, retired `*-aud` scopes, an impossible self-reference, and duplicate same-name roles — all replayed into every regenerated APM/Rego.
 
 **Reconcile** closes this. After routing (step 2) and any override purge (step 3), and **before** persist (step 4), each **touched** SPM is pruned against the step-1 catalog. It **reuses that same `get_services()` result** — no additional IdP read, so the *only-runtime-IdP-read-is-`get_services()`* invariant holds. It runs under **both** merge modes and is **order-independent** — it removes *only* edges whose entity genuinely no longer exists, never a live edge, so both onboarding orders still converge. "Touched SPMs only": at that point the SPM cache holds exactly the routed + override-purged SPMs (agent-derive SPMs aren't loaded yet).
 
@@ -260,7 +260,7 @@ Known limits:
 |--------|---------|
 | `aiac.policy.model` | `PolicyRule`, `RuleEffect`, `ServicePolicyModel`, `AgentPolicyModel`, `PolicyModel` |
 | `aiac.idp.configuration` | `Configuration.get_services` — the **only** runtime IdP read (catalog: `service_type` + own roles/scopes for the P2 seed) |
-| `aiac.policy.model_store.library` | `get_service_policy` / `get_service_policy_by_scope` (fetch SPM), `get_service_policies_by_role` (SPMs containing a role — override purge + outbound derivation), `apply_service_policy` (persist SPM), `delete_service_policy` (offboard) |
+| `aiac.policy.model_store.library` | `get_service_policy` (fetch SPM), `get_service_policies_by_role` (SPMs containing a role — override purge + outbound derivation), `apply_service_policy` (persist SPM), `delete_service_policy` (offboard) |
 | `aiac.pdp.policy.library` | `apply_policy` — partial-upsert derived APMs to OPA; `delete_agent_policy` — remove an offboarded agent's APM/Rego; `apply_agent_policy` — write the no-rules CR of a quarantined agent |
 
 Note: the PCE no longer calls `get_services_by_role` / `get_services_by_scope` / `get_subjects_by_role` at routing or classification time — those facts arrive on the rules (input contract) and derivation reads SPMs. The single IdP read is `get_services()` for the identity seed.
@@ -286,10 +286,10 @@ Good tests assert external behavior — what the engine writes to the Policy Mod
 **Seam:** mock all downstream dependencies at their module-level import boundary:
 
 - `aiac.idp.configuration` — mock `Configuration.get_services` (the catalog: `service_type` + each service's own roles/scopes for the P2 seed).
-- `aiac.policy.model_store.library` — mock `get_service_policy` / `get_service_policy_by_scope`, `get_service_policies_by_role`, `apply_service_policy`, `delete_service_policy`.
+- `aiac.policy.model_store.library` — mock `get_service_policy`, `get_service_policies_by_role`, `apply_service_policy`, `delete_service_policy`.
 - `aiac.pdp.policy.library` — mock `apply_policy`, `delete_agent_policy`, `apply_agent_policy`.
 
-**Un-freeze `test/unit/policy/computation/`.** These tests were excluded (frozen imports caused collection errors). With the SPM redesign landed, un-freeze the directory so the suite runs under the default `pytest` (marker-only selection; the unit lane is untagged).
+**`test/unit/policy/computation/` runs in the unit lane.** The suite runs under the default `pytest` (marker-only selection; the unit lane is untagged).
 
 Key behaviors to assert:
 
@@ -303,7 +303,7 @@ Key behaviors to assert:
 - **P2 identity from `owned_*`.** Each derived APM's `agent_roles` / `agent_scopes` come from `SPM(A).owned_roles` / `owned_scopes`, AIAC-managed-filtered; an agent with no AIAC-managed catalog roles/scopes keeps `[]`.
 - **Directional relevance — no false outbound edge.** A user role shared between `AS` and `TS` does **not** by itself make A "target" T; A's outbound edge to T appears only if one of A's **agent** roles maps to a T scope.
 - **Affected set from the batch, not a full scan.** The affected-agent set is computed from the batch roles/scopes; agents unrelated to the batch are never derived or upserted.
-- **`apply_policy` called exactly once** after all `apply_service_policy` writes complete (partial upsert of only the affected agents).
+- **`apply_policy` called exactly once** after all `apply_service_policy` writes complete (partial upsert of only the affected agents), and not called when no live agent is affected.
 - **Reconcile (drift GC).** A touched SPM carrying dangling edges (retired scope, churned scope UUID, churned/duplicate user role, retired agent-role self-reference) is pruned against the catalog on re-onboarding; live edges survive and the pass is idempotent; a catalog miss (owner absent) leaves the SPM untouched.
 - **Decommission (service offboard).** Onboard an agent A targeting tool T, then `decommission(T)`: `SPM(T)` is deleted, no `delete_agent_policy` (tool has no APM), and A is re-derived with an empty outbound while its inbound survives. `decommission(A)`: `SPM(A)` deleted, `delete_agent_policy(A)` called, A's outbound footprint (`AR→TS` on `SPM(T)`) purged while T keeps its user grant, and no APM re-derived for the deleted agent. A never-onboarded / 404 service is a no-op.
 - **Effect routing.** A `Deny` rule routes to `SPM(scope.serviceId).inbound_deny_rules`; an `Allow` rule to `inbound_allow_rules`. Append-dedup keys on `role.id + scope.id + effect`, so the same `(role, scope)` can be present once in each list.
@@ -316,14 +316,12 @@ Key behaviors to assert:
 - **Quarantine.** For an agent: `SPM(X)` is deleted, its roles are removed from the other SPMs, its CR is replaced with the no-rules CR, and the affected agents are re-derived in one call. For a tool: no CR is written, and its callers are re-derived. A second call gives the same result. An unknown UUID is a no-op. `quarantine` and `decommission` keep the grants of a role that another service also holds, and never derive an agent that is absent from the catalog or disabled.
 - **Failures propagate.** An exception from any dependency is logged and **re-raised** (it propagates to the caller, which surfaces it — e.g. the Controller returns HTTP 500); on success `compute_and_apply` / `decommission` / `quarantine` return `None`.
 
-**Prior art:** `3.14-unit-tests-write-api.md` (mock boundary pattern — apply the same approach at the library import boundary here).
-
 ---
 
 ## Out of Scope
 
 - **Fine-grained rule revocation:** removing an individual `PolicyRule` without replacing its whole role. `override=True` covers role-level replace at the SPM layer (see [Merge Semantics](#merge-semantics)); single-rule revocation is not yet designed — **TBD**. (Full-service **decommission / package deletion** *is* now designed and implemented — see [Decommission (service offboard)](#decommission-service-offboard).)
-- **Full policy rebuild orchestration:** the PCE handles incremental updates; full rebuilds (clear + reapply all) are driven by higher-level orchestration outside this module.
+- **Full policy rebuild orchestration:** the PCE handles incremental updates; full rebuilds (clear + reapply all) are driven by higher-level orchestration outside this module. **Status: not built yet** — UC2 Rebuild (`src/aiac/agent/uc/policy_update/rebuild.py`) is a stub that returns `([], True)`.
 - **Direct Keycloak calls:** all IdP access goes through `aiac.idp.configuration.Configuration` (only `get_services()`). The PCE never calls Keycloak directly.
 - **Persistence of `PolicyRule` inputs:** the PCE persists SPMs (source of truth); APMs are derived and pushed, never persisted as truth. The raw input rule list is not stored.
 - **Model field definitions** (handoff 01), **IdP service / library** (handoffs 02/03), **store CRUD** (handoff 04).
@@ -333,4 +331,3 @@ Key behaviors to assert:
 ## Further Notes
 
 - The PCE is the **only** caller of `aiac.pdp.policy.library.apply_policy` from AIAC Agent sub-agents. Sub-agents call `compute_and_apply`, not the PDP Policy Library directly.
-- `src/aiac/agent/policy/api.py` retains `role_to_scopes` / `roles_to_scope` helpers used by AIAC Agent sub-UC agents; they now carry `scope.serviceId` / `role.kind` / `role.actorIds` through on each `PolicyRule` (input contract above). These helpers are not used by the PCE.

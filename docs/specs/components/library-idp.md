@@ -9,7 +9,7 @@
 src/aiac/idp/
 └── configuration/
     ├── __init__.py     # empty
-    ├── models.py       # Subject, Role, Service, Scope
+    ├── models.py       # ServiceType, RoleKind, Subject, Role, ServiceUuid, ClientId, Service, Scope
     └── api.py          # Configuration class — reads + writes IdP entities
 ```
 
@@ -36,9 +36,9 @@ pydantic
 
 All models use `model_config = ConfigDict(extra='ignore')` to silently discard unknown fields.
 
-Model definition order: `Subject` → `Role` → `Service` → `Scope`. Because `Subject`, `Role`, and `Service` reference `Scope` (and `Subject` references `Role`) as forward references, the module calls `Subject.model_rebuild()`, `Role.model_rebuild()`, and `Service.model_rebuild()` after `Scope` is defined.
+Model definition order: `Subject` → `Role` → `Service` → `Scope`. Because `Subject` references `Role`, `Role` references itself (`childRoles`), and `Service` references `Role` and `Scope` as forward references, the module calls `Subject.model_rebuild()`, `Role.model_rebuild()`, and `Service.model_rebuild()` after `Scope` is defined.
 
-`Service`, `Role`, `Scope`, and `Subject` use pydantic's default equality (field-based) and are **not hashable** — they define no custom `__hash__`/`__eq__` and are never used as dict keys or set members. The relationship maps in `AgentPolicyModel` (`source_roles`, `subject_roles`, and the split target maps `target_allow_scopes` / `target_deny_scopes`) are keyed by the entity's string `id` instead, so no identity override is needed.
+`Service`, `Role`, `Scope`, and `Subject` use pydantic's default equality (field-based) and are **not hashable** — they define no custom `__hash__`/`__eq__` and are never used as dict keys or set members. The relationship maps in `AgentPolicyModel` (`source_roles`, `subject_roles`, and the split target maps `target_allow_scopes` / `target_deny_scopes`) are keyed by a plain string (a username or a clientId) instead, so no identity override is needed.
 
 #### `Subject`
 
@@ -48,15 +48,15 @@ Represents a user (Keycloak: `user`).
 |-------|------|----------------|---------|
 | `id` | `str` | `id` | |
 | `username` | `str` | `username` | |
-| `email` | `str \| None` | `email` | |
-| `firstName` | `str \| None` | `firstName` | |
-| `lastName` | `str \| None` | `lastName` | |
+| `email` | `str \| None` | `email` | `None` |
+| `firstName` | `str \| None` | `firstName` | `None` |
+| `lastName` | `str \| None` | `lastName` | `None` |
 | `enabled` | `bool` | `enabled` | |
 | `roles` | `list[Role]` | _(populated by `Configuration.get_subjects()` from `GET /subjects/{id}/assignments` → `realmMappings`; not present in the raw Keycloak user object)_ | `[]` |
 
 #### `Role`
 
-Represents a role. Per Assumption 3 (policy-model spec), **user** roles are Keycloak realm roles and **agent** roles are Keycloak client roles on the agent's client; `kind` (a `RoleKind`) carries that distinction and is populated from Keycloak's `clientRole` flag at the IdP boundary.
+Represents a role. Per Assumption 3 (policy-model spec), **user** roles are Keycloak realm roles held by users, and **agent** roles are the client roles on the agent's client and the `aiac.managed` realm roles on its service account; `kind` (a `RoleKind`) carries that distinction. The IdP service sets it per endpoint at the IdP boundary: `GET /services/{id}/roles` marks agent roles `Agent`, and `GET /roles` marks realm roles `User`.
 
 | Field | Type | Keycloak field | Default |
 |-------|------|----------------|---------|
@@ -66,8 +66,8 @@ Represents a role. Per Assumption 3 (policy-model spec), **user** roles are Keyc
 | `composite` | `bool` | `composite` | |
 | `childRoles` | `list[Role]` | `composites.realm` | `[]` |
 | `attributes` | `dict[str, Any]` | `attributes` | `{}` |
-| `kind` | `RoleKind` | `clientRole` flag (user = realm role, agent = client role; resolved at the IdP boundary) | |
-| `actorIds` | `list[str]` | _(member **usernames** of a user-kind (realm) role, or the owning agent's `serviceId`(s) for an agent-kind (client) role; populated service-side, user-kind values aligned with `get_subjects_by_role`, handoff 02)_ | `[]` |
+| `kind` | `RoleKind` | _(set per endpoint by the IdP service — see above; resolved at the IdP boundary)_ | `RoleKind.USER` |
+| `actorIds` | `list[str]` | _(member **usernames** of a user-kind (realm) role, or the owning agent's `serviceId`(s) for an agent-kind role; populated service-side, user-kind values aligned with `get_subjects_by_role`, handoff 02)_ | `[]` |
 
 > **Field pass-through (handoff 03 audit).** `kind`, `actorIds`, and `Scope.serviceId` are declared
 > on the models by **handoff 01** and populated by the **IdP service** (handoff 02). The
@@ -78,7 +78,7 @@ Represents a role. Per Assumption 3 (policy-model spec), **user** roles are Keyc
 
 Roles also expose an `aiac_managed` property (`bool`): `True` when `attributes` carries the AIAC provisioning marker `aiac.managed` (realm-role attribute values are lists, so the marker appears as `["true"]`). See the naming convention in the idp-configuration-service spec.
 
-> **SPM/APM (service-side).** `Role.actorIds` is populated per kind at the IdP boundary: for an **agent** (client) role, the owning client's `serviceId`(s) (resolved from the role's `containerId`); for a **user** (realm) role, the role's member usernames (aligned with `get_subjects_by_role`). The IdP service also fails loud on cross-kind roles (Assumption 1) and multi-owner AIAC-managed scopes (Assumption 2). See "Agent roles are client roles, field population, and assumption enforcement" in idp-configuration-service.md.
+> **SPM/APM (service-side).** `Role.actorIds` is populated per kind at the IdP boundary: for an **agent** role, the owning client's `serviceId`(s) (resolved from a client role's `containerId`, or the service itself for an `aiac.managed` realm role on its service account); for a **user** (realm) role, the role's member usernames (aligned with `get_subjects_by_role`). The IdP service also fails loud on cross-kind roles (Assumption 1) and multi-owner AIAC-managed scopes (Assumption 2). See "Agent roles are client roles, field population, and assumption enforcement" in idp-configuration-service.md.
 
 #### `Service`
 
@@ -87,8 +87,8 @@ Represents a service (Keycloak: `client`).
 | Field | Type | Keycloak field | Default |
 |-------|------|----------------|---------|
 | `id` | `str` | `id` | |
-| `serviceId` | `str \| None` | `clientId` | `None` |
-| `name` | `str \| None` | `name` | |
+| `serviceId` | `str` | `clientId` | _(required; copied from `clientId`)_ |
+| `name` | `str \| None` | `name` | `None` |
 | `description` | `str \| None` | `description` | `None` |
 | `enabled` | `bool` | `enabled` | |
 | `type` | `ServiceType \| None` | `attributes.client.type` | `None` |
@@ -120,7 +120,7 @@ Represents a service scope (Keycloak: `client scope`).
 | `name` | `str` | `name` |
 | `description` | `str \| None` | `description` |
 | `attributes` | `dict[str, Any]` | `attributes` |
-| `serviceId` | `str \| None` | _(the `serviceId`/`clientId` of the service that exposes this scope; declared by handoff 01, populated service-side by handoff 02)_ |
+| `serviceId` | `str` (default `""`) | _(the `serviceId`/`clientId` of the service that exposes this scope; declared by handoff 01, populated service-side by handoff 02)_ |
 
 > **Field pass-through (handoff 03 audit).** `Scope.serviceId` round-trips through the library's
 > deserialization automatically (same `model_validate` pass-through as `Role.kind`/`actorIds`). It makes
@@ -179,6 +179,10 @@ class Configuration:
 
     @classmethod
     def for_realm(cls, realm: str) -> "Configuration": ...
+
+    # Realm from $KEYCLOAK_REALM; raises RuntimeError if it is unset or empty.
+    @classmethod
+    def for_default_realm(cls) -> "Configuration": ...
 
     def get_subjects(self) -> list[Subject]: ...
     def get_roles(self) -> list[Role]: ...
@@ -299,10 +303,10 @@ class Configuration:
 
 `get_subjects_by_role(role: Role) -> list[Subject]`:
 1. `GET {AIAC_PDP_CONFIG_URL}/subjects?role_id={role.id}&realm=<self.realm>`
-2. Returns all subjects (users) that have this role directly assigned, enriched with their full realm role assignments (same enrichment as `get_subjects()`).
+2. Returns all subjects (users) that have this role directly assigned, as the service returns them. There is no per-subject enrichment (`Subject.roles` stays `[]`).
 3. Raises `RuntimeError` on non-2xx. Returns an empty list when no subject holds the role.
 
-> **Note:** This method returns only subjects with a **direct** assignment of the given role. Composite role traversal (resolving `childRoles` and querying each) is the caller's responsibility — see PCE algorithm in `aiac.policy.computation`.
+> **Note:** This method returns only subjects with a **direct** assignment of the given role. Composite role traversal (resolving `childRoles` and querying each) is the caller's responsibility. The PCE does no flattening: its rules arrive pre-flattened.
 
 > **`actorIds` consistency — handoff 03 audit.** The subject/username set this method reports is the
 > same set the **IdP service** uses to populate a user-kind role's `Role.actorIds` (handoff 02). The
@@ -390,6 +394,7 @@ Read from a `.env` file co-located with `api.py` (`src/aiac/idp/configuration/.e
 | Variable | Default |
 |----------|---------|
 | `AIAC_PDP_CONFIG_URL` | `http://127.0.0.1:7071` |
+| `KEYCLOAK_REALM` | none — required by `for_default_realm()` |
 
 > **TBD:** whether `AIAC_PDP_CONFIG_URL` should be renamed to `AIAC_IDP_CONFIG_URL`. Not yet decided — keep `AIAC_PDP_CONFIG_URL` until this is resolved.
 
@@ -410,7 +415,7 @@ updated_service = cfg.map_scope_to_service(service, scope)
 role = cfg.create_role(role_name="reader", role_description="Read-only access")
 updated_service = cfg.map_role_to_service(updated_service, role)
 
-# PCE usage — resolve services owning a given role or scope
+# Ad-hoc usage — resolve services owning a given role or scope
 services_with_role = cfg.get_services_by_role(role)
 services_with_scope = cfg.get_services_by_scope(scope)
 ```

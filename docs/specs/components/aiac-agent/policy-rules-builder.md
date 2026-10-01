@@ -8,7 +8,8 @@ internally runs a LangGraph `StateGraph`; callers are decoupled from LangGraph m
 PRB fetches its own policy context (see **Policy source** below), reasons over it with an LLM,
 and emits `list[PolicyRule]` scoped to the input — both grants (`ALLOW`) and explicit prohibitions
 (`DENY`). It does **not** call
-`aiac.pdp.policy.library` or `aiac.policy.model_store.library` directly; only the PCE does.
+`aiac.pdp.policy.library` or `aiac.policy.model_store.library` directly; only the PCE writes through
+them (the UC1 Service Policy Builder reads the Policy Store, read-only, for cross-service detection).
 
 ---
 
@@ -20,10 +21,10 @@ def build_scope_rules(roles: list[Role], scope: Scope) -> list[PolicyRule]: ...
 ```
 
 **`build_role_rules`** — role-centric: "given this role, which scopes does it get?"
-Used for UC3 (Role Update). Called once per role with the full set of scopes relevant to the trigger.
+Used for UC1 (agent path, once per own role in its closure) and, when built, UC3 (Role Update). Called once per role with the full set of scopes relevant to the trigger.
 
 **`build_scope_rules`** — scope-centric: "given this scope, which roles may access it?"
-Used as one of the calls for UC1 (Service Onboarding). See the Controller sub-PRD for the full UC1 dispatch pattern.
+Used as one of the calls for UC1 (Service Onboarding). See [uc1-service-onboarding.md → Service Policy Builder](uc1-service-onboarding.md#sub-agent-service-policy-builder) for the full UC1 dispatch pattern.
 
 Each call handles exactly **one focal entity** (the singular argument) against a list of
 candidate counterparts; the caller (UC handler) does all iteration.
@@ -126,12 +127,12 @@ fetch ─► propose ─► precheck ─► audit ─┬─ approved ───�
 ```python
 class RoleSelection(BaseModel):     # build_role_rules (role focal, scope candidates)
     granted_scope_names: list[str]
-    denied_scope_names: list[str]     # explicit prohibitions (digested deny direct grants)
+    denied_scope_names: list[str] = []     # explicit prohibitions (digested deny direct grants)
     reasoning: str
 
 class ScopeSelection(BaseModel):    # build_scope_rules (scope focal, role candidates)
     roles_with_access_names: list[str]
-    roles_denied_access_names: list[str]   # explicit prohibitions (digested deny direct grants)
+    roles_denied_access_names: list[str] = []   # explicit prohibitions (digested deny direct grants)
     reasoning: str
 
 class Contradiction(BaseModel):
@@ -278,14 +279,16 @@ future reader does not mistake the omission for an oversight.
 
 `ChatOpenAI(base_url=LLM_BASE_URL, model=LLM_MODEL, api_key=LLM_API_KEY, temperature=0,
 max_retries=0, timeout=LLM_REQUEST_TIMEOUT)`. The client does **no** retries of its own
-(`max_retries=0`); the `_structured_call` seam owns all LLM retry logic. Two retry layers stay
+(`max_retries=0`); the `_structured_call` seam owns all LLM retry logic, through the shared
+`aiac.agent.llm` seam (`build_llm`, `call_with_retry`, `raise_sanitized`). Two retry layers stay
 distinct:
 
 - **`MAX_AUDIT_RETRIES`** (module constant, default `3`) — the semantic fix-and-retry loop
   between audit and propose. This is the **audit** budget. It is distinct from the LLM transport
   budget below.
-- **LLM transport retries** — a single seam-level tenacity `Retrying` in `_structured_call`,
-  driven by **dedicated LLM knobs** (not the shared `UPSTREAM_MAX_RETRIES`): `LLM_MAX_RETRIES`
+- **LLM transport retries** — a single tenacity `Retrying` in the shared
+  `aiac.agent.llm.call_with_retry`, which `_structured_call` calls (the Policy Digester uses the
+  same seam), driven by **dedicated LLM knobs** (not the shared `UPSTREAM_MAX_RETRIES`): `LLM_MAX_RETRIES`
   (default `3`), `LLM_RETRY_BACKOFF_MIN` (`1`) and `LLM_RETRY_BACKOFF_MAX` (`30`). `is_transient`
   classifies which failures retry (5xx / connect / timeout). `LLM_REQUEST_TIMEOUT` (default `120`)
   bounds each request. The Phase-1 file read does **not** retry; it raises directly.
@@ -312,14 +315,15 @@ to a human, partial-apply, re-author the policy, split the scope) is a **separat
 > treatment — surveys a candidate policy, records **all** genuine conflicts at once (never aborting on
 > the first), and returns a `ConflictReport` with verbatim quotes — is **folded into the `/apply` path**
 > and returned as the HTTP `422` body on a genuine conflict ([identify conflicts, never reconcile](#design-decision-identify-conflicts-never-reconcile) / #2503).
-> It reuses this module's proposer / precheck / audit machinery as a separate diagnostic assembly. The
+> On `/apply` it is not a separate diagnostic assembly: `ServicePolicyBuilder.build` collects the
+> per-focal contradictions, runs `detect_conflicts`, and reuses the diagnostic explain/quote pieces
+> (`ExplainResult`, `_verify_quote`) through `conflict_enrichment.enrich_report`. The full diagnostic
+> assembly (`check_policy_conflicts`) is not wired to any route. The
 > earlier standalone read-only `POST /policy/check` route is **retired**.
 
 - **Detection is deterministic** (in `precheck`): `conflict_names = granted_names ∩ denied_names`,
-  after candidate-set filtering. Precheck resolves nothing; it only stores the overlap. Because denies
-  are now purely the explicit `denied_names`, overlap can arise **only** from a `denied_names` entry
-  that also appears in `granted_names` — a direct policy conflict or a coarse-scope mismatch, exactly
-  the genuine signal we want.
+  after candidate-set filtering. Precheck resolves nothing; it only stores the overlap (see
+  **precheck** above for why an overlap is the genuine signal).
 - **Adjudication is by the auditor** (three-way). For each name in `conflict_names` the auditor
   decides whether the policy **genuinely** both grants and prohibits it, or whether it's a proposer
   **generation error**:
@@ -332,8 +336,7 @@ to a human, partial-apply, re-author the policy, split the scope) is a **separat
   the call fails closed regardless). Generation errors are **never** reported (LLM noise, not a policy
   finding). The entry-point signature stays `-> list[PolicyRule]`; **the raise is the report**.
 - **Fail-closed.** The focal entity's whole rule set is withheld (whether to salvage the
-  non-conflicting rules is a treatment decision — deferred). A **genuine** `PolicyContradictionError`
-  short-circuits past retry — retrying cannot fix a real conflict.
+  non-conflicting rules is a treatment decision — deferred).
 - **Multi-focal aggregation (UC1).** One PRB call raises for **one** focal entity. UC1's
   `ServicePolicyBuilder.build` iterates many focal entities, so it **aggregates** the per-focal
   `PolicyContradictionError`s into a single `PolicyConflictError` (`conflict_detection.py`) carrying
@@ -557,9 +560,9 @@ Two layers, distinguished by whether the LLM is real:
     path (`PolicyContradictionError`) is **excluded** — a real LLM's adjudication of a genuine
     grant/deny collision is non-deterministic and belongs to focused mocked tests.
 
-The `llm` marker is registered in `pyproject.toml` alongside `integration`; unlike `integration` (which
-needs the full onboarding stack), `llm` needs only an LLM endpoint. Both are deselected by the default
-`-m "not integration"` unit run — the `llm` suite is opt-in via `-m llm` with the `LLM_*` env sourced.
+The `llm` marker is registered in `pyproject.toml`; `llm` needs only an LLM endpoint (no cluster). The
+default `addopts` (`-m "not integration and not system and not llm and not eval"`) deselects it — the
+`llm` suite is opt-in via `-m llm` with the `LLM_*` env sourced.
 
 **Faithfulness / parity gate (eval).** The corpus-level "digested output is unchanged or improved vs
 prose" acceptance criterion lives in `eval/test_policy_pipeline_faithfulness.py`: it runs the PRB over
@@ -576,9 +579,9 @@ and is **not yet enforced** here.
 | Use Case | Caller | Function(s) called |
 |---|---|---|
 | UC1 — Service Onboarding | Service Policy Builder sub-agent | `build_scope_rules(other_roles, scope)` per agent/tool scope + `build_role_rules(role, other_scopes)` per agent role (agent path only) |
-| UC2 — Policy Update (Build) | Build sub-agent | TBD |
-| UC3 — Role Update | Role sub-agent | `build_role_rules(role, all_scopes)` — one call |
-| Conflict diagnostic (folded into `/apply`, [identify conflicts, never reconcile](#design-decision-identify-conflicts-never-reconcile) / #2503) | Apply path | A parallel diagnostic assembly reusing propose / precheck / audit (record-not-raise + a terminal `explain` node); returns a `422` `ConflictReport` |
+| UC2 — Policy Update (Build) | Build sub-agent | TBD. **Status: not built yet** — `build_policy()` is a stub that returns `([], False)` and calls no PRB. |
+| UC3 — Role Update | Role sub-agent | `build_role_rules(role, all_scopes)` — one call. **Status: not built yet** — `update_role()` is a stub that returns `([], True)` and calls no PRB. |
+| Conflict diagnostic (folded into `/apply`, [identify conflicts, never reconcile](#design-decision-identify-conflicts-never-reconcile) / #2503) | Apply path (UC1 `ServicePolicyBuilder.build`) | The accumulated `PolicyContradictionError`s + `detect_conflicts` + `enrich_report` (one explain call for each conflicting pair); returns a `422` `ConflictReport` |
 
 > **Disabled services are not candidates.** The UC1 caller and the conflict diagnostic get their
 > candidates from one shared resolver, `resolve_focal_entities` (`agent/shared/focal_entities.py`).

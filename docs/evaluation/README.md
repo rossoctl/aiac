@@ -2,21 +2,22 @@
 
 `eval/` is a top-level package (sibling of `test/`) holding the AIAC evaluation framework's
 live-infra test suites. Each `test_policy_pipeline_*.py` module below has its own full spec under
-this directory — this README is a one-page map, not a replacement for those specs. Framework-wide
-design (what each attribute measures, scoring philosophy, reporting) lives in
-[`eval-framework.md`](eval-framework.md).
+this directory, except `test_policy_pipeline_faithfulness.py` — this README is a one-page map, not
+a replacement for those specs. Framework-wide design (what each attribute measures, scoring
+philosophy, reporting) lives in [`eval-framework.md`](eval-framework.md).
 
 ## Scripts
 
 | Script | Marker | Level | Spec | What it checks |
 |---|---|---|---|---|
-| `test_policy_pipeline_eval.py` | `eval` | End-to-end | [policy-eval-scenarios.md](policy-eval-scenarios.md) | Full Keycloak+PRB+PCE+OPA pipeline over the 8-scenario corpus — per-cell `opa eval` assertions, grant-set equality, guardrail `xfail` checks (prompt injection, direct contradiction). |
+| `test_policy_pipeline_eval.py` | `eval` | End-to-end | [policy-eval-scenarios.md](policy-eval-scenarios.md) | Full Keycloak+PRB+PCE+OPA pipeline over the 8-scenario corpus — per-cell `opa eval` assertions, grant-set equality. (The guardrail `xfail` checks for prompt injection and direct contradiction are in `test/unit/agent/policy_rules_builder/test_guardrail_*.py`, with the `llm` marker.) |
 | `test_policy_pipeline_correctness_prb.py` | `eval` | PRB-level | [policy-eval-correctness-prb.md](policy-eval-correctness-prb.md) | PRB called directly (synthetic Role/Scope, no Keycloak/OPA) — precision/recall/denial-precision per scenario, zero-tolerance over-grant gate. Feeds the committed trend log. |
 | `test_policy_pipeline_correctness_e2e.py` | `eval` | End-to-end | [policy-eval-correctness-e2e.md](policy-eval-correctness-e2e.md) | Same scorer as the PRB-level suite, one layer further downstream (real Keycloak+PCE+OPA) — the only level that catches PCE-merge/Rego-rendering bugs. Feeds the committed trend log. |
 | `test_policy_pipeline_consistency.py` | `eval` | PRB-level | [policy-eval-robustness-consistency.md](policy-eval-robustness-consistency.md) | PRB run N times (default 5) on identical input, exact grant-set equality gate. Feeds the committed trend log (agreement rate). |
 | `test_policy_pipeline_robustness.py` | `eval` | PRB-level | [policy-eval-robustness-consistency.md](policy-eval-robustness-consistency.md) | PRB grant sets checked for **invariance** and **sensitivity**, each perturbed at both a **mechanical** and a **semantic** (LLM-drafted, human sign-off required — see [SIGNOFF.md](../../eval/scenarios_perturbed/SIGNOFF.md)) tier, each of the four combinations its own metric, feeding the trend log. |
+| `test_policy_pipeline_faithfulness.py` | `eval` | PRB-level | none here (see [`../specs/digested-policy.md`](../specs/digested-policy.md)) | Digests each source policy live, runs the PRB on the digest, and scores it against the truth table — zero-tolerance over-grant gate. Writes no trend-log row. |
 
-All five carry the single flat `eval` marker (the former per-suite `eval_*` markers were
+All six carry the single flat `eval` marker (the former per-suite `eval_*` markers were
 collapsed into one — select an individual suite by its file path or `-k`, as the runbook below
 does). All need only `LLM_BASE_URL`/`LLM_MODEL`/`LLM_API_KEY` at minimum; the two end-to-end
 suites (`test_policy_pipeline_eval.py`, `test_policy_pipeline_correctness_e2e.py`) additionally
@@ -30,11 +31,11 @@ directly — real shell/CI exports still take precedence.
 
 | Variable | Required by | Purpose |
 |---|---|---|
-| `LLM_BASE_URL`, `LLM_MODEL`, `LLM_API_KEY` | All five scripts | The PRB's real LLM calls. `LLM_MODEL` is also the pinned model version recorded on every trend-log row. |
-| `KEYCLOAK_URL`, `KEYCLOAK_ADMIN_USERNAME`, `KEYCLOAK_ADMIN_PASSWORD` | `eval`, `eval` | Real Keycloak admin API — the shared `pipeline` fixture provisions one realm per scenario. |
-| `OPA_BIN` (optional) | `eval`, `eval` | Path to the `opa` binary; falls back to `opa` on `PATH`. Both suites skip cleanly (not fail) if neither resolves. |
-| `EVAL_PIPELINE_PARALLELISM` (optional) | `eval`, `eval` | Max concurrent workers provisioning scenarios in the shared `pipeline` fixture; defaults to the scenario count (8). |
-| `PRB_CONSISTENCY_REPEATS` (optional) | `eval` | Repeats per scenario; default 5, must be ≥ 2. |
+| `LLM_BASE_URL`, `LLM_MODEL`, `LLM_API_KEY` | All six scripts | The PRB's real LLM calls. `LLM_MODEL` is also the pinned model version recorded on every trend-log row. |
+| `KEYCLOAK_URL`, `KEYCLOAK_ADMIN_USERNAME`, `KEYCLOAK_ADMIN_PASSWORD` | `test_policy_pipeline_eval.py`, `test_policy_pipeline_correctness_e2e.py` | Real Keycloak admin API — the shared `pipeline` fixture provisions one realm per scenario. |
+| `OPA_BIN` (optional) | `test_policy_pipeline_eval.py`, `test_policy_pipeline_correctness_e2e.py` | Path to the `opa` binary; falls back to `opa` on `PATH`. Both suites skip cleanly (not fail) if neither resolves. |
+| `EVAL_PIPELINE_PARALLELISM` (optional) | `test_policy_pipeline_eval.py`, `test_policy_pipeline_correctness_e2e.py` | Max concurrent workers provisioning scenarios in the shared `pipeline` fixture; defaults to the scenario count (8). |
+| `PRB_CONSISTENCY_REPEATS` (optional) | `test_policy_pipeline_consistency.py` | Repeats per scenario; default 5, must be ≥ 2. |
 | `EVAL_REPORT_TZ` (optional) | none (report only) | Timezone for the Markdown report's timestamp/filename; default UTC. |
 
 Minimal repo-root `.env` for the PRB-level suites only:
@@ -74,7 +75,6 @@ doesn't already parallelize scenarios internally:
 .venv/bin/pytest eval/test_policy_pipeline_correctness_e2e.py -m eval -v -s
 
 # consistency — PRB-direct, no shared fixture, -n parallelizes cleanly.
-# (legacy suite; not yet wired into the trend log — see table above)
 .venv/bin/pytest eval/test_policy_pipeline_consistency.py -m eval -n 8 -v
 
 # robustness — PRB-direct, no shared fixture, -n parallelizes cleanly.
@@ -82,16 +82,16 @@ doesn't already parallelize scenarios internally:
 .venv/bin/pytest eval/test_policy_pipeline_robustness.py -m eval -n 8 -v
 ```
 
-Every suite's parametrized test is the first thing to call `require_env_or_skip(...)`, so a
-missing variable **skips the suite cleanly** (never a false pass) rather than failing deep into a
-run.
+Every suite calls `require_env_or_skip(...)` first (in the parametrized test, or in the shared
+`pipeline` fixture for `test_policy_pipeline_eval.py`), so a missing variable **skips the suite
+cleanly** (never a false pass) rather than failing deep into a run.
 
 ## Reports
 
-Every run of the five markers above writes a Markdown report to the gitignored `eval/reports/`
-(`report_<DD_MM_HH_MM_SS>.md`) — see `eval/conftest.py`. The two Correctness suites and the
-Robustness suite's mechanical tier additionally append one row each to the **committed**
-`eval/trend_log.jsonl` (spec:
+Every run of any `eval/test_policy_pipeline_*.py` suite above writes a Markdown report to the
+gitignored `eval/reports/` (`report_<DD_MM_HH_MM_SS>.md`) — see `eval/conftest.py`. The two
+Correctness suites, each of the four Robustness family × tier tests, and the Consistency suite
+additionally append one row each to the **committed** `eval/trend_log.jsonl` (spec:
 [eval-framework.md §9](eval-framework.md#9-reporting-and-trend-persistence)) — see
 [policy-eval-correctness-prb.md § Trend log](policy-eval-correctness-prb.md#trend-log) and
 [policy-eval-robustness-consistency.md § Trend log](policy-eval-robustness-consistency.md#trend-log).
@@ -107,7 +107,8 @@ run:
 ```
 
 Writes `eval/dashboard.html` (gitignored, regenerated each time) with one historical trend chart
-per suite present in `eval/trend_log.jsonl`, plus a collapsible scenario drill-down section per
-report found under `eval/reports/`. A chart point links to its matching report's section when one
+per suite present in `eval/trend_log.jsonl` (rows with `run_type="partial"` are not charted), plus
+a collapsible scenario drill-down section per report under `eval/reports/` that holds a full
+correctness or robustness run. A chart point links to its matching report's section when one
 is found on disk within a few hours of that trend-log row's timestamp; otherwise it still shows its
 exact values via a hover tooltip, just without a link.

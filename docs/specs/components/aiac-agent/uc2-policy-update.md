@@ -2,6 +2,8 @@
 
 > **Status: TBD.** The internal design of the Build and Rebuild sub-agents is not yet defined. A dedicated grill session is required.
 
+> **Status: not built yet** — `build_policy()` returns `([], False)` and `rebuild_policy()` returns `([], True)`; neither reads the IdP or calls the PRB, and Rebuild does not delegate to Build.
+
 > **Depends on:** [`../aiac-agent.md`](../aiac-agent.md) — NATS Consumer, Controller, Shared Module, Configuration, Error Handling, Runtime.
 
 > **IdP access — library, not service.** All IdP reads and writes go through the **idp-library** API (`aiac.idp.configuration.api.Configuration`), **never** the IdP Configuration **service** (`aiac.idp.service.configuration.*`) or its HTTP endpoints directly. See [aiac-agent.md → IdP access](../aiac-agent.md#idp-access--library-not-service).
@@ -10,7 +12,7 @@
 
 | Source | Subject / Path |
 |---|---|
-| Event Broker (NATS) | `aiac.apply.policy.build` (originated by RAG Ingest Service post-ingest) |
+| Event Broker (NATS) | `aiac.apply.policy.build` (originated by RAG Ingest Service post-ingest). **Status: not built yet** — no RAG Ingest Service exists; nothing publishes this subject. |
 | HTTP (debug / operator) | `POST /apply/policy/build` |
 | HTTP (operator only) | `POST /apply/policy/rebuild` (not routed through Event Broker) |
 
@@ -24,7 +26,7 @@ flowchart TD
     CTRL["Controller\nroutes.py"]
 
     NATS -->|"durable queue group\naiac-agent-consumer"| NATS_CONSUMER
-    NATS_CONSUMER -->|"calls internal handler"| CTRL
+    NATS_CONSUMER -->|"mirrors the routes:\ncalls the same handler + PCE"| CTRL
     TRIGGERS --> CTRL
 
     subgraph PU["Policy Update (TBD)"]
@@ -52,7 +54,7 @@ flowchart TD
 - **Composite role flattening:** before calling the PRB, Build flattens every role it reads to its **closure** via the shared `flatten_role` helper — the role plus all descendant roles from `role.childRoles`, de-duplicated by `role.id` (a non-composite role yields just itself). The PRB receives already-flattened roles; the PCE performs no flattening. (Same helper and semantics as UC1 and UC3.)
 - Rebuild delegates to Build for rule generation and returns Build's rules to the Controller.
 - **Append vs override:** the sub-agent conveys an `override` flag to the Controller alongside its rules. **Rebuild is the full-rebuild case (`override=True`)** — the PCE purges every input role's mappings before applying (see [`../policy-computation-engine.md`](../policy-computation-engine.md)). The override purge is keyed on `role.id` alone, so it clears each input role's **allow *and* deny** edges before re-appending. **Build's** `override` value is **TBD** (whether an incremental post-ingest build appends or replaces).
-- **ALLOW/DENY rules:** both Build and Rebuild source their rules from the PRB, which emits **both grants (`ALLOW`) and explicit prohibitions (`DENY`)** — direct prohibitions, description-driven denies, and the derived exclusivity complement (see [`policy-rules-builder.md`](policy-rules-builder.md)). A Rebuild therefore re-asserts both effects: `override=True` purges each input role's allow *and* deny edges (keyed on `role.id`), and the fresh PRB output re-appends the currently-extracted `ALLOW` and `DENY` rules for that role. (A role's deny set is thus replaced with whatever the current policy text yields, rather than preserving previously stored denies.)
+- **ALLOW/DENY rules:** both Build and Rebuild source their rules from the PRB, which emits **both grants (`ALLOW`) and explicit prohibitions (`DENY`)** — direct prohibitions and description-driven denies (see [`policy-rules-builder.md`](policy-rules-builder.md)). A Rebuild therefore re-asserts both effects: `override=True` purges each input role's allow *and* deny edges (keyed on `role.id`), and the fresh PRB output re-appends the currently-extracted `ALLOW` and `DENY` rules for that role. (A role's deny set is thus replaced with whatever the current policy text yields, rather than preserving previously stored denies.)
 - The Controller calls `compute_and_apply(merged_rules, override)` via the PCE — the same pattern as all other UCs.
 - Internal behavior (how Build/Rebuild sub-agents derive their tuple content, what IdP data they read, whether any LLM node is involved) is **deferred** — to be resolved in a dedicated grill session.
 
@@ -62,4 +64,4 @@ flowchart TD
 - Rebuild sub-agent internal design.
 - PRB internals — see [`policy-rules-builder.md`](policy-rules-builder.md).
 - PCE reconcile mechanics — see [`../policy-computation-engine.md`](../policy-computation-engine.md).
-- Response body shape — no success body; handlers return bare HTTP status codes (error responses carry FastAPI's default JSON error body from the raised `HTTPException`). Summary + debug go to the log.
+- Response body shape — no success body; handlers return bare HTTP status codes (error responses carry a `{"detail": …}` body from a raised `HTTPException` or a Controller exception handler, or a `ConflictReport` (`422`)). Summary + debug go to the log.

@@ -5,8 +5,8 @@
 `PolicyRule`, `AgentPolicyModel`, and `PolicyModel` were previously defined in `aiac.pdp.library.models`. Three independent consumers now need these types:
 
 - `aiac.pdp.policy.library` — translates `PolicyModel` into HTTP calls to the PDP Policy Writer
-- `aiac.policy.model_store.library` — reads/writes `AgentPolicyModel` from/to the Policy Model Store
-- `aiac.policy.computation` — builds and merges `AgentPolicyModel` objects
+- `aiac.policy.model_store.library` — reads/writes `ServicePolicyModel` (SPM) from/to the Policy Model Store
+- `aiac.policy.computation` — merges rules into `ServicePolicyModel` objects and derives `AgentPolicyModel` objects
 
 Keeping the canonical model definitions inside a PDP-namespaced module (`aiac.pdp.library.models`) forces both the Policy Model Store library and the Policy Computation Engine to take a dependency on the PDP package — a wrong-layer coupling. Any of the three consumers importing from `aiac.pdp.library.models` would create a transitive dependency on an unrelated service namespace.
 
@@ -25,19 +25,19 @@ Concretely, let `UR` be a user (realm) role mapped to agent `A`'s scope `AS` and
 
 The fix is a **two-layer model**: a per-service persistent source of truth (`ServicePolicyModel`) that stores every inbound edge durably on the service that owns the scope — so `UR→TS` lands on `SPM(T)` at tool-onboarding, no agent required, and can never be lost — with `AgentPolicyModel` demoted to a **pure derived projection** that is no longer persisted.
 
-### Allowlist-only (no negative rules)
+### Allowlist-only (the former model — no negative rules)
 
-The model can express only **grants**. A `PolicyRule(role, scope)` is always positive — "this role *may* reach this scope" — and everything not granted is implicitly unreachable (`default allow := false`). There is no way to record that a role **must not** reach a scope. Policy authors describe access in mixed terms ("developers can read source files **but must not** touch issues"), but an allowlist-only model forces the negative to be expressed as the *absence* of a grant. That is fragile: any later, broader grant (a composite role, a role update, another onboarding) silently re-opens the path the author meant to keep closed, because no durable fact records the prohibition.
+The former model could express only **grants**. A `PolicyRule(role, scope)` was always positive — "this role *may* reach this scope" — and everything not granted was implicitly unreachable (`default allow := false`). There was no way to record that a role **must not** reach a scope. Policy authors describe access in mixed terms ("developers can read source files **but must not** touch issues"), but an allowlist-only model forced the negative to be expressed as the *absence* of a grant. That was fragile: any later, broader grant (a composite role, a role update, another onboarding) silently re-opened the path the author meant to keep closed, because no durable fact recorded the prohibition.
 
 ## Solution
 
 A canonical, dependency-free model module at `aiac.policy.model` defines `ServicePolicyModel`, `PolicyRule`, `AgentPolicyModel`, and `PolicyModel` with typed fields. No HTTP client, no service code — importable by any consumer without side effects. `PolicyRule.role` and `PolicyRule.scope` are typed `Role` and `Scope` objects from `aiac.idp.configuration.models`.
 
-**Two-layer model.** `ServicePolicyModel` (SPM) is the **persistent source of truth**, one per **service** (agent *and* tool). It holds the service's **inbound** rules plus its own identity (owned roles and scopes). `AgentPolicyModel` (APM) becomes a **pure derived projection** built from the relevant SPMs by the PCE — it is **no longer persisted**. Its shape is unchanged so existing consumers (PDP Policy Library, Policy Model Store readers) keep working.
+**Two-layer model.** `ServicePolicyModel` (SPM) is the **persistent source of truth**, one per **service** (agent *and* tool). It holds the service's **inbound** rules plus its own identity (owned roles and scopes). `AgentPolicyModel` (APM) becomes a **pure derived projection** built from the relevant SPMs by the PCE — it is **no longer persisted**. Its shape is unchanged so existing consumers (PDP Policy Library, PDP Policy Writer) keep working.
 
 **Canonical form.** *Every rule is an inbound edge on the SPM of the service that owns the rule's scope.* An agent's outbound edge is the target's inbound edge — `AR→TS` is stored on `SPM(T)`, not on `A`. The routing key is `Scope.serviceId`: a rule `(role, scope)` routes to `SPM(scope.serviceId)`.
 
-The relationship maps (`source_roles`, `subject_roles`, `target_allow_scopes` / `target_deny_scopes`) are keyed by the string `id` of the referenced entity rather than by a typed object, so they serialize to JSON natively and carry no hashability requirement into `aiac.policy.model`. Typed `Role` / `Scope` objects are retained as the map *values* (and in `PolicyRule`), preserving the typing the PCE needs for IdP queries. The outbound maps are `target_allow_scopes` / `target_deny_scopes` (`target service id → scopes permitted / prohibited`), the inverse of the former `scope_targets`.
+The relationship maps (`source_roles`, `subject_roles`, `target_allow_scopes` / `target_deny_scopes`) are keyed by a plain string (a username or a clientId) rather than by a typed object, so they serialize to JSON natively and carry no hashability requirement into `aiac.policy.model`. Typed `Role` / `Scope` objects are retained as the map *values* (and in `PolicyRule`), preserving the typing the PCE needs for IdP queries. The outbound maps are `target_allow_scopes` / `target_deny_scopes` (`target service id → scopes permitted / prohibited`), the inverse of the former `scope_targets`.
 
 **Two-sided rules (ALLOW / DENY).** Every rule carries a `RuleEffect` — `Allow` or `Deny` — and both kinds are stored side by side as first-class facts in **explicitly separated** parallel lists (never one intermixed list). A DENY rule is a durable prohibition that **subtracts** from what the ALLOW rules grant, honored uniformly at every gate (inbound subject, inbound source, outbound subject, outbound target). Generated policy applies **deny-overrides**: a request is allowed only if some ALLOW gate passes **and** no DENY gate matches, so a later broad grant can no longer silently re-open a denied path. For now the model assumes **no conflict** — no `(role, scope)` is ever both ALLOW and DENY for the same subject — so there is **no precedence/tie-break logic**; DENY simply subtracts. Cross-role conflict resolution is a deliberate later concern (see [Out of Scope](#out-of-scope)).
 
@@ -49,9 +49,9 @@ The relationship maps (`source_roles`, `subject_roles`, `target_allow_scopes` / 
 
 1. As the Policy Computation Engine, I want to import `PolicyRule`, `AgentPolicyModel`, and `PolicyModel` from a shared, neutral namespace, so that I do not take an unwanted dependency on the PDP package.
 2. As the PDP Policy Library, I want to import `PolicyModel` and `AgentPolicyModel` from `aiac.policy.model`, so that my HTTP serialization logic does not duplicate model definitions.
-3. As the Policy Model Store Library, I want to import `AgentPolicyModel` and `PolicyModel` from `aiac.policy.model`, so that response deserialization uses the same canonical types as every other consumer.
+3. As the Policy Model Store Library, I want to import `ServicePolicyModel`, `Role`, and `Scope` from `aiac.policy.model`, so that response deserialization uses the same canonical types as every other consumer.
 4. As an AIAC Agent sub-UC agent, I want to construct a `PolicyRule` with typed `Role` and `Scope` objects, so that the PCE can use them for IdP queries without additional type conversion.
-5. As the Policy Computation Engine, I want `source_roles`, `subject_roles`, `target_allow_scopes`, and `target_deny_scopes` keyed by string entity IDs, so that I build them with `entity.id` and they serialize to JSON without custom key handling.
+5. As the Policy Computation Engine, I want `source_roles`, `subject_roles`, `target_allow_scopes`, and `target_deny_scopes` keyed by plain strings (a username or a clientId), so that I build them from `role.actorIds` and `scope.serviceId` and they serialize to JSON without custom key handling.
 6. As a developer, I want all models to silently ignore unknown fields from API responses, so that IdP API additions do not break deserialization.
 7. As the PDP Policy Library, I want outbound permissions expressed as `target service id → allowed scopes`, so that I can emit per-target authorization directly without inverting a `scope → targets` map.
 8. As a consumer serializing an `AgentPolicyModel` to JSON, I want every relationship map to have string keys, so that `model_dump(mode="json")` round-trips without a custom key serializer.
@@ -175,7 +175,7 @@ The two-layer model requires ownership and a user/agent distinction on the IdP t
 - **`RoleKind(str, Enum)`** — `USER = "User"`, `AGENT = "Agent"` (mirrors `ServiceType`'s style).
 - **`Role.kind: RoleKind`** — whether the role is held by users or by agent service accounts.
 - **`Role.actorIds: list[str]`** — context-dependent on `kind`:
-  - `kind == AGENT` ⇔ a Keycloak **client role** on the agent's client; `actorIds` = the owning **agent `serviceId`(s)** (usually one).
+  - `kind == AGENT` ⇔ a Keycloak **client role** on the agent's client, or an `aiac.managed` **realm role** on the agent's service account; `actorIds` = the owning **agent `serviceId`(s)** (usually one).
   - `kind == USER` ⇔ a Keycloak **realm role**; `actorIds` = the **holder usernames**.
 
 A `model_validator` on `Role` enforces what it can locally (`kind` present/valid; `actorIds` is a `list[str]`). The **cross-kind** invariant (Assumption 1) and the **client/realm ⇔ agent/user** invariant (Assumption 3) are enforced **upstream at construction** (the Keycloak IdP boundary), because the raw Keycloak facts are only visible there — see handoff 02 for that enforcement and field population.
@@ -198,7 +198,7 @@ The persistent source of truth — one per service (agent *and* tool), keyed by 
 |-------|------|-------------|
 | `service_id` | `str` | The owning service's id. |
 | `service_type` | `ServiceType` | `Agent` or `Tool`. Drives derivation: only `Agent` services get an APM. |
-| `owned_roles` | `list[Role]` | This service's own client roles (`aiac.managed` marker only). |
+| `owned_roles` | `list[Role]` | This service's own roles (`Service.roles`; `aiac.managed` marker only). |
 | `owned_scopes` | `list[Scope]` | This service's exposed scopes (`aiac.managed` marker only). |
 | `inbound_allow_rules` | `list[PolicyRule]` | Canonical positive edges: every `Allow` rule granting access to `owned_scopes`. |
 | `inbound_deny_rules` | `list[PolicyRule]` | Canonical negative edges: every `Deny` rule prohibiting access to `owned_scopes`. |
@@ -221,17 +221,17 @@ A single access rule pairing a typed role with a typed scope, tagged with an eff
 
 Complete policy definition for a single agent (service). Inbound and outbound rule sets are typed collections.
 
-> **Derived, not persisted.** `AgentPolicyModel` is now a **pure derived projection** built by the PCE from the relevant `ServicePolicyModel`s. It is **no longer a persisted entity** — the durable source of truth is `ServicePolicyModel`. Its shape is **unchanged** so existing consumers (PDP Policy Library, Policy Model Store readers) keep working; the docstring on the model states this explicitly.
+> **Derived, not persisted.** `AgentPolicyModel` is now a **pure derived projection** built by the PCE from the relevant `ServicePolicyModel`s. It is **no longer a persisted entity** — the durable source of truth is `ServicePolicyModel`. Its shape is **unchanged** so existing consumers (PDP Policy Library, PDP Policy Writer) keep working; the docstring on the model states this explicitly.
 
 The rule lists split into **8 entity×effect lists** — {inbound subject, inbound source, outbound subject, outbound target} × {allow, deny} — plus split target maps. The identity/aggregate maps (`subject_roles`, `source_roles`, `agent_roles`, `agent_scopes`) stay **effect-agnostic**.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `agent_id` | `str` | Service ID from the AIAC trigger event (`aiac.apply.service.{id}`) |
-| `agent_roles` | `list[Role]` | Realm roles assigned to this agent. **Effect-agnostic identity.** |
+| `agent_id` | `str` | The agent's clientId (`Service.serviceId`, the SPM key) — not the UUID that `aiac.apply.service.<uuid>` carries |
+| `agent_roles` | `list[Role]` | This agent's own `aiac.managed` roles (`SPM.owned_roles`). **Effect-agnostic identity.** |
 | `agent_scopes` | `list[Scope]` | Scopes this agent exposes. **Effect-agnostic identity.** |
-| `source_roles` | `dict[str, list[Role]]` | Inbound: source (calling service) **id** → roles held. **Optional** gate input — an absent source passes. **Effect-agnostic identity** (see deny-inclusion note). |
-| `subject_roles` | `dict[str, list[Role]]` | Inbound: subject (end-user) **id** → roles held. **Mandatory** gate input. **Effect-agnostic identity** (see deny-inclusion note). |
+| `source_roles` | `dict[str, list[Role]]` | Inbound: source (calling service) **clientId** → roles held. **Optional** gate input — an absent source passes. **Effect-agnostic identity** (see deny-inclusion note). |
+| `subject_roles` | `dict[str, list[Role]]` | Inbound: subject (end-user) **username** → roles held. **Mandatory** gate input. **Effect-agnostic identity** (see deny-inclusion note). |
 | `target_allow_scopes` | `dict[str, list[Scope]]` | Outbound: target service **id** → scopes this agent **may** request on it |
 | `target_deny_scopes` | `dict[str, list[Scope]]` | Outbound: target service **id** → scopes this agent **must not** request on it |
 | `inbound_subject_allow_rules` | `list[PolicyRule]` | Who may call this agent: `(subject_role, agent_scope)` `Allow` tuples |
@@ -243,19 +243,19 @@ The rule lists split into **8 entity×effect lists** — {inbound subject, inbou
 | `outbound_subject_allow_rules` | `list[PolicyRule]` | Which users may reach the agent's targets: `(user_role, tool_scope)` `Allow` tuples. Defaults to `[]`. |
 | `outbound_subject_deny_rules` | `list[PolicyRule]` | Which users are barred from the agent's targets: `(user_role, tool_scope)` `Deny` tuples. Defaults to `[]`. |
 
-> **Effect-agnostic identity maps must include deny-edge roles.** `subject_roles` / `source_roles` (and `agent_roles` / `agent_scopes`) carry **no** allow/deny split — the split lives only in the rule lists and target maps. A role or subject that appears **only** in DENY edges **must still be registered** into `subject_roles` / `source_roles`, or the Rego deny lookup (`subject_roles[input.subject]` → deny-scope map) cannot resolve the role and the prohibition silently fails to fire.
+> **Effect-agnostic identity maps must include deny-edge roles.** `subject_roles` / `source_roles` (and `agent_roles` / `agent_scopes`) carry **no** allow/deny split — the split lives only in the rule lists and target maps. A role or subject that appears **only** in DENY edges **must still be registered** into `subject_roles` / `source_roles`, or the Rego deny lookup (`subject_roles[input.identity.subject]` → deny-scope map) cannot resolve the role and the prohibition silently fails to fire.
 
 > **No default effect.** The model has no default-effect field, so the PCE sets none at derive time. A pair that no rule mentions is always DENY.
 
 **Inbound rule semantics (deny-overrides):** a subject holding realm role `role` is permitted to invoke this agent for the agent scope `scope` iff an `inbound_subject_allow` edge grants it **and no** `inbound_subject_deny` edge prohibits it; the same allow-and-not-deny logic applies to the source gate. The PDP Policy Writer consumes the allow/deny lists as separate role → agent-scope maps; its inbound gate is keyed on the subject id (mandatory), with the calling source id optional.
 
-**Outbound target rule semantics (deny-overrides):** this agent acting as realm role `role` is permitted to request the target scope `scope` iff an `outbound_target_allow` edge grants it **and no** `outbound_target_deny` edge prohibits it. The PDP Policy Writer consumes the allow/deny lists as separate agent-role → target-scope maps; its outbound gate requires both the subject and the agent to be authorized and neither to be denied.
+**Outbound target rule semantics (deny-overrides):** this agent acting as realm role `role` is permitted to request the target scope `scope` iff an `outbound_target_allow` edge grants it **and no** `outbound_target_deny` edge prohibits it. The PDP Policy Writer gates on the target maps `target_allow_scopes` / `target_deny_scopes` (keyed by `input.identity.service_id`). It emits the allow list only as the informational `agent_role_scopes` map (the `allow` rule does not use it), and it does not emit the deny list. Its outbound gate requires both the subject and the agent to be authorized and neither to be denied.
 
-**Outbound subject rule semantics (deny-overrides):** the outbound subject gate pairs `(user role, tool scope)` — a user holding `role` may reach a tool exposing `scope` iff an `outbound_subject_allow` edge grants it and no `outbound_subject_deny` edge prohibits it. It is the outbound counterpart of the inbound subject rules (which pair a user role with an *agent* scope): where those answer "may this user call the agent?", these answer "may this user reach the tool the agent targets?". The PDP Policy Writer groups them into `subject_role_allow_scopes` / `subject_role_deny_scopes` (user role → tool-scope names) and matches against `target_allow_scopes[input.target]` / `target_deny_scopes[input.target]`, not against `agent_scopes`.
+**Outbound subject rule semantics (deny-overrides):** the outbound subject gate pairs `(user role, tool scope)` — a user holding `role` may reach a tool exposing `scope` iff an `outbound_subject_allow` edge grants it and no `outbound_subject_deny` edge prohibits it. It is the outbound counterpart of the inbound subject rules (which pair a user role with an *agent* scope): where those answer "may this user call the agent?", these answer "may this user reach the tool the agent targets?". The PDP Policy Writer groups them into `subject_role_allow_scopes` / `subject_role_deny_scopes` (user role → tool-scope names) and matches against `target_allow_scopes[input.identity.service_id]` / `target_deny_scopes[input.identity.service_id]`, not against `agent_scopes`.
 
 #### `PolicyModel`
 
-A partial or full system policy model. When sent to `POST /policy` on the Policy Model Store, it may contain only the agents whose policies have changed.
+A partial or full system policy model. When sent to `POST /policy` on the PDP Policy Writer (via `aiac.pdp.policy.library.apply_policy`), it may contain only the agents whose policies have changed.
 
 | Field | Type |
 |-------|------|
@@ -263,12 +263,12 @@ A partial or full system policy model. When sent to `POST /policy` on the Policy
 
 ### Map keys are string IDs
 
-`source_roles`, `subject_roles`, `target_allow_scopes`, and `target_deny_scopes` are keyed by the string `id` of the referenced Keycloak entity (source service id, subject id, target service id) rather than by the typed `Service` / `Subject` / `Scope` object. Rationale:
+`source_roles`, `subject_roles`, `target_allow_scopes`, and `target_deny_scopes` are keyed by a plain string — the subject's username, the source service's clientId, and the target service's clientId (`Scope.serviceId`) — rather than by the typed `Service` / `Subject` / `Scope` object. Rationale:
 
 - JSON object keys must be strings. A dict keyed by a pydantic model does not round-trip through `model_dump(mode="json")` / JSON without a custom key serializer; a `str` key serializes natively.
-- The IdP models are plain pydantic models (default field-based equality, not hashable). Consumers build these maps with `entity.id` as the key.
+- The IdP models are plain pydantic models (default field-based equality, not hashable). The PCE builds these maps from `role.actorIds` and `scope.serviceId`.
 
-As a result, no field in `aiac.policy.model` uses a typed object as a dict key, and this module imports only `Role` and `Scope` from `aiac.idp.configuration.models` (as map *values* and in `PolicyRule`). `Service` and `Subject` are no longer referenced here.
+As a result, no field in `aiac.policy.model` uses a typed object as a dict key, and this module imports only `Role`, `Scope`, and `ServiceType` from `aiac.idp.configuration.models` (as map *values*, in `PolicyRule`, and in `ServicePolicyModel`). `Service` and `Subject` are no longer referenced here.
 
 ### Usage
 
@@ -306,7 +306,7 @@ model = PolicyModel(agents=[agent_model])
 
 ### Replaces
 
-`aiac.pdp.library.models` is deprecated. All consumers must migrate their imports to `aiac.policy.model.models`.
+`aiac.pdp.library.models` has been removed. All consumers import from `aiac.policy.model.models`.
 
 ---
 
@@ -316,7 +316,7 @@ The two-layer model rests on three invariants. All three are **AIAC invariants**
 
 1. **No role spans both kinds.** A role is held by users *or* by agent service accounts, never both. This is what lets `Role.actorIds` be a single list. Enforced upstream at construction (cross-kind invariant not visible to the local `Role` validator).
 2. **No scope shared across services.** A scope has exactly one owner → a single `Scope.serviceId`. This reconciles with the existing `get_services_by_scope(scope) -> list[Service]` (plural, because Keycloak client scopes are realm-level and assignable to many clients): for AIAC-managed scopes that list is always length 1.
-3. **Agent role ⇔ Keycloak client role; user role ⇔ Keycloak realm role.** The IdP config service sources agent roles from the agent's **client** roles (`Service.roles`), and `Role.kind` is populated from Keycloak's `clientRole` flag. Enforced upstream at construction.
+3. **Agent role ⇔ a client role on the agent's client, or an `aiac.managed` realm role on its service account; user role ⇔ a realm role held by users.** The IdP config service sources agent roles from `Service.roles` and sets `Role.kind`: `GET /services/{id}/roles` marks agent roles `Agent`, and `GET /roles` marks realm roles `User`. Enforced upstream at construction.
 
 ---
 

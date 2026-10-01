@@ -1,11 +1,11 @@
-# Integration Test: policy-pipeline — `test_policy_pipeline.py`
+# System Test: policy-pipeline — `test_policy_pipeline.py`
 
-> **One spec among several.** This document specifies a **single** integration test.
-> Integration-test specs live **one spec per test** under `docs/testing/`
-> (a sibling of `components/`), and the master PRD's *Integration test specifications* section
-> ([../PRD.md](../specs/PRD.md)) is the index of them. This is the **policy-pipeline** integration test —
-> the full identity→policy→**enforcement** pipeline — not the definition of integration testing in
-> general, and not the only integration-test PRD.
+> **One spec among several.** This document specifies a **single** system test.
+> Test specs live **one spec per test** under `docs/testing/`
+> (a sibling of `specs/`), and the master PRD's *Test & evaluation specifications* section
+> ([../PRD.md](../specs/PRD.md)) is the index of them. This is the **policy-pipeline** system test —
+> the full identity→policy→**enforcement** pipeline — not the definition of system testing in
+> general, and not the only test spec.
 
 ## Location
 `test/system/test_policy_pipeline.py` — a pytest module marked `@pytest.mark.system`.
@@ -13,7 +13,7 @@ It imports two shared modules: `test/system/scenario_uc1.py` — the canonical `
 scenario as pure data (the role→access truth table the *Expected output* renders — the pair-lists,
 expressed over the **discovered, workload-prefixed** names `github-tool.source-read`,
 `github-agent.source_operations`, …) — and `test/system/uc1_onboard.py` — the shared live
-harness (Keycloak provisioning/cleanup, the `POST /apply/service/{id}` onboard trigger, the outbound
+harness (Keycloak provisioning/cleanup, the event-driven deploy/teardown of the workloads that fires onboarding, the outbound
 token-exchange-leg prep, the bundle-convergence poll, and the live decision oracle + probes). The
 harness in turn builds on `test/system/launcher.py`'s live-cluster half (`kubectl` wrappers,
 `port_forward`, `resolve_pod`, `mint_token`, `inbound_probe` / `outbound_probe`, `inbound_outcome` /
@@ -35,8 +35,8 @@ policy)** and asserts the real plugin admits/denies each one as the scenario tru
 (`scenario_uc1.py`) requires. A mismatch fails the test and names the exact `subject[ / tool]` cell.
 
 This is the **umbrella full-matrix e2e** for the fixed `github-agent` scenario. It onboards **both** the
-`github-agent` and the `github-tool` through the real in-cluster UC-1 Controller
-(`POST /apply/service/{id}`, which upserts the `AuthorizationPolicy` CR on the live Kubernetes API),
+`github-agent` and the `github-tool` through the real in-cluster UC-1 Controller by **deploying** them
+(the event-driven trigger; onboarding upserts the `AuthorizationPolicy` CR on the live Kubernetes API),
 enables the outbound token-exchange leg, waits for `bundle-service` + the AuthBridge OPA sidecars to
 recompose and reload the bundle, then asserts the **full happy-path matrix + negative controls** over
 the fully onboarded stack. Both gates are exercised through AuthBridge's own parsers: `jwt-validation`
@@ -47,14 +47,14 @@ input document and there is no standalone probe module.
 Where this sits vs. the UC-1 ladder ([uc1-onboarding-pipeline.md](uc1-onboarding-pipeline.md)): rungs
 1–3 isolate onboarding-**order** properties (agent-only; agent→tool; tool→agent + order-independence);
 this module is the **full matrix + negative controls** over the fully onboarded stack. Both share the
-same live stack — the `rossoctl` realm and the deployed `team1` workloads — so there is exactly one
+same live stack — the `rossoctl` realm and the `team1` demo namespace — so there is exactly one
 deployed pipeline to enforce against; the former explicit-vs-abstract two-policy equivalence check is
 therefore **deferred to the two-policy rung** `testing/5.4.4` (only one `policy.md` is mounted on the
 live stack).
 
 Because it needs a live rossoctl/Kind cluster with the AuthBridge OPA pipeline wired in, a real LLM,
 and Keycloak admin creds, it is `@pytest.mark.system` and stays out of the default unit-test run
-(`-m "not integration"`); it **skips cleanly** when the cluster is not wired or the env is unset (it
+(`-m "not integration and not system and not llm and not eval"`); it **skips cleanly** when the cluster is not wired or the env is unset (it
 never false-passes).
 
 ### What it does
@@ -65,19 +65,26 @@ over the fully onboarded stack.
 
 1. **Skip gates first — before any cluster mutation.** `require_pipeline` skips cleanly if the live
    AuthBridge OPA pipeline is not wired (no `kubectl`, `AuthorizationPolicy` CRD not served,
-   `bundle-service` not Running, the `opa` plugin not on **both** legs, or a workload pod not Running);
-   `require_env_or_skip` skips if `KEYCLOAK_URL` / admin creds are unset. The suite never false-passes.
-2. **Clean slate.** Delete the agent's `AuthorizationPolicy` CR, `cleanup_provisioned` (drop the
-   `github-agent.` / `github-tool.`-prefixed realm roles + client scopes UC-1 provisions), and
-   `clear_policy_store` (drop persisted SPMs from the in-cluster Policy Store, whose SQLite outlives
-   redeploys). Then `provision_realm_and_users` idempotently ensures the scenario's three users +
+   `bundle-service` not Running, or the `opa` plugin not on **both** legs);
+   `require_env_or_skip` skips if `KEYCLOAK_URL` / admin creds are unset; `require_event_path` skips if
+   the NATS broker is not Running or the realm does not have the `aiac-event-listener` listener with
+   `adminEventsEnabled`. The suite never false-passes.
+2. **Clean slate (no workloads).** Undeploy both workloads, then `_scrub_to_pristine`:
+   `delete_workload_registrations` (the two Keycloak clients, their `*-aud` scopes, the credentials
+   Secret), `delete_agent_cr`, `sweep_authpolicies` (every remaining `AuthorizationPolicy` CR),
+   `cleanup_provisioned` (drop the `github-agent.` / `github-tool.`-prefixed realm roles + client scopes
+   UC-1 provisions), and `clear_policy_store` (drop persisted SPMs from the in-cluster Policy Store, whose
+   SQLite outlives redeploys). Then `reenable_provisioned_clients`, and poll until both clients are gone
+   (a leftover client would stop the deploy from firing `CLIENT_CREATED` again). Then `provision_realm_and_users` idempotently ensures the scenario's three users +
    realm roles (`developer` / `tester` / `devops`) with the descriptions the PRB reads (the fixture
    provisions these; UC-1 does not), `verify_subject_mapper` confirms the realm's `username → sub`
    mapper + Direct Access Grants are in place (else skip), and `ensure_agent_policy` mounts the single
    abstract `policy.md` on the Controller pod.
-3. **Onboard both workloads through the real in-cluster UC-1 Controller.** `POST /apply/service/{id}`
-   for the `github-tool` and the `github-agent`, where `{id}` is the client's **internal Keycloak
-   UUID** (`resolve_service_id`), not the slash-bearing `clientId`. UC-1 classifies each service,
+3. **Onboard both workloads through the real in-cluster UC-1 Controller.** `load_workload_images`
+   loads the demo images into the Kind node, then `deploy_workload` deploys the `github-agent` and then
+   the `github-tool`, one at a time, each converging before the next. Deploying is the event-driven
+   trigger: the operator registers the Keycloak client → Keycloak emits `CLIENT_CREATED` → the
+   `aiac-event-listener` SPI publishes on NATS → the agent consumer runs `onboard_service`. UC-1 classifies each service,
    reads the MCP `tools/list` / AgentCard skills, provisions the **workload-prefixed** scopes
    (`github-tool.{source-read, source-write, issues-read, issues-write}`) and the agent's **one
    operator role per skill** (`github-agent.{source_operations, issue_operations}`), maps roles→scopes
@@ -90,11 +97,12 @@ over the fully onboarded stack.
    agent so it reloads the route (and its OPA sidecar re-fetches the recomposed bundle). Without this
    the outbound call would pass through unexchanged and never reach OPA.
 5. **Wait for the pipeline to converge.** `poll_until` drives real decisions until this run's CR is
-   reflected: `dev-user` reaches the agent (inbound allow), `devops-user` is blocked (inbound deny —
+   reflected: `dev-user` and `test-user` reach the agent (inbound allow), `devops-user` is blocked (inbound deny —
    proving the restrictive client-scoped gate is live, not the allow-all baseline), and `dev-user`'s
-   outbound `source-read` has reached its terminal `allow` (waiting out the post-restart
-   token-exchange window). Keycloak cleanup + CR delete run **before and after**; the clients stay
-   registered as before.
+   outbound `source-read` and `test-user`'s outbound `issues-read` have reached their terminal `allow`
+   (waiting out the post-restart token-exchange window). Teardown undeploys both workloads, deletes
+   their Keycloak registrations, sweeps every `AuthorizationPolicy` CR, runs the same cleanup as the
+   clean slate, and verifies that no client and no CR remain.
 6. **Assert the enforced decisions over the full matrix.** Each test mints a fresh user token and
    sends a **real HTTP request through AuthBridge**:
    - **Inbound** — one node per `subject`. A request as `subject` reaches the agent iff the user's
@@ -114,8 +122,9 @@ over the fully onboarded stack.
    exactly, so an unknown tool falls through to deny-by-default. A bogus, destructive-sounding tool
    name (`delete_everything`) matching no discovered scope is likewise denied — guarding against an
    over-broad match letting an unrecognized operation through.
-8. **Oracle-contract tests (fixture-independent).** A handful of tests need neither the cluster nor
-   the env: they assert the intended matrix itself — `expected_inbound` / `expected_outbound_bare`
+8. **Oracle-contract tests (fixture-independent).** These tests are not in this module. They live at
+   the unit level in `test/unit/agent/uc/onboarding/test_uc1_grant_set_oracles.py` and need neither the
+   cluster nor the env: they assert the intended matrix itself — `expected_inbound` / `expected_outbound_bare`
    over the scenario pair-lists — the tracer bullet. If these are wrong, every live assertion is
    meaningless.
 
@@ -190,39 +199,43 @@ The suite reads its config from the repo-root `.env` (gitignored); source it bef
 
 | Variable | Purpose | Default |
 |----------|---------|---------|
-| `KUBECONFIG` | Kubeconfig for the live rossoctl/Kind cluster | — (required) |
+| `KUBECONFIG` | Kubeconfig for the live rossoctl/Kind cluster (read by `kubectl`, not by the harness) | `kubectl` default (`~/.kube/config`) |
 | `KEYCLOAK_URL` | External Keycloak base URL | — (required) |
 | `KEYCLOAK_ADMIN_USERNAME` / `KEYCLOAK_ADMIN_PASSWORD` | Keycloak admin creds (user/realm-role provisioning + cleanup) | — (required) |
 | `KEYCLOAK_ADMIN_REALM` | Realm the admin creds live in | `master` |
 | `LLM_BASE_URL` / `LLM_MODEL` / `LLM_API_KEY` | PRB LLM (pinned `temperature=0`), consumed by the in-cluster AIAC pod | — (required) |
 | `AIAC_TEST_REALM` | Realm the tests resolve/provision against. **Must match the deployed AIAC stack's `KEYCLOAK_REALM`** — the in-cluster Controller resolves the onboarding trigger in *its own* realm | `rossoctl` |
-| `AIAC_DEMO_NAMESPACE` | Namespace the demo workloads are deployed in (precondition) | `team1` |
+| `AIAC_DEMO_NAMESPACE` | Namespace the tests deploy (and tear down) the demo workloads into | `team1` |
 | `AIAC_TRUST_DOMAIN` | SPIFFE trust domain the operator registers the demo workloads under | `localtest.me` |
 
 > Cluster/stack knobs the harness also honors, with defaults matching the deployed stack (rarely
-> overridden): the Controller target/namespace/ports (`AIAC_CONTROLLER_*`, default
-> `svc/aiac-agent-service` in `aiac-system` on `7070`), the Policy Store target
+> overridden): the Controller namespace/Deployment/selector (`AIAC_CONTROLLER_NAMESPACE` /
+> `AIAC_CONTROLLER_DEPLOYMENT` / `AIAC_CONTROLLER_SELECTOR`, defaults `aiac-system` / `aiac-agent` /
+> `app=aiac-agent`; the harness does not port-forward to the Controller), the Policy Store target
 > (`AIAC_STORE_*`, `svc/aiac-policy-model-store-service` on `7074`), the policy ConfigMap/mount
-> (`AIAC_POLICY_CONFIGMAP` / `AIAC_POLICY_MOUNT_PATH`), and the timeouts
-> (`AIAC_ONBOARD_TIMEOUT`, `AIAC_BUNDLE_TIMEOUT`, `AIAC_BUNDLE_POLL_INTERVAL`).
+> (`AIAC_POLICY_CONFIGMAP` / `AIAC_POLICY_MOUNT_PATH`), the agent Deployment to restart
+> (`AIAC_AGENT_DEPLOYMENT`), the Kind cluster name (`AIAC_KIND_CLUSTER`), and the timeouts
+> (`AIAC_DEPLOY_TIMEOUT`, `AIAC_BUNDLE_TIMEOUT`, `AIAC_BUNDLE_POLL_INTERVAL`).
 
 ## Runbook
 
 Runnable against a live rossoctl/Kind cluster (operator + Keycloak + SPIRE) with the AuthBridge OPA
-pipeline wired into **both** legs, `github-agent` + `github-tool` **deployed and registered** into
-`AIAC_TEST_REALM`, and a real LLM in-pod. Stand the pipeline up with `k8s/opa-kind-enable.sh`; the full
+pipeline wired into **both** legs, the **NATS Event Broker deployed**, the **Keycloak SPI installed +
+`aiac-event-listener` enabled on the realm**, and a real LLM in-pod. The fixture loads, deploys, and tears
+down `github-agent` + `github-tool` itself (it runs `demo/assets/kind-load.sh`, so the `kind` CLI +
+`kubectl` + a container runtime must be on the pytest host). Stand the pipeline up with `k8s/opa-kind-enable.sh`; the full
 prerequisites, wiring, and manual probe commands are in `k8s/opa-kind-runbook.md`.
 
 ```bash
 k8s/opa-kind-enable.sh          # one-time: wire the OPA plugin into both legs of the Kind cluster
 set -a; . .env; set +a
-.venv/bin/pytest test/system/test_policy_pipeline.py -m system -v
+.venv/bin/pytest -m system -k test_policy_pipeline -v
 # Parametrized over subject inbound + (subject × bare tool) outbound + negative controls.
 # A failing node names the exact cell, e.g.:
-#   test_outbound[test-user-source-read] — expected deny, plugin allowed
+#   test_outbound[source-read-test-user] — expected deny, plugin allowed
 ```
 
-Without `-m system` the suite is not collected; when the cluster is not wired or the env is unset
+Without `-m system` the suite is deselected (the default `addopts`); when the cluster is not wired or the env is unset
 it **skips cleanly** (it never false-passes). To eyeball the pipeline manually, follow
 `k8s/opa-kind-runbook.md` (Part A inbound, Part B outbound) and inspect the upserted
 `AuthorizationPolicy` CR and the provisioned Keycloak realm.
@@ -231,7 +244,7 @@ it **skips cleanly** (it never false-passes). To eyeball the pipeline manually, 
 
 - **Highest seam available, verified by the real evaluator.** Real deployed workloads + real operator
   + real UC-1 onboarding + real PRB/PCE + real Keycloak + real LLM, driven through the production
-  trigger (`POST /apply/service/{id}`) and enforced by the **deployed AuthBridge OPA plugin**. The
+  trigger (the deploy→`CLIENT_CREATED`→NATS→consumer event chain) and enforced by the **deployed AuthBridge OPA plugin**. The
   test asserts only **external behavior** — the allow/deny decisions the plugin makes for
   scenario-derived requests — never internal policy structure (which the OPA Policy Writer's own unit
   tests own).
@@ -258,14 +271,15 @@ it **skips cleanly** (it never false-passes). To eyeball the pipeline manually, 
 - **Shared harness, one live stack.** The onboarding, Part-B prep, bundle-convergence poll, and live
   decision oracle live in `test/system/uc1_onboard.py` and are shared with the UC-1 ladder; the
   fixed scenario lives in `test/system/scenario_uc1.py`. Both suites enforce against the same
-  deployed pipeline (the `rossoctl` realm + the `team1` workloads), left in place across runs with
-  per-run cleanup of only the provisioned prefixed roles/scopes — neither suite deletes/recreates the
+  deployed pipeline (the `rossoctl` realm + the `team1` namespace). The realm, users, and base roles
+  are left in place across runs; each run deploys the workloads and tears them, their Keycloak
+  registrations, and the `AuthorizationPolicy` CRs down to pristine — neither suite deletes/recreates the
   realm.
 
 ## Relationship to other integration tests
 
-This is **one** integration-test spec among several indexed by the master PRD
-([../PRD.md](../specs/PRD.md), § *Integration test specifications*).
+This is **one** test spec among several indexed by the master PRD
+([../PRD.md](../specs/PRD.md), § *Test & evaluation specifications*).
 
 - **Umbrella sibling of the UC-1 onboarding ladder** ([uc1-onboarding-pipeline.md](uc1-onboarding-pipeline.md),
   `testing/5.4.x`): identical scenario facts/tables and the **same** live enforcement loop (onboard
@@ -274,7 +288,7 @@ This is **one** integration-test spec among several indexed by the master PRD
   matrix + negative controls** over the fully onboarded stack.
 - Same `@pytest.mark.system` + live-enforcement flavor as `testing/5.1-integration-tests.md`;
   runs outside the default unit run against live dependencies and skips cleanly when the cluster/env
-  is not wired.
+  is not wired. **Status: not built yet** — the `5.1` live-Keycloak pytest suite does not exist under `test/`.
 
 Tracking issue for this test: `testing/5.3-policy-pipeline-integration-test.md`.
 
@@ -290,12 +304,14 @@ Tracking issue for this test: `testing/5.3-policy-pipeline-integration-test.md`.
   [../components/policy-computation-engine.md](../specs/components/policy-computation-engine.md), and the PRB
   component spec), not here. This test asserts only the **enforced decisions**, never the internal
   structure of the generated policy.
-- **Deploying / registering the workloads and wiring the OPA pipeline** — preconditions
-  (`k8s/opa-kind-enable.sh`), not part of the test.
+- **Wiring the OPA pipeline, deploying the NATS Event Broker, and installing the Keycloak SPI +
+  enabling the realm listener** — preconditions (`k8s/opa-kind-enable.sh`), not part of the test.
+  (Loading, deploying, and tearing down the *workloads* is a test step.)
 - **Two-policy explicit-vs-abstract equivalence** — deferred to the two-policy rung
   `testing/5.4.4`; the live stack mounts a single `policy.md`.
 - **Default-CI wiring** — the test is `@pytest.mark.system` and requires a live cluster +
-  Keycloak + LLM, so it runs on demand, not in the default `-m "not integration"` unit run.
+  Keycloak + LLM, so it runs on demand, not in the default
+  `-m "not integration and not system and not llm and not eval"` unit run.
 
 ## Further Notes
 
@@ -306,8 +322,8 @@ Tracking issue for this test: `testing/5.3-policy-pipeline-integration-test.md`.
 > passes under the DENY-aware PRB (split from #140; the ALLOW+DENY half is the sibling "for later"
 > issue #142). The single `policy.md` therefore carries only positive grants — no `exclusively`, no
 > `read-only`, no `no access to source` — and the entity/role descriptions stay deny-neutral, so the PRB
-> emits **no** `DENY` rules and the enforced policy is allow-only. This keeps the two claims below
-> intact: the descriptions stay generic and drop out of the fact triad, and `devops` stays the pure
+> emits **no** `DENY` rules and the enforced policy is allow-only. This keeps two claims
+> intact (see the bullets below and the *Scenario* section): the descriptions stay generic and drop out of the fact triad, and `devops` stays the pure
 > **deny-by-default / silence** exemplar.
 >
 > Exercising the PRB's ALLOW+DENY path against this fixture — explicit-prohibition prose and a
@@ -325,8 +341,8 @@ Tracking issue for this test: `testing/5.3-policy-pipeline-integration-test.md`.
 - The least-privilege **deny-by-default** directive is supplied by the PRB prompt itself
   (`_GRANT_ACCESS` in `agent/policy_rules_builder/prompts.py`), which prepends it — followed by the
   bundled generic baseline policy (`generic_policy.md`) — ahead of the scenario `policy.md` on every
-  call, so every policy decision gets it. The abstract `policy.md` relies on the prompt and does not
-  restate the directive.
+  call, so every policy decision gets it. The abstract `policy.md` also restates the same directive as
+  its first line.
 - The single mounted `policy.md` is **user-intent-only** (see *Scenario inputs*): it states only what
   users may do and does **not** name the agent's operator roles. The agent's own capability (the
   outbound target gate) comes from the generic rubric (`generic_policy.md`) applied to the operator-role
@@ -334,15 +350,12 @@ Tracking issue for this test: `testing/5.3-policy-pipeline-integration-test.md`.
   positive is also what keeps the fixture ALLOW-only.
 - Descriptions are ≤255 characters and written **verbatim** into Keycloak (Keycloak caps role and
   client descriptions at 255 chars, and the generic descriptions are authored to stay within that cap).
-- The `devops` role's **zero access** is conveyed by its **role description only**. It is absent from
-  every pair-list and from the `policy.md`, so deny-by-default alone denies it inbound and on every
-  outbound tool — which is precisely what the truth table's `devops-user` row asserts.
 
 ## Prerequisites
 
 The live enforcement loop is in place (drivers, `k8s/opa-kind-*` scripts + runbook, and the
 AuthBridge OPA plugin), so this test is ready to run once the pipeline is stood up. It requires a wired
-cluster (`k8s/opa-kind-enable.sh`); the components it exercises end-to-end are specified/unit-tested by
+cluster (`k8s/opa-kind-enable.sh`), the NATS Event Broker, and the Keycloak SPI listener; the components it exercises end-to-end are specified/unit-tested by
 their own issues:
 
 - PRB — `agent/3.20-policy-rules-builder.md`

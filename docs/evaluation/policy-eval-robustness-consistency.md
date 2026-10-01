@@ -2,7 +2,7 @@
 
 > **One spec among several.** This document specifies a **family** of integration tests.
 > Eval specs live **one spec per test** under `docs/evaluation/`
-> (a sibling of `components/`), and the master PRD's *Integration test specifications* section
+> (a sibling of `components/`), and the master PRD's *Test & evaluation specifications* section
 > ([../PRD.md](../specs/PRD.md)) is the index of them. This is the **policy-eval-robustness-consistency**
 > family — it is a **companion to**, not a replacement for,
 > [policy-eval-scenarios.md](policy-eval-scenarios.md): that family's eight heavy scenarios (full
@@ -28,17 +28,18 @@ scenarios, and reuse that family's scenario corpus rather than defining their ow
   [Sensitivity family, semantic tier](#sensitivity-family-semantic-tier)).
 - `eval/prb_direct.py` — shared helper, `build_roles_and_scopes(scenario)`,
   used by both suites (see [No-Keycloak design](#no-keycloak-design) below).
-- `eval/scenarios_perturbed/` — eight hand-authored semantic-sibling scenario
-  modules + policy `.md` files, one per `policy-eval-scenarios.md` scenario (including
+- `eval/scenarios_perturbed/` — sixteen hand-authored semantic-sibling scenario
+  modules + policy `.md` files, two per `policy-eval-scenarios.md` scenario (8 invariance
+  `*_perturbed`, 8 sensitivity `*_sensitive_perturbed`; including
   `agent_delegation`, even though its **original** lives at `test/system/` top level, not
-  under `eval/`) — used only by the robustness suite's semantic tier (see
+  under `eval/`) — used only by the robustness suite's two semantic-tier tests (see
   [Perturbation tiers](#perturbation-tiers)).
-- Both suites import `SCENARIOS`, `orchestrate_prb`, `grant_sets`, `truth` from
-  `eval.test_policy_pipeline_eval` **unmodified** — no changes to that module's
+- Both suites import `SCENARIOS`, `orchestrate_prb`, `grant_sets` (and the robustness suite also
+  `truth`) from `eval.test_policy_pipeline_eval` **unmodified** — no changes to that module's
   own logic were needed for this work, beyond the unrelated file-reorg noted below.
 - `eval/conftest.py` — the same per-run Markdown report generator
-  `policy-eval-scenarios.md` documents, widened to also cover these two suites' markers (see
-  [Test report](#test-report)).
+  `policy-eval-scenarios.md` documents; it covers these two suites by the nodeid prefix
+  `eval/test_policy_pipeline_` (see [Test report](#test-report)).
 
 **Unrelated but adjacent change, done as prerequisite cleanup for this work:** the seven
 `eval/`-resident scenario modules from `policy-eval-scenarios.md` (`scenario_eval_baseline.py` and
@@ -64,7 +65,8 @@ output only — no OPA/PCE/k8s pipeline stage is involved in either (see
 Both suites reuse the exact same 8-scenario corpus `policy-eval-scenarios.md` already defines
 (`baseline`, `agent_delegation`, `unreachable_resources`, `ambiguous_clause`, `wildcard_grant`,
 `misleading_descriptions`, `confusable_agents`, `empty_descriptions`) — one parametrized test case
-per scenario, per suite.
+per scenario for the consistency suite, and four per scenario (one per test function) for the
+robustness suite.
 
 ### Digested corpus
 
@@ -271,14 +273,16 @@ than left to a cascade, and `empty_descriptions`' user and agent role share one 
 
 **Sign-off ledger.** Every perturbed policy `.md` under `eval/scenarios_perturbed/` — both this
 family's 8 new files and the existing 8 semantic-invariance files — has a row in
-`eval/scenarios_perturbed/SIGNOFF.md` recording its content hash, the reviewer, the date, and a
+`eval/scenarios_perturbed/SIGNOFF.md` recording two SHA256 hashes (the source `.md` and its
+digested counterpart in `eval/scenarios_digested/`), the reviewer, the date, and a
 confirmation that it preserves (invariance) or changes as intended (sensitivity) the original's
 meaning, per spec §4's human-sign-off requirement. `eval/test_semantic_signoff.py` (unmarked, no
 LLM, runs in the default fast unit pass) enforces this mechanically: every perturbed `.md` must
-have a row, and that row's recorded hash must match the file's current content — an edited-but-not-
-resigned perturbation fails loudly instead of shipping silently. The 8 pre-existing invariance
-files are backfilled (marked as such in the ledger) since they shipped before this gate existed;
-the 8 new sensitivity files carry a real sign-off obtained before they entered the corpus.
+have a row, and both recorded hashes must match the current content of the two files — an
+edited-but-not-resigned perturbation fails loudly instead of shipping silently. 7 of the 8
+pre-existing invariance files are backfilled (marked as such in the ledger) since they shipped
+before this gate existed; `empty_descriptions`' invariance file was re-signed after a role rename.
+The 8 new sensitivity files carry a real sign-off obtained before they entered the corpus.
 
 ## No-Keycloak design
 
@@ -330,7 +334,7 @@ original does not.
 | Variable | Purpose |
 |---|---|
 | `LLM_BASE_URL` / `LLM_MODEL` / `LLM_API_KEY` | The only required variables — both suites call the PRB directly against a real LLM endpoint. |
-| `AIAC_POLICY_FILE` | Set per test call (via `monkeypatch.setenv`), not from the environment. Every base text is now the scenario's **committed digested** policy in `eval/scenarios_digested/` (`digested_policy_path`, see [Digested corpus](#digested-corpus) below), not the source `.md` next to the scenario module: the consistency suite points it there directly; the robustness suite points it at a `tmp_path`-written mangled copy of that digested text (invariance, mechanical tier), the perturbed sibling's own digested counterpart, `eval/scenarios_digested/policy.eval_<name>_perturbed.md` (invariance, semantic tier), or a `tmp_path`-written edited copy of the digested text (sensitivity, mechanical tier — see [Sensitivity family](#sensitivity-family-mechanical-tier)). |
+| `AIAC_POLICY_FILE` | Set per test call (via `monkeypatch.setenv`), not from the environment. Every base text is now the scenario's **committed digested** policy in `eval/scenarios_digested/` (`digested_policy_path`, see [Digested corpus](#digested-corpus) below), not the source `.md` next to the scenario module: the consistency suite points it there directly; the robustness suite points it at a `tmp_path`-written mangled copy of that digested text (invariance, mechanical tier), the perturbed sibling's own digested counterpart, `eval/scenarios_digested/policy.eval_<name>_perturbed.md` (invariance, semantic tier), a `tmp_path`-written edited copy of the digested text (sensitivity, mechanical tier — see [Sensitivity family](#sensitivity-family-mechanical-tier)), or the sensitive sibling's digested counterpart, `eval/scenarios_digested/policy.eval_<name>_sensitive_perturbed.md` (sensitivity, semantic tier). |
 | `PRB_CONSISTENCY_REPEATS` | Optional, consistency suite only. Number of repeat PRB runs per scenario. Default `5`. |
 
 Neither suite reads `KEYCLOAK_URL`, `KEYCLOAK_ADMIN_USERNAME`/`PASSWORD`, `AIAC_PDP_CONFIG_URL`,
@@ -349,7 +353,7 @@ PRB_CONSISTENCY_REPEATS=10 .venv/bin/pytest eval/test_policy_pipeline_consistenc
   -m eval -v
 
 # A pass/fail/skip/error report for the run is written alongside the policy-eval-scenarios one:
-#   eval/reports/report_<DD_MM_HH_MM>.md (Asia/Jerusalem local time)
+#   eval/reports/report_<DD_MM_HH_MM_SS>.md (UTC by default; set EVAL_REPORT_TZ to change it)
 ```
 
 Both suites call `require_env_or_skip("LLM_BASE_URL", "LLM_MODEL", "LLM_API_KEY")` as the first
@@ -362,21 +366,18 @@ any is unset/empty.
 Reuses the exact report described in
 [policy-eval-scenarios.md § Test report](policy-eval-scenarios.md#test-report), widened to also
 collect this family's `eval`-marked tests (`eval/conftest.py`'s single flat `eval` marker covers
-every suite under `eval/`, this family included). Every test in this family falls
-through to that report's generic docstring + crash-message rendering (none `record_property`s a
-per-cell description the way `test_inbound`/`test_outbound` do) — a single docstring per
-parametrized test function already names exactly what's being checked, since none of these suites
-sweep a per-cell matrix the way the heavy scenarios' `test_inbound`/`test_outbound` do.
-`test_prb_invariant_to_mechanical_perturbation`/`test_prb_sensitive_to_mechanical_edit` additionally
+every suite under `eval/`, this family included; the report collects them by the nodeid prefix
+`eval/test_policy_pipeline_`). All four robustness test functions render the report's metrics
+block: each `record_property`s precision/recall/denial precision and the pair breakdown through
+`_record_scoring`, plus `perturbation`/`expected_grants`/`actual_grants`. All four also
 `record_property("invariant"/"sensitive", bool)` — not rendered in the Markdown report, but read
-back by `_write_trend_log` (see [Trend log](#trend-log)). `test_prb_sensitive_to_mechanical_edit`
-also `record_property("best_effort_notes", ...)` and prints a summary line when non-empty, same
-convention as the two correctness suites — naming which scenario's decision fell back to a
-best-effort, never-approved proposal (see [Testing Decisions](#testing-decisions)).
+back by `_write_trend_log` (see [Trend log](#trend-log)) — and `record_property("best_effort_notes", ...)`,
+which the report renders and each test prints when non-empty, same convention as the two
+correctness suites — naming which scenario's decision fell back to a best-effort, never-approved
+proposal (see [Testing Decisions](#testing-decisions)).
 
-`test_prb_consistent_across_repeats` (#2468) is the one exception to "falls through to the generic
-docstring + crash-message rendering" above: it `record_property("inconsistent", bool)` +
-`record_property("mismatches", "...")` (the full mismatch detail, newline-joined into a single
+`test_prb_consistent_across_repeats` (#2468) has its own render block: it
+`record_property("inconsistent", bool)` + `record_property("mismatches", "...")` (the full mismatch detail, newline-joined into a single
 string, empty when consistent — not a list, since `record_property` is primarily a JUnit-XML
 mechanism and a list isn't a valid XML attribute scalar), and
 `_render_entry` dispatches on `"inconsistent" in props` to render an explicit "Inconsistent:
@@ -467,40 +468,20 @@ chart over time, not just show up as a one-off failed run with no lasting record
   perturbed-scenario file just to preserve an asymmetry that has no bearing on either new suite's
   logic.
 - **Sensitivity edits are exact-match-scored, not "changed somewhere in the right direction".**
-  `test_prb_sensitive_to_mechanical_edit` asserts the actual grant set equals `truth(scenario)`
-  with the edit's delta applied — a looser check would still pass if the edit had an unintended
-  side effect elsewhere in the grant set, which is exactly the failure mode worth catching.
+  See [Sensitivity family (mechanical tier)](#sensitivity-family-mechanical-tier) (`removed`/`added`)
+  for the rationale.
 - **Sensitivity edits touch the user-facing policy sentence, not the agent's own role, only where
-  the agent role names a genuinely distinct worker.** For scenarios where the agent role and user
-  role are different jobs (`wildcard_grant`'s `agent-role-stocker` vs. `user-role-inventory-manager`,
-  `agent_delegation`'s `agent-role-dispatcher` vs. either of its user roles), revoking/swapping only
-  the policy text's user-facing sentence keeps the edit's blast radius to exactly the intended
-  gate(s). `empty_descriptions` (`agent-role-grounds-worker`, sharing its name outright with
-  `user-role-grounds-worker`) and `unreachable_resources` (`agent-role-receptionist`, a different
-  word for the same worker as `user-role-front-desk-clerk`) name the same worker as their paired
-  user role, so their edit's delta necessarily touches `outbound_target` too — confirmed against a
-  live LLM, which denied the agent role's access right alongside the user role's rather than
-  honoring an artificial split between two names for the same job.
-- **Every sensitivity edit is whole-scope, not partial-capability — a correction made after live
-  testing, not the original design.** The first revision narrowed one sub-capability of a role's
-  access while the relevant inbound scope's own description still bundled that capability with
-  another ("reading **and updating** issues"); against a real LLM this reliably read as a
-  grant-and-prohibit contradiction and the auditor rejected it every time — a structural
-  consequence of the edit shape, not occasional model flakiness. The fix: every edit now adds or
-  removes a role's *entire* relationship to a scope. `restriction_word`/`exception_clause` are
-  still represented, just as role-*eligibility* language ("only developers may access...",
-  "everyone except front desk staff may use...") rather than sub-capability language — which needs
-  at least two roles sharing one scope to have anything to restrict/except, so it's used only where
-  that structure exists (`baseline`, `misleading_descriptions`); every other scenario uses a full
-  `negation` instead. See [Sensitivity family](#sensitivity-family-mechanical-tier) for the
+  the agent role names a genuinely distinct worker.** See
+  [Sensitivity family (mechanical tier)](#sensitivity-family-mechanical-tier) for the
   scenario-by-scenario rationale.
+- **Every sensitivity edit is whole-scope, not partial-capability — a correction made after live
+  testing, not the original design.** See
+  [Sensitivity family (mechanical tier)](#sensitivity-family-mechanical-tier) for the rationale.
 - **All four test functions use `orchestrate_prb(..., best_effort=True)`.** Even a whole-scope
   edit, or plain mangling/rewording, isn't guaranteed friction-free against a live auditor —
-  confirmed in testing: `baseline`'s "only developers may access..." triggered a softer auditor note
-  about how exclusivity should be signaled internally (rejected as an implementation nuance, not a
-  contradiction); `ambiguous_clause`'s full revoke was once rejected as an unsupported prohibition on
-  a scope nobody had ever been granted; and `agent_delegation`'s mechanical-tier mangling manufactured
-  a coarse-scope contradiction on `agent-scope-dispatcher` (which bundles manifest operations and
+  confirmed in testing (see [Sensitivity family (mechanical tier)](#sensitivity-family-mechanical-tier)
+  for the `baseline` and `ambiguous_clause` cases); and `agent_delegation`'s mechanical-tier
+  mangling manufactured a coarse-scope contradiction on `agent-scope-dispatcher` (which bundles manifest operations and
   customs-clearance coordination in one scope) that the *unmangled* text never triggers. Best-effort
   falls back to the last-proposed, never-approved rule instead of aborting the whole scenario — the
   same mechanism and rationale as the two correctness suites — so a rejection still scores (and is
@@ -519,7 +500,7 @@ chart over time, not just show up as a one-off failed run with no lasting record
 
 This is **one** integration-test spec (covering two suites, 40 parametrized test cases total — the
 consistency suite's 8 plus the robustness suite's 4 test functions × 8 scenarios) among several
-indexed by the master PRD ([../PRD.md](../specs/PRD.md), § *Integration test specifications*).
+indexed by the master PRD ([../PRD.md](../specs/PRD.md), § *Test & evaluation specifications*).
 
 - **Companion to, not a replacement for, [policy-eval-scenarios.md](policy-eval-scenarios.md).**
   That family proves correctness once per scenario; this family proves consistency and robustness
@@ -546,8 +527,8 @@ indexed by the master PRD ([../PRD.md](../specs/PRD.md), § *Integration test sp
 - **Statistical/majority-vote tolerance.** Both suites require exact equality; introducing a
   tolerance threshold (e.g. "passes if 4 of 5 runs agree") is a policy decision explicitly left for
   future work if today's exact-equality bar proves too strict in practice.
-- **Default-CI wiring.** Both markers keep this family out of the default `-m "not integration"`
-  unit run, matching every other suite indexed in this PRD section (the sign-off enforcement test,
+- **Default-CI wiring.** The single `eval` marker keeps this family out of the default run
+  (`addopts` deselects `eval`), matching every other suite indexed in this PRD section (the sign-off enforcement test,
   `eval/test_semantic_signoff.py`, is the one exception — unmarked, so it runs in the default
   fast pass, same as `eval/test_convert_scenarios.py`).
 

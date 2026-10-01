@@ -1,6 +1,6 @@
 # ~~Component PRD: Keycloak Configuration Service~~
 
-> **Superseded.** This component's read endpoints have been replaced by the **IdP Configuration Service** — see [idp-configuration-service.md](idp-configuration-service.md).
+> **Superseded.** This component (all its endpoints, read and write) has been replaced by the **IdP Configuration Service**, and its code has been removed — see [idp-configuration-service.md](idp-configuration-service.md).
 >
 > The content below is retained for reference only.
 >

@@ -2,7 +2,7 @@
 
 ## Problem Statement
 
-The AIAC Agent's Policy Computation Engine produces and merges `ServicePolicyModel` (SPM) objects — one per service, keyed by `serviceId` — representing the inbound/outbound access control policy for each service. The PDP Policy Writer translates these into Rego packages and writes them to an `AuthorizationPolicy` Kubernetes CR — but this derived artifact cannot be reverse-engineered back into structured SPM data. Without a durable structured policy store:
+The AIAC Agent's Policy Computation Engine produces and merges `ServicePolicyModel` (SPM) objects — one per service, keyed by `serviceId` — representing the inbound access control policy (inbound edges) for each service. The PDP Policy Writer translates the derived `AgentPolicyModel`s into Rego packages and writes one `AuthorizationPolicy` Kubernetes CR per agent — but this derived artifact cannot be reverse-engineered back into structured SPM data. Without a durable structured policy store:
 
 - The Policy Computation Engine cannot read current policy state for additive merging — it must re-derive the full state from the PDP snapshot on every trigger.
 - Override-purge cannot find stale role→service mappings that the live IdP no longer reflects — there is no record of what was previously granted.
@@ -14,12 +14,12 @@ The `AgentPolicyModel` (APM) is **derived and never persisted** — it is comput
 
 A dedicated **AIAC Policy Model Store** owns an in-memory cache of `ServicePolicyModel` rows (keyed by `serviceId`) backed by a SQLite database for durability. A companion library [`aiac.policy.model_store.library`](library-policy-model-store.md) exposes module-level typed functions matching the `aiac.pdp.policy.library` pattern, used by the Policy Computation Engine to read and write SPM state without any storage-layer boilerplate.
 
-The SPM is the **source of truth**. The PDP Policy Writer retains sole ownership of the `AuthorizationPolicy` CR (Rego packages) and has no dependency on the Policy Model Store. The two persistence artifacts serve distinct purposes and are owned by distinct services:
+The SPM is the **source of truth**. The PDP Policy Writer retains sole ownership of the `AuthorizationPolicy` CRs (Rego packages) and has no dependency on the Policy Model Store. The two persistence artifacts serve distinct purposes and are owned by distinct services:
 
 | Artifact | Owner | Contents |
 |---|---|---|
 | SQLite `service_policies` table | Policy Model Store | Structured `ServicePolicyModel`, keyed by `serviceId` — source of truth (cache-first, write-through) |
-| `AuthorizationPolicy` CR (one total) | PDP Policy Writer | Derived Rego packages — OPA runtime artifact |
+| `AuthorizationPolicy` CRs (one per agent) | PDP Policy Writer | Derived Rego packages — OPA runtime artifact |
 
 ---
 
@@ -46,7 +46,7 @@ The SPM is the **source of truth**. The PDP Policy Writer retains sole ownership
 
 **Deployment:** dedicated single-replica `StatefulSet` `aiac-policy-model-store`, with a `volumeClaimTemplate` PVC (1 Gi, `ReadWriteOnce`, cluster-default StorageClass) mounted at `/data`. Fronted by a headless Service for stable pod DNS plus the `aiac-policy-model-store-service:7074` ClusterIP for clients. Not co-located with IdP Configuration / PDP Policy Writer.
 
-**Framework:** FastAPI + uvicorn. **Base image:** `python:3.12-slim`.
+**Framework:** FastAPI + uvicorn. **Base image:** `python:3.13-slim` (digest-pinned).
 
 **Storage backend:** SQLite via `sqlite3` stdlib (zero extra dependency — `sqlite3` ships with the Python standard library). Database file: `SERVICEPOLICY_DB_PATH` (default `/data/policy_model.db`).
 
@@ -109,18 +109,19 @@ segment).
 
 **Error responses:**
 - `404 Not Found` with `{"error": "service {id} not found"}` when `GET /policy/services/{service_id}` finds no entry in cache. The library's `get_service_policy` catches this and returns a fresh empty SPM (per the "engine creates a fresh model on 404" convention); the by-role query never 404s (empty list on no match).
+- `422 Unprocessable Entity` when the `POST` body's `service_id` does not match the decoded path `service_id`.
 - `502 Bad Gateway` with `{"error": "..."}` on SQLite write error for the write and delete endpoints.
 - `503 Service Unavailable` if `GET /health` cannot open or query the SQLite file.
 
 **`main.py` functions:**
 
-- `get_db() -> sqlite3.Connection` — open `SERVICEPOLICY_DB_PATH` with `check_same_thread=False` (FastAPI dependency); `_init_db` runs `CREATE TABLE IF NOT EXISTS` on first open.
-- `upsert_service_policy(service_id: str, model: ServicePolicyModel)` — `POST /policy/services/{service_id}`; under the write lock: `INSERT OR REPLACE INTO service_policies VALUES (?, ?)` with `model.model_dump_json()`, then update cache (DB + cache write as one locked critical section).
+- `get_db() -> sqlite3.Connection` — FastAPI dependency; returns the shared connection that `lifespan` opens at startup (`sqlite3.connect(SERVICEPOLICY_DB_PATH, check_same_thread=False, isolation_level=None)`). `lifespan` then runs `_init_db` (`CREATE TABLE IF NOT EXISTS`) and `_load_cache`.
+- `upsert_service_policy(service_id: str, body: ServicePolicyModel)` — `POST /policy/services/{service_id}`; decode `service_id`, reject a body/path `service_id` mismatch with `422`, then under the write lock: `INSERT OR REPLACE INTO service_policies VALUES (?, ?)` with `body.model_dump_json()`, then update cache (DB + cache write as one locked critical section).
 - `delete_service_policy(service_id: str)` — `DELETE /policy/services/{service_id}`; under the write lock: `DELETE FROM service_policies WHERE service_id = ?`, then evict the cache entry (no-op if absent) — DB + cache eviction as one locked critical section.
 - `clear_service_policies()` — `DELETE /policy/services`; under the write lock: `DELETE FROM service_policies` (all rows) and clear the cache — the collection-root clean slate.
 - `get_service_policy(service_id: str) -> ServicePolicyModel` — `GET /policy/services/{service_id}`; read from in-memory cache; raise `404` if absent.
-- `list_service_policies_by_role(role_id: str) -> list[ServicePolicyModel]` — `GET /policy/services?role={role_id}`; return every cached SPM whose `inbound_allow_rules` or `inbound_deny_rules` references `role_id`.
-- `_load_cache()` — on startup, load all rows from SQLite into the in-memory cache.
+- `list_service_policies_by_role(role: str) -> list[ServicePolicyModel]` — `GET /policy/services?role={role_id}`; return every cached SPM whose `inbound_allow_rules` or `inbound_deny_rules` references `role_id`.
+- `_load_cache(conn)` — called by `lifespan` on startup; load all rows from SQLite into the in-memory cache.
 
 **Configuration:**
 
@@ -130,7 +131,7 @@ segment).
 
 **Dependencies:** `fastapi`, `uvicorn[standard]`, `pydantic`. `sqlite3` is stdlib (no new dependency).
 
-**Imports:** `from aiac.policy.model.models import ServicePolicyModel, Scope, Role`
+**Imports:** `from aiac.policy.model.models import ServicePolicyModel`; `from aiac.policy.model_store.keying import decode_service_id`
 
 **File structure:**
 
@@ -183,6 +184,6 @@ See [library-policy-model-store.md](library-policy-model-store.md) for the compa
 ## Further Notes
 
 - The K8s manifests issue must create the `aiac-policy-model-store` StatefulSet, its `volumeClaimTemplate` PVC (1 Gi, `ReadWriteOnce`), and a headless Service. No CRD or RBAC is needed — the service does not touch the Kubernetes API.
-- `spec` fields use snake_case (matching Pydantic's `model_dump()`) — consistent with the `AuthorizationPolicy` CR convention. The JSON column avoids a translation layer.
-- `service_id` is the SQLite `PRIMARY KEY`. The `aiac.apply.service.{id}` naming convention (lowercase alphanumeric + hyphens) should be maintained for consistency with trigger events.
+- `spec` fields use snake_case (matching Pydantic's `model_dump()`). The JSON column avoids a translation layer.
+- `service_id` is the SQLite `PRIMARY KEY`. It is the Keycloak clientId (it can contain `/`; see the path-encoding note above), not the UUID that `aiac.apply.service.<uuid>` carries.
 - K8s resource names: StatefulSet `aiac-policy-model-store`, ClusterIP Service `aiac-policy-model-store-service:7074`, env var `AIAC_POLICY_MODEL_STORE_URL`.

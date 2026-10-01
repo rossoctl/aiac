@@ -15,10 +15,10 @@
 
 UC1 is the only use case with an Orchestrator, because it is a two-stage pipeline:
 
-1. **Service Provision** (LLM-based): classify the new service, derive its roles + scopes, write them into the IdP.
+1. **Service Provision** (non-LLM): classify the new service, derive its roles + scopes, write them into the IdP.
 2. **Service Policy Builder** (deterministic): read the full IdP role + scope universe (excluding the new service's own entities), call the PRB for each applicable pair, and return a merged `list[PolicyRule]` to the Orchestrator.
 
-The Orchestrator returns `(list[PolicyRule], override=False)` to the Controller. The Controller calls the PCE with that `override` flag; the PCE owns all rule reconciliation. UC1 is **incremental** — existing roles receive a partial new mapping and must not lose their other access — so the mode is always append (`override=False`).
+The Orchestrator returns `(list[PolicyRule], override=False, client_id)` to the Controller. The Controller calls the PCE with that `override` flag and `focus_service=client_id`; the PCE owns all rule reconciliation. UC1 is **incremental** — existing roles receive a partial new mapping and must not lose their other access — so the mode is always append (`override=False`).
 
 ```mermaid
 flowchart TD
@@ -28,12 +28,12 @@ flowchart TD
     CTRL["Controller\nroutes.py"]
 
     NATS -->|"durable queue group\naiac-agent-consumer"| NATS_CONSUMER
-    NATS_CONSUMER -->|"calls internal handler"| CTRL
+    NATS_CONSUMER -->|"mirrors the routes:\ncalls the same handlers + PCE"| CTRL
     TRIGGERS --> CTRL
 
     subgraph CO["Service Onboarding"]
         ORC["Orchestrator"]
-        SA_PROV["Service Provision\n(LLM)"]
+        SA_PROV["Service Provision\n(non-LLM)"]
         SA_POL["Service Policy Builder\n(deterministic)"]
         ORC --> SA_PROV
         ORC --> SA_POL
@@ -44,8 +44,8 @@ flowchart TD
 
     CTRL -->|"service/:id"| ORC
     SA_POL -->|"calls"| PRB
-    ORC -->|"(list[PolicyRule], override=False)"| CTRL
-    CTRL -->|"merged rules, override=False"| PCE
+    ORC -->|"(list[PolicyRule], override=False, client_id)"| CTRL
+    CTRL -->|"merged rules, override=False,\nfocus_service=client_id"| PCE
 ```
 
 ## Orchestrator
@@ -54,7 +54,7 @@ flowchart TD
 
 **Sequence:**
 0. Read the `Service` once (`get_service(service_id)`, by the UUID) and take its clientId (`Service.serviceId`) — the only service id the PCE takes. This read comes before Provision, so if it fails, nothing exists yet that needs compensation: the Orchestrator raises `HTTPException(502)`, as Provision does for the same read. The rollback reuses this `Service`.
-1. Call `ServiceProvisionGraph.invoke()` → get back `ServiceProvision { roles, scopes }` + `service_type`.
+1. Call `build_provision_graph().invoke(...)` → get back `service_type` and the created-manifest (`created_roles`, `created_scopes`).
 2. Call `ServicePolicyBuilder.build(service_id, service_type)` → get back `list[PolicyRule]`. Service Policy Builder re-resolves the focus service from the IdP catalog by its internal client UUID (`service_id`; Provision has already persisted its roles/scopes), so it needs only the id, not the `ServiceProvision`.
 3. Return `(list[PolicyRule], override=False, client_id)` to the Controller. `onboard_service(service_id)` returns this 3-tuple; the caller passes `client_id` to the PCE as `focus_service`, so it makes no second IdP read. It takes no default-effect argument: a pair that no rule mentions is always DENY.
 
@@ -76,7 +76,7 @@ The disable comes before the quarantine, so no run after the teardown sees the s
 
 **Rollback is a full teardown of what Provision created.** The `provision_service` node now returns a **created-manifest** — exactly the roles and scopes it **created** on this run, not the ones it reused by name. For each entity in that manifest, rollback **unmaps then deletes** it (the order the IdP library requires). The rollback **keeps the client `type` attribute**: it removes only what this run created, and this run did not create the type. It then **disables the Keycloak client** (`enabled=false`) as the last step. The disabled client is the failed-service marker visible in the admin UI. Because rollback tears down only what this run added, it never removes a pre-existing entity that another service shares. The IdP teardown and disable primitives (`delete_service_role`, `delete_service_scope`, enable/disable) are specified in [`../library-idp.md`](../library-idp.md).
 
-**Rollback fires on every attempt.** A permanent failure rolls back once, because the NATS consumer routes it straight to the dead-letter subject (see [aiac-agent.md → Ack contract](../aiac-agent.md#ack-contract)). A retryable `LLMAccessError` re-provisions idempotently and rolls back (and quarantines) again on each NATS redelivery. This repeated provision-then-rollback is accepted.
+**Rollback fires on every attempt.** A permanent failure rolls back once, because the NATS consumer routes it straight to the dead-letter subject (see [aiac-agent.md → Ack contract](../aiac-agent.md#ack-contract)). A retryable `LLMAccessError` re-provisions idempotently and rolls back (and quarantines) again on each NATS redelivery. This repeated provision-then-rollback is accepted. This is true for an agent only. For a tool, a redelivery fails in Provision at the discovery-token mint (see the known limit below), so it never gets to the build.
 
 **The success path re-enables the client — but only after the apply.** The Orchestrator does **not** re-enable the client itself. The caller (Controller route or NATS consumer) calls `compute_and_apply(rules, override, focus_service=client_id)` (the clientId from `onboard_service`) and then re-enables the client through `reenable_service(service_id)` (an IdP call, by the UUID) **after** that call succeeds. `reenable_service` sets the client `enabled=true` (idempotent), which clears a failed-disable left by a prior attempt. The re-enable is deliberately post-apply: if `compute_and_apply` fails, the caller never reaches `reenable_service`, so the client stays disabled (the failed-service marker) instead of being left enabled with no applied policy.
 
@@ -92,7 +92,7 @@ The disable comes before the quarantine, so no run after the teardown sees the s
 
 `onboarding/provision/`
 
-**Nature:** LLM-based. Classifies the new service (agent or tool), derives roles + scopes from AgentCard / MCP manifest, and **writes them into the IdP**.
+**Nature:** non-LLM. Classifies the new service (agent or tool), derives roles + scopes from AgentCard / MCP manifest, and **writes them into the IdP**.
 
 All IdP writes and reads target the **idp-library** — `aiac.idp.configuration.api.Configuration` — not the IdP service directly:
 - `create_service_role(service_id, role)` — idempotent (create-or-get by name, then map)
@@ -166,7 +166,7 @@ START → classify_service → [analyze_agent | analyze_tool] → provision_serv
      be not ready for some seconds. Discovery tries `tools/list` again every 3 s while the endpoint is not
      ready — a connection error (refused, reset, connect timeout) or a `502`/`503`/`504` from the sidecar —
      until `AIAC_MCP_DISCOVERY_READY_TIMEOUT` ends (default 120 s, well below the NATS `ACK_WAIT` of 600 s).
-     A `4xx` or a read timeout fails at once.
+     A `4xx` or a read timeout is not waited for (a read timeout still gets the `UPSTREAM_MAX_RETRIES` transport retries).
   4. Produce `ServiceProvision`:
      - `roles`: `[]` (tools do not initiate further calls)
      - `scopes`: `[ScopeDefinition(name=f"{workload_name}.{tool.name}", description=tool.description) for tool in manifest.tools]`
@@ -174,7 +174,7 @@ START → classify_service → [analyze_agent | analyze_tool] → provision_serv
   5. Returns `502` on Service/label lookup failure, discovery-token minting failure, or MCP call failure.
 
   > K8s access: `get` on `services` in the workload namespace (tool path). Identity is resolved by `classify_service` (config API).
-  > MCP path convention: all MCP tool services must serve at `/mcp` and carry the `protocol.rossoctl.io/mcp` label. This label is a **deploy-time prerequisite** — the rossoctl-operator does not stamp it today; automatic stamping is requested upstream (`docs/issues/rossoctl-operator-mcp-label-stamping.md`). Until then it must be applied at deploy time; `analyze_tool` fails loud (`502`, naming the workload + missing label) if it is absent.
+  > MCP path convention: all MCP tool services must serve at `/mcp` and carry the `protocol.rossoctl.io/mcp` label. This label is a **deploy-time prerequisite** — the rossoctl-operator does not stamp it today; automatic stamping is requested upstream. Until then it must be applied at deploy time; `analyze_tool` fails loud (`502`, naming the workload + missing label) if it is absent.
   > Discovery auth: the tool's inbound `jwt-validation` plugin stays fully enforcing — there is no
   > path bypass for `/mcp`. `analyze_tool` authenticates instead of relaxing the sidecar's auth.
 
@@ -183,7 +183,7 @@ START → classify_service → [analyze_agent | analyze_tool] → provision_serv
 
 ### State: `OnboardingProvisionState`
 
-Extends `BaseAgentState` with:
+A pydantic `BaseModel` with `trigger: Trigger` (`entity_id`) and:
 
 | Field | Type | Description |
 |---|---|---|
@@ -192,6 +192,8 @@ Extends `BaseAgentState` with:
 | `workload_name` | `str \| None` | From the `client.name` split in `classify_service` (agents and tools) |
 | `service_type` | `ServiceType \| None` | `agent` or `tool`; routing field |
 | `service_provision` | `ServiceProvision \| None` | Populated by `analyze_agent` or `analyze_tool` |
+| `created_roles` | `list[Role]` | Created-manifest from `provision_service`: the roles this run created (rollback input) |
+| `created_scopes` | `list[Scope]` | Created-manifest from `provision_service`: the scopes this run created (rollback input) |
 
 ### Types
 
@@ -257,7 +259,7 @@ Neither guard alone is sufficient — ownership-based exclusion keeps own entiti
 ### Steps
 
 1. Receive `service_id: str` + `service_type: ServiceType` from the Orchestrator.
-2. Fetch `services = get_services()`, `all_scopes = get_scopes()`, `subjects = get_subjects()` from `aiac.idp.configuration.api`.
+2. Fetch `services = get_services()` and `subjects = get_subjects()` from `aiac.idp.configuration.api` (`502` if the IdP is unreachable).
 3. Resolve the focus service: `focus = next((s for s in services if s.id == service_id), None)` (matching on `id`, the internal client UUID carried by the route/`Trigger.entity_id` — **not** `serviceId`/clientId, which may be a slash-bearing SPIFFE URI); if `focus is None`, raise a clear `404` rather than letting `next(...)` raise `StopIteration`.
 4. Compute candidate sets, all by ownership:
    - **own roles/scopes** — `focus.roles`/`focus.scopes` filtered to `aiac.managed` (drops Keycloak's built-in default client scopes, e.g. `profile`, which are stamped with this service's `serviceId` but are not `aiac.managed`).
@@ -290,18 +292,20 @@ src/aiac/agent/uc/
     ├── orchestrator.py
     ├── provision/
     │   ├── __init__.py
-    │   ├── graph.py      ← ServiceProvisionGraph (LLM-based StateGraph)
+    │   ├── graph.py      ← build_provision_graph() (non-LLM StateGraph)
+    │   ├── kube.py       ← retrying Kubernetes seam (list_pods, read_service, list_agentcards)
     │   ├── nodes.py      ← classify_service, analyze_agent, analyze_tool, provision_service
     │   ├── state.py      ← OnboardingProvisionState
     │   └── types.py      ← RoleDefinition, ScopeDefinition, ServiceProvision (ServiceType imported from aiac.idp.configuration.models)
     └── policy_builder/
         ├── __init__.py
-        └── builder.py     ← ServicePolicyBuilder.build(service_id, service_type) → list[PolicyRule]
+        ├── builder.py     ← ServicePolicyBuilder.build(service_id, service_type) → list[PolicyRule]
+        └── cross_service.py ← applied_rules_for_scopes (read-only Policy Store read for cross-service conflict detection)
 ```
 
 ## Out of scope
 
 - PRB internals — see [`policy-rules-builder.md`](policy-rules-builder.md).
 - PCE reconcile mechanics — see [`../policy-computation-engine.md`](../policy-computation-engine.md).
-- Response body shape — no success body; handlers return bare HTTP status codes (error responses carry FastAPI's default JSON error body from the raised `HTTPException`). Summary + debug go to the log.
-- MCP endpoint lookup strategy for tools — **resolved** (hybrid Keycloak→K8s) in `docs/issues/agent/service-onboarding/6.2-analyze-tool-lookup-strategy.md` and reflected in the `analyze_tool` node above.
+- Response body shape — no success body; handlers return bare HTTP status codes (error responses carry a `{"detail": …}` body from a raised `HTTPException` or a Controller exception handler, or a `ConflictReport` (`422`)). Summary + debug go to the log.
+- MCP endpoint lookup strategy for tools — **resolved** (hybrid Keycloak→K8s) in issue `6.2` (analyze-tool lookup strategy) and reflected in the `analyze_tool` node above.

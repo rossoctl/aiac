@@ -1,8 +1,6 @@
 # Demo Spec: `github-agent` (A2A) — source + issue operations over `github-tool`
 
-> **Status:** spec (design source of truth). Implementation is decomposed into
-> `docs/issues/demo/GA-*.md` and entry-pointed by
-> `docs/handoffs/handoff-github-agent-implementation.md`.
+> **Status:** implemented under `demo/assets/agents/github_agent/`.
 >
 > **This is a demo/reference agent**, not part of the AIAC service tree (`src/aiac/`). It is a
 > self-contained, deployable A2A agent that realises the canonical `github-agent` used by the AIAC
@@ -35,6 +33,8 @@ This agent generalises it to the scenario's **two capability areas**.
 The agent does **not** know or enforce these scopes itself — AIAC/OPA + AuthBridge do. The agent simply
 exposes the two capability areas; the AuthBridge sidecar performs inbound JWT validation and outbound
 RFC-8693 token exchange, and the `github-tool` MitM swaps the exchanged token for a GitHub PAT by scope.
+When the OPA pipeline is wired (`k8s/opa-kind-enable.sh`), OPA also runs on both legs. The outbound
+OPA allows only a granted MCP `tools/call` and the MCP session messages.
 
 ### Related artefacts
 - Scenario spec: [`../../testing/policy-pipeline.md`](../../testing/policy-pipeline.md)
@@ -61,8 +61,8 @@ Reuse the `git_issue_agent` stack verbatim — do not introduce a new framework:
   `/.well-known/agent-card.json` and legacy `/.well-known/agent.json`.
 - **CrewAI** orchestration (`Agent`/`Crew`/`Task`, `Process.sequential`), LLM via **litellm** (`crewai.LLM`).
 - **`crewai-tools[mcp]` `MCPServerAdapter`** — per-request connection to the MCP tool over
-  `transport="streamable-http"` at `MCP_URL` (default `http://github-tool-mcp:9090/mcp`), inside a
-  `with` block, torn down after each request.
+  `transport="streamable-http"` at `MCP_URL` (default `http://github-tool-mcp:9090/mcp`), entered and
+  exited (`__enter__`/`__exit__`) on one dedicated worker thread, torn down after each request.
 - **Auth (three tiers, verbatim from the reference `GithubExecutor.execute`):**
   1. `GITHUB_TOKEN` env set → `Authorization: Bearer <token>` to MCP;
   2. else pass through the inbound request's `Authorization` header
@@ -73,7 +73,8 @@ Reuse the `git_issue_agent` stack verbatim — do not introduce a new framework:
  A2A client ──(JSON-RPC /)──► github-agent (:8000)
                                   │  CrewAI: prereq extract → researcher
                                   └──(streamable-http, MCP_URL)──► github-tool-mcp:9090/mcp ──► GitHub
-        (AuthBridge sidecar: inbound JWT validation; outbound RFC-8693 token exchange for MCP_URL host)
+        (AuthBridge sidecar: inbound JWT validation; outbound RFC-8693 token exchange for MCP_URL host;
+         OPA on both legs when k8s/opa-kind-enable.sh wires it)
 ```
 
 ---
@@ -157,7 +158,7 @@ default set.
 **Excluded by default** (out of the policy-pipeline scenario; one edit / `ENABLED_TOOLS` to add back):
 Teams & Users (`get_me`, `get_team_members`, `get_teams`), Security (`run_secret_scanning`), and
 repo-lifecycle / release tools (`create_repository`, `fork_repository`, `list_tags`, `get_tag`,
-`get_label`, releases). These are named in the module so they are trivially re-enabled.
+`get_label`). These are named in the module so they are trivially re-enabled.
 
 > The allow-list is a single editable constant grouped by skill/scope so the source/issue split stays
 > legible and auditable against the scenario.
@@ -203,10 +204,11 @@ Manifests live under `demo/assets/agents/github_agent/k8s/`, adapted from the gi
   - Container port `8000`; env `MCP_URL=http://github-tool-mcp:9090/mcp`,
     `JWKS_URI=http://keycloak-service.keycloak.svc:8080/realms/rossoctl/protocol/openid-connect/certs`,
     LLM vars, `PORT`, `LOG_LEVEL`; `/shared` `emptyDir` for operator-mounted client creds.
-  - `Service` `8080 → 8000` (ClusterIP).
+  - `Service` (ClusterIP): `agent` `8001 → 8001` (listed first, for the AgentCard fetch after
+    AuthBridge port-stealing) + `proxy` `8080 → 8000`.
   - `AgentRuntime{ type: agent, targetRef: this Deployment }` — enrolls the workload (operator applies
     `rossoctl.io/type=agent`, registers a Keycloak client, injects the AuthBridge sidecar).
-  - Image `github-agent:latest`, `imagePullPolicy: IfNotPresent` (kind-load; name is a documented knob).
+  - Image `localhost/github-agent:latest`, `imagePullPolicy: IfNotPresent` (kind-load; name is a documented knob).
 - **`configmaps.yaml`** — `authbridge-config` (Keycloak URL/realm/issuer) + `authproxy-routes` with the
   outbound token-exchange route:
   ```yaml
@@ -238,11 +240,15 @@ Service name; exchanged audience (`github-tool`) == tool `AUDIENCE`.
    send an A2A `message/send` read query and confirm a grounded, tool-cited answer.
 
 **Cluster (HITL — live Rossoctl + Keycloak + LLM + tool PAT):**
-5. `kind load docker-image github-agent:latest --name rossoctl`.
+5. `demo/assets/kind-load.sh --agent-only` (builds `localhost/github-agent:latest` if absent and loads
+   it into the `rossoctl` Kind cluster).
 6. Ensure `github-tool` + `github-tool-secrets` exist in `team1`.
 7. `kubectl apply -f k8s/configmaps.yaml -f k8s/github-agent-deployment.yaml`.
 8. Confirm AuthBridge injection + `rossoctl.io/type=agent`; `kubectl port-forward svc/github-agent 8080:8080 -n team1`;
-   send an authenticated A2A message; verify token exchange reaches `github-tool` and an answer returns.
+   send an authenticated A2A message; verify token exchange reaches `github-tool` and an answer returns
+   (only without the outbound OPA plugin; with `k8s/opa-kind-enable.sh` the outbound OPA returns `403`
+   on the agent's LLM and A2A calls — see the *Known limit* in
+   [`../components/pdp-policy-writer-opa.md`](../components/pdp-policy-writer-opa.md)).
 
 ---
 

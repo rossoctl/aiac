@@ -55,6 +55,8 @@ def delete_policy() -> None
     # DELETE /policy — clear all Rego packages (rebuild pre-step)
 ```
 
+**Status: not built yet** — no code calls `delete_policy()`; the UC2 rebuild (`src/aiac/agent/uc/policy_update/rebuild.py`) is a stub that returns `([], True)`.
+
 ### Configuration
 
 Read from `AIAC_PDP_POLICY_URL` environment variable (or `.env` file co-located with `api.py`). Falls back to the default if absent.
@@ -69,10 +71,10 @@ Read from `AIAC_PDP_POLICY_URL` environment variable (or `.env` file co-located 
 from aiac.pdp.policy.library.api import apply_policy, apply_agent_policy, delete_agent_policy, delete_policy
 from aiac.policy.model.models import PolicyModel, AgentPolicyModel
 
-# Single-agent update (called by Policy Computation Engine)
+# Quarantine: write the no-rules CR (called by the PCE's quarantine)
 apply_agent_policy("weather-agent", agent_model)
 
-# Full rebuild pre-step: clear all, then reapply
+# Full rebuild pre-step: clear all, then reapply (not built yet — see the status note above)
 delete_policy()
 apply_policy(full_model)
 
@@ -85,8 +87,6 @@ delete_agent_policy("weather-agent")
 ## Testing Decisions
 
 **Seam:** HTTP boundary — mock responses from `AIAC_PDP_POLICY_URL`.
-
-**Prior art:** `3.14-unit-tests-write-api.md` (mock PDP Policy Writer HTTP; cover module-level functions).
 
 Key behaviors to assert:
 - `apply_policy(model)` issues `POST /policy` with serialized `PolicyModel`.
@@ -108,5 +108,5 @@ Key behaviors to assert:
 
 ## Further Notes
 
-- The `aiac.pdp.library.policy` module (old path) is deprecated. All consumers must update imports to `aiac.pdp.policy.library.api`.
-- Models (`PolicyModel`, `AgentPolicyModel`) are imported from `aiac.policy.model.models`, not from the deprecated `aiac.pdp.library.models`.
+- The `aiac.pdp.library.policy` module (old path) has been removed. All consumers import from `aiac.pdp.policy.library.api`.
+- Models (`PolicyModel`, `AgentPolicyModel`) are imported from `aiac.policy.model.models`, not from the removed `aiac.pdp.library.models`.

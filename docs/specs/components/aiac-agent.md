@@ -4,24 +4,26 @@
 
 A LangGraph-based AI agent service that enforces a natural-language access control policy against the live PDP state. Triggered via the **Event Broker** (NATS JetStream) for all automated triggers, and directly via HTTP for the operator-only `rebuild` command:
 
-- **Event Broker** → `aiac.apply.service.{id}` subject (originated by Keycloak SPI `CLIENT_CREATED`)
-- **Event Broker** → `aiac.apply.role.{id}` subject (originated by Keycloak SPI role created/updated)
-- **Event Broker** → `aiac.apply.policy.build` subject (originated by RAG Ingest Service post-ingest)
+- **Event Broker** → `aiac.apply.service.{id}` subject (originated by the Keycloak SPI on a `CLIENT` `CREATE` admin event)
+- **Event Broker** → `aiac.apply.role.{name}` subject (percent-encoded role name; originated by Keycloak SPI role created/updated)
+- **Event Broker** → `aiac.apply.policy.build` subject (originated by RAG Ingest Service post-ingest). **Status: not built yet** — no RAG Ingest Service exists; nothing publishes this subject.
 - **Operator/admin call** → `POST /apply/policy/rebuild` directly via `kubectl port-forward` (HTTP only — not routed through Event Broker)
 
 The Agent subscribes to the Event Broker as a durable competing consumer (`aiac-agent-consumer` queue group). It acknowledges each message only after successful processing — ensuring at-least-once delivery and automatic replay on pod restart.
 
-The `/apply/*` HTTP endpoints are retained as a debugging escape hatch. The **NATS consumer is a thin adapter layer** that receives events from the Event Broker and calls the same internal `/apply/*` handler functions — there is no duplicated business logic.
+The `/apply/*` HTTP endpoints are retained as a debugging escape hatch. The **NATS consumer is a thin adapter layer** that receives events from the Event Broker and calls the same use-case handlers, `compute_and_apply` and (UC1) `reenable_service` that the `/apply/*` routes call — there is no duplicated business logic.
 
-The service is structured as a **Controller** (FastAPI routes) that dispatches to the **Service Onboarding Orchestrator** (UC1) or directly to the Policy Update and Role Update sub-agents (UC2, UC3). Each producing sub-agent calls the **shared Policy Rules Builder** (`agent/policy_rules_builder/`) directly, merges the results internally, and returns a single `list[PolicyRule]` to the Controller. The Controller calls `compute_and_apply(merged_rules)` from `aiac.policy.computation` (PCE) once.
+The service is structured as a **Controller** (FastAPI routes) that dispatches to the **Service Onboarding Orchestrator** (UC1) or directly to the Policy Update and Role Update sub-agents (UC2, UC3). Each producing sub-agent calls the **shared Policy Rules Builder** (`agent/policy_rules_builder/`) directly, merges the results internally, and returns a single `list[PolicyRule]` and an `override` flag to the Controller. The Controller calls `compute_and_apply(merged_rules, override)` from `aiac.policy.computation` (PCE) once.
 
 | Use Case | Dispatch | Sub-agents | Sub-agent output |
 |---|---|---|---|
-| Service Onboarding (UC1) | via Orchestrator | Service Provision + Service Policy Builder | `list[PolicyRule]` |
-| Policy Update (UC2) | Controller → sub-agent directly | Build or Rebuild (TBD) | `list[PolicyRule]` |
-| Role Update (UC3) | Controller → sub-agent directly | Role sub-agent | `list[PolicyRule]` |
+| Service Onboarding (UC1) | via Orchestrator | Service Provision + Service Policy Builder | `(list[PolicyRule], override=False, client_id)` |
+| Policy Update (UC2) | Controller → sub-agent directly | Build or Rebuild (TBD) | `(list[PolicyRule], override)` |
+| Role Update (UC3) | Controller → sub-agent directly | Role sub-agent | `(list[PolicyRule], override)` |
 
-Each producing sub-agent calls the **shared Policy Rules Builder** (`agent/policy_rules_builder/`) for each applicable (roles, scope) or (role, scopes) pair, merges the results, and returns a single `list[PolicyRule]` to the Controller. The Controller calls `compute_and_apply(merged_rules)` from `aiac.policy.computation` (PCE) once — no shared apply node exists. The PCE owns all Policy Model Store ↔ PDP Policy Writer coordination. Neither sub-agents nor the Policy Rules Builder call `aiac.pdp.policy.library` or `aiac.policy.model_store.library` directly.
+**Status: not built yet** — UC2 Build/Rebuild and UC3 Role are stubs that return `([], False)` / `([], True)` / `([], True)`; none calls the PRB, and Rebuild does not delegate to Build.
+
+The sub-agent calls the PRB for each applicable (roles, scope) or (role, scopes) pair. No shared apply node exists. The PCE owns all Policy Model Store ↔ PDP Policy Writer coordination. The Policy Rules Builder never calls `aiac.pdp.policy.library` or `aiac.policy.model_store.library`. The UC1 Service Policy Builder only reads the Policy Store (`get_service_policy`, read-only) for cross-service conflict detection. Only the PCE writes.
 
 All components are **logically separated modules within a single pod and process** — no inter-service network calls between orchestrators and sub-agents.
 
@@ -33,7 +35,7 @@ flowchart TD
     CTRL["Controller\nroutes.py"]
 
     NATS -->|"durable queue group\naiac-agent-consumer"| NATS_CONSUMER
-    NATS_CONSUMER -->|"calls internal handler"| CTRL
+    NATS_CONSUMER -->|"mirrors the routes:\ncalls the same handlers + PCE"| CTRL
     TRIGGERS --> CTRL
 
     subgraph CO["Service Onboarding"]
@@ -66,10 +68,10 @@ flowchart TD
     SA4  -->|"calls"| PRB
     SA6  -->|"calls"| PRB
 
-    ORC1 -->|"list[PolicyRule]"| CTRL
-    SA4  -->|"list[PolicyRule]"| CTRL
-    SA5  -->|"list[PolicyRule]"| CTRL
-    SA6  -->|"list[PolicyRule]"| CTRL
+    ORC1 -->|"(list[PolicyRule], override=False, client_id)"| CTRL
+    SA4  -->|"(list[PolicyRule], override)"| CTRL
+    SA5  -->|"(list[PolicyRule], override)"| CTRL
+    SA6  -->|"(list[PolicyRule], override)"| CTRL
 
     CTRL -->|"merged rules"| PCE
 ```
@@ -78,15 +80,15 @@ flowchart TD
 
 ## NATS Consumer
 
-A thin adapter started as an **asyncio background task** in the FastAPI `lifespan` handler. It subscribes to the `aiac.apply.>` wildcard on the `aiac-events` NATS JetStream stream using the `aiac-agent-consumer` durable queue group.
+A thin adapter started as an **asyncio background task** in the FastAPI `lifespan` handler. It binds the `aiac-agent-consumer` durable queue group on the `aiac-events` NATS JetStream stream (stream subjects `aiac.apply.>`), with the filter subjects `aiac.apply.service.*`, `aiac.apply.role.*` and `aiac.apply.policy.build` — never the DLQ subject.
 
 ### Dispatch table
 
 | Subject pattern | Internal handler |
 |---|---|
 | `aiac.apply.service.{id}` | Service Onboarding Orchestrator (UC1) |
-| `aiac.apply.role.{id}` | Role Update sub-agent (UC3, via Controller) |
-| `aiac.apply.policy.build` | Policy Update Build sub-agent (UC2, via Controller) |
+| `aiac.apply.role.{name}` | Role Update sub-agent (UC3) |
+| `aiac.apply.policy.build` | Policy Update Build sub-agent (UC2) |
 
 > **Follow-up:** `aiac.apply.offboard.{id}` (Service Offboarding, UC4) is the intended subject for event-driven offboard. It is **not yet wired** into the consumer — offboard is reachable today only via the `POST /apply/offboard/{service_id}` HTTP route.
 
@@ -123,8 +125,9 @@ The Controller is a FastAPI routes layer (`controller/routes.py`). Its responsib
 
 - Parse the trigger type and entity ID from the request path.
 - Dispatch to the Service Onboarding Orchestrator (UC1) or directly to the Policy Update / Role Update sub-agents (UC2, UC3).
-- Receive the `list[PolicyRule]` returned by the Orchestrator or sub-agent (already merged by the sub-agent).
-- Call `compute_and_apply(merged_rules)` from `aiac.policy.computation` (PCE) once. For UC1, the onboarding route and the NATS consumer also pass `override` and `focus_service` (the clientId of the service being onboarded, which `onboard_service` returns — not the UUID in the path), so the PCE routing guard keeps the rules of a disabled (quarantined) service that re-onboards.
+- Receive the `(list[PolicyRule], override)` tuple returned by the Orchestrator or sub-agent (rules already merged by the sub-agent; UC1 also returns `client_id`).
+- Call `compute_and_apply(merged_rules, override)` from `aiac.policy.computation` (PCE) once. For UC1, the onboarding route and the NATS consumer also pass `focus_service` (the clientId of the service being onboarded, which `onboard_service` returns — not the UUID in the path), so the PCE routing guard keeps the rules of a disabled (quarantined) service that re-onboards.
+- For UC1, after `compute_and_apply` succeeds, call `reenable_service(service_id)` (by the UUID).
 - Return a bare HTTP status code to the caller; write summary and debug info to the log.
 
 No per-use-case business logic, retry handling, or state assembly lives in the Controller. PRB calls are owned by the producing sub-agents; the Controller's shared step is the single PCE call.
@@ -139,10 +142,10 @@ Each use case (and the UC1 Orchestrator) is specified in a dedicated sub-PRD:
 |---|---|---|---|
 | Service Onboarding | [aiac-agent/uc1-service-onboarding.md](aiac-agent/uc1-service-onboarding.md) | `aiac.apply.service.{id}`, `POST /apply/service/{id}` | Orchestrator sequences: Service Provision → Service Policy Builder (IdP reader + PRB invoker) |
 | Policy Update | [aiac-agent/uc2-policy-update.md](aiac-agent/uc2-policy-update.md) | `aiac.apply.policy.build`, `POST /apply/policy/build`, `POST /apply/policy/rebuild` | |
-| Role Update | [aiac-agent/uc3-role-update.md](aiac-agent/uc3-role-update.md) | `aiac.apply.role.{id}`, `POST /apply/role/{id}` | |
-| Service Offboarding | (see PCE `decommission`) | `POST /apply/offboard/{service_id}` (`aiac.apply.offboard.{id}` — NATS wiring is a follow-up) | Thin sub-agent; calls the PCE's `decommission(service_id)` **directly** (whole-service teardown, not a rule fold — bypasses the PRB and `compute_and_apply`). Keyed by **clientId, not UUID** (an offboarded client is gone from `get_services()`). |
+| Role Update | [aiac-agent/uc3-role-update.md](aiac-agent/uc3-role-update.md) | `aiac.apply.role.{name}`, `POST /apply/role/{id}` | |
+| Service Offboarding | (see PCE `decommission`) | `POST /apply/offboard/{service_id}` (`aiac.apply.offboard.{id}` — NATS wiring is a follow-up) | Thin stub sub-agent returns the clientId unchanged; the Controller route calls the PCE's `decommission(service_id)` **directly** (whole-service teardown, not a rule fold — bypasses the PRB and `compute_and_apply`). Keyed by **clientId, not UUID** (an offboarded client is gone from `get_services()`). **Status: not built yet** — the sub-agent does no clientId validation or resolution (issue 3.21). |
 
-> **Note:** Each producing sub-agent (UC1–UC3) calls the **shared Policy Rules Builder** directly, merges the results, and returns `list[PolicyRule]` to the Controller. The Controller calls `compute_and_apply(merged_rules)` from `aiac.policy.computation` (PCE) once. Policy rule application is fully specified in [policy-computation-engine.md](policy-computation-engine.md). The Policy Rules Builder is specified in [aiac-agent/policy-rules-builder.md](aiac-agent/policy-rules-builder.md). **UC4 (Service Offboarding) is the exception:** it produces no rules — its handler resolves the clientId and calls the PCE's authoritative `decommission(service_id)` (specified in [policy-computation-engine.md → Decommission](policy-computation-engine.md#decommission-service-offboard)) to tear down the service's entire policy footprint.
+> **Note:** Policy rule application is fully specified in [policy-computation-engine.md](policy-computation-engine.md). The Policy Rules Builder is specified in [aiac-agent/policy-rules-builder.md](aiac-agent/policy-rules-builder.md). **UC4 (Service Offboarding) is the exception:** it produces no rules — its stub handler returns the clientId unchanged, and the Controller route calls the PCE's authoritative `decommission(service_id)` (specified in [policy-computation-engine.md → Decommission](policy-computation-engine.md#decommission-service-offboard)) to tear down the service's entire policy footprint.
 
 ### IdP access — library, not service
 
@@ -167,7 +170,7 @@ A `/health` reply needs a **free event loop** — the process being "up" is not 
 
 The `/apply/offboard/{service_id}` path uses the `{service_id:path}` converter (slash-bearing SPIFFE-URI clientIds) and is keyed on the **clientId (SPM key)**, not the Keycloak UUID that `/apply/service/{service_id}` carries — an offboarded client is gone from `get_services()`, so UUID→clientId resolution is impossible. The PCE takes only the clientId; the onboarding resolves it from the UUID in the Orchestrator.
 
-The `/apply/*` endpoints return bare HTTP status codes: `200 OK` on success (no response body), and the status codes from the Error Handling table on upstream failure. Success responses carry no body; upstream failures and PRB exceptions are raised as FastAPI `HTTPException`s, so error responses carry a sanitized JSON error body (`{"detail": <safe summary>}`; see [Error Handling → Sanitized body vs. full log](#sanitized-body-vs-full-log)) alongside the status code. Summary, applied-rule details, and debug information are written to the service log. Validation failures surface as an error status and log entry; detailed reporting is specified in [policy-rules-builder.md](aiac-agent/policy-rules-builder.md). A genuine grant/prohibit conflict surfaces on `/apply` as a `422` with a `ConflictReport` body (verbatim policy quotes; see [Error Handling](#error-handling)). There is no separate pre-commit `/policy/check` route — it is retired (see [PRB design decision: identify conflicts, never reconcile](aiac-agent/policy-rules-builder.md#design-decision-identify-conflicts-never-reconcile) / #2503), and the conflict diagnostic is folded into `/apply`.
+The `/apply/*` endpoints return bare HTTP status codes: `200 OK` on success (no response body), and the status codes from the Error Handling table on upstream failure. Success responses carry no body; upstream failures are raised as FastAPI `HTTPException`s and the Controller's exception handlers map the PRB exceptions, so error responses carry a sanitized JSON error body (`{"detail": <safe summary>}`; see [Error Handling → Sanitized body vs. full log](#sanitized-body-vs-full-log)) alongside the status code. Summary, applied-rule details, and debug information are written to the service log. Validation failures surface as an error status and log entry; detailed reporting is specified in [policy-rules-builder.md](aiac-agent/policy-rules-builder.md). A genuine grant/prohibit conflict surfaces on `/apply` as a `422` with a `ConflictReport` body (verbatim policy quotes; see [Error Handling](#error-handling)). There is no separate pre-commit `/policy/check` route — it is retired (see [PRB design decision: identify conflicts, never reconcile](aiac-agent/policy-rules-builder.md#design-decision-identify-conflicts-never-reconcile) / #2503), and the conflict diagnostic is folded into `/apply`.
 
 ---
 
@@ -176,29 +179,33 @@ The `/apply/*` endpoints return bare HTTP status codes: `200 OK` on success (no 
 | Variable | Default | Source |
 |---|---|---|
 | `NATS_URL` | `nats://aiac-event-broker-service:4222` | ConfigMap (`aiac-pdp-config`) |
-| `AIAC_PDP_CONFIG_URL` | `http://aiac-pdp-config-service:7071` | ConfigMap (`aiac-pdp-config`) — used by `aiac.idp.configuration.api` (in-process via PCE) |
-| `AIAC_PDP_POLICY_URL` | `http://aiac-pdp-policy-service:7072` | ConfigMap (`aiac-pdp-config`) — used by `aiac.pdp.policy.library` (in-process via PCE) |
-| `AIAC_POLICY_MODEL_STORE_URL` | `http://aiac-policy-model-store-service:7074` | ConfigMap (`aiac-pdp-config`) — used by `aiac.policy.model_store.library` (in-process via PCE) |
-| `AIAC_CHROMADB_URL` | `http://aiac-rag-service:8000` | ConfigMap (`aiac-pdp-config`) |
+| `AIAC_PDP_CONFIG_URL` | `http://aiac-pdp-config-service:7071` | ConfigMap (`aiac-pdp-config`) — used by `aiac.idp.configuration.api` (in-process: Orchestrator, Provision, Service Policy Builder, PCE; also the `aiac-init` health gate) |
+| `AIAC_PDP_POLICY_URL` | `http://aiac-pdp-policy-service:7072` | ConfigMap (`aiac-pdp-config`) — used by `aiac.pdp.policy.library` (in-process via PCE; also the `aiac-init` health gate) |
+| `AIAC_POLICY_MODEL_STORE_URL` | `http://aiac-policy-model-store-service:7074` | ConfigMap (`aiac-pdp-config`) — used by `aiac.policy.model_store.library` (in-process via PCE; read-only by the UC1 Service Policy Builder) |
+| `AIAC_CHROMADB_URL` | `http://aiac-rag-service:8000` | ConfigMap (`aiac-pdp-config`). **Status: not built yet** — no code reads it, and no ConfigMap sets it (Phase 2 ChromaDB source). |
 | `KEYCLOAK_REALM` | — | ConfigMap (`aiac-pdp-config`) |
 | `LLM_BASE_URL` | — | ConfigMap |
 | `LLM_MODEL` | — | ConfigMap |
 | `LLM_API_KEY` | — | Kubernetes Secret |
-| `AIAC_AC_MODEL` | `RBAC` | ConfigMap (accepted: `RBAC`, `ABAC`, `REBAC`) |
-| `CHROMA_N_RESULTS` | `10` | ConfigMap |
-| `MAX_CHANGES_PER_RUN` | `50` | ConfigMap |
+| `AIAC_AC_MODEL` | `RBAC` | ConfigMap (accepted: `RBAC`, `ABAC`, `REBAC`). **Status: not built yet** — no code reads `AIAC_AC_MODEL`; the ConfigMap value is ignored. |
+| `CHROMA_N_RESULTS` | `10` | ConfigMap. **Status: not built yet** — no code reads it, and no ConfigMap sets it (Phase 2). |
+| `MAX_CHANGES_PER_RUN` | `50` | ConfigMap. **Status: not built yet** — no code reads it, and no ConfigMap sets it. |
 | `UPSTREAM_MAX_RETRIES` | `3` | ConfigMap |
 | `LLM_MAX_RETRIES` | `3` | ConfigMap |
 | `LLM_RETRY_BACKOFF_MIN` | `1` | ConfigMap |
 | `LLM_RETRY_BACKOFF_MAX` | `30` | ConfigMap |
-| `ONBOARD_LABEL_WAIT_ATTEMPTS` | `15` | ConfigMap |
-| `ONBOARD_LABEL_WAIT_BACKOFF` | `2.0` | ConfigMap |
-| `ONBOARD_CARD_WAIT_ATTEMPTS` | `15` | ConfigMap |
-| `ONBOARD_CARD_WAIT_BACKOFF` | `2.0` | ConfigMap |
+| `LLM_REQUEST_TIMEOUT` | `120` | ConfigMap |
+| `ONBOARD_LABEL_WAIT_ATTEMPTS` | `15` | env (optional; not set in `k8s/`; code default) |
+| `ONBOARD_LABEL_WAIT_BACKOFF` | `2.0` | env (optional; not set in `k8s/`; code default) |
+| `ONBOARD_CARD_WAIT_ATTEMPTS` | `15` | env (optional; not set in `k8s/`; code default) |
+| `ONBOARD_CARD_WAIT_BACKOFF` | `2.0` | env (optional; not set in `k8s/`; code default) |
+| `AIAC_MCP_DISCOVERY_READY_TIMEOUT` | `120` | env (optional; not set in `k8s/`; code default) |
+| `AIAC_POLICY_FILE` | `/etc/aiac/policy.md` | env (optional; not set in `k8s/`; code default) |
+| `AIAC_RAG_INGEST_URL` | — | env (optional; `aiac-init` only; not set in `k8s/`) |
 
 `UPSTREAM_MAX_RETRIES` governs the IdP, MCP, and Kubernetes transport seams only. The `LLM_*` knobs govern the PRB's LLM seam (see [Error Handling → Two retry layers](#two-retry-layers)). The `ONBOARD_LABEL_WAIT_*` knobs bound UC1 `classify_service`'s wait for the operator-applied `rossoctl.io/type` pod label, and the `ONBOARD_CARD_WAIT_*` knobs bound `analyze_agent`'s wait for the agent's AgentCard `status.card.skills` to sync — **two separate deploy→onboard races** (see [`uc1-service-onboarding.md`](aiac-agent/uc1-service-onboarding.md)): up to `*_ATTEMPTS` looks, `*_BACKOFF` seconds apart (both default `15` / `2.0`, ≈30s of slack). A non-numeric or below-minimum value falls back to the default rather than crashing onboarding.
 
-ChromaDB collections: `aiac-policies` and `aiac-domain-knowledge`.
+ChromaDB collections: `aiac-policies` and `aiac-domain-knowledge`. **Status: not built yet** — no code uses ChromaDB (Phase 2).
 
 ---
 
@@ -216,7 +223,7 @@ The Agent keeps two retry layers distinct.
 
 | Upstream | HTTP status on final failure |
 |---|---|
-| ChromaDB | `503 Service Unavailable` |
+| ChromaDB | `503 Service Unavailable`. **Status: not built yet** — no code uses ChromaDB (Phase 2). |
 | IdP Configuration Service | `502 Bad Gateway` |
 | PDP Policy Writer | `502 Bad Gateway` |
 | Kubernetes API | `502 Bad Gateway` |
@@ -239,9 +246,9 @@ The base class `PolicyRulesBuilderBaseError` is a `500` safety net: any unforese
 
 ### Sanitized body vs. full log
 
-An error response body carries a safe summary only — `{"detail": <safe summary>}` — with no internal endpoint, host, or key. The full detail (endpoint, root cause, and traceback) goes to the named loggers only. The `PolicyConflictError` body is the one exception: its `ConflictReport` is already safe, because it carries policy quotes only.
+An error response body carries a safe summary only — `{"detail": <safe summary>}` — with no internal endpoint, host, or key. The full detail (endpoint, root cause, and traceback) goes to the named loggers only. The `PolicyConflictError` and `PolicyContradictionError` bodies are the exceptions: each is a `ConflictReport`, which is already safe, because it carries policy findings only.
 
-Upstream failures and PRB exceptions propagate as HTTP error responses on the synchronous `/apply/*` paths, raised as FastAPI `HTTPException`s. The status code is authoritative.
+Upstream failures and PRB exceptions propagate as HTTP error responses on the synchronous `/apply/*` paths: upstream failures are raised as FastAPI `HTTPException`s, and the Controller's exception handlers map the PRB exceptions. The status code is authoritative.
 
 ### Async failure classification
 
@@ -254,7 +261,7 @@ On the NATS path the failure class is decided by **exception type**, never by HT
 - Framework: FastAPI with uvicorn
 - Bind: `0.0.0.0:7070`
 - State: stateless — changes applied immediately, no pending session required
-- Base image: `python:3.12-slim`
+- Base image: `python:3.13-slim`
 
 ---
 
@@ -265,17 +272,24 @@ src/aiac/
 ├── shared/                             ← project-level shared: run_upstream (upstream.py) — transport retry primitive
 └── agent/
     ├── controller/
+    ├── eventbus/                       ← consumer.py (NATS consumer, lifespan); stream.py (stream/consumer config, ensure_stream)
+    ├── init/                           ← wait_and_provision.py (aiac-init container: health gates + stream provisioning)
+    ├── llm.py                          ← shared LLM seam (client, retry, sanitized LLM errors) for the PRB and the Policy Digester
+    ├── policy_digester/                ← Policy Digester (digest.py, prompts.py)
     ├── shared/                         ← flatten_role (roles.py); focal_entities.py (resolve_focal_entities — D13, shared by live build() + diagnostic; skips the roles and scopes of every disabled service, except the focus service); error_logging.py (log_by_type — per-persona named-logger router)
     ├── uc/
+    │   ├── offboarding/
+    │   │   └── offboard.py             ← offboard_service stub: returns the clientId unchanged
     │   ├── onboarding/
-    │   │   ├── orchestrator.py         ← sequences provision → policy_builder, returns list[PolicyRule]
-    │   │   ├── provision/              ← LLM sub-agent: classify, analyze, write to IdP; kube.py = retrying K8s seam
-    │   │   └── policy_builder/         ← IdP reader + PRB invoker: read IdP, call PRB, return list[PolicyRule]
+    │   │   ├── orchestrator.py         ← sequences provision → policy_builder, returns (list[PolicyRule], override=False, client_id)
+    │   │   ├── provision/              ← non-LLM sub-agent: classify, analyze, write to IdP; kube.py = retrying K8s seam
+    │   │   └── policy_builder/         ← IdP reader + PRB invoker: read IdP, call PRB, return list[PolicyRule]; cross_service.py = read-only Policy Store read (applied_rules_for_scopes)
     │   ├── policy_update/
-    │   │   ├── build/                  ← calls PRB, returns list[PolicyRule]; TBD internals
-    │   │   └── rebuild/                ← delegates to Build; TBD internals
-    │   └── role_update/                ← calls PRB with (role, all_scopes), returns list[PolicyRule]
-    └── policy_rules_builder/           ← shared; called by Service Policy Builder, Build, and Role sub-agent
+    │   │   ├── build.py                ← stub: build_policy() returns ([], False); TBD internals
+    │   │   └── rebuild.py              ← stub: rebuild_policy() returns ([], True); TBD internals
+    │   └── role_update/
+    │       └── role.py                 ← stub: update_role(role_id) returns ([], True)
+    └── policy_rules_builder/           ← shared; called by the Service Policy Builder (Build and Role sub-agent: not built yet)
         ├── diagnostic.py               ← parallel diagnostic assembly (START-seeds-text, _audit_diagnostic record-not-raise, terminal _explain)
         └── diagnostic_models.py        ← ConflictReport + conflict/unevaluated row models
 ```
@@ -303,4 +317,5 @@ requests
 python-dotenv
 kubernetes
 nats-py
+httpx==0.28.1
 ```

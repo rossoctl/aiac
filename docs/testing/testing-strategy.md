@@ -52,7 +52,7 @@ it needs an LLM endpoint and nothing else. It **skips cleanly** when `LLM_BASE_U
 ## Clean-skip discipline
 
 A live suite must never false-pass when its environment is absent. System and live-LLM tests use
-`require_env_or_skip(...)` (a clean `pytest.skip`) so an unset variable or an unwired cluster
+`require_env_or_skip(...)` or an equivalent direct `pytest.skip` (a clean skip) so an unset variable or an unwired cluster
 **skips** rather than fails or silently passes.
 
 ## Specs in this directory
@@ -60,5 +60,5 @@ A live suite must never false-pass when its environment is absent. System and li
 | Spec | Level | What it documents |
 |---|---|---|
 | [pdp-policy-writer.md](pdp-policy-writer.md) | write-only launcher | Standalone `generate_rego.py` launcher — applies a `PolicyModel` and writes Rego for manual inspection. Not a `@pytest.mark`-tagged test. |
-| [policy-pipeline.md](policy-pipeline.md) | write-only launcher | Standalone `policy_pipeline.py` launcher driving the full identity→policy pipeline for manual Rego inspection. |
+| [policy-pipeline.md](policy-pipeline.md) | system | `test/system/test_policy_pipeline.py` — `@pytest.mark.system`, the full inbound/outbound matrix + negative controls over the fully onboarded stack, asserted through the deployed OPA plugin. |
 | [uc1-onboarding-pipeline.md](uc1-onboarding-pipeline.md) | system | The UC-1 onboarding ladder — `@pytest.mark.system`, real in-cluster onboarding asserted through the deployed OPA plugin. |
