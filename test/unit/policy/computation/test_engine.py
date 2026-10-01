@@ -1212,9 +1212,7 @@ def _guard_catalog(*, agent_enabled=True, tool_enabled=True):
 
 def test_guard_drops_rule_whose_scope_owner_is_disabled():
     AR, UR, AS, TS, catalog = _guard_catalog(tool_enabled=False)
-    store = run_engine(
-        [_rule(AR, TS), _rule(UR, TS), _rule(UR, AS)], catalog=catalog, focus_service="github-agent"
-    )
+    store = run_engine([_rule(AR, TS), _rule(UR, TS), _rule(UR, AS)], catalog=catalog, focus_service="github-agent")
 
     assert "github-tool" not in store.data
     assert _pairs(_inbound(store.data["github-agent"])) == [("r-user-dev", "s-agent-inbound")]

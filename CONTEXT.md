@@ -145,7 +145,7 @@ rollback disables the client. Keyed by the clientId, as every PCE operation
 is. It deletes the service's SPM, removes its roles
 from the other SPMs, replaces a failed agent's CR with a no-rules CR (which
 denies every request), and re-derives the affected agents. A disabled client
-*is* a quarantined service: the routing guard drops every rule that touches it,
+_is_ a quarantined service: the routing guard drops every rule that touches it,
 and the focal resolver gives it no candidate role or scope. Only a successful
 re-onboarding lifts it. Distinct from **decommission** (the offboard teardown of
 a deleted client, keyed by clientId).
