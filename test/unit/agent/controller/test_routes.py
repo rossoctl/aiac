@@ -29,6 +29,10 @@ from aiac.policy.model.models import PolicyRule, RuleEffect
 
 client = TestClient(app)
 
+# What onboard_service returns for the onboarded service: the route gets the UUID in the path, the PCE
+# takes the clientId.
+CLIENT_ID = "spiffe://example.org/ns/team1/sa/svc"
+
 
 def _rule(role_id: str = "r-1", scope_id: str = "s-1") -> PolicyRule:
     return PolicyRule(
@@ -54,7 +58,7 @@ def test_health_returns_ok_without_touching_handlers_or_pce():
 
 def test_apply_service_dispatches_to_orchestrator_and_calls_pce_once():
     with (
-        patch("aiac.agent.controller.routes.onboard_service", return_value=([], False)) as orch,
+        patch("aiac.agent.controller.routes.onboard_service", return_value=([], False, CLIENT_ID)) as orch,
         patch("aiac.agent.controller.routes.compute_and_apply") as pce,
         patch("aiac.agent.controller.routes.reenable_service") as reenable,
     ):
@@ -62,16 +66,17 @@ def test_apply_service_dispatches_to_orchestrator_and_calls_pce_once():
 
     assert resp.status_code == 200
     orch.assert_called_once_with("svc-123")
-    # The focus service (the Keycloak UUID) reaches the PCE routing guard.
-    pce.assert_called_once_with([], False, focus_service="svc-123")
-    # The client is re-enabled only after the PCE apply succeeds.
+    # The focus service reaches the PCE routing guard as the clientId from onboard_service, not the
+    # path's Keycloak UUID.
+    pce.assert_called_once_with([], False, focus_service=CLIENT_ID)
+    # The client is re-enabled (an IdP call, by its UUID) only after the PCE apply succeeds.
     reenable.assert_called_once_with("svc-123")
 
 
 def test_apply_service_ignores_a_default_effect_env():
     # The default effect is always DENY: a stale AIAC_DEFAULT_EFFECT on the Controller has no effect.
     with (
-        patch("aiac.agent.controller.routes.onboard_service", return_value=([], False)) as orch,
+        patch("aiac.agent.controller.routes.onboard_service", return_value=([], False, CLIENT_ID)) as orch,
         patch("aiac.agent.controller.routes.compute_and_apply") as pce,
         patch("aiac.agent.controller.routes.reenable_service"),
         patch.dict("os.environ", {"AIAC_DEFAULT_EFFECT": "Allow"}, clear=False),
@@ -80,7 +85,7 @@ def test_apply_service_ignores_a_default_effect_env():
 
     assert resp.status_code == 200
     orch.assert_called_once_with("svc-123")
-    pce.assert_called_once_with([], False, focus_service="svc-123")
+    pce.assert_called_once_with([], False, focus_service=CLIENT_ID)
     assert not hasattr(routes, "DEFAULT_EFFECT_ENV")
     assert not hasattr(routes, "_default_effect_from_env")
 
@@ -155,7 +160,7 @@ def test_controller_forwards_handler_rules_and_override_verbatim():
     with (
         patch(
             "aiac.agent.controller.routes.onboard_service",
-            return_value=(rules, False),
+            return_value=(rules, False, CLIENT_ID),
         ),
         patch("aiac.agent.controller.routes.compute_and_apply") as pce,
         patch("aiac.agent.controller.routes.reenable_service"),
@@ -164,7 +169,7 @@ def test_controller_forwards_handler_rules_and_override_verbatim():
 
     assert resp.status_code == 200
     # Exactly one PCE call, with the handler's own rules object and flag — not a rebuilt/empty one.
-    pce.assert_called_once_with(rules, False, focus_service="svc-9")
+    pce.assert_called_once_with(rules, False, focus_service=CLIENT_ID)
     forwarded_rules, forwarded_override = pce.call_args.args
     assert forwarded_rules is rules
     assert forwarded_override is False
@@ -191,7 +196,7 @@ def test_apply_service_does_not_reenable_when_pce_apply_raises():
     with (
         patch(
             "aiac.agent.controller.routes.onboard_service",
-            return_value=([], False),
+            return_value=([], False, CLIENT_ID),
         ),
         patch(
             "aiac.agent.controller.routes.compute_and_apply",

@@ -1215,7 +1215,7 @@ def publish_service_event(service_uuid: str) -> None:
     """Re-fire the onboarding trigger for an EXISTING Keycloak client: publish on
     ``aiac.apply.service.<uuid>`` (the subject + ``{"id": ...}`` payload the ``aiac-event-listener`` SPI
     publishes on ``CLIENT_CREATED``), so the agent consumer runs the same ``onboard_service`` →
-    ``compute_and_apply(focus_service=uuid)`` → ``reenable_service`` path a deploy fires.
+    ``compute_and_apply(focus_service=client_id)`` → ``reenable_service`` path a deploy fires.
 
     A redeploy cannot do this — the SPI publishes only on client CREATE, and a re-created client has a
     new UUID (a new service, not the quarantined one). The publish runs from INSIDE the Controller pod,

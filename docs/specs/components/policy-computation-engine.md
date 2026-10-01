@@ -55,7 +55,7 @@ These AIAC invariants (from the policy-model spec, handoff 01) are relied on by 
 7. As a developer, I want exceptions from the computation logged **and re-raised**, so a failed IdP / store / PDP interaction surfaces to the caller (the Controller returns HTTP 500; a NATS consumer nacks → at-least-once redelivery) instead of being silently dropped while nothing is applied.
 8. As a developer, I want a stable import path, so the calling convention does not change as the module grows.
 9. As the Policy Computation Engine, I want one run at a time to change the SPMs, so two concurrent onboardings that route rules into one shared SPM do not lose the rules of one run.
-10. As the UC1 Orchestrator, I want to quarantine a failed onboarding by its Keycloak UUID, so its policy footprint is removed, a failed agent denies every request, and no later run writes rules back into that footprint.
+10. As the UC1 Orchestrator, I want to quarantine a failed onboarding by its clientId, so its policy footprint is removed, a failed agent denies every request, and no later run writes rules back into that footprint.
 
 ---
 
@@ -84,18 +84,20 @@ Three entry points — an incremental fold, an authoritative offboard, and the t
 def compute_and_apply(
     rules: list[PolicyRule],
     override: bool = False,
-    focus_service: str | None = None,   # Keycloak internal client UUID of the service this onboarding builds
+    focus_service: ClientId | None = None,   # clientId of the service this onboarding builds
 ) -> None
-def decommission(service_id: str) -> None   # service_id = clientId (SPM key), not the Keycloak UUID
-def quarantine(service_uuid: str) -> None   # service_uuid = Keycloak internal client UUID (Service.id)
+def decommission(service_id: ClientId) -> None
+def quarantine(service_id: ClientId, deleted_roles: Iterable[Role] = ()) -> None   # deleted_roles = roles the rollback deleted
 ```
+
+**Service ids: the PCE takes only the clientId.** Keycloak gives every client two ids: the internal UUID (`Service.id`, type `ServiceUuid`) and the `clientId` (`Service.serviceId`, a SPIFFE ID, type `ClientId`; both `NewType`s of `str` in `aiac.idp.configuration.models`). Every service id the PCE takes is the clientId — the SPM key, `PolicyRule.scope.serviceId`, and OPA `input.identity.service_id`. The UUID is only for finding the service in the IdP. The asymmetry stays at the HTTP/NATS boundary: an onboarding comes in with a UUID (`/apply/service/{uuid}`, `aiac.apply.service.<uuid>`), and the UC1 Orchestrator resolves the clientId once, before Provision, while the client still exists; an offboard comes in with the clientId, because after the client is deleted UUID→clientId resolution is impossible.
 
 - **No return value; failures propagate:** on success the caller receives no return value. All three functions log exceptions and **re-raise** them — a failure in IdP resolution, Policy Model Store I/O, or PDP Policy Writer push surfaces to the caller (the Controller returns HTTP 500; a NATS consumer nacks → at-least-once redelivery) rather than being silently swallowed while nothing is applied.
 - **`override`:** selects the merge mode (see [Merge Semantics](#merge-semantics)). `False` (default) appends additively at the SPM layer; `True` authoritatively replaces every input role's mappings **across all SPMs** (role-level revocation). Set by the caller (the Controller) from the producing UC's choice — UC1 = `False`, UC3 = `True`, UC2 Rebuild = `True`, UC2 Build = TBD.
-- **`focus_service`:** the Keycloak internal client UUID (`Service.id`) of the service that this onboarding builds. The [routing guard](#routing-guard-disabled-services) does not drop the rules of this service while its client is disabled. The onboarding route (`POST /apply/service/{id}`) and the NATS consumer (`aiac.apply.service.<uuid>`) pass it. Other callers pass nothing.
+- **`focus_service`:** the clientId (`Service.serviceId`) of the service that this onboarding builds — not its Keycloak UUID. The [routing guard](#routing-guard-disabled-services) does not drop the rules of this service while its client is disabled. The onboarding route (`POST /apply/service/{uuid}`) and the NATS consumer (`aiac.apply.service.<uuid>`) pass the clientId that `onboard_service` returns. Other callers pass nothing.
 - **No default effect:** there is no default-effect parameter. A `(role, scope)` pair that no rule mentions is always DENY.
 - **`decommission`:** the authoritative service **offboard** — tears down a decommissioned service's entire policy footprint (see [Decommission (service offboard)](#decommission-service-offboard)). Keyed by the **clientId (SPM key)**, since an offboarded client is gone from `get_services()` and its UUID can no longer be resolved.
-- **`quarantine`:** the UC1 failure-path teardown of a failed onboarding (see [Quarantine (failed onboarding)](#quarantine-failed-onboarding)). Keyed by the **Keycloak internal client UUID**, because the failed service stays in the catalog (disabled).
+- **`quarantine`:** the UC1 failure-path teardown of a failed onboarding (see [Quarantine (failed onboarding)](#quarantine-failed-onboarding)). Keyed by the **clientId (SPM key)**, as `decommission` is. The failed service stays in the catalog (disabled).
 - **Serialization:** all three functions hold one PCE lock for their whole body (see [Serialization (the PCE lock)](#serialization-the-pce-lock)).
 - Import path: `from aiac.policy.computation import compute_and_apply, decommission, quarantine`
 
@@ -194,7 +196,7 @@ The prune runs over **both** `inbound_allow_rules` and `inbound_deny_rules` — 
 
 Reconcile is passive and catalog-anchored: it prunes only **touched** SPMs and skips any whose owner is absent from `get_services()`. That leaves the **onboard→offboard** drift species uncovered — once a service `X` is decommissioned (its Keycloak client + roles/scopes deleted), `X` is gone from the catalog forever, so (1) `SPM(X)`'s own inbound edges linger; (2) `X`'s **outbound footprint** (`X_role → other_scope` edges on *other* SPMs) is never pruned; (3) if `X` was an agent, its **APM/Rego stays in the PDP**. `decommission(service_id)` is the **authoritative** teardown for exactly this — it acts on an explicit offboard signal, not the catalog-miss guard.
 
-**Keyed by the clientId, not the UUID.** An offboarded client is gone from `get_services()`, so UUID→clientId resolution is impossible; the offboard contract carries the clientId (`Service.serviceId`, the SPM key) directly. This is the documented asymmetry with onboard's `/apply/service/{uuid}`.
+**Keyed by the clientId, not the UUID.** An offboarded client is gone from `get_services()`, so UUID→clientId resolution is impossible; the offboard contract carries the clientId (`Service.serviceId`, the SPM key) directly. The asymmetry with onboard's `/apply/service/{uuid}` is only at the boundary: the PCE takes the clientId in both cases (see [Public API](#public-api)).
 
 Steps:
 
@@ -211,15 +213,15 @@ Steps:
 
 #### Quarantine (failed onboarding)
 
-`quarantine(service_uuid)` is the UC1 failure-path counterpart of `decommission`. The UC1 Orchestrator calls it after the compensating rollback and before it re-raises the build error (see [`aiac-agent/uc1-service-onboarding.md` → Failure & Rollback](aiac-agent/uc1-service-onboarding.md#failure--rollback)). The Orchestrator never calls the PDP library itself. The PCE owns the PDP.
+`quarantine(service_id, deleted_roles)` is the UC1 failure-path counterpart of `decommission`. The UC1 Orchestrator calls it after the compensating rollback and before it re-raises the build error (see [`aiac-agent/uc1-service-onboarding.md` → Failure & Rollback](aiac-agent/uc1-service-onboarding.md#failure--rollback)). The Orchestrator never calls the PDP library itself. The PCE owns the PDP.
 
-**Keyed by the Keycloak UUID, not the clientId.** The rollback disables the client. It does not delete it. So the failed service `X` is still in the catalog, and the PCE resolves the `serviceId` (the SPM key) from the catalog.
+**Keyed by the clientId, not the UUID.** Like `decommission`, `quarantine` takes the clientId (the SPM key). The UC1 Orchestrator resolves it from the onboarding's UUID once, before Provision. The rollback disables the client. It does not delete it. So the failed service `X` is still in the catalog.
 
 Steps (under the PCE lock):
 
-1. **Catalog once** (`get_services()`). Find `X` by `Service.id == service_uuid`. An unknown UUID is a logged no-op.
+1. **Catalog once** (`get_services()`). A `service_id` that is not a catalog key (for example a UUID passed by mistake) is a logged no-op.
 2. **Targeters** — the agents that targeted `X` (the `actorIds` of every Agent-kind inbound edge on `SPM(X)`, allow and deny).
-3. **Remove `X`'s roles from the other SPMs** — the same purge as decommission step 4. `X`'s SPM is seeded from the catalog, so this removes the roles that `X` still has. The edges of the roles that the rollback deleted are removed later by [reconcile](#reconcile-drift-gc), when a run touches those SPMs.
+3. **Remove `X`'s roles from the other SPMs** — the same purge as decommission step 4. `X`'s SPM is seeded from the catalog, so this removes the roles that `X` still has. The catalog does not list the roles that the rollback deleted, so the Orchestrator passes them in `deleted_roles` (the run's created-manifest), and this step removes their edges too. Without this, a grant that a concurrent onboarding stored for a deleted role (for example `X_role → B_scope` on `SPM(B)`) would keep allowing `X` in `B`'s inbound policy until a later run [reconciles](#reconcile-drift-gc) `SPM(B)`.
 4. **Delete `SPM(X)`** and persist each changed SPM.
 5. **Agent: replace its CR with a no-rules CR.** For an agent, write the `_fresh_apm` shell (identity maps only, no rules) through `apply_agent_policy`. Under always-DENY this CR denies every request. This is **not** a delete, on purpose: the bundle-service combiner allows a pod that has no client CR, so a delete would open the agent (see [`pdp-policy-writer-opa.md` → Quarantined agent — the no-rules CR](pdp-policy-writer-opa.md#quarantined-agent--the-no-rules-cr)). A tool gets no CR (a tool has none).
 6. **Re-derive** the affected agents (the targeters, and the agents whose SPMs lost `X`'s roles; `X` excluded) and apply them in one `apply_policy` call.

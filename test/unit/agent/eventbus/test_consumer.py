@@ -29,6 +29,10 @@ from aiac.agent.policy_rules_builder.graph import (
     UnparseableLLMResponseError,
 )
 
+# What onboard_service returns for the onboarded service: the subject carries the Keycloak UUID, the
+# PCE takes the clientId.
+CLIENT_ID = "spiffe://example.org/ns/team1/sa/svc-1"
+
 
 def _fake_msg(subject: str, num_delivered: int = 1) -> MagicMock:
     msg = MagicMock()
@@ -49,11 +53,12 @@ def _fake_nc() -> MagicMock:
 
 
 def test_handle_routes_service_subject_to_onboard_service():
-    with patch("aiac.agent.eventbus.consumer.onboard_service", return_value=([], False)) as onboard:
+    with patch("aiac.agent.eventbus.consumer.onboard_service", return_value=([], False, CLIENT_ID)) as onboard:
         result = _handle("aiac.apply.service.svc-1")
 
+    # The UUID from the subject goes to onboard_service; the focus service comes back as the clientId.
     onboard.assert_called_once_with("svc-1")
-    assert result == ([], False)
+    assert result == ([], False, CLIENT_ID)
 
 
 def test_handle_routes_role_subject_to_update_role():
@@ -61,7 +66,7 @@ def test_handle_routes_role_subject_to_update_role():
         result = _handle("aiac.apply.role.role-1")
 
     role.assert_called_once_with("role-1")
-    assert result == ([], True)
+    assert result == ([], True, None)  # no focus service: only an onboarding has one
 
 
 def test_handle_decodes_percent_encoded_dotted_role_name():
@@ -71,7 +76,7 @@ def test_handle_decodes_percent_encoded_dotted_role_name():
         result = _handle("aiac.apply.role.team%2Eadmin")
 
     role.assert_called_once_with("team.admin")
-    assert result == ([], True)
+    assert result == ([], True, None)
 
 
 def test_handle_routes_policy_build_subject():
@@ -79,7 +84,7 @@ def test_handle_routes_policy_build_subject():
         result = _handle("aiac.apply.policy.build")
 
     build.assert_called_once_with()
-    assert result == ([], False)
+    assert result == ([], False, None)
 
 
 def test_handle_raises_for_unknown_subject():
@@ -95,7 +100,7 @@ def test_dispatch_acks_on_success():
     with (
         patch(
             "aiac.agent.eventbus.consumer.onboard_service",
-            return_value=([], False),
+            return_value=([], False, CLIENT_ID),
         ),
         patch("aiac.agent.eventbus.consumer.compute_and_apply") as pce,
         patch("aiac.agent.eventbus.consumer.reenable_service") as reenable,
@@ -103,10 +108,10 @@ def test_dispatch_acks_on_success():
         asyncio.run(consumer._dispatch(msg))
 
     # _dispatch forwards the handler's (rules, override) pair to the PCE, with the focus service's
-    # Keycloak UUID for the routing guard.
-    pce.assert_called_once_with([], False, focus_service="svc-1")
-    # UC1 service-onboarding subject: the client is re-enabled with the derived service_id, only
-    # after the PCE apply succeeds.
+    # clientId (from onboard_service, not the subject's UUID) for the routing guard.
+    pce.assert_called_once_with([], False, focus_service=CLIENT_ID)
+    # UC1 service-onboarding subject: the client is re-enabled (an IdP call) by the subject's UUID,
+    # only after the PCE apply succeeds.
     reenable.assert_called_once_with("svc-1")
     msg.ack.assert_called_once()
     msg.term.assert_not_called()
@@ -140,7 +145,7 @@ def test_dispatch_does_not_reenable_when_pce_apply_raises():
     with (
         patch(
             "aiac.agent.eventbus.consumer.onboard_service",
-            return_value=([], False),
+            return_value=([], False, CLIENT_ID),
         ),
         patch("aiac.agent.eventbus.consumer.compute_and_apply", side_effect=RuntimeError("pce boom")),
         patch("aiac.agent.eventbus.consumer.reenable_service") as reenable,

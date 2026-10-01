@@ -40,6 +40,7 @@ from aiac.agent.shared.error_logging import log_by_type
 from aiac.agent.uc.onboarding.orchestrator import onboard_service, reenable_service
 from aiac.agent.uc.policy_update.build import build_policy
 from aiac.agent.uc.role_update.role import update_role
+from aiac.idp.configuration.models import ClientId, ServiceUuid
 from aiac.policy.computation import compute_and_apply
 from aiac.policy.model.models import PolicyRule
 
@@ -69,17 +70,20 @@ _PERMANENT_ERRORS: tuple[type[Exception], ...] = (
 )
 
 
-def _handle(subject: str) -> tuple[list[PolicyRule], bool]:
+def _handle(subject: str) -> tuple[list[PolicyRule], bool, ClientId | None]:
+    """Dispatch ``subject`` to its use-case handler — the consumer's only subject switch. Returns
+    ``(rules, override, focus_service)``: ``focus_service`` is the onboarded service's clientId (from
+    ``onboard_service``), and ``None`` for every other subject."""
     if subject.startswith(_SERVICE_PREFIX):
-        return onboard_service(subject[len(_SERVICE_PREFIX) :])
+        return onboard_service(ServiceUuid(subject[len(_SERVICE_PREFIX) :]))
     if subject.startswith(_ROLE_PREFIX):
         # Mirror image of the Keycloak SPI's SubjectMapper.encodeSubjectToken: role names may
         # contain '.', which NATS treats as a token separator, so the SPI percent-encodes them
         # into a single token before publishing. unquote() is the general-purpose inverse; safe
         # here because every literal '%' in the original name was itself escaped to "%25".
-        return update_role(unquote(subject[len(_ROLE_PREFIX) :]))
+        return *update_role(unquote(subject[len(_ROLE_PREFIX) :])), None
     if subject == _POLICY_BUILD_SUBJECT:
-        return build_policy()
+        return *build_policy(), None
     raise ValueError(f"no handler for subject {subject!r}")
 
 
@@ -145,16 +149,16 @@ class AiacEventConsumer:
             # redelivered the unacked message and the race repeated). Offload both to the default
             # threadpool so the loop stays free to answer ``/health`` while onboarding runs.
             loop = asyncio.get_running_loop()
-            rules, override = await loop.run_in_executor(None, _handle, msg.subject)
-            # UC1 only: the focus service's Keycloak UUID, so the PCE routing guard keeps its rules
-            # while its client is still disabled (a re-onboarding of a quarantined service).
-            focus = msg.subject[len(_SERVICE_PREFIX) :] if msg.subject.startswith(_SERVICE_PREFIX) else None
+            # UC1 only: ``focus`` is the onboarded service's clientId, so the PCE routing guard keeps
+            # its rules while its client is still disabled (a re-onboarding of a quarantined service).
+            rules, override, focus = await loop.run_in_executor(None, _handle, msg.subject)
             await loop.run_in_executor(None, functools.partial(compute_and_apply, rules, override, focus_service=focus))
-            # UC1 only: re-enable the client AFTER a successful compute_and_apply, mirroring the
-            # HTTP route. If compute_and_apply raised above, this is skipped and the client stays
-            # disabled (the failed-service marker), never enabled-with-no-policy.
-            if msg.subject.startswith(_SERVICE_PREFIX):
-                reenable_service(msg.subject[len(_SERVICE_PREFIX) :])
+            # UC1 only (only an onboarding has a focus service): re-enable the client AFTER a
+            # successful compute_and_apply, mirroring the HTTP route. If compute_and_apply raised
+            # above, this is skipped and the client stays disabled (the failed-service marker), never
+            # enabled-with-no-policy. The re-enable is an IdP call, so it takes the subject's UUID.
+            if focus is not None:
+                reenable_service(ServiceUuid(msg.subject.removeprefix(_SERVICE_PREFIX)))
         except Exception as exc:
             # Log exactly once, routed by exception TYPE to its per-persona named logger.
             # FastAPI's exception handlers never fire on this path (there is no request), so

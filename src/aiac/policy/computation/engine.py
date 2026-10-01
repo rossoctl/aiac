@@ -30,13 +30,19 @@ falls out of the catalog forever, so its own ``SPM(X)`` and its outbound footpri
 other_scope`` edges on *other* SPMs) would linger, and its ``APM(X)`` would stay in the PDP.
 ``decommission(service_id)`` is the authoritative counterpart: it acts on an explicit offboard
 signal (not the catalog-miss guard), tears down X's entire footprint, and re-derives every agent
-whose policy changed. It is keyed by the **clientId (SPM key)**, not the Keycloak UUID — after the
-client is deleted, ``get_services()`` can no longer resolve UUID→clientId.
+whose policy changed.
 
-Quarantine. ``quarantine(service_uuid)`` is the UC1 failure-path counterpart of ``decommission``:
-a failed onboarding leaves the service in the catalog (disabled), so it is keyed by the Keycloak
-UUID. It tears down the same store footprint, but replaces an agent's CR with a no-rules CR (deny
-everything) instead of deleting it. ``compute_and_apply``'s routing guard then drops every later
+Service ids. Every service id the PCE takes is the **clientId** (``Service.serviceId``, the SPM key,
+type ``ClientId``) — never the Keycloak internal UUID (``ServiceUuid``). The UUID is only for finding
+the service in the IdP. The asymmetry stays at the HTTP/NATS boundary: an onboarding comes in with a
+UUID, and the Orchestrator resolves the clientId once while the client still exists; an offboard
+comes in with the clientId, because after the client is deleted UUID→clientId resolution is
+impossible.
+
+Quarantine. ``quarantine(service_id, deleted_roles)`` is the UC1 failure-path counterpart of
+``decommission``: a failed onboarding leaves the service in the catalog (disabled). It tears down
+the same store footprint, but replaces an agent's CR with a no-rules CR (deny everything) instead
+of deleting it. ``compute_and_apply``'s routing guard then drops every later
 rule that touches a disabled service, so a build that started before the quarantine cannot write
 its rules back.
 
@@ -61,10 +67,11 @@ parallel; the part under the lock makes no LLM call. Known limits:
 
 import logging
 import threading
+from collections.abc import Iterable
 from typing import TypeVar
 
 from aiac.idp.configuration.api import Configuration
-from aiac.idp.configuration.models import Role, RoleKind, Scope, Service, ServiceType
+from aiac.idp.configuration.models import ClientId, Role, RoleKind, Scope, Service, ServiceType
 from aiac.pdp.policy.library.api import apply_agent_policy, apply_policy, delete_agent_policy
 from aiac.policy.model.models import (
     AgentPolicyModel,
@@ -259,7 +266,7 @@ def _fresh_apm(agent_id: str) -> AgentPolicyModel:
 def compute_and_apply(
     rules: list[PolicyRule],
     override: bool = False,
-    focus_service: str | None = None,
+    focus_service: ClientId | None = None,
 ) -> None:
     """Route, persist, derive, and apply ``rules`` — fire-and-forget.
 
@@ -277,11 +284,12 @@ def compute_and_apply(
     catalog is deleted. Under the PCE lock, after the catalog read, the run drops each rule whose
     scope owner, or the owner of whose agent role (``role.actorIds``), is disabled or absent, so a
     build that started before a quarantine or an offboard cannot write rules back into the removed
-    footprint. The run also derives only agents that are in the catalog. ``focus_service`` — the Keycloak internal
-    client UUID (``Service.id``) of the service this onboarding builds — is exempt: a re-onboarding
-    applies while its client is still disabled (``reenable_service`` runs after the apply). The
-    onboarding route and the NATS consumer pass it; every other caller passes nothing, so every
-    rule that touches a disabled service is dropped.
+    footprint. The run also derives only agents that are in the catalog. ``focus_service`` — the
+    clientId (``Service.serviceId``, the SPM key) of the service this onboarding builds, not its
+    Keycloak UUID — is exempt: a re-onboarding applies while its client is still disabled
+    (``reenable_service`` runs after the apply). The onboarding route and the NATS consumer pass the
+    clientId that ``onboard_service`` returns; every other caller passes nothing, so every rule that
+    touches a disabled service is dropped.
 
     Exceptions from any dependency (IdP, Policy Store, PDP) are logged and **re-raised** so the
     caller (the Controller) surfaces the failure — e.g. as a 500 — instead of returning success
@@ -295,13 +303,13 @@ def compute_and_apply(
         raise
 
 
-def decommission(service_id: str) -> None:
+def decommission(service_id: ClientId) -> None:
     """Authoritatively remove a decommissioned service's entire policy footprint.
 
-    ``service_id`` is the **clientId (the SPM key)**, not the Keycloak internal UUID: an offboarded
-    client is gone from ``get_services()``, so UUID→clientId resolution is impossible — the offboard
-    contract carries the clientId directly (the documented asymmetry with onboard's
-    ``/apply/service/{uuid}``).
+    ``service_id`` is the **clientId (the SPM key)**, as for every PCE function. An offboarded client
+    is gone from the IdP, so the offboard contract carries the clientId directly; an onboarding
+    resolves it from its UUID in the Orchestrator. The asymmetry is only at the HTTP/NATS boundary,
+    not in the PCE.
 
     Tears down everything reconcile's catalog-anchored GC cannot: deletes ``SPM(X)`` (removing every
     user→X and agent→X inbound edge), purges X's **outbound footprint** (``X_role → other_scope``
@@ -322,8 +330,8 @@ def decommission(service_id: str) -> None:
 
 def _disabled_services(catalog: dict[str, Service], focus_service: str | None) -> set[str]:
     """The ``serviceId`` of every disabled (quarantined) service in ``catalog``, except the focus
-    service (given by its Keycloak UUID, ``Service.id``)."""
-    return {sid for sid, svc in catalog.items() if not svc.enabled and svc.id != focus_service}
+    service (given by its clientId, the catalog key)."""
+    return {sid for sid, svc in catalog.items() if not svc.enabled and sid != focus_service}
 
 
 def _routable(rule: PolicyRule, catalog: dict[str, Service], disabled: set[str]) -> bool:
@@ -336,33 +344,37 @@ def _routable(rule: PolicyRule, catalog: dict[str, Service], disabled: set[str])
     return all(owner in catalog and owner not in disabled for owner in owners)
 
 
-def quarantine(service_uuid: str) -> None:
+def quarantine(service_id: ClientId, deleted_roles: Iterable[Role] = ()) -> None:
     """Tear down a failed onboarding's policy footprint — the UC1 failure path (after the rollback).
 
-    ``service_uuid`` is the **Keycloak internal client UUID** (``Service.id``) that the onboarding
-    carries; the failed service X is still in the catalog (disabled), so its ``serviceId`` (the SPM
-    key) is resolved there. Holds the PCE lock. For X:
+    ``service_id`` is the **clientId (the SPM key, ``Service.serviceId``)**, as for ``decommission``
+    — not the Keycloak internal UUID. The orchestrator resolves it from the onboarding's UUID while
+    the client still exists. The failed service X is still in the catalog (disabled). Holds the PCE
+    lock. For X:
 
     1. delete ``SPM(X)`` from the store;
-    2. remove X's roles from the other SPMs (as ``decommission`` step 4 does);
+    2. remove X's roles from the other SPMs (as ``decommission`` step 4 does) — the roles X still
+       has in the catalog, plus ``deleted_roles``: the roles the rollback already deleted from the
+       IdP (the run's created-manifest). The catalog no longer lists those, but a concurrent run can
+       have stored their grants on another SPM, which would keep allowing X;
     3. for an agent, **replace** its CR with a CR that has no rules (the ``_fresh_apm`` shell), which
        denies every request — not a delete, because the bundle-service combiner allows a missing CR;
        a tool gets no CR (it has none);
     4. re-derive the affected agents (those that targeted X, and those whose SPMs lost X's roles)
        and apply them in one call.
 
-    Idempotent: a second call finds no SPM and no edges, and writes the same no-rules CR. An
-    unknown ``service_uuid`` is a logged no-op. The quarantine is lifted only by a successful
-    re-onboarding (its ``compute_and_apply`` writes the real CR over the no-rules CR with the same
-    SSA field manager, then ``reenable_service`` re-enables the client).
+    Idempotent: a second call finds no SPM and no edges, and writes the same no-rules CR. A
+    ``service_id`` that is not in the catalog is a logged no-op. The quarantine is lifted only by a
+    successful re-onboarding (its ``compute_and_apply`` writes the real CR over the no-rules CR with
+    the same SSA field manager, then ``reenable_service`` re-enables the client).
 
     Exceptions from any dependency are logged and **re-raised**.
     """
     try:
         with _pce_lock:
-            _quarantine(service_uuid)
+            _quarantine(service_id, list(deleted_roles))
     except Exception:
-        logger.exception("quarantine failed for service %r", _loggable(service_uuid))
+        logger.exception("quarantine failed for service %r", _loggable(service_id))
         raise
 
 
@@ -488,23 +500,23 @@ def _decommission(service_id: str) -> None:
     _apply_derived(affected, spm, is_agent)
 
 
-def _quarantine(service_uuid: str) -> None:
+def _quarantine(service_id: str, deleted_roles: list[Role]) -> None:
     config = Configuration.for_default_realm()
 
-    # (1) Catalog once. X is still in it (the rollback disables the client, it does not delete it),
-    # so resolve its SPM key (serviceId) from its Keycloak UUID. spm() seeds X's current roles from
-    # the catalog, so step 4 removes the roles X still has. The edges of the roles that the rollback
-    # deleted are dropped by ``_reconcile`` when a later run touches those SPMs.
+    # (1) Catalog once. X is still in it (the rollback disables the client, it does not delete it).
+    # spm() seeds X's current roles from the catalog, so step 4 removes the roles X still has. The
+    # roles the rollback deleted are not in the catalog any more, so the caller passes them in
+    # ``deleted_roles`` and step 4 removes their edges too — else an edge a concurrent run stored
+    # (X_role → other_scope) keeps allowing X until a later run reconciles that SPM.
     catalog = {svc.serviceId: svc for svc in config.get_services()}
-    service_id = next((sid for sid, svc in catalog.items() if svc.id == service_uuid), None)
-    if service_id is None:
-        logger.warning("quarantine: service %r is not in the IdP catalog — nothing to do", _loggable(service_uuid))
+    if service_id not in catalog:
+        logger.warning("quarantine: service %r is not in the IdP catalog — nothing to do", _loggable(service_id))
         return
     spms, spm, is_agent = _spm_cache(catalog)
 
     # (3)-(6) Tear down X's footprint in the store (see ``_remove_footprint``).
     was_agent = is_agent(service_id)
-    affected = _remove_footprint(service_id, spms, spm, is_agent)
+    affected = _remove_footprint(service_id, spms, spm, is_agent, deleted_roles)
 
     # (7) An agent's CR is REPLACED with a no-rules CR (the ``_fresh_apm`` shell), which denies
     # every inbound and outbound request. Not a delete, on purpose: the bundle-service combiner
@@ -517,10 +529,11 @@ def _quarantine(service_uuid: str) -> None:
     _apply_derived(affected, spm, is_agent)
 
 
-def _remove_footprint(service_id: str, spms, spm, is_agent) -> set[str]:
+def _remove_footprint(service_id: str, spms, spm, is_agent, extra_roles: list[Role] = ()) -> set[str]:
     """Tear down service X's footprint in the store — the steps ``decommission`` and ``quarantine``
-    share. Returns the affected agents (X excluded):
-    the agents that targeted X, and the agents whose SPMs lost X's roles."""
+    share. ``extra_roles`` are X's roles that ``SPM(X)`` no longer lists (``quarantine``'s
+    rollback-deleted roles); their edges are purged as X's own. Returns the affected agents (X
+    excluded): the agents that targeted X, and the agents whose SPMs lost X's roles."""
     spm_x = spm(service_id)
 
     # (3) Targeters — agents whose outbound loses X: they hold an Agent-kind inbound edge (allow or
@@ -532,8 +545,9 @@ def _remove_footprint(service_id: str, spms, spm, is_agent) -> set[str]:
     changed: set[str] = set()
 
     # (4) Purge X's outbound footprint — X_role → other_scope edges (allow AND deny) stored on OTHER
-    # services' SPMs.
-    for role in spm_x.owned_roles:
+    # services' SPMs. Dedup by id: an extra role can also still be on SPM(X).
+    roles = {role.id: role for role in [*spm_x.owned_roles, *extra_roles]}
+    for role in roles.values():
         for stored in get_service_policies_by_role(role):
             if stored.service_id == service_id:
                 continue

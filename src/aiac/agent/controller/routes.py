@@ -33,6 +33,7 @@ from aiac.agent.uc.onboarding.orchestrator import onboard_service, reenable_serv
 from aiac.agent.uc.policy_update.build import build_policy
 from aiac.agent.uc.policy_update.rebuild import rebuild_policy
 from aiac.agent.uc.role_update.role import update_role
+from aiac.idp.configuration.models import ClientId, ServiceUuid
 from aiac.policy.computation import compute_and_apply, decommission
 
 app = FastAPI(lifespan=lifespan)
@@ -113,13 +114,15 @@ def health() -> dict[str, str]:
 
 @app.post("/apply/service/{service_id}")
 def apply_service(service_id: str) -> Response:
-    rules, override = onboard_service(service_id)
-    # service_id is the Keycloak UUID of the focus service: the PCE routing guard keeps its rules
-    # while its client is still disabled (a re-onboarding of a quarantined service).
-    compute_and_apply(rules, override, focus_service=service_id)
+    # service_id is the Keycloak UUID (an IdP key). onboard_service resolves the clientId once; the
+    # PCE routing guard takes it as the focus service and keeps its rules while its client is still
+    # disabled (a re-onboarding of a quarantined service).
+    uuid = ServiceUuid(service_id)
+    rules, override, client_id = onboard_service(uuid)
+    compute_and_apply(rules, override, focus_service=client_id)
     # Re-enable the client only AFTER the PCE apply succeeds — a compute_and_apply failure above
     # propagates and leaves the client disabled (the failed-service marker), never enabled-with-no-policy.
-    reenable_service(service_id)
+    reenable_service(uuid)
     return Response(status_code=200)
 
 
@@ -151,7 +154,7 @@ def apply_role(role_id: str) -> Response:
 # (rules, override) → compute_and_apply path and calls the PCE's decommission directly.
 @app.post("/apply/offboard/{service_id:path}")
 def apply_offboard(service_id: str) -> Response:
-    decommission(offboard_service(service_id))
+    decommission(offboard_service(ClientId(service_id)))
     return Response(status_code=200)
 
 
