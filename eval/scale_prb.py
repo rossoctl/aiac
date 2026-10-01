@@ -31,7 +31,7 @@ from typing import Any, Callable, TypeVar
 
 from langchain_core.callbacks.usage import get_usage_metadata_callback
 
-from aiac.agent.policy_rules_builder.graph import ROLE_GRAPH, SCOPE_GRAPH
+from aiac.agent.policy_rules_builder.graph import ROLE_GRAPH, SCOPE_GRAPH, PolicyRulesBuilderBaseError
 from aiac.idp.configuration.models import Role, Scope
 from aiac.policy.model.models import PolicyRule
 from eval.test_policy_pipeline_eval import _invoke_graph
@@ -86,6 +86,17 @@ def orchestrate_prb_concurrent(
     at ~100-150 decisions per total-corpus run, one auditor rejection must not discard every other
     decision's real result; every sibling correctness/robustness/consistency suite already makes
     this same choice at its own call sites.
+
+    ``best_effort=True`` only buys that guarantee against an ``_invoke_graph``-caught rejection
+    (``PolicyContradictionError``/``PolicyRulesBuilderError``) -- it does **not** catch a sibling
+    ``LLMAccessError``/``UnparseableLLMResponseError`` from the same ``PolicyRulesBuilderBaseError``
+    family, which at ~100-150 *concurrent* calls against a real, possibly rate-limited endpoint is
+    the more likely failure mode. Left uncaught, ``run_concurrently``'s ``executor.map`` would raise
+    that one job's exception and discard every other job's already-finished result -- exactly what
+    this function exists to avoid. Each job below therefore catches
+    ``PolicyRulesBuilderBaseError`` itself and reports a failed decision (no rules, no reasoning
+    entry) rather than raising, so ``missing_decisions`` sees it as a decision that never completed
+    instead of losing the whole run.
     """
     user_roles = [roles[name] for name in scenario.USER_ROLES]
 
@@ -98,20 +109,26 @@ def orchestrate_prb_concurrent(
     target_scopes = [scopes[n] for n in target_scope_names]
     agent_roles = [roles[n] for n in agent_role_names]
 
-    def _scope_job(scope: Scope) -> Callable[[], tuple[str, str, list[PolicyRule], str, str | None, dict]]:
-        def _run() -> tuple[str, str, list[PolicyRule], str, str | None, dict]:
-            job_rules, reasoning, note, usage = _invoke_with_usage(
-                SCOPE_GRAPH, roles=user_roles, scope=scope, best_effort=best_effort
-            )
+    def _scope_job(scope: Scope) -> Callable[[], tuple[str, str, list[PolicyRule], str | None, str | None, dict]]:
+        def _run() -> tuple[str, str, list[PolicyRule], str | None, str | None, dict]:
+            try:
+                job_rules, reasoning, note, usage = _invoke_with_usage(
+                    SCOPE_GRAPH, roles=user_roles, scope=scope, best_effort=best_effort
+                )
+            except PolicyRulesBuilderBaseError as exc:
+                return "scope", scope.name, [], None, f"decision call raised {type(exc).__name__}: {exc}", {}
             return "scope", scope.name, job_rules, reasoning, note, usage
 
         return _run
 
-    def _role_job(role: Role) -> Callable[[], tuple[str, str, list[PolicyRule], str, str | None, dict]]:
-        def _run() -> tuple[str, str, list[PolicyRule], str, str | None, dict]:
-            job_rules, reasoning, note, usage = _invoke_with_usage(
-                ROLE_GRAPH, role=role, scopes=target_scopes, best_effort=best_effort
-            )
+    def _role_job(role: Role) -> Callable[[], tuple[str, str, list[PolicyRule], str | None, str | None, dict]]:
+        def _run() -> tuple[str, str, list[PolicyRule], str | None, str | None, dict]:
+            try:
+                job_rules, reasoning, note, usage = _invoke_with_usage(
+                    ROLE_GRAPH, role=role, scopes=target_scopes, best_effort=best_effort
+                )
+            except PolicyRulesBuilderBaseError as exc:
+                return "role", role.name, [], None, f"decision call raised {type(exc).__name__}: {exc}", {}
             return "role", role.name, job_rules, reasoning, note, usage
 
         return _run
@@ -126,10 +143,15 @@ def orchestrate_prb_concurrent(
     usage_by_name: dict[str, dict] = {}
     for kind, name, job_rules, reasoning, note, usage in results:
         rules += job_rules
-        if kind == "scope":
-            reasoning_by_scope[name] = reasoning
-        else:
-            reasoning_by_agent_role[name] = reasoning
+        # ``reasoning`` is ``None`` only for a job that raised above -- leaving its name out of
+        # these dicts (rather than recording an empty string) is what lets missing_decisions
+        # report it as a decision that never ran, instead of a decision that ran and produced
+        # nothing.
+        if reasoning is not None:
+            if kind == "scope":
+                reasoning_by_scope[name] = reasoning
+            else:
+                reasoning_by_agent_role[name] = reasoning
         if note is not None:
             best_effort_notes[name] = note
         usage_by_name[name] = usage
