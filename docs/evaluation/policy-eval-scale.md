@@ -246,6 +246,6 @@ placement (Nightly, not per-PR).
 
 ## Blocked-by
 
-#2091 (the committed trend log — already shipped; `eval.trend_log.append_row`/
+\#2091 (the committed trend log — already shipped; `eval.trend_log.append_row`/
 `pool_correctness_metrics` reused here unmodified, `pool_scale_metrics` added alongside them). Same
 PRB/e2e prerequisites as every other suite in this family — no new production dependency introduced.
