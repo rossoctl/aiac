@@ -30,6 +30,9 @@
 #   RELEASE_NAMESPACE   namespace the chart is installed in (default: rossoctl-system)
 #   AGENT_NAMESPACE     namespace to restart agent pods in (default: team1)
 #   IMAGE_TAG           local authbridge-proxy image tag  (default: localhost/authbridge:local)
+#   GO_BUILD_TAGS       authbridge plugin build tags (default: the cortex "full"
+#                       profile, from scripts/profile-tags; derived with a local
+#                       `go`, or in a golang container when go is absent)
 #   OPERATOR_IMAGE      local operator image (bundle-service runs from it)
 #                       (default: localhost/rossoctl-operator:<operator HEAD short sha>)
 #   CONTAINER_RUNTIME   docker | podman                   (default: docker, auto-falls back to podman)
@@ -150,7 +153,21 @@ kubectl rollout status deployment/bundle-service -n "$RELEASE_NAMESPACE" --timeo
 kubectl get pods -n "$RELEASE_NAMESPACE" -l app=bundle-service
 
 echo "==> Step 2/5: building + loading authbridge-proxy (${IMAGE_TAG}) via ${CONTAINER_RUNTIME}"
-( cd "$CORTEX_DIR" && "$CONTAINER_RUNTIME" build -t "$IMAGE_TAG" -f cmd/authbridge-proxy/Dockerfile . )
+# AuthBridge plugins are opt-in build tags: an untagged build registers none and
+# the Dockerfile refuses it. Use the "full" profile, as the cortex CI does for
+# the authbridge image (scripts/profile-tags). GOWORK=off: the profile tool is a
+# standalone module, and the cortex go.work would want to write go.work.sum.
+if [ -z "${GO_BUILD_TAGS:-}" ]; then
+  if command -v go &> /dev/null; then
+    GO_BUILD_TAGS="$(GOWORK=off go -C "$CORTEX_DIR/scripts/profile-tags" run . full)"
+  else
+    GO_BUILD_TAGS="$("$CONTAINER_RUNTIME" run --rm -e GOWORK=off -v "$CORTEX_DIR:/src:ro" -w /src \
+      docker.io/library/golang:1.26-alpine go -C scripts/profile-tags run . full)"
+  fi
+fi
+echo "    GO_BUILD_TAGS=${GO_BUILD_TAGS}"
+( cd "$CORTEX_DIR" && "$CONTAINER_RUNTIME" build -t "$IMAGE_TAG" -f cmd/authbridge-proxy/Dockerfile \
+    --build-arg GO_BUILD_TAGS="$GO_BUILD_TAGS" . )
 load_image_to_kind "$IMAGE_TAG"
 
 echo "==> Step 3/5: writing throwaway pipeline overlay (${VALUES_FILE} stays untouched)"

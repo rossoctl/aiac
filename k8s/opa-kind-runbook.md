@@ -172,7 +172,11 @@ The script does these steps:
      AuthBridge bundle fetch.
 2. **AuthBridge image.** It builds `localhost/authbridge:local` from
    `$CORTEX_DIR/cmd/authbridge-proxy/Dockerfile` (build context: the cortex repo
-   root) and loads it into the `rossoctl` Kind cluster.
+   root) and loads it into the `rossoctl` Kind cluster. AuthBridge plugins are
+   opt-in build tags, so the build passes `GO_BUILD_TAGS` with the cortex `full`
+   profile (`scripts/profile-tags`, as the cortex CI does). The script derives it
+   with a local `go`, or in a `golang` container when `go` is not installed. Set
+   `GO_BUILD_TAGS` to override it.
 3. **Pipeline.** It `helm upgrade`s the chart with a temporary overlay that
    inserts `opa` (after `token-exchange` on the outbound leg) and the parser set
    into every `team1` agent's pipeline. It does **not** modify
