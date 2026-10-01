@@ -41,8 +41,11 @@ into two independent dimensions, never blended into one "scale score":
 - **Per-decision** — one role/scope facing a very large candidate list in a single PRB call.
   Stresses the LLM itself (context pressure, needle-in-a-haystack attention degradation).
 
-Both dimensions are checked by **two check types**, kept on separate assertions/metrics/trend-log
-rows, at **both levels** (PRB-direct and end-to-end):
+Both dimensions are checked by **two check types**, kept on separate assertions and separate metric
+names — but merged onto one trend-log row per dimension/level (see [Test report and trend
+log](#test-report-and-trend-log)), since what the spec actually guards against is blending the two
+into one number, not which JSON object the keys live in — at **both levels** (PRB-direct and
+end-to-end):
 
 - **Structural** — completeness, no duplication, no orphans (gated, objectively pass/fail);
   latency and cost (reported/trended only — no SLA exists anywhere in the spec or the originating

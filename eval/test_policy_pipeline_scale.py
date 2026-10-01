@@ -9,7 +9,10 @@ Two independent dimensions (never blended into one "scale score"):
 - **per-decision** -- one role/scope facing a very large candidate list in a single PRB call.
   Stresses the LLM itself (context pressure, needle-in-a-haystack degradation).
 
-Both dimensions are checked by two check types, kept on separate assertions/metrics/trend-log rows:
+Both dimensions are checked by two check types, kept on separate assertions and separate metric
+names -- but merged onto one trend-log row per dimension/level (``eval/conftest.py``'s
+``_write_trend_log``, see ``_SCALE_TEST_MARKERS``), since what the spec actually guards against is
+blending the two into one number, not which JSON object the keys live in:
 
 - **structural** -- completeness, no duplication/orphans, latency, cost
   (``eval.scale_structural``). Completeness/no-duplication/no-orphans gate the test (objectively
@@ -123,6 +126,44 @@ def _fix_agent_role_actor_ids(config: Configuration, roles: dict[str, Role], sce
         for role in svc.roles:
             if role.name in agent_role_names:
                 roles[role.name] = role
+
+
+def _provision_scale_realm_and_services(
+    scenario, *, rego_dir: Path, db_prefix: str, ports: dict[str, int]
+) -> tuple[Service, Service, Service]:
+    """Shared prefix of both e2e fixtures below: connect to Keycloak and provision the realm, wipe
+    and recreate ``rego_dir``, point the four ``AIAC_*_URL`` env vars at ``ports``, and build the
+    idp/store/opa ``Service`` triple -- everything each fixture needs before its own distinct
+    PRB-calling logic runs inside its own ``with running_services(...)`` block (one fans a whole
+    scenario's decisions out via ``orchestrate_prb_concurrent``, the other makes exactly two
+    sequential ``_invoke_graph`` calls against two different policy files, so that part can't be
+    shared here). Mirrors ``eval.test_policy_pipeline_eval._provision_scenario``'s own idp/store/opa
+    construction shape -- not reused directly, since that function also runs its own fixed
+    ``orchestrate_prb`` call inside its own ``with`` block."""
+    admin = _connect_admin()
+    os.environ["KEYCLOAK_REALM"] = scenario.REALM_DEFAULT
+    provision_keycloak_admin(admin, scenario.REALM_DEFAULT, scenario)
+
+    if rego_dir.exists():
+        shutil.rmtree(rego_dir)
+    rego_dir.mkdir(parents=True)
+    db_path = Path(tempfile.mkdtemp(prefix=db_prefix)) / "policy_model.db"
+
+    os.environ["AIAC_PDP_CONFIG_URL"] = f"http://127.0.0.1:{ports['idp']}"
+    os.environ["AIAC_POLICY_STORE_URL"] = f"http://127.0.0.1:{ports['store']}"
+    os.environ["AIAC_POLICY_MODEL_STORE_URL"] = f"http://127.0.0.1:{ports['store']}"
+    os.environ["AIAC_PDP_POLICY_URL"] = f"http://127.0.0.1:{ports['opa']}"
+
+    idp = Service("aiac.idp.service.configuration.keycloak.main:app", port=ports["idp"])
+    store = Service(
+        "aiac.policy.model_store.service.main:app", port=ports["store"], env={"SERVICEPOLICY_DB_PATH": str(db_path)}
+    )
+    opa = Service(
+        "aiac.pdp.service.policy.opa.main:app",
+        port=ports["opa"],
+        env={"REGO_OUTPUT_DIR": str(rego_dir), "POLICY_WRITER_DUMP_REGO": "true"},
+    )
+    return idp, store, opa
 
 
 # ======================================================================================
@@ -409,34 +450,14 @@ def total_corpus_e2e_result(tmp_path_factory: pytest.TempPathFactory) -> dict:
     corpus = generate_total_corpus(n_services=TOTAL_CORPUS_SIZE, n_roles=TOTAL_CORPUS_ROLES, seed=SCALE_SEED)
     scenario = corpus.as_namespace()
 
-    admin = _connect_admin()
-    os.environ["KEYCLOAK_REALM"] = scenario.REALM_DEFAULT
-    provision_keycloak_admin(admin, scenario.REALM_DEFAULT, scenario)
-
     rego_dir = HERE / "rego_out" / "policy_pipeline_scale" / "total_corpus"
-    if rego_dir.exists():
-        shutil.rmtree(rego_dir)
-    rego_dir.mkdir(parents=True)
-    db_path = Path(tempfile.mkdtemp(prefix="aiac-store-scale-total-corpus-")) / "policy_model.db"
+    idp, store, opa = _provision_scale_realm_and_services(
+        scenario, rego_dir=rego_dir, db_prefix="aiac-store-scale-total-corpus-", ports=_TOTAL_CORPUS_E2E_PORTS
+    )
 
     policy_path = tmp_path_factory.mktemp("scale_total_corpus_e2e") / "policy.md"
     policy_path.write_text(corpus.policy_text)
-    ports = _TOTAL_CORPUS_E2E_PORTS
     os.environ["AIAC_POLICY_FILE"] = str(policy_path)
-    os.environ["AIAC_PDP_CONFIG_URL"] = f"http://127.0.0.1:{ports['idp']}"
-    os.environ["AIAC_POLICY_STORE_URL"] = f"http://127.0.0.1:{ports['store']}"
-    os.environ["AIAC_POLICY_MODEL_STORE_URL"] = f"http://127.0.0.1:{ports['store']}"
-    os.environ["AIAC_PDP_POLICY_URL"] = f"http://127.0.0.1:{ports['opa']}"
-
-    idp = Service("aiac.idp.service.configuration.keycloak.main:app", port=ports["idp"])
-    store = Service(
-        "aiac.policy.model_store.service.main:app", port=ports["store"], env={"SERVICEPOLICY_DB_PATH": str(db_path)}
-    )
-    opa = Service(
-        "aiac.pdp.service.policy.opa.main:app",
-        port=ports["opa"],
-        env={"REGO_OUTPUT_DIR": str(rego_dir), "POLICY_WRITER_DUMP_REGO": "true"},
-    )
     with running_services([idp, store, opa], src=SRC):
         config = Configuration.for_realm(scenario.REALM_DEFAULT)
         provision_via_config(config, scenario)
@@ -580,31 +601,11 @@ def per_decision_e2e_result(tmp_path_factory: pytest.TempPathFactory) -> dict:
     corpus = generate_per_decision(n_candidates=PER_DECISION_CANDIDATES, seed=SCALE_SEED)
     scenario = corpus.e2e_scenario.as_namespace()
 
-    admin = _connect_admin()
-    os.environ["KEYCLOAK_REALM"] = scenario.REALM_DEFAULT
-    provision_keycloak_admin(admin, scenario.REALM_DEFAULT, scenario)
-
     rego_dir = HERE / "rego_out" / "policy_pipeline_scale" / "per_decision"
-    if rego_dir.exists():
-        shutil.rmtree(rego_dir)
-    rego_dir.mkdir(parents=True)
-    db_path = Path(tempfile.mkdtemp(prefix="aiac-store-scale-per-decision-")) / "policy_model.db"
-
-    ports = _PER_DECISION_E2E_PORTS
-    os.environ["AIAC_PDP_CONFIG_URL"] = f"http://127.0.0.1:{ports['idp']}"
-    os.environ["AIAC_POLICY_STORE_URL"] = f"http://127.0.0.1:{ports['store']}"
-    os.environ["AIAC_POLICY_MODEL_STORE_URL"] = f"http://127.0.0.1:{ports['store']}"
-    os.environ["AIAC_PDP_POLICY_URL"] = f"http://127.0.0.1:{ports['opa']}"
-
-    idp = Service("aiac.idp.service.configuration.keycloak.main:app", port=ports["idp"])
-    store = Service(
-        "aiac.policy.model_store.service.main:app", port=ports["store"], env={"SERVICEPOLICY_DB_PATH": str(db_path)}
+    idp, store, opa = _provision_scale_realm_and_services(
+        scenario, rego_dir=rego_dir, db_prefix="aiac-store-scale-per-decision-", ports=_PER_DECISION_E2E_PORTS
     )
-    opa = Service(
-        "aiac.pdp.service.policy.opa.main:app",
-        port=ports["opa"],
-        env={"REGO_OUTPUT_DIR": str(rego_dir), "POLICY_WRITER_DUMP_REGO": "true"},
-    )
+
     tmp_dir = tmp_path_factory.mktemp("scale_per_decision_e2e")
     with running_services([idp, store, opa], src=SRC):
         config = Configuration.for_realm(scenario.REALM_DEFAULT)

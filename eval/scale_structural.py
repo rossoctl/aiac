@@ -29,6 +29,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 
 from aiac.policy.model.models import PolicyRule
@@ -68,7 +69,7 @@ def missing_decisions(
     return sorted(missing_scopes | missing_roles)
 
 
-def missing_rego(rego_paths: list[tuple[str, "object"]]) -> list[str]:
+def missing_rego(rego_paths: list[tuple[str, Path]]) -> list[str]:
     """E2e completeness: given a list of ``(label, path)`` pairs (label naming the agent+direction,
     e.g. ``"scale-agent-003/inbound"``), returns the labels whose ``path`` never landed on disk.
     Generalizes ``eval.test_policy_pipeline_eval._provision_scenario``'s existing per-scenario
