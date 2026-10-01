@@ -94,6 +94,21 @@ pooled by nodeid substring (``_CONSISTENCY_TEST_MARKERS``) into its own committe
 ``suite="consistency"``, carrying an ``agreement_rate`` (``eval/trend_log.py``'s
 ``pool_consistency_metrics`` -- its own smaller pooling function, since there's no truth table here
 to produce a ``pool_correctness_metrics``-shaped precision/recall).
+
+The Scale suite (``test_policy_pipeline_scale.py``, #2469) is the one family with **two** test
+functions feeding **one** trend-log row per dimension/level: a structural test
+(``record_property("structural_pass"/"structural_issue_count"/"missing_decisions"/
+"duplicate_triples"/"orphaned_scopes"/"wall_clock_seconds"/"total_tokens"/"token_coverage"/...)``,
+rendered via ``_render_scale_block`` -- "Structural check passed: Yes/No" plus every offending
+entity named explicitly, on every entry, pass or fail, same no-opaque-failures convention as
+``_render_consistency_block``) and a correctness test that reuses the two Correctness suites'
+exact ``"precision"``/``"recall"`` shape (via ``correctness_scorer.score_scenario``, so it falls
+through to the existing ``_render_metrics_block`` branch above with no special-casing). Both are
+pooled by nodeid substring (``_SCALE_TEST_MARKERS``, mapping to ``(suite, "structural" |
+"correctness")`` rather than a bare suite name) and merged into one row per dimension/level --
+``scale_total_corpus_prb``/``scale_per_decision_prb`` (and their ``_e2e`` counterparts) -- via
+``eval/trend_log.py``'s ``pool_scale_metrics`` for the structural half and the existing
+``pool_correctness_metrics`` for the correctness half.
 """
 
 from __future__ import annotations
@@ -107,7 +122,7 @@ from zoneinfo import ZoneInfo
 import pytest
 from dotenv import load_dotenv
 
-from eval.trend_log import append_row, pool_consistency_metrics, pool_correctness_metrics
+from eval.trend_log import append_row, pool_consistency_metrics, pool_correctness_metrics, pool_scale_metrics
 
 HERE = Path(__file__).resolve().parent
 REPORTS_DIR = HERE / "reports"
@@ -252,13 +267,13 @@ _ROBUSTNESS_SCORED_TEST_MARKERS = (
 # markers collapsed to one flat ``eval`` marker, every suite under `eval/` is disambiguated by its
 # own test function's nodeid rather than by marker — the same ``::test_prb_correctness[``/
 # ``::test_e2e_correctness[`` substrings ``_CORRECTNESS_TEST_MARKERS`` already uses. Deliberately
-# scoped to the two Correctness suites for now — the Scale suite tickets (#2469-#2470) add their own
-# entries here when they land, reusing the same _write_trend_log/append_row mechanism rather than
-# building a parallel one. Robustness (#2466/#2467) is wired separately below
+# scoped to the two Correctness suites — Robustness (#2466/#2467) is wired separately below
 # (_ROBUSTNESS_TEST_MARKERS) since its four test functions span two families x two tiers that must
 # stay unblended (spec §4) -- a single nodeid -> suite entry here would conflate them. Consistency
-# (#2468) is wired separately too (_CONSISTENCY_TEST_MARKERS) since its metric shape (a
-# agreement rate, no truth table) doesn't fit pool_correctness_metrics.
+# (#2468) is wired separately too (_CONSISTENCY_TEST_MARKERS) since its metric shape (an
+# agreement rate, no truth table) doesn't fit pool_correctness_metrics. Scale (#2469) is wired
+# separately too (_SCALE_TEST_MARKERS) since each of its two dimensions needs its *structural* and
+# *correctness* test functions' properties merged into one row, unlike this dict's 1:1 shape.
 _TREND_LOG_SUITES = {
     "::test_prb_correctness[": "correctness_prb",
     "::test_e2e_correctness[": "correctness_e2e",
@@ -308,6 +323,27 @@ _CONSISTENCY_TEST_MARKERS = {
     "::test_prb_consistent_across_repeats[": "consistency",
 }
 
+# Nodeid substring -> (trend-log suite name, check type) for the Scale suite (#2469,
+# docs/evaluation/policy-eval-scale.md). Unlike every dict above, each Scale trend-log row
+# (e.g. "scale_total_corpus_prb") is built from *two* separate test functions -- a structural test
+# (record_property("structural_pass"/"structural_issue_count"/...), pooled by
+# eval.trend_log.pool_scale_metrics) and a correctness test (the familiar precision/recall shape,
+# pooled by the existing pool_correctness_metrics) -- so this dict's value is a
+# (suite, "structural" | "correctness") pair rather than a bare suite name; _write_trend_log pools
+# each half separately then merges them into one row. Neither test function is parametrized (each
+# dimension/level is one fixture-backed test case, not a sweep), so no trailing "[" like the
+# per-scenario markers above.
+_SCALE_TEST_MARKERS: dict[str, tuple[str, str]] = {
+    "::test_scale_total_corpus_structural_prb": ("scale_total_corpus_prb", "structural"),
+    "::test_scale_total_corpus_correctness_prb": ("scale_total_corpus_prb", "correctness"),
+    "::test_scale_per_decision_structural_prb": ("scale_per_decision_prb", "structural"),
+    "::test_scale_per_decision_correctness_prb": ("scale_per_decision_prb", "correctness"),
+    "::test_scale_total_corpus_structural_e2e": ("scale_total_corpus_e2e", "structural"),
+    "::test_scale_total_corpus_correctness_e2e": ("scale_total_corpus_e2e", "correctness"),
+    "::test_scale_per_decision_structural_e2e": ("scale_per_decision_e2e", "structural"),
+    "::test_scale_per_decision_correctness_e2e": ("scale_per_decision_e2e", "correctness"),
+}
+
 # Full Correctness corpus size (eval.test_policy_pipeline_eval.SCENARIOS) -- kept as a plain
 # constant rather than imported, so this module (loaded for every eval/ run, marked or not) stays
 # free of that file's heavy Keycloak/launcher imports. A run that scores fewer scenarios than this
@@ -326,6 +362,25 @@ _EXPECTED_SCENARIO_COUNT = 8
 # full consistency run "partial" (and drop it from the dashboard chart) with no error. Bump if the
 # consistency suite's own parametrization count changes.
 _EXPECTED_CONSISTENCY_SCENARIO_COUNT = 8
+
+# Scale suite size overrides (eval.test_policy_pipeline_scale.py's own env-var reads) and their
+# documented fixed-100 defaults. Mirrored here as plain strings, not imported, so this module
+# doesn't need to import a live-LLM test module just to read three constants.
+_SCALE_FIXED_100_DEFAULTS = {
+    "SCALE_TOTAL_CORPUS_SIZE": "100",
+    "SCALE_TOTAL_CORPUS_ROLES": "10",
+    "SCALE_PER_DECISION_CANDIDATES": "100",
+}
+
+
+def _scale_run_matches_fixed_100() -> bool:
+    """True only when every Scale suite size override is unset or still at its documented
+    fixed-100 default. A reduced-size run (``SCALE_TOTAL_CORPUS_SIZE=10 ...``, used while
+    iterating per the suite's own module docstring) produces precision/recall/latency/cost numbers
+    that are not comparable to the fixed-100 regression baseline, regardless of whether both
+    halves of a dimension/level ran -- so it must never be tagged "regression" alongside real
+    fixed-100 runs on the same trend-log line."""
+    return all(os.environ.get(var, default) == default for var, default in _SCALE_FIXED_100_DEFAULTS.items())
 
 
 def _format_best_effort_notes(notes: dict[str, str]) -> str:
@@ -380,6 +435,42 @@ def _render_consistency_block(lines: list[str], props: dict) -> None:
         _render_field(lines, "Mismatches", mismatches)
 
 
+def _render_scale_block(lines: list[str], props: dict) -> None:
+    """Render the Scale suite's structural-check detail (``eval.scale_structural``, #2469) --
+    shown on every entry, pass or fail, same convention as ``_render_consistency_block``: a report
+    reader should never have to infer a structural failure's exact cause from pytest's own
+    crash-message fallback."""
+    lines.append(f"- **Structural check passed:** {'Yes' if props.get('structural_pass') else 'No'}")
+    lines.append(f"- **Structural issue count:** {props.get('structural_issue_count', 0)}")
+    for label, key in (
+        ("Missing decisions", "missing_decisions"),
+        ("Duplicate (role, scope, effect) triples", "duplicate_triples"),
+        ("Orphaned scopes", "orphaned_scopes"),
+        ("Hallucinated candidate role names", "scope_invalid_names"),
+        ("Hallucinated candidate scope names", "role_invalid_names"),
+        ("Missing Rego files", "missing_rego"),
+        # Reported only, never gated -- an agent the PRB itself proposed zero grants for across
+        # every one of its own decisions (a live-LLM correctness finding, already tracked
+        # non-gating by the correctness test's under_grants), not a structural/rendering defect.
+        ("Agents with zero PRB-proposed rules", "agents_with_no_rules"),
+    ):
+        if key in props:
+            value = props[key]
+            rendered = ", ".join(str(v) for v in value) if value else "none"
+            _render_field(lines, label, rendered)
+    if "wall_clock_seconds" in props:
+        lines.append(f"- **Wall-clock:** {props['wall_clock_seconds']:.1f}s")
+    if "total_tokens" in props:
+        lines.append(f"- **Total tokens:** {props['total_tokens']} (coverage={props.get('token_coverage', 1.0):.2f})")
+    best_effort_notes = props.get("best_effort_notes", {})
+    if best_effort_notes:
+        _render_field(
+            lines,
+            "Best-effort proposals used (not real production behavior — the auditor never approved these)",
+            _format_best_effort_notes(best_effort_notes),
+        )
+
+
 def _render_entry(lines: list[str], nodeid: str, report: pytest.TestReport, category: str) -> None:
     """Per-cell tests (``test_inbound``/``test_outbound``) ``record_property`` a concrete
     description + expected/actual boolean + explanation; ``test_prb_correctness`` (correctness-prb)
@@ -408,6 +499,11 @@ def _render_entry(lines: list[str], nodeid: str, report: pytest.TestReport, cate
         if description:
             lines.append(f"- **What it tests:** {description}")
         _render_consistency_block(lines, props)
+    elif "structural_pass" in props:
+        description = _docstrings.get(nodeid)
+        if description:
+            lines.append(f"- **What it tests:** {description}")
+        _render_scale_block(lines, props)
     elif category in ("failed", "error") and any(
         marker in nodeid for marker in _CORRECTNESS_TEST_MARKERS + _ROBUSTNESS_SCORED_TEST_MARKERS
     ):
@@ -462,6 +558,8 @@ def _write_trend_log() -> None:
     robustness_flags: dict[str, list[bool]] = {}
     robustness_entries: dict[str, list[dict]] = {}
     consistency_entries: dict[str, list[dict]] = {}
+    scale_structural_entries: dict[str, list[dict]] = {}
+    scale_correctness_entries: dict[str, list[dict]] = {}
     for nodeid, report in _reports.items():
         for nodeid_marker, suite in _TREND_LOG_SUITES.items():
             if nodeid_marker in report.nodeid:
@@ -483,6 +581,14 @@ def _write_trend_log() -> None:
                 if "inconsistent" in props:
                     consistency_entries.setdefault(consistency_suite, []).append(props)
                 break
+        for substring, (scale_suite, check_type) in _SCALE_TEST_MARKERS.items():
+            if substring in nodeid:
+                props = dict(report.user_properties)
+                if check_type == "structural" and "structural_pass" in props:
+                    scale_structural_entries.setdefault(scale_suite, []).append(props)
+                elif check_type == "correctness" and "true_positives" in props:
+                    scale_correctness_entries.setdefault(scale_suite, []).append(props)
+                break
 
     for suite, entries in by_suite.items():
         if entries:
@@ -502,6 +608,27 @@ def _write_trend_log() -> None:
     for consistency_suite, entries in consistency_entries.items():
         run_type = "regression" if len(entries) == _EXPECTED_CONSISTENCY_SCENARIO_COUNT else "partial"
         append_row(consistency_suite, pool_consistency_metrics(entries), run_type=run_type)
+
+    for scale_suite in sorted(set(scale_structural_entries) | set(scale_correctness_entries)):
+        structural = scale_structural_entries.get(scale_suite, [])
+        correctness = scale_correctness_entries.get(scale_suite, [])
+        # "regression" only once both halves ran in this session (a -k filter that exercised just
+        # one of the two test functions produces a row that isn't comparable to a full run of the
+        # suite, same "partial" convention every dict above already uses) AND the run used the
+        # documented fixed-100 sizes, not a reduced size overridden while iterating.
+        run_type = "regression" if structural and correctness and _scale_run_matches_fixed_100() else "partial"
+        # Skip whichever half didn't run rather than pooling an empty list: pool_scale_metrics([])
+        # and pool_correctness_metrics([]) each report a vacuous "nothing failed" for a half that
+        # was never measured (structural_pass_rate / precision+recall+denial_precision = 1.0), and
+        # merging both unconditionally also let whichever ran second clobber the other half's real
+        # scenarios_scored with its own 0 -- same "skip the empty one" convention the Robustness
+        # branch above already uses.
+        scale_metrics: dict[str, Any] = {}
+        if structural:
+            scale_metrics.update(pool_scale_metrics(structural))
+        if correctness:
+            scale_metrics.update(pool_correctness_metrics(correctness))
+        append_row(scale_suite, scale_metrics, run_type=run_type)
 
 
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
