@@ -187,8 +187,9 @@ def total_corpus_prb_result(tmp_path_factory: pytest.TempPathFactory) -> dict:
     os.environ["AIAC_POLICY_FILE"] = str(policy_path)
 
     start = time.perf_counter()
-    rules, reasoning_by_scope, reasoning_by_agent_role, best_effort_notes, usage_by_name = orchestrate_prb_concurrent(
-        roles, scopes, scenario, best_effort=True
+    orchestrated = orchestrate_prb_concurrent(roles, scopes, scenario, best_effort=True)
+    rules, reasoning_by_scope, reasoning_by_agent_role, best_effort_notes, usage_by_name, failed_decisions = (
+        orchestrated
     )
     elapsed = time.perf_counter() - start
 
@@ -200,6 +201,7 @@ def total_corpus_prb_result(tmp_path_factory: pytest.TempPathFactory) -> dict:
         "reasoning_by_agent_role": reasoning_by_agent_role,
         "best_effort_notes": best_effort_notes,
         "usage_by_name": usage_by_name,
+        "failed_decisions": failed_decisions,
         "elapsed_seconds": elapsed,
     }
 
@@ -216,6 +218,7 @@ def test_scale_total_corpus_structural_prb(total_corpus_prb_result: dict, record
     orphans = orphaned_scope_names(scenario)
     cost = summarize_usage(total_corpus_prb_result["usage_by_name"])
     best_effort_notes = total_corpus_prb_result["best_effort_notes"]
+    failed_decisions = total_corpus_prb_result["failed_decisions"]
 
     record_property("missing_decisions", missing)
     record_property("duplicate_triples", duplicates)
@@ -225,6 +228,11 @@ def test_scale_total_corpus_structural_prb(total_corpus_prb_result: dict, record
     record_property("token_coverage", cost.coverage)
     record_property("decision_count", cost.total_calls)
     record_property("best_effort_notes", best_effort_notes)
+    # Every name in failed_decisions is already counted once via `missing` (orchestrate_prb_
+    # concurrent never adds a failed job's name to reasoning_by_scope/reasoning_by_agent_role) --
+    # recorded/printed here only as *why* it's missing, never added into structural_issue_count a
+    # second time.
+    record_property("failed_decisions", failed_decisions)
     # Common fields every Scale structural test records, regardless of dimension -- lets
     # eval.trend_log.pool_scale_metrics pool both dimensions' rows with one shared shape rather
     # than needing to know each dimension's own field taxonomy. See that function's docstring.
@@ -234,7 +242,7 @@ def test_scale_total_corpus_structural_prb(total_corpus_prb_result: dict, record
         f"[scale:total_corpus:structural:prb] decisions={cost.total_calls} "
         f"wall_clock={total_corpus_prb_result['elapsed_seconds']:.1f}s tokens={cost.total_tokens} "
         f"(coverage={cost.coverage:.2f}) missing={missing} duplicates={duplicates} orphans={orphans} "
-        f"best_effort_notes={best_effort_notes or '{}'}"
+        f"best_effort_notes={best_effort_notes or '{}'} failed_decisions={failed_decisions or '{}'}"
     )
     assert not missing, f"decisions never ran: {missing}"
     assert not duplicates, f"duplicate (role, scope, effect) triples: {duplicates}"
@@ -263,6 +271,7 @@ def test_scale_total_corpus_correctness_prb(total_corpus_prb_result: dict, recor
     record_property("under_grants", under_grants)
     record_property("incorrectly_denied", incorrectly_denied)
     record_property("best_effort_notes", total_corpus_prb_result["best_effort_notes"])
+    record_property("failed_decisions", total_corpus_prb_result["failed_decisions"])
     record_property("true_positives", score.true_positive_count)
     record_property("denied_total", score.denied_total)
     print(
@@ -474,7 +483,9 @@ def total_corpus_e2e_result(tmp_path_factory: pytest.TempPathFactory) -> dict:
         _fix_agent_role_actor_ids(config, roles, scenario)
         start = time.perf_counter()
         orchestrated = orchestrate_prb_concurrent(roles, scopes, scenario, best_effort=True)
-        rules, reasoning_by_scope, reasoning_by_agent_role, best_effort_notes, usage_by_name = orchestrated
+        rules, reasoning_by_scope, reasoning_by_agent_role, best_effort_notes, usage_by_name, failed_decisions = (
+            orchestrated
+        )
         compute_and_apply(rules, override=False)
         elapsed = time.perf_counter() - start
 
@@ -487,6 +498,7 @@ def total_corpus_e2e_result(tmp_path_factory: pytest.TempPathFactory) -> dict:
         "reasoning_by_agent_role": reasoning_by_agent_role,
         "best_effort_notes": best_effort_notes,
         "usage_by_name": usage_by_name,
+        "failed_decisions": failed_decisions,
         "elapsed_seconds": elapsed,
     }
 
@@ -532,6 +544,7 @@ def test_scale_total_corpus_structural_e2e(total_corpus_e2e_result: dict, record
     orphans = orphaned_scope_names(scenario)
     cost = summarize_usage(total_corpus_e2e_result["usage_by_name"])
     best_effort_notes = total_corpus_e2e_result["best_effort_notes"]
+    failed_decisions = total_corpus_e2e_result["failed_decisions"]
 
     record_property("missing_decisions", missing_decisions_)
     record_property("missing_rego", missing_files)
@@ -542,6 +555,9 @@ def test_scale_total_corpus_structural_e2e(total_corpus_e2e_result: dict, record
     record_property("total_tokens", cost.total_tokens)
     record_property("token_coverage", cost.coverage)
     record_property("best_effort_notes", best_effort_notes)
+    # Already counted once via missing_decisions_ -- recorded/printed only as *why*, see
+    # orchestrate_prb_concurrent's docstring.
+    record_property("failed_decisions", failed_decisions)
     issue_count = len(missing_decisions_) + len(missing_files) + len(duplicates) + len(orphans)
     record_property("structural_pass", issue_count == 0)
     record_property("structural_issue_count", issue_count)
@@ -549,7 +565,8 @@ def test_scale_total_corpus_structural_e2e(total_corpus_e2e_result: dict, record
         f"[scale:total_corpus:structural:e2e] wall_clock={total_corpus_e2e_result['elapsed_seconds']:.1f}s "
         f"tokens={cost.total_tokens} (coverage={cost.coverage:.2f}) missing_decisions={missing_decisions_} "
         f"missing_rego={missing_files} agents_with_no_rules={agents_with_no_rules} duplicates={duplicates} "
-        f"orphans={orphans} best_effort_notes={best_effort_notes or '{}'}"
+        f"orphans={orphans} best_effort_notes={best_effort_notes or '{}'} "
+        f"failed_decisions={failed_decisions or '{}'}"
     )
     assert not missing_decisions_, f"decisions never ran: {missing_decisions_}"
     assert not missing_files, f"agent/direction with no rendered rego despite having rules: {missing_files}"
@@ -578,6 +595,7 @@ def test_scale_total_corpus_correctness_e2e(total_corpus_e2e_result: dict, recor
     record_property("under_grants", under_grants)
     record_property("incorrectly_denied", incorrectly_denied)
     record_property("best_effort_notes", total_corpus_e2e_result["best_effort_notes"])
+    record_property("failed_decisions", total_corpus_e2e_result["failed_decisions"])
     record_property("true_positives", score.true_positive_count)
     record_property("denied_total", score.denied_total)
     print(
