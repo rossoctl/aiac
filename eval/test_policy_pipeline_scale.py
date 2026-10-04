@@ -14,10 +14,12 @@ names -- but merged onto one trend-log row per dimension/level (``eval/conftest.
 ``_write_trend_log``, see ``_SCALE_TEST_MARKERS``), since what the spec actually guards against is
 blending the two into one number, not which JSON object the keys live in:
 
-- **structural** -- completeness, no duplication/orphans, latency, cost
-  (``eval.scale_structural``). Completeness/no-duplication/no-orphans gate the test (objectively
-  pass/fail); latency/cost are reported/trended only (no SLA exists anywhere in the spec/issue to
-  gate against).
+- **structural** -- completeness, no duplication, latency, cost (``eval.scale_structural``).
+  Completeness/no-duplication gate the test (objectively pass/fail); latency/cost are
+  reported/trended only (no SLA exists anywhere in the spec/issue to gate against). No-orphans is
+  also gated, but offline against the generator's own output in
+  ``eval/test_scale_generator.py`` -- see ``eval.scale_structural.orphaned_scope_names``'s
+  docstring for why it belongs there, not here.
 - **correctness** -- the same precision/recall scorer (``eval.correctness_scorer``) every other
   suite in this family uses, against the generated corpus's ground truth.
 
@@ -76,16 +78,15 @@ from eval.scale_generator import (  # noqa: E402
     generate_per_decision,
     generate_total_corpus,
 )
-from eval.scale_prb import _invoke_with_usage, orchestrate_prb_concurrent  # noqa: E402
+from eval.scale_prb import _invoke_with_usage, capture_precheck_drops, orchestrate_prb_concurrent  # noqa: E402
 from eval.scale_structural import (  # noqa: E402
+    duplicate_rego_entries,
     duplicate_rule_triples,
-    invalid_selected_names,
     missing_decisions,
     missing_rego,
-    orphaned_scope_names,
     summarize_usage,
 )
-from eval.test_policy_pipeline_correctness_e2e import _e2e_grant_sets  # noqa: E402
+from eval.test_policy_pipeline_correctness_e2e import _e2e_grant_sets, _rego_map  # noqa: E402
 from eval.test_policy_pipeline_eval import (  # noqa: E402
     _connect_admin,
     _rego_path,
@@ -208,21 +209,22 @@ def total_corpus_prb_result(tmp_path_factory: pytest.TempPathFactory) -> dict:
 
 def test_scale_total_corpus_structural_prb(total_corpus_prb_result: dict, record_property) -> None:
     """Total-corpus dimension, PRB level: every generated decision ran (completeness), no
-    duplicate/orphaned rule (no-duplication/no-orphans) -- gated. Latency/cost are reported and
-    trended, never gated (no SLA exists anywhere in the spec/issue)."""
+    duplicate rule (no-duplication) -- gated. Latency/cost are reported and trended, never gated
+    (no SLA exists anywhere in the spec/issue). No-orphans is a pure invariant of the *generated
+    corpus* (never of what the PRB did), so it's exercised directly, offline, in
+    ``eval/test_scale_generator.py`` instead of re-checked once per expensive live run here -- see
+    ``eval.scale_structural.orphaned_scope_names``'s docstring."""
     scenario = total_corpus_prb_result["scenario"]
     missing = missing_decisions(
         scenario, total_corpus_prb_result["reasoning_by_scope"], total_corpus_prb_result["reasoning_by_agent_role"]
     )
     duplicates = duplicate_rule_triples(total_corpus_prb_result["rules"])
-    orphans = orphaned_scope_names(scenario)
     cost = summarize_usage(total_corpus_prb_result["usage_by_name"])
     best_effort_notes = total_corpus_prb_result["best_effort_notes"]
     failed_decisions = total_corpus_prb_result["failed_decisions"]
 
     record_property("missing_decisions", missing)
     record_property("duplicate_triples", duplicates)
-    record_property("orphaned_scopes", orphans)
     record_property("wall_clock_seconds", total_corpus_prb_result["elapsed_seconds"])
     record_property("total_tokens", cost.total_tokens)
     record_property("token_coverage", cost.coverage)
@@ -236,17 +238,16 @@ def test_scale_total_corpus_structural_prb(total_corpus_prb_result: dict, record
     # Common fields every Scale structural test records, regardless of dimension -- lets
     # eval.trend_log.pool_scale_metrics pool both dimensions' rows with one shared shape rather
     # than needing to know each dimension's own field taxonomy. See that function's docstring.
-    record_property("structural_pass", not missing and not duplicates and not orphans)
-    record_property("structural_issue_count", len(missing) + len(duplicates) + len(orphans))
+    record_property("structural_pass", not missing and not duplicates)
+    record_property("structural_issue_count", len(missing) + len(duplicates))
     print(
         f"[scale:total_corpus:structural:prb] decisions={cost.total_calls} "
         f"wall_clock={total_corpus_prb_result['elapsed_seconds']:.1f}s tokens={cost.total_tokens} "
-        f"(coverage={cost.coverage:.2f}) missing={missing} duplicates={duplicates} orphans={orphans} "
+        f"(coverage={cost.coverage:.2f}) missing={missing} duplicates={duplicates} "
         f"best_effort_notes={best_effort_notes or '{}'} failed_decisions={failed_decisions or '{}'}"
     )
     assert not missing, f"decisions never ran: {missing}"
     assert not duplicates, f"duplicate (role, scope, effect) triples: {duplicates}"
-    assert not orphans, f"scopes unreachable by any role: {orphans}"
 
 
 def test_scale_total_corpus_correctness_prb(total_corpus_prb_result: dict, record_property) -> None:
@@ -309,9 +310,15 @@ def per_decision_prb_result(tmp_path_factory: pytest.TempPathFactory) -> dict:
     focal_scope = Scope(id="scope-focal", name=FOCAL_SCOPE_NAME, description="", serviceId="scale-tool-per-decision")
     (tmp_dir / "scope_policy.md").write_text(corpus.scope_policy_text)
     os.environ["AIAC_POLICY_FILE"] = str(tmp_dir / "scope_policy.md")
-    scope_rules, _, scope_note, scope_usage = _invoke_with_usage(
-        SCOPE_GRAPH, roles=candidate_roles, scope=focal_scope, best_effort=True
-    )
+    # capture_precheck_drops recovers the LLM's raw proposed names, before production's own
+    # _precheck step silently filters out anything not in `candidate_roles` -- without it,
+    # invalid_selected_names below would only ever see already-filtered names and could never
+    # actually detect a hallucination. Safe here (unlike inside orchestrate_prb_concurrent):
+    # these two calls are sequential, not concurrent -- see that context manager's own docstring.
+    with capture_precheck_drops() as scope_drops:
+        scope_rules, _, scope_note, scope_usage = _invoke_with_usage(
+            SCOPE_GRAPH, roles=candidate_roles, scope=focal_scope, best_effort=True
+        )
     scope_selected = [r.role.name for r in scope_rules if r.effect == RuleEffect.ALLOW]
     scope_denied = [r.role.name for r in scope_rules if r.effect == RuleEffect.DENY]
 
@@ -322,9 +329,10 @@ def per_decision_prb_result(tmp_path_factory: pytest.TempPathFactory) -> dict:
     focal_role = Role(id="role-focal", name=FOCAL_ROLE_NAME, description="", composite=False, kind=RoleKind.AGENT)
     (tmp_dir / "role_policy.md").write_text(corpus.role_policy_text)
     os.environ["AIAC_POLICY_FILE"] = str(tmp_dir / "role_policy.md")
-    role_rules, _, role_note, role_usage = _invoke_with_usage(
-        ROLE_GRAPH, role=focal_role, scopes=candidate_scopes, best_effort=True
-    )
+    with capture_precheck_drops() as role_drops:
+        role_rules, _, role_note, role_usage = _invoke_with_usage(
+            ROLE_GRAPH, role=focal_role, scopes=candidate_scopes, best_effort=True
+        )
     role_selected = [r.scope.name for r in role_rules if r.effect == RuleEffect.ALLOW]
     role_denied = [r.scope.name for r in role_rules if r.effect == RuleEffect.DENY]
     elapsed = time.perf_counter() - start
@@ -335,12 +343,14 @@ def per_decision_prb_result(tmp_path_factory: pytest.TempPathFactory) -> dict:
         "scope_candidate_names": corpus.scope_candidate_roles,
         "scope_selected": scope_selected,
         "scope_denied": scope_denied,
+        "scope_dropped_names": sorted(set(scope_drops.granted) | set(scope_drops.denied)),
         "scope_rules": scope_rules,
         "scope_note": scope_note,
         "scope_usage": scope_usage,
         "role_candidate_names": corpus.role_candidate_scopes,
         "role_selected": role_selected,
         "role_denied": role_denied,
+        "role_dropped_names": sorted(set(role_drops.granted) | set(role_drops.denied)),
         "role_rules": role_rules,
         "role_note": role_note,
         "role_usage": role_usage,
@@ -351,14 +361,20 @@ def test_scale_per_decision_structural_prb(per_decision_prb_result: dict, record
     """Per-decision dimension, PRB level: no hallucinated candidate name in the PRB's response
     (fidelity, gated) and no duplicate rule. Latency/cost are reported and trended, never gated.
 
+    Fidelity is checked against ``*_dropped_names`` -- the names ``eval.scale_prb.
+    capture_precheck_drops`` recovered directly from production's own ``_precheck`` step, before
+    it silently filtered them out. The post-filter ``*_selected``/``*_denied`` lists below can
+    never contain a hallucinated name by the time a caller sees them, so checking fidelity against
+    those (as this test once did) could never actually fail -- see that function's own docstring.
+
     Completeness here is *not* "every candidate appears in selected or denied" -- production's own
     selection schema carries only explicit grants/prohibitions with no enumerated "everyone else is
     denied" complement (see ``eval.scale_structural.invalid_selected_names``'s docstring), so a
     candidate absent from both is an ordinary implicit deny. A truncation/needle-in-a-haystack
     failure instead shows up as an under-grant in the correctness test below."""
     r = per_decision_prb_result
-    scope_invalid = invalid_selected_names(r["scope_candidate_names"], r["scope_selected"], r["scope_denied"])
-    role_invalid = invalid_selected_names(r["role_candidate_names"], r["role_selected"], r["role_denied"])
+    scope_invalid = r["scope_dropped_names"]
+    role_invalid = r["role_dropped_names"]
     scope_duplicates = duplicate_rule_triples(r["scope_rules"])
     role_duplicates = duplicate_rule_triples(r["role_rules"])
     cost = summarize_usage({"scope_decision": r["scope_usage"], "role_decision": r["role_usage"]})
@@ -505,9 +521,12 @@ def total_corpus_e2e_result(tmp_path_factory: pytest.TempPathFactory) -> dict:
 
 def test_scale_total_corpus_structural_e2e(total_corpus_e2e_result: dict, record_property) -> None:
     """Total-corpus dimension, e2e level: every generated PRB decision ran, every agent's
-    inbound+outbound Rego actually landed on disk (completeness), no duplicate PRB rule and no
-    orphaned scope (no-duplication/no-orphans) -- gated. Latency/cost (now including PCE+Rego
-    rendering, not just the PRB) are reported and trended, never gated."""
+    inbound+outbound Rego actually landed on disk (completeness), no duplicate entry in the real
+    rendered Rego (no-duplication -- the actual Policy Computation Engine merge output, not the
+    pre-merge PRB rules ``duplicate_rule_triples`` checks at PRB level) -- gated. Latency/cost (now
+    including PCE+Rego rendering, not just the PRB) are reported and trended, never gated.
+    No-orphans is a pure invariant of the generated corpus, checked offline in
+    ``eval/test_scale_generator.py`` instead -- see ``test_scale_total_corpus_structural_prb``."""
     scenario = total_corpus_e2e_result["scenario"]
     rego_dir = total_corpus_e2e_result["rego_dir"]
     rules = total_corpus_e2e_result["rules"]
@@ -540,8 +559,25 @@ def test_scale_total_corpus_structural_e2e(total_corpus_e2e_result: dict, record
         for direction in ("inbound", "outbound")
     ]
     missing_files = missing_rego(rego_paths)
-    duplicates = duplicate_rule_triples(rules)
-    orphans = orphaned_scope_names(scenario)
+
+    # Real merge-engine duplication check: query every rendered document the real PDP Policy
+    # Writer + OPA actually wrote for each agent that has any (same _rego_map helper
+    # _e2e_grant_sets uses to score correctness), and flag any candidate name listed more than
+    # once under one role/scope -- the one way compute_and_apply's documented role.id+scope.id+
+    # effect dedup could actually fail. See duplicate_rego_entries' own docstring for why this,
+    # not duplicate_rule_triples(rules), is the real e2e-level no-duplication check.
+    rego_duplicates = [
+        (f"{agent_id}/{doc}", key, candidate)
+        for agent_id in sorted(agents_with_rules)
+        for rego, doc in (
+            (_rego_path(rego_dir, agent_id, "inbound"), "inbound.request.subject_role_allow_scopes"),
+            (_rego_path(rego_dir, agent_id, "inbound"), "inbound.request.subject_role_deny_scopes"),
+            (_rego_path(rego_dir, agent_id, "outbound"), "outbound.request.subject_role_allow_scopes"),
+            (_rego_path(rego_dir, agent_id, "outbound"), "outbound.request.subject_role_deny_scopes"),
+            (_rego_path(rego_dir, agent_id, "outbound"), "outbound.request.agent_role_scopes"),
+        )
+        for key, candidate in duplicate_rego_entries(_rego_map(rego, doc))
+    ]
     cost = summarize_usage(total_corpus_e2e_result["usage_by_name"])
     best_effort_notes = total_corpus_e2e_result["best_effort_notes"]
     failed_decisions = total_corpus_e2e_result["failed_decisions"]
@@ -549,8 +585,7 @@ def test_scale_total_corpus_structural_e2e(total_corpus_e2e_result: dict, record
     record_property("missing_decisions", missing_decisions_)
     record_property("missing_rego", missing_files)
     record_property("agents_with_no_rules", agents_with_no_rules)  # reported only, see above
-    record_property("duplicate_triples", duplicates)
-    record_property("orphaned_scopes", orphans)
+    record_property("rego_duplicates", rego_duplicates)
     record_property("wall_clock_seconds", total_corpus_e2e_result["elapsed_seconds"])
     record_property("total_tokens", cost.total_tokens)
     record_property("token_coverage", cost.coverage)
@@ -558,20 +593,19 @@ def test_scale_total_corpus_structural_e2e(total_corpus_e2e_result: dict, record
     # Already counted once via missing_decisions_ -- recorded/printed only as *why*, see
     # orchestrate_prb_concurrent's docstring.
     record_property("failed_decisions", failed_decisions)
-    issue_count = len(missing_decisions_) + len(missing_files) + len(duplicates) + len(orphans)
+    issue_count = len(missing_decisions_) + len(missing_files) + len(rego_duplicates)
     record_property("structural_pass", issue_count == 0)
     record_property("structural_issue_count", issue_count)
     print(
         f"[scale:total_corpus:structural:e2e] wall_clock={total_corpus_e2e_result['elapsed_seconds']:.1f}s "
         f"tokens={cost.total_tokens} (coverage={cost.coverage:.2f}) missing_decisions={missing_decisions_} "
-        f"missing_rego={missing_files} agents_with_no_rules={agents_with_no_rules} duplicates={duplicates} "
-        f"orphans={orphans} best_effort_notes={best_effort_notes or '{}'} "
+        f"missing_rego={missing_files} agents_with_no_rules={agents_with_no_rules} "
+        f"rego_duplicates={rego_duplicates} best_effort_notes={best_effort_notes or '{}'} "
         f"failed_decisions={failed_decisions or '{}'}"
     )
     assert not missing_decisions_, f"decisions never ran: {missing_decisions_}"
     assert not missing_files, f"agent/direction with no rendered rego despite having rules: {missing_files}"
-    assert not duplicates, f"duplicate (role, scope, effect) triples: {duplicates}"
-    assert not orphans, f"scopes unreachable by any role: {orphans}"
+    assert not rego_duplicates, f"duplicate candidate name(s) in the rendered Rego: {rego_duplicates}"
 
 
 def test_scale_total_corpus_correctness_e2e(total_corpus_e2e_result: dict, record_property) -> None:
@@ -652,14 +686,18 @@ def per_decision_e2e_result(tmp_path_factory: pytest.TempPathFactory) -> dict:
         # must stay sequential, not fanned out via eval.scale_prb's concurrency helper.
         (tmp_dir / "scope_policy.md").write_text(corpus.scope_policy_text)
         os.environ["AIAC_POLICY_FILE"] = str(tmp_dir / "scope_policy.md")
-        scope_rules, _, scope_note, scope_usage = _invoke_with_usage(
-            SCOPE_GRAPH, roles=candidate_role_objs, scope=focal_scope_obj, best_effort=True
-        )
+        # See per_decision_prb_result's own comment: these two calls are sequential, not
+        # concurrent, so capturing precheck drops here is safe.
+        with capture_precheck_drops() as scope_drops:
+            scope_rules, _, scope_note, scope_usage = _invoke_with_usage(
+                SCOPE_GRAPH, roles=candidate_role_objs, scope=focal_scope_obj, best_effort=True
+            )
         (tmp_dir / "role_policy.md").write_text(corpus.role_policy_text)
         os.environ["AIAC_POLICY_FILE"] = str(tmp_dir / "role_policy.md")
-        role_rules, _, role_note, role_usage = _invoke_with_usage(
-            ROLE_GRAPH, role=focal_role_obj, scopes=candidate_scope_objs, best_effort=True
-        )
+        with capture_precheck_drops() as role_drops:
+            role_rules, _, role_note, role_usage = _invoke_with_usage(
+                ROLE_GRAPH, role=focal_role_obj, scopes=candidate_scope_objs, best_effort=True
+            )
         compute_and_apply(scope_rules + role_rules, override=False)
         elapsed = time.perf_counter() - start
 
@@ -670,11 +708,13 @@ def per_decision_e2e_result(tmp_path_factory: pytest.TempPathFactory) -> dict:
         "scope_candidate_names": corpus.scope_candidate_roles,
         "scope_selected": [r.role.name for r in scope_rules if r.effect == RuleEffect.ALLOW],
         "scope_denied": [r.role.name for r in scope_rules if r.effect == RuleEffect.DENY],
+        "scope_dropped_names": sorted(set(scope_drops.granted) | set(scope_drops.denied)),
         "scope_rules": scope_rules,
         "scope_note": scope_note,
         "role_candidate_names": corpus.role_candidate_scopes,
         "role_selected": [r.scope.name for r in role_rules if r.effect == RuleEffect.ALLOW],
         "role_denied": [r.scope.name for r in role_rules if r.effect == RuleEffect.DENY],
+        "role_dropped_names": sorted(set(role_drops.granted) | set(role_drops.denied)),
         "role_rules": role_rules,
         "role_note": role_note,
         "usage_by_name": {"scope_decision": scope_usage, "role_decision": role_usage},
@@ -683,14 +723,16 @@ def per_decision_e2e_result(tmp_path_factory: pytest.TempPathFactory) -> dict:
 
 
 def test_scale_per_decision_structural_e2e(per_decision_e2e_result: dict, record_property) -> None:
-    """Per-decision dimension, e2e level: no hallucinated candidate name, no duplicate rule, and
-    both agents' expected Rego file actually rendered (fidelity + completeness, gated). Latency/
-    cost (now including PCE+Rego rendering) are reported and trended, never gated."""
+    """Per-decision dimension, e2e level: no hallucinated candidate name (checked against
+    ``*_dropped_names``, captured straight from production's own precheck step -- see
+    ``per_decision_prb_result``'s own comment for why), no duplicate entry in the real rendered
+    Rego (the actual PCE merge output, not the pre-merge PRB rules -- see
+    ``duplicate_rego_entries``'s docstring), and both agents' expected Rego file actually rendered
+    (fidelity + completeness, gated). Latency/cost (now including PCE+Rego rendering) are reported
+    and trended, never gated."""
     r = per_decision_e2e_result
-    scope_invalid = invalid_selected_names(r["scope_candidate_names"], r["scope_selected"], r["scope_denied"])
-    role_invalid = invalid_selected_names(r["role_candidate_names"], r["role_selected"], r["role_denied"])
-    scope_duplicates = duplicate_rule_triples(r["scope_rules"])
-    role_duplicates = duplicate_rule_triples(r["role_rules"])
+    scope_invalid = r["scope_dropped_names"]
+    role_invalid = r["role_dropped_names"]
     # PER_DECISION_SCOPE_AGENT_ID has no outbound-side roles/target-scopes at all, and
     # PER_DECISION_ROLE_AGENT_ID has no inbound scope -- both by design, not a gap, so at most
     # these two files are ever expected. But a file is expected only once the PRB actually
@@ -700,48 +742,47 @@ def test_scale_per_decision_structural_e2e(per_decision_e2e_result: dict, record
     # finding (already tracked, non-gating, by the correctness test's under_grants), not a
     # structural defect. Mirrors the total-corpus structural test's own agents_with_rules gating.
     rego_paths = []
+    rego_duplicates: list[tuple[str, str, str]] = []
     if r["scope_rules"]:
-        rego_paths.append(
-            (
-                f"{PER_DECISION_SCOPE_AGENT_ID}/inbound",
-                _rego_path(r["rego_dir"], PER_DECISION_SCOPE_AGENT_ID, "inbound"),
-            )
-        )
+        inbound_rego = _rego_path(r["rego_dir"], PER_DECISION_SCOPE_AGENT_ID, "inbound")
+        rego_paths.append((f"{PER_DECISION_SCOPE_AGENT_ID}/inbound", inbound_rego))
+        for doc in ("inbound.request.subject_role_allow_scopes", "inbound.request.subject_role_deny_scopes"):
+            rego_duplicates += [
+                (f"scope_decision/{doc}", key, candidate)
+                for key, candidate in duplicate_rego_entries(_rego_map(inbound_rego, doc))
+            ]
     if r["role_rules"]:
-        rego_paths.append(
-            (
-                f"{PER_DECISION_ROLE_AGENT_ID}/outbound",
-                _rego_path(r["rego_dir"], PER_DECISION_ROLE_AGENT_ID, "outbound"),
-            )
-        )
+        outbound_rego = _rego_path(r["rego_dir"], PER_DECISION_ROLE_AGENT_ID, "outbound")
+        rego_paths.append((f"{PER_DECISION_ROLE_AGENT_ID}/outbound", outbound_rego))
+        doc = "outbound.request.agent_role_scopes"
+        rego_duplicates += [
+            (f"role_decision/{doc}", key, candidate)
+            for key, candidate in duplicate_rego_entries(_rego_map(outbound_rego, doc))
+        ]
     missing_files = missing_rego(rego_paths)
     cost = summarize_usage(r["usage_by_name"])
     best_effort_notes = {k: v for k, v in (("scope_decision", r["scope_note"]), ("role_decision", r["role_note"])) if v}
 
     record_property("scope_invalid_names", scope_invalid)
     record_property("role_invalid_names", role_invalid)
-    record_property("duplicate_triples", scope_duplicates + role_duplicates)
+    record_property("rego_duplicates", rego_duplicates)
     record_property("missing_rego", missing_files)
     record_property("wall_clock_seconds", r["elapsed_seconds"])
     record_property("total_tokens", cost.total_tokens)
     record_property("token_coverage", cost.coverage)
     record_property("best_effort_notes", best_effort_notes)
-    issue_count = (
-        len(scope_invalid) + len(role_invalid) + len(scope_duplicates) + len(role_duplicates) + len(missing_files)
-    )
+    issue_count = len(scope_invalid) + len(role_invalid) + len(rego_duplicates) + len(missing_files)
     record_property("structural_pass", issue_count == 0)
     record_property("structural_issue_count", issue_count)
     print(
         f"[scale:per_decision:structural:e2e] n_candidates={len(r['scope_candidate_names'])} "
         f"wall_clock={r['elapsed_seconds']:.1f}s tokens={cost.total_tokens} (coverage={cost.coverage:.2f}) "
         f"scope_invalid={scope_invalid} role_invalid={role_invalid} missing_rego={missing_files} "
-        f"best_effort_notes={best_effort_notes or '{}'}"
+        f"rego_duplicates={rego_duplicates} best_effort_notes={best_effort_notes or '{}'}"
     )
     assert not scope_invalid, f"hallucinated candidate role name(s): {scope_invalid}"
     assert not role_invalid, f"hallucinated candidate scope name(s): {role_invalid}"
-    assert not scope_duplicates and not role_duplicates, (
-        f"duplicate (role, scope, effect) triples: {scope_duplicates + role_duplicates}"
-    )
+    assert not rego_duplicates, f"duplicate candidate name(s) in the rendered Rego: {rego_duplicates}"
     assert not missing_files, f"expected rego files never rendered: {missing_files}"
 
 

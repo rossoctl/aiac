@@ -24,10 +24,12 @@ then aggregates on the main thread -- see ``eval.scale_structural`` for the aggr
 
 from __future__ import annotations
 
+import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from types import SimpleNamespace
-from typing import Any, Callable, TypeVar
+from typing import Any, Callable, Iterator, TypeVar
 
 from langchain_core.callbacks.usage import get_usage_metadata_callback
 
@@ -38,6 +40,15 @@ from eval.test_policy_pipeline_eval import _invoke_graph
 
 DEFAULT_CONCURRENCY = 20
 T = TypeVar("T")
+
+# The exact logger name and message prefix aiac.agent.policy_rules_builder.graph's own _precheck
+# step logs a diagnostic warning under when it drops a hallucinated (non-candidate) name --
+# ``logger = logging.getLogger(__name__)`` there, so this is that module's dotted path, not an
+# arbitrary string. Capturing this (see ``capture_precheck_drops`` below) observes a message
+# production code already emits on purpose for exactly this kind of diagnosis -- no production
+# code is read, called, or modified to recover it.
+_PRECHECK_LOGGER_NAME = "aiac.agent.policy_rules_builder.graph"
+_PRECHECK_DROP_MESSAGE = "PRB precheck dropped hallucinated names: granted=%s denied=%s"
 
 
 def concurrency() -> int:
@@ -65,6 +76,49 @@ def _invoke_with_usage(
     with get_usage_metadata_callback() as cb:
         rules, reasoning, note = _invoke_graph(graph, best_effort=best_effort, **entity)
     return rules, reasoning, note, dict(cb.usage_metadata)
+
+
+class PrecheckDrops(logging.Handler):
+    """Collects the names ``_precheck``'s own diagnostic warning reports as dropped (a candidate
+    the LLM selected or denied that was never offered to it -- see ``capture_precheck_drops``
+    below). Not meant to be instantiated directly outside that context manager."""
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.WARNING)
+        self.granted: list[str] = []
+        self.denied: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if record.msg == _PRECHECK_DROP_MESSAGE and record.args:
+            granted, denied = record.args
+            self.granted.extend(granted)
+            self.denied.extend(denied)
+
+
+@contextmanager
+def capture_precheck_drops() -> Iterator[PrecheckDrops]:
+    """Attach a :class:`PrecheckDrops` handler to ``_precheck``'s own logger for the duration of
+    the ``with`` block, so a hallucinated (non-candidate) name it drops can actually be observed
+    from eval code -- without reading, calling, or modifying any production code, only listening
+    to a diagnostic warning ``_precheck`` already logs on purpose. ``eval.scale_structural.
+    invalid_selected_names`` cannot see this itself: by the time a PRB call returns, the final
+    state's ``selected_names``/``denied_names`` are already the post-``_precheck`` *filtered*
+    lists, so an invented name is already gone from everything a caller can read off the result.
+
+    **Not thread-safe** -- a ``logging.Logger``'s handler list is one shared, global object; two
+    concurrent ``with`` blocks on different threads would both receive every record logged by
+    *either* call, misattributing drops across jobs, and concurrently mutating the same handler
+    list is itself a race. Only use this around a single, non-concurrent call (the per-decision
+    fixtures' two sequential ``_invoke_with_usage`` calls) -- never from
+    ``orchestrate_prb_concurrent``'s ``ThreadPoolExecutor`` jobs.
+    """
+    handler = PrecheckDrops()
+    logger = logging.getLogger(_PRECHECK_LOGGER_NAME)
+    logger.addHandler(handler)
+    try:
+        yield handler
+    finally:
+        logger.removeHandler(handler)
 
 
 def orchestrate_prb_concurrent(
