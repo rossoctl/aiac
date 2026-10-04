@@ -452,6 +452,7 @@ def _render_scale_block(lines: list[str], props: dict) -> None:
     for label, key in (
         ("Missing decisions", "missing_decisions"),
         ("Duplicate (role, scope, effect) triples", "duplicate_triples"),
+        ("Duplicate entries in rendered Rego", "rego_duplicates"),
         ("Orphaned scopes", "orphaned_scopes"),
         ("Hallucinated candidate role names", "scope_invalid_names"),
         ("Hallucinated candidate scope names", "role_invalid_names"),
@@ -475,6 +476,19 @@ def _render_scale_block(lines: list[str], props: dict) -> None:
             lines,
             "Best-effort proposals used (not real production behavior — the auditor never approved these)",
             _format_best_effort_notes(best_effort_notes),
+        )
+    # Names every entry in "Missing decisions" above whose call raised an exception outright
+    # (e.g. a rate-limited LLMAccessError) rather than running and being rejected -- without this,
+    # a reader sees a name under "Missing decisions" with no way to tell whether it never ran at
+    # all or ran and was silently dropped. See eval.scale_prb.orchestrate_prb_concurrent's
+    # docstring for why this is kept separate from best_effort_notes above (a different, not a
+    # worse, outcome: no proposal was ever produced to approve or reject).
+    failed_decisions = props.get("failed_decisions", {})
+    if failed_decisions:
+        _render_field(
+            lines,
+            "Failed decision calls (raised an exception, see reason)",
+            _format_best_effort_notes(failed_decisions),
         )
 
 
