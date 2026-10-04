@@ -14,7 +14,9 @@ Two halves, both live here so a single module import serves every launcher:
   ``outbound_probe`` / ``outbound_session_probe`` send **real HTTP requests through AuthBridge** and
   classify the **real OPA plugin's** allow/deny; ``poll_until`` waits for ``bundle-service`` to reflect a CR change; and the
   skip gates (``require_env_or_skip`` / ``require_pipeline`` / ``verify_subject_mapper``) make the
-  suite skip cleanly — never false-pass — when the cluster is not wired.
+  suite skip cleanly — never false-pass — when the cluster is not wired. ``require_pipeline`` also
+  skips when the global combiner (the ``default`` ``AuthorizationPolicy`` in the bundle-service
+  namespace) still allows a pod that has no client CR (D20, ``combiner_reason``).
 
 The evaluator is now the deployed plugin, not a standalone OPA-CLI run over dumped ``.rego``: there is
 deliberately no ``opa`` binary dependency and no ``.rego``-dump oracle here anymore (handoff 08).
@@ -467,7 +469,8 @@ def outbound_probe(
 
     Mirrors the runbook's outbound probe (B.4) but invokes a **bare** tool (``params.name = tool_name``,
     e.g. ``source-read``) instead of ``tools/list``, so AuthBridge's ``mcp-parser`` surfaces
-    ``input.mcp.params.name`` and OPA's per-tool outbound gate is actually exercised. The agent app
+    ``input.mcp.params.name`` and OPA's per-tool check is actually exercised (github-tool's inbound
+    under target side, the agent's outbound under agent side). The agent app
     container has ``HTTP_PROXY=127.0.0.1:8081`` (the forward proxy) and ``python3``; ``token-exchange``
     uses the carried ``dev-user`` bearer as the RFC 8693 subject token. It is a one-frame
     :func:`outbound_session_probe`. Any exec failure returns ``(None, <message>)`` -> ``"error"``."""
@@ -499,8 +502,9 @@ def outbound_session_probe(
 
     The forward proxy is ``127.0.0.1:8081``, the user bearer is the token-exchange subject token, and
     the request carries the MCP ``Accept`` header. The frames are sent as given, so a method that
-    carries no tool name reaches the outbound OPA session rule; :func:`outbound_probe` sends one
-    ``tools/call`` frame. Each frame's output starts
+    carries no tool name reaches the MCP session rule of the tool check (github-tool's inbound under
+    target side, the agent's outbound under agent side); :func:`outbound_probe` sends one ``tools/call``
+    frame. Each frame's output starts
     with an ``AB_MSG:<i>`` line and carries the ``AB_HTTP:<n>`` / ``AB_ERR:<msg>`` markers that
     ``_parse_curl_output`` reads. An exec failure returns ``(None, <message>)`` for every frame."""
     script = (
@@ -581,13 +585,38 @@ def inbound_outcome(code: int | None) -> str:
     return "error"
 
 
+def is_opa_violation(doc: object) -> bool:
+    """True when ``doc`` (a parsed rejection body, or the ``error.data`` of a JSON-RPC error frame)
+    names the OPA plugin: ``plugin == "opa"`` or ``error == "policy.forbidden"`` (cortex
+    ``pipeline.Violation.Render`` / ``httpx.MarshalMCPRejectionBody``)."""
+    return isinstance(doc, dict) and (doc.get("plugin") == "opa" or doc.get("error") == "policy.forbidden")
+
+
+def _json_or_none(body: str) -> object:
+    """``json.loads(body)``, or ``None`` when the body is not JSON."""
+    try:
+        return json.loads(body)
+    except (ValueError, TypeError):
+        return None
+
+
 def outbound_outcome(code: int | None, body: str) -> str:
     """Classify an outbound probe by **body**, per runbook B.4.
 
-    On an MCP-shaped request (a ``method`` + ``id``) AuthBridge's forward proxy renders **any**
-    rejection as a JSON-RPC error frame **at HTTP 200** (``writeMCPRejection`` — the MCP client sees a
-    single failed tool call, not a transport break), so the frame's ``error.data`` — not the HTTP
-    status — carries the reason. The reason decides the class:
+    A denied ``tools/call`` has one of two shapes, by the enforcement side:
+
+      * **Target side** — the agent's outbound is a pass-through, and the **callee's inbound** OPA
+        (github-tool's reverse proxy) decides. The reverse proxy renders a rejection with
+        ``httpx.WriteRejection``: **HTTP 403** and a plain JSON body
+        (``{"error": "policy.forbidden", "message": …, "plugin": "opa"}``). The agent's forward proxy
+        relays that response as it is. A 403 whose body names OPA -> ``"deny"``. A 403 with any other
+        body -> ``"error"``: it is not an OPA verdict, so it must not stand in for one.
+      * **Agent side** — the agent's **outbound** OPA decides. On an MCP-shaped request (a ``method``
+        + ``id``) AuthBridge's forward proxy renders **any** rejection as a JSON-RPC error frame **at
+        HTTP 200** (``writeMCPRejection`` — the MCP client sees a single failed tool call, not a
+        transport break), so the frame's ``error.data`` — not the HTTP status — carries the reason.
+
+    The reason of a JSON-RPC error frame at HTTP 200 decides the class:
 
       * **OPA** blocked it — ``error.data.plugin == "opa"`` / ``error.data.error == "policy.forbidden"``
         -> ``"deny"``. This is the real outbound authorization verdict: token-exchange succeeded and the
@@ -603,20 +632,19 @@ def outbound_outcome(code: int | None, body: str) -> str:
         ``agent -> tool`` call and token-exchange would short-circuit here anyway — so this frame is
         not an expected verdict on any rung; it always signals a fault worth surfacing.
 
-    So: a plain ``403`` (non-MCP-shaped rejection fallback) -> ``"deny"``; HTTP 200 with an OPA error
-    frame -> ``"deny"``; HTTP 200 with a token-exchange error frame -> ``"error"``; HTTP 200 with any
-    other body (a ``result`` frame, or a tool-level error that means the call was *allowed* through) ->
-    ``"allow"``; ``None`` or any other non-200/403 (a transport break, or a non-MCP token-exchange
-    ``503``) -> ``"error"``. Classify by the frame, never the transport status."""
+    So: a plain ``403`` whose body names OPA (the callee's inbound, target side; or the agent's own
+    non-MCP-shaped rejection fallback) -> ``"deny"``; any other ``403`` -> ``"error"``; HTTP 200 with an
+    OPA error frame -> ``"deny"``; HTTP 200 with a token-exchange error frame -> ``"error"``; HTTP 200
+    with any other body (a ``result`` frame, or a tool-level error that means the call was *allowed*
+    through) -> ``"allow"``; ``None`` or any other status (a transport break, a 401 from the callee's
+    ``jwt-validation``, a 503 before the first bundle loads, or a non-MCP token-exchange ``503``) ->
+    ``"error"``. Classify by the body, never the transport status alone."""
     if code is None:
         return "error"
+    doc = _json_or_none(body)
     if code == 403:
-        return "deny"
-    if code != 200:
-        return "error"
-    try:
-        doc = json.loads(body)
-    except (ValueError, TypeError):
+        return "deny" if is_opa_violation(doc) else "error"
+    if code != 200 or doc is None:
         return "error"
     err = doc.get("error") if isinstance(doc, dict) else None
     if isinstance(err, dict):
@@ -627,9 +655,41 @@ def outbound_outcome(code: int | None, body: str) -> str:
             if data.get("plugin") == "token-exchange" or data.get("error") == "upstream.token-exchange-failed":
                 return "error"
             # A real OPA verdict — token-exchange succeeded and the request reached the policy.
-            if data.get("plugin") == "opa" or data.get("error") == "policy.forbidden":
+            if is_opa_violation(data):
                 return "deny"
     return "allow"
+
+
+# Where the deny of a ``tools/call`` comes from (``deny_origin``): the callee's own inbound OPA
+# (github-tool's reverse proxy; target side) or the agent's outbound OPA (agent side).
+DENY_ORIGIN_TOOL_INBOUND = "tool-inbound"
+DENY_ORIGIN_AGENT_OUTBOUND = "agent-outbound"
+
+
+def deny_origin(code: int | None, body: str) -> str | None:
+    """Where the raw response ``(code, body)`` of a **denied** ``tools/call`` (sent through the agent's
+    forward proxy) comes from. **Pure** — decides from the response only.
+
+      * HTTP 403 with a plain JSON body that names OPA (no ``jsonrpc`` member) ->
+        ``DENY_ORIGIN_TOOL_INBOUND``: github-tool's reverse proxy rejected the call
+        (``httpx.WriteRejection``), and the agent's outbound let it through and relayed the response.
+      * HTTP 200 with a JSON-RPC error frame whose ``error.data`` names OPA ->
+        ``DENY_ORIGIN_AGENT_OUTBOUND``: the agent's forward proxy rejected the MCP-shaped request
+        (``httpx.WriteRejectionForRequest``).
+      * Anything else (an allow, a token-exchange refusal, a transport error) -> ``None``.
+
+    Only a request frame (``tools/call`` with an ``id``) has two distinct shapes. A notification gets a
+    plain 403 from either side, so this helper does not apply to it."""
+    doc = _json_or_none(body)
+    if not isinstance(doc, dict):
+        return None
+    if code == 403 and "jsonrpc" not in doc and is_opa_violation(doc):
+        return DENY_ORIGIN_TOOL_INBOUND
+    if code == 200:
+        err = doc.get("error")
+        if isinstance(err, dict) and is_opa_violation(err.get("data")):
+            return DENY_ORIGIN_AGENT_OUTBOUND
+    return None
 
 
 def poll_until(predicate: Callable[[], bool], *, timeout: float, interval: float = 5.0) -> bool:
@@ -679,11 +739,48 @@ def _kubectl_try(*args: str, timeout: float = 30.0) -> tuple[bool, str, str]:
         return False, "", "kubectl timed out"
 
 
+# The bundle-service namespace — home of ``bundle-service`` and of the global ``default``
+# ``AuthorizationPolicy`` (the combiner). Same env name and default as the Controller's start check #4.
+BUNDLE_SERVICE_NAMESPACE = os.environ.get("AIAC_BUNDLE_SERVICE_NAMESPACE", "rossoctl-system")
+
+# D20: in an AIAC setup the combiner's two **request** packages must not carry these fallback lines,
+# which allow a pod that has no client CR. ``k8s/opa-kind-enable.sh`` applies the changed ``default``
+# CR; a ``helm upgrade`` of the operator puts the lines back. The response packages keep the default.
+COMBINER_FALLBACK_LINES: dict[str, str] = {
+    "inbound/request.rego": "client_ok if not data.authbridge.client.inbound.request",
+    "outbound/request.rego": "client_ok if not data.authbridge.client.outbound.request",
+}
+
+
+def combiner_reason(default_cr: dict | None, *, namespace: str = BUNDLE_SERVICE_NAMESPACE) -> str | None:
+    """Return ``None`` when the global combiner denies a pod that has no client CR (D20), else a skip
+    reason. **Pure** — decides from the already-read ``default`` ``AuthorizationPolicy`` object
+    (``None`` when it is missing), like ``event_path_reason``.
+
+    The combiner is changed when both request packages exist and neither holds its
+    ``COMBINER_FALLBACK_LINES`` line (whitespace-normalized). A missing CR or package also fails, as
+    in the Controller's start check #4."""
+    fix = "run k8s/opa-kind-enable.sh to apply the changed combiner (D20; a helm upgrade of the operator reverts it)"
+    if not default_cr:
+        return f"the global combiner (AuthorizationPolicy 'default' in {namespace}) is missing — {fix}"
+    policies = {p.get("path", ""): p.get("content") or "" for p in (default_cr.get("spec") or {}).get("policies") or []}
+    for path, line in COMBINER_FALLBACK_LINES.items():
+        if path not in policies:
+            return f"the global combiner in {namespace} has no {path} package — {fix}"
+        if any(" ".join(raw.split()) == line for raw in policies[path].splitlines()):
+            return (
+                f"the global combiner in {namespace} still allows a pod that has no client CR "
+                f"({path} holds {line!r}) — {fix}"
+            )
+    return None
+
+
 def pipeline_unwired_reason(*, namespace: str, workloads: list[str]) -> str | None:
     """Return ``None`` when the live AuthBridge OPA pipeline is fully wired for ``namespace``, else a
     human-readable reason the suite should skip. Checks (cheap -> specific): ``kubectl`` present, the
-    ``AuthorizationPolicy`` CRD served, ``bundle-service`` Running, the ``opa`` plugin on **both** legs
-    of ``namespace``'s AuthBridge runtime config, and each ``workloads`` pod Running."""
+    ``AuthorizationPolicy`` CRD served, ``bundle-service`` Running, the global combiner changed (D20,
+    ``combiner_reason``), the ``opa`` plugin on **both** legs of ``namespace``'s AuthBridge runtime
+    config, and each ``workloads`` pod Running."""
     if shutil.which("kubectl") is None:
         return "kubectl not on PATH"
 
@@ -691,20 +788,32 @@ def pipeline_unwired_reason(*, namespace: str, workloads: list[str]) -> str | No
     if not ok:
         return f"AuthorizationPolicy CRD not served / cluster unreachable ({err or 'no output'})"
 
+    ns = BUNDLE_SERVICE_NAMESPACE
     ok, out, err = _kubectl_try(
         "get",
         "pods",
         "-n",
-        "rossoctl-system",
+        ns,
         "-l",
         "app=bundle-service",
         "-o",
         "jsonpath={.items[*].status.phase}",
     )
     if not ok:
-        return f"cannot query bundle-service in rossoctl-system ({err})"
+        return f"cannot query bundle-service in {ns} ({err})"
     if "Running" not in out:
-        return "bundle-service is not Running in rossoctl-system"
+        return f"bundle-service is not Running in {ns}"
+
+    ok, out, err = _kubectl_try("get", "authorizationpolicy", "default", "-n", ns, "-o", "json", "--ignore-not-found")
+    if not ok:
+        return f"cannot read the global combiner (AuthorizationPolicy 'default') in {ns} ({err})"
+    try:
+        default_cr = json.loads(out) if out.strip() else None
+    except ValueError:
+        return f"cannot parse the global combiner (AuthorizationPolicy 'default') in {ns}"
+    reason = combiner_reason(default_cr, namespace=ns)
+    if reason:
+        return reason
 
     ok, out, err = _kubectl_try(
         "get",

@@ -168,7 +168,7 @@ def test_cross_service_conflict_is_surfaced_as_422_conflict_report() -> None:
     # (Agent CR delete, Keycloak cleanup, Policy Store clear, provisioning) already mutate shared
     # cluster state, so a failure mid-setup must still hit the ``finally`` teardown.
     try:
-        uc1.delete_agent_cr()  # clean policy slate (drop any prior run's CR)
+        uc1.delete_workload_crs()  # clean policy slate (drop any prior run's CRs)
         uc1.cleanup_provisioned(admin, TEST_REALM)  # clean slate (Keycloak)
         uc1.clear_policy_store()  # clean slate ONCE — NOT between phases (the agent must see the tool's rule)
         uc1.provision_realm_and_users(admin, TEST_REALM)  # PRB reads the role universe
@@ -185,7 +185,7 @@ def test_cross_service_conflict_is_surfaced_as_422_conflict_report() -> None:
         # (role, scope). The #2504 store read surfaces it -> 422 + ConflictReport.
         report = _onboard_via_fresh_controller(POLICY_AGENT_GRANTS_SOURCE, scn.AGENT_WORKLOAD, expect_conflict=True)
     finally:
-        uc1.delete_agent_cr()  # after — drop any CR (there should be none on the raising path)
+        uc1.delete_workload_crs()  # after — drop any CR (there should be none on the raising path)
         uc1.cleanup_provisioned(admin, TEST_REALM)  # restore the pre-run Keycloak state
         # Phase 1 persisted a tool-side deny; clear it so later integration tests don't read stale
         # inbound rules and become order-dependent.

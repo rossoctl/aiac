@@ -1,8 +1,18 @@
-"""Shared harness for the UC-1 onboarding integration-test ladder (rungs 1–3).
+"""Shared harness for the UC-1 onboarding integration-test ladder (rungs 1–3, 5 and 6).
 
 Spec: ``docs/testing/uc1-onboarding-pipeline.md``; live loop shape (handoff 08):
 ``k8s/opa-kind-runbook.md``. The evaluator is now the **deployed AuthBridge OPA plugin**, not a
 standalone OPA-CLI run over dumped ``.rego`` — there is no ``.rego`` dump and no ``opa`` binary here.
+
+**One CR per managed service (D20).** Every onboarded service — the tool included — has its own
+``AuthorizationPolicy`` CR (name and namespace from its clientId, label
+``app.kubernetes.io/managed-by: aiac-pdp-policy-writer``) with both request packages. The global
+combiner denies a pod that has no client CR, so a missing CR means deny. Under the **target side**
+(the default enforcement side) each callee checks the access to itself in its own inbound OPA: the
+agent's outbound is a pass-through (``allow := true``), and github-tool's inbound decides each tool
+call. Under the **agent side** the agent's outbound decides and github-tool has a pass-through CR.
+The harness reads the live side (``live_enforcement_side``) and selects only the side-dependent
+assertions (``cr_matches_side``, ``deny_origin``); the verdict tables do not depend on the side.
 
 Every rung follows the same shape against **one** live rossoctl/Kind cluster with the AuthBridge OPA
 pipeline wired into both legs:
@@ -11,7 +21,7 @@ pipeline wired into both legs:
       → deploy the rung's workloads in order, one at a time — each deploy fires the EVENT-DRIVEN
         trigger (operator registers a Keycloak client → Keycloak CLIENT_CREATED → the aiac-event-listener
         SPI publishes on NATS → the agent consumer runs onboard_service, upserting the AuthorizationPolicy
-        CR on the live API), converging before the next
+        CR of each affected service on the live API), converging before the next
       → enable the outbound token-exchange leg (Part B: route + optional client scope + agent restart)
       → poll bundle-service + OPA until this run's CR is reflected in real decisions
       → drive REAL HTTP requests through AuthBridge and assert the real plugin's allow/deny
@@ -26,6 +36,8 @@ This module owns:
 * **Config** (env, spec § Configuration) — single stack, no variants.
 * **Keycloak** — ``connect_admin`` / ``provision_realm_and_users`` (the fixture UC-1 does *not* do) /
   ``cleanup_provisioned`` / ``delete_workload_registrations`` (teardown).
+* **CRs** — ``delete_workload_crs`` (the agent's and the tool's CR) / ``sweep_authpolicies`` (every
+  other CR in the namespace) / ``delete_authpolicy`` (one CR, raising).
 * **Onboarding (event-driven)** — ``ensure_agent_policy`` (mount the PRB's ``policy.md``) +
   ``deploy_workload`` (deploy fires the trigger) / ``wait_for_registration`` / ``undeploy_workload``.
 * **Outbound-leg prep (Part B)** — ``ensure_github_tool_route`` / ``grant_exchange_scope`` /
@@ -36,12 +48,17 @@ This module owns:
   real plugin's response).
 * **``onboarded_stack``** — the whole per-rung fixture flow, parameterised by the ordered workload
   list; each rung wraps it in a one-line session fixture and yields a probe context.
+* **CR readers and the enforcement side** — ``authpolicy_policies`` (one CR's ``{path: rego}``),
+  ``aiac_crs`` / ``aiac_cr_uids`` (every CR with the managed-by label), ``cr_has_request_packages``,
+  ``cr_has_grants``, ``rego_is_pass_through``, ``live_enforcement_side``, ``cr_matches_side`` /
+  ``cr_side_mismatches``, and ``deny_origin`` + ``outbound_raw`` (where a deny comes from).
 * **Failure path (rung 5)** — ``pristine_stack`` (the slate + teardown of ``onboarded_stack`` with no
   deploy / convergence, for a flow that must not converge), ``controller_llm_unusable`` (the LLM-seam
   failure injection, restored on exit), ``publish_service_event`` (re-fire the onboarding trigger for
-  an existing client), and the quarantine readers (``workload_client``, ``authpolicy_policies``,
-  ``cr_has_no_grants`` / ``cr_has_grants``, ``spm_present``, ``controller_logs``) plus the MCP session
-  probe ``mcp_session_decisions``.
+  an existing client), and the quarantine readers (``workload_client``, ``spm_present``,
+  ``controller_logs``) plus the MCP session probe ``mcp_session_decisions``.
+* **Controller restart (rung 6)** — ``restart_controller`` (rollout restart + wait until no old pod
+  is left; the resync at start ends before the new pod is Ready).
 
 It imports only stdlib + ``requests`` + ``launcher`` + the pure-data ``scenario_uc1`` (never
 ``aiac``), so it is importable before the env-before-import dance, exactly like ``scenario_uc1`` and
@@ -71,7 +88,10 @@ if str(REPO_ROOT) not in sys.path:  # so ``import test.system.*`` resolves
 
 from test.system import scenario_uc1 as scn  # noqa: E402
 from test.system.launcher import (  # noqa: E402
+    DENY_ORIGIN_AGENT_OUTBOUND,
+    DENY_ORIGIN_TOOL_INBOUND,
     _kubectl_try,
+    deny_origin,
     inbound_outcome,
     inbound_probe,
     kubectl,
@@ -121,6 +141,30 @@ CONTROLLER_DEPLOYMENT = os.environ.get("AIAC_CONTROLLER_DEPLOYMENT", "aiac-agent
 POLICY_CONFIGMAP = os.environ.get("AIAC_POLICY_CONFIGMAP", "aiac-policy")
 POLICY_MOUNT_PATH = os.environ.get("AIAC_POLICY_MOUNT_PATH", "/etc/aiac")
 
+# The Controller's start sequence (read the side, start check #4, then the resync under the PCE lock)
+# ends before uvicorn serves, so a restarted Controller is Ready only after its resync. This budget
+# (seconds) covers that start, for every Controller rollout the harness waits on.
+CONTROLLER_RESTART_TIMEOUT = float(os.environ.get("AIAC_CONTROLLER_RESTART_TIMEOUT", "300"))
+
+# --- Enforcement side (D16) ---------------------------------------------------------------
+# ``AIAC_ENFORCEMENT_SIDE`` in the Controller's ConfigMap selects where the check runs. The harness
+# only reads it (``live_enforcement_side``); an absent key means the default, ``target-side``.
+AGENT_CONFIGMAP = os.environ.get("AIAC_AGENT_CONFIGMAP", "aiac-agent-config")
+ENFORCEMENT_SIDE_KEY = "AIAC_ENFORCEMENT_SIDE"
+TARGET_SIDE = "target-side"
+AGENT_SIDE = "agent-side"
+
+# The place a denied tool call comes from under each side (``deny_origin``): github-tool's inbound
+# under target side (an HTTP 403 relayed by the agent's pass-through outbound), the agent's outbound
+# under agent side (a JSON-RPC error frame at HTTP 200).
+SIDE_ENFORCEMENT_POINT: dict[str, str] = {
+    TARGET_SIDE: DENY_ORIGIN_TOOL_INBOUND,
+    AGENT_SIDE: DENY_ORIGIN_AGENT_OUTBOUND,
+}
+
+# The label the OPA Policy Writer puts on every CR it owns (``_MANAGED_BY_LABEL`` in the writer).
+MANAGED_BY_SELECTOR = "app.kubernetes.io/managed-by=aiac-pdp-policy-writer"
+
 # --- Live-cluster loop knobs (handoff 08) ---------------------------------------------------
 
 # The workload Deployment to restart after Part B so it reloads the new outbound route (and, on its
@@ -142,6 +186,11 @@ BUNDLE_POLL_INTERVAL = float(os.environ.get("AIAC_BUNDLE_POLL_INTERVAL", "10"))
 # client registration is asynchronous (reconcile after the pod comes up), so the fixture polls for it
 # up to this budget (``AIAC_DEPLOY_TIMEOUT``, seconds).
 DEPLOY_TIMEOUT = float(os.environ.get("AIAC_DEPLOY_TIMEOUT", "180"))
+
+# A tool's onboarding ends only after the bootstrap CR reaches its OPA sidecar (the discovery waits up
+# to ``AIAC_MCP_DISCOVERY_READY_TIMEOUT``, default 180 s, for the bundle poll), Provision, and the real
+# PRB (LLM). The tool's convergence gate polls up to this budget (``AIAC_ONBOARD_TIMEOUT``, seconds).
+ONBOARD_TIMEOUT = float(os.environ.get("AIAC_ONBOARD_TIMEOUT", "600"))
 
 # The demo manifests each workload deploys, in apply order (agent: ConfigMaps THEN Deployment; tool:
 # a single Deployment manifest). ``deploy.sh`` (demo/assets) applies this same set + order — keep the
@@ -392,7 +441,9 @@ def ensure_agent_policy(namespace: str, policy_md: str = scn.POLICY_ABSTRACT) ->
         # place before onboarding; skip it when apply reported the ConfigMap unchanged (fast reruns).
         if cm_changed:
             kubectl("rollout", "restart", f"deployment/{CONTROLLER_DEPLOYMENT}", "-n", namespace)
-            kubectl_rollout_status(f"deployment/{CONTROLLER_DEPLOYMENT}", namespace=namespace)
+            kubectl_rollout_status(
+                f"deployment/{CONTROLLER_DEPLOYMENT}", namespace=namespace, timeout=CONTROLLER_RESTART_TIMEOUT
+            )
         return  # already mounted — content is now current
 
     patch = {
@@ -421,7 +472,9 @@ def ensure_agent_policy(namespace: str, policy_md: str = scn.POLICY_ABSTRACT) ->
         "-p",
         json.dumps(patch),
     )
-    kubectl_rollout_status(f"deployment/{CONTROLLER_DEPLOYMENT}", namespace=namespace)
+    kubectl_rollout_status(
+        f"deployment/{CONTROLLER_DEPLOYMENT}", namespace=namespace, timeout=CONTROLLER_RESTART_TIMEOUT
+    )
 
 
 # The demo-asset image loader. ``kind load`` needs the ``kind`` CLI + a container runtime on the pytest
@@ -526,12 +579,31 @@ def workload_clients_present(admin) -> set[str]:
 
 def tool_scopes_present(admin) -> bool:
     """True once every ``github-tool.*`` client scope (``scn.TOOL_SCOPES``) is provisioned in the realm
-    — the tool's convergence gate. The tool is a pure target: it produces **no** ``AuthorizationPolicy``
-    CR and **no** enforced decision of its own, so its scopes existing (not a live probe) is the signal
-    the operator finished registering it."""
+    — the Provision half of the tool's convergence gate (``tool_onboarding_state``)."""
     admin.change_current_realm(TEST_REALM)
     names = {s.get("name") for s in admin.get_client_scopes()}
     return all(scope in names for scope in scn.TOOL_SCOPES)
+
+
+def tool_onboarding_state(admin) -> dict[str, bool]:
+    """The three facts of the tool's convergence gate, each ``True`` when it holds:
+
+    * ``scopes`` — every ``github-tool.*`` client scope is provisioned (Provision ran);
+    * ``spm`` — ``SPM(github-tool)`` is in the Policy Store. The PCE stores the focus SPM also when it
+      has zero rules (D21), and the bootstrap CR stores none, so this is the proof that the PRB and
+      ``compute_and_apply`` ran — not only the bootstrap;
+    * ``cr`` — github-tool's own CR is present with both request packages (D20).
+
+    The bootstrap CR is present before Provision, so the CR alone does not prove the final CR; with
+    the SPM it does (the PCE writes the CR right after the store write). A live decision on github-tool's
+    inbound needs the outbound token-exchange leg, which the fixture prepares later, so this gate reads
+    state; the live proof is the final convergence poll."""
+    client = workload_client(admin, scn.TOOL_WORKLOAD)
+    return {
+        "scopes": tool_scopes_present(admin),
+        "spm": bool(client) and spm_present(client["clientId"]),
+        "cr": cr_has_request_packages(authpolicy_policies(scn.TOOL_WORKLOAD)),
+    }
 
 
 def delete_workload_registrations(admin, realm: str) -> None:
@@ -574,10 +646,11 @@ def delete_workload_registrations(admin, realm: str) -> None:
 
 
 def sweep_authpolicies() -> None:
-    """Delete every ``AuthorizationPolicy`` CR left in the namespace. ``delete_agent_cr`` removes only
-    the agent's own CR (named for the agent workload); this sweeps any other that leaked. ``bundle-service``
-    recomposes the namespace bundle in-memory from the live CR set, so removing the CRs self-cleans the
-    OPA bundle — there is no separate OPA-bundle CR/ConfigMap to delete. Best-effort + tolerant."""
+    """Delete every ``AuthorizationPolicy`` CR left in the namespace. ``delete_workload_crs`` removes
+    only the two workloads' own CRs (named for each workload); this sweeps any other that leaked.
+    ``bundle-service`` recomposes the namespace bundle in-memory from the live CR set, so removing the
+    CRs self-cleans the OPA bundle — there is no separate OPA-bundle CR/ConfigMap to delete.
+    Best-effort + tolerant."""
     ok, out, _ = _kubectl_try("get", "authorizationpolicy", "-n", NAMESPACE, "-o", "name")
     if not ok:
         return
@@ -593,32 +666,37 @@ def no_authpolicies_remain() -> bool:
     return ok and not out.split()
 
 
-def delete_agent_cr() -> None:
-    """Best-effort delete of the agent's ``AuthorizationPolicy`` CR so each run starts and ends from a
-    clean policy slate (the CR is named for the agent workload, matched by bundle-service against the
-    SPIFFE SA segment). Ignored if absent; a delete failure is logged, not raised."""
-    try:
-        kubectl(
-            "delete",
-            "authorizationpolicy",
-            scn.AGENT_WORKLOAD,
-            "-n",
-            NAMESPACE,
-            "--ignore-not-found",
-            timeout=60,
-        )
-    except subprocess.CalledProcessError as exc:
-        log.warning("delete_agent_cr: %s", (exc.stderr or exc.output or exc))
+def delete_authpolicy(name: str) -> None:
+    """Delete the ``AuthorizationPolicy`` CR ``name`` in the namespace (absent is fine). Raises on any
+    other failure — a caller that needs the CR gone (rung 6, the D20 no-CR deny) must not go on when the
+    delete did not happen."""
+    kubectl("delete", "authorizationpolicy", name, "-n", NAMESPACE, "--ignore-not-found", timeout=60)
+
+
+def delete_workload_crs() -> None:
+    """Best-effort delete of every AIAC ``AuthorizationPolicy`` CR of the two workloads — the agent's
+    and the tool's (D20: every managed service has its own CR) — so each run starts and ends from a
+    clean policy slate. Each CR is named for its workload (``identity_ref`` of the clientId: the SPIFFE
+    SA segment, which bundle-service matches). Ignored if absent; a delete failure is logged, not
+    raised."""
+    for workload in (scn.AGENT_WORKLOAD, scn.TOOL_WORKLOAD):
+        try:
+            delete_authpolicy(workload)
+        except subprocess.CalledProcessError as exc:
+            log.warning("delete_workload_crs(%s): %s", workload, (exc.stderr or exc.output or exc))
 
 
 # ======================================================================================
 # Outbound token-exchange leg prep (runbook Part B) — so OPA is actually consulted outbound
 # ======================================================================================
 #
-# The outbound OPA gate is only reached if ``token-exchange`` first intercepts + exchanges the agent's
-# call to github-tool. That needs: (B.1) an outbound route for the github-tool host, (B.2) the agent's
-# Keycloak client granted the github-tool audience scope as optional, and (B.3) the agent restarted so
-# it reloads the route. Without this the call would pass through unexchanged and never reach OPA.
+# The tool check is only reached if ``token-exchange`` first intercepts + exchanges the agent's call to
+# github-tool. That needs: (B.1) an outbound route for the github-tool host, (B.2) the agent's Keycloak
+# client granted the github-tool audience scope as optional, and (B.3) the agent restarted so it
+# reloads the route. Without this the call would pass through unexchanged and never reach OPA. Under
+# target side the leg is still necessary: the agent's outbound is a pass-through, but github-tool's
+# inbound ``jwt-validation`` accepts only a token whose audience is github-tool, so ``token-exchange``
+# must mint it.
 
 
 def _tool_audience() -> str:
@@ -750,14 +828,29 @@ def resolve_agent_pod() -> str:
     return resolve_pod(f"app.kubernetes.io/name={scn.AGENT_WORKLOAD}", namespace=NAMESPACE)
 
 
-def outbound_decision(ctx: dict, user: str, tool_bare: str) -> str:
+def outbound_raw(ctx: dict, user: str, tool_bare: str) -> tuple[int | None, str]:
     """Mint a fresh ``user`` token, drive an outbound MCP ``tools/call`` for the **bare** ``tool_bare``
-    through AuthBridge's forward proxy (token-exchange → OPA), and return the real plugin's classified
-    decision (``"deny"`` for an OPA error frame or 403; ``"allow"`` for a non-OPA 200; ``"error"`` for
-    a 503/transport failure)."""
+    through AuthBridge's forward proxy, and return the raw ``(http_code, body)`` — for ``deny_origin``
+    and for diagnostics."""
     token = mint_token(user, scn.USER_PASSWORD, keycloak_url=ctx["keycloak_url"], realm=ctx["realm"])
-    code, body = outbound_probe(token, tool_bare, namespace=ctx["namespace"], agent_pod=resolve_agent_pod())
-    return outbound_outcome(code, body)
+    return outbound_probe(token, tool_bare, namespace=ctx["namespace"], agent_pod=resolve_agent_pod())
+
+
+def outbound_decision(ctx: dict, user: str, tool_bare: str) -> str:
+    """Drive one outbound ``tools/call`` (``outbound_raw``) and return the real plugin's classified
+    decision (``outbound_outcome``): ``"deny"`` for an OPA verdict — github-tool's inbound 403 under
+    target side, the agent's outbound JSON-RPC error frame under agent side; ``"allow"`` for a non-OPA
+    200; ``"error"`` for a token-exchange refusal, a 503 or a transport failure."""
+    return outbound_outcome(*outbound_raw(ctx, user, tool_bare))
+
+
+def outbound_deny_probe(ctx: dict, user: str, tool_bare: str) -> dict:
+    """Drive one outbound ``tools/call`` and return ``{"decision", "origin", "code", "body"}``:
+    ``decision`` from ``outbound_outcome``, and ``origin`` from ``deny_origin`` — where a deny comes
+    from (``DENY_ORIGIN_TOOL_INBOUND`` / ``DENY_ORIGIN_AGENT_OUTBOUND``; ``None`` when it is not an OPA
+    deny). Compare ``origin`` with ``SIDE_ENFORCEMENT_POINT[ctx["side"]]``."""
+    code, body = outbound_raw(ctx, user, tool_bare)
+    return {"decision": outbound_outcome(code, body), "origin": deny_origin(code, body), "code": code, "body": body}
 
 
 # ======================================================================================
@@ -853,11 +946,11 @@ def _scrub_to_pristine(admin) -> None:
     is back to a no-workloads slate. Shared by the fixture's pre-run reset and its teardown — the two
     ran the same sequence inline. Each step is best-effort (its helper tolerates already-absent
     objects), and the five steps touch independent object classes (Keycloak clients + ``*-aud`` scopes,
-    the agent CR, stray AuthorizationPolicy CRs, prefixed roles/scopes, and the Policy Store), so their
-    order is not load-bearing. The caller owns undeploying the workloads first and verifying the
-    result — this only scrubs registrations + state, it does not delete Deployments."""
+    the agent's and the tool's CR, stray AuthorizationPolicy CRs, prefixed roles/scopes, and the Policy
+    Store), so their order is not load-bearing. The caller owns undeploying the workloads first and
+    verifying the result — this only scrubs registrations + state, it does not delete Deployments."""
     delete_workload_registrations(admin, TEST_REALM)  # clients + *-aud scopes + credentials Secret
-    delete_agent_cr()  # this run's (or a prior run's) CR
+    delete_workload_crs()  # this run's (or a prior run's) agent and tool CRs
     sweep_authpolicies()  # any leaked AuthorizationPolicy CR — the OPA bundle self-cleans from the CR set
     cleanup_provisioned(admin, TEST_REALM)  # prefixed roles/scopes (Keycloak)
     clear_policy_store()  # Policy Store SPMs (PV survives redeploys)
@@ -872,7 +965,8 @@ def onboarded_stack(
 ) -> Iterator[dict]:
     """Run one rung's whole live flow and yield a probe ``ctx`` for its assertions.
 
-    ``ctx`` = ``{"admin", "namespace", "agent_pod", "keycloak_url", "realm", "tool_onboarded"}``.
+    ``ctx`` = ``{"admin", "namespace", "agent_pod", "keycloak_url", "realm", "tool_onboarded", "side"}``
+    (``side`` = ``live_enforcement_side()``, read once at setup).
 
     Flow (event-driven trigger): skip cleanly (never false-pass) if the OPA pipeline or the event path
     is not wired, or the integration env is unset; **start from a no-workloads slate** (a leftover
@@ -887,8 +981,9 @@ def onboarded_stack(
     ``bundle-service`` + OPA reflect this run's CR (and token-exchange has settled) before yielding.
     Teardown is **full-to-pristine** — the workloads and every registration are removed and the removal
     is verified. The workload order is the rung's identity — e.g. rung 2 passes ``[agent, tool]`` so
-    tool onboarding retroactively completes the agent's outbound gate; rung 3 passes ``[tool, agent]``
-    and must converge to the same live decisions.
+    tool onboarding completes the tool check (under target side it writes github-tool's own CR with
+    both gates; under agent side it completes the agent's outbound gate); rung 3 passes
+    ``[tool, agent]`` and must converge to the same live decisions.
 
     **Policy-agnostic parametrization (#149).** Every keyword defaults to today's Policy-A behavior,
     so the rung callers (which pass only a positional ``workloads``) are byte-for-byte unchanged, while
@@ -902,8 +997,8 @@ def onboarded_stack(
       ``devops-user`` inbound is *allow*, not *deny*) supplies its own deterministic signals so the run
       converges on the right decisions; the raw-diagnostics message is recomputed against them."""
     # Skip gates first — before any cluster mutation (acceptance #4: skip, never false-pass).
-    # Gate on the *wiring* only (OPA plugin on both legs, bundle-service, CRD) — NOT on the demo
-    # workloads being pre-Running. This is the event-driven flow: the fixture starts from a
+    # Gate on the *wiring* only (OPA plugin on both legs, bundle-service, CRD, the changed combiner of
+    # D20) — NOT on the demo workloads being pre-Running. This is the event-driven flow: the fixture starts from a
     # no-workloads slate and deploys the workloads itself as the onboarding trigger, so requiring
     # them up front would skip every rung on a correctly-wired cluster. A missing/unloadable image or
     # a deploy that never converges surfaces later as a loud RuntimeError from the deploy/convergence
@@ -916,6 +1011,7 @@ def onboarded_stack(
     # Event-path skip gate — placed here (not at the ``require_pipeline`` line) because it needs the
     # admin client to read the realm's events config, and ``launcher`` has no KeycloakAdmin of its own.
     require_event_path(admin=admin, realm=TEST_REALM)
+    side = live_enforcement_side()  # read-only; the suite runs under the live side
 
     # Pre-run: start from a NO-WORKLOADS slate. The trigger is event-driven — deploying a workload only
     # re-fires ``CLIENT_CREATED`` if there is no client for it yet, so a leftover workload + its Keycloak
@@ -926,7 +1022,7 @@ def onboarded_stack(
     undeploy_workload(scn.TOOL_WORKLOAD)
     _scrub_to_pristine(
         admin
-    )  # clients + *-aud scopes + agent CR + stray AuthorizationPolicy CRs + roles/scopes + store
+    )  # clients + *-aud scopes + workload CRs + stray AuthorizationPolicy CRs + roles/scopes + store
     reenable_provisioned_clients(
         admin, TEST_REALM
     )  # undo any prior run's failed-service disable (a no-op once scrubbed)
@@ -972,7 +1068,9 @@ def onboarded_stack(
                 # Option A′ — one representative ENFORCED decision proves OPA loaded the agent's bundle.
                 # A bare AuthorizationPolicy CR proves only that the operator reconciled, not that the
                 # bundle is in force; a live inbound dev-user=allow through AuthBridge->OPA is positive
-                # proof. dev-user inbound is deterministically allow on every rung.
+                # proof. dev-user inbound is deterministically allow on every rung. The changed combiner
+                # denies the agent pod until its own CR is loaded (D20), so the allow cannot come from a
+                # missing CR.
                 gate = ReadySignal("inbound", "dev-user", "allow")
                 if not poll_until(
                     lambda g=gate: g.decide(probe_ctx) == g.expected,
@@ -985,18 +1083,31 @@ def onboarded_stack(
                         "bundle. See k8s/opa-kind-runbook.md and issue #139."
                     )
             else:
-                # Tool — a pure target: no CR, no enforced decision of its own, so its convergence signal
-                # is that the operator provisioned all of its ``github-tool.*`` client scopes.
-                if not poll_until(lambda: tool_scopes_present(admin), timeout=DEPLOY_TIMEOUT, interval=5):
+                # Tool — it has its own CR (D20): under target side its inbound decides the tool calls,
+                # under agent side it is a pass-through CR. A live decision on its inbound needs the
+                # outbound leg (Part B, below), so the per-workload gate reads state instead: the scopes
+                # provisioned, SPM(github-tool) stored (the PRB ran, not only the bootstrap), and the CR
+                # present with both request packages (``tool_onboarding_state``).
+                seen = {"state": {}}
+
+                def _tool_converged() -> bool:
+                    seen["state"] = tool_onboarding_state(admin)
+                    return all(seen["state"].values())
+
+                if not poll_until(_tool_converged, timeout=ONBOARD_TIMEOUT, interval=5):
                     raise RuntimeError(
-                        f"tool did not converge after deploy: not all {sorted(scn.TOOL_SCOPES)} client scopes "
-                        f"present within {DEPLOY_TIMEOUT:.0f}s — did the operator finish registering "
-                        f"{scn.TOOL_WORKLOAD}?"
+                        f"tool did not converge after deploy within {ONBOARD_TIMEOUT:.0f}s: {seen['state']} "
+                        f"(scopes = all of {sorted(scn.TOOL_SCOPES)} provisioned; spm = SPM({scn.TOOL_WORKLOAD}) "
+                        f"stored; cr = its AuthorizationPolicy CR with both request packages). A failed "
+                        "onboarding check (D30: the tool pod has no authbridge-proxy sidecar — injectTools; no "
+                        "opa / mcp-parser in the namespace inbound pipeline; an httpGet probe) leaves no CR — "
+                        "see the Controller log and k8s/opa-kind-enable.sh."
                     )
 
-        # Part B — enable the outbound token-exchange leg so OPA is actually consulted outbound. Done
-        # after onboarding so the restarted agent (and its OPA sidecar) picks up both the new route
-        # and, on its next poll, the recomposed bundle.
+        # Part B — enable the outbound token-exchange leg so the tool check is actually reached (under
+        # target side github-tool's inbound OPA, which accepts only a token with its audience; under
+        # agent side the agent's outbound OPA). Done after onboarding so the restarted agent (and its
+        # OPA sidecar) picks up both the new route and, on its next poll, the recomposed bundle.
         #
         # Prepared ONLY when this run actually probes outbound (``has_outbound``). The agent-only rung
         # (rung 1) has no tool onboarded, so there is no real ``agent -> tool`` call to make and no
@@ -1028,6 +1139,7 @@ def onboarded_stack(
             "keycloak_url": keycloak_url,
             "realm": TEST_REALM,
             "tool_onboarded": tool_onboarded,
+            "side": side,
         }
 
         # Wait for bundle-service + OPA to reflect THIS run's CR (and token-exchange to settle) before
@@ -1048,8 +1160,9 @@ def onboarded_stack(
             #   * ``code=503`` — the ``token-exchange`` leg failed upstream (audience refused, IdP
             #     unreachable), so OPA was never consulted.
             #   * a genuine OPA policy stall can't show as ``"error"`` at all: it surfaces as ``"deny"``
-            #     under deny-by-default (HTTP 200 + an OPA error frame), because the generated Rego
-            #     carries ``default allow := false``.
+            #     under deny-by-default (target side: github-tool's inbound HTTP 403 with an OPA body;
+            #     agent side: HTTP 200 + an OPA error frame), because the generated Rego carries
+            #     ``default allow := false``.
             # The observed-vs-expected line is recomputed against *this run's* signals so a denyworld
             # (or any parametrized) run diagnoses itself, not a hardcoded Policy-A probe.
             observed = "; ".join(f"{sig.label()}={sig.decide(ctx)!r}(want {sig.expected!r})" for sig in signals)
@@ -1097,14 +1210,233 @@ def onboarded_stack(
 
 
 # ======================================================================================
-# Failure path (rung 5) — LLM-seam injection, re-fired trigger, quarantine readers, pristine stack
+# AuthorizationPolicy CRs, stored SPMs and the enforcement side — read-only views for every rung
+# ======================================================================================
+#
+# Every managed service has its own CR (D20) with exactly the two request packages
+# (``aiac.pdp.service.policy.opa.main._build_cr``); there is no response package. The shapes by side
+# (spec § *CR end state for each side*): a **rules-based** package carries ``default allow := false``
+# (D25); a **pass-through** package is only ``allow := true`` (D24).
+#
+#   side         github-agent CR                           github-tool CR
+#   target side  inbound: rules + grants; outbound: pass     inbound: rules + grants (D26); outbound: pass
+#   agent side   inbound: rules + grants; outbound: rules    inbound and outbound: pass (a pass-through CR)
+#
+# A service with no stored SPM (for example after a quarantine) has no CR, and the combiner denies it.
+
+CR_INBOUND_PATH = "inbound/request.rego"
+CR_OUTBOUND_PATH = "outbound/request.rego"
+CR_REQUEST_PATHS = frozenset({CR_INBOUND_PATH, CR_OUTBOUND_PATH})
+
+# The Rego bindings that carry the grants of each rules-based package. An empty one renders as ``[]`` /
+# ``{}`` (``rego._render_list`` / ``_render_map``).
+#   * agent inbound (both sides, agent-level, D26a): the agent's own scopes + the user gate;
+#   * tool inbound (target side, D26): the user gate + the calling-agent gate, keyed by the bare tool;
+#   * agent outbound (agent side only): the user→tool gate + the per-target capability gate.
+AGENT_INBOUND_GRANT_BINDINGS = ("agent_scopes", "subject_role_allow_scopes")
+TOOL_INBOUND_GRANT_BINDINGS = ("subject_role_allow_scopes", "source_role_allow_scopes")
+AGENT_SIDE_OUTBOUND_GRANT_BINDINGS = ("subject_role_allow_scopes", "target_allow_scopes")
+
+# The kind of a service, for the CR shape. The demo agent and tool are the two kinds.
+AGENT_KIND = "agent"
+TOOL_KIND = "tool"
+WORKLOAD_KIND: dict[str, str] = {scn.AGENT_WORKLOAD: AGENT_KIND, scn.TOOL_WORKLOAD: TOOL_KIND}
+
+
+def workload_client(admin, workload: str) -> dict | None:
+    """The Keycloak client representation (``id`` UUID, ``clientId``, ``enabled``, ``attributes``) of
+    ``{ns}/{workload}``, keyed on the client ``name`` like ``wait_for_registration``; ``None`` if absent."""
+    admin.change_current_realm(TEST_REALM)
+    return next((c for c in admin.get_clients() if c.get("name") == f"{NAMESPACE}/{workload}"), None)
+
+
+def spm_present(client_id: str) -> bool:
+    """Whether the Policy Store holds an SPM for the service keyed ``client_id`` (the SPM key is the
+    client's ``clientId``) — that is, whether the service is in the **managed set** (D21).
+    ``GET /policy/services/{id}`` takes the id as unpadded base64url
+    (``aiac.policy.model_store.keying.encode_service_id``): 200 -> True, 404 -> False; any other
+    answer raises, so an unreachable store is never read as "no SPM"."""
+    encoded = base64.urlsafe_b64encode(client_id.encode("utf-8")).decode("ascii").rstrip("=")
+    with port_forward(
+        STORE_TARGET,
+        namespace=STORE_NAMESPACE,
+        local_port=STORE_LOCAL_PORT,
+        remote_port=STORE_REMOTE_PORT,
+        ready_url=f"http://127.0.0.1:{STORE_LOCAL_PORT}/health",
+    ) as base_url:
+        resp = requests.get(f"{base_url}/policy/services/{encoded}", timeout=30)
+    if resp.status_code == 200:
+        return True
+    if resp.status_code == 404:
+        return False
+    raise AssertionError(f"GET /policy/services/<{client_id}> returned HTTP {resp.status_code}: {resp.text[:300]}")
+
+
+def authpolicy_policies(name: str) -> dict[str, str] | None:
+    """The ``AuthorizationPolicy`` CR ``name``'s policies as ``{path: rego}`` (``spec.policies[]``), or
+    ``None`` when no such CR exists. ``--ignore-not-found`` makes an absent CR an empty output, so an
+    unreachable API still raises instead of reading as "no CR"."""
+    out = kubectl("get", "authorizationpolicy", name, "-n", NAMESPACE, "-o", "json", "--ignore-not-found", timeout=30)
+    if not out.strip():
+        return None
+    spec = json.loads(out).get("spec", {})
+    return {p.get("path", ""): p.get("content", "") for p in spec.get("policies", [])}
+
+
+def _aiac_cr_items() -> list[dict]:
+    """Every ``AuthorizationPolicy`` CR with the writer's managed-by label, cluster-wide — the set the
+    writer's ``PUT /policy`` replaces (it deletes by that label)."""
+    out = kubectl("get", "authorizationpolicy", "-A", "-l", MANAGED_BY_SELECTOR, "-o", "json", timeout=30)
+    return json.loads(out).get("items", [])
+
+
+def _cr_key(item: dict) -> str:
+    meta = item.get("metadata", {})
+    return f"{meta.get('namespace', '')}/{meta.get('name', '')}"
+
+
+def aiac_crs() -> dict[str, dict[str, str]]:
+    """Every AIAC CR (the managed-by label ``app.kubernetes.io/managed-by: aiac-pdp-policy-writer``),
+    as ``{"<namespace>/<name>": {path: rego}}`` (``spec.policies``). Raises when the API is unreachable."""
+    return {
+        _cr_key(item): {p.get("path", ""): p.get("content", "") for p in item.get("spec", {}).get("policies", [])}
+        for item in _aiac_cr_items()
+    }
+
+
+def aiac_cr_uids() -> dict[str, str]:
+    """Every AIAC CR as ``{"<namespace>/<name>": metadata.uid}``. A CR that is deleted and created again
+    gets a new uid, so an unchanged uid proves the object was only updated in place (or not at all)."""
+    return {_cr_key(item): item.get("metadata", {}).get("uid", "") for item in _aiac_cr_items()}
+
+
+def cr_key(workload: str) -> str:
+    """The ``aiac_crs`` key of ``workload``'s CR in the demo namespace."""
+    return f"{NAMESPACE}/{workload}"
+
+
+def rego_binding_empty(rego: str, var: str) -> bool | None:
+    """Whether the top-level Rego binding ``var := …`` is an empty list/map (``[]`` / ``{}``) — the
+    form ``rego._render_list`` / ``_render_map`` emit for no entries. ``None`` when ``var`` is not
+    bound at all (a CR format change, surfaced by the caller rather than read as empty)."""
+    if not re.search(rf"^{re.escape(var)}\s*:=", rego, re.M):
+        return None
+    return re.search(rf"^{re.escape(var)}\s*:=\s*(\[\s*\]|\{{\s*\}})", rego, re.M) is not None
+
+
+def _rego_lines(rego: str) -> list[str]:
+    """The non-blank, non-comment lines of ``rego``, stripped."""
+    return [ln.strip() for ln in rego.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+
+
+def rego_is_pass_through(rego: str | None) -> bool:
+    """True when ``rego`` is a **pass-through** package (D24): a ``package`` line, ``import rego.v1``,
+    and ``allow := true`` — nothing else. The pass-throughs are the only ALLOW packages (D25)."""
+    lines = _rego_lines(rego or "")
+    if not lines or not lines[0].startswith("package "):
+        return False
+    return [ln for ln in lines[1:] if ln != "import rego.v1"] == ["allow := true"]
+
+
+def rego_is_rules_based(rego: str | None) -> bool:
+    """True when ``rego`` is a **rules-based** package: ``default allow := false`` (always DENY, D25)
+    and not a pass-through."""
+    return bool(rego) and "default allow := false" in _rego_lines(rego) and not rego_is_pass_through(rego)
+
+
+def cr_has_request_packages(policies: dict[str, str] | None) -> bool:
+    """True when ``policies`` is a present CR with exactly the two request packages
+    (``inbound/request.rego`` and ``outbound/request.rego``) and no response package (D20)."""
+    return bool(policies) and set(policies) == CR_REQUEST_PATHS
+
+
+def cr_has_grants(policies: dict[str, str] | None, kind: str = AGENT_KIND) -> bool:
+    """True when ``policies`` is a CR whose **inbound** package carries grants:
+
+    * ``kind="agent"`` — the agent's scopes and some user role reaching one of them (non-empty
+      ``agent_scopes`` + ``subject_role_allow_scopes``), under both sides;
+    * ``kind="tool"`` — the target-side tool inbound (D26): the user gate and the calling-agent gate
+      (non-empty ``subject_role_allow_scopes`` + ``source_role_allow_scopes``)."""
+    if not policies:
+        return False
+    inbound = policies.get(CR_INBOUND_PATH, "")
+    bindings = AGENT_INBOUND_GRANT_BINDINGS if kind == AGENT_KIND else TOOL_INBOUND_GRANT_BINDINGS
+    return all(rego_binding_empty(inbound, v) is False for v in bindings)
+
+
+def live_enforcement_side() -> str:
+    """The live **enforcement side** (D16): ``AIAC_ENFORCEMENT_SIDE`` in the Controller's ConfigMap
+    (``aiac-agent-config`` in the Controller namespace); an absent or empty key means the default,
+    ``target-side``. Read-only — the harness never changes it here. Raises on an unknown value (the
+    Controller does not start with one) or when the ConfigMap cannot be read."""
+    out = kubectl(
+        "get",
+        "configmap",
+        AGENT_CONFIGMAP,
+        "-n",
+        CONTROLLER_NAMESPACE,
+        "-o",
+        f"jsonpath={{.data.{ENFORCEMENT_SIDE_KEY}}}",
+        timeout=30,
+    )
+    side = out.strip() or TARGET_SIDE
+    if side not in SIDE_ENFORCEMENT_POINT:
+        raise RuntimeError(
+            f"unknown {ENFORCEMENT_SIDE_KEY}={side!r} in configmap/{AGENT_CONFIGMAP} ({CONTROLLER_NAMESPACE}); "
+            f"want {TARGET_SIDE!r} or {AGENT_SIDE!r}"
+        )
+    return side
+
+
+def cr_side_mismatches(policies: dict[str, str] | None, kind: str, side: str) -> list[str]:
+    """Each way the CR ``policies`` of a service of ``kind`` (``"agent"`` / ``"tool"``) differs from
+    the shape of ``side`` (the table above); an empty list means the CR matches. A missing CR is one
+    mismatch (every managed service has a CR, D20)."""
+    if not policies:
+        return ["no CR"]
+    problems: list[str] = []
+    if not cr_has_request_packages(policies):
+        problems.append(f"packages {sorted(policies)} (want exactly {sorted(CR_REQUEST_PATHS)})")
+    inbound, outbound = policies.get(CR_INBOUND_PATH), policies.get(CR_OUTBOUND_PATH)
+    if side == AGENT_SIDE and kind == TOOL_KIND:
+        # A pass-through CR: the agent's outbound decides the calls to the tool.
+        if not rego_is_pass_through(inbound):
+            problems.append("inbound is not a pass-through")
+        if not rego_is_pass_through(outbound):
+            problems.append("outbound is not a pass-through")
+        return problems
+    if not rego_is_rules_based(inbound):
+        problems.append("inbound is not rules-based (default allow := false)")
+    elif not cr_has_grants(policies, kind):
+        problems.append(f"inbound has no grants ({kind})")
+    if side == AGENT_SIDE:  # the agent's outbound: per-tool checks + the MCP session rule
+        if not rego_is_rules_based(outbound):
+            problems.append("outbound is not rules-based")
+        elif not all(rego_binding_empty(outbound or "", v) is False for v in AGENT_SIDE_OUTBOUND_GRANT_BINDINGS):
+            problems.append("outbound has no grants")
+    elif not rego_is_pass_through(outbound):  # target side: the callee decides (D24)
+        problems.append("outbound is not a pass-through")
+    return problems
+
+
+def cr_matches_side(policies: dict[str, str] | None, kind: str, side: str) -> bool:
+    """True when the CR ``policies`` of a service of ``kind`` has the shape of ``side``
+    (``cr_side_mismatches`` is empty)."""
+    return not cr_side_mismatches(policies, kind, side)
+
+
+# ======================================================================================
+# Failure path (rung 5) and Controller restart (rung 6) — LLM-seam injection, re-fired trigger,
+# Controller rollouts, MCP session probe, pristine stack
 # ======================================================================================
 #
 # A failed onboarding does not converge to a live allow, so ``onboarded_stack`` (which polls for the
 # happy path) cannot drive it. These helpers let a failure-path flow compose the same building blocks:
 # the pristine slate + teardown (``pristine_stack``), a Controller-side failure injection that is always
 # undone (``controller_llm_unusable``), a re-fire of the onboarding trigger for an existing client
-# (``publish_service_event``), and read-only views of the state a rollback + quarantine leaves.
+# (``publish_service_event``), and the read-only views above of the state a rollback + quarantine
+# leaves (the quarantine deletes the CR under both sides, D20). Every Controller rollout runs the
+# resync at start (D28) before the new pod is Ready; ``restart_controller`` is that rollout alone.
 
 # The Controller pod selector (``app: aiac-agent`` in ``k8s/agent-deployment.yaml``) and the PRB's
 # endpoint env (``aiac.agent.llm.load_llm_settings`` reads the bare ``LLM_BASE_URL``).
@@ -1118,14 +1450,6 @@ LLM_BASE_URL_ENV = "LLM_BASE_URL"
 # delivery). See the rung-5 test's module docstring for why this is preferred over an unreachable host.
 UNUSABLE_LLM_BASE_URL = os.environ.get("AIAC_UNUSABLE_LLM_BASE_URL", "http://127.0.0.1:7070/aiac-system-test-no-llm/v1")
 
-# The CR's two policy paths (``aiac.pdp.service.policy.opa.main._build_cr``) and the Rego bindings that
-# carry every grant in each. A no-rules CR (``engine._fresh_apm`` — the quarantine shell) renders each
-# of them empty (``[]`` / ``{}``); a real CR has a non-empty ``agent_scopes`` + subject allow map.
-CR_INBOUND_PATH = "inbound/request.rego"
-CR_OUTBOUND_PATH = "outbound/request.rego"
-INBOUND_GRANT_BINDINGS = ("agent_scopes", "subject_role_allow_scopes", "source_role_allow_scopes")
-OUTBOUND_GRANT_BINDINGS = ("subject_role_allow_scopes", "target_allow_scopes")
-
 
 def resolve_controller_pod() -> str:
     """The current live Controller pod (newest Ready, non-terminating — see ``resolve_pod``)."""
@@ -1136,8 +1460,11 @@ def _wait_controller_rolled() -> None:
     """Wait for the Controller rollout AND for every old Controller pod to be gone. ``rollout status``
     returns while the old pod may still be ``Terminating`` with its NATS consumer bound; an event it
     takes then runs on the OLD env (or is lost to the kill and redelivered only after ``ACK_WAIT``), so
-    the injection is in force only once no terminating pod remains."""
-    kubectl_rollout_status(f"deployment/{CONTROLLER_DEPLOYMENT}", namespace=CONTROLLER_NAMESPACE)
+    the injection is in force only once no terminating pod remains. The new pod is Ready only after its
+    start sequence (the side, start check #4, the resync) ends, so the resync has run on return."""
+    kubectl_rollout_status(
+        f"deployment/{CONTROLLER_DEPLOYMENT}", namespace=CONTROLLER_NAMESPACE, timeout=CONTROLLER_RESTART_TIMEOUT
+    )
 
     def _no_terminating() -> bool:
         doc = json.loads(kubectl("get", "pods", "-n", CONTROLLER_NAMESPACE, "-l", CONTROLLER_SELECTOR, "-o", "json"))
@@ -1146,6 +1473,15 @@ def _wait_controller_rolled() -> None:
 
     if not poll_until(_no_terminating, timeout=DEPLOY_TIMEOUT, interval=3):
         raise RuntimeError(f"old {CONTROLLER_DEPLOYMENT} pod(s) still terminating after {DEPLOY_TIMEOUT:.0f}s")
+
+
+def restart_controller() -> None:
+    """Restart the Controller (``kubectl rollout restart``) and wait until the new pod is Ready and no
+    old pod is left (``_wait_controller_rolled``). At each start the Controller runs the resync (D28)
+    under the PCE lock before it serves: ``PUT /policy`` with the full policy model of the live side,
+    then a teardown of each disabled service that still has an SPM. Changes no env and no ConfigMap."""
+    kubectl("rollout", "restart", f"deployment/{CONTROLLER_DEPLOYMENT}", "-n", CONTROLLER_NAMESPACE, timeout=60)
+    _wait_controller_rolled()
 
 
 @contextmanager
@@ -1254,77 +1590,6 @@ def publish_service_event(service_uuid: str) -> None:
         raise RuntimeError(f"publish on {subject!r} was not acknowledged by JetStream: {out.strip()[:300]!r}")
 
 
-def workload_client(admin, workload: str) -> dict | None:
-    """The Keycloak client representation (``id`` UUID, ``clientId``, ``enabled``, ``attributes``) of
-    ``{ns}/{workload}``, keyed on the client ``name`` like ``wait_for_registration``; ``None`` if absent."""
-    admin.change_current_realm(TEST_REALM)
-    return next((c for c in admin.get_clients() if c.get("name") == f"{NAMESPACE}/{workload}"), None)
-
-
-def authpolicy_policies(name: str) -> dict[str, str] | None:
-    """The ``AuthorizationPolicy`` CR ``name``'s policies as ``{path: rego}`` (``spec.policies[]``), or
-    ``None`` when no such CR exists. ``--ignore-not-found`` makes an absent CR an empty output, so an
-    unreachable API still raises instead of reading as "no CR"."""
-    out = kubectl("get", "authorizationpolicy", name, "-n", NAMESPACE, "-o", "json", "--ignore-not-found", timeout=30)
-    if not out.strip():
-        return None
-    spec = json.loads(out).get("spec", {})
-    return {p.get("path", ""): p.get("content", "") for p in spec.get("policies", [])}
-
-
-def rego_binding_empty(rego: str, var: str) -> bool | None:
-    """Whether the top-level Rego binding ``var := …`` is an empty list/map (``[]`` / ``{}``) — the
-    form ``rego._render_list`` / ``_render_map`` emit for no entries. ``None`` when ``var`` is not
-    bound at all (a CR format change, surfaced by the caller rather than read as empty)."""
-    if not re.search(rf"^{re.escape(var)}\s*:=", rego, re.M):
-        return None
-    return re.search(rf"^{re.escape(var)}\s*:=\s*(\[\s*\]|\{{\s*\}})", rego, re.M) is not None
-
-
-def cr_has_no_grants(policies: dict[str, str] | None) -> bool:
-    """True when ``policies`` is a present no-rules CR (the quarantine shell): both packages carry
-    ``default allow := false`` and every grant binding (``INBOUND_GRANT_BINDINGS`` /
-    ``OUTBOUND_GRANT_BINDINGS``) is bound and empty — so every inbound and outbound request is denied."""
-    if not policies:
-        return False
-    inbound, outbound = policies.get(CR_INBOUND_PATH, ""), policies.get(CR_OUTBOUND_PATH, "")
-    if "default allow := false" not in inbound or "default allow := false" not in outbound:
-        return False
-    return all(rego_binding_empty(inbound, v) is True for v in INBOUND_GRANT_BINDINGS) and all(
-        rego_binding_empty(outbound, v) is True for v in OUTBOUND_GRANT_BINDINGS
-    )
-
-
-def cr_has_grants(policies: dict[str, str] | None) -> bool:
-    """True when ``policies`` is a real agent CR: the inbound package names the agent's scopes and
-    grants some user role one of them (non-empty ``agent_scopes`` + ``subject_role_allow_scopes``)."""
-    if not policies:
-        return False
-    inbound = policies.get(CR_INBOUND_PATH, "")
-    return all(rego_binding_empty(inbound, v) is False for v in ("agent_scopes", "subject_role_allow_scopes"))
-
-
-def spm_present(client_id: str) -> bool:
-    """Whether the Policy Store holds an SPM for the service keyed ``client_id`` (the SPM key is the
-    client's ``clientId``). ``GET /policy/services/{id}`` takes the id as unpadded base64url
-    (``aiac.policy.model_store.keying.encode_service_id``): 200 -> True, 404 -> False; any other
-    answer raises, so an unreachable store is never read as "no SPM"."""
-    encoded = base64.urlsafe_b64encode(client_id.encode("utf-8")).decode("ascii").rstrip("=")
-    with port_forward(
-        STORE_TARGET,
-        namespace=STORE_NAMESPACE,
-        local_port=STORE_LOCAL_PORT,
-        remote_port=STORE_REMOTE_PORT,
-        ready_url=f"http://127.0.0.1:{STORE_LOCAL_PORT}/health",
-    ) as base_url:
-        resp = requests.get(f"{base_url}/policy/services/{encoded}", timeout=30)
-    if resp.status_code == 200:
-        return True
-    if resp.status_code == 404:
-        return False
-    raise AssertionError(f"GET /policy/services/<{client_id}> returned HTTP {resp.status_code}: {resp.text[:300]}")
-
-
 def mcp_session_frames(tool_bare: str) -> list[dict]:
     """One MCP session against the tool, in protocol order: ``initialize``, the
     ``notifications/initialized`` notification (no ``id``), ``tools/list``, then a ``tools/call`` of the
@@ -1349,9 +1614,11 @@ def mcp_session_frames(tool_bare: str) -> list[dict]:
 
 def mcp_session_decisions(ctx: dict, user: str, tool_bare: str) -> dict[str, tuple[str, int | None, str]]:
     """Mint a fresh ``user`` token, send one MCP session (``mcp_session_frames``) through the agent's
-    outbound (token-exchange → OPA), and return ``{method: (decision, http_code, body)}``. A request
-    frame is classified by its body (``outbound_outcome``: a ``result`` frame = allow, an OPA error frame
-    = deny); the notification by its status (``notification_outcome``: 202 = allow, 403 = deny)."""
+    outbound (token-exchange, then the tool check: github-tool's inbound OPA under target side, the
+    agent's outbound OPA under agent side), and return ``{method: (decision, http_code, body)}``. A
+    request frame is classified by its body (``outbound_outcome``: a ``result`` frame = allow, an OPA
+    403 or OPA error frame = deny); the notification by its status (``notification_outcome``: 202 =
+    allow, 403 = deny)."""
     token = mint_token(user, scn.USER_PASSWORD, keycloak_url=ctx["keycloak_url"], realm=ctx["realm"])
     frames = mcp_session_frames(tool_bare)
     raw = outbound_session_probe(token, frames, namespace=ctx["namespace"], agent_pod=resolve_agent_pod())
@@ -1369,7 +1636,8 @@ def mcp_session_decisions(ctx: dict, user: str, tool_bare: str) -> dict[str, tup
 def pristine_stack(workloads: Sequence[str], *, policy_md: str = scn.POLICY_ABSTRACT) -> Iterator[dict]:
     """The slate + teardown half of ``onboarded_stack`` with NO deploy and NO convergence poll, for a
     flow whose onboarding is meant to fail (``onboarded_stack`` would wait for a happy-path allow that
-    never comes). Yields ``ctx = {"admin", "namespace", "keycloak_url", "realm"}``; the caller deploys.
+    never comes). Yields ``ctx = {"admin", "namespace", "keycloak_url", "realm", "side"}`` (``side`` =
+    ``live_enforcement_side()``); the caller deploys.
 
     Same skip gates (pipeline wiring, env, event path — before any mutation), same no-workloads slate
     (undeploy + ``_scrub_to_pristine`` + ``reenable_provisioned_clients`` + clients-gone poll), same
@@ -1380,6 +1648,7 @@ def pristine_stack(workloads: Sequence[str], *, policy_md: str = scn.POLICY_ABST
     keycloak_url = creds["KEYCLOAK_URL"]
     admin = connect_admin()
     require_event_path(admin=admin, realm=TEST_REALM)
+    side = live_enforcement_side()
 
     undeploy_workload(scn.AGENT_WORKLOAD)
     undeploy_workload(scn.TOOL_WORKLOAD)
@@ -1396,7 +1665,7 @@ def pristine_stack(workloads: Sequence[str], *, policy_md: str = scn.POLICY_ABST
     try:
         ensure_agent_policy(CONTROLLER_NAMESPACE, policy_md=policy_md)
         load_workload_images(list(workloads))
-        yield {"admin": admin, "namespace": NAMESPACE, "keycloak_url": keycloak_url, "realm": TEST_REALM}
+        yield {"admin": admin, "namespace": NAMESPACE, "keycloak_url": keycloak_url, "realm": TEST_REALM, "side": side}
     finally:
         for workload in reversed(list(workloads)):
             undeploy_workload(workload)
