@@ -18,11 +18,16 @@
 - `eval/scale_prb.py` — `orchestrate_prb_concurrent`/`run_concurrently`: a thread-pooled counterpart
   of `eval.test_policy_pipeline_eval.orchestrate_prb` that fans the same set of per-scope/per-role
   `_invoke_graph` calls out concurrently instead of running them one after another. See [Why
-  concurrency](#why-concurrency).
+  concurrency](#why-concurrency). Also `capture_precheck_drops`: a log-capture context manager
+  (unit-tested unmarked in `eval/test_scale_prb.py`) that recovers a hallucinated candidate name
+  production's own `_precheck` step drops, for the two **sequential** per-decision calls only —
+  not thread-safe to use from the concurrent loop above, see its own docstring.
 - `eval/scale_structural.py` — the structural-check helpers: `missing_decisions`, `missing_rego`,
-  `invalid_selected_names`, `duplicate_rule_triples`, `orphaned_scope_names`, `summarize_usage`/
-  `CostSummary`. Pure logic + the `get_usage_metadata_callback()` seam, no LLM of its own.
-  Unit-tested unmarked in `eval/test_scale_structural.py`.
+  `invalid_selected_names`, `duplicate_rule_triples` (PRB-level, pre-merge), `duplicate_rego_entries`
+  (e2e-level, the real rendered output), `orphaned_scope_names`, `summarize_usage`/`CostSummary`.
+  Pure logic, no LLM/IO of its own — unit-tested unmarked in `eval/test_scale_structural.py`.
+  `orphaned_scope_names` is also exercised directly in `eval/test_scale_generator.py` (see
+  [Structural checks](#structural-checks)).
 - `eval/test_policy_pipeline_scale.py` — the suite itself, `@pytest.mark.eval`. Eight test
   functions: `test_scale_{total_corpus,per_decision}_{structural,correctness}_{prb,e2e}`.
 - Reuses, unmodified: `eval.prb_direct.build_roles_and_scopes`, `eval.test_policy_pipeline_eval`'s
@@ -141,13 +146,15 @@ established for Consistency/Correctness):
 
 | Property | Function | Gated? |
 |---|---|---|
-| Completeness (total-corpus) | `missing_decisions` — every generated agent-inbound-scope/target-scope/agent-role decision actually ran (`best_effort=True` guarantees a rejected decision still contributes an entry, so a name missing here is an eval-harness bug, not an LLM finding) | Yes |
-| Completeness (per-decision) | `invalid_selected_names` — **not** "every candidate resolved to selected or denied": production's own selection schema (`RoleSelection`/`ScopeSelection`) carries only explicit grants/prohibitions with no enumerated "everyone else is denied" complement, and this corpus's grammar never emits explicit prohibitions, so a non-granted candidate absent from both lists is an ordinary implicit deny, not an incomplete response. The one genuinely distinct fidelity signal here is a **hallucinated** candidate name — one that never appeared in the input at all. | Yes |
+| Completeness (total-corpus) | `missing_decisions` — every generated agent-inbound-scope/target-scope/agent-role decision actually ran (`best_effort=True` guarantees a rejected decision still contributes an entry, so a name missing here is an eval-harness bug — including a job `eval.scale_prb.orchestrate_prb_concurrent` itself caught failing outright, see `failed_decisions` below — not an LLM finding) | Yes |
+| Completeness (per-decision) | `invalid_selected_names`, fed the names `eval.scale_prb.capture_precheck_drops` recovers directly from production's own `_precheck` step's diagnostic log, **before** it silently filters them out — not the post-filter `selected`/`denied` lists, which by construction can never contain one. **Not** "every candidate resolved to selected or denied": production's own selection schema (`RoleSelection`/`ScopeSelection`) carries only explicit grants/prohibitions with no enumerated "everyone else is denied" complement, and this corpus's grammar never emits explicit prohibitions, so a non-granted candidate absent from both lists is an ordinary implicit deny, not an incomplete response. The one genuinely distinct fidelity signal here is a **hallucinated** candidate name — one that never appeared in the input at all. | Yes |
 | Completeness (e2e) | `missing_rego` — every agent that the PRB **actually produced a rule for** got its expected Rego file rendered. Deliberately *not* unconditional over every agent: a live LLM can legitimately propose zero grants for one agent's every decision despite the generator's ground-truth-reachability guarantee — that is a correctness finding (already tracked, non-gating, by the correctness test's `under_grants`), not a structural/rendering defect, and conflating the two would make this "stable regression guard" flake on ordinary LLM variance instead of on an actual pipeline bug. Reported (non-gating) as `agents_with_no_rules`. | Yes (for agents with rules) |
-| No duplication | `duplicate_rule_triples` — no `(role, scope, effect)` triple appears more than once in a flat rule list (a merge-engine defect would restate the same decision twice) | Yes |
-| No orphans | `orphaned_scope_names` — every scope the corpus defines is reachable by at least one role in the **generated ground truth** (a generator invariant per the repair pass above — a violation here is a generator regression, never an LLM finding) | Yes |
+| No duplication (PRB level) | `duplicate_rule_triples` — no `(role, scope, effect)` triple appears more than once in the **raw, pre-merge** PRB output. No merge engine runs at this level, so this cannot catch a merge defect (see `duplicate_rego_entries` below for that) — what it still catches is a duplicate entry in this suite's *own* candidate-list construction, which the PRB would faithfully restate twice. | Yes |
+| No duplication (e2e level) | `duplicate_rego_entries` — no candidate name appears more than once in the **real rendered Rego** (`eval.test_policy_pipeline_correctness_e2e._rego_map`'s own per-document output), the one way `compute_and_apply`'s documented role.id+scope.id+effect dedup could actually fail on disk. Supersedes `duplicate_rule_triples` at this level, which checks the same pre-merge rules the PRB-level check already does and so cannot see a real merge defect either. | Yes |
+| No orphans | `orphaned_scope_names` — every scope the corpus defines is reachable by at least one role in the **generated ground truth** (a generator invariant per the repair pass above — a violation here is a generator regression, never an LLM finding). A pure property of the generator's own output, independent of any PRB call, so it's exercised directly — parametrized across several `(size, seed)` combinations — in the **offline** `eval/test_scale_structural.py`/`eval/test_scale_generator.py`, not re-checked once per expensive live run here (where the already-fixed scenario would always pass for free). | Yes (offline) |
 | Latency | plain `time.perf_counter()` wall-clock around the whole PRB-level call (total-corpus: the full concurrent loop; per-decision: the two sequential calls) and, at e2e level, additionally around PCE/Rego rendering | No — reported/trended |
-| Cost | `summarize_usage`/`CostSummary` — summed `total_tokens` across every call's `usage_metadata`, plus a `coverage` fraction (calls the endpoint actually reported usage for) so a partial-coverage run is visible, never silently read as a lower true cost | No — reported/trended |
+| Cost | `summarize_usage`/`CostSummary` — summed `total_tokens` across every call's `usage_metadata`, plus a `coverage` fraction (calls the endpoint actually reported usage for) so a partial-coverage run is visible, never silently read as a lower true cost. A call `orchestrate_prb_concurrent` caught failing contributes to neither — see `failed_decisions` below. | No — reported/trended |
+| Failed decisions (total-corpus) | `eval.scale_prb.orchestrate_prb_concurrent`'s `failed_decisions` — a `{name: reason}` dict for a job that raised `PolicyRulesBuilderBaseError` (e.g. a rate-limited `LLMAccessError`) outright, kept separate from `best_effort_notes` (which means something different: a proposal the auditor saw and rejected) and from `usage_by_name` (there is no usage to report for a call that never returned). Reported only — the name is already counted once via `missing_decisions` above. | No — reported only |
 
 ## Correctness checks
 

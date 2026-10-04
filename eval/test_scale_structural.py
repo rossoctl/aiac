@@ -12,6 +12,7 @@ from aiac.policy.model.models import PolicyRule, RuleEffect
 from eval.scale_generator import generate_total_corpus
 from eval.scale_structural import (
     CostSummary,
+    duplicate_rego_entries,
     duplicate_rule_triples,
     invalid_selected_names,
     missing_decisions,
@@ -98,14 +99,36 @@ class TestDuplicateRuleTriples:
         assert duplicate_rule_triples(rules) == []
 
 
+class TestDuplicateRegoEntries:
+    def test_no_duplicates(self) -> None:
+        assert duplicate_rego_entries({"role-a": ["scope-1", "scope-2"]}) == []
+
+    def test_names_the_exact_key_and_repeated_candidate(self) -> None:
+        assert duplicate_rego_entries({"role-a": ["scope-1", "scope-1"]}) == [("role-a", "scope-1")]
+
+    def test_only_the_repeated_entry_is_flagged_not_the_whole_key(self) -> None:
+        assert duplicate_rego_entries({"role-a": ["scope-1", "scope-1", "scope-2"]}) == [("role-a", "scope-1")]
+
+    def test_different_keys_are_independent(self) -> None:
+        assert duplicate_rego_entries({"role-a": ["scope-1"], "role-b": ["scope-1"]}) == []
+
+    def test_empty_map_has_no_duplicates(self) -> None:
+        assert duplicate_rego_entries({}) == []
+
+
 class TestOrphanedScopeNames:
     def test_generated_corpus_has_no_orphans_across_many_seeds(self) -> None:
         # The generator's repair pass must hold even where independent-density sampling would
         # otherwise leave a scope with zero grants by chance -- check several seeds/sizes, not
         # just one, since the failure mode is inherently probabilistic without the repair pass.
-        for seed in range(10):
-            corpus = generate_total_corpus(n_services=30, n_roles=4, seed=seed)
-            assert orphaned_scope_names(corpus.as_namespace()) == [], f"seed={seed}"
+        # This invariant is a pure property of the *generator's* output (never of what an LLM
+        # did), so it's exercised directly here, offline, every ``pytest`` run -- the live-LLM
+        # Scale suite's own structural tests do not re-check it (see this function's own
+        # docstring for why that would always pass for free).
+        for n_services, n_roles in [(30, 4), (2, 1), (37, 3)]:
+            for seed in range(10):
+                corpus = generate_total_corpus(n_services=n_services, n_roles=n_roles, seed=seed)
+                assert orphaned_scope_names(corpus.as_namespace()) == [], f"n_services={n_services} seed={seed}"
 
     def test_names_the_exact_orphaned_scope(self) -> None:
         ns = SimpleNamespace(
