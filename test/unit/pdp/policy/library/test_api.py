@@ -14,12 +14,13 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from aiac.idp.configuration.models import Role, RoleKind, Scope
+from aiac.idp.configuration.models import Role, RoleKind, Scope, ServiceType
 from aiac.policy.model.models import (
     AgentPolicyModel,
-    PolicyModel,
     PolicyRule,
     RuleEffect,
+    ServicePolicyModel,
+    TargetSidePolicyModel,
 )
 
 BASE = "http://127.0.0.1:7072"
@@ -77,8 +78,25 @@ def _agent_policy_model() -> AgentPolicyModel:
 
 
 _AGENT_MODEL = _agent_policy_model()
-_AGENT_POLICY_DICT = _AGENT_MODEL.model_dump()
-_POLICY_DICT = {"agents": [_AGENT_POLICY_DICT]}
+
+
+def _policy_model() -> TargetSidePolicyModel:
+    """A target-side policy model with one tool SPM that carries an allow and a deny edge."""
+    scope = Scope(id="scope-1", name="weather-tool.read", serviceId="team1/weather-tool")
+    allow = PolicyRule(role=_role(), scope=scope)
+    deny = PolicyRule(role=_role(id="role-2", name="blocked"), scope=scope, effect=RuleEffect.DENY)
+    return TargetSidePolicyModel(
+        services=[
+            ServicePolicyModel(
+                service_id="team1/weather-tool",
+                service_type=ServiceType.TOOL,
+                owned_roles=[],
+                owned_scopes=[scope],
+                inbound_allow_rules=[allow],
+                inbound_deny_rules=[deny],
+            )
+        ]
+    )
 
 
 def _ok(status: int = 200) -> MagicMock:
@@ -160,89 +178,104 @@ class TestRoundTrip:
         assert "secret-tool" in restored.target_deny_scopes
 
     def test_policy_model_round_trips_losslessly(self):
-        model = PolicyModel(agents=[_agent_policy_model()])
-        restored = PolicyModel.model_validate(model.model_dump(mode="json"))
+        model = _policy_model()
+        restored = TargetSidePolicyModel.model_validate(model.model_dump(mode="json"))
         assert restored == model
-        assert restored.agents[0].outbound_subject_deny_rules[0].effect == RuleEffect.DENY
+        assert restored.services[0].inbound_deny_rules[0].effect == RuleEffect.DENY
 
 
 # ---------------------------------------------------------------------------
-# apply_policy
+# apply_policy — POST /policy (upsert one CR per entry)
 # ---------------------------------------------------------------------------
 
 
 class TestApplyPolicy:
-    def test_posts_serialized_policy_model(self):
-        model = PolicyModel.model_validate(_POLICY_DICT)
+    def test_posts_the_tagged_policy_model(self):
+        model = _policy_model()
         with patch("aiac.pdp.policy.library.api.requests.post", return_value=_ok()) as m:
             from aiac.pdp.policy.library.api import apply_policy
 
             result = apply_policy(model)
         assert result is None
         assert m.call_args[0][0] == f"{BASE}/policy"
-        assert m.call_args.kwargs["json"] == model.model_dump()
+        body = m.call_args.kwargs["json"]
+        assert body == model.model_dump(mode="json")
+        assert body["enforcement_side"] == "target-side"
         assert m.call_args.kwargs.get("params") is None
 
     def test_raises_on_non_2xx(self):
-        model = PolicyModel.model_validate(_POLICY_DICT)
         with patch("aiac.pdp.policy.library.api.requests.post", return_value=_err()):
             from aiac.pdp.policy.library.api import apply_policy
 
             with pytest.raises(RuntimeError):
-                apply_policy(model)
+                apply_policy(_policy_model())
 
 
 # ---------------------------------------------------------------------------
-# apply_agent_policy
+# replace_policy — PUT /policy (upsert every entry, then delete every other AIAC CR)
 # ---------------------------------------------------------------------------
 
 
-class TestApplyAgentPolicy:
-    def test_posts_serialized_agent_model_to_agent_path(self):
-        model = AgentPolicyModel.model_validate(_AGENT_POLICY_DICT)
-        with patch("aiac.pdp.policy.library.api.requests.post", return_value=_ok()) as m:
-            from aiac.pdp.policy.library.api import apply_agent_policy
+class TestReplacePolicy:
+    def test_puts_the_tagged_policy_model(self):
+        model = _policy_model()
+        with patch("aiac.pdp.policy.library.api.requests.put", return_value=_ok(204)) as m:
+            from aiac.pdp.policy.library.api import replace_policy
 
-            result = apply_agent_policy("weather-agent", model)
+            result = replace_policy(model)
         assert result is None
-        assert m.call_args[0][0] == f"{BASE}/policy/agents/weather-agent"
-        assert m.call_args.kwargs["json"] == model.model_dump()
-        assert m.call_args.kwargs.get("params") is None
+        assert m.call_args[0][0] == f"{BASE}/policy"
+        assert m.call_args.kwargs["json"] == model.model_dump(mode="json")
 
     def test_raises_on_non_2xx(self):
-        model = AgentPolicyModel.model_validate(_AGENT_POLICY_DICT)
-        with patch("aiac.pdp.policy.library.api.requests.post", return_value=_err()):
-            from aiac.pdp.policy.library.api import apply_agent_policy
+        with patch("aiac.pdp.policy.library.api.requests.put", return_value=_err(502)):
+            from aiac.pdp.policy.library.api import replace_policy
 
             with pytest.raises(RuntimeError):
-                apply_agent_policy("weather-agent", model)
+                replace_policy(_policy_model())
 
 
 # ---------------------------------------------------------------------------
-# delete_agent_policy
+# delete_service_cr — DELETE /policy/services/{service_id:path}
 # ---------------------------------------------------------------------------
 
 
-class TestDeleteAgentPolicy:
-    def test_deletes_agent_path(self):
+class TestDeleteServiceCr:
+    def test_deletes_the_service_path_with_the_id_encoded_as_one_segment(self):
         with patch("aiac.pdp.policy.library.api.requests.delete", return_value=_ok(204)) as m:
-            from aiac.pdp.policy.library.api import delete_agent_policy
+            from aiac.pdp.policy.library.api import delete_service_cr
 
-            result = delete_agent_policy("weather-agent")
+            result = delete_service_cr("team1/weather-tool")
         assert result is None
-        assert m.call_args[0][0] == f"{BASE}/policy/agents/weather-agent"
+        assert m.call_args[0][0] == f"{BASE}/policy/services/team1%2Fweather-tool"
         assert m.call_args.kwargs.get("params") is None
 
     def test_raises_on_non_2xx(self):
-        with patch("aiac.pdp.policy.library.api.requests.delete", return_value=_err(404)):
-            from aiac.pdp.policy.library.api import delete_agent_policy
+        with patch("aiac.pdp.policy.library.api.requests.delete", return_value=_err(502)):
+            from aiac.pdp.policy.library.api import delete_service_cr
 
             with pytest.raises(RuntimeError):
-                delete_agent_policy("missing-agent")
+                delete_service_cr("team1/weather-tool")
+
+    def test_rejects_an_empty_id(self):
+        with patch("aiac.pdp.policy.library.api.requests.delete") as m:
+            from aiac.pdp.policy.library.api import delete_service_cr
+
+            with pytest.raises(ValueError):
+                delete_service_cr("")
+        m.assert_not_called()
+
+
+class TestRetiredFunctions:
+    def test_the_per_agent_functions_are_gone(self):
+        import aiac.pdp.policy.library.api as api
+
+        assert not hasattr(api, "apply_agent_policy")
+        assert not hasattr(api, "delete_agent_policy")
 
 
 # ---------------------------------------------------------------------------
-# delete_policy
+# delete_policy — DELETE /policy (every AIAC CR; no AIAC caller, C1)
 # ---------------------------------------------------------------------------
 
 
@@ -272,11 +305,10 @@ class TestDeletePolicy:
 class TestUrlFallback:
     def test_defaults_to_localhost_7072_when_env_unset(self, monkeypatch):
         monkeypatch.delenv("AIAC_PDP_POLICY_URL", raising=False)
-        model = PolicyModel.model_validate(_POLICY_DICT)
         with patch("aiac.pdp.policy.library.api.requests.post", return_value=_ok()) as m:
             from aiac.pdp.policy.library.api import apply_policy
 
-            apply_policy(model)
+            apply_policy(_policy_model())
         assert m.call_args[0][0] == "http://127.0.0.1:7072/policy"
 
 
@@ -287,24 +319,24 @@ class TestUrlFallback:
 
 class TestNoRealmParam:
     def test_none_of_the_four_functions_append_realm(self):
-        policy = PolicyModel.model_validate(_POLICY_DICT)
-        agent = AgentPolicyModel.model_validate(_AGENT_POLICY_DICT)
+        policy = _policy_model()
         with (
             patch("aiac.pdp.policy.library.api.requests.post", return_value=_ok()) as post,
+            patch("aiac.pdp.policy.library.api.requests.put", return_value=_ok(204)) as put,
             patch("aiac.pdp.policy.library.api.requests.delete", return_value=_ok(204)) as delete,
         ):
             from aiac.pdp.policy.library.api import (
-                apply_agent_policy,
                 apply_policy,
-                delete_agent_policy,
                 delete_policy,
+                delete_service_cr,
+                replace_policy,
             )
 
             apply_policy(policy)
-            apply_agent_policy("weather-agent", agent)
-            delete_agent_policy("weather-agent")
+            replace_policy(policy)
+            delete_service_cr("team1/weather-tool")
             delete_policy()
 
-        for call in list(post.call_args_list) + list(delete.call_args_list):
+        for call in list(post.call_args_list) + list(put.call_args_list) + list(delete.call_args_list):
             assert call.kwargs.get("params") is None
             assert "realm" not in call.args[0]

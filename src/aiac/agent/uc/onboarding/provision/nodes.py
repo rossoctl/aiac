@@ -34,7 +34,7 @@ class _WaitConfig:
     """A bounded deploy->onboard race-tolerance poll. ``attempts_env``/``backoff_env`` name the
     environment knobs (read at poll time, falling back to the defaults on an unset / non-numeric /
     below-minimum value). Bundled so the two onboarding races below share one poll mechanic
-    (``_poll_until_ready``) instead of each repeating the read-env + range + backoff loop."""
+    (``poll_until_ready``) instead of each repeating the read-env + range + backoff loop."""
 
     attempts_env: str
     backoff_env: str
@@ -47,7 +47,7 @@ class _WaitConfig:
 # ``classify_service`` can run BEFORE the operator has patched the label onto the pod. A briefly-absent
 # label is therefore a transient not-ready state, re-polled before we give up with a 502. Defaults
 # ≈ 30s of slack (well under the NATS ACK_WAIT and the system-test convergence poll); tests set fast.
-_LABEL_WAIT = _WaitConfig("ONBOARD_LABEL_WAIT_ATTEMPTS", "ONBOARD_LABEL_WAIT_BACKOFF", 15, 2.0)
+LABEL_WAIT = _WaitConfig("ONBOARD_LABEL_WAIT_ATTEMPTS", "ONBOARD_LABEL_WAIT_BACKOFF", 15, 2.0)
 
 # Deploy->onboard race tolerance for the AgentCard skill sync — a SECOND, later race than the label one
 # above. The operator syncs the fetched A2A card onto ``status.card.skills`` only AFTER the agent pod is
@@ -67,7 +67,7 @@ def _env_num(name: str, default, cast, minimum):
     return value if value >= minimum else default
 
 
-def _poll_until_ready(probe, cfg: _WaitConfig):
+def poll_until_ready(probe, cfg: _WaitConfig):
     """Re-poll ``probe`` up to ``cfg`` attempts, backing off between looks (skipped after the last).
     ``probe`` returns a non-``None`` 'ready' result to stop, or ``None`` to retry; it may raise to fail
     the whole wait immediately (a real error, never a race). Returns the ready result, or ``None`` once
@@ -103,11 +103,14 @@ _MCP_TIMEOUT = (5, 30)
 # How long discovery waits for the tool's MCP endpoint to become ready. The operator registers the
 # tool's Keycloak client (which fires the onboarding event) while it still rolls the tool pod onto
 # the AuthBridge-injected template, so the Service can have no ready endpoint for some seconds
-# ("connection refused"), or the sidecar can answer 502/503/504 while the app starts. Failing here
-# is retryable, but the NATS redelivery comes only after ACK_WAIT (600 s), so discovery waits for
-# the endpoint instead. Read from the env at call time; keep it well below ACK_WAIT.
+# ("connection refused"), or the sidecar can answer 502/503/504 while the app starts. Also, the
+# tool's OPA loads the bootstrap CR (written just before Provision, checkpoint B1) only at its next
+# bundle poll (10 s to 120 s); until then the tool's inbound denies the discovery call with 403
+# (D20). Failing here is retryable, but the NATS redelivery comes only after ACK_WAIT (600 s), so
+# discovery waits for the endpoint instead. The default covers the bundle poll. Read from the env at
+# call time; keep it well below ACK_WAIT.
 _MCP_READY_TIMEOUT_ENV = "AIAC_MCP_DISCOVERY_READY_TIMEOUT"
-_MCP_READY_TIMEOUT_DEFAULT = 120.0
+_MCP_READY_TIMEOUT_DEFAULT = 180.0
 _MCP_READY_INTERVAL = 3.0  # seconds between readiness attempts (patched in unit tests)
 
 
@@ -123,14 +126,15 @@ def _mcp_ready_timeout() -> float:
 
 def _endpoint_not_ready(exc: Exception) -> bool:
     """True for the failures of an MCP endpoint that is not ready yet: a connection-level error
-    (refused, reset, connect timeout) or a 502/503/504 from the sidecar. A read timeout (the tool
-    accepted the connection and hangs) and any other status are not waited for."""
+    (refused, reset, connect timeout), a 502/503/504 from the sidecar, or a 403 from the tool's
+    inbound OPA before it loads the bootstrap CR. A read timeout (the tool accepted the connection
+    and hangs) and any other status are not waited for."""
     import requests
 
     if isinstance(exc, requests.ConnectionError):  # includes ConnectTimeout
         return True
     response = getattr(exc, "response", None)
-    return isinstance(exc, requests.HTTPError) and getattr(response, "status_code", None) in (502, 503, 504)
+    return isinstance(exc, requests.HTTPError) and getattr(response, "status_code", None) in (403, 502, 503, 504)
 
 
 def _mcp_tools_list(endpoint: str, token: str | None = None) -> list[dict]:
@@ -140,7 +144,7 @@ def _mcp_tools_list(endpoint: str, token: str | None = None) -> list[dict]:
     sidecar that validates inbound JWTs). Bounded transport retries are applied here so callers
     just map the final failure to a 502. Around them, an endpoint that is not ready yet (see
     ``_endpoint_not_ready``) is tried again every ``_MCP_READY_INTERVAL`` seconds until the
-    ``AIAC_MCP_DISCOVERY_READY_TIMEOUT`` budget ends (default 120 s)."""
+    ``AIAC_MCP_DISCOVERY_READY_TIMEOUT`` budget ends (default 180 s)."""
     import requests
 
     def _do():
@@ -166,16 +170,63 @@ def _mcp_tools_list(endpoint: str, token: str | None = None) -> list[dict]:
         time.sleep(_MCP_READY_INTERVAL)
 
 
-def _select_pod(pods, workload_name: str):
-    """The pod owned by ``workload_name``: a Deployment's ReplicaSet (name prefix
+def _owned_by(pod, workload_name: str) -> bool:
+    """True if ``workload_name`` owns ``pod``: a Deployment's ReplicaSet (name prefix
     ``{workload}-``), or a StatefulSet / Sandbox whose name equals ``workload``."""
-    for pod in pods:
-        for owner in getattr(pod.metadata, "owner_references", None) or []:
-            if owner.kind == "ReplicaSet" and owner.name.startswith(f"{workload_name}-"):
-                return pod
-            if owner.kind in ("StatefulSet", "Sandbox") and owner.name == workload_name:
-                return pod
-    return None
+    for owner in getattr(pod.metadata, "owner_references", None) or []:
+        if owner.kind == "ReplicaSet" and owner.name.startswith(f"{workload_name}-"):
+            return True
+        if owner.kind in ("StatefulSet", "Sandbox") and owner.name == workload_name:
+            return True
+    return False
+
+
+def owned_pods(pods, workload_name: str) -> list:
+    """Every pod owned by ``workload_name`` (see ``_owned_by``), in list order."""
+    return [pod for pod in pods if _owned_by(pod, workload_name)]
+
+
+def _select_pod(pods, workload_name: str):
+    """The first pod owned by ``workload_name``, or ``None``."""
+    return next(iter(owned_pods(pods, workload_name)), None)
+
+
+def split_client_name(service_id: str, name: str | None) -> tuple[str, str]:
+    """``(namespace, workload_name)`` from the Keycloak ``client.name`` (``<namespace>/<workload>``).
+    A name with no ``/`` raises ``HTTPException(502)``: the pod of the service cannot be found."""
+    name = name or ""
+    if "/" not in name:
+        raise HTTPException(
+            502,
+            f"client.name {name!r} for service {service_id!r} has no '/': namespace/workload_name unrecoverable",
+        )
+    namespace, workload_name = name.split("/", 1)
+    return namespace, workload_name
+
+
+def pod_service_type(pod, workload_name: str) -> ServiceType | None:
+    """The service type from the operator's ``rossoctl.io/type`` label of ``pod``, or ``None`` while
+    the label is absent (a deploy->onboard race). A label that is present with a value other than
+    ``agent``/``tool`` is a real misconfiguration that no wait can fix: ``HTTPException(502)`` now."""
+    label = (getattr(pod.metadata, "labels", None) or {}).get(_TYPE_LABEL)
+    if not label:
+        return None
+    try:
+        return ServiceType(label.capitalize())
+    except ValueError:
+        raise HTTPException(
+            502,
+            f"workload {workload_name!r}: {_TYPE_LABEL} label invalid (got {label!r}, expected 'agent' or 'tool')",
+        )
+
+
+def label_missing_detail(workload_name: str, pod) -> str:
+    """The 502 detail of an exhausted wait for the ``rossoctl.io/type`` label of ``pod``."""
+    label = (getattr(pod.metadata, "labels", None) or {}).get(_TYPE_LABEL)
+    return (
+        f"workload {workload_name!r}: {_TYPE_LABEL} label missing or invalid "
+        f"(got {label!r}, expected 'agent' or 'tool')"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -191,13 +242,7 @@ def classify_service(state: OnboardingProvisionState) -> dict:
     except Exception as e:
         raise HTTPException(502, f"IdP config unavailable resolving service {service_id!r}: {e}")
 
-    name = service.name or ""
-    if "/" not in name:
-        raise HTTPException(
-            502,
-            f"client.name {name!r} for service {service_id!r} has no '/': namespace/workload_name unrecoverable",
-        )
-    namespace, workload_name = name.split("/", 1)
+    namespace, workload_name = split_client_name(service_id, service.name)
 
     service_type = _await_service_type(namespace, workload_name)
 
@@ -231,25 +276,15 @@ def _await_service_type(namespace: str, workload_name: str) -> ServiceType:
             raise HTTPException(502, f"Kubernetes pod LIST failed in namespace {namespace!r}: {e}")
 
         pod = _select_pod(pods, workload_name)
-        if pod is not None:
-            label = (getattr(pod.metadata, "labels", None) or {}).get(_TYPE_LABEL)
-            if label:
-                try:
-                    return ServiceType(label.capitalize())
-                except ValueError:
-                    # Present but not agent/tool: a real misconfiguration, never a race — fail now.
-                    raise HTTPException(
-                        502,
-                        f"workload {workload_name!r}: {_TYPE_LABEL} label invalid "
-                        f"(got {label!r}, expected 'agent' or 'tool')",
-                    )
-            detail = (
-                f"workload {workload_name!r}: {_TYPE_LABEL} label missing or invalid "
-                f"(got {label!r}, expected 'agent' or 'tool')"
-            )
-        return None
+        if pod is None:
+            return None
+        # Present but not agent/tool raises now: a real misconfiguration, never a race.
+        service_type = pod_service_type(pod, workload_name)
+        if service_type is None:
+            detail = label_missing_detail(workload_name, pod)
+        return service_type
 
-    service_type = _poll_until_ready(_probe, _LABEL_WAIT)
+    service_type = poll_until_ready(_probe, LABEL_WAIT)
     if service_type is None:
         raise HTTPException(502, detail)
     return service_type
@@ -287,7 +322,7 @@ def _await_agent_skills(namespace: str, workload: str):
         skills = (((last_card or {}).get("status") or {}).get("card") or {}).get("skills", [])
         return (last_card, skills) if skills else None
 
-    result = _poll_until_ready(_probe, _CARD_WAIT)
+    result = poll_until_ready(_probe, _CARD_WAIT)
     return result if result is not None else (last_card, [])
 
 

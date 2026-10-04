@@ -293,6 +293,10 @@ def _drive_apply_with_passes(scope_rules, applied=None) -> tuple[MagicMock, Magi
         # The Orchestrator's IdP seam: the success path re-enables the client and the failure path
         # rolls back through it (issue 171). Stubbed so neither touches a live IdP.
         patch("aiac.agent.uc.onboarding.orchestrator._config", return_value=MagicMock()),
+        # The D30 precondition checks (they read the cluster) pass for a tool, and the tool's
+        # bootstrap CR (a PCE write, checkpoint B1) is stubbed: these cases pin the PRB/PCE seams.
+        patch("aiac.agent.uc.onboarding.orchestrator.check_preconditions", return_value=ServiceType.TOOL),
+        patch("aiac.agent.uc.onboarding.orchestrator.bootstrap"),
         patch(f"{_BUILDER}._config", return_value=MagicMock()),
         patch(f"{_BUILDER}.resolve_focal_entities", return_value=_focal_own_scope()),
         patch(f"{_BUILDER}.build_scope_rules", return_value=scope_rules),

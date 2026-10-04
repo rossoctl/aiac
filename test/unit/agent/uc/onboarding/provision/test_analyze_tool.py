@@ -159,8 +159,9 @@ class TestMcpToolsListWaitsForEndpoint:
     """The operator registers the tool's Keycloak client (which fires the onboarding event) while it
     still rolls the tool pod onto the AuthBridge-injected template. The Service can then have no
     ready endpoint for some seconds, so `tools/list` gets "connection refused". Discovery waits for
-    the endpoint (bounded by `AIAC_MCP_DISCOVERY_READY_TIMEOUT`) instead of failing into a NATS
-    redelivery that comes only after `ACK_WAIT` (600 s)."""
+    the endpoint (bounded by `AIAC_MCP_DISCOVERY_READY_TIMEOUT`, default 180 s) instead of failing
+    into a NATS redelivery that comes only after `ACK_WAIT` (600 s). A 403 is waited for too: the
+    tool's OPA loads the bootstrap CR only at its next bundle poll (checkpoint B1)."""
 
     @pytest.fixture(autouse=True)
     def fast(self, monkeypatch):
@@ -218,3 +219,32 @@ class TestMcpToolsListWaitsForEndpoint:
     def test_bad_ready_timeout_env_falls_back_to_the_default(self, monkeypatch):
         monkeypatch.setenv("AIAC_MCP_DISCOVERY_READY_TIMEOUT", "banana")
         assert nodes._mcp_ready_timeout() == nodes._MCP_READY_TIMEOUT_DEFAULT
+
+    def test_the_ready_timeout_default_covers_the_opa_bundle_poll(self, monkeypatch):
+        # Checkpoint B1: the budget must cover the OPA bundle poll of the tool's sidecar (up to 120 s)
+        # after the bootstrap CR write, plus the pod roll-out, so the default is 180 s.
+        monkeypatch.delenv("AIAC_MCP_DISCOVERY_READY_TIMEOUT")
+        assert nodes._mcp_ready_timeout() == 180.0
+
+    def test_forbidden_until_the_bootstrap_cr_loads_then_ready_returns_the_tools(self):
+        # The tool's OPA loads its bootstrap CR only at its next bundle poll (10-120 s). Until then
+        # its inbound denies the discovery call (D20): 403 is "not ready yet", not a final answer.
+        tools = [{"name": "t1"}]
+        with patch("requests.post", side_effect=[self._status(403), self._status(403), self._ok(tools)]) as post:
+            assert nodes._mcp_tools_list("http://x/mcp", token="abc") == tools
+        assert post.call_count == 3
+
+    def test_forbidden_until_the_budget_ends_is_a_502(self, monkeypatch):
+        monkeypatch.setenv("AIAC_MCP_DISCOVERY_READY_TIMEOUT", "0.2")
+        svc = _svc({MCP_LABEL: ""})
+        with (
+            patch.object(kube, "_core_v1") as core_v1,
+            patch.object(nodes, "_discovery_token", return_value="disco-tok"),
+            patch("requests.post", return_value=self._status(403)) as post,
+        ):
+            core_v1.return_value.read_namespaced_service.return_value = svc
+            with pytest.raises(HTTPException) as ei:
+                nodes.analyze_tool(_state())
+        assert ei.value.status_code == 502
+        assert "tools/list failed" in ei.value.detail
+        assert post.call_count > 1

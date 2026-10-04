@@ -1,18 +1,28 @@
-"""AIAC Agent Controller — FastAPI app factory + the four ``/apply/*`` routes.
+"""AIAC Agent Controller — FastAPI app factory, the ``/apply/*`` routes and one read-only route.
 
-The Controller is stateless. Each route dispatches to its use-case handler
+The Controller is stateless. Each ``/apply/*`` route dispatches to its use-case handler
 (orchestrator or sub-agent), receives the ``(list[PolicyRule], override)`` tuple
 the handler returns, and makes the **single** ``compute_and_apply(rules, override)``
 call to the Policy Computation Engine. No per-use-case business logic, retry
 handling, or state assembly lives here.
 
+``GET /policy/services/{service_id:path}`` is a read-only view (D18): the policy model of the
+current side with only the entry of one service (by its clientId), or 404 if it has no SPM. It
+calls the PCE ``policy_model_for`` and writes nothing.
+
+The app's lifespan (``eventbus.consumer.lifespan``) runs the start sequence first — start check #4
+and the PCE resync (see ``controller.start``) — then starts the NATS consumer. A failed step stops
+the Controller before it serves.
+
 Responses are bare HTTP status codes: ``200 OK`` on success (no body). Upstream
 failures are raised as FastAPI ``HTTPException``s by the handlers; the status
-code is authoritative (the accompanying default JSON error body is incidental).
+code is authoritative (the accompanying default JSON error body is incidental). The exception
+handlers below map the PRB errors (422 / 502 / 500, sanitized or a ``ConflictReport``) and a failed
+UC1 precondition check (``EnforcementPreconditionError`` → 409 with ``failed_checks``).
 """
 
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 
 from aiac.agent.eventbus.consumer import lifespan
@@ -30,11 +40,12 @@ from aiac.agent.policy_rules_builder.graph import (
 from aiac.agent.shared.error_logging import log_by_type
 from aiac.agent.uc.offboarding.offboard import offboard_service
 from aiac.agent.uc.onboarding.orchestrator import onboard_service, reenable_service
+from aiac.agent.uc.onboarding.preconditions import EnforcementPreconditionError
 from aiac.agent.uc.policy_update.build import build_policy
 from aiac.agent.uc.policy_update.rebuild import rebuild_policy
 from aiac.agent.uc.role_update.role import update_role
 from aiac.idp.configuration.models import ClientId, ServiceUuid
-from aiac.policy.computation import compute_and_apply, decommission
+from aiac.policy.computation import compute_and_apply, decommission, policy_model_for
 
 app = FastAPI(lifespan=lifespan)
 
@@ -89,6 +100,23 @@ def _policy_conflict_error(_request: Request, exc: PolicyConflictError) -> JSONR
 def _policy_contradiction_error(_request: Request, exc: PolicyContradictionError) -> JSONResponse:
     report = report_from_contradictions(exc.focal, exc.contradictions)
     return JSONResponse(status_code=422, content=report.model_dump(mode="json"))
+
+
+# A failed UC1 precondition check (D30): the pod of the service cannot enforce its CR. This is a
+# conflict with the state of the cluster that the operator must fix, not a server fault, so 409. The
+# body names each failed check, so the operator knows what to fix; the items carry check, pod,
+# container and namespace names only (no endpoint, host or key). The checks run before Provision,
+# so nothing changed and the PCE is never reached.
+@app.exception_handler(EnforcementPreconditionError)
+def _enforcement_precondition_error(_request: Request, exc: EnforcementPreconditionError) -> JSONResponse:
+    log_by_type(exc)
+    return JSONResponse(
+        status_code=409,
+        content={
+            "detail": "The service cannot enforce its access policy: one or more precondition checks failed.",
+            "failed_checks": exc.failures,
+        },
+    )
 
 
 # Safety net — registered LAST, on purpose. Any ``PolicyRulesBuilderBaseError`` WITHOUT its own
@@ -156,6 +184,19 @@ def apply_role(role_id: str) -> Response:
 def apply_offboard(service_id: str) -> Response:
     decommission(offboard_service(ClientId(service_id)))
     return Response(status_code=200)
+
+
+# A read-only view for tests and debugging (D18): the policy model of the current side with only the
+# entry of one service, as JSON in the shape of the writer's POST /policy body. Keyed by the clientId
+# (the SPM key), as on the offboard path, so the {service_id:path} converter carries a slash-bearing
+# SPIFFE URI. 404 if the service has no SPM (it is not in the managed set). It takes no PCE lock and
+# writes nothing.
+@app.get("/policy/services/{service_id:path}")
+def get_service_policy_model(service_id: str) -> JSONResponse:
+    model = policy_model_for(ClientId(service_id))
+    if model is None:
+        raise HTTPException(404, "The service has no policy model (it is not in the managed set).")
+    return JSONResponse(status_code=200, content=model.model_dump(mode="json"))
 
 
 def main() -> None:

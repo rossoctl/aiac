@@ -1,6 +1,7 @@
 from enum import Enum
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 from aiac.idp.configuration.models import Role, Scope, ServiceType
 
@@ -100,7 +101,50 @@ class AgentPolicyModel(BaseModel):
     outbound_subject_deny_rules: list[PolicyRule] = []
 
 
+class EnforcementSide(str, Enum):
+    """Where the access to a callee is checked (D16).
+
+    Under ``target-side`` each callee (agent or tool) checks the access to itself in its own inbound
+    OPA, from its own CR. Under ``agent-side`` (the legacy method) each agent's outbound OPA checks
+    the agent's calls to tools. One global switch selects the side for every callee."""
+
+    TARGET_SIDE = "target-side"
+    AGENT_SIDE = "agent-side"
+
+
 class PolicyModel(BaseModel):
+    """The deploy input that the PCE gives to the PDP Policy Writer (D18a).
+
+    The base of the hierarchy, never sent on its own. ``enforcement_side`` is the tag: each subclass
+    fixes it as a ``Literal`` class constant with a default, so code never sets it by hand, and the
+    writer dispatches on the subclass that the tag parses into. A model that mixes the sides
+    cannot exist."""
+
     model_config = ConfigDict(extra="ignore")
 
-    agents: list[AgentPolicyModel]
+    enforcement_side: EnforcementSide
+
+
+class TargetSidePolicyModel(PolicyModel):
+    """The target-side policy model: the stored SPMs, one per callee.
+
+    Every edge that service X checks on its inbound is already on ``SPM(X)`` (a rule is stored on
+    the SPM of the service that owns its scope), so the stored SPM is the render input and the
+    writer does no join."""
+
+    enforcement_side: Literal[EnforcementSide.TARGET_SIDE] = EnforcementSide.TARGET_SIDE
+    services: list[ServicePolicyModel]
+
+
+# The body of ``POST`` / ``PUT /policy``: every concrete policy model, told apart by its tag. The
+# discriminator makes the tag mandatory in a body, although each subclass has it as a default.
+AnyPolicyModel = Annotated[TargetSidePolicyModel, Field(discriminator="enforcement_side")]
+
+_policy_model_adapter: TypeAdapter[AnyPolicyModel] = TypeAdapter(AnyPolicyModel)
+
+
+def parse_policy_model(data: object) -> PolicyModel:
+    """Parse a policy-model body into its concrete subclass, by its ``enforcement_side`` tag.
+
+    Raises ``pydantic.ValidationError`` on a missing or unknown tag."""
+    return _policy_model_adapter.validate_python(data)

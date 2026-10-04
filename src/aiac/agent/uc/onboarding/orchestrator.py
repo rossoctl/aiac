@@ -5,6 +5,12 @@ the Controller for the ``aiac.apply.service.{id}`` / ``POST /apply/service/{serv
 trigger, it sequences the two sub-agents and returns ``(list[PolicyRule], override=False, client_id)``
 (``client_id`` is the service's clientId, which the Controller passes to the PCE as ``focus_service``):
 
+    0. The precondition checks (D30, see ``preconditions``) — run FIRST, after the one IdP read
+       that resolves the clientId: the pod has the AuthBridge sidecar (#1), the namespace pipeline
+       has ``opa`` (and ``mcp-parser`` for a tool) inbound (#2), no app container has an
+       ``httpGet`` probe (#6). A failed check raises ``EnforcementPreconditionError``.
+       Then, for an enabled TOOL only, the PCE ``bootstrap`` writes the tool's first CR, so that
+       discovery (``tools/list`` through the tool's own inbound) passes (checkpoint B1).
     1. Service Provision  — classifies the service and writes its roles/scopes into the IdP,
        producing the discovered ``service_type`` and the **created-manifest** (exactly the
        roles/scopes it created on this run — see ``provision_service``).
@@ -18,8 +24,9 @@ is always ``False`` (append; existing roles keep their other access).
 reconcile is idempotent, so a crash between stages simply re-runs the full pipeline to
 convergence on NATS redelivery. A build **failure**, however, triggers a **compensating
 rollback** (UC1-only) and then the PCE ``quarantine`` before the error propagates — see
-:func:`_rollback` and :func:`onboard_service`. The PCE owns the PDP: this module never imports
-``aiac.pdp.policy.library``.
+:func:`_rollback` and :func:`onboard_service`. A failed precondition check is **not** a build
+failure: nothing changed yet, so it runs no rollback, no client disable and no quarantine
+(checkpoint O2). The PCE owns the PDP: this module never imports ``aiac.pdp.policy.library``.
 """
 
 import contextlib
@@ -35,11 +42,12 @@ from aiac.agent.policy_rules_builder.graph import (
     UnparseableLLMResponseError,
 )
 from aiac.agent.uc.onboarding.policy_builder.builder import ServicePolicyBuilder
+from aiac.agent.uc.onboarding.preconditions import check_preconditions
 from aiac.agent.uc.onboarding.provision.graph import build_provision_graph
 from aiac.agent.uc.onboarding.provision.state import OnboardingProvisionState, Trigger
 from aiac.idp.configuration.api import Configuration
-from aiac.idp.configuration.models import ClientId, Service, ServiceUuid
-from aiac.policy.computation import quarantine
+from aiac.idp.configuration.models import ClientId, Service, ServiceType, ServiceUuid
+from aiac.policy.computation import bootstrap, quarantine
 from aiac.policy.model.models import PolicyRule
 
 logger = logging.getLogger(__name__)
@@ -49,6 +57,9 @@ logger = logging.getLogger(__name__)
 # ``LLMAccessError``, ``UnparseableLLMResponseError``) all leave a provisioned-but-unusable
 # service, so each rolls back what Provision created. Any other exception (e.g. an
 # ``HTTPException`` from IdP focus resolution) propagates untouched — no teardown.
+# ``EnforcementPreconditionError`` is deliberately NOT here (checkpoint O2): the checks run before
+# Provision, so nothing exists that needs compensation. A first onboarding then has no CR, so D20
+# denies the service (fail closed); an onboarded service keeps its policy.
 _ROLLBACK_ERRORS = (
     PolicyConflictError,
     PolicyRulesBuilderError,
@@ -180,7 +191,8 @@ def reenable_service(service_id: ServiceUuid) -> None:
 
 
 def onboard_service(service_id: ServiceUuid) -> tuple[list[PolicyRule], bool, ClientId]:
-    """Sequence Provision → Policy Builder and return ``(rules, override=False, client_id)``.
+    """Sequence the precondition checks → (tool) bootstrap → Provision → Policy Builder and return
+    ``(rules, override=False, client_id)``.
 
     ``service_id`` is the Keycloak internal client UUID that the trigger carries. The Orchestrator
     reads the ``Service`` from the IdP **once**, before Provision, and resolves its clientId
@@ -189,15 +201,24 @@ def onboard_service(service_id: ServiceUuid) -> tuple[list[PolicyRule], bool, Cl
     the read fails, nothing exists yet that needs compensation: it raises ``HTTPException(502)``
     (as Provision's ``classify_service`` does) before Provision.
 
+    Then the precondition checks (D30, :func:`~aiac.agent.uc.onboarding.preconditions.check_preconditions`)
+    run, before Provision and the PRB. A failed check raises ``EnforcementPreconditionError``,
+    which names each failed check; nothing changed yet, so there is no rollback, no client disable
+    and no quarantine (checkpoint O2). If the service is a tool (the type of its pod label) and its
+    client is enabled, the PCE ``bootstrap(client_id, ServiceType.TOOL)`` writes the tool's first CR
+    before Provision, so that discovery passes (checkpoint B1). A disabled tool gets no bootstrap:
+    it fails at the discovery-token mint anyway (C5). A bootstrap failure propagates (no rollback:
+    Provision has not run).
+
     On any of the four typed build failures (see ``_ROLLBACK_ERRORS``, for agents and tools, on the
     first failure — also the retryable ``LLMAccessError``) the Orchestrator runs the compensating
     :func:`_rollback` (delete this run's created roles/scopes; disable the client last), then the
     PCE's ``quarantine(client_id, created_roles)`` (delete the SPM, remove the service's roles —
-    including the created roles the rollback deleted — from the other SPMs,
-    replace an agent's CR with a no-rules CR, re-derive the affected agents), and **re-raises** the
-    original error unchanged. The disable comes before the quarantine, so no run after the teardown
-    sees the service as enabled. The quarantine runs even when the rollback raises, so a failed
-    rollback never leaves a first onboarding fail-open. A rollback or quarantine failure
+    including the created roles the rollback deleted — from the other SPMs, delete the service's
+    CR, deploy the affected services), and **re-raises** the original error unchanged. The disable
+    comes before the quarantine, so no run after the teardown sees the service as enabled. The
+    quarantine runs even when the rollback raises, so a failed rollback never leaves a first
+    onboarding fail-open. A rollback or quarantine failure
     propagates in place of the build error (the build error stays on its ``__context__``): the
     compensation failure is not in the consumer's permanent set, so NATS redelivers and the next
     run tries the compensation again. If the build error won, a permanent build error would
@@ -207,7 +228,7 @@ def onboard_service(service_id: ServiceUuid) -> tuple[list[PolicyRule], bool, Cl
     :func:`reenable_service`, but only AFTER the caller's ``compute_and_apply`` (PCE) call succeeds,
     so a PCE failure leaves the client disabled rather than enabled-with-no-policy.
 
-    The full provision → build → rollback lifecycle is serialized per ``service_id`` (see
+    The full checks → provision → build → rollback lifecycle is serialized per ``service_id`` (see
     :func:`_service_lock`): a concurrent same-service run cannot corrupt the created-manifest
     or roll back a shared entity, while different service_ids run concurrently. The registry
     entry is reference-counted and evicted once the last run using it exits (issue 202), on
@@ -222,6 +243,17 @@ def onboard_service(service_id: ServiceUuid) -> tuple[list[PolicyRule], bool, Cl
             # is a 502, not a raw error that the Controller turns into a 500.
             raise HTTPException(502, f"IdP config unavailable resolving service {service_id!r}: {e}") from e
         client_id = ClientId(service.serviceId)
+
+        # D30: the precondition checks run FIRST, before anything changes. A failed check raises
+        # EnforcementPreconditionError, which is NOT a rollback error (checkpoint O2): nothing was
+        # provisioned, so there is no rollback, no client disable and no quarantine.
+        pod_type = check_preconditions(service)  # the type from the pod label (no catalog type yet)
+        # Checkpoint B1: the first CR of a tool, before Provision, so that discovery (tools/list
+        # through the tool's own inbound) passes D20. Only for an enabled client: a disabled
+        # (quarantined) tool fails at the discovery-token mint anyway (C5), and its bootstrap CR
+        # would stay stale until the next resync. Agents get no bootstrap.
+        if pod_type is ServiceType.TOOL and service.enabled:
+            bootstrap(client_id, ServiceType.TOOL)
 
         provision = build_provision_graph().invoke(OnboardingProvisionState(trigger=Trigger(entity_id=service_id)))
         service_type = provision["service_type"]

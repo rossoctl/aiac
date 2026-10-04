@@ -28,6 +28,7 @@ from aiac.agent.policy_rules_builder.graph import (
     PolicyRulesBuilderError,
     UnparseableLLMResponseError,
 )
+from aiac.agent.uc.onboarding.preconditions import EnforcementPreconditionError
 
 # What onboard_service returns for the onboarded service: the subject carries the Keycloak UUID, the
 # PCE takes the clientId.
@@ -205,6 +206,8 @@ _PERMANENT_EXCEPTIONS = [
     PolicyContradictionError("scope:read", []),
     PolicyRulesBuilderError("builder blew up"),
     UnparseableLLMResponseError("cannot parse"),
+    # A failed onboarding precondition check (D30) needs a fix in the cluster first: no retry helps.
+    EnforcementPreconditionError(["#1 sidecar: no authbridge-proxy container"]),
 ]
 
 
@@ -329,7 +332,11 @@ def test_lifespan_awaits_cancelled_task_before_stopping_consumer():
             events.append("stopped")
 
     async def run():
-        with patch("aiac.agent.eventbus.consumer.AiacEventConsumer", return_value=FakeConsumer()):
+        # The start sequence (check #4, resync) is covered in test/unit/agent/controller/test_start.py.
+        with (
+            patch("aiac.agent.eventbus.consumer.run_start_sequence"),
+            patch("aiac.agent.eventbus.consumer.AiacEventConsumer", return_value=FakeConsumer()),
+        ):
             async with lifespan(MagicMock()):
                 await asyncio.sleep(0)  # let the background task actually start
 

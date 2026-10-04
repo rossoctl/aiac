@@ -13,6 +13,12 @@ failures the Orchestrator tears down exactly what Provision *created this run* (
 created-manifest) and disables the client (failed-service marker). The client type is
 kept (handoff 11 B2). Then it calls the PCE's ``quarantine`` (the policy teardown) and
 re-raises. The caller re-enables the client after a successful apply (idempotent).
+
+Handoff 12 (D30, checkpoint B1) adds the enforcement precondition checks, which run first (before
+Provision and the PRB), and the bootstrap CR of a tool, which the PCE writes after the checks and
+before Provision. The checks read Kubernetes through the ``kube._core_v1`` seam, which is faked here
+for every test (by default a service that passes every check); the PCE ``bootstrap`` is patched at
+its import site.
 """
 
 import ast
@@ -31,7 +37,10 @@ from aiac.agent.policy_rules_builder.graph import (
     UnparseableLLMResponseError,
 )
 from aiac.agent.uc.onboarding import orchestrator
+from aiac.agent.uc.onboarding.preconditions import EnforcementPreconditionError
+from aiac.agent.uc.onboarding.provision import kube
 from aiac.idp.configuration.models import Role, Scope, Service, ServiceType
+from test.unit.agent.uc.onboarding import kube_fakes as kf
 
 # The onboarding trigger carries the Keycloak UUID; the PCE takes the clientId. The two differ, so a
 # test fails if the UUID leaks to the PCE.
@@ -47,6 +56,26 @@ def quarantine():
         yield mock
 
 
+@pytest.fixture(autouse=True)
+def bootstrap():
+    """The PCE ``bootstrap`` seam (the first CR of a tool, checkpoint B1) — patched for every test.
+    Tests that check it request this fixture by name."""
+    with patch.object(orchestrator, "bootstrap") as mock:
+        yield mock
+
+
+@pytest.fixture(autouse=True)
+def k8s(monkeypatch):
+    """The Kubernetes seam of the precondition checks (D30): by default one agent pod and a pipeline
+    that pass every check. Tests that change the cluster request this fixture by name. The
+    deploy->onboard re-poll is one look with no sleep, unless a test sets it."""
+    monkeypatch.setenv("ONBOARD_LABEL_WAIT_ATTEMPTS", "1")
+    monkeypatch.setenv("ONBOARD_LABEL_WAIT_BACKOFF", "0")
+    core = kf.core_v1()
+    with patch.object(kube, "_core_v1", return_value=core):
+        yield core
+
+
 def _graph(*, created_roles=(), created_scopes=(), service_type=ServiceType.AGENT):
     """A mocked Service Provision graph whose invoke() returns the final state dict,
     including the created-manifest (`created_roles` / `created_scopes`)."""
@@ -59,9 +88,10 @@ def _graph(*, created_roles=(), created_scopes=(), service_type=ServiceType.AGEN
     return graph
 
 
-def _service():
-    """The onboarded service as the IdP returns it: UUID ``SERVICE_ID``, clientId ``CLIENT_ID``."""
-    return Service(id=SERVICE_ID, serviceId=CLIENT_ID, enabled=True)
+def _service(*, enabled=True):
+    """The onboarded service as the IdP returns it: UUID ``SERVICE_ID``, clientId ``CLIENT_ID``, and
+    ``client.name`` = ``<namespace>/<workload>`` (the checks find the pod from it)."""
+    return Service(id=SERVICE_ID, serviceId=CLIENT_ID, name=kf.SERVICE_NAME, enabled=enabled)
 
 
 def _config_returning(service):
@@ -334,7 +364,7 @@ class TestRollbackLogInjectionSanitized:
         evil_id = "svc-1\r\nINFO forged: attacker-controlled entry"
         role = Role(id="r1", name="role\r\ninjected", composite=False)
         scope = Scope(id="s1", name="scope\ninjected")
-        service = Service(id=evil_id, serviceId=CLIENT_ID, enabled=True)
+        service = Service(id=evil_id, serviceId=CLIENT_ID, name=kf.SERVICE_NAME, enabled=True)
         config = _config_returning(service)
         graph = _graph(created_roles=[role], created_scopes=[scope])
 
@@ -645,3 +675,151 @@ class TestPceOwnsThePdp:
         }
         assert not any(name and name.startswith("aiac.pdp") for name in imported)
         assert "aiac.policy.computation" in imported
+
+
+# --------------------------------------------------------------------------- #
+# Precondition checks (D30) and the bootstrap CR of a tool (checkpoint B1)     #
+# --------------------------------------------------------------------------- #
+def _failed_pod_check(check: str):
+    """A cluster in which exactly one precondition check fails."""
+    if check == "#1":
+        return {"pods": [kf.pod(containers=[kf.app_container()])]}  # no sidecar
+    if check == "#2":
+        return {"configmap": kf.pipeline_configmap(inbound=("jwt-validation", "mcp-parser"))}  # no opa
+    return {"pods": [kf.pod(containers=[kf.app_container(readiness=kf.http_get_probe()), kf.sidecar_container()])]}
+
+
+class TestPreconditionChecksRunFirst:
+    @pytest.mark.parametrize("check", ["#1", "#2", "#6"])
+    def test_a_failed_check_raises_before_provision_and_the_prb_with_no_rollback(
+        self, check, k8s, quarantine, bootstrap
+    ):
+        # Checkpoint O2: the checks run first, so nothing changed yet. A failed check is not a
+        # rollback error: no Provision, no PRB, no rollback, no client disable, no quarantine.
+        cluster = _failed_pod_check(check)
+        if "pods" in cluster:
+            k8s.list_namespaced_pod.return_value = kf.pod_list(*cluster["pods"])
+        if "configmap" in cluster:
+            k8s.read_namespaced_config_map.return_value = cluster["configmap"]
+        config = _config_returning(_service())
+        graph = _graph()
+
+        with (
+            patch.object(orchestrator, "build_provision_graph", return_value=graph),
+            patch.object(orchestrator, "ServicePolicyBuilder") as spb,
+            patch.object(orchestrator, "_config", return_value=config),
+        ):
+            with pytest.raises(EnforcementPreconditionError) as ei:
+                orchestrator.onboard_service(SERVICE_ID)
+
+        assert len(ei.value.failures) == 1
+        assert ei.value.failures[0].startswith(check)
+        graph.invoke.assert_not_called()
+        spb.build.assert_not_called()
+        config.set_service_enabled.assert_not_called()
+        config.delete_service_role.assert_not_called()
+        config.delete_service_scope.assert_not_called()
+        quarantine.assert_not_called()
+        bootstrap.assert_not_called()
+        assert SERVICE_ID not in orchestrator._service_locks
+
+    def test_every_failed_check_is_named(self, k8s):
+        # The Orchestrator runs every check, then raises one error that names each failed check.
+        k8s.list_namespaced_pod.return_value = kf.pod_list(
+            kf.pod(containers=[kf.app_container(liveness=kf.http_get_probe())])
+        )
+        k8s.read_namespaced_config_map.return_value = kf.pipeline_configmap(inbound=("jwt-validation",))
+
+        with (
+            patch.object(orchestrator, "build_provision_graph", return_value=_graph()),
+            patch.object(orchestrator, "ServicePolicyBuilder"),
+            patch.object(orchestrator, "_config", return_value=_config_returning(_service())),
+        ):
+            with pytest.raises(EnforcementPreconditionError) as ei:
+                orchestrator.onboard_service(SERVICE_ID)
+
+        assert [f[:2] for f in ei.value.failures] == ["#1", "#2", "#6"]
+
+    def test_the_checks_read_the_pods_and_the_pipeline_of_the_service_namespace(self, k8s):
+        with (
+            patch.object(orchestrator, "build_provision_graph", return_value=_graph()),
+            patch.object(orchestrator, "ServicePolicyBuilder") as spb,
+            patch.object(orchestrator, "_config", return_value=_config_returning(_service())),
+        ):
+            spb.build.return_value = []
+            orchestrator.onboard_service(SERVICE_ID)
+
+        k8s.list_namespaced_pod.assert_called_with(kf.NAMESPACE)
+        k8s.read_namespaced_config_map.assert_called_once_with(kf.PIPELINE_CONFIGMAP, kf.NAMESPACE)
+
+
+class TestBootstrapOfATool:
+    def test_a_passing_tool_gets_its_bootstrap_cr_before_provision(self, k8s, bootstrap):
+        # Checkpoint B1: checks -> bootstrap (tool only) -> Provision -> PRB. The type comes from the
+        # pod label: the catalog type is not set before Provision.
+        k8s.list_namespaced_pod.return_value = kf.pod_list(kf.pod(type_label="tool"))
+        graph = _graph(service_type=ServiceType.TOOL)
+        order = MagicMock()
+        order.attach_mock(bootstrap, "bootstrap")
+        order.attach_mock(graph.invoke, "provision")
+
+        with (
+            patch.object(orchestrator, "build_provision_graph", return_value=graph),
+            patch.object(orchestrator, "ServicePolicyBuilder") as spb,
+            patch.object(orchestrator, "_config", return_value=_config_returning(_service())),
+        ):
+            order.attach_mock(spb.build, "prb")
+            spb.build.return_value = []
+            orchestrator.onboard_service(SERVICE_ID)
+
+        bootstrap.assert_called_once_with(CLIENT_ID, ServiceType.TOOL)
+        assert [c[0] for c in order.mock_calls] == ["bootstrap", "provision", "prb"]
+
+    def test_a_passing_agent_gets_no_bootstrap(self, bootstrap):
+        with (
+            patch.object(orchestrator, "build_provision_graph", return_value=_graph()),
+            patch.object(orchestrator, "ServicePolicyBuilder") as spb,
+            patch.object(orchestrator, "_config", return_value=_config_returning(_service())),
+        ):
+            spb.build.return_value = []
+            orchestrator.onboard_service(SERVICE_ID)
+
+        bootstrap.assert_not_called()
+
+    def test_a_disabled_tool_gets_no_bootstrap(self, k8s, bootstrap):
+        # A disabled (quarantined) tool fails at the discovery-token mint anyway (C5); a bootstrap CR
+        # would then stay stale until the next resync.
+        k8s.list_namespaced_pod.return_value = kf.pod_list(kf.pod(type_label="tool"))
+        graph = _graph(service_type=ServiceType.TOOL)
+
+        with (
+            patch.object(orchestrator, "build_provision_graph", return_value=graph),
+            patch.object(orchestrator, "ServicePolicyBuilder") as spb,
+            patch.object(orchestrator, "_config", return_value=_config_returning(_service(enabled=False))),
+        ):
+            spb.build.return_value = []
+            orchestrator.onboard_service(SERVICE_ID)
+
+        bootstrap.assert_not_called()
+        graph.invoke.assert_called_once()
+
+    def test_a_failed_bootstrap_propagates_before_provision_with_no_rollback(self, k8s, bootstrap, quarantine):
+        # The bootstrap stores no SPM and Provision has not run, so nothing needs compensation: the
+        # error propagates (retryable on the NATS path), with no rollback and no quarantine.
+        k8s.list_namespaced_pod.return_value = kf.pod_list(kf.pod(type_label="tool"))
+        bootstrap.side_effect = RuntimeError("PDP unreachable")
+        config = _config_returning(_service())
+        graph = _graph(service_type=ServiceType.TOOL)
+
+        with (
+            patch.object(orchestrator, "build_provision_graph", return_value=graph),
+            patch.object(orchestrator, "ServicePolicyBuilder") as spb,
+            patch.object(orchestrator, "_config", return_value=config),
+        ):
+            with pytest.raises(RuntimeError, match="PDP unreachable"):
+                orchestrator.onboard_service(SERVICE_ID)
+
+        graph.invoke.assert_not_called()
+        spb.build.assert_not_called()
+        config.set_service_enabled.assert_not_called()
+        quarantine.assert_not_called()

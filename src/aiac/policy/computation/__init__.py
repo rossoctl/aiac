@@ -1,3 +1,10 @@
-from aiac.policy.computation.engine import compute_and_apply, decommission, quarantine
+from aiac.policy.computation.engine import (
+    bootstrap,
+    compute_and_apply,
+    decommission,
+    policy_model_for,
+    quarantine,
+    resync,
+)
 
-__all__ = ["compute_and_apply", "decommission", "quarantine"]
+__all__ = ["bootstrap", "compute_and_apply", "decommission", "policy_model_for", "quarantine", "resync"]

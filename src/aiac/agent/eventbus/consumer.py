@@ -2,10 +2,16 @@
 
 Subscribes to the ``aiac-agent-consumer`` durable queue group and, on each
 message, calls the same use-case handler + ``compute_and_apply`` sequence the
-HTTP routes use, awaiting completion before acking. On handler failure, the
-message is left unacked (NATS redelivers) until ``num_delivered`` reaches
-``MAX_DELIVER``, at which point it is republished to the DLQ subject and
-terminated (stops redelivery on this consumer).
+HTTP routes use, awaiting completion before acking. On a **permanent** failure (see
+``_PERMANENT_ERRORS``: a policy conflict or contradiction, a PRB fault, an unparseable LLM
+response, or a failed UC1 precondition check) the message is republished to the DLQ subject and
+terminated at the FIRST delivery. On any other failure the message is left unacked (NATS
+redelivers) until ``num_delivered`` reaches ``MAX_DELIVER``, at which point it is republished to
+the DLQ subject and terminated (stops redelivery on this consumer).
+
+Also owns the FastAPI ``lifespan``: it runs the Controller start sequence (start check #4, then the
+PCE resync; see ``controller.start``) and starts the consumer only after it. A failed step raises
+from the lifespan, so the Controller stops before it serves.
 """
 
 import asyncio
@@ -20,6 +26,7 @@ from fastapi import FastAPI
 from nats.aio.msg import Msg
 from nats.js.api import AckPolicy, ConsumerConfig
 
+from aiac.agent.controller.start import run_start_sequence
 from aiac.agent.eventbus.stream import (
     ACK_WAIT_SECONDS,
     CONSUMER_FILTER_SUBJECTS,
@@ -38,6 +45,7 @@ from aiac.agent.policy_rules_builder.graph import (
 )
 from aiac.agent.shared.error_logging import log_by_type
 from aiac.agent.uc.onboarding.orchestrator import onboard_service, reenable_service
+from aiac.agent.uc.onboarding.preconditions import EnforcementPreconditionError
 from aiac.agent.uc.policy_update.build import build_policy
 from aiac.agent.uc.role_update.role import update_role
 from aiac.idp.configuration.models import ClientId, ServiceUuid
@@ -56,8 +64,9 @@ _ROLE_PREFIX = "aiac.apply.role."
 _POLICY_BUILD_SUBJECT = "aiac.apply.policy.build"
 
 # PERMANENT failures: redelivery can never make them succeed (a real policy conflict /
-# contradiction, an unparseable LLM response, or a builder fault), so they are DLQ'd +
-# term()ed on the FIRST delivery. Everything else — LLMAccessError (a transient LLM
+# contradiction, an unparseable LLM response, a builder fault, or a failed UC1 precondition
+# check — that one needs a fix in the cluster first), so they are DLQ'd + term()ed on the
+# FIRST delivery. Everything else — LLMAccessError (a transient LLM
 # outage that may clear) and genuinely unknown/transient errors — is RETRYABLE: left
 # unacked to redeliver until MAX_DELIVER, then DLQ'd. LLMAccessError is a sibling of the
 # permanent PRB errors under PolicyRulesBuilderBaseError, so isinstance() below correctly
@@ -67,6 +76,7 @@ _PERMANENT_ERRORS: tuple[type[Exception], ...] = (
     PolicyContradictionError,
     PolicyRulesBuilderError,
     UnparseableLLMResponseError,
+    EnforcementPreconditionError,
 )
 
 
@@ -185,6 +195,10 @@ class AiacEventConsumer:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # The Controller start sequence (start check #4, then the resync) runs FIRST, before the NATS
+    # consumer starts and before uvicorn serves: a failure raises here, so uvicorn exits and the pod
+    # restarts. It is synchronous (k8s and PDP calls), so it runs in a thread.
+    await asyncio.to_thread(run_start_sequence)
     consumer = AiacEventConsumer()
     # Backgrounded so a slow NATS handshake never blocks /apply/* from becoming
     # available. Each individual message is still awaited to completion by

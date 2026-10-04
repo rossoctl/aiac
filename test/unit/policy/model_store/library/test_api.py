@@ -134,6 +134,30 @@ class TestGetServicePolicyByScope:
 
 
 # ---------------------------------------------------------------------------
+# list_service_policies (every SPM, C3)
+# ---------------------------------------------------------------------------
+
+
+class TestListServicePolicies:
+    def test_lists_every_spm_with_no_role_param(self):
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = _mock_response(200, [_spm_dict("svc-a", "r1"), _spm_dict("svc-b", "r2")])
+            from aiac.policy.model_store.library.api import list_service_policies
+
+            result = list_service_policies()
+            mock_get.assert_called_once_with(f"{BASE_URL}/policy/services", timeout=_HTTP_TIMEOUT)
+            assert [s.service_id for s in result] == ["svc-a", "svc-b"]
+
+    def test_raises_on_error_response(self):
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = _mock_response(500)
+            from aiac.policy.model_store.library.api import list_service_policies
+
+            with pytest.raises(RuntimeError):
+                list_service_policies()
+
+
+# ---------------------------------------------------------------------------
 # get_service_policies_by_role
 # ---------------------------------------------------------------------------
 

@@ -57,6 +57,14 @@ def get_service_policy_by_scope(scope: Scope) -> ServicePolicyModel | None:
     return get_service_policy(scope.serviceId)
 
 
+def list_service_policies() -> list[ServicePolicyModel]:
+    # Every stored SPM — the managed set (D21). The collection-root GET with no ``role`` (C3);
+    # the PCE resync reads it to write every CR.
+    resp = requests.get(f"{_base_url()}/policy/services", timeout=_HTTP_TIMEOUT)
+    _check(resp)
+    return [ServicePolicyModel.model_validate(item) for item in resp.json()]
+
+
 def get_service_policies_by_role(role: Role) -> list[ServicePolicyModel]:
     # The one genuinely new route. Returns every SPM whose inbound_rules reference role.id —
     # including stale role->service mappings the live IdP no longer reflects (which

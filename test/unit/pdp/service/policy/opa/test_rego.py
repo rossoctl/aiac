@@ -1,16 +1,25 @@
 """Unit tests for aiac.pdp.service.policy.opa.rego (fixed packages, ALLOW/DENY).
 
-Targets the synthesized generator: fixed package names
+Targets the generators of both sides: fixed package names
 (``authbridge.client.{inbound,outbound}.request`` + ``import rego.v1``), the
-nested ``input.identity`` / ``input.mcp`` shape, the ``rossoctl`` platform
-bypass, and outbound de-prefixing (provisioned ``<owner>.<tool>`` scope names
-collapse to the bare ``input.mcp.params.name`` the live plugin sends) — now with
-the deny-overrides ALLOW/DENY split. Each gate is emitted twice
-(``*_allow_ok`` / ``*_deny_ok``) and ``allow`` requires every ALLOW gate and no
-DENY gate. Scope maps are split symmetrically
-(``subject_role_allow_scopes`` / ``_deny_scopes``, ``source_role_allow_scopes`` /
-``_deny_scopes``, ``target_allow_scopes`` / ``target_deny_scopes``); the identity
-maps (``subject_roles`` / ``source_roles`` / ``agent_roles``) keep their names.
+nested ``input.identity`` / ``input.mcp`` shape, and de-prefixing (provisioned
+``<owner>.<tool>`` scope names collapse to the bare ``input.mcp.params.name`` the
+live plugin sends).
+
+- **Agent side** (an APM): the agent inbound (the ``rossoctl`` platform bypass)
+  and the agent outbound (per-tool checks and the MCP session rule), with the
+  deny-overrides ALLOW/DENY split. Scope maps are split symmetrically
+  (``subject_role_allow_scopes`` / ``_deny_scopes``, ``source_role_allow_scopes`` /
+  ``_deny_scopes``, ``target_allow_scopes`` / ``target_deny_scopes``); the identity
+  maps (``subject_roles`` / ``source_roles`` / ``agent_roles``) keep their names.
+- **Target side** (a stored SPM, ``render_target_side``): the tool inbound (D26:
+  the user gate and the calling-agent gate, the session messages, the
+  self-discovery rule of checkpoint B1), the agent inbound (D26a, agent-level),
+  no request without identity (D27), and the pass-through outbound (D24).
+
+The behavioural tests evaluate the rendered Rego with ``opa eval`` and skip
+without ``opa`` on PATH. Expected verdicts are hand-written oracles, never read
+back from the Rego under test.
 """
 
 import json
@@ -21,14 +30,15 @@ from pathlib import Path
 
 import pytest
 
-from aiac.idp.configuration.models import Role, Scope
+from aiac.idp.configuration.models import Role, RoleKind, Scope, ServiceType
 from aiac.pdp.service.policy.opa.rego import (
     generate_inbound_rego,
     generate_outbound_rego,
+    generate_pass_through_rego,
     identity_ref,
+    render_target_side,
 )
-from aiac.policy.computation.engine import _fresh_apm
-from aiac.policy.model.models import AgentPolicyModel, PolicyRule, RuleEffect
+from aiac.policy.model.models import AgentPolicyModel, PolicyRule, RuleEffect, ServicePolicyModel
 
 # Full SPIFFE id of the github-tool workload that owns the outbound scopes.
 GH_TOOL = "spiffe://localtest.me/ns/team1/sa/github-tool"
@@ -784,12 +794,12 @@ def test_policy_b_matrix_under_deny_default():
             assert _opa_verdict(rego, query, input_doc) is _POLICY_B_MATRIX[(role, tool)], (role, tool)
 
 
-# --- the no-rules CR of a quarantined agent ----------------------------------
+# --- an APM with no rules -----------------------------------------------------
 #
-# The PCE's ``quarantine`` replaces a failed agent's CR with the ``_fresh_apm``
-# shell (no rules, no scopes). Under the DENY default it denies every inbound and
-# every outbound request — also end-user traffic that carries the ``rossoctl``
-# platform client, and also the MCP session messages.
+# An agent with no rules and no scopes (agent side). Under the DENY default its
+# packages deny every inbound and every outbound request — also end-user traffic
+# that carries the ``rossoctl`` platform client, and also the MCP session messages.
+# (A quarantine no longer writes such a CR: it deletes the CR, D20.)
 
 _OUTBOUND = "data.authbridge.client.outbound.request.allow"
 _INBOUND = "data.authbridge.client.inbound.request.allow"
@@ -807,8 +817,8 @@ _SESSION_METHODS = ("initialize", "notifications/initialized", "ping", "tools/li
     ],
     ids=["end-user", "platform-client", "agent-client", "anonymous"],
 )
-def test_no_rules_cr_denies_every_inbound_request(identity):
-    _assert_opa_allow(generate_inbound_rego(_fresh_apm(GH_AGENT)), _INBOUND, {"identity": identity}, False)
+def test_no_rules_apm_denies_every_inbound_request(identity):
+    _assert_opa_allow(generate_inbound_rego(_model(agent_id=GH_AGENT)), _INBOUND, {"identity": identity}, False)
 
 
 @pytest.mark.skipif(not shutil.which("opa"), reason="opa binary not on PATH")
@@ -817,9 +827,9 @@ def test_no_rules_cr_denies_every_inbound_request(identity):
     [{"method": "tools/call", "params": {"name": "source-read"}}] + [{"method": m} for m in _SESSION_METHODS],
     ids=lambda mcp: mcp["method"],
 )
-def test_no_rules_cr_denies_every_outbound_request(mcp):
+def test_no_rules_apm_denies_every_outbound_request(mcp):
     _assert_opa_allow(
-        generate_outbound_rego(_fresh_apm(GH_AGENT)),
+        generate_outbound_rego(_model(agent_id=GH_AGENT)),
         _OUTBOUND,
         {"identity": {"subject": "dev-user", "service_id": GH_TOOL}, "mcp": mcp},
         False,
@@ -920,3 +930,362 @@ def test_tools_call_stays_a_per_tool_check(subject, tool, allowed):
 def test_every_other_mcp_method_is_denied(mcp):
     rego = generate_outbound_rego(_session_model())
     _assert_opa_allow(rego, _OUTBOUND, _outbound_input("dev-user", mcp), False)
+
+
+# =========================================================================== #
+# Target side (D18c, D24, D26, D26a, D27; checkpoint B1)                      #
+# =========================================================================== #
+#
+# The render input of a target-side CR is the stored SPM of the callee. The writer
+# does no join: every edge that the callee checks is already on its own SPM.
+
+
+# --- the pass-through package (D24) -----------------------------------------
+
+_PASS_THROUGH_OUTBOUND = "package authbridge.client.outbound.request\nimport rego.v1\n\nallow := true\n"
+_PASS_THROUGH_INBOUND = "package authbridge.client.inbound.request\nimport rego.v1\n\nallow := true\n"
+
+
+def test_pass_through_package_is_the_header_and_allow_true():
+    assert generate_pass_through_rego("outbound") == _PASS_THROUGH_OUTBOUND
+    assert generate_pass_through_rego("inbound") == _PASS_THROUGH_INBOUND
+
+
+@pytest.mark.skipif(not shutil.which("opa"), reason="opa binary not on PATH")
+@pytest.mark.parametrize(
+    "input_doc",
+    [
+        {},
+        {"identity": {"subject": "dev-user", "service_id": GH_TOOL}, "mcp": {"method": "tools/call"}},
+        {"identity": {"subject": "dev-user"}, "a2a": {"method": "message/send"}},
+    ],
+    ids=["no-identity", "mcp", "a2a"],
+)
+def test_pass_through_outbound_allows_every_request(input_doc):
+    _assert_opa_allow(_PASS_THROUGH_OUTBOUND, _OUTBOUND, input_doc, True)
+
+
+# --- the tool inbound package (D26, checkpoint B1) ---------------------------
+#
+# The tool's stored SPM, with the two gates keyed by the bare tool name:
+#
+#   user roles   developer (dev-user)    allow source-read, issues-read
+#                tester (test-user)      allow issues-read, issues-write
+#                sr-reader (mixed-user)  allow source-read
+#                auditor (mixed-user)    DENY  source-read
+#   agent roles  github-agent.ops        (github-agent) allow source-read, issues-read
+#                other-agent.ops         (other-agent)  allow source-read, issues-read, issues-write
+#                other-agent.restricted  (other-agent)  DENY  issues-read
+
+OTHER_AGENT = "spiffe://localtest.me/ns/team1/sa/other-agent"
+
+
+def _user_role(name: str, *users: str) -> Role:
+    return Role(id=f"role-{name}", name=name, composite=False, kind=RoleKind.USER, actorIds=list(users))
+
+
+def _agent_role(name: str, agent: str) -> Role:
+    return Role(id=f"role-{name}", name=name, composite=False, kind=RoleKind.AGENT, actorIds=[agent])
+
+
+def _tool_spm() -> ServicePolicyModel:
+    source_read = _scope("github-tool.source-read", GH_TOOL)
+    issues_read = _scope("github-tool.issues-read", GH_TOOL)
+    issues_write = _scope("github-tool.issues-write", GH_TOOL)
+    developer = _user_role("developer", "dev-user")
+    tester = _user_role("tester", "test-user")
+    sr_reader = _user_role("sr-reader", "mixed-user")
+    auditor = _user_role("auditor", "mixed-user")
+    gh_ops = _agent_role("github-agent.ops", GH_AGENT)
+    other_ops = _agent_role("other-agent.ops", OTHER_AGENT)
+    other_restricted = _agent_role("other-agent.restricted", OTHER_AGENT)
+    return ServicePolicyModel(
+        service_id=GH_TOOL,
+        service_type=ServiceType.TOOL,
+        owned_roles=[],
+        owned_scopes=[source_read, issues_read, issues_write],
+        inbound_allow_rules=[
+            _rule(developer, source_read),
+            _rule(developer, issues_read),
+            _rule(tester, issues_read),
+            _rule(tester, issues_write),
+            _rule(sr_reader, source_read),
+            _rule(gh_ops, source_read),
+            _rule(gh_ops, issues_read),
+            _rule(other_ops, source_read),
+            _rule(other_ops, issues_read),
+            _rule(other_ops, issues_write),
+        ],
+        inbound_deny_rules=[
+            _rule(auditor, source_read, RuleEffect.DENY),
+            _rule(other_restricted, issues_read, RuleEffect.DENY),
+        ],
+    )
+
+
+def _tool_inbound() -> str:
+    return render_target_side(_tool_spm()).inbound
+
+
+def _call(tool: str) -> dict:
+    return {"method": "tools/call", "params": {"name": tool}}
+
+
+def _inbound_input(subject: str | None, client_id: str | None, mcp: dict) -> dict:
+    identity = {}
+    if subject is not None:
+        identity["subject"] = subject
+    if client_id is not None:
+        identity["client_id"] = client_id
+    return {"identity": identity, "mcp": mcp}
+
+
+@pytest.mark.skipif(not shutil.which("opa"), reason="opa binary not on PATH")
+@pytest.mark.parametrize(
+    "subject, client_id, tool, allowed",
+    [
+        ("dev-user", GH_AGENT, "source-read", True),  # both gates allow
+        ("test-user", OTHER_AGENT, "issues-write", True),  # both gates allow
+        ("dev-user", GH_AGENT, "issues-write", False),  # neither gate allows
+        ("test-user", GH_AGENT, "issues-write", False),  # the user is granted, the calling agent is not
+        ("dev-user", OTHER_AGENT, "issues-write", False),  # the calling agent is granted, the user is not
+        ("mixed-user", GH_AGENT, "source-read", False),  # a user deny vetoes the user allow
+        ("dev-user", OTHER_AGENT, "issues-read", False),  # a calling-agent deny vetoes its allow
+        ("dev-user", None, "source-read", False),  # no calling agent (no bypass)
+        ("dev-user", "rossoctl", "source-read", False),  # no platform-client bypass on a tool inbound
+        ("dev-user", GH_AGENT, "delete-repo", False),  # not a tool of this service
+    ],
+    ids=[
+        "granted",
+        "granted-other-agent",
+        "ungranted",
+        "agent-gate-closed",
+        "user-gate-closed",
+        "user-deny-veto",
+        "agent-deny-veto",
+        "no-calling-agent",
+        "platform-client",
+        "unknown-tool",
+    ],
+)
+def test_tool_inbound_tools_call_needs_both_gates_and_no_deny(subject, client_id, tool, allowed):
+    _assert_opa_allow(_tool_inbound(), _INBOUND, _inbound_input(subject, client_id, _call(tool)), allowed)
+
+
+@pytest.mark.skipif(not shutil.which("opa"), reason="opa binary not on PATH")
+@pytest.mark.parametrize("method", _SESSION_METHODS)
+@pytest.mark.parametrize(
+    "subject, client_id, allowed",
+    [
+        ("dev-user", GH_AGENT, True),  # source-read and issues-read pass both gates
+        ("test-user", OTHER_AGENT, True),  # issues-write passes both gates
+        ("mixed-user", GH_AGENT, False),  # the only allow (source-read) is vetoed by a user deny
+        ("test-user", "spiffe://localtest.me/ns/team1/sa/unknown-agent", False),  # the agent holds no role
+        ("guest", GH_AGENT, False),  # the user holds no role
+        ("dev-user", None, False),  # no calling agent
+        ("dev-user", "rossoctl", False),  # no platform-client bypass
+    ],
+    ids=["granted", "granted-other-agent", "vetoed", "unknown-agent", "no-roles", "no-calling-agent", "platform"],
+)
+def test_tool_inbound_session_methods_pass_only_for_a_granted_caller(method, subject, client_id, allowed):
+    _assert_opa_allow(_tool_inbound(), _INBOUND, _inbound_input(subject, client_id, {"method": method}), allowed)
+
+
+# The self-discovery rule (checkpoint B1): the UC-1 discovery token is minted as the tool's own
+# client, so its client_id is the tool's clientId (the SPM service_id). It opens the session
+# methods only, never tools/call.
+
+
+def test_tool_inbound_renders_the_tool_client_id_as_self_client_id():
+    assert f'self_client_id := "{GH_TOOL}"' in _tool_inbound()
+
+
+@pytest.mark.skipif(not shutil.which("opa"), reason="opa binary not on PATH")
+@pytest.mark.parametrize("method", _SESSION_METHODS)
+@pytest.mark.parametrize("subject", [None, "guest"], ids=["no-subject", "no-roles"])
+def test_tool_inbound_self_discovery_passes_the_session_methods(method, subject):
+    _assert_opa_allow(_tool_inbound(), _INBOUND, _inbound_input(subject, GH_TOOL, {"method": method}), True)
+
+
+@pytest.mark.skipif(not shutil.which("opa"), reason="opa binary not on PATH")
+@pytest.mark.parametrize("subject", [None, "dev-user"], ids=["no-subject", "granted-user"])
+@pytest.mark.parametrize("mcp", [_call("source-read"), {"method": "resources/list"}], ids=["tools-call", "other"])
+def test_tool_inbound_self_discovery_never_passes_other_methods(subject, mcp):
+    _assert_opa_allow(_tool_inbound(), _INBOUND, _inbound_input(subject, GH_TOOL, mcp), False)
+
+
+@pytest.mark.skipif(not shutil.which("opa"), reason="opa binary not on PATH")
+def test_tool_inbound_self_discovery_is_only_for_the_tool_itself():
+    # Another tool's own client gets no session on this tool.
+    other_tool = "spiffe://localtest.me/ns/team1/sa/other-tool"
+    _assert_opa_allow(_tool_inbound(), _INBOUND, _inbound_input(None, other_tool, {"method": "tools/list"}), False)
+
+
+@pytest.mark.skipif(not shutil.which("opa"), reason="opa binary not on PATH")
+@pytest.mark.parametrize(
+    "mcp",
+    [
+        {"method": "resources/list"},
+        {"method": "prompts/list"},
+        {"method": "resources/read", "params": {"uri": "file:///etc/passwd"}},
+        # A granted tool name under a method that is not tools/call.
+        {"method": "prompts/get", "params": {"name": "source-read"}},
+        {"params": {"name": "source-read"}},  # no method at all
+    ],
+    ids=["resources-list", "prompts-list", "resources-read", "prompts-get-granted-name", "no-method"],
+)
+def test_tool_inbound_denies_every_other_mcp_method(mcp):
+    _assert_opa_allow(_tool_inbound(), _INBOUND, _inbound_input("dev-user", GH_AGENT, mcp), False)
+
+
+@pytest.mark.skipif(not shutil.which("opa"), reason="opa binary not on PATH")
+@pytest.mark.parametrize(
+    "input_doc",
+    [
+        {},
+        {"mcp": _call("source-read")},
+        {"mcp": {"method": "tools/list"}},
+        {"identity": {}, "mcp": {"method": "initialize"}},
+    ],
+    ids=["nothing", "tools-call", "tools-list", "empty-identity"],
+)
+def test_tool_inbound_denies_a_request_without_identity(input_doc):
+    # D27: jwt-validation lets its bypass paths through with no identity; OPA must deny them.
+    _assert_opa_allow(_tool_inbound(), _INBOUND, input_doc, False)
+
+
+def test_tool_inbound_known_good_lines():
+    rego = _tool_inbound()
+    assert rego.startswith("package authbridge.client.inbound.request\nimport rego.v1\n")
+    # The bare MCP names of the tool's own scopes (de-prefixed).
+    assert 'owned_tools := ["source-read", "issues-read", "issues-write"]' in rego
+    assert 'subject_role_allow_scopes := {\n    "developer": ["source-read", "issues-read"],' in rego
+    assert 'source_role_deny_scopes := {\n    "other-agent.restricted": ["issues-read"],\n}' in rego
+    assert 'session_methods := {"initialize", "notifications/initialized", "ping", "tools/list"}' in rego
+    assert rego.count("default allow := false") == 1
+    assert 'allow if { input.mcp.method == "tools/call"; tool_ok(input.mcp.params.name) }' in rego
+    assert "allow if { input.mcp.method in session_methods; some tool in owned_tools; tool_ok(tool) }" in rego
+    assert "allow if { input.mcp.method in session_methods; input.identity.client_id == self_client_id }" in rego
+    # The callee is the key: no target map, and no platform-client bypass.
+    assert "input.identity.service_id" not in rego
+    assert "rossoctl" not in rego
+
+
+# --- the agent inbound package under target side (D26a) ---------------------
+#
+# The agent's stored SPM: two agent scopes; developer may use both, tester only issue_operations;
+# the orchestrator agent may call the agent through source_operations.
+
+ORCHESTRATOR = "spiffe://localtest.me/ns/team1/sa/orchestrator"
+
+
+def _agent_spm() -> ServicePolicyModel:
+    source_ops = _scope("github-agent.source_operations", GH_AGENT)
+    issue_ops = _scope("github-agent.issue_operations", GH_AGENT)
+    developer = _user_role("developer", "dev-user")
+    tester = _user_role("tester", "test-user")
+    orchestrator = _agent_role("orchestrator.ops", ORCHESTRATOR)
+    return ServicePolicyModel(
+        service_id=GH_AGENT,
+        service_type=ServiceType.AGENT,
+        owned_roles=[_agent_role("github-agent.ops", GH_AGENT)],
+        owned_scopes=[source_ops, issue_ops],
+        inbound_allow_rules=[
+            _rule(developer, source_ops),
+            _rule(developer, issue_ops),
+            _rule(tester, issue_ops),
+            _rule(orchestrator, source_ops),
+        ],
+    )
+
+
+def _agent_inbound(platform_clients: tuple[str, ...] = ("rossoctl",)) -> str:
+    return render_target_side(_agent_spm(), platform_clients=platform_clients).inbound
+
+
+def test_agent_inbound_keeps_the_full_scope_names():
+    rego = _agent_inbound()
+    assert rego.startswith("package authbridge.client.inbound.request\nimport rego.v1\n")
+    assert 'agent_scopes := ["github-agent.source_operations", "github-agent.issue_operations"]' in rego
+    assert '"tester": ["github-agent.issue_operations"]' in rego
+    assert "allow if { subject_allow_ok; source_allow_ok; not subject_deny_ok; not source_deny_ok }" in rego
+    # Not the tool package.
+    assert "owned_tools" not in rego
+    assert "tool_ok" not in rego
+
+
+@pytest.mark.skipif(not shutil.which("opa"), reason="opa binary not on PATH")
+@pytest.mark.parametrize(
+    "identity, allowed",
+    [
+        ({"subject": "dev-user"}, True),  # end-user traffic, no calling client
+        ({"subject": "test-user"}, True),  # agent-level: an allow on any scope of the agent is enough
+        ({"subject": "dev-user", "client_id": "rossoctl"}, True),  # the platform-client bypass
+        ({"subject": "dev-user", "client_id": ORCHESTRATOR}, True),  # a calling agent that holds a role
+        ({"subject": "dev-user", "client_id": OTHER_AGENT}, False),  # a calling agent with no role
+        ({"subject": "guest"}, False),  # a user with no role
+        ({"client_id": "rossoctl"}, False),  # D27: no subject
+        ({"client_id": ORCHESTRATOR}, False),  # D27: no subject
+        ({}, False),  # D27: no identity
+    ],
+    ids=[
+        "user",
+        "agent-level",
+        "platform-client",
+        "calling-agent",
+        "unknown-agent",
+        "no-roles",
+        "platform-no-subject",
+        "agent-no-subject",
+        "no-identity",
+    ],
+)
+def test_agent_inbound_is_agent_level_and_needs_identity(identity, allowed):
+    # The A2A input has no skill ID, so the method does not change the decision.
+    input_doc = {"identity": identity, "a2a": {"method": "message/send"}}
+    _assert_opa_allow(_agent_inbound(), _INBOUND, input_doc, allowed)
+
+
+@pytest.mark.skipif(not shutil.which("opa"), reason="opa binary not on PATH")
+def test_agent_inbound_platform_clients_come_from_the_caller():
+    rego = _agent_inbound(platform_clients=("argocd",))
+    _assert_opa_allow(rego, _INBOUND, {"identity": {"subject": "dev-user", "client_id": "argocd"}}, True)
+    _assert_opa_allow(rego, _INBOUND, {"identity": {"subject": "dev-user", "client_id": "rossoctl"}}, False)
+
+
+# --- the outbound of every service under target side (D24) ------------------
+
+
+@pytest.mark.parametrize("spm", [_tool_spm(), _agent_spm()], ids=["tool", "agent"])
+def test_target_side_outbound_is_the_pass_through(spm):
+    assert render_target_side(spm).outbound == _PASS_THROUGH_OUTBOUND
+
+
+@pytest.mark.skipif(not shutil.which("opa"), reason="opa binary not on PATH")
+@pytest.mark.parametrize("spm", [_tool_spm(), _agent_spm()], ids=["tool", "agent"])
+def test_target_side_outbound_allows_an_ungranted_call(spm):
+    # Under agent side this call is denied by the agent outbound; under target side the callee decides.
+    input_doc = {"identity": {"subject": "guest", "service_id": GH_TOOL}, "mcp": _call("delete-repo")}
+    _assert_opa_allow(render_target_side(spm).outbound, _OUTBOUND, input_doc, True)
+
+
+@pytest.mark.skipif(not shutil.which("opa"), reason="opa binary not on PATH")
+@pytest.mark.parametrize(
+    "subject, client_id, mcp, allowed",
+    [
+        (None, GH_TOOL, {"method": "tools/list"}, True),  # the self-discovery rule
+        (None, GH_TOOL, _call("source-read"), False),  # never tools/call
+        ("dev-user", GH_AGENT, {"method": "tools/list"}, False),  # no rules: no session for a caller
+        ("dev-user", GH_AGENT, _call("source-read"), False),  # no rules: no tool for a caller
+    ],
+    ids=["self-tools-list", "self-tools-call", "caller-tools-list", "caller-tools-call"],
+)
+def test_zero_rule_tool_inbound_passes_only_self_discovery(subject, client_id, mcp, allowed):
+    # The bootstrap CR of a first onboarding (checkpoint B1): a zero-rule SPM.
+    spm = ServicePolicyModel(
+        service_id=GH_TOOL,
+        service_type=ServiceType.TOOL,
+        owned_roles=[],
+        owned_scopes=[_scope("github-tool.source-read", GH_TOOL)],
+    )
+    _assert_opa_allow(render_target_side(spm).inbound, _INBOUND, _inbound_input(subject, client_id, mcp), allowed)

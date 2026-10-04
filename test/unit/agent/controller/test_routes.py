@@ -24,8 +24,9 @@ from aiac.agent.policy_rules_builder.graph import (
     PolicyRulesBuilderError,
     UnparseableLLMResponseError,
 )
-from aiac.idp.configuration.models import Role, Scope
-from aiac.policy.model.models import PolicyRule, RuleEffect
+from aiac.agent.uc.onboarding.preconditions import EnforcementPreconditionError
+from aiac.idp.configuration.models import Role, Scope, ServiceType
+from aiac.policy.model.models import PolicyRule, RuleEffect, ServicePolicyModel, TargetSidePolicyModel
 
 client = TestClient(app)
 
@@ -155,6 +156,44 @@ def test_apply_offboard_carries_slash_bearing_spiffe_client_id():
     dec.assert_called_once_with(spiffe_id)
 
 
+def test_get_policy_model_of_a_managed_service_returns_200_with_its_policy_model():
+    # D18: a read-only view of the policy model of the current side with only the entry of that
+    # service. The id is the clientId; the {service_id:path} converter keeps a slash-bearing SPIFFE
+    # URI intact. The body is the policy model as JSON, in the shape of the writer's POST /policy body.
+    spiffe_id = "spiffe://cluster.local/ns/team1/sa/github-tool"
+    model = TargetSidePolicyModel(
+        services=[
+            ServicePolicyModel(
+                service_id=spiffe_id,
+                service_type=ServiceType.TOOL,
+                owned_roles=[],
+                owned_scopes=[Scope(id="s-1", name="github-tool.list_issues", serviceId=spiffe_id)],
+                inbound_allow_rules=[_rule()],
+            )
+        ]
+    )
+    with (
+        patch("aiac.agent.controller.routes.policy_model_for", return_value=model) as read,
+        patch("aiac.agent.controller.routes.compute_and_apply") as pce,
+    ):
+        resp = client.get(f"/policy/services/{spiffe_id}")
+
+    assert resp.status_code == 200
+    read.assert_called_once_with(spiffe_id)
+    assert resp.json() == model.model_dump(mode="json")
+    assert resp.json()["enforcement_side"] == "target-side"
+    pce.assert_not_called()
+
+
+def test_get_policy_model_of_an_unmanaged_service_returns_404():
+    # A service with no SPM is not in the managed set: 404.
+    with patch("aiac.agent.controller.routes.policy_model_for", return_value=None) as read:
+        resp = client.get("/policy/services/spiffe://cluster.local/ns/team1/sa/unknown")
+
+    assert resp.status_code == 404
+    read.assert_called_once_with("spiffe://cluster.local/ns/team1/sa/unknown")
+
+
 def test_controller_forwards_handler_rules_and_override_verbatim():
     rules = [_rule("r-a"), _rule("r-b")]
     with (
@@ -278,6 +317,30 @@ def test_policy_contradiction_error_surfaces_422_conflict_report_and_skips_pce()
     assert body["status"] == ConflictStatus.CONFLICTS_FOUND.value
     assert body["conflicts"][0]["scope"]["name"] == "issues"
     assert body["conflicts"][0]["quotes_verified"] is False
+
+
+def test_failed_precondition_check_surfaces_409_with_the_failed_checks_and_skips_pce():
+    # A failed UC1 precondition check (D30) is a cluster problem that the operator must fix, not a
+    # server fault: 409, with a body that names each failed check. The PCE is never reached and the
+    # client is not re-enabled (the checks run before Provision, so nothing changed).
+    failures = [
+        "#1 sidecar: pod 'svc-abc' in namespace 'team1' has no 'authbridge-proxy' container",
+        "#6 probes: container 'app' of pod 'svc-abc' has an httpGet readinessProbe",
+    ]
+    with (
+        patch("aiac.agent.controller.routes.onboard_service", side_effect=EnforcementPreconditionError(failures)),
+        patch("aiac.agent.controller.routes.compute_and_apply") as pce,
+        patch("aiac.agent.controller.routes.reenable_service") as reenable,
+    ):
+        resp = client.post("/apply/service/svc-unenforceable")
+
+    assert resp.status_code == 409
+    body = resp.json()
+    assert set(body) == {"detail", "failed_checks"}
+    assert isinstance(body["detail"], str) and body["detail"]
+    assert body["failed_checks"] == failures
+    pce.assert_not_called()
+    reenable.assert_not_called()
 
 
 # --------------------------------------------------------------------------- #
