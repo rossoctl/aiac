@@ -6,7 +6,7 @@ Two halves, both live here so a single module import serves every launcher:
   until ready, run some work, tear them down. Used by ``test/unit/pdp/policy/generate_rego.py`` (the
   standalone Rego-dump launcher, which is *not* under ``test/system/`` and is out of scope for
   the live-cluster rework). ``Service`` / ``start_service`` / ``wait_until_ready`` /
-  ``running_services`` / ``terminate`` / ``print_rego_dir`` / ``resolve_output_dir`` exist for it.
+  ``running_services`` / ``terminate`` / ``resolve_output_dir`` exist for it.
 
 * **Live-cluster half** — drive a real rossoctl/Kind cluster with the AuthBridge OPA pipeline wired
   in (see ``k8s/opa-kind-runbook.md``). ``kubectl`` wrappers + ``port_forward`` + ``resolve_pod``
@@ -152,13 +152,6 @@ def running_services(services: list[Service], *, src: Path, timeout: float = 30.
     finally:
         for proc in procs:
             terminate(proc)
-
-
-def print_rego_dir(output_dir: Path) -> None:
-    """Print the output directory and the ``.rego`` files it contains (the launcher's result)."""
-    print(f"Rego written to: {output_dir}")
-    for path in sorted(output_dir.glob("*.rego")):
-        print(f"  {path.name}")
 
 
 # ======================================================================================
