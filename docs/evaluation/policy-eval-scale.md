@@ -126,11 +126,13 @@ mirrors `EVAL_PIPELINE_PARALLELISM`'s existing override convention).
    (`eval.scale_prb._invoke_with_usage`) correctly captures that task's own usage, aggregated by the
    caller afterward — see [Cost](#cost).
 3. `_read_back`'s flat `Configuration.get_roles()` call does not reliably carry the correct
-   `kind`/`actorIds` for an agent-owned role (a service's own `.roles` list does — see
-   `eval.test_policy_pipeline_scale._fix_agent_role_actor_ids`, applied after every `_read_back` call
-   at the end-to-end level). This is unrelated to concurrency itself but was only caught because the
-   end-to-end fixtures exercise a code path the hand-authored 8-scenario corpus's own agent-role
-   structure happens not to trigger.
+   `kind`/`actorIds` for an agent-owned role (a service's own `.roles` list does). This is unrelated
+   to concurrency itself but was only caught because the end-to-end fixtures exercise a code path
+   the hand-authored 8-scenario corpus's own agent-role structure happens not to trigger. Originally
+   worked around locally in this suite's own fixtures (`_fix_agent_role_actor_ids`); fixed once in
+   `_read_back` itself instead, since the other suites that call it (the scenario suite,
+   correctness-e2e, robustness) carry the same latent defect for any agent-owned role they ever
+   exercise.
 4. The real PDP writer server-side-applies a Kubernetes `AuthorizationPolicy` CR per agent against a
    **live cluster namespace** matching the agent id's own namespace segment — not merely a local
    file dump. Every generated agent id therefore uses the `team1/` namespace every hand-authored eval
