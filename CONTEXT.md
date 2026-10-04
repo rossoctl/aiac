@@ -143,8 +143,8 @@ _Avoid_: description-driven deny, effect-in-description.
 The policy teardown of a failed onboarding, done by the PCE after the UC1
 rollback disables the client. Keyed by the clientId, as every PCE operation
 is. It deletes the service's SPM, removes its roles
-from the other SPMs, replaces a failed agent's CR with a no-rules CR (which
-denies every request), and re-derives the affected agents. A disabled client
+from the other SPMs, deletes the service's CR (a pod that has no CR is denied),
+and redeploys the CRs of the affected services. A disabled client
 _is_ a quarantined service: the routing guard drops every rule that touches it,
 and the focal resolver gives it no candidate role or scope. Only a successful
 re-onboarding lifts it. Distinct from **decommission** (the offboard teardown of
@@ -160,3 +160,54 @@ because a re-onboarding of a quarantined service builds and applies while its
 client is still disabled (`reenable_service` runs after the apply).
 _Avoid_: target service (a target is the service an agent calls), focal entity
 (the per-pass subject inside one build).
+
+## Policy stack
+
+**SPM** (service policy model):
+The stored policy of one service, agent or tool: its own roles and scopes, and
+every inbound edge (allow and deny) on those scopes. A rule is stored on the SPM
+of the service that owns the rule's scope. The SPM is the only policy the store
+keeps.
+_Avoid_: complete SPM, service policy.
+
+**APM** (agent policy model):
+The policy of one agent under **agent side**: its inbound gates and its outbound
+tool checks, joined from the SPMs of the services that it calls. The PCE derives
+it in memory at each deploy and never stores it.
+_Avoid_: agent policy (as a stored thing).
+
+**Policy model**:
+The deploy input that the PCE gives to the PDP Policy Writer. It is tagged with
+its **enforcement side**. A **target-side policy model** holds stored SPMs. An
+**agent-side policy model** holds APMs and the IDs of the managed tools that get
+a **pass-through CR**. One policy model never mixes the two sides.
+_Avoid_: POM, complete SPM, PolicyModel of agents.
+
+**Managed set**:
+The services that have a stored SPM. Every service in the managed set has a CR.
+A service that leaves the set (quarantine, decommission) loses its CR, and is
+then denied.
+_Avoid_: onboarded services, known services.
+
+## Enforcement
+
+**Enforcement side**:
+Where the access to a callee is checked. Under **target side**, each callee
+(agent or tool) checks the access to itself in its own inbound OPA, from its own
+CR. Under **agent side** (the legacy method), each agent's outbound OPA checks
+the agent's calls to tools, and tools check nothing. One global switch selects
+the side for every callee. The two sides never exist together.
+_Avoid_: AC method, AC model (that names a modeling paradigm, RBAC/ABAC),
+enforcement mode, PEP side.
+
+**Callee**:
+A service that is called — agent or tool. Under **target side** the callee's own
+inbound OPA decides each call.
+_Avoid_: target (ambiguous with the agent-side outbound target), server.
+
+**Pass-through CR**:
+A CR whose two request packages allow every request. Under **agent side**, every
+managed tool gets one, because a pod that has no CR is denied. Under **target
+side**, only the outbound package of each CR is a pass-through: the callee
+decides.
+_Avoid_: allow-all CR, open CR, empty CR (an empty CR denies).

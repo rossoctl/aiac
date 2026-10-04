@@ -16,9 +16,13 @@ scripts that wire OPA in and out:
   operator image from the operator clone and deploys the bundle service from
   the operator chart, builds the `authbridge-proxy` image from the cortex clone,
   loads both images into Kind, and wires the `opa` plugin (plus the parser set)
-  into **both** the inbound and outbound pipeline of every `team1` agent.
+  into **both** the inbound and outbound pipeline of every `team1` agent and
+  tool. It also applies the changed combiner (D20): a pod that has no client CR
+  is denied.
 - [`opa-kind-restore.sh`](opa-kind-restore.sh) — reverts
-  the pipeline to its shipped state (no OPA overlay) and restarts the agents.
+  the pipeline to its shipped state (no OPA overlay), puts back the stock global
+  combiner, and restarts the agent and tool pods. The restore does not set
+  `injectTools=true`, so the restarted tool pods have no sidecar.
 
 The scenario itself uses one agent (`github-agent` in namespace `team1`) and
 its downstream tool (`github-tool`):
@@ -26,18 +30,35 @@ its downstream tool (`github-tool`):
 - **`dev-user` is the allowed user, `alice` is the blocked user.** `dev-user`
   is the canonical scenario username from
   [`docs/testing/policy-pipeline.md`](../docs/testing/policy-pipeline.md).
-- **Inbound** authorization is enforced by a **client-scoped**
-  `AuthorizationPolicy` targeting `github-agent` alone.
+- **Inbound** authorization of `github-agent` is enforced by its
+  **client-scoped** `AuthorizationPolicy`, which targets `github-agent` alone.
 - **Outbound** shows the token-exchange → OPA leg: the agent's call to
   `github-tool` is exchanged for a `github-tool`-audience token, and OPA sees a
   delegation chain plus a synthesized `input.identity`.
+- **In an AIAC setup**, AIAC writes one client-scoped CR for each managed
+  service, agent and tool. The **enforcement side** selects where a tool call
+  is checked. Under **target side** (the default), `github-tool`'s own inbound
+  OPA checks it, and the outbound of every service is a pass-through. Under
+  **agent side**, `github-agent`'s outbound OPA checks it, and `github-tool`
+  gets a pass-through CR. See [Part C](#part-c--switch-the-enforcement-side).
+  Parts A and B apply the example CRs by hand
+  ([`opa-team1-policy.yaml`](../docs/examples/opa-team1-policy.yaml)). The
+  example is the **target-side** CR pair: one CR for `github-agent` (the agent
+  inbound + a pass-through outbound) and one CR for `github-tool` (the tool
+  inbound + a pass-through outbound).
 
 ## Architecture
 
 ```
 Inbound:   caller ─► jwt-validation ─► OPA ─► github-agent app
 Outbound:  github-agent app ─► token-exchange ─► OPA ─► github-tool
+Tool:      github-agent (outbound) ─► jwt-validation ─► OPA ─► github-tool app
 ```
+
+Each AuthBridge sidecar runs one OPA instance for both directions. A call from
+`github-agent` to `github-tool` crosses two OPA checks: the agent's outbound and
+the tool's inbound. The enforcement side selects which of the two has the rules;
+the other one is a pass-through.
 
 Policies are distributed via the bundle service used by every AuthBridge
 workload: `http://bundle-service.rossoctl-system.svc.cluster.local:8080`.
@@ -55,7 +76,8 @@ read the delegation chain (see [Part B](#part-b--outbound-token-exchange--opa)).
     enable script builds the operator image from `operator/Dockerfile` and
     renders the bundle-service templates from `charts/operator`. It needs a
     clone at or after operator commit `5e4c991`, which puts the bundle service
-    in the operator image.
+    in the operator image. The restore script renders the stock global combiner
+    from the same chart to put it back, and stops if the chart is missing.
   - `ROSSOCTL_DIR` → `rossoctl/rossoctl` clone, i.e. the Helm chart
     (default: `../rossoctl`)
   - `CORTEX_DIR` → `rossoctl/cortex` clone (default: `../cortex`). The enable
@@ -151,10 +173,11 @@ All commands below are run from the repo root.
 OPERATOR_DIR=../operator ROSSOCTL_DIR=../rossoctl CORTEX_DIR=../cortex ./k8s/opa-kind-enable.sh
 ```
 
-The script does these steps:
+The script does these 4 steps:
 
-1. **Bundle service.** No released operator chart carries the bundle service
-   yet, so the script deploys it from the operator clone:
+1. **Bundle service + the changed combiner (D20).** No released operator chart
+   carries the bundle service yet, so the script deploys it from the operator
+   clone:
    - It builds the operator image from `$OPERATOR_DIR/operator/Dockerfile`
      (`OPERATOR_IMAGE`, default `localhost/rossoctl-operator:<operator HEAD short sha>`)
      and loads it into Kind. The bundle service runs from this image.
@@ -170,6 +193,12 @@ The script does these steps:
      admits only pods labelled `rossoctl.dev/authbridge=true`, and nothing sets
      that label today. On a CNI that enforces NetworkPolicy it would block every
      AuthBridge bundle fetch.
+   - It does **not** apply the chart's stock global combiner
+     (`default-policy.yaml`). In its place, it applies the changed combiner
+     [`aiac-combiner-default.yaml`](aiac-combiner-default.yaml) as the `default`
+     CR in `rossoctl-system`, and checks it. So the cluster never has the stock
+     combiner, also on a re-run. See
+     [The changed combiner (D20)](#the-changed-combiner-d20).
 2. **AuthBridge image.** It builds `localhost/authbridge:local` from
    `$CORTEX_DIR/cmd/authbridge-proxy/Dockerfile` (build context: the cortex repo
    root) and loads it into the `rossoctl` Kind cluster. AuthBridge plugins are
@@ -179,14 +208,70 @@ The script does these steps:
    `GO_BUILD_TAGS` to override it.
 3. **Pipeline.** It `helm upgrade`s the chart with a temporary overlay that
    inserts `opa` (after `token-exchange` on the outbound leg) and the parser set
-   into every `team1` agent's pipeline. It does **not** modify
-   `charts/rossoctl/values.yaml` on disk.
+   into the `team1` namespace pipeline (the `authbridge-runtime-config`
+   ConfigMap). Every injected pod in the namespace uses it, agent and tool. The
+   inbound leg is `a2a-parser`, `mcp-parser`, `inference-parser`,
+   `jwt-validation`, `opa`: a tool needs `mcp-parser` and `opa` there (onboarding
+   check #2, D30). It does **not** modify `charts/rossoctl/values.yaml` on disk.
+   - It sets `operator-chart.featureGates.injectTools=true`. So the operator
+     webhook also injects the AuthBridge sidecar into tool pods
+     (`rossoctl.io/type=tool`). The default is `false`. Without it a tool pod
+     gets no sidecar and no operator-registered Keycloak client, and the
+     onboarding check #1 (D30) fails for the tool.
+   - After the `helm upgrade`, it checks the combiner again. If the chart
+     brought back the stock combiner, the script stops before the restart.
+4. **Restart.** It deletes the `rossoctl.io/type=agent` **and** the
+   `rossoctl.io/type=tool` pods in `team1`. The webhook injects the sidecar and
+   the pipeline only at pod CREATE, so a pod that exists already keeps its old
+   pipeline until it restarts.
 
 Confirm OPA is wired into **both** legs (expect **2**):
 
 ```bash
 kubectl get configmap authbridge-runtime-config -n team1 \
   -o jsonpath='{.data.config\.yaml}' | grep -c 'name: opa'
+# 2
+```
+
+### The changed combiner (D20)
+
+The bundle service adds a global combiner to every bundle: the `default` CR
+(`scope: global`) in `rossoctl-system`. The stock combiner from the operator
+chart (`charts/operator/templates/bundleservice/default-policy.yaml`) has the
+rule `client_ok if not <client package>` in each of its four packages. With it,
+a pod that has no client CR is **allowed**.
+
+In an AIAC setup, the two request packages do not have this rule:
+
+- `client_ok if not data.authbridge.client.inbound.request` is removed from
+  `authbridge.inbound.request`;
+- `client_ok if not data.authbridge.client.outbound.request` is removed from
+  `authbridge.outbound.request`.
+
+So a pod that has no client CR is **denied** on both request legs. The two
+response packages keep the stock rule. A deleted CR is then lockdown, not
+off-boarding. That is why every managed service has a CR (a pass-through where
+AIAC has no rules), and why the AIAC quarantine and decommission delete the CR.
+
+The operator chart has no value for this yet. The upstream value is
+`bundleService.defaultPolicy.requireClientPolicy` (opt-in, default `false`).
+Until it exists, `opa-kind-enable.sh` applies the changed `default` CR in its
+Step 1, in place of the stock one. A later install or upgrade of the operator
+chart's bundle service (without the value) brings back the stock combiner. The
+AIAC Controller checks the combiner at every start (check #4, D30), and it stops
+if the combiner still allows a pod that has no client CR.
+
+Check the combiner (expect **0** request fallback rules and **2** response
+fallback rules):
+
+```bash
+kubectl get authorizationpolicy default -n rossoctl-system \
+  -o jsonpath='{.spec.policies[*].content}' \
+  | grep -cE 'client_ok if not data\.authbridge\.client\.(inbound|outbound)\.request'
+# 0
+kubectl get authorizationpolicy default -n rossoctl-system \
+  -o jsonpath='{.spec.policies[*].content}' \
+  | grep -cE 'client_ok if not data\.authbridge\.client\.(inbound|outbound)\.response'
 # 2
 ```
 
@@ -198,9 +283,15 @@ kubectl get configmap authbridge-runtime-config -n team1 \
 # github-agent is 2/2 (app + authbridge-proxy sidecar)
 kubectl get pods -n team1 -l app.kubernetes.io/name=github-agent
 
-# bundle-service is up and serving the shipped global policy
+# github-tool is 2/2 too (app + authbridge-proxy sidecar; needs injectTools=true)
+kubectl get pods -n team1 -l app=github-tool
+
+# bundle-service is up and serving the global combiner (the changed one, see Step 1)
 kubectl get pods -n rossoctl-system -l app=bundle-service   # 1/1 Running
 kubectl get authorizationpolicy -n rossoctl-system          # 'default', scope global
+
+# the AIAC CRs: one per managed service (none before the first onboarding)
+kubectl get authorizationpolicy -A -l app.kubernetes.io/managed-by=aiac-pdp-policy-writer
 
 # github-agent's SPIFFE ID — this is what the client-scoped policy targets
 kubectl exec -n team1 deploy/github-agent -c authbridge-proxy -- cat /shared/client-id.txt
@@ -212,16 +303,25 @@ kubectl exec -n team1 deploy/github-agent -c authbridge-proxy -- cat /shared/cli
 # Part A — Inbound authorization
 
 Proves inbound OPA authorization for `github-agent` using a **client-scoped**
-policy (`spec.scope: client`) so the rule affects only this one agent.
+policy (`spec.scope: client`) so the rule affects only this one agent. A.3
+applies both example CRs (`team1/github-agent` and `team1/github-tool`). Part A
+uses the `github-agent` CR. Part B uses the `github-tool` CR.
+
+> **The changed combiner and the AIAC CRs.** Under the changed combiner (D20),
+> a pod that has no client CR is denied. If AIAC has already onboarded
+> `github-agent` or `github-tool`, its AIAC CR is in place, and A.3 replaces it
+> by hand. AIAC writes its own CR again at the next deploy of that service, or
+> at the next Controller start (the resync, D28).
 
 > **How client-scope targeting works.** `bundle-service` looks up a
 > client-scope CR by **`metadata.name` + `metadata.namespace`**, matched
 > against the ServiceAccount segment of the caller's SPIFFE ID
 > (`spiffe://<trust-domain>/ns/<namespace>/sa/<name>`). `spec.clientID` is
 > **not** consulted by that lookup — it's a print-column convenience field. So
-> the example CR is named `github-agent` (matching `sa/github-agent`), and
-> `clientID` is the short name `"github-agent"` (the CRD validates it against a
-> DNS-label regex that rejects `spiffe://` and `/`).
+> the example CRs are named `github-agent` and `github-tool` (matching
+> `sa/github-agent` and `sa/github-tool`), and each `clientID` is the short name
+> (`"github-agent"`, `"github-tool"`; the CRD validates it against a DNS-label
+> regex that rejects `spiffe://` and `/`).
 
 ## A.1 — Verify the dev-user token carries the right `sub`
 
@@ -257,27 +357,32 @@ probe_as() {   # usage: probe_as dev-user | probe_as alice
 }
 ```
 
-Baseline — before any client policy, both users reach the app:
+Baseline — before any client CR, the changed combiner (D20) denies both users:
 
 ```bash
 probe_as dev-user
-# {"error":{"code":-32601,"message":"Method not found"},"id":"1","jsonrpc":"2.0"}
-# HTTP_CODE:200
+# {"error":"policy.forbidden","message":"policy denied","plugin":"opa"}
+# HTTP_CODE:403
 
 probe_as alice
-# {"error":{"code":-32601,"message":"Method not found"},"id":"1","jsonrpc":"2.0"}
-# HTTP_CODE:200
+# {"error":"policy.forbidden","message":"policy denied","plugin":"opa"}
+# HTTP_CODE:403
 ```
 
-`HTTP_CODE:200` with a JSON-RPC `-32601` body means the request passed
+If AIAC has already onboarded `github-agent`, its AIAC CR decides instead, and
+the result is the same as in A.4.
+
+In A.4, `HTTP_CODE:200` with a JSON-RPC `-32601` body means the request passed
 `jwt-validation` and OPA and reached the app — the app rejected the unknown
 method, which is expected and irrelevant to authorization.
 
 > **Don't test with `/.well-known/agent-card.json`** — it matches
 > `jwt-validation`'s bypass list (`/.well-known/*`, `/healthz`, `/readyz`,
-> `/livez`, `/metrics`) and returns `200` with **no token**, never reaching
-> OPA. **Don't test with a real `message/send` task** either — it drives the
-> CrewAI flow and can hang for minutes if `github-tool` is unhealthy. The
+> `/livez`, `/metrics`), which passes it on with **no identity**. OPA then
+> denies it: with no client CR the changed combiner denies it (D20), and a
+> rules-based inbound package denies a request with no identity (D27). So it
+> never shows the effect of a user's roles. **Don't test with a real
+> `message/send` task** either — it drives the CrewAI flow and can hang for minutes if `github-tool` is unhealthy. The
 > `ping/nonexistent` probe above reaches OPA and returns instantly.
 
 ## A.3 — Apply the client-scoped policy
@@ -286,8 +391,10 @@ method, which is expected and irrelevant to authorization.
 kubectl apply -f docs/examples/opa-team1-policy.yaml
 ```
 
+This applies the two target-side CRs: `github-agent` and `github-tool`.
 `bundle-service` rebuilds the `team1` bundle on the CR change; `github-agent`'s
-OPA polls the bundle on its own interval, so allow **~20–30 s** before testing.
+OPA polls the bundle on its own interval (10 s min, up to 120 s), so allow
+**~20–30 s** before testing.
 
 ## A.4 — Test: dev-user allowed, alice blocked
 
@@ -353,9 +460,11 @@ JSON; the log prints it in Go `map[...]` form):
 - Credential headers (`authorization`, `cookie`, …) are **redacted** from
   `headers` — use `identity` for auth decisions.
 
-The policy ([`opa-team1-policy.yaml`](../docs/examples/opa-team1-policy.yaml)) keys on
+The inbound package of the `github-agent` CR
+([`opa-team1-policy.yaml`](../docs/examples/opa-team1-policy.yaml)) keys on
 `input.identity.subject`: `dev-user` maps to a role whose scopes are allowed →
-`allow: true`; `alice` has no role → `allow: false`. The decision appears in
+`allow: true`; `alice` has no role → `allow: false`. Its source gate passes
+`client_id: "rossoctl"` (the platform client). The decision appears in
 the same log line as `result`:
 
 ```
@@ -371,6 +480,23 @@ The agent's outbound call to `github-tool` is intercepted by the forward proxy.
 `token-exchange` matches the route, mints a `github-tool`-audience token, and
 records a **delegation hop**; OPA (placed after it) then sees both
 `input.delegation` and a synthesized `input.identity`.
+
+The call then crosses `github-tool`'s own inbound OPA. The example is target
+side, so the callee decides:
+
+- `github-agent`'s outbound package is a pass-through (`allow := true`, D24). It
+  lets the call through.
+- `github-tool`'s inbound package (the `github-tool` CR that A.3 applied) checks
+  the call: the user gate, the calling-agent gate, and the MCP session rule
+  (D26). Under the changed combiner (D20), `github-tool` must have a CR, or its
+  inbound denies the call. A.3 gave it one, so Part B applies no other CR.
+
+> **Agent side.** Under agent side (`AIAC_ENFORCEMENT_SIDE=agent-side`, see
+> [Part C](#part-c--switch-the-enforcement-side)), the `github-agent` CR has the
+> per-tool checks in its outbound package (`generate_outbound_rego`), and
+> `github-tool` gets a pass-through CR (both request packages allow every
+> request; D24). The example has no agent-side CRs: let AIAC write them
+> (Part C).
 
 ## B.1 — Add the github-tool outbound route
 
@@ -432,7 +558,10 @@ kubectl wait --for=condition=ready pod -n team1 -l app.kubernetes.io/name=github
 The github-agent app container (`agent`) is configured with
 `HTTP_PROXY=127.0.0.1:8081` (the AuthBridge forward proxy) and has `python3`.
 Drive an outbound MCP call through it, carrying a `dev-user` bearer — the token
-`token-exchange` uses as the RFC 8693 `subject_token`:
+`token-exchange` uses as the RFC 8693 `subject_token`. The github-tool app is a
+FastMCP server: it serves MCP on `/mcp`, and it needs the header
+`Accept: application/json, text/event-stream`. It is stateless and sends JSON
+replies, so one `tools/list` request gets its reply with no MCP session ID.
 
 ```bash
 POD=$(kubectl get pod -n team1 -l app.kubernetes.io/name=github-agent -o jsonpath='{.items[0].metadata.name}')
@@ -445,41 +574,54 @@ import urllib.request, urllib.error, json
 tok = """$TOK"""
 op = urllib.request.build_opener(urllib.request.ProxyHandler({"http": "http://127.0.0.1:8081"}))
 body = json.dumps({"jsonrpc":"2.0","id":"1","method":"tools/list","params":{}}).encode()
-req = urllib.request.Request("http://github-tool:9090/", data=body,
-    headers={"Content-Type":"application/json","Authorization":"Bearer "+tok})
+req = urllib.request.Request("http://github-tool:9090/mcp", data=body,
+    headers={"Content-Type":"application/json",
+             "Accept":"application/json, text/event-stream",
+             "Authorization":"Bearer "+tok})
 try:
     r = op.open(req, timeout=15); print("HTTP", r.status); print(r.read().decode())
 except urllib.error.HTTPError as e: print("HTTPError", e.code); print(e.read().decode())
 PY
 kubectl exec -i -n team1 "$POD" -c agent -- python3 - < /tmp/probe.py
 # HTTP 200
-# {"error":{"code":-32000,"data":{"error":"policy.forbidden","plugin":"opa"},"message":"policy denied"},"id":"1","jsonrpc":"2.0"}
+# {"jsonrpc":"2.0","id":"1","result":{"tools":[{"name":"source-read",...},{"name":"source-write",...},{"name":"issues-read",...},{"name":"issues-write",...}]}}
 ```
 
-> **The example CR's `outbound/request.rego` denies this `tools/list` probe** —
-> and because the outbound pipeline includes `mcp-parser`, that denial is
-> surfaced the MCP-correct way: a **JSON-RPC 2.0 error frame at HTTP 200**
-> (`error.code: -32000`, `error.data.plugin: "opa"`), not an HTTP error status.
-> The forward proxy renders a `Reject` for an MCP JSON-RPC request (one with a
-> `method` and an `id`) as an application-layer error frame so the caller's MCP
-> client sees a single failed tool call rather than a transport break — see
-> `writeMCPRejection` in
-> `core/listener/httpx/render.go` in the cortex repo. The request is **denied and
-> never reaches `github-tool`**; the `HTTP 200` is only the JSON-RPC transport
-> envelope. Classify the outcome by the response **body** (an `error` frame =
-> denied, a `result` frame = allowed), not the HTTP status.
+> **Expected result: allowed.** The reply is a JSON-RPC **`result` frame** at
+> HTTP 200 that lists the four tools of `github-tool`. The call passes two OPA
+> checks:
 >
-> The example CR is generated output (`generate_outbound_rego`, see
-> [`pdp-policy-writer-opa.md`](../docs/specs/components/pdp-policy-writer-opa.md#outbound-package-authbridgeclientoutboundrequest)).
-> It admits a `tools/call` whose `input.mcp.params.name` (the invoked tool) both
-> the delegated user's role and the target service list. It also allows the MCP
-> session messages (`initialize`, `notifications/initialized`, `ping`,
-> `tools/list`) to a target when the user holds a grant on at least one tool of
-> that target. So this `tools/list` probe as `dev-user` is **allowed** (a
-> `result` frame), and the same probe as a user with no grant on a
-> `github-tool` tool is **denied**. A non-MCP-shaped rejection (no parser, or a JSON-RPC
-> *notification* with no `id`) instead falls through to a plain HTTP `403`; a
-> `token-exchange` failure surfaces as `503` before OPA is even consulted.
+> 1. `github-agent`'s outbound OPA: the `github-agent` CR's outbound package is
+>    a pass-through (`allow := true`).
+> 2. `github-tool`'s inbound OPA: the `github-tool` CR's inbound package. There,
+>    `jwt-validation` builds `input.identity` from the exchanged token
+>    (`subject` = `dev-user`; `client_id` = `github-agent`'s SPIFFE ID, the
+>    calling agent). `tools/list` is an MCP session message: it carries no tool
+>    name. The session rule allows it when at least one tool of `owned_tools`
+>    passes `tool_ok`. `source-read` passes: `dev-user` has the role
+>    `developer`, and the calling agent has the role
+>    `github-agent.source_operations`. Both roles grant `source-read`.
+>
+> The example CRs are generator output (`render_target_side`, see
+> [`pdp-policy-writer-opa.md` → Tool inbound package](../docs/specs/components/pdp-policy-writer-opa.md#tool-inbound-package-target-side-authbridgeclientinboundrequest)).
+> The tool inbound allows a `tools/call` when `tool_ok(input.mcp.params.name)`
+> holds, and it denies every other request.
+>
+> **The deny shapes.** The same probe as a user with no grant on a
+> `github-tool` tool (for example `alice`) is **denied** by `github-tool`'s
+> inbound OPA. The tool's reverse proxy sends **HTTP `403`** with a plain JSON
+> body (`{"error":"policy.forbidden","message":"policy denied","plugin":"opa"}`),
+> and the agent's forward proxy relays it. Under agent side, the agent's outbound
+> OPA decides instead. Because the outbound pipeline includes `mcp-parser`, the
+> forward proxy sends a deny of an MCP request (one with a `method` and an `id`)
+> as a **JSON-RPC 2.0 error frame at HTTP 200** (`error.code: -32000`,
+> `error.data.plugin: "opa"`), so the MCP client of the caller sees one failed
+> tool call and not a transport break (`writeMCPRejection` in
+> `core/listener/httpx/render.go` in the cortex repo). So classify the outcome
+> by the response **body**: a `result` frame = allowed; an `error` frame or a
+> `403` body that names `opa` = denied. A JSON-RPC *notification* (no `id`) gets
+> a plain HTTP `403` on a deny. A `token-exchange` failure comes before OPA (a
+> `503`, or an error frame with `plugin: "token-exchange"`).
 
 ## B.5 — The outbound OPA input, exactly
 
@@ -494,9 +636,10 @@ The plugin builds this `input` document:
 {
   "direction": "outbound",
   "method": "POST",
-  "path": "/",
+  "path": "/mcp",
   "host": "github-tool:9090",
   "headers": {
+    "accept": "application/json, text/event-stream",
     "accept-encoding": "identity",
     "connection": "close",
     "content-length": "67",
@@ -546,30 +689,109 @@ built:
     hop's target `audience` — here the `github-tool` SPIFFE ID). This mirrors the
     inbound identity, where `jwt-validation` surfaces the validated JWT's
     audience; on the outbound leg the equivalent "who is this token for" signal
-    is the exchange target, exposed as `service_id`. A policy keys on it via
-    `target_allow_scopes[input.identity.service_id]`. Omitted when the last hop is a
-    non-exchange hop that recorded no audience.
+    is the exchange target, exposed as `service_id`. The agent-side outbound
+    package keys on it via `target_allow_scopes[input.identity.service_id]`;
+    the target-side pass-through does not read it. Omitted when the last hop is
+    a non-exchange hop that recorded no audience.
 - `input.delegation` carries the full RFC 8693 chain for policies that need
   per-hop detail (`audience`, `strategy`, `from_cache`, `depth`).
 - `input.mcp` is present because the probe sent a real MCP body (`tools/list`).
   Parser sections (`mcp` / `a2a` / `inference`) appear **only** when the body
   matches that parser's protocol — a non-MCP body carries no `input.mcp`.
 
-The example CR ([`opa-team1-policy.yaml`](../docs/examples/opa-team1-policy.yaml))
-carries an `outbound/request.rego` that keys entirely on fields the live plugin
-emits on this leg: the synthesized `input.identity.subject`,
-`input.identity.service_id` (the exchange target, added to the outbound identity
-as shown above), and `input.mcp.params.name` (the specific tool being invoked).
-It gates **per tool**: allowing only when the delegated user's role **and** the
-target service both admit the invoked tool — an AND across the user→tool and
-service→tool gates. The `subject_role_allow_scopes` / `target_allow_scopes` maps
-in the example are keyed by the actual MCP tool names exposed by the deployed
-github-tool (`demo/assets/tools/github_tool`): `source-read`,
-`source-write`, `issues-read`, `issues-write`. The outbound rego also reads
-`input.mcp.method` (always set by the plugin). It allows a `tools/call` per tool, and it allows the session messages
-(`initialize`, `notifications/initialized`, `ping`, `tools/list`) to a target
-iff at least one tool of that target passes the full per-tool check for this
-user. It denies every other MCP method.
+Under target side (the example,
+[`opa-team1-policy.yaml`](../docs/examples/opa-team1-policy.yaml)), the
+`github-agent` CR's `outbound/request.rego` is a pass-through: it reads no field
+of this input, and it allows the call. The per-tool check is in the
+`github-tool` CR's `inbound/request.rego`, on `github-tool`'s inbound leg. There
+the input comes from the validated exchanged JWT, not from a delegation hop:
+
+- `input.identity.subject` = the delegated user (`dev-user`);
+- `input.identity.client_id` = the calling agent
+  (`spiffe://localtest.me/ns/team1/sa/github-agent`);
+- `input.mcp.method` and `input.mcp.params.name` (the invoked tool), from
+  `mcp-parser`.
+
+The tool inbound gates **per tool**, with two gates: the user gate
+(`subject_roles` → `subject_role_allow_scopes`) and the calling-agent gate
+(`source_roles` → `source_role_allow_scopes`). `tool_ok(tool)` holds when both
+gates allow the tool and neither denies it. The maps are keyed by the bare MCP
+tool names of the deployed github-tool (`demo/assets/tools/github_tool`):
+`source-read`, `source-write`, `issues-read`, `issues-write`. A `tools/call` is
+allowed when `tool_ok(input.mcp.params.name)` holds. The session messages
+(`initialize`, `notifications/initialized`, `ping`, `tools/list`) are allowed
+when at least one tool of `owned_tools` passes `tool_ok`, or when the caller is
+the tool's own client (`self_client_id`, the UC-1 discovery token). Every other
+request is denied.
+
+To see the decision of `github-tool`'s inbound OPA:
+
+```bash
+TOOL_POD=$(kubectl get pod -n team1 -l app=github-tool -o jsonpath='{.items[0].metadata.name}')
+kubectl logs -n team1 "$TOOL_POD" -c authbridge-proxy --tail=200 \
+  | grep 'path=authbridge/inbound/request' | tail -1
+```
+
+Under agent side, the `github-agent` CR's outbound package does the per-tool
+check on this outbound input. It keys on `input.identity.subject`,
+`input.identity.service_id` (the exchange target), and `input.mcp.params.name`.
+See
+[`pdp-policy-writer-opa.md` → Agent outbound package](../docs/specs/components/pdp-policy-writer-opa.md#agent-outbound-package-agent-side-authbridgeclientoutboundrequest).
+
+---
+
+# Part C — Switch the enforcement side
+
+AIAC writes the CRs of one **enforcement side** for every managed service (D16).
+The switch is `AIAC_ENFORCEMENT_SIDE` in the `aiac-agent-config` ConfigMap
+(`aiac-system`): `target-side` (the default) or `agent-side` (D29). The
+Controller reads it at start. An unknown value stops the Controller.
+
+| Side | `github-agent` CR | `github-tool` CR | Who checks a tool call |
+|------|-------------------|------------------|------------------------|
+| `target-side` | agent inbound + pass-through outbound | tool inbound (the per-tool check) + pass-through outbound | `github-tool`'s inbound OPA |
+| `agent-side` | agent inbound + agent outbound (the per-tool check) | pass-through inbound + pass-through outbound | `github-agent`'s outbound OPA |
+
+The packages are described in
+[`pdp-policy-writer-opa.md` → What each side renders](../docs/specs/components/pdp-policy-writer-opa.md#what-each-side-renders).
+
+To switch, patch the ConfigMap and restart the Controller:
+
+```bash
+kubectl patch configmap aiac-agent-config -n aiac-system --type merge \
+  -p '{"data":{"AIAC_ENFORCEMENT_SIDE":"agent-side"}}'    # or "target-side"
+kubectl rollout restart deployment/aiac-agent -n aiac-system
+kubectl rollout status deployment/aiac-agent -n aiac-system --timeout=300s
+```
+
+At start, the Controller checks the combiner (check #4, D30). Then it runs the
+resync under the PCE lock (D28): `PUT /policy` writes the CR of every live
+managed service (in the IdP catalog and not disabled) in the new side, and
+deletes each other AIAC CR.
+Then it quarantines each disabled service that still has an SPM. Onboardings
+wait for the resync. So no CR of the old side stays.
+
+> **Do not change the side by hand-editing the CRs.** A partial change is open.
+> For example, a pass-through outbound on `github-agent` and a pass-through
+> inbound on `github-tool` check nothing.
+
+Under agent side, the onboarding checks (D30) run for agents only, and check #2
+also needs `opa` in the outbound pipeline. The Kind overlay of Step 1 has it.
+
+Check the result:
+
+```bash
+# every AIAC CR (one per managed service)
+kubectl get authorizationpolicy -A -l app.kubernetes.io/managed-by=aiac-pdp-policy-writer
+
+# github-tool's inbound package: `allow := true` under agent side;
+# the per-tool check (tool_ok) under target side
+kubectl get authorizationpolicy github-tool -n team1 \
+  -o jsonpath='{.spec.policies[?(@.path=="inbound/request.rego")].content}'
+```
+
+The pods load the new bundles at their next poll (10 s min, up to 120 s). Until
+every pod has polled, a pod can still use the bundle of the old side.
 
 ---
 
@@ -578,7 +800,7 @@ user. It denies every other MCP method.
 Undo everything, in reverse order:
 
 ```bash
-# 1. delete the inbound policy CR
+# 1. delete the two example CRs (github-agent and github-tool)
 kubectl delete -f docs/examples/opa-team1-policy.yaml
 
 # 2. revert authproxy-routes to weather-only
@@ -602,9 +824,16 @@ SID=$(curl -s -H "Authorization: Bearer $ADMIN" "$KC/admin/realms/rossoctl/clien
 curl -s -o /dev/null -w "remove scope HTTP %{http_code}\n" -X DELETE -H "Authorization: Bearer $ADMIN" \
   "$KC/admin/realms/rossoctl/clients/$CID/optional-client-scopes/$SID"
 
-# 4. revert the pipeline (removes the OPA overlay, restarts the agents)
-ROSSOCTL_DIR=../rossoctl ./k8s/opa-kind-restore.sh
+# 4. revert the pipeline (removes the OPA overlay, puts back the stock
+#    combiner, restarts the agent and tool pods)
+OPERATOR_DIR=../operator ROSSOCTL_DIR=../rossoctl ./k8s/opa-kind-restore.sh
 ```
+
+Under the changed combiner (D20), a deleted CR denies its pod. So after step 1,
+`github-agent` and `github-tool` are denied until step 4 removes `opa`
+from the pipeline, or until AIAC writes their CRs again. The restore puts back
+the stock combiner. After that, the AIAC Controller does not start (start
+check #4) until `opa-kind-enable.sh` runs again.
 
 Confirm OPA is gone from the pipeline (expect **0**):
 

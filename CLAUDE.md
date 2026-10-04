@@ -120,14 +120,18 @@ through the in-cluster Controller, then drive real HTTP requests **through AuthB
 **deployed OPA plugin's** allow/deny (no `opa eval`, no `.rego` dump, so `opa` on PATH is no longer
 needed). They therefore need a live **rossoctl/Kind cluster with the AuthBridge OPA pipeline wired
 into both legs** (the demo `github-agent`/`github-tool` deployed + registered), plus Keycloak admin
-creds and an LLM endpoint for onboarding. Stand the pipeline up with `k8s/opa-kind-enable.sh`;
-the full prerequisites, wiring, and manual probe commands are in `k8s/opa-kind-runbook.md`, and the
+creds and an LLM endpoint for onboarding. Stand the pipeline up with `k8s/opa-kind-enable.sh`. It
+also applies the AIAC global combiner, which denies a pod that has no `AuthorizationPolicy` CR; the
+Controller refuses to start without that combiner. The lane runs under the **enforcement side** that
+`AIAC_ENFORCEMENT_SIDE` sets in the `aiac-agent-config` ConfigMap (default `target-side`: each
+callee, the tool included, checks its own inbound from its own CR). The full prerequisites, wiring,
+side switch, and manual probe commands are in `k8s/opa-kind-runbook.md`, and the
 per-loop shape is documented in `test/system/uc1_onboard.py`. Config lives in
 the repo-root `.env` (gitignored): `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL`, `KEYCLOAK_URL`,
 `KEYCLOAK_ADMIN_USERNAME`, `KEYCLOAK_ADMIN_PASSWORD`. Source it before running:
 
 ```bash
-k8s/opa-kind-enable.sh          # one-time: wire the OPA plugin into the Kind cluster
+k8s/opa-kind-enable.sh          # one-time: wire the OPA plugin and the AIAC combiner into Kind
 set -a; . .env; set +a
 .venv/bin/pytest -m system
 ```
@@ -266,8 +270,9 @@ With `readOnlyRootFilesystem: true` the container gets a writable `/tmp`
 have somewhere to land. The demo `github-agent` **omits** `readOnlyRootFilesystem`
 because its runtime (`uv` / `litellm` / `crewai`) writes caches under `HOME=/app`.
 All core workloads also carry both readiness **and** liveness probes (`httpGet
-/health` where the service exposes one; `tcpSocket` for the Controller and the
-demo workloads, which don't) and CPU/memory requests + limits.
+/health` where the service exposes one; `tcpSocket` for the demo workloads, which
+don't) and CPU/memory requests + limits. The Controller also has a `startupProbe`:
+it serves `/health` only after its start sequence (combiner check, resync) ends.
 
 ## External references
 

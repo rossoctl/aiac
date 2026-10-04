@@ -19,7 +19,9 @@ they need, models access, and emits rules — which are then validated by **live
 AuthBridge to the deployed OPA plugin (no `opa eval`, no `.rego` dump). Phase 1 is explicitly **"Deploy + discover + evaluate".** The tool is onboarded and its
 scopes are evaluated. The agent's CrewAI app does not call this tool. The system tests send live MCP
 `tools/call` requests to this tool from the `github-agent` pod through AuthBridge, and assert the
-decisions of the deployed OPA plugin (`test/system/launcher.py`, `outbound_probe`).
+decisions of the deployed OPA plugin (`test/system/launcher.py`, `outbound_probe`). Under target side
+(the default), this tool's own inbound OPA makes the decision. Under agent side, the outbound OPA of
+`github-agent` makes it (see §1 *Mapping to the policy-pipeline scenario*).
 
 This spec defines the **tool half** of that demo: a **real, deployable MCP endpoint** that answers
 `tools/list` with exactly four tools, so that UC-1's `analyze_tool` node derives exactly the four
@@ -38,7 +40,9 @@ From `analyze_tool` (`../components/aiac-agent/uc1-service-onboarding.md`):
    prerequisite — the operator does **not** stamp it), takes the Service's **first port**, mints a
    discovery token (`Configuration.mint_discovery_token(service_id)`), and POSTs JSON-RPC
    `tools/list` with `Authorization: Bearer <token>` to
-   `http://{workload_name}.{namespace}.svc.cluster.local:{port}/mcp`.
+   `http://{workload_name}.{namespace}.svc.cluster.local:{port}/mcp`. Before Provision, the PCE
+   `bootstrap` writes the tool's CR, so that this call passes the changed combiner (D20) and, under
+   target side, the tool's self-discovery rule.
 3. UC-1 derives **one scope per returned tool**:
    `ScopeDefinition(name=f"{workload_name}.{tool.name}", description=tool.description)`.
 
@@ -60,8 +64,23 @@ exactly the four MCP tools whose names + descriptions make UC-1 reproduce them:
 | `issues-read` | `issues-read` | `github-tool.issues-read` |
 | `issues-write` | `issues-write` | `github-tool.issues-write` |
 
-The tool does **not** know or enforce these scopes — AIAC/OPA + AuthBridge do. The outbound OPA
-package of the calling agent allows a `tools/call` only for a granted tool.
+The tool does **not** know or enforce these scopes — AIAC/OPA + AuthBridge do. AIAC writes one
+`AuthorizationPolicy` CR for this tool (`team1/github-tool`, `scope: client`). The **enforcement side**
+selects where a `tools/call` is checked
+([`pdp-policy-writer-opa.md` → What each side renders](../components/pdp-policy-writer-opa.md#what-each-side-renders)):
+
+- **Target side (the default).** The tool's own inbound OPA decides each tool call, from its own CR. The
+  inbound package allows a `tools/call` only when the delegated user and the calling agent
+  (`github-agent`) both hold a role granted that tool, and no deny vetoes it (D26). The MCP session
+  messages (`initialize`, `notifications/initialized`, `ping`, `tools/list`) pass only when at least one
+  of the four tools passes that check. The outbound packages of `github-agent` and of this tool are
+  pass-throughs (D24).
+- **Agent side.** This tool gets a **pass-through CR**: both of its request packages allow every
+  request. The outbound OPA package of the calling agent (`github-agent`) allows a `tools/call` only for
+  a granted tool.
+
+Under both sides the tool needs its CR: in an AIAC setup the bundle-service combiner denies a pod that has
+no client CR (D20).
 
 ### Related artefacts
 - UC-1 `analyze_tool`: [`../components/aiac-agent/uc1-service-onboarding.md`](../components/aiac-agent/uc1-service-onboarding.md)
@@ -150,7 +169,8 @@ answers `tools/list` with the four tools of §3.
 ```
  UC-1 analyze_tool ──(JSON-RPC POST /mcp: tools/list)──► github-tool (:PORT) ──► 4 tools
    (resolves http://github-tool.team1.svc.cluster.local:{first-port}/mcp)
- (system tests send tools/call here through the agent pod's AuthBridge outbound proxy)
+ (system tests send tools/call here through the agent pod's AuthBridge outbound proxy and this
+  tool's AuthBridge inbound; the side selects which of the two OPA checks decides)
 ```
 
 ---
@@ -244,6 +264,22 @@ ConfigMaps/secrets assumed present), consistent with the agent spec.
   spec's `authproxy-routes` still targets the **production** `github-tool-mcp` host and is unrelated to
   this stand-in.
 
+- **The tool's `AuthorizationPolicy` CR is written by AIAC, not by these manifests.** At the start of the
+  UC-1 onboarding (after the precondition checks, before Provision), the PCE `bootstrap` writes a first
+  CR, so that discovery passes D20. After a successful UC-1 onboarding, the PDP Policy Writer
+  server-side-applies the CR `team1/github-tool` (the name and the
+  namespace come from the ServiceAccount segment of the tool's SPIFFE ID). Under target side its
+  `inbound/request.rego` is the tool inbound package (the per-tool check, and the self-discovery rule
+  for the tool's own clientId), and its
+  `outbound/request.rego` is a pass-through. Under agent side both packages are pass-throughs. The
+  quarantine and the decommission delete the CR, and the pod is then denied (D20).
+
+- **Onboarding preconditions (D30), checked at the start of the onboarding under target side.** The pod
+  has the AuthBridge sidecar (`injectTools=true`); the namespace inbound pipeline has `opa` and
+  `mcp-parser`; and no app container has an `httpGet` probe. The manifest uses `tcpSocket` probes on
+  `9095`. This is necessary: a request with no identity does not pass the tool inbound package (D27).
+  Under agent side a tool's pass-through CR needs no check.
+
 - **Prerequisite (reused, not created here):** a running rossoctl cluster with the rossoctl-operator
   (Keycloak realm as configured by the installer, namespace `team1`), so the `AgentRuntime` is
   reconciled into a Keycloak client + pod label.
@@ -286,11 +322,23 @@ port; the operator-applied pod label is `rossoctl.io/type=tool`; the operator-re
    `tools/list` to `http://github-tool.team1.svc.cluster.local:9090/mcp` with
    `-H 'Accept: application/json'` and `-H 'Authorization: Bearer <token>'` (a token from
    `Configuration.mint_discovery_token(<service id>)`; the sidecar's `jwt-validation` rejects a call
-   without it), and confirm the four tools — the exact call UC-1 `analyze_tool` makes.
+   without it), and confirm the four tools — the exact call UC-1 `analyze_tool` makes. With `opa` in
+   the inbound pipeline and the changed combiner (D20), the tool's OPA allows this call only when the
+   tool has a CR. Before the first onboarding (and before its bootstrap) the tool has no CR, so the
+   call is denied (HTTP `403`). After the PCE bootstrap or the onboarding wrote the CR, the call
+   passes. Under target side it passes the self-discovery rule: the token is minted as the tool's own
+   client (client credentials), so its `azp`, which `jwt-validation` gives as
+   `input.identity.client_id`, is the tool's clientId. Under agent side it passes the pass-through CR.
+   See [`uc1-service-onboarding.md` → Tool discovery and the bootstrap CR](../components/aiac-agent/uc1-service-onboarding.md#tool-discovery-and-the-bootstrap-cr).
 10. (End-to-end) Trigger UC-1 onboarding for `github-tool` and confirm it provisions scopes
     `github-tool.source-read` / `github-tool.source-write` / `github-tool.issues-read` /
     `github-tool.issues-write`. For the tool alone, it writes the (user role → tool scope) rules onto
-    `SPM(github-tool)`, but no APM and no `AuthorizationPolicy` CR.
+    `SPM(github-tool)` and the `AuthorizationPolicy` CR `team1/github-tool`, but no APM. Under target
+    side the CR's inbound package checks the four tools; under agent side the CR is a pass-through CR.
+    (The bootstrap writes the CR before the discovery of this onboarding, so the discovery passes;
+    see step 9.) Check it:
+    `kubectl get authorizationpolicy github-tool -n team1
+    -o jsonpath='{.spec.policies[?(@.path=="inbound/request.rego")].content}'`.
 
 ---
 

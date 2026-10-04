@@ -11,7 +11,7 @@ Companion library for the [AIAC Policy Model Store](policy-model-store.md). Foll
 src/aiac/policy/model_store/
 └── library/
     ├── __init__.py     # empty
-    └── api.py          # six module-level functions (SPM-centric surface)
+    └── api.py          # seven module-level functions (SPM-centric surface)
 ```
 
 All `__init__.py` files are empty. Callers use explicit submodule paths:
@@ -21,6 +21,7 @@ from aiac.policy.model_store.library.api import (
     get_service_policy,
     get_service_policy_by_scope,
     get_service_policies_by_role,
+    list_service_policies,
     apply_service_policy,
     delete_service_policy,
     clear_service_policies,
@@ -35,13 +36,16 @@ from aiac.policy.model.models import ServicePolicyModel, Scope, Role
 The `ServicePolicyModel` (SPM), keyed by `serviceId`, is the **persistent source of truth**.
 The `AgentPolicyModel` (APM) is now **derived and never persisted** — so the store no longer
 exposes any per-agent read/write functions. The library surface is entirely SPM-centric.
+This is true under both enforcement sides (D18): the store keeps only SPMs. The policy model
+(target-side or agent-side) is built by the PCE at each deploy and never stored. The stored SPMs
+are the **managed set** (D21).
 
 ---
 
 ## Submodule: `aiac.policy.model_store.library.api`
 
 ### Description
-HTTP client module wrapping the [AIAC Policy Model Store](policy-model-store.md) REST API. Exposes six module-level functions returning `ServicePolicyModel` objects directly — no Kubernetes client boilerplate. Service URL is read from the `AIAC_POLICY_MODEL_STORE_URL` environment variable (default: `http://127.0.0.1:7074`). All functions raise `RuntimeError` on an unexpected non-2xx response (a `404` on the by-id read is handled, not raised — see below).
+HTTP client module wrapping the [AIAC Policy Model Store](policy-model-store.md) REST API. Exposes seven module-level functions returning `ServicePolicyModel` objects directly — no Kubernetes client boilerplate. Service URL is read from the `AIAC_POLICY_MODEL_STORE_URL` environment variable (default: `http://127.0.0.1:7074`). All functions raise `RuntimeError` on an unexpected non-2xx response (a `404` on the by-id read is handled, not raised — see below).
 
 ### Dependencies
 ```
@@ -75,6 +79,11 @@ def get_service_policies_by_role(role: Role) -> list[ServicePolicyModel]
     # Returns every SPM whose inbound_allow_rules or inbound_deny_rules
     # contains a rule referencing role.id (both effect lists are scanned).
     # Empty list when none match.
+
+def list_service_policies() -> list[ServicePolicyModel]
+    # GET /policy/services  (no role param)  — every stored SPM (C3).
+    # The stored SPMs are the managed set (D21). The PCE resync (D28) calls
+    # it at every Controller start. Empty list on an empty store.
 
 def apply_service_policy(service_id: str, spm: ServicePolicyModel) -> None
     # POST /policy/services/{service_id}  — upsert.
@@ -125,6 +134,7 @@ from aiac.policy.model_store.library.api import (
     get_service_policy,
     get_service_policy_by_scope,
     get_service_policies_by_role,
+    list_service_policies,
     apply_service_policy,
     delete_service_policy,
 )
@@ -138,6 +148,9 @@ owner = get_service_policy_by_scope(scope)
 
 # Find every SPM that grants a role (incl. stale mappings, for override-purge)
 affected = get_service_policies_by_role(role)
+
+# List every stored SPM — the managed set (for the resync)
+managed = list_service_policies()
 
 # Write updated state (upsert)
 apply_service_policy("weather-service", updated_spm)
@@ -154,6 +167,7 @@ Key behaviors to assert:
 - `get_service_policy(id)` on `404` returns a fresh empty `ServicePolicyModel` for that `service_id` — no `RuntimeError` (miss).
 - `get_service_policy_by_scope(scope)` resolves via `scope.serviceId` (sugar over the by-id read).
 - `get_service_policies_by_role(role)` issues the by-role query; returns every SPM referencing `role.id`; returns `[]` when none match; returns multiple when several match.
+- `list_service_policies()` issues `GET /policy/services` with no `role` param; returns every SPM; returns `[]` on an empty store.
 - `apply_service_policy(id, spm)` issues `POST /policy/services/{id}` with serialized `ServicePolicyModel`; upsert round-trip (write then read back the same SPM).
 - `delete_service_policy(id)` issues `DELETE /policy/services/{id}`; returns `None` on success.
 - Any unexpected non-2xx response raises `RuntimeError`.
