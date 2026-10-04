@@ -30,10 +30,11 @@ HERE = Path(__file__).resolve().parent.parent  # lib/ -> uc1-onboarding/
 GENERATED = HERE / "generated"
 
 # The reworked PDP Policy Writer (OPA) is CR-backed: it server-side-applies one
-# per-agent AuthorizationPolicy CR (agent.rossoctl.dev/v1alpha1) and, in production, writes
-# NO .rego files (k8s/pdp-interface-deployment.yaml keeps POLICY_WRITER_DUMP_REGO off and mounts
-# no /rego). So this demo sources its rego straight from the CR's spec.policies[].content — the
-# same artifact a live enforcement point consumes — rather than kubectl-cp-ing a dumped file.
+# AuthorizationPolicy CR (agent.rossoctl.dev/v1alpha1) per managed service, agent and tool (D20),
+# and, in production, writes NO .rego files (k8s/pdp-interface-deployment.yaml keeps
+# POLICY_WRITER_DUMP_REGO off and mounts no /rego). So this demo sources its rego straight from the
+# CRs' spec.policies[].content — the same artifact a live enforcement point consumes — rather than
+# kubectl-cp-ing a dumped file.
 # Fully qualified to disambiguate from Istio's security.istio.io AuthorizationPolicy (same short
 # name): `kubectl get authorizationpolicies.agent.rossoctl.dev/<name> -n <ns>`.
 AUTHZ_POLICY_RESOURCE = "authorizationpolicies.agent.rossoctl.dev"
@@ -127,22 +128,43 @@ class Config:
     @property
     def cr_name(self) -> str:
         """The demo agent's ``AuthorizationPolicy`` CR name. The reworked writer places a CR at
-        ``identity_ref(agent_id) -> (namespace, name)`` and bundle-service matches it by
-        name+namespace; for this demo that name is just ``AGENT_WORKLOAD`` (``github-agent``) in
-        ``cfg.namespace`` (``team1``). No per-agent underscore slug any more — the package name is
-        fixed (``authbridge.client.{inbound,outbound}.request``), never per-agent."""
+        ``identity_ref(client_id) -> (namespace, name)`` (the ServiceAccount segment of the SPIFFE
+        clientId) and bundle-service matches it by name+namespace; for this demo that name is just
+        ``AGENT_WORKLOAD`` (``github-agent``) in ``cfg.namespace`` (``team1``). No per-agent
+        underscore slug any more — the package name is fixed
+        (``authbridge.client.{inbound,outbound}.request``), never per-agent."""
         return scn.AGENT_WORKLOAD
 
     @property
+    def tool_cr_name(self) -> str:
+        """The demo tool's ``AuthorizationPolicy`` CR name: ``TOOL_WORKLOAD`` (``github-tool``) in
+        ``cfg.namespace``. Every managed service has a CR (D20), so the tool has one too once it is
+        onboarded."""
+        return scn.TOOL_WORKLOAD
+
+    @property
     def inbound_rego(self) -> str:
-        """Snapshot-relative path of the inbound rego, mirroring the CR ``policies[].path`` under
-        the writer's nested ``<ns>/<name>/`` layout (``rego_dir / cfg.inbound_rego`` is the local
-        file ``capture_rego`` writes)."""
-        return f"{self.namespace}/{scn.AGENT_WORKLOAD}/inbound/request.rego"
+        """Snapshot-relative path of the agent's inbound rego, mirroring the CR ``policies[].path``
+        under the writer's nested ``<ns>/<name>/`` layout (``rego_dir / cfg.inbound_rego`` is the
+        local file ``capture_rego`` writes)."""
+        return f"{self.namespace}/{self.cr_name}/inbound/request.rego"
 
     @property
     def outbound_rego(self) -> str:
-        return f"{self.namespace}/{scn.AGENT_WORKLOAD}/outbound/request.rego"
+        """Snapshot-relative path of the agent's outbound rego: a pass-through under target side,
+        the per-tool check under agent side."""
+        return f"{self.namespace}/{self.cr_name}/outbound/request.rego"
+
+    @property
+    def tool_inbound_rego(self) -> str:
+        """Snapshot-relative path of the tool's inbound rego — under target side the package that
+        decides each tool call (the user gate and the calling-agent gate)."""
+        return f"{self.namespace}/{self.tool_cr_name}/inbound/request.rego"
+
+    @property
+    def tool_outbound_rego(self) -> str:
+        """Snapshot-relative path of the tool's outbound rego (a pass-through on both sides)."""
+        return f"{self.namespace}/{self.tool_cr_name}/outbound/request.rego"
 
 
 def require_env(*names: str) -> dict[str, str]:
@@ -281,6 +303,16 @@ def opa_eval(rego_paths: list[Path], query: str, input_doc: dict) -> object:
         return json.loads(proc.stdout)["result"][0]["expressions"][0]["value"]
     except (KeyError, IndexError) as exc:
         abort(f"opa eval produced no value for {query!r} against {rego_paths}: {exc}")
+
+
+def is_pass_through(rego_path: Path, tier: str) -> bool:
+    """True when the ``tier`` request package at ``rego_path`` is a pass-through (D24): its whole
+    data document is ``{"allow": true}`` — ``allow := true`` and no other rule.
+
+    Tells the enforcement side from the agent's outbound package: a pass-through under target side
+    (the tool's own inbound decides each tool call), the per-tool check under agent side."""
+    package = opa_eval([rego_path], f"data.authbridge.client.{tier}.request", {})
+    return package == {"allow": True}
 
 
 # ======================================================================================
@@ -448,26 +480,40 @@ def onboard(cfg: Config, base_url: str, service_id: str) -> None:
 
 
 def clear_writer_rego(cfg: Config) -> None:
-    """Reset the writer's state for the demo agent by deleting its AuthorizationPolicy CR.
+    """Reset the writer's state for the demo by deleting the agent's and the tool's
+    AuthorizationPolicy CRs.
 
     The reworked writer is CR-backed (no ``/rego`` file dump in production), so "clear the
-    writer's rego" means "delete the CR" — the next onboard server-side-applies a fresh one.
-    Idempotent: ``--ignore-not-found`` treats an already-absent CR as success."""
+    writer's rego" means "delete the CRs" — the next onboard server-side-applies fresh ones. Under
+    the changed combiner (D20) a pod with no CR is denied until then. Idempotent:
+    ``--ignore-not-found`` treats an already-absent CR as success."""
     kubectl(
         "delete",
         AUTHZ_POLICY_RESOURCE,
         cfg.cr_name,
+        cfg.tool_cr_name,
         "-n",
         cfg.namespace,
         "--ignore-not-found",
     )
 
 
+def _write_cr_policies(cfg: Config, rego_dir: Path, cr_name: str, policies: list[dict]) -> None:
+    for policy in policies:
+        dest = rego_dir / cfg.namespace / cr_name / policy["path"]
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(policy["content"])
+
+
 def capture_rego(cfg: Config, rego_dir: Path) -> None:
-    """Fetch the agent's generated rego straight from its AuthorizationPolicy CR and write each
-    ``spec.policies[].content`` into ``rego_dir`` under the writer's nested ``<ns>/<name>/<path>``
-    layout, so ``opa eval`` / ``show-state.py`` read the very bytes a live enforcement point would
-    (the CR is production's source of truth — there is no ``/rego`` file to ``kubectl cp``)."""
+    """Fetch the generated rego straight from the agent's and the tool's AuthorizationPolicy CRs
+    and write each ``spec.policies[].content`` into ``rego_dir`` under the writer's nested
+    ``<ns>/<name>/<path>`` layout, so ``opa eval`` / ``show-state.py`` read the very bytes a live
+    enforcement point would (the CR is production's source of truth — there is no ``/rego`` file to
+    ``kubectl cp``).
+
+    The agent's CR must exist (the agent is onboarded first). The tool's CR exists only once the
+    tool is onboarded, so a missing tool CR is skipped."""
     cr = kubectl_get_json(f"{AUTHZ_POLICY_RESOURCE}/{cfg.cr_name}", namespace=cfg.namespace)
     policies = cr.get("spec", {}).get("policies", [])
     if not policies:
@@ -475,10 +521,20 @@ def capture_rego(cfg: Config, rego_dir: Path) -> None:
             f"AuthorizationPolicy {cfg.cr_name!r} in namespace {cfg.namespace!r} has no "
             "spec.policies — did the onboard call actually write the CR?"
         )
-    for policy in policies:
-        dest = rego_dir / cfg.namespace / cfg.cr_name / policy["path"]
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text(policy["content"])
+    _write_cr_policies(cfg, rego_dir, cfg.cr_name, policies)
+
+    found = kubectl(
+        "get",
+        AUTHZ_POLICY_RESOURCE,
+        cfg.tool_cr_name,
+        "-n",
+        cfg.namespace,
+        "--ignore-not-found",
+        "-o",
+        "json",
+    ).strip()
+    if found:
+        _write_cr_policies(cfg, rego_dir, cfg.tool_cr_name, json.loads(found).get("spec", {}).get("policies", []))
 
 
 # ======================================================================================
@@ -542,10 +598,16 @@ def token_exchange(cfg: Config, *, client_id: str, client_secret_value: str, sub
 
 def drive(username: str) -> None:
     """Run one user's intents end to end against ``generated/02-after-tool/``: ROPC login, the
-    inbound gate (stopping — as a feature, not an error — on denial), an RFC 8693 exchange proving
-    the live flow, then the per-intent outbound gate. Every verdict is checked against
+    agent inbound gate (stopping — as a feature, not an error — on denial), an RFC 8693 exchange
+    proving the live flow, then the per-intent tool-call gate. Every verdict is checked against
     ``scenario.expected_inbound``/``expected_outbound``; any mismatch aborts naming the offending
-    ``(subject, function_name)`` rather than printing a quietly-wrong table."""
+    ``(subject, function_name)`` rather than printing a quietly-wrong table.
+
+    The tool-call gate follows the enforcement side of the captured CRs. Under target side (the
+    default) the agent's outbound package is a pass-through and the tool's own inbound package
+    decides each ``tools/call`` (the user gate on ``input.identity.subject``, the calling-agent gate
+    on ``input.identity.client_id``). Under agent side the agent's outbound package decides it
+    (keyed on the exchange target ``input.identity.service_id``)."""
     cfg = load_config()
     role = scn.USERS[username]
     rego_dir = GENERATED / "02-after-tool"
@@ -553,8 +615,15 @@ def drive(username: str) -> None:
     outbound_rego = rego_dir / cfg.outbound_rego
     if not (inbound_rego.is_file() and outbound_rego.is_file()):
         abort(
-            f"no policy found at {rego_dir} — run `make onboard-agent` and `make onboard-tool` first "
+            f"no policy found at {rego_dir} — run `make agent` and `make tool` first "
             "(run-*.py always drives against the after-tool snapshot)"
+        )
+    target_side = is_pass_through(outbound_rego, "outbound")
+    tool_inbound_rego = rego_dir / cfg.tool_inbound_rego
+    if target_side and not tool_inbound_rego.is_file():
+        abort(
+            f"the agent's outbound is a pass-through (target side), but no tool inbound policy is at "
+            f"{tool_inbound_rego} — run `make tool` first (it captures the tool's CR)"
         )
 
     admin = connect_admin(cfg)
@@ -566,8 +635,8 @@ def drive(username: str) -> None:
 
     say("2", "3", "Inbound gate: may this user call the agent?")
     # Fixed package + live-plugin input shape. This demo path is an end-user ROPC login with no
-    # platform source client, so we send NO input.identity.client_id — source_ok is satisfied by
-    # the writer's `source_ok if { not input.identity.client_id }` rule.
+    # platform source client, so we send NO input.identity.client_id — source_allow_ok is satisfied
+    # by the writer's `source_allow_ok if { not input.identity.client_id }` rule.
     inbound_allowed = bool(
         opa_eval(
             [inbound_rego],
@@ -586,17 +655,29 @@ def drive(username: str) -> None:
         return
     ok("inbound allowed")
 
-    say("3", "3", "Per-intent outbound gate (via a real RFC 8693 exchange)")
+    say("3", "3", "Per-intent tool-call gate (via a real RFC 8693 exchange)")
     agent_uuid = resolve_service_id(admin, cfg, f"{cfg.namespace}/{scn.AGENT_WORKLOAD}")
     agent_client_id = admin.get_client(agent_uuid)["clientId"]
     secret = client_secret(admin, cfg, agent_uuid)
 
-    # target_allow_scopes is keyed by the FULL target service id (a SPIFFE id), with bare
-    # de-prefixed scope values. next(iter(...)) still yields the id to exchange for.
-    target_scopes = opa_eval([outbound_rego], "data.authbridge.client.outbound.request.target_allow_scopes", {}) or {}
-    if not target_scopes:
-        abort(f"outbound rego at {outbound_rego} has no target_allow_scopes — is the tool onboarded?")
-    target_uri = next(iter(target_scopes))
+    if target_side:
+        # Target side: the exchange target is the tool's own clientId (its SPIFFE id), and the
+        # tool's inbound package decides the call.
+        tool_uuid = resolve_service_id(admin, cfg, f"{cfg.namespace}/{scn.TOOL_WORKLOAD}")
+        target_uri = admin.get_client(tool_uuid)["clientId"]
+        gate_rego, gate_query = tool_inbound_rego, "data.authbridge.client.inbound.request.allow"
+        note(f"target side: {scn.TOOL_WORKLOAD}'s inbound decides; {scn.AGENT_WORKLOAD}'s outbound is a pass-through")
+    else:
+        # Agent side: target_allow_scopes is keyed by the FULL target service id (a SPIFFE id), with
+        # bare de-prefixed scope values. next(iter(...)) yields the id to exchange for.
+        target_scopes = (
+            opa_eval([outbound_rego], "data.authbridge.client.outbound.request.target_allow_scopes", {}) or {}
+        )
+        if not target_scopes:
+            abort(f"outbound rego at {outbound_rego} has no target_allow_scopes — is the tool onboarded?")
+        target_uri = next(iter(target_scopes))
+        gate_rego, gate_query = outbound_rego, "data.authbridge.client.outbound.request.allow"
+        note(f"agent side: {scn.AGENT_WORKLOAD}'s outbound decides")
 
     token_exchange(
         cfg, client_id=agent_client_id, client_secret_value=secret, subject_token=subject_token, audience=target_uri
@@ -605,20 +686,23 @@ def drive(username: str) -> None:
 
     rows: list[tuple[str, ...]] = []
     for intent in scn.INTENTS[username]:
+        if target_side:
+            # The tool inbound input: the user, the calling agent's clientId, and the invoked tool.
+            identity = {"subject": username, "client_id": agent_client_id}
+        else:
+            # The agent outbound input: the delegated user and the exchange target.
+            identity = {"subject": username, "service_id": target_uri}
         allowed = bool(
             opa_eval(
-                [outbound_rego],
-                "data.authbridge.client.outbound.request.allow",
-                {
-                    "identity": {"subject": username, "service_id": target_uri},
-                    "mcp": {"params": {"name": intent.function_name}},
-                },
+                [gate_rego],
+                gate_query,
+                {"identity": identity, "mcp": {"method": "tools/call", "params": {"name": intent.function_name}}},
             )
         )
         expected_out = scn.expected_outbound(username, intent.function_name)
         if allowed != expected_out:
             abort(
-                f"outbound mismatch for (subject={username!r}, function_name={intent.function_name!r}): "
+                f"tool-call mismatch for (subject={username!r}, function_name={intent.function_name!r}): "
                 f"opa said {allowed}, expected {expected_out}"
             )
         (ok if allowed else fail)(f"{intent.label} -> {intent.function_name}: {'allowed' if allowed else 'denied'}")

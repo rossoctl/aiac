@@ -1,43 +1,71 @@
-# Example Rossoctl OPA AuthorizationPolicy (client-scoped, github-agent)
+# Example Rossoctl OPA AuthorizationPolicies (client-scoped, team1, target side)
 #
-# One client-scoped policy CR for exactly one workload in the `team1` namespace:
-# the github-agent. It carries one rego file per tier (inbound/request +
-# outbound/request), as the PDP Policy Writer (OPA) server-side-applies it. The
-# two `content` blocks are the exact output of `generate_inbound_rego` /
-# `generate_outbound_rego` (src/aiac/pdp/service/policy/opa/rego.py) for the
-# demo policy: users dev-user (role developer) and test-user (role tester), the
-# agent's two scopes, and the github-tool's four tools. Regenerate them from the
-# generator when it changes; do not edit them by hand.
+# One client-scoped policy CR per managed service (D20), as the PDP Policy
+# Writer (OPA) server-side-applies them under target side (the default
+# enforcement side): github-agent and github-tool in the `team1` namespace.
+# Each CR carries the two request packages (inbound/request +
+# outbound/request). The `content` blocks are the exact output of
+# `render_target_side` (src/aiac/pdp/service/policy/opa/rego.py) for the two
+# stored SPMs of the demo policy: users dev-user (role developer) and
+# test-user (role tester), the agent's two scopes and two operator roles, and
+# the github-tool's four tools. Regenerate them from the generator when it
+# changes; do not edit them by hand. (The writer also sets the label
+# app.kubernetes.io/managed-by: aiac-pdp-policy-writer; this example, applied
+# by hand, has no label.)
 #
-# ALWAYS DENY BY DEFAULT. Both tiers emit `default allow := false`: a request that
-# no rule allows is denied. Each tier has *_allow_ok gates and mirrored *_deny_ok
-# gates; a matching deny gate blocks the request. The identity maps (subject_roles,
-# source_roles) are effect-agnostic. In this demo the deny maps are empty
-# (an allow-only policy).
+# THE CALLEE DECIDES. Each service checks the calls to itself in its own
+# inbound package. The outbound package of every service is a pass-through
+# (`allow := true`, D24): github-tool's inbound decides each tool call, and
+# github-agent's outbound checks nothing (known limit: no egress check under
+# target side).
 #
-# OUTBOUND. The outbound tier reads input.identity.subject (the delegated user),
-# input.identity.service_id (the target the exchanged token was minted for — the
-# github-tool SPIFFE ID), input.mcp.method and input.mcp.params.name (the invoked
-# tool; the maps key on the bare MCP tool names source-read, source-write,
-# issues-read, issues-write). A `tools/call` is allowed when the user's role AND
-# the target both admit the invoked tool and no deny matches. The MCP session
-# messages (initialize, notifications/initialized, ping, tools/list) carry no tool
-# name: they are allowed to a target when at least one tool of that target passes
-# that same per-tool check (`tool_ok`). Every other request is denied — also A2A
-# and LLM calls through the agent's outbound proxy (see the known limit in
-# docs/specs/components/pdp-policy-writer-opa.md).
+# ALWAYS DENY BY DEFAULT (D25). Every rules-based package emits
+# `default allow := false`: a request that no rule allows is denied. Each gate
+# has an allow side and a mirrored deny side; a matching deny vetoes an allow.
+# The identity maps (subject_roles, source_roles) are effect-agnostic. In this
+# demo the deny maps are empty (an allow-only policy). No request without
+# identity passes a rules-based inbound (D27): the subject gate needs a subject
+# that holds a role.
+#
+# github-agent INBOUND (agent-level, D26a). Who may call the agent: the user
+# gate (input.identity.subject -> subject_roles -> a role that grants one of
+# agent_scopes) and the source gate (input.identity.client_id: no client_id or
+# the platform client `rossoctl` passes, else source_roles).
+#
+# github-tool INBOUND (D26). Who may call which tool, through which agent: two
+# gates, keyed by the bare MCP tool name (source-read, source-write,
+# issues-read, issues-write) — the user gate (input.identity.subject ->
+# subject_roles) and the calling-agent gate (input.identity.client_id, the
+# calling agent's SPIFFE clientId -> source_roles). tool_ok(tool) holds when
+# both gates allow the tool and neither denies it. A `tools/call` is allowed
+# when tool_ok(input.mcp.params.name). The MCP session messages (initialize,
+# notifications/initialized, ping, tools/list) carry no tool name: they are
+# allowed when at least one tool of owned_tools passes tool_ok, or when the
+# caller is the tool's own client (self_client_id; the UC-1 discovery token is
+# minted as that client). Every other request is denied. There is no
+# platform-client bypass on a tool inbound.
+#
+# THE CHANGED COMBINER (D20). In an AIAC setup the global combiner (the
+# `default` CR in rossoctl-system, applied by k8s/opa-kind-enable.sh) has no
+# `client_ok if not data.authbridge.client.<tier>.request` fallback: a pod that
+# has no client CR is denied on both request legs. So every managed service has
+# a CR (a pass-through where AIAC has no rules), and a deleted CR denies its pod.
+#
+# AGENT SIDE (AIAC_ENFORCEMENT_SIDE=agent-side) renders other CRs: the per-tool
+# check is in github-agent's outbound package (generate_outbound_rego, keyed by
+# input.identity.service_id), and github-tool gets a pass-through CR. See
+# docs/specs/components/pdp-policy-writer-opa.md ("What each side renders").
 #
 # CLIENT-SCOPE TARGETING: bundle-service looks a client-scope CR up by
 # metadata.name + metadata.namespace, matched against the ServiceAccount segment
 # of the caller's SPIFFE ID (spiffe://<trust-domain>/ns/<namespace>/sa/<name>).
 # spec.clientID is not used by that lookup; it must satisfy the CRD's DNS-label
 # regex (no `spiffe://`, no `/`). The bundle-service combines each tier with the
-# shipped global policy; a tier with no client package falls back to allow
-# (`client_ok if not data.authbridge.client.<tier>`).
+# global combiner.
 #
 # Identity note: INBOUND the OPA plugin exposes input.identity.{subject,
-# client_id, scopes}. OUTBOUND there is no validated JWT, so the plugin
-# synthesizes input.identity from the token-exchange delegation hop. `subject` is
+# client_id, scopes} from the validated JWT. On github-tool's inbound the JWT is
+# the exchanged token, so client_id is the calling agent's client. `subject` is
 # the JWT `sub` claim; rossoctl-realm tokens carry the username in `sub` (via a
 # username->sub protocol mapper — see A.1 in k8s/opa-kind-runbook.md).
 apiVersion: agent.rossoctl.dev/v1alpha1
@@ -54,7 +82,7 @@ spec:
         package authbridge.client.inbound.request
         import rego.v1
 
-        agent_scopes := ["github-agent.issue_operations", "github-agent.source_operations"]
+        agent_scopes := ["github-agent.source_operations", "github-agent.issue_operations"]
 
         subject_roles := {
             "dev-user": ["developer"],
@@ -62,7 +90,7 @@ spec:
         }
         source_roles := {}
         subject_role_allow_scopes := {
-            "developer": ["github-agent.issue_operations", "github-agent.source_operations"],
+            "developer": ["github-agent.source_operations", "github-agent.issue_operations"],
             "tester": ["github-agent.issue_operations"],
         }
         subject_role_deny_scopes := {}
@@ -98,51 +126,73 @@ spec:
         package authbridge.client.outbound.request
         import rego.v1
 
-        agent_roles := ["github-agent.issue_operations", "github-agent.source_operations"]
+        allow := true
+---
+apiVersion: agent.rossoctl.dev/v1alpha1
+kind: AuthorizationPolicy
+metadata:
+  name: github-tool
+  namespace: team1
+spec:
+  scope: client
+  clientID: "github-tool"
+  policies:
+    - path: "inbound/request.rego"
+      content: |
+        package authbridge.client.inbound.request
+        import rego.v1
+
+        owned_tools := ["source-read", "source-write", "issues-read", "issues-write"]
+
         subject_roles := {
             "dev-user": ["developer"],
             "test-user": ["tester"],
         }
+        source_roles := {
+            "spiffe://localtest.me/ns/team1/sa/github-agent": ["github-agent.source_operations", "github-agent.issue_operations"],
+        }
         subject_role_allow_scopes := {
-            "developer": ["issues-read", "source-write", "source-read"],
+            "developer": ["source-read", "source-write", "issues-read"],
             "tester": ["issues-read", "issues-write"],
         }
         subject_role_deny_scopes := {}
-        # informational/debugging only — not referenced by allow
-        agent_role_scopes := {
+        source_role_allow_scopes := {
+            "github-agent.source_operations": ["source-read", "source-write"],
             "github-agent.issue_operations": ["issues-read", "issues-write"],
-            "github-agent.source_operations": ["source-write", "source-read"],
         }
-        target_allow_scopes := {
-            "spiffe://localtest.me/ns/team1/sa/github-tool": ["source-read", "source-write", "issues-read", "issues-write"],
-        }
-        target_deny_scopes := {}
+        source_role_deny_scopes := {}
         session_methods := {"initialize", "notifications/initialized", "ping", "tools/list"}
+        self_client_id := "spiffe://localtest.me/ns/team1/sa/github-tool"
 
         subject_allows(tool) if {
             some role in subject_roles[input.identity.subject]
             tool in subject_role_allow_scopes[role]
         }
-        subject_allow_ok if { subject_allows(input.mcp.params.name) }
         subject_denies(tool) if {
             some role in subject_roles[input.identity.subject]
             tool in subject_role_deny_scopes[role]
         }
-        subject_deny_ok if { subject_denies(input.mcp.params.name) }
-        target_allows(tool) if {
-            tool in target_allow_scopes[input.identity.service_id]
+        source_allows(tool) if {
+            some role in source_roles[input.identity.client_id]
+            tool in source_role_allow_scopes[role]
         }
-        target_allow_ok if { target_allows(input.mcp.params.name) }
-        target_denies(tool) if {
-            tool in target_deny_scopes[input.identity.service_id]
+        source_denies(tool) if {
+            some role in source_roles[input.identity.client_id]
+            tool in source_role_deny_scopes[role]
         }
-        target_deny_ok if { target_denies(input.mcp.params.name) }
         tool_ok(tool) if {
             subject_allows(tool)
-            target_allows(tool)
+            source_allows(tool)
             not subject_denies(tool)
-            not target_denies(tool)
+            not source_denies(tool)
         }
         default allow := false
-        allow if { input.mcp.method == "tools/call"; subject_allow_ok; target_allow_ok; not subject_deny_ok; not target_deny_ok }
-        allow if { input.mcp.method in session_methods; some tool in target_allow_scopes[input.identity.service_id]; tool_ok(tool) }
+        allow if { input.mcp.method == "tools/call"; tool_ok(input.mcp.params.name) }
+        allow if { input.mcp.method in session_methods; some tool in owned_tools; tool_ok(tool) }
+        allow if { input.mcp.method in session_methods; input.identity.client_id == self_client_id }
+    - path: "outbound/request.rego"
+      content: |
+        package authbridge.client.outbound.request
+        import rego.v1
+
+        allow := true

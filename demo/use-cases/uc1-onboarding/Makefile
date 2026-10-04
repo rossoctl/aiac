@@ -6,11 +6,13 @@
 #   make dev    # drive dev-user's intents through the after-tool snapshot
 #
 # How the demo sources generated Rego (see demo.md "How the demo sources the generated Rego"):
-# the reworked PDP Policy Writer is CR-backed — production writes AuthorizationPolicy CRs only, no
-# /rego file dump. So `make agent`/`tool` read the agent's Rego straight from its
-# `authorizationpolicies.agent.rossoctl.dev/github-agent` CR (spec.policies[].content) into
-# generated/<snapshot>/team1/github-agent/{inbound,outbound}/request.rego, and `make clear` deletes
-# that CR. No demo-only deployment overlay is needed (we do NOT enable POLICY_WRITER_DUMP_REGO).
+# the reworked PDP Policy Writer is CR-backed — production writes AuthorizationPolicy CRs only, one
+# per managed service (D20), no /rego file dump. So `make agent`/`tool` read the Rego straight from
+# the `authorizationpolicies.agent.rossoctl.dev/github-agent` and `.../github-tool` CRs
+# (spec.policies[].content) into generated/<snapshot>/team1/<name>/{inbound,outbound}/request.rego,
+# and `make clear` deletes both CRs. Under target side (the default) the tool's inbound decides each
+# tool call and every outbound is a pass-through. No demo-only deployment overlay is needed (we do
+# NOT enable POLICY_WRITER_DUMP_REGO).
 #
 # Prereqs: a rossoctl/kind cluster with SPIRE + Keycloak + the rossoctl operator (see
 # ../../assets/INSTALL.md and ../../../k8s/aiac-deployment-guide.md). KEYCLOAK_URL /
@@ -52,7 +54,7 @@ keycloak:  ## Port-forward the in-cluster Keycloak and discover admin creds (run
 prereqs: keycloak  ## Verify (and install if absent) everything the demo needs before touching Keycloak
 	$(KC_ENV) $(PYTHON) init/01-prereqs.py
 
-clear:  ## Reset to a clean slate: Keycloak roles/scopes, Policy Store, the agent's AuthorizationPolicy CR, generated/
+clear:  ## Reset to a clean slate: Keycloak roles/scopes, Policy Store, the agent's + tool's AuthorizationPolicy CRs, generated/
 	$(KC_ENV) $(PYTHON) init/02-clear.py
 
 setup:  ## Provision users/roles, mount policy.md, configure token exchange; prints both UUIDs

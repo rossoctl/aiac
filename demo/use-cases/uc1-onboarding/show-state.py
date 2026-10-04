@@ -6,6 +6,11 @@ snapshot. Serves all three pauses (baseline, after-agent, after-tool) from one i
     show-state.py --snapshot NAME    # a specific generated/<NAME> snapshot
     show-state.py --diff PRIOR       # diff the current default snapshot against generated/<PRIOR>
 
+A snapshot holds one CR per managed service (D20): the agent's, and the tool's once the tool is
+onboarded. Under target side (the default) the agent's outbound is a pass-through and the tool's
+inbound decides each tool call; under agent side the agent's outbound decides it and the tool's CR
+is a pass-through. The tool-call grants are read from the package that decides.
+
 The diff narrates the raw ``.rego`` text (line-oriented, so a presenter can see it) but only
 *asserts* on order-independent ``(role, scope)`` sets — the writer's list ordering is not stable
 across runs, and a text diff on unstable ordering would show noise, not signal.
@@ -21,7 +26,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
 
 import scenario as scn
-from _lib import GENERATED, abort, connect_admin, load_config, note, opa_eval, rule, say, table
+from _lib import GENERATED, abort, connect_admin, is_pass_through, load_config, note, opa_eval, rule, say, table
 
 
 def latest_snapshot() -> Path | None:
@@ -55,7 +60,13 @@ def show_keycloak(admin, cfg) -> None:
         note(f"{name} — {desc}")
 
 
+def snapshot_files(cfg) -> tuple[str, ...]:
+    """The snapshot-relative Rego paths: the agent's CR, then the tool's CR."""
+    return (cfg.inbound_rego, cfg.outbound_rego, cfg.tool_inbound_rego, cfg.tool_outbound_rego)
+
+
 def grant_sets(cfg, rego_dir: Path) -> tuple[set[tuple[str, str]], set[tuple[str, str]]]:
+    """The ``(user role, agent scope)`` inbound grants and the ``(user role, tool)`` tool-call grants."""
     inbound_rego = rego_dir / cfg.inbound_rego
     outbound_rego = rego_dir / cfg.outbound_rego
     # Inbound values stay FULL agent-scope names (not de-prefixed) — the inbound gate compares
@@ -64,17 +75,23 @@ def grant_sets(cfg, rego_dir: Path) -> tuple[set[tuple[str, str]], set[tuple[str
     agent_scopes = set(opa_eval([inbound_rego], "data.authbridge.client.inbound.request.agent_scopes", {}) or [])
     inbound = {(role, scope) for role, scopes in role_scopes.items() for scope in scopes if scope in agent_scopes}
 
-    # Outbound subject_role_allow_scopes values are BARE de-prefixed tool scopes.
-    subj_scopes = (
-        opa_eval([outbound_rego], "data.authbridge.client.outbound.request.subject_role_allow_scopes", {}) or {}
-    )
-    outbound = {(role, scope) for role, scopes in subj_scopes.items() for scope in scopes}
-    return inbound, outbound
+    # The tool-call user gate: under target side in the tool's inbound (absent until the tool is
+    # onboarded), under agent side in the agent's outbound. Its values are BARE de-prefixed tools.
+    if is_pass_through(outbound_rego, "outbound"):
+        tool_inbound_rego = rego_dir / cfg.tool_inbound_rego
+        if not tool_inbound_rego.is_file():
+            return inbound, set()
+        gate_rego, query = tool_inbound_rego, "data.authbridge.client.inbound.request.subject_role_allow_scopes"
+    else:
+        gate_rego, query = outbound_rego, "data.authbridge.client.outbound.request.subject_role_allow_scopes"
+    subj_scopes = opa_eval([gate_rego], query, {}) or {}
+    tool_calls = {(role, scope) for role, scopes in subj_scopes.items() for scope in scopes}
+    return inbound, tool_calls
 
 
 def show_snapshot(cfg, rego_dir: Path) -> None:
     say("B", "B", f"Generated policy: {rego_dir.relative_to(GENERATED.parent)}")
-    files_present = [f for f in (cfg.inbound_rego, cfg.outbound_rego) if (rego_dir / f).is_file()]
+    files_present = [f for f in snapshot_files(cfg) if (rego_dir / f).is_file()]
     if not files_present:
         print("  (no policy generated yet)")
         return
@@ -84,25 +101,30 @@ def show_snapshot(cfg, rego_dir: Path) -> None:
         print(f"  {f}:")
         print((rego_dir / f).read_text())
 
-    # grant_sets loads BOTH Rego files; an interrupted capture that left only one would abort here
-    # after printing partial state. Only tally grants when the snapshot is complete.
-    if len(files_present) < 2:
+    # grant_sets loads BOTH Rego files of the agent's CR; an interrupted capture that left only one
+    # would abort here after printing partial state. Only tally grants when the snapshot is complete.
+    if not _complete(cfg, rego_dir):
         rule()
-        print("  (incomplete snapshot — grant tallies need both Rego files; skipping)")
+        print("  (incomplete snapshot — grant tallies need both Rego files of the agent's CR; skipping)")
         return
 
-    inbound, outbound = grant_sets(cfg, rego_dir)
+    inbound, tool_calls = grant_sets(cfg, rego_dir)
     rule()
-    print(f"  inbound grants:  {len(inbound)}")
+    print(f"  inbound grants (who may call {scn.AGENT_WORKLOAD}):  {len(inbound)}")
     table(sorted(inbound), headers=("role", "agent scope"))
-    print(f"\n  outbound grants: {len(outbound)}")
-    table(sorted(outbound), headers=("role", "tool scope"))
+    print(f"\n  tool-call grants (who may call which {scn.TOOL_WORKLOAD} tool): {len(tool_calls)}")
+    if tool_calls:
+        table(sorted(tool_calls), headers=("role", "tool scope"))
 
 
 def _complete(cfg, d: Path) -> bool:
-    """True only when both Rego files are present — grant_sets loads both, so a half-captured
-    snapshot cannot be diffed."""
+    """True only when both Rego files of the agent's CR are present — grant_sets loads both, so a
+    half-captured snapshot cannot be diffed. (The tool's CR exists only after the tool is onboarded.)"""
     return (d / cfg.inbound_rego).is_file() and (d / cfg.outbound_rego).is_file()
+
+
+def _read_lines(path: Path) -> list[str]:
+    return path.read_text().splitlines() if path.is_file() else []
 
 
 def show_diff(cfg, prior_name: str, current_dir: Path) -> None:
@@ -121,13 +143,14 @@ def show_diff(cfg, prior_name: str, current_dir: Path) -> None:
     say("B", "B", f"Diff: {prior_dir.name} -> {current_dir.name}")
 
     # Narrate the raw Rego text first (line-oriented, so a presenter can see exactly what changed),
-    # then assert on the order-independent (role, scope) sets below.
-    for f in (cfg.inbound_rego, cfg.outbound_rego):
+    # then assert on the order-independent (role, scope) sets below. A file that one snapshot does
+    # not have (the tool's CR before the tool is onboarded) diffs as empty.
+    for f in snapshot_files(cfg):
         rule()
         print(f"  {f}:")
         diff = difflib.unified_diff(
-            (prior_dir / f).read_text().splitlines(),
-            (current_dir / f).read_text().splitlines(),
+            _read_lines(prior_dir / f),
+            _read_lines(current_dir / f),
             fromfile=f"{prior_dir.name}/{f}",
             tofile=f"{current_dir.name}/{f}",
             lineterm="",
@@ -142,7 +165,7 @@ def show_diff(cfg, prior_name: str, current_dir: Path) -> None:
     print("  inbound:")
     print(f"    + added:   {sorted(cur_in - prior_in) or 'none'}")
     print(f"    - removed: {sorted(prior_in - cur_in) or 'none'}")
-    print("  outbound:")
+    print("  tool calls:")
     print(f"    + added:   {sorted(cur_out - prior_out) or 'none'}")
     print(f"    - removed: {sorted(prior_out - cur_out) or 'none'}")
 
