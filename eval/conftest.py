@@ -366,28 +366,39 @@ _EXPECTED_CONSISTENCY_SCENARIO_COUNT = 8
 # Scale suite env-var overrides (eval.test_policy_pipeline_scale.py's/eval.scale_prb.py's own
 # reads) and their documented fixed-100 defaults. Mirrored here as plain strings, not imported, so
 # this module doesn't need to import a live-LLM test module just to read a handful of constants.
-# Covers every override that changes what a run actually measures, not only corpus *size*:
-# SCALE_SEED changes the whole generated corpus/truth table (a different seed's precision/recall
-# aren't comparable to the baseline's at all, not just "smaller"), and SCALE_CONCURRENCY changes
-# the latency figures (eval.scale_prb.DEFAULT_CONCURRENCY) without changing the corpus at all.
-_SCALE_FIXED_100_DEFAULTS = {
-    "SCALE_TOTAL_CORPUS_SIZE": "100",
-    "SCALE_TOTAL_CORPUS_ROLES": "10",
-    "SCALE_PER_DECISION_CANDIDATES": "100",
+# Split by what each override actually changes, not lumped into one flat dict: SCALE_SEED changes
+# the whole generated corpus/truth table (a different seed's precision/recall aren't comparable to
+# the baseline's at all, not just "smaller") and SCALE_CONCURRENCY changes the latency figures
+# (eval.scale_prb.DEFAULT_CONCURRENCY) -- both apply to every Scale suite row regardless of
+# dimension. The size overrides don't: total-corpus and per-decision read disjoint env vars, so a
+# per-decision row must not be penalized for a total-corpus-only size override in the same session
+# (and vice versa) -- see _scale_run_matches_fixed_100.
+_SCALE_SHARED_DEFAULTS = {
     "SCALE_SEED": "0",
     "SCALE_CONCURRENCY": "20",
 }
+_SCALE_DIMENSION_DEFAULTS = {
+    "total_corpus": {"SCALE_TOTAL_CORPUS_SIZE": "100", "SCALE_TOTAL_CORPUS_ROLES": "10"},
+    "per_decision": {"SCALE_PER_DECISION_CANDIDATES": "100"},
+}
 
 
-def _scale_run_matches_fixed_100() -> bool:
-    """True only when every Scale suite env-var override (size, seed, concurrency) is unset or
-    still at its documented fixed-100 default. A run with any of them overridden -- a reduced size
-    while iterating, a different seed (an entirely different generated corpus/truth table, not
+def _scale_run_matches_fixed_100(scale_suite: str) -> bool:
+    """True only when every env-var override *this suite's own dimension* actually reads (plus
+    ``SCALE_SEED``/``SCALE_CONCURRENCY``, which apply to both -- see the dicts above) is unset or
+    still at its documented fixed-100 default. Checked per-suite, not globally: a total-corpus-only
+    size override (``SCALE_TOTAL_CORPUS_SIZE=10`` while iterating) must not also tag the
+    *per-decision* rows in the same session "partial" -- those ran at the real fixed-100 size and
+    are perfectly valid baseline points, dropped from the trend chart for no reason if lumped in
+    with the dimension that was actually overridden. A run with any relevant override in place --
+    a reduced size, a different seed (an entirely different generated corpus/truth table, not
     merely "smaller"), or a different concurrency (skews the latency figures alone) -- produces
     precision/recall/latency/cost numbers that are not comparable to the fixed-100 regression
     baseline, regardless of whether both halves of a dimension/level ran -- so it must never be
     tagged "regression" alongside real fixed-100 runs on the same trend-log line."""
-    return all(os.environ.get(var, default) == default for var, default in _SCALE_FIXED_100_DEFAULTS.items())
+    dimension = "total_corpus" if "total_corpus" in scale_suite else "per_decision"
+    defaults = {**_SCALE_SHARED_DEFAULTS, **_SCALE_DIMENSION_DEFAULTS[dimension]}
+    return all(os.environ.get(var, default) == default for var, default in defaults.items())
 
 
 def _format_best_effort_notes(notes: dict[str, str]) -> str:
@@ -635,9 +646,12 @@ def _write_trend_log() -> None:
         correctness = scale_correctness_entries.get(scale_suite, [])
         # "regression" only once both halves ran in this session (a -k filter that exercised just
         # one of the two test functions produces a row that isn't comparable to a full run of the
-        # suite, same "partial" convention every dict above already uses) AND the run used the
-        # documented fixed-100 sizes, not a reduced size overridden while iterating.
-        run_type = "regression" if structural and correctness and _scale_run_matches_fixed_100() else "partial"
+        # suite, same "partial" convention every dict above already uses) AND this suite's own
+        # dimension used the documented fixed-100 sizes, not a reduced size overridden while
+        # iterating -- checked per-suite so a sibling dimension's override doesn't leak in.
+        run_type = (
+            "regression" if structural and correctness and _scale_run_matches_fixed_100(scale_suite) else "partial"
+        )
         # Skip whichever half didn't run rather than pooling an empty list: pool_scale_metrics([])
         # and pool_correctness_metrics([]) each report a vacuous "nothing failed" for a half that
         # was never measured (structural_pass_rate / precision+recall+denial_precision = 1.0), and
