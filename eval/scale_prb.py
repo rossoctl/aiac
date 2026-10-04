@@ -74,13 +74,14 @@ def orchestrate_prb_concurrent(
     *,
     best_effort: bool = True,
     max_workers: int | None = None,
-) -> tuple[list[PolicyRule], dict[str, str], dict[str, str], dict[str, str], dict[str, dict]]:
+) -> tuple[list[PolicyRule], dict[str, str], dict[str, str], dict[str, str], dict[str, dict], dict[str, str]]:
     """Concurrent counterpart of ``eval.test_policy_pipeline_eval.orchestrate_prb`` -- same call
     set (one ``SCOPE_GRAPH`` call per agent inbound scope and per tool/agent-target scope, one
     ``ROLE_GRAPH`` call per agent role), fanned out via ``run_concurrently`` instead of run one
-    after another. Returns the same four values ``orchestrate_prb`` does, plus a fifth,
-    ``usage_by_name`` (``{scope_or_role_name: usage_metadata}``), for the cost structural check
-    (``eval.scale_structural``) to sum.
+    after another. Returns the same four values ``orchestrate_prb`` does, plus ``usage_by_name``
+    (``{scope_or_role_name: usage_metadata}``, for the cost structural check
+    (``eval.scale_structural``) to sum) and ``failed_decisions`` (``{scope_or_role_name: reason}``,
+    see below).
 
     ``best_effort`` defaults to ``True`` here (unlike ``orchestrate_prb``'s ``False`` default) --
     at ~100-150 decisions per total-corpus run, one auditor rejection must not discard every other
@@ -97,6 +98,15 @@ def orchestrate_prb_concurrent(
     ``PolicyRulesBuilderBaseError`` itself and reports a failed decision (no rules, no reasoning
     entry) rather than raising, so ``missing_decisions`` sees it as a decision that never completed
     instead of losing the whole run.
+
+    A failed decision's reason is kept in its own ``failed_decisions`` dict, **not** folded into
+    ``best_effort_notes`` -- that dict is rendered as "best-effort proposals the auditor never
+    approved", which is a different, misleading story for a call that never produced a proposal at
+    all. Its usage is left out of ``usage_by_name`` entirely rather than recorded as ``{}``, for the
+    same reason: ``_invoke_with_usage``'s ``get_usage_metadata_callback()`` scope never reaches its
+    own return when the wrapped call raises, so there is no usage to report, and recording an empty
+    dict would read as "the endpoint didn't report usage" (lowering ``token_coverage``) instead of
+    "this call never finished".
     """
     user_roles = [roles[name] for name in scenario.USER_ROLES]
 
@@ -141,19 +151,25 @@ def orchestrate_prb_concurrent(
     reasoning_by_agent_role: dict[str, str] = {}
     best_effort_notes: dict[str, str] = {}
     usage_by_name: dict[str, dict] = {}
+    failed_decisions: dict[str, str] = {}
     for kind, name, job_rules, reasoning, note, usage in results:
         rules += job_rules
         # ``reasoning`` is ``None`` only for a job that raised above -- leaving its name out of
-        # these dicts (rather than recording an empty string) is what lets missing_decisions
-        # report it as a decision that never ran, instead of a decision that ran and produced
-        # nothing.
-        if reasoning is not None:
-            if kind == "scope":
-                reasoning_by_scope[name] = reasoning
-            else:
-                reasoning_by_agent_role[name] = reasoning
+        # reasoning_by_scope/reasoning_by_agent_role (rather than recording an empty string) is
+        # what lets missing_decisions report it as a decision that never ran, instead of a
+        # decision that ran and produced nothing. Its ``note`` (the failure reason) goes to
+        # failed_decisions, not best_effort_notes, and no usage is recorded for it at all -- see
+        # this function's own docstring for why both would otherwise misreport the cause.
+        if reasoning is None:
+            if note is not None:
+                failed_decisions[name] = note
+            continue
+        if kind == "scope":
+            reasoning_by_scope[name] = reasoning
+        else:
+            reasoning_by_agent_role[name] = reasoning
         if note is not None:
             best_effort_notes[name] = note
         usage_by_name[name] = usage
 
-    return rules, reasoning_by_scope, reasoning_by_agent_role, best_effort_notes, usage_by_name
+    return rules, reasoning_by_scope, reasoning_by_agent_role, best_effort_notes, usage_by_name, failed_decisions

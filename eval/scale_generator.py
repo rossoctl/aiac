@@ -124,6 +124,18 @@ def generate_total_corpus(
     grants it -- kept well under 1.0 so the truth table is neither degenerately full nor empty.
     Deterministic for a fixed ``(n_services, n_roles, seed, *_density)``.
     """
+    if n_roles < 1:
+        raise ValueError(
+            f"generate_total_corpus needs n_roles >= 1 (the repair pass below picks a user role to "
+            f"anchor every inbound/outbound-subject pair onto); got n_roles={n_roles}"
+        )
+    if n_services < 2:
+        raise ValueError(
+            f"generate_total_corpus needs n_services >= 2 (n_agents = n_services // 2 must be >= 1, "
+            f"so the repair pass below has an agent role to anchor every outbound-target pair onto); "
+            f"got n_services={n_services}"
+        )
+
     rng = random.Random(seed)
     n_agents = n_services // 2
     n_tools = n_services - n_agents
@@ -270,6 +282,12 @@ def generate_per_decision(*, n_candidates: int = 100, seed: int = 0, granted_den
     say nothing real. A repair pass (continuing the same rng stream, so still fully seed-
     deterministic) forces at least one grant in each direction when sampling comes up empty.
     """
+    if n_candidates < 1:
+        raise ValueError(
+            f"generate_per_decision needs n_candidates >= 1 (the repair pass below picks a "
+            f"candidate to force a grant onto when sampling comes up empty); got n_candidates={n_candidates}"
+        )
+
     rng = random.Random(seed)
 
     candidate_roles = [f"user-role-{i:03d}" for i in range(n_candidates)]

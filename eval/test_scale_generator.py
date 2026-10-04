@@ -6,6 +6,8 @@ Pure logic, no LLM, no I/O -- unmarked so it runs in the default fast pass, same
 
 from __future__ import annotations
 
+import pytest
+
 from eval.scale_generator import (
     FOCAL_ROLE_NAME,
     FOCAL_SCOPE_NAME,
@@ -86,6 +88,15 @@ class TestGenerateTotalCorpus:
         for field_name in ("AGENTS", "TOOLS", "USER_ROLES", "USERS", "USER_PASSWORD", "REALM_DEFAULT"):
             assert hasattr(ns, field_name)
 
+    def test_raises_clearly_on_zero_roles_instead_of_crashing_in_the_repair_pass(self) -> None:
+        with pytest.raises(ValueError, match="n_roles"):
+            generate_total_corpus(n_services=10, n_roles=0, seed=0)
+
+    def test_raises_clearly_on_fewer_than_two_services_instead_of_crashing_in_the_repair_pass(self) -> None:
+        # n_services=1 -> n_agents = 1 // 2 = 0 -> no agent role for the repair pass to pick from.
+        with pytest.raises(ValueError, match="n_services"):
+            generate_total_corpus(n_services=1, n_roles=2, seed=0)
+
 
 class TestGeneratePerDecision:
     def test_deterministic_for_same_seed(self) -> None:
@@ -132,3 +143,7 @@ class TestGeneratePerDecision:
         assert all(line.endswith(f"Scope '{FOCAL_SCOPE_NAME}'.") for line in scope_grant_lines)
         # ... and every granted line for the role direction starts from the fixed focal role.
         assert all(line.startswith(f"Role '{FOCAL_ROLE_NAME}'") for line in role_grant_lines)
+
+    def test_raises_clearly_on_zero_candidates_instead_of_crashing_in_the_repair_pass(self) -> None:
+        with pytest.raises(ValueError, match="n_candidates"):
+            generate_per_decision(n_candidates=0, seed=0)
