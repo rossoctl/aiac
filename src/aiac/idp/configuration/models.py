@@ -1,5 +1,5 @@
 from enum import Enum
-from typing import Any
+from typing import Any, NewType
 
 from pydantic import BaseModel, ConfigDict, model_validator
 
@@ -98,6 +98,18 @@ class Role(BaseModel):
         if not isinstance(self.actorIds, list) or not all(isinstance(a, str) for a in self.actorIds):
             raise ValueError("Role.actorIds must be a list[str]")
         return self
+
+
+# The two ids Keycloak gives every client. They cannot merge: after an offboard the client is gone, so
+# UUID→clientId resolution is impossible. The UUID is only for finding the service in the IdP;
+# inside the PCE every service id is the clientId.
+ServiceUuid = NewType("ServiceUuid", str)
+"""``Service.id`` — the Keycloak internal client UUID (slash-free). Carried by ``CLIENT_CREATED``,
+``/apply/service/{uuid}``, UC1 Provision and the PRB."""
+
+ClientId = NewType("ClientId", str)
+"""``Service.serviceId`` — the Keycloak ``clientId`` (a SPIFFE ID, can contain ``/``). The SPM key,
+``PolicyRule.scope.serviceId``, the ``decommission`` key and OPA ``input.identity.service_id``."""
 
 
 class Service(BaseModel):

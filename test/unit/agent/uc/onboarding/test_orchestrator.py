@@ -5,15 +5,18 @@ Service Provision (a compiled StateGraph) -> Service Policy Builder. Both are mo
 here via the module-level `build_provision_graph` / `ServicePolicyBuilder` seams, and the
 idp-library `Configuration` is mocked via the `_config` seam -- no live graph, IdP,
 Kubernetes, or LLM. The Orchestrator applies nothing (no PCE call); it returns
-`(list[PolicyRule], override=False, default_effect)` to the Controller, which makes the
+`(list[PolicyRule], override=False)` to the Controller, which makes the
 single `compute_and_apply` call afterwards.
 
 Issue 171 adds a compensating rollback (UC1-only): on any of the four typed build
 failures the Orchestrator tears down exactly what Provision *created this run* (the
-created-manifest), unsets the client type, disables the client (failed-service marker),
-and re-raises. On success it re-enables the client (idempotent).
+created-manifest) and disables the client (failed-service marker). The client type is
+kept (handoff 11 B2). Then it calls the PCE's ``quarantine`` (the policy teardown) and
+re-raises. The caller re-enables the client after a successful apply (idempotent).
 """
 
+import ast
+import inspect
 import threading
 from unittest.mock import MagicMock, patch
 
@@ -28,10 +31,20 @@ from aiac.agent.policy_rules_builder.graph import (
     UnparseableLLMResponseError,
 )
 from aiac.agent.uc.onboarding import orchestrator
-from aiac.idp.configuration.models import Role, Scope, ServiceType
-from aiac.policy.model.models import RuleEffect
+from aiac.idp.configuration.models import Role, Scope, Service, ServiceType
 
+# The onboarding trigger carries the Keycloak UUID; the PCE takes the clientId. The two differ, so a
+# test fails if the UUID leaks to the PCE.
 SERVICE_ID = "svc-1"
+CLIENT_ID = "spiffe://example.org/ns/team1/sa/svc-1"
+
+
+@pytest.fixture(autouse=True)
+def quarantine():
+    """The PCE ``quarantine`` seam — patched for every test, so the failure path never reaches a
+    live PCE. Tests that check it request this fixture by name."""
+    with patch.object(orchestrator, "quarantine") as mock:
+        yield mock
 
 
 def _graph(*, created_roles=(), created_scopes=(), service_type=ServiceType.AGENT):
@@ -44,6 +57,11 @@ def _graph(*, created_roles=(), created_scopes=(), service_type=ServiceType.AGEN
         "created_scopes": list(created_scopes),
     }
     return graph
+
+
+def _service():
+    """The onboarded service as the IdP returns it: UUID ``SERVICE_ID``, clientId ``CLIENT_ID``."""
+    return Service(id=SERVICE_ID, serviceId=CLIENT_ID, enabled=True)
 
 
 def _config_returning(service):
@@ -77,34 +95,22 @@ class TestBothStagesSucceed:
         with (
             patch.object(orchestrator, "build_provision_graph", return_value=graph),
             patch.object(orchestrator, "ServicePolicyBuilder") as spb,
-            patch.object(orchestrator, "_config", return_value=_config_returning(object())),
+            patch.object(orchestrator, "_config", return_value=_config_returning(_service())),
         ):
             spb.build.return_value = rules
             result = orchestrator.onboard_service(SERVICE_ID)
 
         # service_type produced by Provision is fed into the Service Policy Builder
         spb.build.assert_called_once_with(SERVICE_ID, ServiceType.AGENT)
-        # Orchestrator returns the builder's rules paired with the append flag and the
-        # default_effect (least-privilege DENY when the caller does not request otherwise).
-        assert result == (rules, False, RuleEffect.DENY)
+        # Orchestrator returns the builder's rules, the append flag, and the service's clientId (the
+        # PCE focus service). There is no default effect to forward: the deployed Rego always denies
+        # an unmentioned pair.
+        assert result == (rules, False, CLIENT_ID)
 
+    def test_onboard_service_takes_no_default_effect(self):
+        import inspect
 
-class TestDefaultEffectForwarding:
-    def test_caller_requested_default_effect_is_returned_for_forwarding(self):
-        # A caller onboarding a service that should default to ALLOW passes default_effect through;
-        # the orchestrator returns it verbatim so the Controller forwards it to compute_and_apply.
-        graph = _graph(service_type=ServiceType.AGENT)
-
-        with (
-            patch.object(orchestrator, "build_provision_graph", return_value=graph),
-            patch.object(orchestrator, "ServicePolicyBuilder") as spb,
-            patch.object(orchestrator, "_config", return_value=_config_returning(object())),
-        ):
-            spb.build.return_value = [object()]
-            rules, override, default_effect = orchestrator.onboard_service(SERVICE_ID, default_effect=RuleEffect.ALLOW)
-
-        assert override is False
-        assert default_effect is RuleEffect.ALLOW
+        assert "default_effect" not in inspect.signature(orchestrator.onboard_service).parameters
 
     def test_provision_graph_invoked_with_service_id_in_trigger(self):
         # The service_id must reach Provision as the trigger's entity_id (Keycloak
@@ -115,7 +121,7 @@ class TestDefaultEffectForwarding:
         with (
             patch.object(orchestrator, "build_provision_graph", return_value=graph),
             patch.object(orchestrator, "ServicePolicyBuilder") as spb,
-            patch.object(orchestrator, "_config", return_value=_config_returning(object())),
+            patch.object(orchestrator, "_config", return_value=_config_returning(_service())),
         ):
             spb.build.return_value = [object()]
             orchestrator.onboard_service(SERVICE_ID)
@@ -132,6 +138,7 @@ class TestProvisionFails:
         with (
             patch.object(orchestrator, "build_provision_graph", return_value=graph),
             patch.object(orchestrator, "ServicePolicyBuilder") as spb,
+            patch.object(orchestrator, "_config", return_value=_config_returning(_service())),
         ):
             with pytest.raises(HTTPException) as exc:
                 orchestrator.onboard_service(SERVICE_ID)
@@ -140,13 +147,39 @@ class TestProvisionFails:
         spb.build.assert_not_called()
 
 
+class TestServiceReadFails:
+    def test_nothing_is_provisioned_or_quarantined_when_the_service_read_fails(self, quarantine):
+        # The clientId is resolved before Provision, so a failed IdP read happens before anything
+        # exists that needs compensation: no Provision, no build, no rollback, no quarantine.
+        # A raw IdP error (the Configuration library raises RuntimeError) becomes the same
+        # HTTPException(502) that Provision raises, not a generic 500.
+        config = MagicMock()
+        config.get_service.side_effect = RuntimeError("IdP config unavailable")
+        graph = _graph()
+
+        with (
+            patch.object(orchestrator, "build_provision_graph", return_value=graph),
+            patch.object(orchestrator, "ServicePolicyBuilder") as spb,
+            patch.object(orchestrator, "_config", return_value=config),
+        ):
+            with pytest.raises(HTTPException) as exc:
+                orchestrator.onboard_service(SERVICE_ID)
+
+        assert exc.value.status_code == 502
+        graph.invoke.assert_not_called()
+        spb.build.assert_not_called()
+        config.set_service_enabled.assert_not_called()
+        quarantine.assert_not_called()
+        assert SERVICE_ID not in orchestrator._service_locks
+
+
 class TestSuccessDoesNotReEnableClient:
     def test_success_does_not_touch_enabled_and_does_not_tear_down(self):
         # On a successful onboarding the Orchestrator no longer re-enables the client itself —
         # the caller does that via reenable_service(), but only AFTER compute_and_apply succeeds
         # (so a PCE failure leaves the client disabled). onboard_service tears nothing down and
         # never sets enabled here.
-        service = object()
+        service = _service()
         config = _config_returning(service)
         graph = _graph(
             created_roles=[Role(id="r1", name="weather.forecast", composite=False)],
@@ -164,14 +197,13 @@ class TestSuccessDoesNotReEnableClient:
         config.set_service_enabled.assert_not_called()
         config.delete_service_role.assert_not_called()
         config.delete_service_scope.assert_not_called()
-        config.unset_service_type.assert_not_called()
 
 
 class TestReenableService:
     def test_reenable_sets_enabled_true_and_touches_nothing_else(self):
         # reenable_service is the UC1-only, idempotent post-apply hook the caller runs after a
         # successful compute_and_apply. It resolves the service and sets enabled=true — nothing else.
-        service = object()
+        service = _service()
         config = _config_returning(service)
 
         with patch.object(orchestrator, "_config", return_value=config):
@@ -181,17 +213,20 @@ class TestReenableService:
         config.set_service_enabled.assert_called_once_with(service, True)
         config.delete_service_role.assert_not_called()
         config.delete_service_scope.assert_not_called()
-        config.unset_service_type.assert_not_called()
 
 
 class TestRollbackOnBuildFailure:
+    @pytest.mark.parametrize("service_type", [ServiceType.AGENT, ServiceType.TOOL])
     @pytest.mark.parametrize("error", _rollback_errors(), ids=lambda e: type(e).__name__)
-    def test_rollback_tears_down_created_disables_and_reraises(self, error):
+    def test_rollback_then_quarantine_then_reraise(self, error, service_type, quarantine):
         role = Role(id="r1", name="weather.forecast", composite=False)
         scope = Scope(id="s1", name="weather.history")
-        service = object()
+        service = _service()
         config = _config_returning(service)
-        graph = _graph(created_roles=[role], created_scopes=[scope])
+        graph = _graph(created_roles=[role], created_scopes=[scope], service_type=service_type)
+        order = MagicMock()
+        order.attach_mock(config, "config")
+        order.attach_mock(quarantine, "quarantine")
 
         with (
             patch.object(orchestrator, "build_provision_graph", return_value=graph),
@@ -205,18 +240,31 @@ class TestRollbackOnBuildFailure:
         # The ORIGINAL error instance is re-raised, not swallowed or re-wrapped.
         assert ei.value is error
         # Teardown of exactly what this run created (unmap-then-delete is done inside the
-        # Configuration primitives), then unset type, then disable (failed-service marker).
+        # Configuration primitives), then disable (failed-service marker), then the PCE quarantine
+        # keyed by the clientId. The Service is read from the IdP once, by its UUID.
+        config.get_service.assert_called_once_with(SERVICE_ID)
         config.delete_service_role.assert_called_once_with(service, role)
         config.delete_service_scope.assert_called_once_with(service, scope)
-        config.unset_service_type.assert_called_once_with(service)
         config.set_service_enabled.assert_called_once_with(service, False)
+        # The created roles go to the quarantine: the rollback deleted them from the IdP, so the
+        # quarantine cannot find them in the catalog, but their grants can be on other SPMs.
+        quarantine.assert_called_once_with(CLIENT_ID, [role])
+        calls = [c[0] for c in order.method_calls if c[0] != "config.get_service"]
+        assert calls == [
+            "config.delete_service_role",
+            "config.delete_service_scope",
+            "config.set_service_enabled",
+            "quarantine",
+        ]
 
     def test_disable_is_the_last_rollback_action(self):
         # The failed-service marker (enabled=false) must land AFTER the teardown, so a
-        # crash mid-teardown never leaves a disabled-but-still-provisioned client.
+        # crash mid-teardown never leaves a disabled-but-still-provisioned client. It lands
+        # BEFORE the quarantine (asserted above), so no run after the teardown sees the service
+        # as enabled.
         role = Role(id="r1", name="weather.forecast", composite=False)
         scope = Scope(id="s1", name="weather.history")
-        service = object()
+        service = _service()
         config = _config_returning(service)
         graph = _graph(created_roles=[role], created_scopes=[scope])
 
@@ -232,7 +280,50 @@ class TestRollbackOnBuildFailure:
         names = [c[0] for c in config.method_calls]
         assert names.index("set_service_enabled") > names.index("delete_service_role")
         assert names.index("set_service_enabled") > names.index("delete_service_scope")
-        assert names.index("set_service_enabled") > names.index("unset_service_type")
+
+    def test_quarantine_failure_propagates_after_the_rollback(self, quarantine):
+        # A failed quarantine (e.g. the PDP is down) surfaces loudly — it is not swallowed. The
+        # rollback already ran, so the client is disabled. The quarantine error replaces even a
+        # permanent build error, so the consumer retries (and quarantines again) instead of
+        # term()ing a fail-open service; the build error stays on __context__.
+        service = _service()
+        config = _config_returning(service)
+        quarantine.side_effect = RuntimeError("PDP unreachable")
+        build_error = PolicyRulesBuilderError("auditor rejected after retries")
+
+        with (
+            patch.object(orchestrator, "build_provision_graph", return_value=_graph()),
+            patch.object(orchestrator, "ServicePolicyBuilder") as spb,
+            patch.object(orchestrator, "_config", return_value=config),
+        ):
+            spb.build.side_effect = build_error
+            with pytest.raises(RuntimeError, match="PDP unreachable") as ei:
+                orchestrator.onboard_service(SERVICE_ID)
+
+        config.set_service_enabled.assert_called_once_with(service, False)
+        assert ei.value.__context__ is build_error
+
+    def test_rollback_failure_still_quarantines(self, quarantine):
+        # A failed rollback (e.g. Keycloak is down) must not skip the quarantine: else a failed
+        # first onboarding stays fail-open. The rollback error propagates (a retryable error), and
+        # the build error stays on its __context__.
+        config = _config_returning(_service())
+        config.delete_service_role.side_effect = RuntimeError("Keycloak unreachable")
+        build_error = PolicyRulesBuilderError("auditor rejected after retries")
+        created_role = Role(id="r1", name="weather.forecast", composite=False)
+        graph = _graph(created_roles=[created_role])
+
+        with (
+            patch.object(orchestrator, "build_provision_graph", return_value=graph),
+            patch.object(orchestrator, "ServicePolicyBuilder") as spb,
+            patch.object(orchestrator, "_config", return_value=config),
+        ):
+            spb.build.side_effect = build_error
+            with pytest.raises(RuntimeError, match="Keycloak unreachable") as ei:
+                orchestrator.onboard_service(SERVICE_ID)
+
+        quarantine.assert_called_once_with(CLIENT_ID, [created_role])
+        assert ei.value.__context__ is build_error
 
 
 class TestRollbackLogInjectionSanitized:
@@ -243,7 +334,7 @@ class TestRollbackLogInjectionSanitized:
         evil_id = "svc-1\r\nINFO forged: attacker-controlled entry"
         role = Role(id="r1", name="role\r\ninjected", composite=False)
         scope = Scope(id="s1", name="scope\ninjected")
-        service = object()
+        service = Service(id=evil_id, serviceId=CLIENT_ID, enabled=True)
         config = _config_returning(service)
         graph = _graph(created_roles=[role], created_scopes=[scope])
 
@@ -271,7 +362,7 @@ class TestRollbackDeletesOnlyCreated:
         reused_role = Role(id="r-shared", name="shared.role", composite=False)
         created_scope = Scope(id="s-new", name="weather.new")
         reused_scope = Scope(id="s-shared", name="shared.scope")
-        service = object()
+        service = _service()
         config = _config_returning(service)
         graph = _graph(created_roles=[created_role], created_scopes=[created_scope])
 
@@ -293,10 +384,10 @@ class TestRollbackDeletesOnlyCreated:
 
 
 class TestRollbackScopedToFourErrors:
-    def test_non_rollback_builder_error_propagates_without_teardown(self):
+    def test_non_rollback_builder_error_propagates_without_teardown(self, quarantine):
         # A builder error that is NOT one of the four typed failures (e.g. an HTTPException
         # from IdP focus resolution) propagates untouched -- no teardown, no disable.
-        service = object()
+        service = _service()
         config = _config_returning(service)
         graph = _graph(
             created_roles=[Role(id="r1", name="weather.forecast", composite=False)],
@@ -317,8 +408,8 @@ class TestRollbackScopedToFourErrors:
         graph.invoke.assert_called_once()
         config.delete_service_role.assert_not_called()
         config.delete_service_scope.assert_not_called()
-        config.unset_service_type.assert_not_called()
         config.set_service_enabled.assert_not_called()
+        quarantine.assert_not_called()
 
 
 class TestRetryableReRunRollsBackIdempotently:
@@ -327,7 +418,7 @@ class TestRetryableReRunRollsBackIdempotently:
         # The first attempt already deleted its objects; the second re-creates fresh ones
         # (its own created-manifest) and tears down ONLY those -- no crash on already-gone
         # objects (the Configuration deletes are idempotent; the mock never raises).
-        service = object()
+        service = _service()
         config = _config_returning(service)
 
         def _attempt(role, scope):
@@ -370,7 +461,7 @@ class TestLockRegistryEviction:
         with (
             patch.object(orchestrator, "build_provision_graph", return_value=graph),
             patch.object(orchestrator, "ServicePolicyBuilder") as spb,
-            patch.object(orchestrator, "_config", return_value=_config_returning(object())),
+            patch.object(orchestrator, "_config", return_value=_config_returning(_service())),
         ):
             spb.build.return_value = [object()]
             orchestrator.onboard_service(SERVICE_ID)
@@ -387,7 +478,7 @@ class TestLockRegistryEviction:
         with (
             patch.object(orchestrator, "build_provision_graph", return_value=graph),
             patch.object(orchestrator, "ServicePolicyBuilder") as spb,
-            patch.object(orchestrator, "_config", return_value=_config_returning(object())),
+            patch.object(orchestrator, "_config", return_value=_config_returning(_service())),
         ):
             spb.build.side_effect = error
             with pytest.raises(type(error)):
@@ -402,7 +493,7 @@ class TestLockRegistryEviction:
         with (
             patch.object(orchestrator, "build_provision_graph", return_value=graph),
             patch.object(orchestrator, "ServicePolicyBuilder") as spb,
-            patch.object(orchestrator, "_config", return_value=_config_returning(object())),
+            patch.object(orchestrator, "_config", return_value=_config_returning(_service())),
         ):
             spb.build.side_effect = HTTPException(502, "IdP config unavailable")
             with pytest.raises(HTTPException):
@@ -418,6 +509,7 @@ class TestLockRegistryEviction:
         with (
             patch.object(orchestrator, "build_provision_graph", return_value=graph),
             patch.object(orchestrator, "ServicePolicyBuilder"),
+            patch.object(orchestrator, "_config", return_value=_config_returning(_service())),
         ):
             with pytest.raises(HTTPException):
                 orchestrator.onboard_service(SERVICE_ID)
@@ -446,7 +538,7 @@ class TestLockRegistryEviction:
         with (
             patch.object(orchestrator, "build_provision_graph", return_value=_graph()),
             patch.object(orchestrator, "ServicePolicyBuilder") as spb,
-            patch.object(orchestrator, "_config", return_value=_config_returning(object())),
+            patch.object(orchestrator, "_config", return_value=_config_returning(_service())),
         ):
             spb.build.side_effect = _build
 
@@ -490,7 +582,7 @@ class TestPerServiceSerialization:
         with (
             patch.object(orchestrator, "build_provision_graph", return_value=_graph()),
             patch.object(orchestrator, "ServicePolicyBuilder") as spb,
-            patch.object(orchestrator, "_config", return_value=_config_returning(object())),
+            patch.object(orchestrator, "_config", return_value=_config_returning(_service())),
         ):
             spb.build.side_effect = _build
 
@@ -524,7 +616,7 @@ class TestPerServiceSerialization:
         with (
             patch.object(orchestrator, "build_provision_graph", return_value=_graph()),
             patch.object(orchestrator, "ServicePolicyBuilder") as spb,
-            patch.object(orchestrator, "_config", return_value=_config_returning(object())),
+            patch.object(orchestrator, "_config", return_value=_config_returning(_service())),
         ):
             spb.build.side_effect = _build
 
@@ -542,3 +634,14 @@ class TestPerServiceSerialization:
                 assert not t.is_alive(), "onboard_service thread hung"
 
         assert errors == [], "different service_ids did not run concurrently"
+
+
+class TestPceOwnsThePdp:
+    def test_orchestrator_does_not_import_the_pdp_library(self):
+        # The PCE owns the PDP: the orchestrator reaches it only through the PCE (quarantine).
+        tree = ast.parse(inspect.getsource(orchestrator))
+        imported = {node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)} | {
+            alias.name for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names
+        }
+        assert not any(name and name.startswith("aiac.pdp") for name in imported)
+        assert "aiac.policy.computation" in imported

@@ -196,23 +196,6 @@ class Configuration:
         )
         return Service.model_validate(resp.json())
 
-    def unset_service_type(self, service: Service) -> Service:
-        """Clear a service's type — consumed by the UC1 rollback.
-
-        Reuses the ``set_service_type`` transport: ``POST /services/{service.id}/type`` with an
-        empty/clear type body. The config service clears the ``client.type`` attribute with the
-        same read-merge-``update_client`` pattern ``set_service_type`` uses. Idempotent — clearing
-        an already-clear type is not an error. Raises ``RuntimeError`` on a non-OK status. Returns
-        the updated ``Service`` (``type`` now ``None``).
-        """
-        resp = self._request(
-            "POST",
-            f"/services/{service.id}/type",
-            json={"type": ""},
-            params=self._params(),
-        )
-        return Service.model_validate(resp.json())
-
     def set_service_enabled(self, service: Service, enabled: bool) -> Service:
         """The **writer** for ``Service.enabled`` — consumed by the UC1 rollback (disable a failed
         service's client) and the success re-enable path.

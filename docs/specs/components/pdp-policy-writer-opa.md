@@ -40,7 +40,6 @@ Complete policy definition for a single agent (service). Contains two sets of `P
 | Field | Type | Description |
 |-------|------|-------------|
 | `agent_id` | `str` | Service ID from the AIAC trigger event (`aiac.apply.service.{id}`) |
-| `default_effect` | `RuleEffect` | How the generated Rego treats a `(role, scope)` pair **no rule mentions**: `Allow` / `Deny`. Default `Deny`. Selects which **decision block** the generators emit (see [Per-policy default effect](#per-policy-default-effect-default_effect)); every declaration map and `*_allow_ok` / `*_deny_ok` gate is emitted identically in both modes. |
 | `agent_roles` | `list[Role]` | Realm roles assigned to this agent. Effect-agnostic identity. |
 | `agent_scopes` | `list[Scope]` | Scopes this agent exposes. Effect-agnostic identity. |
 | `source_roles` | `dict[str, list[Role]]` | Inbound: source (calling service) **id** → roles held. Keyed by the inbound `input.identity.client_id`. **Optional** gate input — an absent `client_id`, or a platform bypass client, passes. Effect-agnostic; **includes deny-edge roles**. |
@@ -58,7 +57,9 @@ Complete policy definition for a single agent (service). Contains two sets of `P
 
 **Outbound target rule semantics (deny-overrides):** this agent acting as realm role `role` may request target scope `scope` iff an allow edge grants it and no deny edge prohibits it. Grouped by role, the allow list becomes the single informational `agent_role_scopes` map, and the effective capability gate materializes into `target_allow_scopes` / `target_deny_scopes`.
 
-**Outbound subject rule semantics (deny-overrides):** a subject holding realm role `role` (a **user** role) may reach a **tool** exposing scope `scope` iff an allow edge grants it and no deny edge prohibits it. Grouped by role, the lists become `subject_role_allow_scopes` / `subject_role_deny_scopes` (user role → tool scopes) that the **outbound** package's subject gate evaluates as `input.mcp.params.name in subject_role_allow_scopes[role]` (mirrored against `subject_role_deny_scopes`); their scope **values** are **de-prefixed** to the bare MCP tool name (Q9). This is distinct from the inbound subject rules (user → *agent* scope): the outbound subject gate answers "may this user reach the tool?", not "may this user call the agent?".
+**No default effect.** `AgentPolicyModel` has no default-effect field. A `(role, scope)` pair that no rule mentions is always denied (`default allow := false` in both packages). A legacy payload that still carries `default_effect` is accepted and the field is ignored (`extra='ignore'`).
+
+**Outbound subject rule semantics (deny-overrides):** a subject holding realm role `role` (a **user** role) may reach a **tool** exposing scope `scope` iff an allow edge grants it and no deny edge prohibits it. Grouped by role, the lists become `subject_role_allow_scopes` / `subject_role_deny_scopes` (user role → tool scopes) that the **outbound** package's subject gate evaluates as `tool in subject_role_allow_scopes[role]` (the function `subject_allows(tool)`, mirrored by `subject_denies(tool)` against `subject_role_deny_scopes`; it is applied to `input.mcp.params.name` for `tools/call`, and to each tool of the target for the MCP session messages); their scope **values** are **de-prefixed** to the bare MCP tool name (Q9). This is distinct from the inbound subject rules (user → *agent* scope): the outbound subject gate answers "may this user reach the tool?", not "may this user call the agent?".
 
 **Note on target-map direction:** `target_allow_scopes` / `target_deny_scopes` are keyed by **target service id → scopes** (the inverse of the former `scope_targets`, which was `scope → targets`). The outbound Rego generator emits the **full** target service id as the map key and evaluates `target_allow_scopes[input.identity.service_id]` / `target_deny_scopes[input.identity.service_id]` directly — there is no inversion (see below). Only the scope **values** are de-prefixed to bare MCP tool names; the **keys** stay the full target service id (Q9).
 
@@ -153,9 +154,10 @@ The Rego packages evaluate the `input` document the live AuthBridge OPA plugin p
 | `input.identity.subject` | The delegated end-user id (JWT `sub`) | inbound + outbound |
 | `input.identity.client_id` | The calling client — the inbound source | inbound |
 | `input.identity.service_id` | The downstream target audience the exchanged token was minted for — a **full SPIFFE id** | outbound |
-| `input.mcp.params.name` | The **bare** invoked MCP tool name (e.g. `source-read`) | outbound |
+| `input.mcp.method` | The MCP JSON-RPC method (`tools/call`, `tools/list`, `initialize`, …). The plugin always sets it (`buildMCPInput` in the cortex OPA plugin, `core/plugins/opa/plugin.go`) | outbound |
+| `input.mcp.params.name` | The **bare** invoked MCP tool name (e.g. `source-read`). Only `tools/call` carries it | outbound |
 
-On the outbound leg there is no validated JWT; the plugin synthesizes `input.identity` from the token-exchange delegation hop. A **missing** `input.mcp.params.name` (e.g. a `tools/list` discovery request, which carries no tool name) or an **absent** `input.identity.service_id` matches nothing in the maps and is therefore **denied**.
+On the outbound leg there is no validated JWT; the plugin synthesizes `input.identity` from the token-exchange delegation hop. An **absent** `input.identity.service_id` matches nothing in the maps and is therefore **denied**. A request with no tool name (for example `tools/list`) is allowed only as an MCP session message (see [Outbound package](#outbound-package-authbridgeclientoutboundrequest)).
 
 The generator embeds these symbols, derived from the `AgentPolicyModel`:
 
@@ -174,24 +176,17 @@ The generator embeds these symbols, derived from the `AgentPolicyModel`:
 
 De-prefixing (Q9) is **outbound-only**: provisioned scope names are prefixed with their owning workload (`github-tool.source-read`), but the value that arrives in `input.mcp.params.name` at runtime is the bare tool name (`source-read`), so the outbound map **values** are stripped of a leading `"<owner>."` (where `owner = identity_ref(scope.serviceId).name`). The **keys** of `target_allow_scopes` / `target_deny_scopes` stay the full target service id (they match `input.identity.service_id`). Inbound `agent_scopes` and the `*_role_allow_scopes` / `*_role_deny_scopes` maps keep their **full** names — the inbound gate compares scopes internally, never against `input.mcp.params.name`.
 
-### Per-policy default effect (`default_effect`)
+### Always DENY by default
 
-`AgentPolicyModel.default_effect` (`Allow` / `Deny`, default `Deny`) decides how each package treats a `(role, scope)` pair that **no rule mentions**. Three states exist per pair: **explicitly allowed** (an allow rule/edge names it), **explicitly denied** (a deny rule/edge names it), and **unspecified** (no rule names it → resolves to `default_effect`).
+Each package ends with `default allow := false` and one or more `allow if { … }` rules. A request that no rule allows is denied. There is no permissive default and there are no `allow := false` rules. Each `allow` body carries inline `not …_deny_ok` guards (deny-overrides).
 
-- `Deny` (default) reproduces today's least-privilege output **byte-for-byte**: `default allow := false` plus one incremental `allow if { … }` rule per package (the blocks shown below).
-- `Allow` opens the default while explicit denies still override.
-
-**Only the trailing decision block branches on `default_effect`.** Every declaration map (`subject_role_allow_scopes`, `target_allow_scopes`, the informational `agent_role_scopes`, …) and every `*_allow_ok` / `*_deny_ok` gate is emitted **identically** in both modes. Under `Allow` the allow-side machinery (the allow scope maps, `subject_allow_ok` / `source_allow_ok` / `target_allow_ok`, and the inbound platform-bypass rules) is still generated but **inert** — an allowed pair and an unmentioned pair both resolve to `allow` — mirroring how `agent_role_scopes` is already emitted-but-unreferenced.
-
-**Why a literal flip of the `default allow :=` constant is insufficient.** In Rego, `default allow := <v>` supplies a value only when every other `allow` rule is undefined, and an incremental `allow if { <body> }` rule can only push `allow` *toward* `true`. Keeping the existing `allow if { …; not …_deny_ok }` body and merely flipping the constant to `true` would leave `allow` `true` whenever that body is undefined, so the `not …_deny_ok` guard subtracts nothing and **every prohibition silently evaporates**. Overriding a permissive default therefore requires **separate** complete rules — `allow := false if { <deny_gate> }`, one per deny gate; an assigned `false` wins over `default true` when its body holds, which is exactly deny-overrides.
-
-**The generator assumes disjoint allow/deny per `(role, scope)` and never reconciles an overlap.** A genuine grant/deny overlap on the same pair is a real policy conflict surfaced **upstream** as HTTP 422 (the PRB raises `PolicyContradictionError`); the PCE assumes a conflict-free model. The generator therefore adds **no** logic that silently reconciles an allow-vs-deny overlap — doing so would mask a conflict that is *supposed* to surface as a 422. The `allow := false if { <deny> }` rules are **not** conflict reconciliation: (1) they give a deny precedence over the permissive default (for a pair unmentioned-by-allow, hence not an overlap), and (2) they let a deny on **one** of a subject's several roles — or on **one** of the two outbound gates — beat an allow arriving from a *different* role / the *other* gate. Each individual `(role, scope)` stays allow-XOR-deny; the denies merely co-occur within a single request.
+**The generator assumes disjoint allow/deny per `(role, scope)` and never reconciles an overlap.** A genuine grant/deny overlap on the same pair is a real policy conflict surfaced **upstream** as HTTP 422 (the PRB raises `PolicyContradictionError`); the PCE assumes a conflict-free model. The generator therefore adds **no** logic that silently reconciles an allow-vs-deny overlap — doing so would mask a conflict that is *supposed* to surface as a 422. The inline `not …_deny_ok` guards are **not** conflict reconciliation: they let a deny on **one** of a subject's several roles — or on **one** of the two outbound gates — beat an allow arriving from a *different* role / the *other* gate. Each individual `(role, scope)` stays allow-XOR-deny; the denies merely co-occur within a single request.
 
 ### Inbound package: `authbridge.client.inbound.request`
 
 Evaluated by the AuthBridge OPA plugin in the **inbound pipeline** — "who may call this agent". `allow` requires `subject_allow_ok` **and** `source_allow_ok` and **neither** `subject_deny_ok` **nor** `source_deny_ok` (deny-overrides). `subject_allow_ok` passes when the subject (`input.identity.subject`) holds a role granting at least one of the agent's own `agent_scopes` via `subject_role_allow_scopes`; `subject_deny_ok` mirrors it against `subject_role_deny_scopes`. `source_allow_ok` passes when (a) there is no calling `input.identity.client_id` (pure end-user traffic), (b) the `client_id` is one of the **platform bypass clients** — `rossoctl` by default, from `PLATFORM_SOURCE_CLIENTS` (Q5); this bypass is **mandatory**, since end-user traffic carries the platform client and would otherwise be denied — or (c) that client holds a role granting an agent scope via `source_role_allow_scopes`; `source_deny_ok` mirrors it against `source_role_deny_scopes`.
 
-The block below mirrors the current `generate_inbound_rego` output (`inbound/request.rego`) under the default `default_effect == Deny`, reproduced with light blank-line spacing for readability — every declaration map, gate, and the trailing decision block are identical to what the generator emits. (The `docs/examples/opa-team1-policy.yaml` golden fixture has been regenerated to these split gates and carries a `default_effect` annotation.)
+The block below mirrors the current `generate_inbound_rego` output (`inbound/request.rego`), reproduced with light blank-line spacing for readability — every declaration map, gate, and the trailing decision block are identical to what the generator emits.
 
 ```rego
 package authbridge.client.inbound.request
@@ -242,16 +237,6 @@ default allow := false
 allow if { subject_allow_ok; source_allow_ok; not subject_deny_ok; not source_deny_ok }
 ```
 
-Under `default_effect == Allow`, **only** the trailing decision block changes — every declaration map and gate above is emitted identically; the allow gates and the platform-bypass rules become inert, the package opens by default, and explicit denies still override:
-
-```rego
-default allow := true
-allow := false if { subject_deny_ok }
-allow := false if { source_deny_ok }
-```
-
-An unmentioned subject/source (matched by no deny gate) falls through to `default allow := true`; a subject or source named by a deny edge forces `allow := false` (see [Per-policy default effect](#per-policy-default-effect-default_effect) for why this can't be a bare constant flip).
-
 **Deny-overrides:** `allow` fires only when both allow gates pass **and** neither deny gate matches. A subject or source barred by a deny edge is rejected even when an allow edge would otherwise admit it. (An absent `input.identity.client_id` makes `source_allow_ok` true and — because `source_roles[input.identity.client_id]` is undefined — leaves `source_deny_ok` false, so an absent source still passes.)
 
 > **Security property — source-side deny reach.** The `source_allow_ok`
@@ -281,9 +266,16 @@ An unmentioned subject/source (matched by no deny gate) falls through to `defaul
 
 ### Outbound package: `authbridge.client.outbound.request`
 
-Evaluated by the AuthBridge OPA plugin in the **outbound pipeline** — "what this agent may call", **per invoked tool**. `allow` is an AND on the **same** `input.mcp.params.name`, requiring **both** allow gates to pass and **neither** deny gate to match (deny-overrides): `subject_allow_ok` (the delegated user's role admits the tool — `input.mcp.params.name in subject_role_allow_scopes[role]`, de-prefixed values) AND `target_allow_ok` (the target service, keyed by the full `input.identity.service_id`, admits the tool — `input.mcp.params.name in target_allow_scopes[input.identity.service_id]`), with `subject_deny_ok` / `target_deny_ok` mirroring them against `subject_role_deny_scopes` / `target_deny_scopes`. `agent_roles` / `agent_role_scopes` are emitted for debugging but are **not** referenced by `allow` — `target_allow_scopes[input.identity.service_id]` already *is* the per-scope capability gate. This package emits neither `agent_scopes` nor the inbound subject gate: outbound decisions never consider the agent's own audience scopes.
+Evaluated by the AuthBridge OPA plugin in the **outbound pipeline** — "what this agent may call". The four outbound gates are Rego **functions over a bare tool name**: `subject_allows(tool)` (the delegated user's role admits the tool — `tool in subject_role_allow_scopes[role]`, de-prefixed values), `target_allows(tool)` (the target service, keyed by the full `input.identity.service_id`, admits the tool — `tool in target_allow_scopes[input.identity.service_id]`), and `subject_denies(tool)` / `target_denies(tool)`, which mirror them against `subject_role_deny_scopes` / `target_deny_scopes`. The named gates apply these functions to the invoked tool: `subject_allow_ok if { subject_allows(input.mcp.params.name) }`, and the same for `subject_deny_ok`, `target_allow_ok` and `target_deny_ok`. `tool_ok(tool)` is the full per-tool check: both allow functions pass and neither deny function matches (deny-overrides).
 
-The block below mirrors the current `generate_outbound_rego` output (`outbound/request.rego`) under the default `default_effect == Deny`, annotated with explanatory `#` comments and spacing for readability — the maps, gates, and trailing decision block are identical to what the generator emits (which itself emits only the single `# informational/debugging only` comment). (As above, the `docs/examples/opa-team1-policy.yaml` golden fixture has been regenerated to these split gates with a `default_effect` annotation.)
+The decision has two `allow` rules:
+
+- **`tools/call` — per invoked tool.** `input.mcp.method == "tools/call"` and both allow gates pass on the **same** `input.mcp.params.name` and neither deny gate matches.
+- **MCP session messages.** `session_methods := {"initialize", "notifications/initialized", "ping", "tools/list"}`. These messages carry no tool name. A session message to a target is allowed iff at least one tool of that target (`some tool in target_allow_scopes[input.identity.service_id]`) passes `tool_ok(tool)` for this user. An allow that a deny vetoes gives no session.
+
+Every other MCP method, and a request with no method, is denied. The caller sees the whole tool list of the target (`tools/list`), but it can call only its granted tools. `agent_roles` / `agent_role_scopes` are emitted for debugging but are **not** referenced by `allow` — `target_allow_scopes[input.identity.service_id]` already *is* the per-scope capability gate. This package emits neither `agent_scopes` nor the inbound subject gate: outbound decisions never consider the agent's own audience scopes.
+
+The block below mirrors the current `generate_outbound_rego` output (`outbound/request.rego`), annotated with explanatory `#` comments for readability — the maps, gates, and trailing decision block are identical to what the generator emits (which itself emits only the single `# informational/debugging only` comment).
 
 ```rego
 package authbridge.client.outbound.request
@@ -292,7 +284,7 @@ import rego.v1
 agent_roles := ["github-agent.issue_operations", "github-agent.source_operations"]
 subject_roles := {
     "dev-user": ["developer"],
-    "test-user": ["tester"]
+    "test-user": ["tester"],
 }
 # The deployed github-tool (demo/assets/tools/github_tool) exposes
 # exactly four MCP tools — source-read, source-write, issues-read,
@@ -313,37 +305,46 @@ target_allow_scopes := {
     "spiffe://localtest.me/ns/team1/sa/github-tool": ["source-read", "source-write", "issues-read", "issues-write"],
 }
 target_deny_scopes := {}
-# user may reach the tool: holds a role granted the invoked tool (input.mcp.params.name)
-subject_allow_ok if {
+# the MCP messages that carry no tool name (see the session rule below)
+session_methods := {"initialize", "notifications/initialized", "ping", "tools/list"}
+
+# user may reach the tool: holds a role granted the tool
+subject_allows(tool) if {
     some role in subject_roles[input.identity.subject]
-    input.mcp.params.name in subject_role_allow_scopes[role]
+    tool in subject_role_allow_scopes[role]
 }
-subject_deny_ok if {
+subject_allow_ok if { subject_allows(input.mcp.params.name) }
+subject_denies(tool) if {
     some role in subject_roles[input.identity.subject]
-    input.mcp.params.name in subject_role_deny_scopes[role]
+    tool in subject_role_deny_scopes[role]
 }
-# agent may reach the tool: the invoked tool is one the target accepts (direct, per-scope)
-target_allow_ok if {
-    input.mcp.params.name in target_allow_scopes[input.identity.service_id]
+subject_deny_ok if { subject_denies(input.mcp.params.name) }
+# agent may reach the tool: the tool is one the target accepts (direct, per-scope)
+target_allows(tool) if {
+    tool in target_allow_scopes[input.identity.service_id]
 }
-target_deny_ok if {
-    input.mcp.params.name in target_deny_scopes[input.identity.service_id]
+target_allow_ok if { target_allows(input.mcp.params.name) }
+target_denies(tool) if {
+    tool in target_deny_scopes[input.identity.service_id]
+}
+target_deny_ok if { target_denies(input.mcp.params.name) }
+# the full per-tool check (both allow gates, no deny)
+tool_ok(tool) if {
+    subject_allows(tool)
+    target_allows(tool)
+    not subject_denies(tool)
+    not target_denies(tool)
 }
 default allow := false
-allow if { subject_allow_ok; target_allow_ok; not subject_deny_ok; not target_deny_ok }
+# tools/call: checked per invoked tool
+allow if { input.mcp.method == "tools/call"; subject_allow_ok; target_allow_ok; not subject_deny_ok; not target_deny_ok }
+# session messages: allowed iff at least one tool of the target passes tool_ok
+allow if { input.mcp.method in session_methods; some tool in target_allow_scopes[input.identity.service_id]; tool_ok(tool) }
 ```
 
-Under `default_effect == Allow`, **only** the trailing decision block changes — the two-gate AND is **dropped** and replaced by **deny-if-either-side**:
+**Known limit — A2A and LLM calls through the outbound proxy are denied.** The outbound package allows only a granted `tools/call` and the MCP session messages. Every other request falls to `default allow := false`. An A2A call (`input.a2a`, for example `message/send`) and an LLM call (an OpenAI-shaped chat request) carry no MCP method, so the agent's outbound OPA denies them with HTTP `403` (`policy.forbidden`, `plugin: opa`). This applies to every call that crosses the agent's outbound proxy. The demo `github-agent` sends its LLM traffic through it (`HTTP_PROXY=http://127.0.0.1:8081`, plain-HTTP `LLM_API_BASE`). Checked on the Kind cluster (handoff 11, 2026-10-01): an A2A `message/send` and an LLM `/v1/chat/completions` request from the agent container both got `403` from OPA. This handoff does not change the behavior. Until the outbound package has rules for A2A and inference traffic, wire the outbound OPA only where the agent's LLM endpoint does not cross the proxy (for example HTTPS passthrough, or `NO_PROXY`).
 
-```rego
-default allow := true
-allow := false if { subject_deny_ok }
-allow := false if { target_deny_ok }
-```
-
-**Why not a negated allow-gate AND.** Today's `allow` is `subject_allow_ok AND target_allow_ok AND not (either deny)` — a conjunction correct only under `Deny`, where a pair must be affirmatively granted by *both* gates. Under `Allow` you must **not** carry that AND forward as `allow := false if { not subject_allow_ok }` / `{ not target_allow_ok }`: every unmentioned `(role, tool)` pair matches neither allow gate and would be wrongly **denied**, defeating the permissive default. With deny-if-either-side an unmentioned pair (no deny on either side) falls through to `default allow := true`, and an explicit deny on **either** the subject side or the target/capability side overrides it.
-
-A worked example (agent `github-agent`, users `developer`/`tester`, tool `github-tool`) is maintained alongside the tests. The `docs/examples/opa-team1-policy.yaml` mirror has been regenerated to the split ALLOW/DENY gates and annotated with the `default_effect` semantics.
+A worked example (agent `github-agent`, users `developer`/`tester`, tool `github-tool`) is maintained alongside the tests. `docs/examples/opa-team1-policy.yaml` is one CR whose two packages are the exact `generate_inbound_rego` / `generate_outbound_rego` output for that demo policy; regenerate it when the generator changes.
 
 ### `AuthorizationPolicy` Custom Resource (Q6)
 
@@ -379,6 +380,17 @@ spec:
 Every upsert writes **both** tiers, each with `default allow := false`. The shipped global combiner allows a tier only when `ns_ok AND client_ok`, where `client_ok` comes from this package's `allow` — **except** that a tier with **no** CR falls back to allow via the combiner's `client_ok if not data.authbridge.client.<tier>` rule.
 
 Consequently **deleting a CR is off-boarding, not lockdown**: removing an agent's CR returns that agent to the combiner's **allow-fallback**, it does *not* deny the agent. To actually block an agent while keeping it in the system, **upsert** a CR with empty maps (so `allow` stays `false`) rather than deleting it.
+
+### Quarantined agent — the no-rules CR
+
+When a UC1 onboarding of an agent fails, the PCE `quarantine` replaces the agent's CR with a **no-rules CR** (see [policy-computation-engine.md → Quarantine (failed onboarding)](policy-computation-engine.md#quarantine-failed-onboarding)). The PCE writes it with `apply_agent_policy`. The model is the `_fresh_apm` shell of the PCE: the `agent_id` and empty identity maps (`agent_roles`, `agent_scopes`, `source_roles`, `subject_roles`), and no rules. The writer renders it with the same generators, so both tiers keep all gates and end with `default allow := false`.
+
+- **Inbound:** `subject_roles` and `agent_scopes` are empty, so `subject_allow_ok` never passes. Every inbound request is denied. This is also true for the `rossoctl` platform client: the bypass sets only `source_allow_ok`, and `allow` also needs `subject_allow_ok`.
+- **Outbound:** `target_allow_scopes` and `subject_roles` are empty, so no `tools/call` passes and no target has a tool for the session rule. Every outbound request is denied.
+
+**Why not a delete.** The shipped combiner allows a pod that has no client CR (`client_ok if not data.authbridge.client.<tier>`, see [Q7](#both-tiers-always-emitted-delete--off-boarding-q7)). A delete would open the failed agent. A tool has no CR, so a quarantined tool gets none. Its callers lose it through their re-derived outbound packages.
+
+**The lift.** A successful re-onboarding writes the real CR over the no-rules CR. Both writes use the same SSA field manager (`aiac-pdp-policy-writer`), so the second write replaces the first.
 
 ---
 
@@ -498,7 +510,7 @@ docker build -f src/aiac/pdp/service/policy/opa/Dockerfile \
 - **Kube config at import:** `_load_kube_config()` tries `config.load_incluster_config()`, falling back to `config.load_kube_config()` (local dev). Both failing is non-fatal — the module stays importable and API calls surface as 502/503 until real config exists. A module-level `client.CustomObjectsApi` handles all CR operations.
 - **Code constants (never env vars):** `_GROUP = "agent.rossoctl.dev"`, `_VERSION = "v1alpha1"`, `_PLURAL = "authorizationpolicies"`, `_MANAGED_BY_LABEL = {"app.kubernetes.io/managed-by": "aiac-pdp-policy-writer"}`, `_FIELD_MANAGER = "aiac-pdp-policy-writer"` (Q8).
 - **`identity_ref(agent_id) -> (namespace, name)`** (in `rego.py`): SPIFFE or `<ns>/<name>` → DNS-1123-validated `(namespace, name)`; raises `ValueError` (→ 400) when no namespace is derivable or a segment is an invalid label — no fallback.
-- **`generate_inbound_rego(model, platform_clients)` / `generate_outbound_rego(model)`** (in `rego.py`): render the two fixed-package strings under the ALLOW/DENY model. The inbound generator emits `subject_roles` / `source_roles` (effect-agnostic) plus the grouped `subject_role_allow_scopes` / `subject_role_deny_scopes` (from `inbound_subject_{allow,deny}_rules`) and `source_role_allow_scopes` / `source_role_deny_scopes` (from `inbound_source_{allow,deny}_rules`), one `source_allow_ok` bypass rule per `platform_clients` entry (plus the no-`client_id` and role-based rules), and the mirrored `subject_deny_ok` / `source_deny_ok` gates; `allow` applies deny-overrides. The outbound generator emits `subject_role_allow_scopes` / `subject_role_deny_scopes` (from `outbound_subject_{allow,deny}_rules`), the single informational `agent_role_scopes` (from `outbound_target_allow_rules`), and `target_allow_scopes` / `target_deny_scopes`, de-prefixing its map values; `allow` is a per-scope AND with deny-overrides. Both generators branch on `model.default_effect`: `Deny` (default) emits today's `default allow := false` + single `allow if { … }` block **byte-for-byte**; `Allow` emits `default allow := true` + one `allow := false if { <deny_gate> }` rule per deny gate (`subject_deny_ok` / `source_deny_ok` inbound; `subject_deny_ok` / `target_deny_ok` outbound). Only the decision block differs — all declaration maps and `*_allow_ok` / `*_deny_ok` gates are emitted identically in both modes, and the generator never reconciles an allow-vs-deny overlap (a genuine overlap is an upstream 422; see [Per-policy default effect](#per-policy-default-effect-default_effect)).
+- **`generate_inbound_rego(model, platform_clients)` / `generate_outbound_rego(model)`** (in `rego.py`): render the two fixed-package strings under the ALLOW/DENY model (always DENY by default). The inbound generator emits `subject_roles` / `source_roles` (effect-agnostic) plus the grouped `subject_role_allow_scopes` / `subject_role_deny_scopes` (from `inbound_subject_{allow,deny}_rules`) and `source_role_allow_scopes` / `source_role_deny_scopes` (from `inbound_source_{allow,deny}_rules`), one `source_allow_ok` bypass rule per `platform_clients` entry (plus the no-`client_id` and role-based rules), and the mirrored `subject_deny_ok` / `source_deny_ok` gates; `allow` applies deny-overrides. The outbound generator emits `subject_role_allow_scopes` / `subject_role_deny_scopes` (from `outbound_subject_{allow,deny}_rules`), the single informational `agent_role_scopes` (from `outbound_target_allow_rules`), and `target_allow_scopes` / `target_deny_scopes`, de-prefixing its map values; the four outbound gates are functions over a bare tool name (`subject_allows` / `subject_denies` / `target_allows` / `target_denies`), with `tool_ok(tool)` and `session_methods`; `allow` is a per-tool AND with deny-overrides for `tools/call`, plus the MCP session rule. Both generators emit `default allow := false` and `allow if { … }` rule(s) only — there is no default-effect branch. The generator never reconciles an allow-vs-deny overlap (a genuine overlap is an upstream 422; see [Always DENY by default](#always-deny-by-default)).
 
 > **Rollout impact.** These identifier renames are symmetric with **no alias / no back-compat**. All generated `.rego` **golden fixtures must be regenerated** to match the split gates. The demo helper `demo/use-cases/onboarding/lib/_lib.py` (which reads the `target_scopes` Rego map) must **retarget to `target_allow_scopes`**.
 - **`_build_cr(model)`:** assemble the CR body — `metadata.name`/`.namespace` from `identity_ref`, the managed-by label, `spec.scope: client`, `spec.clientID` = the display name, and `policies[]` = the two rendered packages. Raises `ValueError` (via `identity_ref`) on a malformed `agent_id`.

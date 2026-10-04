@@ -10,7 +10,7 @@
 > **Ladder, not one test.** This spec was previously a single "complete two-policy" test that assumed a
 > **two-stack** topology (one AIAC stack per `policy.md` variant) which is **not deployed** and so could
 > never run. It is now a **ladder** of three gradual, runnable happy-path tests against **one** AIAC
-> stack, plus two **deferred** rungs (two-policy and failure-path rollback):
+> stack, one failure-path rung (rung 5), and one **deferred** rung (two-policy):
 >
 > | Rung | Issue | Onboards | Proves |
 > |---|---|---|---|
@@ -18,7 +18,7 @@
 > | 2 | `testing/5.4.2-uc1-onboard-agent-then-tool.md` | agent → tool | onboarding the tool **after** the agent completes the agent's outbound gate (PCE additive merge) |
 > | 3 | `testing/5.4.3-uc1-onboard-tool-then-agent.md` | tool → agent | the happy path; **and, vs rung 2, onboarding-order-independence** |
 > | 4 | `testing/5.4.4-uc1-onboard-two-policies.md` | two policies | **deferred / TBD**; two-stack impl discarded |
-> | 5 | `testing/5.4.5-uc1-onboard-failure-rollback.md` | agent (PRB failure) | **deferred / no test file**; UC-1 **compensating rollback** under the event model (failure surfaces via NATS redelivery→DLQ, not an HTTP status). Tracked by the PRB-failure issue opened alongside the harness work |
+> | 5 | `testing/5.4.5-uc1-onboard-failure-rollback.md` | agent / tool (build failure) | UC-1 **compensating rollback + PCE quarantine**: a failed agent denies every request, a failed tool is unreachable, and a successful re-onboarding lifts the quarantine. Also the outbound **MCP session** for a granted user. Test file: `test/system/test_uc1_onboard_failure_rollback.py` |
 
 > **Relationship to `policy-pipeline`.** This is the **onboarding-order-focused sibling** of
 > [policy-pipeline.md](policy-pipeline.md). Identical *scenario facts and truth tables* (same three users,
@@ -32,8 +32,8 @@
 
 `test/system/` — pytest modules marked `@pytest.mark.system`, one per **implemented** rung
 (`test_uc1_onboard_agent_only.py`, `test_uc1_onboard_agent_then_tool.py`,
-`test_uc1_onboard_tool_then_agent.py`). Rungs 4 (two-policy) and 5 (failure-rollback) are **deferred and
-have no test file**. Each implemented module is a thin module that wraps the shared harness in a
+`test_uc1_onboard_tool_then_agent.py`, and `test_uc1_onboard_failure_rollback.py` for rung 5). Rung 4
+(two-policy) is **deferred and has no test file**. Each implemented module is a thin module that wraps the shared harness in a
 one-line session fixture and supplies only its own rung's oracle (verdicts computed from
 `scenario_uc1.py`) and live assertions. They import three shared modules:
 
@@ -278,25 +278,33 @@ it is deterministic and real: at the unit level by the grant-set oracle
 (`test/unit/agent/uc/onboarding/test_uc1_grant_set_oracles.py`) and live by `test_no_tool_scopes_provisioned`
 (no `github-tool.*` scope in Keycloak). Inbound is unaffected.
 
-## Failure path — compensating rollback (rung 5) — **deferred**
+## Failure path — compensating rollback and quarantine (rung 5)
 
-Rungs 1–3 prove the happy path. Rung 5 would prove the **failure path**: a build failure must leave **no
-partial footprint** and a **visible failed-service marker**, per the UC-1
+Rungs 1–3 prove the happy path. Rung 5 (`test/system/test_uc1_onboard_failure_rollback.py`) proves the
+**failure path**, per the UC-1
 [Failure & Rollback](../specs/components/aiac-agent/uc1-service-onboarding.md#failure--rollback) contract
-(Service Provision's non-LLM nodes succeed and create the agent's roles/scopes; the LLM is first reached
-inside `ServicePolicyBuilder.build`, so a broken PRB LLM seam raises `LLMAccessError` after Provision has
-written its entities — exactly the provision-succeeded / build-failed shape the rollback exists for).
+and the PCE [Quarantine](../specs/components/policy-computation-engine.md#quarantine-failed-onboarding).
+Service Provision succeeds and creates the service's roles/scopes; the build then fails (a
+`_ROLLBACK_ERRORS` failure, for example a broken PRB LLM seam). The Orchestrator rolls back, calls the PCE
+`quarantine`, and re-raises. Under the event model the failure surfaces via **NATS redelivery → DLQ**, not
+an HTTP status, so the rung asserts only observable end state (Keycloak, CRs, the policy store, and real
+requests through AuthBridge + OPA):
 
-**Rung 5 is deferred and has no test file.** Its assertions were written around the **synchronous** POST
-trigger — a `POST /apply/service/{id}` returning **`502`** with a sanitized body — which **no longer
-applies** under the event model: onboarding is now fired asynchronously by `CLIENT_CREATED` over NATS,
-with **no HTTP status to assert on**. Under the event model a PRB failure surfaces via **NATS
-redelivery → dead-letter queue (DLQ)**, not an HTTP error, so the failure-observation surface must be
-respecified before the rung can be written. This is tracked by the **PRB-failure issue opened alongside
-the harness work** (Handoff `04`). The observable end state the rung must eventually assert is unchanged
-(observable Keycloak + CR state only): no partial footprint (provisioned roles/scopes absent, `client.type`
-unset), a failed-service marker (`enabled=false`), no `AuthorizationPolicy` CR, and a clean re-onboard
-that re-enables the client and upserts the CR — the live counterpart of the UC-1 rollback unit coverage.
+- **Failed agent:**
+  - the agent's `AuthorizationPolicy` CR is **present** and is the **no-rules CR** (not deleted — a missing
+    CR would open the agent through the combiner's allow-fallback);
+  - a real inbound request through AuthBridge + OPA is **denied**;
+  - the Keycloak client is **disabled** (`enabled=false`), and its `client.type` is **kept**;
+  - the agent has **no SPM** in the policy store.
+- **Failed tool:**
+  - the tool has **no CR** (a tool never has one) and **no SPM**;
+  - the agent's outbound **denies** a call to the tool.
+- **Lift:** a successful re-onboarding writes the **real CR** over the no-rules CR and **re-enables** the
+  client. The test proves the lift on the agent only: a quarantined tool cannot be re-onboarded today
+  (see the known limit in `docs/specs/components/aiac-agent/uc1-service-onboarding.md`), so the failed-tool
+  phase runs last.
+- **Outbound MCP session:** through the agent's outbound leg, `initialize`, `tools/list` and `tools/call`
+  work for a granted user (a user who holds a grant on at least one tool of the target).
 
 ## Expected output
 
@@ -322,6 +330,10 @@ and 3** (with a tool onboarded):
 | dev-user | ✅ | ✅ | ✅ | ❌ |
 | test-user | ❌ | ❌ | ✅ | ✅ |
 | devops-user | ❌ | ❌ | ❌ | ❌ |
+
+The table covers `tools/call`. The MCP session messages (`initialize`, `notifications/initialized`,
+`ping`, `tools/list`) to `github-tool` are allowed for a user who holds a grant on at least one of its
+tools (`dev-user`, `test-user`) and denied otherwise (`devops-user`).
 
 **Rung 1 (agent only):** the outbound user gate is **empty** (no tool scopes), so this table has no live
 counterpart on rung 1 — the outbound leg is **not probed**. The emptiness is asserted at the unit level
@@ -448,11 +460,12 @@ CLI or a container runtime makes the load (and thus the test) **fail loudly**, n
 - **Onboarding-order-independence is asserted, not assumed** (rungs 2 vs 3). Rung 3's intended end state
   is checked identical to rung 2's published expectations, and the real plugin's decisions are asserted in
   the tool→agent order. A divergence is a bug.
-- **The failure path is deferred** (rung 5). Its old `POST`-`502` assertions do not apply under the event
-  model — a PRB failure now surfaces via **NATS redelivery→DLQ**, not an HTTP status — so the rung is
-  respecified and tracked by the PRB-failure issue (Handoff `04`). The observable end state it must
-  eventually assert is unchanged (no partial footprint, `client.type` unset, `enabled=false`, no CR; a
-  clean re-onboard re-enables), on observable Keycloak + CR state only.
+- **The failure path asserts observable end state only** (rung 5). A build failure surfaces via **NATS
+  redelivery→DLQ**, not an HTTP status, so the rung does not assert a `POST` status. It asserts Keycloak,
+  CR and policy-store state and real requests through AuthBridge + OPA: a failed agent has the no-rules
+  CR and is denied, its client is disabled with `client.type` kept, and it has no SPM; a failed tool has
+  no CR and no SPM and is unreachable from the agent; a clean re-onboard writes the real CR and
+  re-enables the client.
 - **Per-scope two-gate AND.** UC-1's per-skill operator roles are mapped to the tool scopes by
   capability-match, so the capability gate is populated; the plugin enforces the real per-scope AND. The
   agent reaches all four tool scopes, so the user gate discriminates.
@@ -481,7 +494,7 @@ CLI or a container runtime makes the load (and thus the test) **fail loudly**, n
   wired.
 
 Tracking issues: `testing/5.4-uc1-onboarding-integration-test.md` (epic) + `5.4.1`/`5.4.2`/`5.4.3` (rungs)
-+ `5.4.4` (deferred two-policy) + `5.4.5` (deferred failure-path rollback).
++ `5.4.4` (deferred two-policy) + `5.4.5` (failure-path rollback and quarantine).
 
 ## Out of Scope
 
@@ -494,9 +507,8 @@ Tracking issues: `testing/5.4-uc1-onboarding-integration-test.md` (epic) + `5.4.
   Keycloak SPI + enabling the realm listener, and deploying the NATS Event Broker are **preconditions**,
   not test steps. (Loading the demo images, then deploying and tearing down the *workloads*, by contrast,
   **is** a test step — the fixture runs `kind-load.sh` before deploy — see *[Per-rung flow](#per-rung-flow)*.)
-- **Two-policy (rung 4) and failure-rollback (rung 5)** — both **deferred**. Rung 4's two-stack topology
-  is discarded and the in-cluster approach is TBD (`testing/5.4.4-uc1-onboard-two-policies.md`); rung 5
-  is respecified for the event model and tracked by the PRB-failure issue (Handoff `04`).
+- **Two-policy (rung 4)** — **deferred**. Rung 4's two-stack topology is discarded and the in-cluster
+  approach is TBD (`testing/5.4.4-uc1-onboard-two-policies.md`).
 - **The agent's CrewAI reasoning flow / real A2A message content** — the probes drive synthetic requests
   through AuthBridge to exercise the enforced gates; they do not run the agent's task graph.
 - **Default-CI wiring** — `@pytest.mark.system`; runs on demand.

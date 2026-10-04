@@ -2,7 +2,8 @@
 
 The only use case with an Orchestrator, because it is a **two-stage** pipeline. Invoked by
 the Controller for the ``aiac.apply.service.{id}`` / ``POST /apply/service/{service_id}``
-trigger, it sequences the two sub-agents and returns ``(list[PolicyRule], override=False)``:
+trigger, it sequences the two sub-agents and returns ``(list[PolicyRule], override=False, client_id)``
+(``client_id`` is the service's clientId, which the Controller passes to the PCE as ``focus_service``):
 
     1. Service Provision  — classifies the service and writes its roles/scopes into the IdP,
        producing the discovered ``service_type`` and the **created-manifest** (exactly the
@@ -16,12 +17,16 @@ is always ``False`` (append; existing roles keep their other access).
 **Replay safety (at-least-once delivery):** Provision IdP writes are idempotent and the PCE
 reconcile is idempotent, so a crash between stages simply re-runs the full pipeline to
 convergence on NATS redelivery. A build **failure**, however, triggers a **compensating
-rollback** (UC1-only) before the error propagates — see :func:`_rollback`.
+rollback** (UC1-only) and then the PCE ``quarantine`` before the error propagates — see
+:func:`_rollback` and :func:`onboard_service`. The PCE owns the PDP: this module never imports
+``aiac.pdp.policy.library``.
 """
 
 import contextlib
 import logging
 import threading
+
+from fastapi import HTTPException
 
 from aiac.agent.policy_rules_builder.conflict_detection import PolicyConflictError
 from aiac.agent.policy_rules_builder.graph import (
@@ -33,7 +38,9 @@ from aiac.agent.uc.onboarding.policy_builder.builder import ServicePolicyBuilder
 from aiac.agent.uc.onboarding.provision.graph import build_provision_graph
 from aiac.agent.uc.onboarding.provision.state import OnboardingProvisionState, Trigger
 from aiac.idp.configuration.api import Configuration
-from aiac.policy.model.models import PolicyRule, RuleEffect
+from aiac.idp.configuration.models import ClientId, Service, ServiceUuid
+from aiac.policy.computation import quarantine
+from aiac.policy.model.models import PolicyRule
 
 logger = logging.getLogger(__name__)
 
@@ -132,31 +139,33 @@ def _loggable(value: object) -> str:
     return str(value).replace("\r", "").replace("\n", "")
 
 
-def _rollback(config: Configuration, service_id: str, created_roles, created_scopes) -> None:
-    """Compensating rollback (UC1-only): tear down exactly what Provision created on this run,
-    unset the client type, then disable the client as a failed-service marker.
+def _rollback(config: Configuration, service: Service, created_roles, created_scopes) -> None:
+    """Compensating rollback (UC1-only): tear down exactly what Provision created on this run, then
+    disable the client as a failed-service marker.
 
     ``created_roles`` / ``created_scopes`` are the **created-manifest** — only the entities this
     run added (reused-by-name entities are absent, so a role/scope another service shares is never
     removed). Each ``delete_service_*`` unmaps-then-deletes and is idempotent, so a retry that
     finds an object already gone does not crash. The disable lands **last**, after the teardown,
     so an interrupted rollback never leaves a disabled-but-still-provisioned client. Actions are
-    logged at INFO."""
-    service = config.get_service(service_id)
-    safe_id = _loggable(service_id)
+    logged at INFO.
+
+    The client **type is kept**: the rollback removes only what this run created, and the type
+    was not created by it. The
+    policy side of the teardown is the PCE's :func:`~aiac.policy.computation.quarantine`, which
+    the caller runs next."""
+    safe_id = _loggable(service.id)
     for role in created_roles:
         config.delete_service_role(service, role)
         logger.info("UC1 rollback: deleted role %r (service %s)", _loggable(getattr(role, "name", role)), safe_id)
     for scope in created_scopes:
         config.delete_service_scope(service, scope)
         logger.info("UC1 rollback: deleted scope %r (service %s)", _loggable(getattr(scope, "name", scope)), safe_id)
-    config.unset_service_type(service)
-    logger.info("UC1 rollback: unset client type (service %s)", safe_id)
     config.set_service_enabled(service, False)
     logger.info("UC1 rollback: disabled client — failed-service marker (service %s)", safe_id)
 
 
-def reenable_service(service_id: str) -> None:
+def reenable_service(service_id: ServiceUuid) -> None:
     """Re-enable the Keycloak client (UC1-only, idempotent), clearing any prior failed-disable marker.
 
     The **caller** (Controller route or NATS consumer) invokes this AFTER a successful
@@ -170,22 +179,33 @@ def reenable_service(service_id: str) -> None:
     config.set_service_enabled(config.get_service(service_id), True)
 
 
-def onboard_service(
-    service_id: str, default_effect: RuleEffect = RuleEffect.DENY
-) -> tuple[list[PolicyRule], bool, RuleEffect]:
-    """Sequence Provision → Policy Builder and return ``(rules, override=False, default_effect)``.
+def onboard_service(service_id: ServiceUuid) -> tuple[list[PolicyRule], bool, ClientId]:
+    """Sequence Provision → Policy Builder and return ``(rules, override=False, client_id)``.
 
-    On any of the four typed build failures (see ``_ROLLBACK_ERRORS``) the Orchestrator runs the
-    compensating :func:`_rollback` (UC1-only) and **re-raises** the original error unchanged. On
+    ``service_id`` is the Keycloak internal client UUID that the trigger carries. The Orchestrator
+    reads the ``Service`` from the IdP **once**, before Provision, and resolves its clientId
+    (``Service.serviceId``) — the only service id the PCE takes. The caller passes the returned
+    ``client_id`` to ``compute_and_apply`` as ``focus_service``, so it makes no second IdP read. If
+    the read fails, nothing exists yet that needs compensation: it raises ``HTTPException(502)``
+    (as Provision's ``classify_service`` does) before Provision.
+
+    On any of the four typed build failures (see ``_ROLLBACK_ERRORS``, for agents and tools, on the
+    first failure — also the retryable ``LLMAccessError``) the Orchestrator runs the compensating
+    :func:`_rollback` (delete this run's created roles/scopes; disable the client last), then the
+    PCE's ``quarantine(client_id, created_roles)`` (delete the SPM, remove the service's roles —
+    including the created roles the rollback deleted — from the other SPMs,
+    replace an agent's CR with a no-rules CR, re-derive the affected agents), and **re-raises** the
+    original error unchanged. The disable comes before the quarantine, so no run after the teardown
+    sees the service as enabled. The quarantine runs even when the rollback raises, so a failed
+    rollback never leaves a first onboarding fail-open. A rollback or quarantine failure
+    propagates in place of the build error (the build error stays on its ``__context__``): the
+    compensation failure is not in the consumer's permanent set, so NATS redelivers and the next
+    run tries the compensation again. If the build error won, a permanent build error would
+    ``term()`` the message and leave the half-compensated service fail-open. The
+    quarantine is lifted only by a successful re-onboarding. On
     success it does **not** re-enable the client here: the client is re-enabled by the caller via
     :func:`reenable_service`, but only AFTER the caller's ``compute_and_apply`` (PCE) call succeeds,
     so a PCE failure leaves the client disabled rather than enabled-with-no-policy.
-
-    ``default_effect`` is passed straight back to the Controller so it reaches the single
-    ``compute_and_apply`` call and lands on every derived ``AgentPolicyModel``. It defaults to
-    ``DENY`` (least-privilege); a caller onboarding a service that should default to ``ALLOW``
-    supplies it here. This is the caller-facing surface for requesting a permissive default
-    end-to-end (onboard → PCE → derived APM → OPA).
 
     The full provision → build → rollback lifecycle is serialized per ``service_id`` (see
     :func:`_service_lock`): a concurrent same-service run cannot corrupt the created-manifest
@@ -194,16 +214,30 @@ def onboard_service(
     both the success and failure paths, without breaking serialization. This is an in-process
     lock (one agent replica only); cross-replica serialization is out of scope."""
     with _service_lock(service_id):
+        config = _config()
+        try:
+            service = config.get_service(service_id)
+        except Exception as e:
+            # The same boundary as Provision's classify_service: an IdP outage or an unknown UUID
+            # is a 502, not a raw error that the Controller turns into a 500.
+            raise HTTPException(502, f"IdP config unavailable resolving service {service_id!r}: {e}") from e
+        client_id = ClientId(service.serviceId)
+
         provision = build_provision_graph().invoke(OnboardingProvisionState(trigger=Trigger(entity_id=service_id)))
         service_type = provision["service_type"]
         created_roles = provision["created_roles"]
         created_scopes = provision["created_scopes"]
 
-        config = _config()
         try:
             rules = ServicePolicyBuilder.build(service_id, service_type)
         except _ROLLBACK_ERRORS:
-            _rollback(config, service_id, created_roles, created_scopes)
+            try:
+                _rollback(config, service, created_roles, created_scopes)
+            finally:
+                # A failed rollback must not leave a first onboarding fail-open.
+                # Pass the created roles: the rollback deleted them from the IdP, so the quarantine
+                # cannot find them in the catalog, but their grants can be on other SPMs.
+                quarantine(client_id, created_roles)
             raise
 
-        return rules, False, default_effect
+        return rules, False, client_id

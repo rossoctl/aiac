@@ -113,13 +113,47 @@ def _discovery_token(service_id: str) -> str:
 # block the onboarding request indefinitely (there was previously no timeout).
 _MCP_TIMEOUT = (5, 30)
 
+# How long discovery waits for the tool's MCP endpoint to become ready. The operator registers the
+# tool's Keycloak client (which fires the onboarding event) while it still rolls the tool pod onto
+# the AuthBridge-injected template, so the Service can have no ready endpoint for some seconds
+# ("connection refused"), or the sidecar can answer 502/503/504 while the app starts. Failing here
+# is retryable, but the NATS redelivery comes only after ACK_WAIT (600 s), so discovery waits for
+# the endpoint instead. Read from the env at call time; keep it well below ACK_WAIT.
+_MCP_READY_TIMEOUT_ENV = "AIAC_MCP_DISCOVERY_READY_TIMEOUT"
+_MCP_READY_TIMEOUT_DEFAULT = 120.0
+_MCP_READY_INTERVAL = 3.0  # seconds between readiness attempts (patched in unit tests)
+
+
+def _mcp_ready_timeout() -> float:
+    """The discovery readiness budget in seconds; an unset, non-numeric or negative value falls
+    back to the default."""
+    try:
+        value = float(os.getenv(_MCP_READY_TIMEOUT_ENV, str(_MCP_READY_TIMEOUT_DEFAULT)))
+    except (TypeError, ValueError):
+        return _MCP_READY_TIMEOUT_DEFAULT
+    return value if value >= 0 else _MCP_READY_TIMEOUT_DEFAULT
+
+
+def _endpoint_not_ready(exc: Exception) -> bool:
+    """True for the failures of an MCP endpoint that is not ready yet: a connection-level error
+    (refused, reset, connect timeout) or a 502/503/504 from the sidecar. A read timeout (the tool
+    accepted the connection and hangs) and any other status are not waited for."""
+    import requests
+
+    if isinstance(exc, requests.ConnectionError):  # includes ConnectTimeout
+        return True
+    response = getattr(exc, "response", None)
+    return isinstance(exc, requests.HTTPError) and getattr(response, "status_code", None) in (502, 503, 504)
+
 
 def _mcp_tools_list(endpoint: str, token: str | None = None) -> list[dict]:
     """POST a JSON-RPC `tools/list` to an MCP endpoint and return the tool manifest list.
     Each tool is a dict with `name` and (optional) `description`. When `token` is provided it is
     sent as an `Authorization: Bearer` header (the tool's MCP endpoint is fronted by an AuthBridge
     sidecar that validates inbound JWTs). Bounded transport retries are applied here so callers
-    just map the final failure to a 502."""
+    just map the final failure to a 502. Around them, an endpoint that is not ready yet (see
+    ``_endpoint_not_ready``) is tried again every ``_MCP_READY_INTERVAL`` seconds until the
+    ``AIAC_MCP_DISCOVERY_READY_TIMEOUT`` budget ends (default 120 s)."""
     import requests
 
     def _do():
@@ -135,7 +169,14 @@ def _mcp_tools_list(endpoint: str, token: str | None = None) -> list[dict]:
         resp.raise_for_status()
         return (resp.json().get("result") or {}).get("tools", [])
 
-    return run_upstream(_do)
+    deadline = time.monotonic() + _mcp_ready_timeout()
+    while True:
+        try:
+            return run_upstream(_do)
+        except requests.RequestException as exc:
+            if not _endpoint_not_ready(exc) or time.monotonic() >= deadline:
+                raise
+        time.sleep(_MCP_READY_INTERVAL)
 
 
 def _select_pod(pods, workload_name: str):

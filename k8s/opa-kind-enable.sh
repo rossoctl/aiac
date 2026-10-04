@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# opa-kind-enable.sh — authbridge/docs/opa-kind-runbook.md Steps 1-5, on the fly.
+# opa-kind-enable.sh — k8s/opa-kind-runbook.md Step 1 (the enable Steps 1-5), on the fly.
 #
 # Wires the OPA plugin into every agent's inbound AND outbound AuthBridge
 # pipeline on a Kind cluster, alongside the full parser set (a2a-parser,
@@ -17,7 +17,10 @@
 #
 # Requires: kubectl, helm, kind, docker (or podman), python3 not needed here.
 # Env vars:
-#   OPERATOR_DIR        path to the rossoctl/operator repo clone (bundle-service)
+#   OPERATOR_DIR        path to the rossoctl/operator repo clone; Step 1 builds
+#                       the operator image (which carries the bundle-service
+#                       binary) and renders the bundle-service templates from
+#                       its local chart                   (default: ../operator)
 #   ROSSOCTL_DIR        path to the rossoctl/rossoctl repo clone (the chart)
 #   CORTEX_DIR          path to the rossoctl/cortex repo clone; the authbridge
 #                       source built in Step 2 lives there, not in this repo
@@ -27,6 +30,11 @@
 #   RELEASE_NAMESPACE   namespace the chart is installed in (default: rossoctl-system)
 #   AGENT_NAMESPACE     namespace to restart agent pods in (default: team1)
 #   IMAGE_TAG           local authbridge-proxy image tag  (default: localhost/authbridge:local)
+#   GO_BUILD_TAGS       authbridge plugin build tags (default: the cortex "full"
+#                       profile, from scripts/profile-tags; derived with a local
+#                       `go`, or in a golang container when go is absent)
+#   OPERATOR_IMAGE      local operator image (bundle-service runs from it)
+#                       (default: localhost/rossoctl-operator:<operator HEAD short sha>)
 #   CONTAINER_RUNTIME   docker | podman                   (default: docker, auto-falls back to podman)
 #   AUTHBRIDGE_PROFILE  plugin profile for the Step 2 build (default: full — the
 #                       proxy-sidecar set, the only one carrying the opa plugin)
@@ -51,20 +59,24 @@ RELEASE_NAMESPACE="${RELEASE_NAMESPACE:-rossoctl-system}"
 AGENT_NAMESPACE="${AGENT_NAMESPACE:-team1}"
 IMAGE_TAG="${IMAGE_TAG:-localhost/authbridge:local}"
 
-if [ -z "$OPERATOR_DIR" ] || [ ! -d "$OPERATOR_DIR" ]; then
+if [ -z "$OPERATOR_DIR" ] || [ ! -f "$OPERATOR_DIR/operator/Dockerfile" ] || [ ! -d "$OPERATOR_DIR/charts/operator/templates/bundleservice" ]; then
   echo "ERROR: Set OPERATOR_DIR to point to your rossoctl/operator repo clone" >&2
+  echo "       (Step 1 needs \$OPERATOR_DIR/operator/Dockerfile and the bundle-service" >&2
+  echo "        templates in \$OPERATOR_DIR/charts/operator/templates/bundleservice/)" >&2
   exit 1
 fi
 if [ -z "$ROSSOCTL_DIR" ] || [ ! -d "$ROSSOCTL_DIR" ]; then
   echo "ERROR: Set ROSSOCTL_DIR to point to your rossoctl/rossoctl repo clone" >&2
   exit 1
 fi
-if [ -z "$CORTEX_DIR" ] || [ ! -d "$CORTEX_DIR/authbridge" ]; then
+if [ -z "$CORTEX_DIR" ] || [ ! -f "$CORTEX_DIR/cmd/authbridge-proxy/Dockerfile" ]; then
   echo "ERROR: Set CORTEX_DIR to point to your rossoctl/cortex repo clone" >&2
-  echo "       (Step 2 builds the authbridge-proxy image from \$CORTEX_DIR/authbridge," >&2
-  echo "        which lives in the cortex monorepo, not in this repo)" >&2
+  echo "       (Step 2 builds the authbridge-proxy image from" >&2
+  echo "        \$CORTEX_DIR/cmd/authbridge-proxy/Dockerfile, which lives in the cortex" >&2
+  echo "        monorepo, not in this repo)" >&2
   exit 1
 fi
+OPERATOR_IMAGE="${OPERATOR_IMAGE:-localhost/rossoctl-operator:$(git -C "$OPERATOR_DIR" rev-parse --short HEAD)}"
 
 VALUES_FILE="${ROSSOCTL_DIR}/charts/rossoctl/values.yaml"
 CHART_DIR="${ROSSOCTL_DIR}/charts/rossoctl"
@@ -105,52 +117,62 @@ load_image_to_kind() {
 OVERLAY_FILE="$(mktemp "${TMPDIR:-/tmp}/opa-kind-enable-overlay.XXXXXX")"
 TMPFILES+=("$OVERLAY_FILE")
 
-echo "==> Step 1/5: deploying bundle-service (${OPERATOR_DIR})"
-( cd "$OPERATOR_DIR" && ./operator/hack/bundle-service-kind.sh "$CLUSTER_NAME" "$RELEASE_NAMESPACE" )
+echo "==> Step 1/5: deploying bundle-service from the operator chart (${OPERATOR_DIR}, image ${OPERATOR_IMAGE})"
+# The bundle service ships inside the operator image (selected by the container
+# `command:`) and is installed by the operator chart behind
+# bundleService.enabled. No released operator chart carries it yet, so — like
+# operator/hack/kind-reload-all.sh — build the image from the clone and render
+# only the bundle-service templates from its local chart. The rest of the
+# operator (the controller-manager) is left as installed.
+"$CONTAINER_RUNTIME" build -t "$OPERATOR_IMAGE" -f "$OPERATOR_DIR/operator/Dockerfile" "$OPERATOR_DIR/operator"
+load_image_to_kind "$OPERATOR_IMAGE"
+kubectl apply -f "$OPERATOR_DIR/operator/config/crd/bases/agent.rossoctl.dev_authorizationpolicies.yaml"
+# A bundle-service from the removed operator/hack/bundle-service-kind.sh selects
+# on `app: bundle-service` only. The chart's selector adds the
+# app.kubernetes.io/{name,instance} labels, and a Deployment selector is
+# immutable, so delete that legacy Deployment before the apply.
+#
+# The chart's bundle-service NetworkPolicy is NOT applied: it admits only pods
+# labelled rossoctl.dev/authbridge=true, and nothing (operator webhook, chart,
+# AuthBridge) sets that label today. On a CNI that enforces NetworkPolicy it
+# would block every AuthBridge bundle fetch. The removed hack script applied no
+# NetworkPolicy either, so this keeps the earlier dev-cluster behavior.
+if kubectl get deployment bundle-service -n "$RELEASE_NAMESPACE" >/dev/null 2>&1 \
+  && [ -z "$(kubectl get deployment bundle-service -n "$RELEASE_NAMESPACE" \
+        -o jsonpath='{.spec.selector.matchLabels.app\.kubernetes\.io/instance}')" ]; then
+  kubectl delete deployment bundle-service -n "$RELEASE_NAMESPACE" --wait=true
+fi
+helm template rossoctl-operator "$OPERATOR_DIR/charts/operator" \
+  --namespace "$RELEASE_NAMESPACE" \
+  --set bundleService.enabled=true \
+  --set bundleService.container.image.repository="${OPERATOR_IMAGE%:*}" \
+  --set bundleService.container.image.tag="${OPERATOR_IMAGE##*:}" \
+  --set bundleService.container.image.pullPolicy=Never \
+  --show-only templates/bundleservice/serviceaccount.yaml \
+  --show-only templates/bundleservice/rbac.yaml \
+  --show-only templates/bundleservice/deployment.yaml \
+  --show-only templates/bundleservice/service.yaml \
+  --show-only templates/bundleservice/default-policy.yaml \
+  | kubectl apply -f -
+kubectl rollout status deployment/bundle-service -n "$RELEASE_NAMESPACE" --timeout=180s
 kubectl get pods -n "$RELEASE_NAMESPACE" -l app=bundle-service
 
 echo "==> Step 2/5: building + loading authbridge-proxy (${IMAGE_TAG}) via ${CONTAINER_RUNTIME}"
-# AuthBridge plugins are all opt-in build tags, so cmd/authbridge-proxy/Dockerfile REQUIRES
-# --build-arg GO_BUILD_TAGS and hard-fails without it ("plugins are opt-in and an untagged build
-# registers none"). An untagged image would silently register no opa plugin at all, which is the one
-# thing this script exists to install — so the Dockerfile failing the build early is correct, and we
-# must pass the tag list here.
-#
-# The authoritative tag list comes from authbridge/scripts/profile-tags, never hand-copied: the
-# profile membership changes upstream in cortex, and a stale literal list here would quietly build an
-# image missing plugins the Step 3 overlay wires. `full` is the profile for the Kubernetes
-# proxy-sidecar image and the only non-envoy profile carrying `opa`.
-#
-# Resolved via a golang container when the host has no `go`, matching how the onboarding demo builds
-# the Keycloak SPI jar in a maven container — this repo's scripts assume kubectl/helm/kind/docker,
-# not a Go toolchain. The helper is a dependency-free module, so the container needs no network.
-PROFILE_TAGS_DIR="$CORTEX_DIR/authbridge/scripts/profile-tags"
-AUTHBRIDGE_PROFILE="${AUTHBRIDGE_PROFILE:-full}"
+# AuthBridge plugins are opt-in build tags: an untagged build registers none and
+# the Dockerfile refuses it. Use the "full" profile, as the cortex CI does for
+# the authbridge image (scripts/profile-tags). GOWORK=off: the profile tool is a
+# standalone module, and the cortex go.work would want to write go.work.sum.
 if [ -z "${GO_BUILD_TAGS:-}" ]; then
-  if [ ! -d "$PROFILE_TAGS_DIR" ]; then
-    echo "ERROR: ${PROFILE_TAGS_DIR} not found — check CORTEX_DIR" >&2
-    exit 1
-  fi
-  if command -v go > /dev/null 2>&1; then
-    GO_BUILD_TAGS="$(go -C "$PROFILE_TAGS_DIR" run . "$AUTHBRIDGE_PROFILE")"
+  if command -v go &> /dev/null; then
+    GO_BUILD_TAGS="$(GOWORK=off go -C "$CORTEX_DIR/scripts/profile-tags" run . full)"
   else
-    echo "    no host 'go' — resolving the '${AUTHBRIDGE_PROFILE}' profile in a golang container"
-    GO_BUILD_TAGS="$("$CONTAINER_RUNTIME" run --rm \
-      -v "${PROFILE_TAGS_DIR}":/profile-tags:ro -w /profile-tags \
-      -e GOCACHE=/tmp/gocache -e GOFLAGS=-mod=mod \
-      golang:1.26-alpine go run . "$AUTHBRIDGE_PROFILE")"
+    GO_BUILD_TAGS="$("$CONTAINER_RUNTIME" run --rm -e GOWORK=off -v "$CORTEX_DIR:/src:ro" -w /src \
+      docker.io/library/golang:1.26-alpine go -C scripts/profile-tags run . full)"
   fi
 fi
-[ -n "$GO_BUILD_TAGS" ] || { echo "ERROR: could not resolve GO_BUILD_TAGS for profile '${AUTHBRIDGE_PROFILE}'" >&2; exit 1; }
-case "$GO_BUILD_TAGS" in
-  *include_plugin_opa*) ;;
-  *) echo "ERROR: profile '${AUTHBRIDGE_PROFILE}' does not carry the opa plugin, which this script installs." >&2
-     echo "       Resolved tags: ${GO_BUILD_TAGS}" >&2
-     exit 1 ;;
-esac
-echo "    plugin profile '${AUTHBRIDGE_PROFILE}': ${GO_BUILD_TAGS}"
-( cd "$CORTEX_DIR/authbridge" && "$CONTAINER_RUNTIME" build -t "$IMAGE_TAG" \
-    --build-arg GO_BUILD_TAGS="$GO_BUILD_TAGS" -f cmd/authbridge-proxy/Dockerfile . )
+echo "    GO_BUILD_TAGS=${GO_BUILD_TAGS}"
+( cd "$CORTEX_DIR" && "$CONTAINER_RUNTIME" build -t "$IMAGE_TAG" -f cmd/authbridge-proxy/Dockerfile \
+    --build-arg GO_BUILD_TAGS="$GO_BUILD_TAGS" . )
 load_image_to_kind "$IMAGE_TAG"
 
 echo "==> Step 3/5: writing throwaway pipeline overlay (${VALUES_FILE} stays untouched)"

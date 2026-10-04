@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+import requests
 from fastapi import HTTPException
 
 from aiac.agent.uc.onboarding.provision import kube, nodes
@@ -212,3 +213,68 @@ class TestMcpToolsList:
         tools = [{"name": "t1", "description": "d"}]
         with patch("requests.post", return_value=self._resp(tools)):
             assert nodes._mcp_tools_list("http://x/mcp", token="abc") == tools
+
+
+class TestMcpToolsListWaitsForEndpoint:
+    """The operator registers the tool's Keycloak client (which fires the onboarding event) while it
+    still rolls the tool pod onto the AuthBridge-injected template. The Service can then have no
+    ready endpoint for some seconds, so `tools/list` gets "connection refused". Discovery waits for
+    the endpoint (bounded by `AIAC_MCP_DISCOVERY_READY_TIMEOUT`) instead of failing into a NATS
+    redelivery that comes only after `ACK_WAIT` (600 s)."""
+
+    @pytest.fixture(autouse=True)
+    def fast(self, monkeypatch):
+        monkeypatch.setenv("UPSTREAM_MAX_RETRIES", "1")
+        monkeypatch.setenv("AIAC_MCP_DISCOVERY_READY_TIMEOUT", "5")
+        monkeypatch.setattr(nodes, "_MCP_READY_INTERVAL", 0)
+
+    def _ok(self, tools):
+        resp = MagicMock()
+        resp.json.return_value = {"result": {"tools": tools}}
+        resp.raise_for_status = MagicMock()
+        return resp
+
+    def _status(self, code):
+        resp = MagicMock()
+        resp.status_code = code
+        resp.raise_for_status.side_effect = requests.HTTPError(f"{code}", response=resp)
+        return resp
+
+    def test_connection_refused_then_ready_returns_the_tools(self):
+        tools = [{"name": "t1", "description": "d"}]
+        refused = requests.ConnectionError("Connection refused")
+        with patch("requests.post", side_effect=[refused, refused, self._ok(tools)]) as post:
+            assert nodes._mcp_tools_list("http://x/mcp", token="abc") == tools
+        assert post.call_count == 3
+
+    @pytest.mark.parametrize("code", [502, 503, 504])
+    def test_sidecar_gateway_error_then_ready_returns_the_tools(self, code):
+        tools = [{"name": "t1"}]
+        with patch("requests.post", side_effect=[self._status(code), self._ok(tools)]) as post:
+            assert nodes._mcp_tools_list("http://x/mcp") == tools
+        assert post.call_count == 2
+
+    def test_endpoint_never_ready_fails_after_the_ready_timeout(self, monkeypatch):
+        monkeypatch.setenv("AIAC_MCP_DISCOVERY_READY_TIMEOUT", "0.2")
+        with patch("requests.post", side_effect=requests.ConnectionError("Connection refused")) as post:
+            with pytest.raises(requests.ConnectionError):
+                nodes._mcp_tools_list("http://x/mcp")
+        assert post.call_count > 1
+
+    @pytest.mark.parametrize("code", [401, 404])
+    def test_client_error_is_not_waited_for(self, code):
+        with patch("requests.post", return_value=self._status(code)) as post:
+            with pytest.raises(requests.HTTPError):
+                nodes._mcp_tools_list("http://x/mcp")
+        assert post.call_count == 1
+
+    def test_read_timeout_is_not_waited_for(self):
+        # A tool that accepts the connection but hangs is not a "not ready yet" endpoint.
+        with patch("requests.post", side_effect=requests.ReadTimeout("read timed out")) as post:
+            with pytest.raises(requests.ReadTimeout):
+                nodes._mcp_tools_list("http://x/mcp")
+        assert post.call_count == 1
+
+    def test_bad_ready_timeout_env_falls_back_to_the_default(self, monkeypatch):
+        monkeypatch.setenv("AIAC_MCP_DISCOVERY_READY_TIMEOUT", "banana")
+        assert nodes._mcp_ready_timeout() == nodes._MCP_READY_TIMEOUT_DEFAULT

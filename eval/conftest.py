@@ -84,6 +84,16 @@ denial_precision (``eval/trend_log.py``'s ``pool_correctness_metrics``, the same
 Correctness suites use, so the resulting chart is directly comparable to theirs: two measuring
 performance against the *original* inputs, two against *deliberately edited/reworded* inputs) plus
 that row's own pass/fail rate (``invariance_rate``/``sensitivity_rate``).
+
+``test_prb_consistent_across_repeats`` (the consistency suite, #2468) similarly ``record_property``s
+an ``"inconsistent"`` boolean plus the full ``"mismatches"`` detail, joined into one string (empty
+when consistent) -- rendered in the Markdown report as an explicit "Inconsistent: Yes/No" line (plus
+mismatch detail when ``True``) via ``_render_consistency_block``, on every entry, pass or fail,
+unlike every other test in this suite besides the correctness/robustness metrics blocks above -- and
+pooled by nodeid substring (``_CONSISTENCY_TEST_MARKERS``) into its own committed trend-log row,
+``suite="consistency"``, carrying an ``agreement_rate`` (``eval/trend_log.py``'s
+``pool_consistency_metrics`` -- its own smaller pooling function, since there's no truth table here
+to produce a ``pool_correctness_metrics``-shaped precision/recall).
 """
 
 from __future__ import annotations
@@ -97,7 +107,7 @@ from zoneinfo import ZoneInfo
 import pytest
 from dotenv import load_dotenv
 
-from eval.trend_log import append_row, pool_correctness_metrics
+from eval.trend_log import append_row, pool_consistency_metrics, pool_correctness_metrics
 
 HERE = Path(__file__).resolve().parent
 REPORTS_DIR = HERE / "reports"
@@ -242,11 +252,13 @@ _ROBUSTNESS_SCORED_TEST_MARKERS = (
 # markers collapsed to one flat ``eval`` marker, every suite under `eval/` is disambiguated by its
 # own test function's nodeid rather than by marker — the same ``::test_prb_correctness[``/
 # ``::test_e2e_correctness[`` substrings ``_CORRECTNESS_TEST_MARKERS`` already uses. Deliberately
-# scoped to the two Correctness suites for now — the Consistency/Scale suite tickets (#2468-#2470)
-# add their own entries here when they land, reusing the same _write_trend_log/append_row mechanism
-# rather than building a parallel one. Robustness (#2466/#2467) is wired separately below
+# scoped to the two Correctness suites for now — the Scale suite tickets (#2469-#2470) add their own
+# entries here when they land, reusing the same _write_trend_log/append_row mechanism rather than
+# building a parallel one. Robustness (#2466/#2467) is wired separately below
 # (_ROBUSTNESS_TEST_MARKERS) since its four test functions span two families x two tiers that must
-# stay unblended (spec §4) -- a single nodeid -> suite entry here would conflate them.
+# stay unblended (spec §4) -- a single nodeid -> suite entry here would conflate them. Consistency
+# (#2468) is wired separately too (_CONSISTENCY_TEST_MARKERS) since its metric shape (a
+# agreement rate, no truth table) doesn't fit pool_correctness_metrics.
 _TREND_LOG_SUITES = {
     "::test_prb_correctness[": "correctness_prb",
     "::test_e2e_correctness[": "correctness_e2e",
@@ -284,12 +296,36 @@ _ROBUSTNESS_TEST_MARKERS = {
     ),
 }
 
+# Nodeid substring -> trend-log suite name for the Consistency suite (#2468) -- mirrors
+# _TREND_LOG_SUITES' shape (one test function, one suite), not _ROBUSTNESS_TEST_MARKERS' (there's
+# only one family/tier here, so no rate_key/prop_name tuple is needed: pool_consistency_metrics
+# derives agreement_rate directly from each entry's own "inconsistent" flag, unlike Robustness's
+# invariance_rate/sensitivity_rate, which _write_trend_log injects on top of pool_correctness_
+# metrics' output separately). Kept as its own dict (not folded into _TREND_LOG_SUITES) since its
+# entries are pooled by pool_consistency_metrics, not pool_correctness_metrics -- see
+# eval/trend_log.py.
+_CONSISTENCY_TEST_MARKERS = {
+    "::test_prb_consistent_across_repeats[": "consistency",
+}
+
 # Full Correctness corpus size (eval.test_policy_pipeline_eval.SCENARIOS) -- kept as a plain
 # constant rather than imported, so this module (loaded for every eval/ run, marked or not) stays
 # free of that file's heavy Keycloak/launcher imports. A run that scores fewer scenarios than this
 # (a `-k` filter, or most scenarios erroring in setup) is not comparable to a full-corpus run, so
 # it's tagged "partial" rather than "regression" -- see _write_trend_log. Bump if the corpus grows.
+# Also used by the Robustness suite, whose four families draw from this same corpus.
 _EXPECTED_SCENARIO_COUNT = 8
+
+# Full Consistency corpus size (eval.test_policy_pipeline_consistency.py's own
+# `@pytest.mark.parametrize("scenario_name", sorted(SCENARIOS))`) -- tracked as its own constant,
+# not folded into _EXPECTED_SCENARIO_COUNT above, even though the two are the same value today: the
+# consistency suite happens to import and reuse the Correctness corpus (`SCENARIOS`) directly, but
+# that's an implementation detail of today's suite, not a guarantee. If the consistency corpus ever
+# diverges from Correctness's (a consistency-only scenario added, or one dropped from `SCENARIOS`),
+# only this constant needs bumping -- sharing _EXPECTED_SCENARIO_COUNT would silently mislabel every
+# full consistency run "partial" (and drop it from the dashboard chart) with no error. Bump if the
+# consistency suite's own parametrization count changes.
+_EXPECTED_CONSISTENCY_SCENARIO_COUNT = 8
 
 
 def _format_best_effort_notes(notes: dict[str, str]) -> str:
@@ -331,14 +367,29 @@ def _render_metrics_block(lines: list[str], props: dict, *, unavailable_reason: 
         )
 
 
+def _render_consistency_block(lines: list[str], props: dict) -> None:
+    """Render ``test_prb_consistent_across_repeats``' ``inconsistent`` flag + ``mismatches`` detail
+    — shown on every entry (pass or fail), not just inferred from a failure's crash message, so a
+    reader sees at a glance whether each scenario agreed across its repeats without having to open
+    a failing case's assertion text. ``mismatches`` is a single newline-joined string (empty when
+    consistent), not a list — ``record_property`` is primarily a JUnit-XML mechanism, and a list
+    value isn't a valid XML attribute scalar."""
+    lines.append(f"- **Inconsistent:** {'Yes' if props.get('inconsistent') else 'No'}")
+    mismatches = props.get("mismatches") or ""
+    if mismatches:
+        _render_field(lines, "Mismatches", mismatches)
+
+
 def _render_entry(lines: list[str], nodeid: str, report: pytest.TestReport, category: str) -> None:
     """Per-cell tests (``test_inbound``/``test_outbound``) ``record_property`` a concrete
     description + expected/actual boolean + explanation; ``test_prb_correctness`` (correctness-prb)
     ``record_property``s precision/recall/denial-precision + the over-/under-grant/incorrect-denial
-    pair breakdown; render each instead of the generic docstring + crash/skip-reason fallback every
-    other test in this suite gets. A correctness-suite scenario whose *setup* failed (a pipeline
-    error before ``score_scenario`` ever ran) gets the crash detail *and* the same six-field metrics
-    block, marked unavailable with why — not silently dropped to the generic fallback."""
+    pair breakdown; ``test_prb_consistent_across_repeats`` (consistency) ``record_property``s an
+    ``inconsistent`` flag + ``mismatches`` detail; render each instead of the generic docstring +
+    crash/skip-reason fallback every other test in this suite gets. A correctness-suite scenario
+    whose *setup* failed (a pipeline error before ``score_scenario`` ever ran) gets the crash detail
+    *and* the same six-field metrics block, marked unavailable with why — not silently dropped to
+    the generic fallback."""
     lines.append(f"### `{nodeid}`")
     props = dict(report.user_properties)
     if "expected" in props and "output" in props:
@@ -352,6 +403,11 @@ def _render_entry(lines: list[str], nodeid: str, report: pytest.TestReport, cate
         if description:
             lines.append(f"- **What it tests:** {description}")
         _render_metrics_block(lines, props)
+    elif "inconsistent" in props:
+        description = _docstrings.get(nodeid)
+        if description:
+            lines.append(f"- **What it tests:** {description}")
+        _render_consistency_block(lines, props)
     elif category in ("failed", "error") and any(
         marker in nodeid for marker in _CORRECTNESS_TEST_MARKERS + _ROBUSTNESS_SCORED_TEST_MARKERS
     ):
@@ -392,12 +448,20 @@ def _write_trend_log() -> None:
     combination it never ran, rather than a shared row mislabeling one combination's count against
     another's.
 
+    Also one row for the Consistency suite (``suite="consistency"``, #2468), pooled by
+    ``pool_consistency_metrics`` from every scenario's own ``inconsistent`` flag into an
+    ``agreement_rate`` — unlike the two families above, there's no truth table involved and
+    nothing to compare against ``pool_correctness_metrics``, so it gets its own smaller pooling
+    function and its own row, recorded whether the run passed or failed (spec §6: an occasional
+    flake against a live LLM should stay visible over time, not just show up as a one-off failure).
+
     Always stamped in UTC, independent of ``EVAL_REPORT_TZ`` (that variable only controls the
     gitignored per-run Markdown report's timestamp/filename) — a committed file read by every
     contributor and by downstream trend analysis must not carry a per-contributor UTC offset."""
     by_suite: dict[str, list[dict]] = {}
     robustness_flags: dict[str, list[bool]] = {}
     robustness_entries: dict[str, list[dict]] = {}
+    consistency_entries: dict[str, list[dict]] = {}
     for nodeid, report in _reports.items():
         for nodeid_marker, suite in _TREND_LOG_SUITES.items():
             if nodeid_marker in report.nodeid:
@@ -412,6 +476,12 @@ def _write_trend_log() -> None:
                     robustness_flags.setdefault(robustness_suite, []).append(bool(props[prop_name]))
                     if "true_positives" in props:
                         robustness_entries.setdefault(robustness_suite, []).append(props)
+                break
+        for substring, consistency_suite in _CONSISTENCY_TEST_MARKERS.items():
+            if substring in nodeid:
+                props = dict(report.user_properties)
+                if "inconsistent" in props:
+                    consistency_entries.setdefault(consistency_suite, []).append(props)
                 break
 
     for suite, entries in by_suite.items():
@@ -428,6 +498,10 @@ def _write_trend_log() -> None:
         metrics[rate_key] = sum(flags) / len(flags)
         run_type = "regression" if len(flags) == _EXPECTED_SCENARIO_COUNT else "partial"
         append_row(robustness_suite, metrics, run_type=run_type)
+
+    for consistency_suite, entries in consistency_entries.items():
+        run_type = "regression" if len(entries) == _EXPECTED_CONSISTENCY_SCENARIO_COUNT else "partial"
+        append_row(consistency_suite, pool_consistency_metrics(entries), run_type=run_type)
 
 
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:

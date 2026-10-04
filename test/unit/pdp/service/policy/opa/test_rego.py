@@ -27,6 +27,7 @@ from aiac.pdp.service.policy.opa.rego import (
     generate_outbound_rego,
     identity_ref,
 )
+from aiac.policy.computation.engine import _fresh_apm
 from aiac.policy.model.models import AgentPolicyModel, PolicyRule, RuleEffect
 
 # Full SPIFFE id of the github-tool workload that owns the outbound scopes.
@@ -230,8 +231,6 @@ def test_inbound_split_scope_maps_from_split_rule_lists():
 
 def test_inbound_subject_gates_use_identity_fields():
     rego = generate_inbound_rego(_github_agent())
-    assert "subject_allow_ok if {" in rego
-    assert "subject_deny_ok if {" in rego
     assert "some role in subject_roles[input.identity.subject]" in rego
     assert "some scope in subject_role_allow_scopes[role]" in rego
     assert "some scope in subject_role_deny_scopes[role]" in rego
@@ -352,17 +351,20 @@ def test_outbound_no_prefixed_scope_leaks():
 
 def test_outbound_gates_use_nested_identity_and_mcp_input():
     rego = generate_outbound_rego(_github_agent())
-    assert "subject_allow_ok if {" in rego
-    assert "subject_deny_ok if {" in rego
     assert "some role in subject_roles[input.identity.subject]" in rego
-    assert "input.mcp.params.name in subject_role_allow_scopes[role]" in rego
-    assert "input.mcp.params.name in subject_role_deny_scopes[role]" in rego
-    assert "target_allow_ok if {" in rego
-    assert "input.mcp.params.name in target_allow_scopes[input.identity.service_id]" in rego
-    assert "target_deny_ok if {" in rego
-    assert "input.mcp.params.name in target_deny_scopes[input.identity.service_id]" in rego
+    assert "tool in subject_role_allow_scopes[role]" in rego
+    assert "tool in subject_role_deny_scopes[role]" in rego
+    assert "subject_allow_ok if { subject_allows(input.mcp.params.name) }" in rego
+    assert "subject_deny_ok if { subject_denies(input.mcp.params.name) }" in rego
+    assert "target_allow_ok if { target_allows(input.mcp.params.name) }" in rego
+    assert "tool in target_allow_scopes[input.identity.service_id]" in rego
+    assert "target_deny_ok if { target_denies(input.mcp.params.name) }" in rego
+    assert "tool in target_deny_scopes[input.identity.service_id]" in rego
     assert "default allow := false" in rego
-    assert "allow if { subject_allow_ok; target_allow_ok; not subject_deny_ok; not target_deny_ok }" in rego
+    assert (
+        'allow if { input.mcp.method == "tools/call"; subject_allow_ok; target_allow_ok; not subject_deny_ok; not target_deny_ok }'
+        in rego
+    )
     # The inbound-flavoured subject gate must NOT appear in the outbound package.
     assert "scope in agent_scopes" not in rego
 
@@ -398,7 +400,10 @@ def test_outbound_empty_model_renders_valid_empty_literals():
     assert "target_allow_scopes := {}" in rego
     assert "target_deny_scopes := {}" in rego
     assert "default allow := false" in rego
-    assert "allow if { subject_allow_ok; target_allow_ok; not subject_deny_ok; not target_deny_ok }" in rego
+    assert (
+        'allow if { input.mcp.method == "tools/call"; subject_allow_ok; target_allow_ok; not subject_deny_ok; not target_deny_ok }'
+        in rego
+    )
 
 
 # --- per-scope AND intersection + deny-overrides semantics ---
@@ -451,10 +456,13 @@ def test_outbound_per_scope_and_structural():
     assert (
         '"spiffe://localtest.me/ns/team1/sa/github-tool": ["scope-b", "scope-c", "scope-d"]' in rego
     )  # capability allow gate
-    assert "input.mcp.params.name in subject_role_allow_scopes[role]" in rego
-    assert "input.mcp.params.name in subject_role_deny_scopes[role]" in rego
-    assert "input.mcp.params.name in target_allow_scopes[input.identity.service_id]" in rego
-    assert "allow if { subject_allow_ok; target_allow_ok; not subject_deny_ok; not target_deny_ok }" in rego
+    assert "subject_allow_ok if { subject_allows(input.mcp.params.name) }" in rego
+    assert "subject_deny_ok if { subject_denies(input.mcp.params.name) }" in rego
+    assert "target_allow_ok if { target_allows(input.mcp.params.name) }" in rego
+    assert (
+        'allow if { input.mcp.method == "tools/call"; subject_allow_ok; target_allow_ok; not subject_deny_ok; not target_deny_ok }'
+        in rego
+    )
 
 
 @pytest.mark.skipif(not shutil.which("opa"), reason="opa binary not on PATH")
@@ -479,7 +487,7 @@ def test_outbound_per_scope_and_denies_mismatch(tool_name: str, allowed: bool):
         "data.authbridge.client.outbound.request.allow",
         {
             "identity": {"subject": "user1", "service_id": GH_TOOL},
-            "mcp": {"params": {"name": tool_name}},
+            "mcp": {"method": "tools/call", "params": {"name": tool_name}},
         },
         allowed,
     )
@@ -557,91 +565,51 @@ def test_inbound_source_deny_overrides_behavioural(source: str, allowed: bool):
     )
 
 
-# --- per-policy default_effect (issue #145) ---------------------------------
+# --- always DENY: no configurable default effect ---------------------------
 #
-# default_effect decides how a (role, scope) pair that NO rule mentions
-# resolves: DENY (the default, least-privilege) reproduces today's
-# `default allow := false` byte-for-byte; ALLOW opens the default while explicit
-# denies still override. Only the trailing decision block changes — every
-# declaration map and every *_allow_ok / *_deny_ok gate is emitted identically.
+# A (role, scope) pair that NO rule mentions is always denied. Both packages emit
+# exactly one decision shape: `default allow := false` plus one allow
+# conjunction with inline `not …_deny_ok` guards. There is no permissive
+# (`default allow := true`) branch.
 
 
-def test_inbound_default_effect_omitted_is_deny_byte_for_byte():
-    """Omitting default_effect (→ DENY) reproduces today's inbound decision block
-    verbatim, and is byte-for-byte identical to an explicit DENY."""
-    omitted = generate_inbound_rego(_github_agent())
-    assert "default allow := false" in omitted
-    assert "allow if { subject_allow_ok; source_allow_ok; not subject_deny_ok; not source_deny_ok }" in omitted
-    explicit_deny = generate_inbound_rego(_github_agent_with_effect(RuleEffect.DENY))
-    assert omitted == explicit_deny
+def test_inbound_decision_block_is_the_single_deny_default():
+    rego = generate_inbound_rego(_github_agent())
+    assert "default allow := false" in rego
+    assert "allow if { subject_allow_ok; source_allow_ok; not subject_deny_ok; not source_deny_ok }" in rego
+    assert "default allow := true" not in rego
+    assert "allow := false if" not in rego
 
 
-def test_outbound_default_effect_omitted_is_deny_byte_for_byte():
-    """Omitting default_effect (→ DENY) reproduces today's outbound decision block
-    verbatim, and is byte-for-byte identical to an explicit DENY."""
-    omitted = generate_outbound_rego(_github_agent())
-    assert "default allow := false" in omitted
-    assert "allow if { subject_allow_ok; target_allow_ok; not subject_deny_ok; not target_deny_ok }" in omitted
-    explicit_deny = generate_outbound_rego(_github_agent_with_effect(RuleEffect.DENY))
-    assert omitted == explicit_deny
+def test_outbound_decision_block_is_the_single_deny_default():
+    rego = generate_outbound_rego(_github_agent())
+    assert rego.count("default allow := false") == 1
+    assert "default allow := true" not in rego
+    assert "allow := false if" not in rego
+    # Two allow rules, both under the DENY default: the per-tool tools/call check and the session.
+    assert rego.count("\nallow if {") == 2
 
 
-def _github_agent_with_effect(effect: RuleEffect) -> AgentPolicyModel:
-    model = _github_agent()
-    return model.model_copy(update={"default_effect": effect})
+def test_agent_policy_model_has_no_default_effect():
+    assert "default_effect" not in AgentPolicyModel.model_fields
 
 
-def test_inbound_allow_default_shape():
-    """ALLOW mode: default flips to true, deny gates become separate
-    `allow := false if` rules, and the DENY-mode allow-conjunction is gone."""
-    rego = generate_inbound_rego(_github_agent_with_effect(RuleEffect.ALLOW))
-    assert "default allow := true" in rego
-    assert "allow := false if { subject_deny_ok }" in rego
-    assert "allow := false if { source_deny_ok }" in rego
-    # The DENY-mode allow-conjunction must not appear.
-    assert "default allow := false" not in rego
-    assert "allow if { subject_allow_ok; source_allow_ok; not subject_deny_ok; not source_deny_ok }" not in rego
+def test_legacy_default_effect_allow_in_payload_is_ignored():
+    """A stored or posted APM that still carries ``default_effect: Allow`` renders
+    the DENY default (the field is gone and ``extra="ignore"`` drops it)."""
+    payload = _github_agent().model_dump()
+    payload["default_effect"] = RuleEffect.ALLOW.value
+    model = AgentPolicyModel.model_validate(payload)
+    for rego in (generate_inbound_rego(model), generate_outbound_rego(model)):
+        assert "default allow := false" in rego
+        assert "default allow := true" not in rego
 
 
-def test_outbound_allow_default_shape_is_deny_if_either_side():
-    """ALLOW mode outbound: deny-if-either-side, NOT a negated allow-gate AND.
-
-    Guards §3d — a `not subject_allow_ok` / `not target_allow_ok` flip would
-    wrongly DENY every unmentioned (role, tool) pair."""
-    rego = generate_outbound_rego(_github_agent_with_effect(RuleEffect.ALLOW))
-    assert "default allow := true" in rego
-    assert "allow := false if { subject_deny_ok }" in rego
-    assert "allow := false if { target_deny_ok }" in rego
-    # The DENY-mode allow-conjunction must not appear.
-    assert "default allow := false" not in rego
-    assert "allow if { subject_allow_ok; target_allow_ok; not subject_deny_ok; not target_deny_ok }" not in rego
-    # The wrong "unmentioned → deny" flip must NOT be emitted.
-    assert "not subject_allow_ok" not in rego
-    assert "not target_allow_ok" not in rego
-
-
-def test_allow_mode_still_emits_inert_allow_maps_and_gates():
-    """Under ALLOW the allow-side machinery is still emitted (inert but
-    structurally symmetric, expected by downstream tooling)."""
-    inbound = generate_inbound_rego(_github_agent_with_effect(RuleEffect.ALLOW))
-    assert "subject_role_allow_scopes := {" in inbound
-    assert "source_role_allow_scopes := {" in inbound
-    assert "subject_allow_ok if {" in inbound
-    assert "source_allow_ok if {" in inbound
-    outbound = generate_outbound_rego(_github_agent_with_effect(RuleEffect.ALLOW))
-    assert "subject_role_allow_scopes := {" in outbound
-    assert "target_allow_scopes := {" in outbound
-    assert "agent_role_scopes := {" in outbound
-    assert "subject_allow_ok if {" in outbound
-    assert "target_allow_ok if {" in outbound
-
-
-# --- behavioural: default_effect decides the unmentioned pair ----------------
+# --- behavioural: an unmentioned pair is denied ------------------------------
 
 
 def _inbound_unmentioned_model() -> AgentPolicyModel:
-    """A subject holding a role that NO allow/deny rule mentions — the unmentioned
-    (role, scope) case that resolves to default_effect."""
+    """A subject holding a role that NO allow/deny rule mentions."""
     lonely = _role("lonely")
     access = _scope("github-agent.access")
     return _model(
@@ -652,27 +620,17 @@ def _inbound_unmentioned_model() -> AgentPolicyModel:
 
 
 @pytest.mark.skipif(not shutil.which("opa"), reason="opa binary not on PATH")
-@pytest.mark.parametrize(
-    "effect, allowed",
-    [
-        (RuleEffect.DENY, False),  # unmentioned → least-privilege deny
-        (RuleEffect.ALLOW, True),  # unmentioned → permissive default
-    ],
-)
-def test_inbound_unmentioned_resolves_to_default_effect(effect: RuleEffect, allowed: bool):
-    model = _inbound_unmentioned_model().model_copy(update={"default_effect": effect})
-    rego = generate_inbound_rego(model)
+def test_inbound_unmentioned_pair_is_denied():
     _assert_opa_allow(
-        rego,
+        generate_inbound_rego(_inbound_unmentioned_model()),
         "data.authbridge.client.inbound.request.allow",
         {"identity": {"subject": "some-user"}},
-        allowed,
+        False,
     )
 
 
 def _outbound_unmentioned_model() -> AgentPolicyModel:
-    """A (subject role, tool) that NO outbound rule mentions and no target scope
-    grants — the unmentioned outbound case resolving to default_effect."""
+    """A (subject role, tool) that NO outbound rule mentions and no target scope grants."""
     lonely = _role("lonely")
     return _model(
         agent_id=GH_AGENT,
@@ -681,74 +639,15 @@ def _outbound_unmentioned_model() -> AgentPolicyModel:
 
 
 @pytest.mark.skipif(not shutil.which("opa"), reason="opa binary not on PATH")
-@pytest.mark.parametrize(
-    "effect, allowed",
-    [
-        (RuleEffect.DENY, False),
-        (RuleEffect.ALLOW, True),
-    ],
-)
-def test_outbound_unmentioned_resolves_to_default_effect(effect: RuleEffect, allowed: bool):
-    model = _outbound_unmentioned_model().model_copy(update={"default_effect": effect})
-    rego = generate_outbound_rego(model)
+def test_outbound_unmentioned_pair_is_denied():
     _assert_opa_allow(
-        rego,
+        generate_outbound_rego(_outbound_unmentioned_model()),
         "data.authbridge.client.outbound.request.allow",
         {
             "identity": {"subject": "some-user", "service_id": GH_TOOL},
-            "mcp": {"params": {"name": "anything"}},
+            "mcp": {"method": "tools/call", "params": {"name": "anything"}},
         },
-        allowed,
-    )
-
-
-@pytest.mark.skipif(not shutil.which("opa"), reason="opa binary not on PATH")
-@pytest.mark.parametrize("effect", [RuleEffect.DENY, RuleEffect.ALLOW])
-def test_inbound_deny_overrides_holds_under_both_defaults(effect: RuleEffect):
-    """A subject holding both an allow and a deny role on the same audience scope
-    is barred regardless of default_effect (deny-overrides)."""
-    model = _inbound_deny_model().model_copy(update={"default_effect": effect})
-    rego = generate_inbound_rego(model)
-    _assert_opa_allow(
-        rego,
-        "data.authbridge.client.inbound.request.allow",
-        {"identity": {"subject": "bad-user"}},
         False,
-    )
-
-
-@pytest.mark.skipif(not shutil.which("opa"), reason="opa binary not on PATH")
-@pytest.mark.parametrize(
-    "tool_name, deny_allowed, allow_allowed",
-    [
-        # tool_name          DENY   ALLOW
-        ("scope-c", True, True),  # both allow gates, not denied → allowed either way
-        ("scope-a", False, True),  # user-only: AND fails under DENY, unmentioned→allow under ALLOW
-        ("scope-b", False, True),  # agent-only: AND fails under DENY, unmentioned→allow under ALLOW
-        ("scope-d", False, False),  # subject-denied: deny-overrides under BOTH
-    ],
-)
-def test_outbound_gate_flip_under_allow_keeps_deny_override(tool_name: str, deny_allowed: bool, allow_allowed: bool):
-    """The outbound gate-shape flip: under DENY the two allow gates AND (A user-only
-    and B agent-only both denied); under ALLOW that AND drops so A and B become
-    allowed (unmentioned by any deny), while the subject-denied D stays denied."""
-    input_doc = {
-        "identity": {"subject": "user1", "service_id": GH_TOOL},
-        "mcp": {"params": {"name": tool_name}},
-    }
-    deny_model = _outbound_and_model()  # default_effect defaults to DENY
-    _assert_opa_allow(
-        generate_outbound_rego(deny_model),
-        "data.authbridge.client.outbound.request.allow",
-        input_doc,
-        deny_allowed,
-    )
-    allow_model = _outbound_and_model().model_copy(update={"default_effect": RuleEffect.ALLOW})
-    _assert_opa_allow(
-        generate_outbound_rego(allow_model),
-        "data.authbridge.client.outbound.request.allow",
-        input_doc,
-        allow_allowed,
     )
 
 
@@ -780,9 +679,8 @@ def _assert_opa_allow(rego: str, query: str, input_doc: dict, expected: bool) ->
 def _opa_verdict(rego: str, query: str, input_doc: dict) -> bool:
     """Evaluate ``query`` against ``rego`` for ``input_doc`` and return the bool.
 
-    The value-returning sibling of ``_assert_opa_allow`` — used by the toggle
-    differential below, which must *compare* the two defaults' verdicts cell by
-    cell rather than pin each to a literal."""
+    The value-returning sibling of ``_assert_opa_allow`` — used by the matrix
+    tests below, which compare each verdict against an oracle table."""
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "policy.rego"
         path.write_text(rego)
@@ -806,40 +704,24 @@ def _opa_verdict(rego: str, query: str, input_doc: dict) -> bool:
     return json.loads(out)["result"][0]["expressions"][0]["value"]
 
 
-# --- default_effect toggle isolation (issue #150) ---------------------------
+# --- Policy B matrix under the DENY default ---------------------------------
 #
-# The clean controlled experiment the cross-policy live full-deployment test
-# (test/system/disabled/test_policy_pipeline_denyworld.py) cannot give on its own:
-# it can only run default=ALLOW, so it never *directly* compares the two defaults
-# on one policy. Here we build ONE Policy-B outbound APM by hand (the hand-built
-# analogue of what the PRB emits — NOT a PRB re-run), generate its Rego twice
-# from the SAME model — once default_effect=DENY, once ALLOW — and opa-eval the
-# full {developer,tester,devops} × {source,issues}-{read,write} matrix against
-# each bundle. With the APM, the generator, and the inputs all pinned, the toggle
-# is the only variable: it must flip ONLY the unmentioned (devops, issues-*) cell
-# and leave every explicit-rule cell (the 4 allow, the 6 deny) invariant. That
-# isolates "the toggle changed the base" from "an explicit rule fired".
+# One hand-built Policy-B outbound APM (the hand-built analogue of what the PRB
+# emits), opa-evaluated over the full {developer,tester,devops} x
+# {source,issues}-{read,write} matrix. The capability gate (target_allow_scopes)
+# provisions all four tool scopes wide-open, as a real github-tool deployment
+# does, so the two-gate AND reduces to the subject side.
 #
-# Policy B, subject side only (mirrors handoff 02 §5's corrected PRB emission):
 #   ALLOW  developer -> source-read, source-write ; tester -> issues-read, issues-write
 #   DENY   developer -> issues-*  ; tester -> source-*  ; devops -> source-*
-# devops -> issues-* is mentioned by NO rule, so it resolves to default_effect:
-# deny under DENY (least-privilege), allow under ALLOW (permissive default).
-#
-# The prose emits no target-side DENY, but the capability gate (target_allow_scopes)
-# still provisions all four tool scopes wide-open — exactly as a real github-tool
-# deployment does. That open capability gate is what makes the two-gate AND under
-# default=DENY reduce to the subject side, so the 4 allow cells read allow under
-# BOTH defaults; without it default=DENY would deny every cell (target gate never
-# passing) and the explicit allow cells would not be invariant across the toggle.
+# devops -> issues-* is mentioned by NO rule, so it is denied (no permissive default).
 
 _POLICY_B_ROLES = ("developer", "tester", "devops")
 _POLICY_B_TOOLS = ("source-read", "source-write", "issues-read", "issues-write")
-_POLICY_B_FLIP_CELLS = {("devops", "issues-read"), ("devops", "issues-write")}
 
-# Oracle verdicts (allow=True / deny=False) under default=DENY, computed from the
-# rule lists by hand — NEVER read back from the Rego under test.
-_POLICY_B_DENY_MATRIX: dict[tuple[str, str], bool] = {
+# Oracle verdicts (allow=True / deny=False), computed from the rule lists by
+# hand — NEVER read back from the Rego under test.
+_POLICY_B_MATRIX: dict[tuple[str, str], bool] = {
     ("developer", "source-read"): True,  # explicit ALLOW + capability gate open
     ("developer", "source-write"): True,  # explicit ALLOW
     ("developer", "issues-read"): False,  # explicit DENY
@@ -850,14 +732,8 @@ _POLICY_B_DENY_MATRIX: dict[tuple[str, str], bool] = {
     ("tester", "issues-write"): True,  # explicit ALLOW
     ("devops", "source-read"): False,  # explicit DENY
     ("devops", "source-write"): False,  # explicit DENY
-    ("devops", "issues-read"): False,  # UNMENTIONED -> least-privilege deny
-    ("devops", "issues-write"): False,  # UNMENTIONED -> least-privilege deny
-}
-# Under default=ALLOW only the two unmentioned cells flip to allow.
-_POLICY_B_ALLOW_MATRIX: dict[tuple[str, str], bool] = {
-    **_POLICY_B_DENY_MATRIX,
-    ("devops", "issues-read"): True,  # UNMENTIONED -> permissive default (flip)
-    ("devops", "issues-write"): True,  # UNMENTIONED -> permissive default (flip)
+    ("devops", "issues-read"): False,  # UNMENTIONED -> deny
+    ("devops", "issues-write"): False,  # UNMENTIONED -> deny
 }
 
 
@@ -877,9 +753,6 @@ def _policy_b_outbound_model() -> AgentPolicyModel:
             "tester": [tester],
             "devops": [devops],
         },
-        # Capability gate provisioned wide-open (the tool exposes all four scopes);
-        # NO target-side DENY. This makes the outbound two-gate AND reduce to the
-        # subject side, so the matrix is driven purely by the subject allow/deny.
         target_allow_scopes={GH_TOOL: [source_read, source_write, issues_read, issues_write]},
         outbound_subject_allow_rules=[
             _rule(developer, source_read),
@@ -898,53 +771,152 @@ def _policy_b_outbound_model() -> AgentPolicyModel:
     )
 
 
-def test_policy_b_only_decision_block_differs_between_defaults():
-    """Cluster-free: flipping default_effect on the SAME model changes ONLY the
-    trailing decision block — every declaration map and every ``*_allow_ok`` /
-    ``*_deny_ok`` gate is emitted identically. Split on the ``default allow`` line;
-    the whole prefix (declarations + gates) must be byte-equal across both."""
-    model = _policy_b_outbound_model()
-    deny_rego = generate_outbound_rego(model)  # default_effect defaults to DENY
-    allow_rego = generate_outbound_rego(model.model_copy(update={"default_effect": RuleEffect.ALLOW}))
-    assert deny_rego != allow_rego
-    assert "default allow := false" in deny_rego
-    assert "default allow := true" in allow_rego
-    marker = "default allow"
-    assert deny_rego.split(marker)[0] == allow_rego.split(marker)[0]
+@pytest.mark.skipif(not shutil.which("opa"), reason="opa binary not on PATH")
+def test_policy_b_matrix_under_deny_default():
+    rego = generate_outbound_rego(_policy_b_outbound_model())
+    query = "data.authbridge.client.outbound.request.allow"
+    for role in _POLICY_B_ROLES:
+        for tool in _POLICY_B_TOOLS:
+            input_doc = {
+                "identity": {"subject": role, "service_id": GH_TOOL},
+                "mcp": {"method": "tools/call", "params": {"name": tool}},
+            }
+            assert _opa_verdict(rego, query, input_doc) is _POLICY_B_MATRIX[(role, tool)], (role, tool)
+
+
+# --- the no-rules CR of a quarantined agent ----------------------------------
+#
+# The PCE's ``quarantine`` replaces a failed agent's CR with the ``_fresh_apm``
+# shell (no rules, no scopes). Under the DENY default it denies every inbound and
+# every outbound request — also end-user traffic that carries the ``rossoctl``
+# platform client, and also the MCP session messages.
+
+_OUTBOUND = "data.authbridge.client.outbound.request.allow"
+_INBOUND = "data.authbridge.client.inbound.request.allow"
+_SESSION_METHODS = ("initialize", "notifications/initialized", "ping", "tools/list")
 
 
 @pytest.mark.skipif(not shutil.which("opa"), reason="opa binary not on PATH")
-def test_policy_b_default_effect_toggle_flips_only_unmentioned_cell():
-    """Behavioural differential: generate Policy B twice from the SAME model
-    (default=DENY vs default=ALLOW) and opa-eval the full 3x4 matrix against each.
+@pytest.mark.parametrize(
+    "identity",
+    [
+        {"subject": "dev-user"},
+        {"subject": "dev-user", "client_id": "rossoctl"},
+        {"subject": "dev-user", "client_id": "spiffe://localtest.me/ns/team1/sa/other-agent"},
+        {},
+    ],
+    ids=["end-user", "platform-client", "agent-client", "anonymous"],
+)
+def test_no_rules_cr_denies_every_inbound_request(identity):
+    _assert_opa_allow(generate_inbound_rego(_fresh_apm(GH_AGENT)), _INBOUND, {"identity": identity}, False)
 
-    Asserts, cell by cell: each verdict matches the hand-computed oracle for its
-    default, every explicit-rule cell (the 4 allow, the 6 deny) is IDENTICAL under
-    both defaults, and ONLY the unmentioned devops -> issues-read / issues-write
-    cell flips (deny under DENY, allow under ALLOW). This is the toggle-isolation
-    the ALLOW-only live test cannot give."""
-    model = _policy_b_outbound_model()
-    deny_rego = generate_outbound_rego(model)  # default_effect defaults to DENY
-    allow_rego = generate_outbound_rego(model.model_copy(update={"default_effect": RuleEffect.ALLOW}))
-    query = "data.authbridge.client.outbound.request.allow"
-    flipped: set[tuple[str, str]] = set()
-    for role in _POLICY_B_ROLES:
-        for tool in _POLICY_B_TOOLS:
-            cell = (role, tool)
-            input_doc = {
-                "identity": {"subject": role, "service_id": GH_TOOL},
-                "mcp": {"params": {"name": tool}},
-            }
-            deny_v = _opa_verdict(deny_rego, query, input_doc)
-            allow_v = _opa_verdict(allow_rego, query, input_doc)
-            # 1. Each verdict matches the hand-computed oracle for its default.
-            assert deny_v is _POLICY_B_DENY_MATRIX[cell], f"DENY mode {cell}"
-            assert allow_v is _POLICY_B_ALLOW_MATRIX[cell], f"ALLOW mode {cell}"
-            # 2. Invariance vs flip: explicit cells hold, only the unmentioned flips.
-            if cell in _POLICY_B_FLIP_CELLS:
-                assert deny_v is False and allow_v is True, f"flip cell {cell}"
-                flipped.add(cell)
-            else:
-                assert deny_v is allow_v, f"explicit cell not invariant: {cell}"
-    # 3. Exactly the two unmentioned cells flipped — no explicit cell moved.
-    assert flipped == _POLICY_B_FLIP_CELLS
+
+@pytest.mark.skipif(not shutil.which("opa"), reason="opa binary not on PATH")
+@pytest.mark.parametrize(
+    "mcp",
+    [{"method": "tools/call", "params": {"name": "source-read"}}] + [{"method": m} for m in _SESSION_METHODS],
+    ids=lambda mcp: mcp["method"],
+)
+def test_no_rules_cr_denies_every_outbound_request(mcp):
+    _assert_opa_allow(
+        generate_outbound_rego(_fresh_apm(GH_AGENT)),
+        _OUTBOUND,
+        {"identity": {"subject": "dev-user", "service_id": GH_TOOL}, "mcp": mcp},
+        False,
+    )
+
+
+# --- B4: MCP session messages on the outbound -------------------------------
+#
+# ``initialize``, ``notifications/initialized``, ``ping`` and ``tools/list``
+# carry no tool name. They are allowed to a target (``input.identity.service_id``)
+# iff at least ONE tool of that target passes the full per-tool check for this
+# request: the user gate allows it, the target gate allows it, and no deny vetoes
+# it. ``tools/call`` stays a per-tool check on ``input.mcp.params.name`` (and
+# requires the ``tools/call`` method). Every other MCP method is denied.
+
+OTHER_TOOL = "spiffe://localtest.me/ns/team1/sa/other-tool"
+
+
+def _session_model() -> AgentPolicyModel:
+    """dev-user may use source-read on github-tool; ops-user holds a role that is allowed
+    issues-read but also denied it (a vetoed allow); guest holds a role that no rule grants.
+    The target gate admits source-read and issues-read on github-tool, and nothing on other-tool
+    except a target-denied tool."""
+    dev = _role("developer")
+    ops = _role("ops")
+    lonely = _role("lonely")
+    source_read = _scope("github-tool.source-read", GH_TOOL)
+    issues_read = _scope("github-tool.issues-read", GH_TOOL)
+    blocked = _scope("other-tool.blocked", OTHER_TOOL)
+    return _model(
+        agent_id=GH_AGENT,
+        subject_roles={"dev-user": [dev], "ops-user": [ops], "guest": [lonely]},
+        target_allow_scopes={GH_TOOL: [source_read, issues_read], OTHER_TOOL: [blocked]},
+        target_deny_scopes={OTHER_TOOL: [blocked]},
+        outbound_subject_allow_rules=[_rule(dev, source_read), _rule(ops, issues_read), _rule(dev, blocked)],
+        outbound_subject_deny_rules=[_rule(ops, issues_read, RuleEffect.DENY)],
+    )
+
+
+def _outbound_input(subject, mcp, target=GH_TOOL):
+    return {"identity": {"subject": subject, "service_id": target}, "mcp": mcp}
+
+
+@pytest.mark.skipif(not shutil.which("opa"), reason="opa binary not on PATH")
+@pytest.mark.parametrize("method", _SESSION_METHODS)
+def test_session_message_allowed_when_a_tool_of_the_target_passes(method):
+    rego = generate_outbound_rego(_session_model())
+    _assert_opa_allow(rego, _OUTBOUND, _outbound_input("dev-user", {"method": method}), True)
+
+
+@pytest.mark.skipif(not shutil.which("opa"), reason="opa binary not on PATH")
+@pytest.mark.parametrize("method", _SESSION_METHODS)
+@pytest.mark.parametrize(
+    "subject, target",
+    [
+        ("guest", GH_TOOL),  # no role of the user grants any tool of the target
+        ("ops-user", GH_TOOL),  # the only allow is vetoed by a subject deny
+        ("dev-user", OTHER_TOOL),  # the only allow is vetoed by a target deny
+        ("dev-user", "spiffe://localtest.me/ns/team1/sa/unknown"),  # a target with no grant
+        ("nobody", GH_TOOL),  # a user with no roles
+    ],
+    ids=["no-grant", "subject-veto", "target-veto", "unknown-target", "no-roles"],
+)
+def test_session_message_denied_when_no_tool_of_the_target_passes(method, subject, target):
+    rego = generate_outbound_rego(_session_model())
+    _assert_opa_allow(rego, _OUTBOUND, _outbound_input(subject, {"method": method}, target), False)
+
+
+@pytest.mark.skipif(not shutil.which("opa"), reason="opa binary not on PATH")
+@pytest.mark.parametrize(
+    "subject, tool, allowed",
+    [
+        ("dev-user", "source-read", True),  # granted
+        ("dev-user", "issues-read", False),  # the session is open, but this tool is not granted
+        ("ops-user", "issues-read", False),  # vetoed
+    ],
+)
+def test_tools_call_stays_a_per_tool_check(subject, tool, allowed):
+    rego = generate_outbound_rego(_session_model())
+    mcp = {"method": "tools/call", "params": {"name": tool}}
+    _assert_opa_allow(rego, _OUTBOUND, _outbound_input(subject, mcp), allowed)
+
+
+@pytest.mark.skipif(not shutil.which("opa"), reason="opa binary not on PATH")
+@pytest.mark.parametrize(
+    "mcp",
+    [
+        {"method": "resources/list"},
+        {"method": "prompts/list"},
+        {"method": "resources/read", "params": {"uri": "file:///etc/passwd"}},
+        # A granted tool name under a method that is not tools/call: the per-tool branch
+        # requires the tools/call method.
+        {"method": "prompts/get", "params": {"name": "source-read"}},
+        {"params": {"name": "source-read"}},  # no method at all
+    ],
+    ids=["resources-list", "prompts-list", "resources-read", "prompts-get-granted-name", "no-method"],
+)
+def test_every_other_mcp_method_is_denied(mcp):
+    rego = generate_outbound_rego(_session_model())
+    _assert_opa_allow(rego, _OUTBOUND, _outbound_input("dev-user", mcp), False)
