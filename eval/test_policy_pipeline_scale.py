@@ -113,24 +113,6 @@ _TOTAL_CORPUS_E2E_PORTS = {"idp": 7500, "store": 7502, "opa": 7501}
 _PER_DECISION_E2E_PORTS = {"idp": 7510, "store": 7512, "opa": 7511}
 
 
-def _fix_agent_role_actor_ids(config: Configuration, roles: dict[str, Role], scenario) -> None:
-    """``read_back_idp``'s flat ``config.get_roles()`` call does not reliably carry the correct
-    ``kind``/``actorIds`` for an agent-owned role (confirmed empirically: it returned ``kind=USER``
-    with an unrelated ``actorIds`` value for a role actually owned by an agent) -- a service's own
-    ``.roles`` list does (``aiac.idp.configuration.api.Configuration._build_service`` merges the
-    authoritative per-service ``kind``/``actorIds`` in). Patches ``roles`` in place for every agent
-    role the scenario declares, so ``compute_and_apply`` correctly attributes each agent role's
-    rules to its owning agent's own outbound APM -- getting this wrong is why an agent that
-    genuinely received grants could still end up with no rendered outbound Rego at all."""
-    agent_role_names = {name for agent in scenario.AGENTS.values() for name in agent["roles"]}
-    if not agent_role_names:
-        return
-    for svc in config.get_services():
-        for role in svc.roles:
-            if role.name in agent_role_names:
-                roles[role.name] = role
-
-
 def _provision_scale_realm_and_services(
     scenario, *, rego_dir: Path, db_prefix: str, ports: dict[str, int]
 ) -> tuple[Service, Service, Service]:
@@ -467,9 +449,11 @@ def total_corpus_e2e_result(tmp_path_factory: pytest.TempPathFactory) -> dict:
     real PDP Policy Writer + OPA -- the only level that can catch merge/rendering/OPA-semantics
     bugs a PRB-only check can't see (same rationale as ``test_e2e_correctness``). Reuses
     ``eval.test_policy_pipeline_eval``'s ``provision_keycloak_admin``/``provision_via_config``/
-    ``_read_back`` **unmodified** -- both provisioning functions are already generic over any
-    scenario's own ``AGENTS``/``TOOLS``/``USER_ROLES`` dicts, so the generated corpus needs no
-    special-casing there.
+    ``_read_back`` -- both provisioning functions are already generic over any scenario's own
+    ``AGENTS``/``TOOLS``/``USER_ROLES`` dicts, so the generated corpus needs no special-casing
+    there. ``_read_back`` itself now corrects every agent role's ``kind``/``actorIds`` as part of
+    its own shared contract (see its docstring) -- this suite no longer needs its own
+    fixture-local ``_fix_agent_role_actor_ids`` patch on top of it.
 
     Deliberately pays for the full ~100-150-call PRB run a second time rather than reusing
     ``total_corpus_prb_result``'s already-computed rules: this fixture's own PRB run is against
@@ -496,7 +480,6 @@ def total_corpus_e2e_result(tmp_path_factory: pytest.TempPathFactory) -> dict:
         config = Configuration.for_realm(scenario.REALM_DEFAULT)
         provision_via_config(config, scenario)
         roles, scopes = read_back_idp(config)
-        _fix_agent_role_actor_ids(config, roles, scenario)
         start = time.perf_counter()
         orchestrated = orchestrate_prb_concurrent(roles, scopes, scenario, best_effort=True)
         rules, reasoning_by_scope, reasoning_by_agent_role, best_effort_notes, usage_by_name, failed_decisions = (
@@ -672,7 +655,6 @@ def per_decision_e2e_result(tmp_path_factory: pytest.TempPathFactory) -> dict:
         config = Configuration.for_realm(scenario.REALM_DEFAULT)
         provision_via_config(config, scenario)
         roles, scopes = read_back_idp(config)
-        _fix_agent_role_actor_ids(config, roles, scenario)
 
         candidate_role_objs = [roles[n] for n in corpus.scope_candidate_roles]
         focal_scope_obj = scopes[FOCAL_SCOPE_NAME]
