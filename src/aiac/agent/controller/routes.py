@@ -10,9 +10,9 @@ handling, or state assembly lives here.
 current side with only the entry of one service (by its clientId), or 404 if it has no SPM. It
 calls the PCE ``policy_model_for`` and writes nothing.
 
-The app's lifespan (``eventbus.consumer.lifespan``) runs the start sequence first — start check #4
-and the PCE resync (see ``controller.start``) — then starts the NATS consumer. A failed step stops
-the Controller before it serves.
+The app's lifespan (``eventbus.consumer.lifespan``) runs the start sequence first — the enforcement
+side (``AIAC_ENFORCEMENT_SIDE``), start check #4 and the PCE resync (see ``controller.start``) — then
+starts the NATS consumer. A failed step (also an unknown side) stops the Controller before it serves.
 
 Responses are bare HTTP status codes: ``200 OK`` on success (no body). Upstream
 failures are raised as FastAPI ``HTTPException``s by the handlers; the status

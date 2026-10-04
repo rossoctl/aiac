@@ -1,10 +1,12 @@
 """Unit tests for the Controller start sequence (the FastAPI lifespan, before the NATS consumer).
 
-The sequence: start check #4 (D30: the global combiner denies a pod that has no client CR), then the
-PCE ``resync()`` (D28), then the NATS consumer. A failure in check #4 or in the resync stops the
-Controller: the lifespan raises, so uvicorn never serves. Driven through the real app with a
-``TestClient`` context (which runs the lifespan). The k8s read of the combiner CR is faked at the
-``kube._custom_objects`` seam, the PCE ``resync`` at its import site, and the NATS consumer is a fake.
+The sequence: read the enforcement side (D29: ``AIAC_ENFORCEMENT_SIDE``), then start check #4 (D30:
+the global combiner denies a pod that has no client CR), then the PCE ``resync()`` (D28), then the
+NATS consumer. An unknown side, a failed check #4 or a failed resync stops the Controller: the
+lifespan raises, so uvicorn never serves. Driven through the real app with a ``TestClient`` context
+(which runs the lifespan). The side is set in the env, the k8s read of the combiner CR is faked at
+the ``kube._custom_objects`` seam, the PCE ``resync`` at its import site, and the NATS consumer is a
+fake.
 """
 
 from unittest.mock import MagicMock, patch
@@ -74,9 +76,11 @@ class _FakeConsumer:
 @pytest.fixture
 def cluster(monkeypatch):
     """The fake CustomObjectsApi (``get_namespaced_custom_object`` returns the changed combiner), the
-    PCE ``resync`` and the NATS consumer, recording the start order in ``cluster.events``."""
+    PCE ``resync`` and the NATS consumer, recording the start order in ``cluster.events``. The side
+    is unset (the default, target side)."""
     monkeypatch.setenv("UPSTREAM_MAX_RETRIES", "1")
     monkeypatch.delenv("AIAC_BUNDLE_SERVICE_NAMESPACE", raising=False)
+    monkeypatch.delenv("AIAC_ENFORCEMENT_SIDE", raising=False)
     events: list[str] = []
     objects = MagicMock()
     objects.get_namespaced_custom_object.side_effect = lambda **_: events.append("check #4") or objects.combiner
@@ -122,6 +126,34 @@ class TestStartSequencePasses:
         content = _package("inbound", "request", fail_open=False) + f"# {_INBOUND_LINE}\n"
         cluster.combiner["spec"]["policies"][0]["content"] = content
         assert _serve() == 200
+
+
+class TestTheEnforcementSide:
+    """Step 1 (D29): the Controller reads ``AIAC_ENFORCEMENT_SIDE`` before every other step."""
+
+    @pytest.mark.parametrize(
+        ("value", "side"),
+        [(None, "target-side"), ("target-side", "target-side"), ("agent-side", "agent-side")],
+        ids=["unset-is-target-side", "target-side", "agent-side"],
+    )
+    def test_each_valid_side_starts_and_is_logged(self, cluster, monkeypatch, caplog, value, side):
+        if value is not None:
+            monkeypatch.setenv("AIAC_ENFORCEMENT_SIDE", value)
+        with caplog.at_level("INFO", logger=start.__name__):
+            assert _serve() == 200
+        assert cluster.events == ["check #4", "resync", "consumer"]
+        assert any(side in r.getMessage() and r.levelname == "INFO" for r in caplog.records)
+
+    @pytest.mark.parametrize("value", ["both-sides", "", "Target-Side"])
+    def test_an_unknown_side_stops_the_start_before_check_4_and_the_resync(self, cluster, monkeypatch, caplog, value):
+        monkeypatch.setenv("AIAC_ENFORCEMENT_SIDE", value)
+        with pytest.raises(ValueError, match="AIAC_ENFORCEMENT_SIDE"):
+            _serve()
+        cluster.get_namespaced_custom_object.assert_not_called()
+        cluster.resync.assert_not_called()
+        assert cluster.events == []
+        errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+        assert any("AIAC_ENFORCEMENT_SIDE" in m and repr(value) in m for m in errors)
 
 
 class TestCheck4StopsTheController:

@@ -7,10 +7,14 @@ trigger, it sequences the two sub-agents and returns ``(list[PolicyRule], overri
 
     0. The precondition checks (D30, see ``preconditions``) — run FIRST, after the one IdP read
        that resolves the clientId: the pod has the AuthBridge sidecar (#1), the namespace pipeline
-       has ``opa`` (and ``mcp-parser`` for a tool) inbound (#2), no app container has an
-       ``httpGet`` probe (#6). A failed check raises ``EnforcementPreconditionError``.
-       Then, for an enabled TOOL only, the PCE ``bootstrap`` writes the tool's first CR, so that
-       discovery (``tools/list`` through the tool's own inbound) passes (checkpoint B1).
+       has ``opa`` (and ``mcp-parser`` for a tool) inbound, and under agent side also ``opa``
+       outbound (#2), no app container has an ``httpGet`` probe (#6). The scope depends on the
+       enforcement side: every service under target side, agents only under agent side (a tool
+       then gets a pass-through CR, which needs no check; its pod type is still read). A failed
+       check raises ``EnforcementPreconditionError``.
+       Then, for an enabled TOOL only, the PCE ``bootstrap`` writes the tool's first CR (under
+       target side its rules-based CR, under agent side a pass-through CR), so that discovery
+       (``tools/list`` through the tool's own inbound) passes D20 (checkpoint B1).
     1. Service Provision  — classifies the service and writes its roles/scopes into the IdP,
        producing the discovered ``service_type`` and the **created-manifest** (exactly the
        roles/scopes it created on this run — see ``provision_service``).
@@ -202,11 +206,14 @@ def onboard_service(service_id: ServiceUuid) -> tuple[list[PolicyRule], bool, Cl
     (as Provision's ``classify_service`` does) before Provision.
 
     Then the precondition checks (D30, :func:`~aiac.agent.uc.onboarding.preconditions.check_preconditions`)
-    run, before Provision and the PRB. A failed check raises ``EnforcementPreconditionError``,
+    run, before Provision and the PRB. They read the enforcement side: under target side they check
+    every service, under agent side agents only (a tool's pass-through CR needs no check, but the
+    checks still return its pod type). A failed check raises ``EnforcementPreconditionError``,
     which names each failed check; nothing changed yet, so there is no rollback, no client disable
     and no quarantine (checkpoint O2). If the service is a tool (the type of its pod label) and its
     client is enabled, the PCE ``bootstrap(client_id, ServiceType.TOOL)`` writes the tool's first CR
-    before Provision, so that discovery passes (checkpoint B1). A disabled tool gets no bootstrap:
+    before Provision (of the current side: rules-based under target side, a pass-through under
+    agent side), so that discovery passes (checkpoint B1). A disabled tool gets no bootstrap:
     it fails at the discovery-token mint anyway (C5). A bootstrap failure propagates (no rollback:
     Provision has not run).
 
@@ -246,7 +253,8 @@ def onboard_service(service_id: ServiceUuid) -> tuple[list[PolicyRule], bool, Cl
 
         # D30: the precondition checks run FIRST, before anything changes. A failed check raises
         # EnforcementPreconditionError, which is NOT a rollback error (checkpoint O2): nothing was
-        # provisioned, so there is no rollback, no client disable and no quarantine.
+        # provisioned, so there is no rollback, no client disable and no quarantine. Under agent
+        # side a tool gets no check, but its pod type is still returned (for the bootstrap below).
         pod_type = check_preconditions(service)  # the type from the pod label (no catalog type yet)
         # Checkpoint B1: the first CR of a tool, before Provision, so that discovery (tools/list
         # through the tool's own inbound) passes D20. Only for an enabled client: a disabled

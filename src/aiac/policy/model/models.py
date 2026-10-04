@@ -136,9 +136,22 @@ class TargetSidePolicyModel(PolicyModel):
     services: list[ServicePolicyModel]
 
 
+class AgentSidePolicyModel(PolicyModel):
+    """The agent-side policy model: the APMs, which the PCE derives in memory at each deploy and
+    never stores, and the clientIds of the managed tools.
+
+    Each agent's CR has its inbound and its outbound tool checks (the outbound needs the edges on
+    the SPMs of the services it calls — the join that ``_derive`` does). Each ``pass_through`` tool
+    gets a pass-through CR (D24): a pod with no CR is denied (D20), also on its outbound."""
+
+    enforcement_side: Literal[EnforcementSide.AGENT_SIDE] = EnforcementSide.AGENT_SIDE
+    agents: list[AgentPolicyModel]
+    pass_through: list[str] = []
+
+
 # The body of ``POST`` / ``PUT /policy``: every concrete policy model, told apart by its tag. The
 # discriminator makes the tag mandatory in a body, although each subclass has it as a default.
-AnyPolicyModel = Annotated[TargetSidePolicyModel, Field(discriminator="enforcement_side")]
+AnyPolicyModel = Annotated[TargetSidePolicyModel | AgentSidePolicyModel, Field(discriminator="enforcement_side")]
 
 _policy_model_adapter: TypeAdapter[AnyPolicyModel] = TypeAdapter(AnyPolicyModel)
 

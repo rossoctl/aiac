@@ -682,6 +682,9 @@ def _provision_scenario(name: str, idp_port: int, store_port: int, opa_port: int
         # 127.0.0.1:7074 default once ports diverge per worker.
         os.environ["AIAC_POLICY_MODEL_STORE_URL"] = f"http://{store_host}:{store_port}"
         os.environ["AIAC_PDP_POLICY_URL"] = f"http://{opa_host}:{opa_port}"
+        # The suites score each AGENT's outbound Rego (agent_role_scopes, target_allow_scopes), which is
+        # a pass-through under target side, so this in-process PCE always deploys the agent side.
+        os.environ["AIAC_ENFORCEMENT_SIDE"] = "agent-side"
         log.info(
             "scenario %s: realm=%s policy=%s rego_dir=%s ports=(idp=%d store=%d opa=%d)",
             name,

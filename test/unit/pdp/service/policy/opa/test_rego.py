@@ -6,9 +6,11 @@ nested ``input.identity`` / ``input.mcp`` shape, and de-prefixing (provisioned
 ``<owner>.<tool>`` scope names collapse to the bare ``input.mcp.params.name`` the
 live plugin sends).
 
-- **Agent side** (an APM): the agent inbound (the ``rossoctl`` platform bypass)
-  and the agent outbound (per-tool checks and the MCP session rule), with the
-  deny-overrides ALLOW/DENY split. Scope maps are split symmetrically
+- **Agent side** (an APM, ``render_agent_side``; a managed tool,
+  ``render_pass_through``): the agent inbound (the ``rossoctl`` platform bypass)
+  and the agent outbound (per-tool checks and the MCP session rule; the known limit
+  that A2A and LLM calls are denied), with the deny-overrides ALLOW/DENY split; the
+  pass-through CR of a managed tool (D24), which allows every request on both tiers. Scope maps are split symmetrically
   (``subject_role_allow_scopes`` / ``_deny_scopes``, ``source_role_allow_scopes`` /
   ``_deny_scopes``, ``target_allow_scopes`` / ``target_deny_scopes``); the identity
   maps (``subject_roles`` / ``source_roles`` / ``agent_roles``) keep their names.
@@ -32,10 +34,13 @@ import pytest
 
 from aiac.idp.configuration.models import Role, RoleKind, Scope, ServiceType
 from aiac.pdp.service.policy.opa.rego import (
+    ClientPolicies,
     generate_inbound_rego,
     generate_outbound_rego,
     generate_pass_through_rego,
     identity_ref,
+    render_agent_side,
+    render_pass_through,
     render_target_side,
 )
 from aiac.policy.model.models import AgentPolicyModel, PolicyRule, RuleEffect, ServicePolicyModel
@@ -1289,3 +1294,67 @@ def test_zero_rule_tool_inbound_passes_only_self_discovery(subject, client_id, m
         owned_scopes=[_scope("github-tool.source-read", GH_TOOL)],
     )
     _assert_opa_allow(render_target_side(spm).inbound, _INBOUND, _inbound_input(subject, client_id, mcp), allowed)
+
+
+# =========================================================================== #
+# Agent side (D18c, D24)                                                      #
+# =========================================================================== #
+#
+# The render input is the APMs and the pass-through IDs. An agent CR has the agent inbound and the
+# agent outbound (per-tool checks and the MCP session rule); a managed tool gets a pass-through CR.
+
+
+# --- the pass-through CR of a managed tool (D24) -----------------------------
+
+
+def test_agent_side_pass_through_cr_has_a_pass_through_in_both_tiers():
+    assert render_pass_through() == ClientPolicies(inbound=_PASS_THROUGH_INBOUND, outbound=_PASS_THROUGH_OUTBOUND)
+
+
+@pytest.mark.skipif(not shutil.which("opa"), reason="opa binary not on PATH")
+@pytest.mark.parametrize("tier", ["inbound", "outbound"])
+@pytest.mark.parametrize(
+    "input_doc",
+    [
+        {},  # no identity (D27 does not apply: a pass-through is not rules-based)
+        {"identity": {"subject": "guest", "client_id": OTHER_AGENT}, "mcp": _call("delete-repo")},
+        {"identity": {"subject": "guest", "service_id": GH_TOOL}, "mcp": {"method": "resources/read"}},
+        {"identity": {"subject": "dev-user"}, "a2a": {"method": "message/send"}},
+    ],
+    ids=["no-identity", "ungranted-tools-call", "other-mcp-method", "a2a"],
+)
+def test_agent_side_pass_through_cr_allows_every_request(tier, input_doc):
+    query = {"inbound": _INBOUND, "outbound": _OUTBOUND}[tier]
+    _assert_opa_allow(getattr(render_pass_through(), tier), query, input_doc, True)
+
+
+# --- the agent CR: the agent inbound and the agent outbound ------------------
+
+
+def test_agent_side_agent_cr_has_the_agent_inbound_and_the_agent_outbound():
+    apm = _github_agent()
+    policies = render_agent_side(apm, platform_clients=("argocd",))
+    # The agent inbound, agent-level (D26a), with the caller's platform clients.
+    assert policies.inbound == generate_inbound_rego(apm, platform_clients=("argocd",))
+    assert 'source_allow_ok if { input.identity.client_id == "argocd" }' in policies.inbound
+    # The agent outbound: the per-tool checks and the MCP session rule, never a pass-through.
+    assert policies.outbound == generate_outbound_rego(apm)
+    assert (
+        "allow if { input.mcp.method in session_methods; "
+        "some tool in target_allow_scopes[input.identity.service_id]; tool_ok(tool) }"
+    ) in policies.outbound
+    assert policies.outbound != _PASS_THROUGH_OUTBOUND
+
+
+@pytest.mark.skipif(not shutil.which("opa"), reason="opa binary not on PATH")
+@pytest.mark.parametrize(
+    "input_doc",
+    [
+        {"identity": {"subject": "dev-user", "service_id": GH_TOOL}, "a2a": {"method": "message/send"}},
+        {"identity": {"subject": "dev-user", "service_id": GH_TOOL}},  # an LLM call: no MCP method
+    ],
+    ids=["a2a-message-send", "llm-call"],
+)
+def test_agent_side_agent_outbound_denies_a2a_and_llm_calls(input_doc):
+    # The known limit of the agent side (b435aa1): only a granted tools/call and the MCP session pass.
+    _assert_opa_allow(render_agent_side(_github_agent()).outbound, _OUTBOUND, input_doc, False)

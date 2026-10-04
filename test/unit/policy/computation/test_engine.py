@@ -2,8 +2,10 @@
 
 The engine routes each pre-flattened ``PolicyRule`` to the ``ServicePolicyModel`` (SPM) of the
 service that *owns* the rule's scope (``scope.serviceId``), persists the changed SPMs, and then
-deploys the target-side policy model (``TargetSidePolicyModel``) of the changed live services with
-one ``apply_policy`` call (D23). Quarantine and decommission delete the CR of the service
+deploys the policy model of the current enforcement side for the affected live services with one
+``apply_policy`` call (D23): under target side a ``TargetSidePolicyModel`` (the changed SPMs), under
+agent side an ``AgentSidePolicyModel`` (the APMs of the affected agents, derived from the store, and
+the pass-through of a focus tool). Quarantine and decommission delete the CR of the service
 (``delete_service_cr``, D20); ``resync`` replaces every AIAC CR (``replace_policy``, D28);
 ``policy_model_for`` reads one service's entry (D18); ``bootstrap`` writes the focus tool's first CR.
 
@@ -17,10 +19,10 @@ inbound lists, ``list_service_policies`` returning every stored SPM):
     ``apply_service_policy`` / ``delete_service_policy``    (Policy Store library)
   - ``engine.apply_policy`` / ``replace_policy`` / ``delete_service_cr``  (PDP Policy Writer library)
 
-Agent-side derivation (P0b). In P0 the engine deploys only the target side, so no APM is pushed.
-``_derive`` stays (P0b deploys the agent side again), and the tests marked "agent-side derivation"
-keep its coverage: ``FakeStore.derived_apm`` runs the real ``engine._derive`` over the SPMs the run
-stored, seeded from the catalog as a run seeds them. The expected values stay literals.
+The side (D16, D29). ``AIAC_ENFORCEMENT_SIDE`` is unset in every test (target side, the default; see
+``conftest.py``). A test that takes the ``agent_side`` fixture runs under agent side, and a test
+that takes the ``side`` fixture runs once under each side. The agent-side tests read the APM that the
+run pushes (``FakeStore.pushed_apm``). The expected values are literals.
 """
 
 import os
@@ -32,7 +34,15 @@ import pytest
 
 from aiac.idp.configuration.api import Configuration
 from aiac.idp.configuration.models import Role, RoleKind, Scope, Service, ServiceType
-from aiac.policy.model.models import PolicyRule, RuleEffect, ServicePolicyModel, TargetSidePolicyModel
+from aiac.policy.model.models import (
+    AgentPolicyModel,
+    AgentSidePolicyModel,
+    EnforcementSide,
+    PolicyRule,
+    RuleEffect,
+    ServicePolicyModel,
+    TargetSidePolicyModel,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -120,7 +130,6 @@ def _inbound(spm) -> list[PolicyRule]:
 class FakeStore:
     def __init__(self, initial=None):
         self.data = {sid: m.model_copy(deep=True) for sid, m in (initial or {}).items()}
-        self.catalog = []  # the catalog of the latest ``engine_env`` — seeds ``derived_apm``
         self.calls = []  # [(op, arg)] — every store write and PDP call, in order
         self.service_writes = []  # [(service_id, SPM)] captured from apply_service_policy
         self.by_role_calls = []  # [Role] captured from get_service_policies_by_role
@@ -182,28 +191,30 @@ class FakeStore:
     def pushed_service(self, service_id):
         """The most recent target-side entry (an SPM) for ``service_id`` across all pushes."""
         for push in reversed(self.policy_pushes):
-            for spm in push.services:
+            for spm in getattr(push, "services", []):
                 if spm.service_id == service_id:
                     return spm
         return None
 
     @property
     def pushed_service_ids(self):
-        return {spm.service_id for push in self.policy_pushes for spm in push.services}
+        return {spm.service_id for push in self.policy_pushes for spm in getattr(push, "services", [])}
 
-    def derived_apm(self, agent_id):
-        """Agent-side derivation (P0b): the APM that the real ``engine._derive`` builds for
-        ``agent_id`` from the SPMs in this store, seeded from the latest catalog as a run seeds
-        them. Records no ``get_service_policies_by_role`` call."""
-        from aiac.policy.computation import engine
+    def pushed_apm(self, agent_id):
+        """The most recent agent-side entry (an APM) for ``agent_id`` across all pushes."""
+        for push in reversed(self.policy_pushes):
+            for apm in getattr(push, "agents", []):
+                if apm.agent_id == agent_id:
+                    return apm
+        return None
 
-        catalog = {svc.serviceId: svc for svc in self.catalog}
-        with (
-            patch.object(engine, "get_service_policy", side_effect=self.get_service_policy),
-            patch.object(engine, "get_service_policies_by_role", side_effect=self._scan_by_role),
-        ):
-            spm = engine._spm_cache(catalog)[1]
-            return engine._derive(agent_id, spm)
+    @property
+    def pushed_agent_ids(self):
+        return {apm.agent_id for push in self.policy_pushes for apm in getattr(push, "agents", [])}
+
+    @property
+    def pushed_pass_through(self):
+        return {sid for push in self.policy_pushes for sid in getattr(push, "pass_through", [])}
 
 
 _BOUNDARY = (
@@ -221,7 +232,6 @@ _BOUNDARY = (
 @contextmanager
 def engine_env(catalog, store):
     """Patch the engine boundary; yield ``compute_and_apply``. Multiple calls share the store."""
-    store.catalog = list(catalog)
     with ExitStack() as stack:
         stack.enter_context(patch.dict(os.environ, {"KEYCLOAK_REALM": "test-realm"}))
         stack.enter_context(patch.object(Configuration, "get_services", return_value=list(catalog)))
@@ -304,26 +314,65 @@ def test_user_role_agent_scope_lands_inbound_and_pushes_once():
     assert store.last_push.services == [store.data["github-agent"]]
 
 
-def test_derive_user_role_agent_scope_lands_in_inbound_subject_gate():
-    # Agent-side derivation (P0b): a User role lands in the inbound SUBJECT allow bucket.
+def test_agent_side_pushes_the_apm_of_the_agent_whose_inbound_changed(agent_side):
+    # Under agent side the run derives the APM of the touched agent and pushes it, once; a User role
+    # lands in the inbound SUBJECT allow bucket.
     AR, UR, AS, TS, catalog = _repro()
     store = run_engine([_rule(UR, AS)], catalog=catalog)
 
-    apm = store.derived_apm("github-agent")
-    assert _pairs(apm.inbound_subject_allow_rules) == [("r-user-dev", "s-agent-inbound")]
-    assert apm.subject_roles == {"dev-user": [UR]}
+    assert store.apply_policy_count == 1
+    assert store.last_push == AgentSidePolicyModel(
+        agents=[
+            AgentPolicyModel(
+                agent_id="github-agent",
+                agent_roles=[AR],
+                agent_scopes=[AS],
+                source_roles={},
+                subject_roles={"dev-user": [UR]},
+                inbound_subject_allow_rules=[_rule(UR, AS)],
+            )
+        ]
+    )
+
+
+def test_agent_side_rederives_the_owner_of_a_revoked_agent_role(agent_side):
+    # Override purges AR's only edge (on SPM(old-tool)), and the guard drops AR's new rule (its tool
+    # is disabled). Nothing else marks github-agent affected: it is affected because it owns AR, so
+    # its outbound to old-tool goes.
+    AR = _agent_role("r-agent-src", "agent-source", owner="github-agent")
+    AS = _scope("s-agent-inbound", "agent-inbound", service_id="github-agent")
+    OS = _scope("s-old-read", "old-read", service_id="old-tool")
+    NS = _scope("s-new-read", "new-read", service_id="new-tool")
+    catalog = [
+        _agent("github-agent", roles=[AR], scopes=[AS]),
+        _tool("old-tool", scopes=[OS]),
+        _tool("new-tool", scopes=[NS], enabled=False),
+    ]
+    initial = {"old-tool": _spm("old-tool", type=ServiceType.TOOL, owned_scopes=[OS], inbound=[_rule(AR, OS)])}
+    store = run_engine([_rule(AR, NS)], catalog=catalog, store_initial=initial, override=True)
+
+    assert _inbound(store.data["old-tool"]) == []
+    assert store.policy_pushes == [
+        AgentSidePolicyModel(
+            agents=[
+                AgentPolicyModel(
+                    agent_id="github-agent", agent_roles=[AR], agent_scopes=[AS], source_roles={}, subject_roles={}
+                )
+            ]
+        )
+    ]
 
 
 # --------------------------------------------------------------------------- #
 # Cycle 2 — an (agent role, tool scope) rule is stored on SPM(T); A's derived   #
 # APM gains outbound_rules + a target_scopes entry for the tool.               #
 # --------------------------------------------------------------------------- #
-def test_agent_role_tool_scope_derives_outbound_and_target_scopes():
+def test_agent_role_tool_scope_derives_outbound_and_target_scopes(agent_side):
     AR, UR, AS, TS, catalog = _repro()
     store = run_engine([_rule(AR, TS)], catalog=catalog)
 
     assert _pairs(store.data["github-tool"].inbound_allow_rules) == [("r-agent-src", "s-tool-read")]
-    apm = store.derived_apm("github-agent")
+    apm = store.pushed_apm("github-agent")
     assert _pairs(apm.outbound_target_allow_rules) == [("r-agent-src", "s-tool-read")]
     assert {k: [s.id for s in v] for k, v in apm.target_allow_scopes.items()} == {"github-tool": ["s-tool-read"]}
 
@@ -332,19 +381,18 @@ def test_agent_role_tool_scope_derives_outbound_and_target_scopes():
 # Cycle 3 — a (user role, tool scope) rule, once an agent targets that tool,    #
 # becomes the agent's outbound subject gate.                                    #
 # --------------------------------------------------------------------------- #
-def test_user_role_tool_scope_becomes_outbound_subject_gate():
+def test_user_role_tool_scope_becomes_outbound_subject_gate(agent_side):
     AR, UR, AS, TS, catalog = _repro()
     store = run_engine([_rule(AR, TS), _rule(UR, TS)], catalog=catalog)
 
-    apm = store.derived_apm("github-agent")
+    apm = store.pushed_apm("github-agent")
     assert _pairs(apm.outbound_subject_allow_rules) == [("r-user-dev", "s-tool-read")]
     assert apm.subject_roles == {"dev-user": [UR]}
 
 
 # --------------------------------------------------------------------------- #
 # Cycle 4 — HEADLINE: both onboarding orders converge — the same stored SPM(T)  #
-# and the same target-side entry of T; under agent-side derivation (P0b) the    #
-# same APM(A).                                                                   #
+# and the same target-side entry of T; under agent side the same pushed APM(A).  #
 # --------------------------------------------------------------------------- #
 def _both_orders():
     AR, UR, AS, TS, catalog = _repro()
@@ -374,11 +422,11 @@ def test_both_orders_yield_identical_target_side_entry_for_the_tool():
     ]
 
 
-def test_both_orders_yield_identical_agent_policy():
+def test_both_orders_yield_identical_agent_policy(agent_side):
     store_at, store_ta = _both_orders()
 
-    apm_at = store_at.derived_apm("github-agent")
-    apm_ta = store_ta.derived_apm("github-agent")
+    apm_at = store_at.pushed_apm("github-agent")
+    apm_ta = store_ta.pushed_apm("github-agent")
     assert _norm(apm_at) == _norm(apm_ta)
 
     # and it is the expected policy: inbound {UR->AS}, outbound {AR->TS} + subject gate {UR->TS}
@@ -389,8 +437,8 @@ def test_both_orders_yield_identical_agent_policy():
 
 # --------------------------------------------------------------------------- #
 # Cycle 5 — latent sibling bug: after A+T exist, a late (UR2 -> TS) user-role    #
-# rule routes to SPM(T); only T's entry is redeployed, with UR2. Under agent-    #
-# side derivation (P0b), A's subject gate includes UR2.                          #
+# rule routes to SPM(T); only T's entry is redeployed, with UR2. Under agent    #
+# side, A is re-derived and its subject gate includes UR2.                       #
 # --------------------------------------------------------------------------- #
 def _late_user_role_store():
     AR, UR, AS, TS, catalog = _repro()
@@ -410,13 +458,28 @@ def test_late_user_role_on_tool_redeploys_only_the_tool_entry():
     assert ("r-user-ops", "s-tool-read") in _pairs(late.services[0].inbound_allow_rules)
 
 
-def test_late_user_role_on_tool_rederives_affected_agent_subject_gate():
+def test_agent_side_late_user_role_on_tool_rederives_the_agent_that_targets_it(agent_side):
+    # Only SPM(T) changed. github-agent is affected because it targets T (AR→TS on SPM(T)); its
+    # re-derived outbound subject gate includes UR2. The tool is not the focus: no pass-through.
+    AR, UR, AS, TS, catalog = _repro()
+    UR2 = _user_role("r-user-ops", "ops", users=["ops-user"])
     store = _late_user_role_store()
 
-    apm = store.derived_apm("github-agent")
-    subject_pairs = _pairs(apm.outbound_subject_allow_rules)
-    assert ("r-user-ops", "s-tool-read") in subject_pairs
-    assert "ops-user" in apm.subject_roles
+    assert store.last_push == AgentSidePolicyModel(
+        agents=[
+            AgentPolicyModel(
+                agent_id="github-agent",
+                agent_roles=[AR],
+                agent_scopes=[AS],
+                source_roles={},
+                subject_roles={"dev-user": [UR], "ops-user": [UR2]},
+                target_allow_scopes={"github-tool": [TS]},
+                inbound_subject_allow_rules=[_rule(UR, AS)],
+                outbound_target_allow_rules=[_rule(AR, TS)],
+                outbound_subject_allow_rules=[_rule(UR, TS), _rule(UR2, TS)],
+            )
+        ]
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -441,14 +504,14 @@ def test_agent_to_agent_edge_deploys_only_the_callee_entry():
     assert _pairs(store.pushed_service("agent-b").inbound_allow_rules) == [("r-a-caller", "s-b-inbound")]
 
 
-def test_agent_to_agent_edge_projects_into_both_policies():
+def test_agent_to_agent_edge_projects_into_both_policies(agent_side):
     store = _agent_to_agent()
 
-    apm_a = store.derived_apm("agent-a")
+    apm_a = store.pushed_apm("agent-a")
     assert _pairs(apm_a.outbound_target_allow_rules) == [("r-a-caller", "s-b-inbound")]
     assert {k: [s.id for s in v] for k, v in apm_a.target_allow_scopes.items()} == {"agent-b": ["s-b-inbound"]}
 
-    apm_b = store.derived_apm("agent-b")
+    apm_b = store.pushed_apm("agent-b")
     assert {k: [r.id for r in v] for k, v in apm_b.source_roles.items()} == {"agent-a": ["r-a-caller"]}
 
 
@@ -531,8 +594,8 @@ def test_composite_role_is_not_flattened():
 
 # --------------------------------------------------------------------------- #
 # Cycle 11 — every managed service gets a CR (rule P4 is gone): a tool's stored  #
-# SPM is its target-side entry. Under agent-side derivation (P0b) the agent's    #
-# APM still has the agent -> tool target_allow_scopes edge.                      #
+# SPM is its target-side entry. Under agent side the pushed APM of the agent    #
+# has the agent -> tool target_allow_scopes edge.                                #
 # --------------------------------------------------------------------------- #
 def test_tool_gets_its_stored_spm_as_a_target_side_entry():
     AR, UR, AS, TS, catalog = _repro()
@@ -543,18 +606,18 @@ def test_tool_gets_its_stored_spm_as_a_target_side_entry():
     assert store.last_push.services[0].service_type == ServiceType.TOOL
 
 
-def test_derive_agent_to_tool_edge_on_the_agent_apm():
+def test_derive_agent_to_tool_edge_on_the_agent_apm(agent_side):
     AR, UR, AS, TS, catalog = _repro()
     store = run_engine([_rule(AR, TS)], catalog=catalog)
 
-    assert "github-tool" in store.derived_apm("github-agent").target_allow_scopes
+    assert "github-tool" in store.pushed_apm("github-agent").target_allow_scopes
 
 
 # --------------------------------------------------------------------------- #
 # Cycle 12 — P2 identity from owned_*: the derived APM embeds the agent's own     #
 # aiac.managed roles/scopes; built-ins are filtered; an agent with none keeps []. #
 # --------------------------------------------------------------------------- #
-def test_p2_identity_embeds_aiac_managed_owned_roles_and_scopes():
+def test_p2_identity_embeds_aiac_managed_owned_roles_and_scopes(agent_side):
     helper = _agent_role("r-helper", "helper", owner="github-agent")
     builtin = _agent_role("r-default", "default-roles-aiac", owner="github-agent")
     builtin = builtin.model_copy(update={"attributes": {}})  # not aiac.managed
@@ -564,17 +627,17 @@ def test_p2_identity_embeds_aiac_managed_owned_roles_and_scopes():
     UR = _user_role("r-user", users=["u"])
     store = run_engine([_rule(UR, src)], catalog=[agent])
 
-    apm = store.derived_apm("github-agent")
+    apm = store.pushed_apm("github-agent")
     assert [r.id for r in apm.agent_roles] == ["r-helper"]  # built-in role dropped
     assert [s.id for s in apm.agent_scopes] == ["s-src"]  # profile scope dropped
 
 
-def test_p2_identity_empty_when_no_owned_entities():
+def test_p2_identity_empty_when_no_owned_entities(agent_side):
     agent = _agent("github-agent")  # no catalog roles/scopes
     UR = _user_role("r-user", users=["u"])
     store = run_engine([_rule(UR, _scope("s-x", service_id="github-agent"))], catalog=[agent])
 
-    apm = store.derived_apm("github-agent")
+    apm = store.pushed_apm("github-agent")
     assert apm.agent_roles == [] and apm.agent_scopes == []
 
 
@@ -582,7 +645,7 @@ def test_p2_identity_empty_when_no_owned_entities():
 # Cycle 13 — directional relevance: a user role shared between an agent scope     #
 # and a tool scope does NOT create a false outbound edge from A to the tool.      #
 # --------------------------------------------------------------------------- #
-def test_shared_user_role_creates_no_false_outbound_edge():
+def test_shared_user_role_creates_no_false_outbound_edge(agent_side):
     UR = _user_role("r-user-dev", "developer", users=["dev-user"])
     AS = _scope("s-agent-inbound", service_id="github-agent")
     TS = _scope("s-tool-read", service_id="github-tool")
@@ -590,7 +653,7 @@ def test_shared_user_role_creates_no_false_outbound_edge():
     catalog = [_agent("github-agent", scopes=[AS]), _tool("github-tool", scopes=[TS])]
     store = run_engine([_rule(UR, AS), _rule(UR, TS)], catalog=catalog)
 
-    apm = store.derived_apm("github-agent")
+    apm = store.pushed_apm("github-agent")
     assert apm.outbound_target_allow_rules == []
     assert apm.outbound_target_deny_rules == []
     assert apm.target_allow_scopes == {}
@@ -605,7 +668,7 @@ def test_shared_user_role_creates_no_false_outbound_edge():
 # BOTH outbound gates — the full agent->tool outbound_rules + target_scopes, and    #
 # the user->tool outbound_subject gate. This is what populates the per-scope AND.   #
 # --------------------------------------------------------------------------- #
-def test_multi_role_capability_match_populates_both_outbound_gates():
+def test_multi_role_capability_match_populates_both_outbound_gates(agent_side):
     src_op = _agent_role("r-src-op", "source_operations", owner="github-agent")
     issue_op = _agent_role("r-issue-op", "issue_operations", owner="github-agent")
     developer = _user_role("r-developer", "developer", users=["dev-user"])
@@ -633,7 +696,7 @@ def test_multi_role_capability_match_populates_both_outbound_gates():
     ]
     store = run_engine(rules, catalog=catalog)
 
-    apm = store.derived_apm("github-agent")
+    apm = store.pushed_apm("github-agent")
     # capability gate: all four agent->tool edges + target_allow_scopes covering all four scopes
     assert _pairs(apm.outbound_target_allow_rules) == sorted(
         [
@@ -673,6 +736,77 @@ def test_unrelated_service_is_not_deployed():
 
 
 # --------------------------------------------------------------------------- #
+# The affected set of each side (D23). Under target side: the changed set. Under #
+# agent side: the affected agents (here the agent that targets the touched tool) #
+# plus the pass-through of the focus service when it is a tool. An unrelated     #
+# agent is not deployed under either side.                                        #
+# --------------------------------------------------------------------------- #
+def test_the_affected_set_of_each_side(side):
+    AR, UR, AS, TS, catalog = _repro()
+    US = _scope("s-other", service_id="other-agent")
+    catalog = catalog + [_agent("other-agent", scopes=[US])]
+    initial = {
+        "github-tool": _spm("github-tool", type=ServiceType.TOOL, owned_scopes=[TS], inbound=[_rule(AR, TS)]),
+        "other-agent": _spm("other-agent", owned_scopes=[US], inbound=[_rule(UR, US)]),
+    }
+    store = run_engine([_rule(UR, TS)], catalog=catalog, store_initial=initial, focus_service="github-tool")
+
+    tool = _spm("github-tool", type=ServiceType.TOOL, owned_scopes=[TS], inbound=[_rule(AR, TS), _rule(UR, TS)])
+    agent = AgentPolicyModel(
+        agent_id="github-agent",
+        agent_roles=[AR],
+        agent_scopes=[AS],
+        source_roles={},
+        subject_roles={"dev-user": [UR]},
+        target_allow_scopes={"github-tool": [TS]},
+        outbound_target_allow_rules=[_rule(AR, TS)],
+        outbound_subject_allow_rules=[_rule(UR, TS)],
+    )
+    expected = {
+        EnforcementSide.TARGET_SIDE: TargetSidePolicyModel(services=[tool]),
+        EnforcementSide.AGENT_SIDE: AgentSidePolicyModel(agents=[agent], pass_through=["github-tool"]),
+    }
+    assert store.data["github-tool"] == tool
+    assert store.policy_pushes == [expected[side]]
+
+
+def test_no_push_when_the_policy_model_of_the_side_is_empty(side):
+    # SPM(T) changed, but no agent targets T and T is not the focus: under agent side the model is
+    # empty, so there is no apply_policy call; under target side T's entry is pushed.
+    AR, UR, AS, TS, catalog = _repro()
+    store = run_engine([_rule(UR, TS)], catalog=catalog)
+
+    expected = {EnforcementSide.TARGET_SIDE: 1, EnforcementSide.AGENT_SIDE: 0}
+    assert store.apply_policy_count == expected[side]
+
+
+def test_agent_side_disabled_focus_tool_gets_its_pass_through(agent_side):
+    # A re-onboarding applies while the tool's client is still disabled: the focus counts as live.
+    AR, UR, AS, TS, catalog = _guard_catalog(tool_enabled=False)
+    store = run_engine([], catalog=catalog, focus_service="github-tool")
+
+    assert store.policy_pushes == [AgentSidePolicyModel(agents=[], pass_through=["github-tool"])]
+
+
+def test_agent_side_never_deploys_a_disabled_or_absent_agent(agent_side):
+    # disabled-agent and ghost-agent target the tool; github-agent's inbound changed. Only the live
+    # agent is derived.
+    AR, UR, AS, TS, catalog = _repro()
+    DR = _agent_role("r-disabled-src", "disabled-source", owner="disabled-agent")
+    GR = _agent_role("r-ghost-src", "ghost-source", owner="ghost-agent")
+    catalog = catalog + [_agent("disabled-agent", roles=[DR], enabled=False)]
+    initial = {
+        "github-tool": _spm(
+            "github-tool", type=ServiceType.TOOL, owned_scopes=[TS], inbound=[_rule(DR, TS), _rule(GR, TS)]
+        ),
+    }
+    store = run_engine([_rule(UR, AS), _rule(UR, TS)], catalog=catalog, store_initial=initial)
+
+    assert store.pushed_agent_ids == {"github-agent"}
+    assert store.pushed_pass_through == set()
+
+
+# --------------------------------------------------------------------------- #
 # Cycle 15 — apply_policy is called exactly once, after every SPM write.          #
 # --------------------------------------------------------------------------- #
 def test_apply_policy_called_exactly_once_after_all_spm_writes():
@@ -702,6 +836,35 @@ def test_zero_rule_focus_spm_is_stored_and_deployed(kind):
     expected = _spm("new-svc", type=kind, owned_roles=[own_role], owned_scopes=[own_scope])
     assert store.data == {"new-svc": expected}  # seeded from the catalog (aiac.managed only)
     assert store.policy_pushes == [TargetSidePolicyModel(services=[expected])]
+
+
+def test_agent_side_zero_rule_focus_tool_gets_its_pass_through(agent_side):
+    TS = _scope("s-own", "own", service_id="new-svc")
+    store = run_engine([], catalog=[_tool("new-svc", scopes=[TS])], focus_service="new-svc")
+
+    assert store.data == {"new-svc": _spm("new-svc", type=ServiceType.TOOL, owned_scopes=[TS])}
+    assert store.policy_pushes == [AgentSidePolicyModel(agents=[], pass_through=["new-svc"])]
+
+
+def test_agent_side_zero_rule_focus_agent_gets_its_apm(agent_side):
+    own_role = _agent_role("r-own", "own", owner="new-svc")
+    own_scope = _scope("s-own", "own", service_id="new-svc")
+    store = run_engine([], catalog=[_agent("new-svc", roles=[own_role], scopes=[own_scope])], focus_service="new-svc")
+
+    assert store.data == {"new-svc": _spm("new-svc", owned_roles=[own_role], owned_scopes=[own_scope])}
+    assert store.policy_pushes == [
+        AgentSidePolicyModel(
+            agents=[
+                AgentPolicyModel(
+                    agent_id="new-svc",
+                    agent_roles=[own_role],
+                    agent_scopes=[own_scope],
+                    source_roles={},
+                    subject_roles={},
+                )
+            ]
+        )
+    ]
 
 
 def test_zero_rule_reonboarding_stores_and_redeploys_the_focus_spm():
@@ -820,7 +983,7 @@ def test_reconcile_drops_churned_scope_uuid_same_name():
     assert _pairs(_inbound(store.data["github-agent"])) == [("r-user-dev", "s-as-v2")]
 
 
-def test_reconcile_collapses_churned_duplicate_user_role():
+def test_reconcile_collapses_churned_duplicate_user_role(agent_side):
     # Two same-name/different-id ``developer`` edges on one scope (Keycloak delete+recreate). The
     # batch carries the current generation, so the old-generation edge is dropped; the derived APM's
     # subject gate then names only the current role.
@@ -834,7 +997,7 @@ def test_reconcile_collapses_churned_duplicate_user_role():
     store = run_engine([_rule(dev_new, AS)], catalog=catalog, store_initial=initial)
 
     assert _pairs(_inbound(store.data["github-agent"])) == [("r-dev-v2", "s-agent-inbound")]
-    apm = store.derived_apm("github-agent")
+    apm = store.pushed_apm("github-agent")
     assert apm.subject_roles == {"dev-user": [dev_new]}
 
 
@@ -929,20 +1092,44 @@ def test_decommission_tool_deletes_its_cr_and_strands_no_edges():
     assert len(store.policy_pushes) == pushes_before
 
 
-def test_derive_after_decommission_of_a_tool_strands_the_agent_outbound():
-    # Agent-side derivation (P0b): A's outbound to the tool is stranded (the edge lived on SPM(T));
-    # its inbound UR→AS survives.
+def test_agent_side_decommission_of_a_tool_rederives_its_targeter(agent_side):
+    # The targeter's outbound to the tool is stranded (the edge lived on SPM(T)): it is re-derived
+    # and pushed with an empty outbound, after the CR delete; its inbound UR→AS survives. The tool
+    # gets no pass-through (its CR is deleted).
+    store = FakeStore()
+    AR, UR, AS, TS = _onboard_repro(store)
+    store.calls.clear()
+
+    run_decommission("github-tool", catalog=[_agent("github-agent", roles=[AR], scopes=[AS])], store=store)
+
+    assert store.cr_deletes == ["github-tool"]
+    assert store.last_push == AgentSidePolicyModel(
+        agents=[
+            AgentPolicyModel(
+                agent_id="github-agent",
+                agent_roles=[AR],
+                agent_scopes=[AS],
+                source_roles={},
+                subject_roles={"dev-user": [UR]},
+                inbound_subject_allow_rules=[_rule(UR, AS)],
+            )
+        ]
+    )
+    assert [op for op, _ in store.calls] == ["delete", "delete_service_cr", "apply_policy"]
+
+
+def test_agent_side_decommission_of_an_agent_pushes_no_tool(agent_side):
+    # Offboard the agent: its footprint leaves SPM(T), but T is a tool (its pass-through CR does not
+    # change) and nothing targeted the agent, so nothing is pushed.
     store = FakeStore()
     _onboard_repro(store)
-    assert _pairs(store.derived_apm("github-agent").outbound_target_allow_rules) == [("r-agent-src", "s-tool-read")]
+    pushes_before = len(store.policy_pushes)
 
-    run_decommission("github-tool", catalog=[_agent("github-agent", scopes=[])], store=store)
+    run_decommission("github-agent", catalog=[_tool("github-tool", scopes=[])], store=store)
 
-    apm = store.derived_apm("github-agent")
-    assert apm.outbound_target_allow_rules == []
-    assert apm.target_allow_scopes == {}
-    assert apm.outbound_subject_allow_rules == []
-    assert _pairs(apm.inbound_subject_allow_rules) == [("r-user-dev", "s-agent-inbound")]
+    assert store.cr_deletes == ["github-agent"]
+    assert _pairs(_inbound(store.data["github-tool"])) == [("r-user-dev", "s-tool-read")]
+    assert len(store.policy_pushes) == pushes_before
 
 
 def test_decommission_agent_deletes_its_cr_and_purges_outbound_footprint():
@@ -965,6 +1152,30 @@ def test_decommission_agent_deletes_its_cr_and_purges_outbound_footprint():
     assert store.last_push == TargetSidePolicyModel(services=[store.data["github-tool"]])
 
 
+def test_decommission_of_a_caller_redeploys_the_callee_that_lost_its_role(side):
+    # agent-a calls agent-b (AR→BS on SPM(agent-b)); agent-b does not call agent-a. Offboarding
+    # agent-a purges AR→BS. Target side: the purged SPM(agent-b) is redeployed. Agent side: agent-b
+    # is re-derived, with no source_roles[agent-a].
+    AR = _agent_role("r-a-caller", "a-caller", owner="agent-a")
+    BS = _scope("s-b-inbound", "b-inbound", service_id="agent-b")
+    store = FakeStore({"agent-b": _spm("agent-b", owned_scopes=[BS], inbound=[_rule(AR, BS)])})
+    store.data["agent-a"] = _spm("agent-a", owned_roles=[AR])
+
+    run_decommission("agent-a", catalog=[_agent("agent-b", scopes=[BS])], store=store)
+
+    expected = {
+        EnforcementSide.TARGET_SIDE: TargetSidePolicyModel(services=[_spm("agent-b", owned_scopes=[BS])]),
+        EnforcementSide.AGENT_SIDE: AgentSidePolicyModel(
+            agents=[
+                AgentPolicyModel(
+                    agent_id="agent-b", agent_roles=[], agent_scopes=[BS], source_roles={}, subject_roles={}
+                )
+            ]
+        ),
+    }
+    assert store.policy_pushes == [expected[side]]
+
+
 def test_decommission_writes_the_store_then_deletes_the_cr_then_redeploys():
     store = FakeStore()
     _onboard_repro(store)
@@ -984,9 +1195,8 @@ def test_decommission_of_a_never_onboarded_service_is_a_no_op():
 # =========================================================================== #
 # Effect (ALLOW / DENY) routing and derivation (#118). Every inbound edge      #
 # carries a ``RuleEffect``; the engine files each into the owning SPM's         #
-# effect-matching list, and agent-side derivation (P0b) classifies each edge   #
-# by role.kind AND effect into the split APM buckets (deny-overrides at request #
-# time).                                                                        #
+# effect-matching list, and the agent side derives each edge into the split    #
+# APM buckets by role.kind AND effect (deny-overrides at request time).          #
 # =========================================================================== #
 def test_deny_and_allow_rules_route_to_separate_inbound_lists():
     # A Deny edge lands in the owning SPM's inbound_deny_rules; an Allow edge in inbound_allow_rules.
@@ -1098,10 +1308,10 @@ def test_reconcile_preserves_live_deny_edge_and_is_idempotent():
     assert _pairs(store.data["github-agent"].inbound_deny_rules) == [("r-user-ops", "s-agent-inbound")]
 
 
-def test_decommission_tool_deletes_spm_holding_both_allow_and_deny_inbound():
+def test_decommission_tool_deletes_spm_holding_both_allow_and_deny_inbound(agent_side):
     # SPM(T) holds an Allow user edge, a Deny user edge, and an agent capability edge on TS.
-    # Offboarding T deletes SPM(T) (both lists at once) and its CR; the agent that targeted it
-    # derives (P0b) with its outbound stranded.
+    # Offboarding T deletes SPM(T) (both lists at once) and its CR; the agent that targeted it is
+    # re-derived and pushed with its outbound stranded.
     AR = _agent_role("r-agent-src", "agent-source", owner="github-agent")
     UR = _user_role("r-user-dev", "developer", users=["dev-user"])
     barred = _user_role("r-user-ops", "ops", users=["ops-user"])
@@ -1123,7 +1333,7 @@ def test_decommission_tool_deletes_spm_holding_both_allow_and_deny_inbound():
     assert "github-tool" in store.service_deletes
     assert "github-tool" not in store.data  # SPM(T) gone — both lists torn down together
     assert store.cr_deletes == ["github-tool"]
-    apm = store.derived_apm("github-agent")  # agent-side derivation (P0b): outbound stranded
+    apm = store.pushed_apm("github-agent")  # the decommission's push: outbound stranded
     assert apm.outbound_target_allow_rules == []
     assert apm.target_allow_scopes == {}
     assert apm.outbound_subject_allow_rules == []
@@ -1152,20 +1362,20 @@ def test_decommission_purges_agent_deny_footprint_from_other_spm():
     assert _pairs(store.data["github-tool"].inbound_allow_rules) == [("r-user-dev", "s-tool-read")]
 
 
-def test_derive_classifies_subject_deny_inbound_and_registers_identity():
+def test_derive_classifies_subject_deny_inbound_and_registers_identity(agent_side):
     # A User-kind DENY edge on SPM(A) derives into inbound_subject_deny_rules; the barred user is
     # still registered into the EFFECT-AGNOSTIC subject_roles map alongside the allowed one.
     AR, UR, AS, TS, catalog = _repro()
     barred = _user_role("r-user-ops", "ops", users=["ops-user"])
     store = run_engine([_rule(UR, AS), _deny(barred, AS)], catalog=catalog)
 
-    apm = store.derived_apm("github-agent")
+    apm = store.pushed_apm("github-agent")
     assert _pairs(apm.inbound_subject_allow_rules) == [("r-user-dev", "s-agent-inbound")]
     assert _pairs(apm.inbound_subject_deny_rules) == [("r-user-ops", "s-agent-inbound")]
     assert apm.subject_roles == {"dev-user": [UR], "ops-user": [barred]}
 
 
-def test_derive_registers_deny_only_subject_into_effect_agnostic_map():
+def test_derive_registers_deny_only_subject_into_effect_agnostic_map(agent_side):
     # Correctness invariant: a subject appearing ONLY in a DENY edge (no allow anywhere) must still
     # register in subject_roles, or the generated deny lookup cannot resolve it and the prohibition
     # silently never fires.
@@ -1173,13 +1383,13 @@ def test_derive_registers_deny_only_subject_into_effect_agnostic_map():
     barred = _user_role("r-user-ops", "ops", users=["ops-user"])
     store = run_engine([_deny(barred, AS)], catalog=catalog)
 
-    apm = store.derived_apm("github-agent")
+    apm = store.pushed_apm("github-agent")
     assert apm.inbound_subject_allow_rules == []
     assert _pairs(apm.inbound_subject_deny_rules) == [("r-user-ops", "s-agent-inbound")]
     assert apm.subject_roles == {"ops-user": [barred]}  # deny-only, still registered
 
 
-def test_derive_classifies_source_deny_inbound_and_registers_source_identity():
+def test_derive_classifies_source_deny_inbound_and_registers_source_identity(agent_side):
     # An Agent-kind DENY edge on SPM(B) derives into inbound_source_deny_rules and registers the
     # calling agent into the effect-agnostic source_roles; A's outbound sees the deny target.
     AR = _agent_role("r-a-caller", "a-caller", owner="agent-a")
@@ -1190,19 +1400,19 @@ def test_derive_classifies_source_deny_inbound_and_registers_source_identity():
     ]
     store = run_engine([_deny(AR, BS)], catalog=catalog)
 
-    apm_b = store.derived_apm("agent-b")
+    apm_b = store.pushed_apm("agent-b")
     assert _pairs(apm_b.inbound_source_deny_rules) == [("r-a-caller", "s-b-inbound")]
     assert apm_b.inbound_source_allow_rules == []
     assert {k: [r.id for r in v] for k, v in apm_b.source_roles.items()} == {"agent-a": ["r-a-caller"]}
 
-    apm_a = store.derived_apm("agent-a")
+    apm_a = store.pushed_apm("agent-a")
     assert _pairs(apm_a.outbound_target_deny_rules) == [("r-a-caller", "s-b-inbound")]
     assert {k: [s.id for s in v] for k, v in apm_a.target_deny_scopes.items()} == {"agent-b": ["s-b-inbound"]}
     assert apm_a.outbound_target_allow_rules == []
     assert apm_a.target_allow_scopes == {}
 
 
-def test_derive_agent_deny_target_scope_and_outbound_subject_deny_gate():
+def test_derive_agent_deny_target_scope_and_outbound_subject_deny_gate(agent_side):
     # An agent-role → target-scope DENY edge derives into outbound_target_deny_rules +
     # target_deny_scopes. Per the spec the subject gate is gathered for every target scope (allow OR
     # deny), split by the USER edge's own effect: an allowed user lands in the allow gate, a barred
@@ -1215,7 +1425,7 @@ def test_derive_agent_deny_target_scope_and_outbound_subject_deny_gate():
     catalog = [_agent("github-agent", roles=[AR], scopes=[AS]), _tool("github-tool", scopes=[TS])]
     store = run_engine([_deny(AR, TS), _rule(allowed, TS), _deny(barred, TS)], catalog=catalog)
 
-    apm = store.derived_apm("github-agent")
+    apm = store.pushed_apm("github-agent")
     # agent capability deny -> target_deny_scopes + outbound_target_deny_rules
     assert _pairs(apm.outbound_target_deny_rules) == [("r-agent-src", "s-tool-read")]
     assert {k: [s.id for s in v] for k, v in apm.target_deny_scopes.items()} == {"github-tool": ["s-tool-read"]}
@@ -1239,11 +1449,11 @@ def test_compute_and_apply_takes_no_default_effect():
         assert "default_effect" not in inspect.signature(fn).parameters, fn.__name__
 
 
-def test_derived_apm_carries_no_default_effect():
+def test_pushed_apm_carries_no_default_effect(agent_side):
     AR, UR, AS, TS, catalog = _repro()
     store = run_engine([_rule(UR, AS)], catalog=catalog)
 
-    apm = store.derived_apm("github-agent")
+    apm = store.pushed_apm("github-agent")
     assert "default_effect" not in apm.model_dump()
 
 
@@ -1408,7 +1618,14 @@ def test_guard_keeps_the_focus_service_rules_while_it_is_disabled():
     assert _pairs(_inbound(store.data["github-agent"])) == [("r-user-dev", "s-agent-inbound")]
     # the disabled focus service counts as live: its entry is deployed with the tool's
     assert store.pushed_service_ids == {"github-agent", "github-tool"}
-    assert _pairs(store.derived_apm("github-agent").outbound_target_allow_rules) == [("r-agent-src", "s-tool-read")]
+
+
+def test_agent_side_guard_derives_the_focus_agent_while_it_is_disabled(agent_side):
+    AR, UR, AS, TS, catalog = _guard_catalog(agent_enabled=False)
+    store = run_engine([_rule(AR, TS), _rule(UR, AS)], catalog=catalog, focus_service="github-agent")
+
+    assert store.pushed_agent_ids == {"github-agent"}
+    assert _pairs(store.pushed_apm("github-agent").outbound_target_allow_rules) == [("r-agent-src", "s-tool-read")]
 
 
 def test_guard_does_not_exempt_a_focus_service_given_by_its_keycloak_uuid():
@@ -1521,14 +1738,35 @@ def test_quarantine_writes_the_store_then_deletes_the_cr_then_redeploys():
     assert [op for op, _ in store.calls] == ["delete", "write", "write", "delete_service_cr", "apply_policy"]
 
 
-def test_derive_after_quarantine_drops_the_quarantined_agent_from_its_callers():
+def test_agent_side_quarantine_rederives_its_targeters_and_the_agents_that_lost_its_roles(agent_side):
+    # other-agent targeted X (BR→AS on SPM(X)) and lost X's role (AR→BS on its SPM): it is pushed
+    # once, with no outbound to X and no source_roles[X]. The tool lost X's role too, but its
+    # pass-through CR does not change. X itself gets no entry.
     catalog, initial = _quarantine_fixture()
     store = run_quarantine("github-agent", catalog=catalog, store=FakeStore(initial))
 
-    other = store.derived_apm("other-agent")
-    assert "github-agent" not in other.target_allow_scopes  # targeted X: outbound to X dropped
-    assert "github-agent" not in other.source_roles  # X's role lost on SPM(other-agent)
-    assert _pairs(other.inbound_subject_allow_rules) == [("r-user-dev", "s-b-in")]
+    BR = initial["other-agent"].owned_roles[0]
+    BS = initial["other-agent"].owned_scopes[0]
+    TS = initial["github-tool"].owned_scopes[0]
+    UR = initial["other-agent"].inbound_allow_rules[1].role
+    assert store.policy_pushes == [
+        AgentSidePolicyModel(
+            agents=[
+                AgentPolicyModel(
+                    agent_id="other-agent",
+                    agent_roles=[BR],
+                    agent_scopes=[BS],
+                    source_roles={},
+                    subject_roles={"dev-user": [UR]},
+                    target_allow_scopes={"github-tool": [TS]},
+                    inbound_subject_allow_rules=[_rule(UR, BS)],
+                    outbound_target_allow_rules=[_rule(BR, TS)],
+                    outbound_subject_allow_rules=[_rule(UR, TS)],
+                )
+            ]
+        )
+    ]
+    assert [op for op, _ in store.calls] == ["delete", "write", "write", "delete_service_cr", "apply_policy"]
 
 
 def test_quarantine_tool_deletes_its_cr():
@@ -1547,9 +1785,28 @@ def test_quarantine_tool_deletes_its_cr():
     assert "github-tool" not in store.data
     assert store.cr_deletes == ["github-tool"]
     # The tool owns no role, so no other SPM changed: the callers' CRs stay (their outbound is a
-    # pass-through). Agent-side derivation (P0b) drops the tool from the caller's outbound.
+    # pass-through).
     assert store.apply_policy_count == 0
-    assert store.derived_apm("github-agent").target_allow_scopes == {}
+
+
+def test_agent_side_quarantine_of_a_tool_rederives_the_agent_that_targeted_it(agent_side):
+    AR = _agent_role("r-agent-src", "agent-source", owner="github-agent")
+    TS = _scope("s-tool-read", "tool-read", service_id="github-tool")
+    initial = {"github-tool": _spm("github-tool", type=ServiceType.TOOL, owned_scopes=[TS], inbound=[_rule(AR, TS)])}
+    catalog = [_agent("github-agent", roles=[AR]), _tool("github-tool", scopes=[TS], enabled=False)]
+
+    store = run_quarantine("github-tool", catalog=catalog, store=FakeStore(initial))
+
+    assert store.cr_deletes == ["github-tool"]
+    assert store.policy_pushes == [
+        AgentSidePolicyModel(
+            agents=[
+                AgentPolicyModel(
+                    agent_id="github-agent", agent_roles=[AR], agent_scopes=[], source_roles={}, subject_roles={}
+                )
+            ]
+        )
+    ]
 
 
 def test_quarantine_twice_gives_the_same_result():
@@ -1700,7 +1957,16 @@ def test_quarantine_keeps_the_grants_of_a_role_another_service_also_holds():
     assert ("r-shared", "s-tool-read") in _pairs(_inbound(store.data["github-tool"]))
     assert ("r-x-src", "s-tool-read") not in _pairs(_inbound(store.data["github-tool"]))
     assert ("r-shared", "s-tool-read") in _pairs(_inbound(store.pushed_service("github-tool")))
-    assert ("r-shared", "s-tool-read") in _pairs(store.derived_apm("other-agent").outbound_target_allow_rules)
+
+
+def test_agent_side_quarantine_keeps_the_grants_of_a_role_another_service_also_holds(agent_side):
+    catalog, initial = _shared_role_fixture()
+    store = run_quarantine("github-agent", catalog=catalog, store=FakeStore(initial))
+
+    assert _pairs(store.pushed_apm("other-agent").outbound_target_allow_rules) == [
+        ("r-b-src", "s-tool-read"),
+        ("r-shared", "s-tool-read"),
+    ]
 
 
 def test_decommission_keeps_the_grants_of_a_role_another_service_also_holds():
@@ -1820,6 +2086,61 @@ def test_resync_quarantines_each_disabled_service_that_has_an_spm():
     ]
 
 
+def test_agent_side_resync_replaces_every_cr_with_the_apms_and_the_pass_throughs(agent_side):
+    # The PUT carries the APM of each live stored agent and the pass-through of each live stored
+    # tool. The disabled agent and the absent one are not in it.
+    catalog, initial = _resync_fixture()
+    store = run_resync(catalog=catalog, store=FakeStore(initial))
+
+    AR = initial["github-agent"].owned_roles[0]
+    AS = initial["github-agent"].owned_scopes[0]
+    UR = initial["github-agent"].inbound_allow_rules[0].role
+    TS = initial["github-tool"].owned_scopes[0]
+    assert store.policy_replaces == [
+        AgentSidePolicyModel(
+            agents=[
+                AgentPolicyModel(
+                    agent_id="github-agent",
+                    agent_roles=[AR],
+                    agent_scopes=[AS],
+                    source_roles={},
+                    subject_roles={"dev-user": [UR]},
+                    target_allow_scopes={"github-tool": [TS]},
+                    inbound_subject_allow_rules=[_rule(UR, AS)],
+                    outbound_target_allow_rules=[_rule(AR, TS)],
+                )
+            ],
+            pass_through=["github-tool"],
+        )
+    ]
+
+
+def test_resync_quarantines_under_the_same_side(side):
+    # The disabled failed-agent is quarantined after the PUT. Its role leaves SPM(github-tool).
+    # Target side: the tool's CR is redeployed. Agent side: the tool keeps its pass-through and no
+    # agent targeted failed-agent, so nothing is pushed.
+    catalog, initial = _resync_fixture()
+    store = run_resync(catalog=catalog, store=FakeStore(initial))
+
+    assert store.cr_deletes == ["failed-agent"]
+    expected = {
+        EnforcementSide.TARGET_SIDE: ["replace_policy", "delete", "write", "delete_service_cr", "apply_policy"],
+        EnforcementSide.AGENT_SIDE: ["replace_policy", "delete", "write", "delete_service_cr"],
+    }
+    assert [op for op, _ in store.calls] == expected[side]
+
+
+def test_resync_with_an_empty_store_replaces_with_the_empty_model_of_the_side(side):
+    store = run_resync(catalog=[_tool("github-tool")], store=FakeStore())
+
+    expected = {
+        EnforcementSide.TARGET_SIDE: TargetSidePolicyModel(services=[]),
+        EnforcementSide.AGENT_SIDE: AgentSidePolicyModel(agents=[]),
+    }
+    assert store.policy_replaces == [expected[side]]  # the PUT deletes every AIAC CR
+    assert [op for op, _ in store.calls] == ["replace_policy"]
+
+
 def test_resync_keeps_the_spm_of_a_service_absent_from_the_catalog():
     # Removing a deleted service's SPM is decommission's job; the PUT already removed its CR.
     catalog, initial = _resync_fixture()
@@ -1827,13 +2148,6 @@ def test_resync_keeps_the_spm_of_a_service_absent_from_the_catalog():
 
     assert store.data["ghost-agent"] == initial["ghost-agent"]
     assert "ghost-agent" not in store.cr_deletes
-
-
-def test_resync_with_an_empty_store_replaces_with_an_empty_model():
-    store = run_resync(catalog=[_tool("github-tool")], store=FakeStore())
-
-    assert store.policy_replaces == [TargetSidePolicyModel(services=[])]  # the PUT deletes every AIAC CR
-    assert [op for op, _ in store.calls] == ["replace_policy"]
 
 
 def test_resync_failure_is_logged_and_reraised(caplog):
@@ -1894,7 +2208,41 @@ def test_policy_model_for_returns_the_stored_spm_as_the_only_entry():
     assert store.calls == []  # writes nothing
 
 
-def test_policy_model_for_returns_none_when_the_store_has_no_spm():
+def test_agent_side_policy_model_for_an_agent_is_its_apm(agent_side):
+    # Derived from the store, as at a deploy; the stored SPM gives the type and the identity.
+    catalog, initial = _resync_fixture()
+    store = FakeStore(initial)
+
+    AR = initial["github-agent"].owned_roles[0]
+    AS = initial["github-agent"].owned_scopes[0]
+    UR = initial["github-agent"].inbound_allow_rules[0].role
+    TS = initial["github-tool"].owned_scopes[0]
+    assert _read_model("github-agent", store=store) == AgentSidePolicyModel(
+        agents=[
+            AgentPolicyModel(
+                agent_id="github-agent",
+                agent_roles=[AR],
+                agent_scopes=[AS],
+                source_roles={},
+                subject_roles={"dev-user": [UR]},
+                target_allow_scopes={"github-tool": [TS]},
+                inbound_subject_allow_rules=[_rule(UR, AS)],
+                outbound_target_allow_rules=[_rule(AR, TS)],
+            )
+        ]
+    )
+    assert store.calls == []  # writes nothing
+
+
+def test_agent_side_policy_model_for_a_tool_is_its_pass_through(agent_side):
+    catalog, initial = _resync_fixture()
+    store = FakeStore(initial)
+
+    assert _read_model("github-tool", store=store) == AgentSidePolicyModel(agents=[], pass_through=["github-tool"])
+    assert store.calls == []
+
+
+def test_policy_model_for_returns_none_when_the_store_has_no_spm(side):
     catalog, initial = _resync_fixture()
 
     assert _read_model("never-seen", store=FakeStore(initial), catalog=catalog) is None
@@ -1976,6 +2324,42 @@ def test_bootstrap_pushes_the_stored_spm_of_a_managed_tool():
     assert store.service_writes == []
 
 
+def test_agent_side_bootstrap_of_a_tool_pushes_its_pass_through_and_stores_nothing(agent_side):
+    store = run_bootstrap("new-tool", ServiceType.TOOL, catalog=[_service("new-tool", type=None)], store=FakeStore())
+
+    assert store.policy_pushes == [AgentSidePolicyModel(agents=[], pass_through=["new-tool"])]
+    assert store.data == {}
+    assert [op for op, _ in store.calls] == ["apply_policy"]
+
+
+def test_agent_side_bootstrap_of_a_managed_tool_pushes_its_pass_through(agent_side):
+    AR, UR, AS, TS, catalog = _repro()
+    stored = _spm("github-tool", type=ServiceType.TOOL, owned_scopes=[TS], inbound=[_rule(AR, TS)])
+    store = run_bootstrap("github-tool", ServiceType.TOOL, catalog=catalog, store=FakeStore({"github-tool": stored}))
+
+    assert store.policy_pushes == [AgentSidePolicyModel(agents=[], pass_through=["github-tool"])]
+    assert store.service_writes == []
+
+
+def test_agent_side_bootstrap_never_gives_an_agent_a_pass_through(agent_side):
+    # A pass-through CR allows every request. An agent (the caller's mistake: agents get no
+    # bootstrap) gets the APM of its zero-rule SPM instead, as the target side renders that SPM.
+    own_scope = _scope("s-own", "own", service_id="new-agent")
+    catalog = [_service("new-agent", type=None, scopes=[own_scope])]
+    store = run_bootstrap("new-agent", ServiceType.AGENT, catalog=catalog, store=FakeStore())
+
+    assert store.policy_pushes == [
+        AgentSidePolicyModel(
+            agents=[
+                AgentPolicyModel(
+                    agent_id="new-agent", agent_roles=[], agent_scopes=[own_scope], source_roles={}, subject_roles={}
+                )
+            ]
+        )
+    ]
+    assert store.data == {}
+
+
 def test_bootstrap_holds_the_pce_lock():
     store = FakeStore()
     with engine_env([], store):
@@ -1996,3 +2380,36 @@ def test_bootstrap_failure_is_logged_and_reraised(caplog):
             bootstrap("new-tool", ServiceType.TOOL)
 
     assert "bootstrap failed" in caplog.text
+
+
+# --------------------------------------------------------------------------- #
+# The side (D16, D29) — every public operation reads AIAC_ENFORCEMENT_SIDE once #
+# and builds the policy model of that side. An unknown value raises ValueError  #
+# before the operation touches the IdP, the store or the PDP.                   #
+# --------------------------------------------------------------------------- #
+_ENTRY_POINTS = {
+    "compute_and_apply": lambda pce: pce.compute_and_apply([], focus_service="github-agent"),
+    "decommission": lambda pce: pce.decommission("github-agent"),
+    "quarantine": lambda pce: pce.quarantine("github-agent"),
+    "resync": lambda pce: pce.resync(),
+    "bootstrap": lambda pce: pce.bootstrap("github-tool", ServiceType.TOOL),
+    "policy_model_for": lambda pce: pce.policy_model_for("github-agent"),
+}
+
+
+@pytest.mark.parametrize("entry_point", list(_ENTRY_POINTS))
+def test_an_unknown_side_raises_from_every_entry_point_and_writes_nothing(monkeypatch, entry_point):
+    from aiac import policy
+
+    monkeypatch.setenv("AIAC_ENFORCEMENT_SIDE", "both")
+    catalog, initial = _resync_fixture()
+    store = FakeStore(initial)
+    with (
+        engine_env(catalog, store),
+        patch.object(Configuration, "get_services", side_effect=AssertionError("read the IdP")),
+        pytest.raises(ValueError, match="AIAC_ENFORCEMENT_SIDE"),
+    ):
+        _ENTRY_POINTS[entry_point](policy.computation)
+
+    assert store.calls == []
+    assert store.data == initial

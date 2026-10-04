@@ -1,6 +1,12 @@
 """The Controller start sequence — runs in the FastAPI lifespan, before the NATS consumer starts.
 
-1. **Start check #4 (D30):** the global combiner denies a pod that has no client CR. The check reads
+1. **The enforcement side (D29):** the PCE ``enforcement_side()`` reads ``AIAC_ENFORCEMENT_SIDE``
+   (``target-side``, the default, or ``agent-side``). An unknown value raises ``ValueError`` (it
+   names the variable and the value). The side in use is logged at INFO. Every later PCE operation
+   reads the same env, so the Controller serves one side until it restarts; a side change is a
+   ConfigMap patch and a Controller restart, and the resync (step 3) then moves every CR to the new
+   side.
+2. **Start check #4 (D30):** the global combiner denies a pod that has no client CR. The check reads
    the ``AuthorizationPolicy`` named ``default`` in the bundle-service namespace
    (``AIAC_BUNDLE_SERVICE_NAMESPACE``, default ``rossoctl-system``). Its ``inbound/request.rego``
    and ``outbound/request.rego`` entries must exist, and they must not contain the stock line
@@ -9,7 +15,8 @@
    Reason: the quarantine and the decommission delete the CR of the service (D20); the stock
    combiner allows a pod that has no client CR, so a delete would open the service. A ``helm
    upgrade`` of the operator can put the stock combiner back; this check finds that at the next start.
-2. **The resync (D28):** the PCE ``resync()`` writes every CR of the current side and quarantines
+   The check runs under both sides.
+3. **The resync (D28):** the PCE ``resync()`` writes every CR of the current side and quarantines
    each disabled service that still has an SPM.
 
 A failure in a step stops the Controller: the error is logged (naming the failed step) and raised
@@ -21,7 +28,7 @@ import logging
 import os
 
 from aiac.agent.uc.onboarding.provision.kube import is_not_found, read_authorization_policy
-from aiac.policy.computation import resync
+from aiac.policy.computation import enforcement_side, resync
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +85,13 @@ def check_combiner() -> None:
 
 
 def run_start_sequence() -> None:
-    """Run the start sequence (check #4, then the resync). Raise on the first failure."""
+    """Run the start sequence (the side, check #4, then the resync). Raise on the first failure."""
+    try:
+        side = enforcement_side()
+    except ValueError as e:
+        logger.error("Controller start stopped: unknown enforcement side (D29): %s", e)
+        raise
+    logger.info("enforcement side (D29): %s", side.value)
     try:
         check_combiner()
     except StartCheckError as e:

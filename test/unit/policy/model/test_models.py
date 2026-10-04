@@ -11,6 +11,7 @@ from aiac.idp.configuration.models import (
 )
 from aiac.policy.model.models import (
     AgentPolicyModel,
+    AgentSidePolicyModel,
     EnforcementSide,
     PolicyRule,
     RuleEffect,
@@ -477,6 +478,31 @@ def test_target_side_body_without_a_tag_is_rejected():
 def test_policy_model_with_an_unknown_tag_is_rejected():
     with pytest.raises(ValidationError):
         parse_policy_model({"enforcement_side": "both-sides", "services": []})
+
+
+def _apm_body(agent_id="team1/github-agent") -> dict:
+    return {"agent_id": agent_id, "agent_roles": [], "agent_scopes": [], "source_roles": {}, "subject_roles": {}}
+
+
+def test_agent_side_body_parses_to_agent_side_policy_model():
+    model = parse_policy_model(
+        {"enforcement_side": "agent-side", "agents": [_apm_body()], "pass_through": ["team1/github-tool"]}
+    )
+    assert isinstance(model, AgentSidePolicyModel)
+    assert model.enforcement_side == EnforcementSide.AGENT_SIDE
+    assert [apm.agent_id for apm in model.agents] == ["team1/github-agent"]
+    assert model.pass_through == ["team1/github-tool"]
+
+
+def test_agent_side_policy_model_sets_its_own_tag_and_defaults_pass_through():
+    model = AgentSidePolicyModel(agents=[])
+    assert model.model_dump(mode="json") == {"enforcement_side": "agent-side", "agents": [], "pass_through": []}
+
+
+def test_a_body_cannot_mix_the_sides():
+    # The tag selects the subclass: an agent-side tag with target-side content is not a policy model.
+    with pytest.raises(ValidationError):
+        parse_policy_model({"enforcement_side": "agent-side", "services": [_spm_body()]})
 
 
 def test_target_side_policy_model_round_trips_through_json():

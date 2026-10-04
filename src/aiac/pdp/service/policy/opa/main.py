@@ -4,15 +4,27 @@ The body of ``POST`` / ``PUT /policy`` is a policy model tagged with its enforce
 (``AnyPolicyModel``). The writer reads the side from the tag, never from an env var (D29). For each
 entry of the model it renders the two request packages via ``rego.py`` and server-side-applies them
 into one ``AuthorizationPolicy`` Custom Resource (``agent.rossoctl.dev/v1alpha1``, ``scope:
-client``) — one CR per managed service, agent or tool. Under target side an entry is one
-``services[]`` SPM. The writer does no join: the PCE builds the policy model. ``bundle-service``
-(operator repo) composes those CRs into per-pod OPA bundles that AuthBridge polls.
+client``) — one CR per managed service, agent or tool. The entries of each side:
+
+- target side (``TargetSidePolicyModel``): each ``services[]`` SPM — the tool inbound or the agent
+  inbound, and a pass-through outbound (the callee decides);
+- agent side (``AgentSidePolicyModel``): each ``agents[]`` APM — the agent CR, with the agent
+  inbound and the agent outbound (per-tool checks and the MCP session rule) — and each
+  ``pass_through[]`` tool id — a pass-through CR, with a pass-through in both tiers (D24).
+
+The writer does no join: the PCE builds the policy model. ``bundle-service`` (operator repo)
+composes those CRs into per-pod OPA bundles that AuthBridge polls.
+
+A body with a wrong or missing tag is a 422 (the discriminated union). So is a body that carries the
+entry fields of the other side (the models ignore unknown fields, so pydantic alone would drop
+them), and an agent-side body that names an agent also as a pass-through.
 
 Routes:
 
 - ``POST /policy`` — upsert one CR per entry (no rollback on a partial failure).
 - ``PUT /policy`` — replace: upsert every entry, then delete every other CR that has the
-  managed-by label. The delete step runs only after every upsert succeeded.
+  managed-by label. The delete step runs only after every upsert succeeded. Both sides; a side
+  change rewrites both packages of a kept CR in one write (``spec.policies`` is atomic).
 - ``DELETE /policy/services/{service_id:path}`` — delete the CR of one service (the quarantine and
   the decommission); a k8s 404 is success.
 - ``DELETE /policy`` — delete every CR that has the managed-by label.
@@ -32,13 +44,20 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Annotated
 
-from fastapi import Body, FastAPI
+from fastapi import FastAPI
 from kubernetes import client, config
 from kubernetes.client import ApiException
+from pydantic import AfterValidator, BeforeValidator
 from starlette.responses import JSONResponse, Response
 
-from aiac.pdp.service.policy.opa.rego import ClientPolicies, identity_ref, render_target_side
-from aiac.policy.model.models import AnyPolicyModel, PolicyModel, TargetSidePolicyModel
+from aiac.pdp.service.policy.opa.rego import (
+    ClientPolicies,
+    identity_ref,
+    render_agent_side,
+    render_pass_through,
+    render_target_side,
+)
+from aiac.policy.model.models import AgentSidePolicyModel, AnyPolicyModel, PolicyModel, TargetSidePolicyModel
 
 # --------------------------------------------------------------------------- #
 # CR coordinates & write identity — code constants, never env vars (Q6, Q8a). #
@@ -116,14 +135,26 @@ def _entries(model: PolicyModel) -> Iterator[tuple[str, ClientPolicies]]:
     """The CRs that ``model`` asks for: one ``(service_id, packages)`` per entry (D18c).
 
     Dispatches on the policy-model subclass, so the side comes from the tag, never from an env var
-    (D29). Target side: one entry per ``services[]`` SPM. (The agent side adds its own branch: one
-    agent CR per APM and one pass-through CR per ``pass_through`` id.) Lazy, so a batch writes its
-    entries in order and stops at the first failure.
+    (D29):
+
+    - target side: one CR per ``services[]`` SPM (the tool inbound or the agent inbound, and a
+      pass-through outbound);
+    - agent side: one agent CR per ``agents[]`` APM (the agent inbound and the agent outbound), then
+      one pass-through CR per ``pass_through[]`` tool id.
+
+    Lazy, so a batch writes its entries in order and stops at the first failure.
     """
     if isinstance(model, TargetSidePolicyModel):
         platform_clients = _platform_clients()
         for spm in model.services:
             yield spm.service_id, render_target_side(spm, platform_clients=platform_clients)
+        return
+    if isinstance(model, AgentSidePolicyModel):
+        platform_clients = _platform_clients()
+        for apm in model.agents:
+            yield apm.agent_id, render_agent_side(apm, platform_clients=platform_clients)
+        for tool_id in model.pass_through:
+            yield tool_id, render_pass_through()
         return
     raise TypeError(f"no renderer for the policy model {type(model).__name__}")
 
@@ -284,9 +315,47 @@ def _run_write(op) -> Response:
 app = FastAPI()
 
 
-# The body of POST / PUT /policy. The discriminator makes the tag mandatory: a body with a wrong
-# or missing ``enforcement_side`` is a 422 (pydantic), also while ``AnyPolicyModel`` has one class.
-_PolicyBody = Annotated[AnyPolicyModel, Body(discriminator="enforcement_side")]
+# The entry fields of each side (every field but the tag), keyed by the tag value.
+_SIDE_FIELDS: dict[str, frozenset[str]] = {
+    side.model_fields["enforcement_side"].default.value: frozenset(
+        side.model_fields.keys() - PolicyModel.model_fields.keys()
+    )
+    for side in (TargetSidePolicyModel, AgentSidePolicyModel)
+}
+
+
+def _one_side_only(body: object) -> object:
+    """Reject a body that carries the entry fields of another side (422).
+
+    The models ignore unknown fields, so pydantic alone would drop, for example, the ``services``
+    of an agent-side body without a word, and a ``PUT`` would then delete their CRs. A body with no
+    tag, or with an unknown tag, goes on to the discriminator, which rejects it."""
+    if isinstance(body, dict) and isinstance(side := body.get("enforcement_side"), str) and side in _SIDE_FIELDS:
+        foreign = sorted(
+            field for other, fields in _SIDE_FIELDS.items() if other != side for field in fields & body.keys()
+        )
+        if foreign:
+            raise ValueError(f"the {side} policy model has no {', '.join(foreign)}: the body mixes the sides")
+    return body
+
+
+def _no_agent_pass_through(model: PolicyModel) -> PolicyModel:
+    """Reject an agent-side model that names an agent also as a pass-through tool (422).
+
+    Fail closed: written in order, the pass-through CR would replace the agent CR and open the
+    agent. The PCE never builds such a model (an agent's APM and a tool's pass-through come from
+    SPMs of different service types)."""
+    if isinstance(model, AgentSidePolicyModel):
+        both = sorted({apm.agent_id for apm in model.agents} & set(model.pass_through))
+        if both:
+            raise ValueError(f"an agent cannot also be a pass-through: {', '.join(both)}")
+    return model
+
+
+# The body of POST / PUT /policy. The discriminated union makes the tag mandatory: a body with a
+# wrong or missing ``enforcement_side`` is a 422 (pydantic). The two validators add the 422 of a body
+# that mixes the sides, and of an agent that is also a pass-through.
+_PolicyBody = Annotated[AnyPolicyModel, BeforeValidator(_one_side_only), AfterValidator(_no_agent_pass_through)]
 
 
 @app.post("/policy", status_code=204)

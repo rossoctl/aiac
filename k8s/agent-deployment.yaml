@@ -17,6 +17,16 @@ data:
   LLM_BASE_URL: "https://openai-compatible-endpoint.example.com/v1"
   LLM_MODEL: "your-model-name"
   AIAC_AC_MODEL: "RBAC"
+  # Enforcement side (D16, D29): where the access to each callee is checked.
+  #   target-side (default): each callee (agent or tool) checks the access to
+  #     itself in its own inbound OPA, from its own CR.
+  #   agent-side (legacy): each agent's outbound OPA checks the agent's calls
+  #     to tools; each tool gets a pass-through CR.
+  # The Controller reads it at start and stops on an unknown value. A change
+  # needs a Controller restart: the start resync (D28) then moves every CR to
+  # the new side. Not the same as AIAC_AC_MODEL above, which names a modeling
+  # paradigm (RBAC/ABAC/REBAC) and is read by no code.
+  AIAC_ENFORCEMENT_SIDE: "target-side"
   # Namespace of the bundle service and its `default` global combiner CR (D20).
   # At every start the Controller reads that CR (start check #4, D30) and stops
   # if a request package still allows a pod that has no client CR.

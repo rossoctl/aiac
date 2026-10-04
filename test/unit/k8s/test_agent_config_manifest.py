@@ -46,3 +46,11 @@ def test_upstream_max_retries_remains_and_is_distinct_from_llm_knobs():
         "LLM_RETRY_BACKOFF_MIN",
         "LLM_RETRY_BACKOFF_MAX",
     }
+
+
+def test_the_enforcement_side_switch_defaults_to_target_side():
+    """The switch (D29) is on the ConfigMap with the default side, and the start check #4 reads the
+    combiner in the bundle-service namespace that the ConfigMap names."""
+    data = _agent_config_data()
+    assert data.get("AIAC_ENFORCEMENT_SIDE") == "target-side"
+    assert data.get("AIAC_BUNDLE_SERVICE_NAMESPACE") == "rossoctl-system"

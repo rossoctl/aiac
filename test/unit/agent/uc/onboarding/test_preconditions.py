@@ -1,8 +1,10 @@
 """Unit tests for the UC1 enforcement precondition checks (D30, ``check_preconditions``).
 
-The checks read Kubernetes through the ``kube._core_v1`` seam, faked here (see ``kube_fakes``). The
-Orchestrator-level contract (the checks run first, before Provision and the PRB, with no rollback)
-is in ``test_orchestrator.py``; this file covers what each check reads and when it fails.
+The checks read Kubernetes through the ``kube._core_v1`` seam, faked here (see ``kube_fakes``), and
+the enforcement side from ``AIAC_ENFORCEMENT_SIDE`` (unset here, so target side, unless a test sets
+it). The Orchestrator-level contract (the checks run first, before Provision and the PRB, with no
+rollback) is in ``test_orchestrator.py``; this file covers what each check reads and when it fails,
+and the scope of the checks for each side.
 """
 
 from unittest.mock import patch
@@ -11,6 +13,7 @@ import pytest
 from fastapi import HTTPException
 from kubernetes.client.exceptions import ApiException
 
+from aiac.agent.uc.onboarding import preconditions
 from aiac.agent.uc.onboarding.preconditions import EnforcementPreconditionError, check_preconditions
 from aiac.agent.uc.onboarding.provision import kube
 from aiac.idp.configuration.models import Service, ServiceType
@@ -23,6 +26,12 @@ def _one_look(monkeypatch):
     monkeypatch.setenv("ONBOARD_LABEL_WAIT_ATTEMPTS", "1")
     monkeypatch.setenv("ONBOARD_LABEL_WAIT_BACKOFF", "0")
     monkeypatch.setenv("UPSTREAM_MAX_RETRIES", "1")
+    monkeypatch.delenv("AIAC_ENFORCEMENT_SIDE", raising=False)  # target side, unless a test sets it
+
+
+@pytest.fixture
+def agent_side(monkeypatch):
+    monkeypatch.setenv("AIAC_ENFORCEMENT_SIDE", "agent-side")
 
 
 def _service(name=kf.SERVICE_NAME):
@@ -96,6 +105,11 @@ class TestCheck2Pipeline:
         failures = _failures(core)
         assert len(failures) == 1
         assert failures[0].startswith("#2") and "'mcp-parser'" in failures[0]
+
+    def test_target_side_does_not_need_opa_in_the_outbound_pipeline(self):
+        # Under target side every outbound is a pass-through (D24): the callee decides.
+        core = kf.core_v1(configmap=kf.pipeline_configmap(outbound=("token-exchange",)))
+        assert _check(core) is ServiceType.AGENT
 
     def test_opa_in_the_outbound_pipeline_only_does_not_count(self):
         core = kf.core_v1(configmap=kf.pipeline_configmap(inbound=("jwt-validation",), outbound=("opa",)))
@@ -209,3 +223,98 @@ class TestThePodRace:
                 check_preconditions(_service(name="no-slash"))
         assert ei.value.status_code == 502
         core_v1.assert_not_called()
+
+
+class TestAgentSideScope:
+    """Under agent side the checks run for agents only (D30): a tool gets a pass-through CR (D24),
+    which needs no check. The type is still read from the pod label, because the Orchestrator needs
+    it for the bootstrap of a tool."""
+
+    @pytest.mark.parametrize(
+        "pods",
+        [
+            [kf.pod(type_label="tool", containers=[kf.app_container()])],
+            [kf.pod(type_label="tool", containers=[kf.app_container(readiness=kf.http_get_probe())])],
+        ],
+        ids=["no-sidecar", "http-get-probe"],
+    )
+    def test_a_tool_that_fails_a_pod_check_passes_and_returns_its_type(self, agent_side, pods):
+        assert _check(kf.core_v1(pods=pods)) is ServiceType.TOOL
+
+    @pytest.mark.parametrize("inbound", [(), ("jwt-validation",), ("jwt-validation", "opa")], ids=str)
+    def test_a_tool_needs_no_pipeline_plugin(self, agent_side, inbound):
+        core = kf.core_v1(
+            pods=[kf.pod(type_label="tool")], configmap=kf.pipeline_configmap(inbound=inbound, outbound=())
+        )
+        assert _check(core) is ServiceType.TOOL
+
+    def test_a_tool_does_not_read_the_pipeline(self, agent_side):
+        # No ConfigMap is needed: a missing one is no failure for a tool under agent side.
+        core = kf.core_v1(pods=[kf.pod(type_label="tool")])
+        core.read_namespaced_config_map.side_effect = kf.not_found()
+        assert _check(core) is ServiceType.TOOL
+        core.read_namespaced_config_map.assert_not_called()
+
+    def test_a_tool_with_no_sidecar_is_not_waited_for(self, agent_side, monkeypatch):
+        # The re-poll waits for a pod that can enforce its CR; a tool's pass-through CR needs none.
+        monkeypatch.setenv("ONBOARD_LABEL_WAIT_ATTEMPTS", "3")
+        core = kf.core_v1(pods=[kf.pod(type_label="tool", containers=[kf.app_container()])])
+        assert _check(core) is ServiceType.TOOL
+        assert core.list_namespaced_pod.call_count == 1
+
+    def test_a_tool_still_needs_a_labelled_pod(self, agent_side):
+        # The type comes from the pod label, so the deploy->onboard race is still a 502.
+        with pytest.raises(HTTPException) as ei:
+            _check(kf.core_v1(pods=[kf.pod(type_label=None)]))
+        assert ei.value.status_code == 502
+
+    def test_an_agent_needs_opa_in_the_outbound_pipeline(self, agent_side):
+        # The agent's outbound checks its calls to tools (agent side), so its outbound needs OPA.
+        core = kf.core_v1(
+            configmap=kf.pipeline_configmap(inbound=("jwt-validation", "opa"), outbound=("token-exchange",))
+        )
+        failures = _failures(core)
+        assert len(failures) == 1
+        assert failures[0].startswith("#2") and "outbound" in failures[0] and "'opa'" in failures[0]
+        assert "inbound pipeline has no" not in failures[0]
+
+    def test_an_agent_with_opa_in_both_pipelines_passes(self, agent_side):
+        core = kf.core_v1(configmap=kf.pipeline_configmap(inbound=("jwt-validation", "opa"), outbound=("opa",)))
+        assert _check(core) is ServiceType.AGENT
+
+    def test_an_agent_with_no_opa_in_either_pipeline_gets_one_2_failure_that_names_both(self, agent_side):
+        core = kf.core_v1(configmap=kf.pipeline_configmap(inbound=("jwt-validation",), outbound=("token-exchange",)))
+        failures = _failures(core)
+        assert [f[:2] for f in failures] == ["#2"]
+        assert "inbound" in failures[0] and "outbound" in failures[0]
+
+    def test_an_agent_with_no_readable_outbound_pipeline_fails(self, agent_side):
+        configmap = kf.pipeline_configmap()
+        configmap.data = {"config.yaml": "pipeline:\n  inbound:\n    plugins: [{name: opa}]\n"}
+        failures = _failures(kf.core_v1(configmap=configmap))
+        assert [f[:2] for f in failures] == ["#2"]
+        assert "pipeline.outbound.plugins" in failures[0]
+
+    @pytest.mark.parametrize("check", ["#1", "#6"])
+    def test_an_agent_still_gets_the_pod_checks(self, agent_side, check):
+        containers = (
+            [kf.app_container()]
+            if check == "#1"
+            else [kf.app_container(liveness=kf.http_get_probe()), kf.sidecar_container()]
+        )
+        assert [f[:2] for f in _failures(kf.core_v1(pods=[kf.pod(containers=containers)]))] == [check]
+
+    def test_the_side_is_read_once_per_onboarding(self, agent_side, monkeypatch):
+        monkeypatch.setenv("ONBOARD_LABEL_WAIT_ATTEMPTS", "3")
+        core = kf.core_v1()
+        core.list_namespaced_pod.side_effect = [kf.pod_list(), kf.pod_list(), kf.pod_list(kf.pod())]
+        with patch.object(preconditions, "enforcement_side", wraps=preconditions.enforcement_side) as side:
+            assert _check(core) is ServiceType.AGENT
+        side.assert_called_once_with()
+
+    def test_an_unknown_side_is_a_value_error(self, monkeypatch):
+        monkeypatch.setenv("AIAC_ENFORCEMENT_SIDE", "both-sides")
+        core = kf.core_v1()
+        with pytest.raises(ValueError, match="AIAC_ENFORCEMENT_SIDE"):
+            _check(core)
+        core.list_namespaced_pod.assert_not_called()

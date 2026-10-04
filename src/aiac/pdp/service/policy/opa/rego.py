@@ -1,18 +1,30 @@
 """Rego package generation for the PDP Policy Writer (OPA).
 
 Renders the two request packages of one client CR (``ClientPolicies``) for each
-entry of a policy model. Four package kinds:
+entry of a policy model. Three CR renderers, one per kind of entry:
+
+- ``render_target_side(spm)`` — target side, one stored SPM: the tool inbound or the
+  agent inbound, and a pass-through outbound (the callee decides);
+- ``render_agent_side(apm)`` — agent side, one APM: the agent inbound and the agent
+  outbound;
+- ``render_pass_through()`` — agent side, one managed tool: a pass-through in both
+  tiers.
+
+Four package kinds:
 
 - **tool inbound** (target side, D26) — ``render_target_side`` of a tool's SPM;
 - **agent inbound** (both sides, D26a) — ``render_target_side`` of an agent's SPM,
   or ``generate_inbound_rego`` of an APM (agent side); one shared renderer, so one
   SPM gives the same inbound under both sides (D18b);
-- **agent outbound** (agent side) — ``generate_outbound_rego`` of an APM;
+- **agent outbound** (agent side) — ``generate_outbound_rego`` of an APM. Known
+  limit: it denies the agent's A2A and LLM calls through the outbound proxy;
 - **pass-through** (D24) — ``generate_pass_through_rego``: ``allow := true``. Under
-  target side the outbound of every service is one: the callee decides.
+  target side the outbound of every service is one: the callee decides. Under agent
+  side both packages of every managed tool are one.
 
 The target-side render input is the stored SPM of the callee, through
-``project_inbound`` (D18b). The writer does no join.
+``project_inbound`` (D18b). The agent-side render input is the APM, which the PCE
+derives. The writer does no join.
 
 Both packages use **fixed** names — ``authbridge.client.inbound.request`` and
 ``authbridge.client.outbound.request`` (each ``import rego.v1``). Per-service
@@ -82,6 +94,8 @@ __all__ = [
     "generate_inbound_rego",
     "generate_outbound_rego",
     "generate_pass_through_rego",
+    "render_agent_side",
+    "render_pass_through",
     "render_target_side",
 ]
 
@@ -441,6 +455,30 @@ def generate_pass_through_rego(tier: Tier) -> str:
     The pass-throughs are the only ALLOW packages (D25). Under target side the outbound of every
     service is one: the callee decides."""
     return f"{_PACKAGES[tier]}\n\nallow := true\n"
+
+
+def render_agent_side(apm: AgentPolicyModel, platform_clients: tuple[str, ...] = ("rossoctl",)) -> ClientPolicies:
+    """Render the two request packages of the agent-side CR of ``apm``'s agent.
+
+    The APM is the render input (the PCE derives it; the writer does no join). The inbound is the
+    agent inbound (agent-level, D26a); ``platform_clients`` feeds its bypass. The outbound is the
+    agent outbound: the per-tool checks and the MCP session rule. Known limit: it denies the
+    agent's A2A and LLM calls through the outbound proxy (``b435aa1``).
+    """
+    return ClientPolicies(
+        inbound=generate_inbound_rego(apm, platform_clients=platform_clients),
+        outbound=generate_outbound_rego(apm),
+    )
+
+
+def render_pass_through() -> ClientPolicies:
+    """Render the two request packages of a pass-through CR: a pass-through in both tiers (D24).
+
+    Agent side: the CR of each managed tool (``pass_through[]``). AIAC checks nothing on it, but a
+    pod with no CR is denied (D20), also on its outbound."""
+    return ClientPolicies(
+        inbound=generate_pass_through_rego("inbound"), outbound=generate_pass_through_rego("outbound")
+    )
 
 
 def generate_inbound_rego(model: AgentPolicyModel, platform_clients: tuple[str, ...] = ("rossoctl",)) -> str:

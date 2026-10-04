@@ -9,9 +9,10 @@ terminated at the FIRST delivery. On any other failure the message is left unack
 redelivers) until ``num_delivered`` reaches ``MAX_DELIVER``, at which point it is republished to
 the DLQ subject and terminated (stops redelivery on this consumer).
 
-Also owns the FastAPI ``lifespan``: it runs the Controller start sequence (start check #4, then the
-PCE resync; see ``controller.start``) and starts the consumer only after it. A failed step raises
-from the lifespan, so the Controller stops before it serves.
+Also owns the FastAPI ``lifespan``: it runs the Controller start sequence (the enforcement side,
+start check #4, then the PCE resync; see ``controller.start``) and starts the consumer only after
+it. A failed step (also an unknown ``AIAC_ENFORCEMENT_SIDE``) raises from the lifespan, so the
+Controller stops before it serves.
 """
 
 import asyncio
@@ -195,9 +196,9 @@ class AiacEventConsumer:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # The Controller start sequence (start check #4, then the resync) runs FIRST, before the NATS
-    # consumer starts and before uvicorn serves: a failure raises here, so uvicorn exits and the pod
-    # restarts. It is synchronous (k8s and PDP calls), so it runs in a thread.
+    # The Controller start sequence (the enforcement side, start check #4, then the resync) runs
+    # FIRST, before the NATS consumer starts and before uvicorn serves: a failure raises here, so
+    # uvicorn exits and the pod restarts. It is synchronous (k8s and PDP calls), so it runs in a thread.
     await asyncio.to_thread(run_start_sequence)
     consumer = AiacEventConsumer()
     # Backgrounded so a slow NATS handshake never blocks /apply/* from becoming
