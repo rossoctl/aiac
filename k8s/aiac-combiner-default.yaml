@@ -1,0 +1,92 @@
+# The changed global combiner (D20) for an AIAC setup.
+#
+# This is the stock `default` AuthorizationPolicy of the operator chart
+# (charts/operator/templates/bundleservice/default-policy.yaml, rendered with
+# bundleService.enabled=true), with exactly two lines removed:
+#
+#   client_ok if not data.authbridge.client.inbound.request    (inbound/request.rego)
+#   client_ok if not data.authbridge.client.outbound.request   (outbound/request.rego)
+#
+# With these lines, a pod that has no client CR is ALLOWED. Without them, it is
+# DENIED on both request legs. AIAC needs the deny: the quarantine and the
+# decommission delete the CR of a service, and every managed service has a CR
+# (a pass-through where AIAC has no rules). The two response packages keep the
+# stock fallback, because an AIAC CR has no response packages.
+#
+# Until the operator chart has the opt-in value
+# bundleService.defaultPolicy.requireClientPolicy, k8s/opa-kind-enable.sh applies
+# this CR in place of the stock one when it deploys the bundle service (Step 1;
+# it replaces the namespace with RELEASE_NAMESPACE), so the cluster never has
+# the stock combiner. k8s/opa-kind-restore.sh puts the stock CR back. A helm
+# upgrade of the operator chart's bundle service brings back the stock
+# combiner; the Controller start check #4 (D30) then stops the Controller.
+#
+# The CR must be in the bundle-service namespace: the bundle-service watcher
+# ignores global-scope CRs from any other namespace. Do not add the label
+# app.kubernetes.io/managed-by=aiac-pdp-policy-writer: PUT /policy deletes every
+# labelled CR that is not in its policy model.
+#
+# Test: test/unit/pdp/service/policy/opa/test_combiner.py (opa eval).
+---
+apiVersion: agent.rossoctl.dev/v1alpha1
+kind: AuthorizationPolicy
+metadata:
+  name: default
+  namespace: rossoctl-system
+spec:
+  scope: global
+  policies:
+    - path: "inbound/request.rego"
+      content: |
+        package authbridge.inbound.request
+        import rego.v1
+        default allow := false
+        allow if data.authbridge.ns.inbound.request.override
+        allow if {
+            ns_ok
+            client_ok
+        }
+        ns_ok if data.authbridge.ns.inbound.request.allow
+        ns_ok if not data.authbridge.ns.inbound.request
+        client_ok if data.authbridge.client.inbound.request.allow
+    - path: "inbound/response.rego"
+      content: |
+        package authbridge.inbound.response
+        import rego.v1
+        default allow := false
+        allow if data.authbridge.ns.inbound.response.override
+        allow if {
+            ns_ok
+            client_ok
+        }
+        ns_ok if data.authbridge.ns.inbound.response.allow
+        ns_ok if not data.authbridge.ns.inbound.response
+        client_ok if data.authbridge.client.inbound.response.allow
+        client_ok if not data.authbridge.client.inbound.response
+    - path: "outbound/request.rego"
+      content: |
+        package authbridge.outbound.request
+        import rego.v1
+        default allow := false
+        allow if data.authbridge.ns.outbound.request.override
+        allow if {
+            ns_ok
+            client_ok
+        }
+        ns_ok if data.authbridge.ns.outbound.request.allow
+        ns_ok if not data.authbridge.ns.outbound.request
+        client_ok if data.authbridge.client.outbound.request.allow
+    - path: "outbound/response.rego"
+      content: |
+        package authbridge.outbound.response
+        import rego.v1
+        default allow := false
+        allow if data.authbridge.ns.outbound.response.override
+        allow if {
+            ns_ok
+            client_ok
+        }
+        ns_ok if data.authbridge.ns.outbound.response.allow
+        ns_ok if not data.authbridge.ns.outbound.response
+        client_ok if data.authbridge.client.outbound.response.allow
+        client_ok if not data.authbridge.client.outbound.response

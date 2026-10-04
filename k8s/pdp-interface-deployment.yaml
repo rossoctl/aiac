@@ -28,8 +28,9 @@ data:
 
 ---
 # RBAC for the PDP Policy Writer (aiac-pdp-policy-opa container). The writer
-# server-side-applies per-agent AuthorizationPolicy CRs, so its pod needs a
-# dedicated ServiceAccount bound to a ClusterRole granting CR write access.
+# server-side-applies one AuthorizationPolicy CR per managed service (agent or
+# tool), so its pod needs a dedicated ServiceAccount bound to a ClusterRole
+# granting CR write access.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -148,8 +149,8 @@ spec:
             - name: tmp
               mountPath: /tmp
         # PDP Policy Writer (OPA): CR-backed writer. It server-side-applies
-        # per-agent AuthorizationPolicy CRs (agent.rossoctl.dev) to the
-        # Kubernetes API, authorized via the aiac-pdp-policy-writer
+        # one AuthorizationPolicy CR (agent.rossoctl.dev) per managed service
+        # (agent or tool) to the Kubernetes API, authorized via the aiac-pdp-policy-writer
         # ServiceAccount/RBAC (above). The .rego file dump is an optional debug
         # aid (POLICY_WRITER_DUMP_REGO) and is off here in production.
         - name: aiac-pdp-policy-opa

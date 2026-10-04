@@ -17,6 +17,10 @@ data:
   LLM_BASE_URL: "https://openai-compatible-endpoint.example.com/v1"
   LLM_MODEL: "your-model-name"
   AIAC_AC_MODEL: "RBAC"
+  # Namespace of the bundle service and its `default` global combiner CR (D20).
+  # At every start the Controller reads that CR (start check #4, D30) and stops
+  # if a request package still allows a pod that has no client CR.
+  AIAC_BUNDLE_SERVICE_NAMESPACE: "rossoctl-system"
   # Per-request LLM timeout (seconds): a stalled connection raises after this instead
   # of wedging /apply forever. Timeouts are transient, so _structured_call retries them
   # up to LLM_MAX_RETRIES (default 3, below) with exponential backoff before surfacing.
@@ -55,9 +59,22 @@ rules:
   - apiGroups: [""]
     resources: ["services"]
     verbs: ["get"]
+  # UC1 onboarding check #2 (D30): the namespace pipeline of the service, in
+  # any service namespace. Read-only, and only this ConfigMap name.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["authbridge-runtime-config"]
+    verbs: ["get"]
   - apiGroups: ["agent.rossoctl.dev"]
     resources: ["agentcards"]
     verbs: ["list"]
+  # Start check #4 (D30): the `default` global combiner CR in the bundle-service
+  # namespace (AIAC_BUNDLE_SERVICE_NAMESPACE). Read-only; the PDP Policy Writer
+  # does every AuthorizationPolicy write.
+  - apiGroups: ["agent.rossoctl.dev"]
+    resources: ["authorizationpolicies"]
+    resourceNames: ["default"]
+    verbs: ["get"]
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -155,6 +172,22 @@ spec:
           # hair-trigger kill. Liveness tolerates ~50s (5 x 10s) of unresponsiveness with a
           # 5s per-probe timeout before restarting; readiness just gates traffic, so it can
           # react a little faster.
+          #
+          # Uvicorn serves /health only after the FastAPI lifespan start ends: read the
+          # enforcement side, start check #4 (the combiner, D30), then the resync (D28,
+          # PUT /policy). The startupProbe gives that sequence its own budget —
+          # 30 x 10s = 5 min (it typically takes < 30s) — and holds the liveness and
+          # readiness probes until /health first answers, so a slow resync is not killed
+          # by the liveness probe. A failed start check or resync exits the process: the
+          # container restarts (with the kubelet back-off) and does not wait out this budget.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 7070
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 30
           readinessProbe:
             httpGet:
               path: /health
