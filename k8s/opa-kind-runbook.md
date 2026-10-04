@@ -52,17 +52,21 @@ read the delegation chain (see [Part B](#part-b--outbound-token-exchange--opa)).
   `github-agent` + `github-tool` deployed in namespace `team1`.
 - The three sibling repo clones the enable/restore scripts need:
   - `OPERATOR_DIR` → `rossoctl/operator` clone (default: `../operator`). The
-    enable script builds the operator image from `operator/Dockerfile` and
-    renders the bundle-service templates from `charts/operator`. It needs a
-    clone at or after operator commit `5e4c991`, which puts the bundle service
-    in the operator image.
+    enable script builds the bundle-service image from
+    `operator/cmd/bundle-service/Dockerfile` and applies the raw manifests in
+    `operator/config/bundleservice/`. The bundle service is **not** in the
+    operator image (that image builds only `cmd/main.go`, the manager) and the
+    operator chart has no bundle-service templates.
   - `ROSSOCTL_DIR` → `rossoctl/rossoctl` clone, i.e. the Helm chart
     (default: `../rossoctl`)
   - `CORTEX_DIR` → `rossoctl/cortex` clone (default: `../cortex`). The enable
     script builds the `authbridge-proxy` image from
-    `cmd/authbridge-proxy/Dockerfile` at the cortex repo root. This clone is
-    required: the enable script stops if it is missing. The restore script does
-    not need it.
+    `authbridge/cmd/authbridge-proxy/Dockerfile`. The authbridge Go module root
+    is the `authbridge/` subdirectory of the clone, not the clone root — that
+    is where `go.work` lives and what the Dockerfile's `COPY authlib/` /
+    `COPY storage/` resolve against. Override `AUTHBRIDGE_DIR` if your clone
+    puts the module elsewhere. This clone is required: the enable script stops
+    if it is missing. The restore script does not need it.
 - `kubectl`, `helm`, `kind`, and `docker` (or `podman`) on `PATH`.
   - If `kubectl` reports `connection refused` reaching the API server, the Kind
     node was likely restarted and reassigned its API-server host port, leaving
@@ -153,30 +157,42 @@ OPERATOR_DIR=../operator ROSSOCTL_DIR=../rossoctl CORTEX_DIR=../cortex ./k8s/opa
 
 The script does these steps:
 
-1. **Bundle service.** No released operator chart carries the bundle service
-   yet, so the script deploys it from the operator clone:
-   - It builds the operator image from `$OPERATOR_DIR/operator/Dockerfile`
-     (`OPERATOR_IMAGE`, default `localhost/rossoctl-operator:<operator HEAD short sha>`)
-     and loads it into Kind. The bundle service runs from this image.
-   - It applies the `AuthorizationPolicy` CRD from the operator clone.
-   - It deletes a legacy `bundle-service` Deployment whose selector is only
-     `app: bundle-service` (from the removed `operator/hack/bundle-service-kind.sh`).
-     The chart selector adds `app.kubernetes.io` labels, and a Deployment
-     selector is immutable.
-   - It renders and applies only the bundle-service templates from
-     `$OPERATOR_DIR/charts/operator` (`bundleService.enabled=true`, the local
-     image, `pullPolicy: Never`). The rest of the operator stays as installed.
-   - It does **not** apply the chart's bundle-service NetworkPolicy. That policy
-     admits only pods labelled `rossoctl.dev/authbridge=true`, and nothing sets
-     that label today. On a CNI that enforces NetworkPolicy it would block every
-     AuthBridge bundle fetch.
+1. **Bundle service.** No operator chart carries the bundle service — it has no
+   chart templates and no `bundleService` value — so the script deploys it from
+   the raw manifests in the operator clone:
+   - It builds the bundle-service image from
+     `$OPERATOR_DIR/operator/cmd/bundle-service/Dockerfile` (build context:
+     `$OPERATOR_DIR/operator`) and loads it into Kind. `BUNDLE_SERVICE_IMAGE`
+     overrides the tag, default `localhost/bundle-service:local`. The bundle
+     service is its **own** binary (`ENTRYPOINT /bundle-service`) — the operator
+     image builds only `cmd/main.go`, the manager, and cannot run it.
+   - It applies the `AuthorizationPolicy` CRD from the operator clone, before
+     the `default-policy.yaml` CR that needs it.
+   - It deletes an existing `bundle-service` Deployment only when its selector
+     differs from the manifest's `app: bundle-service` (a Deployment selector is
+     immutable). The manifest reuses the selector the removed
+     `operator/hack/bundle-service-kind.sh` set, so the usual case is an
+     in-place update and nothing is deleted.
+   - It applies `serviceaccount`, `rbac`, `service`, `deployment` and
+     `default-policy` from `$OPERATOR_DIR/operator/config/bundleservice/`,
+     rewriting the kustomize `namespace: system` placeholders (and
+     `default-policy`'s pinned `rossoctl-system`) to `$RELEASE_NAMESPACE`, and
+     the manifest's `ghcr.io/rossoctl/bundle-service:latest` to the locally
+     built image with `imagePullPolicy: Never` — otherwise the `:latest` tag
+     would default to `Always` and send Kind to ghcr.io instead of running the
+     image just built. The rest of the operator stays as installed.
+   - It does **not** apply `networkpolicy.yaml`. That policy admits only pods
+     labelled `rossoctl.dev/authbridge=true`, and nothing sets that label today.
+     On a CNI that enforces NetworkPolicy it would block every AuthBridge
+     bundle fetch.
 2. **AuthBridge image.** It builds `localhost/authbridge:local` from
-   `$CORTEX_DIR/cmd/authbridge-proxy/Dockerfile` (build context: the cortex repo
-   root) and loads it into the `rossoctl` Kind cluster. AuthBridge plugins are
-   opt-in build tags, so the build passes `GO_BUILD_TAGS` with the cortex `full`
-   profile (`scripts/profile-tags`, as the cortex CI does). The script derives it
-   with a local `go`, or in a `golang` container when `go` is not installed. Set
-   `GO_BUILD_TAGS` to override it.
+   `$AUTHBRIDGE_DIR/cmd/authbridge-proxy/Dockerfile` (build context:
+   `$AUTHBRIDGE_DIR`, i.e. `$CORTEX_DIR/authbridge`) and loads it into the
+   `rossoctl` Kind cluster. AuthBridge plugins are opt-in build tags, so the
+   build passes `GO_BUILD_TAGS` with the cortex `full` profile
+   (`authbridge/scripts/profile-tags`, as the cortex CI does). The script
+   derives it with a local `go`, or in a `golang` container when `go` is not
+   installed. Set `GO_BUILD_TAGS` to override it.
 3. **Pipeline.** It `helm upgrade`s the chart with a temporary overlay that
    inserts `opa` (after `token-exchange` on the outbound leg) and the parser set
    into every `team1` agent's pipeline. It does **not** modify

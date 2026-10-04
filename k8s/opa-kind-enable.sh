@@ -18,13 +18,17 @@
 # Requires: kubectl, helm, kind, docker (or podman), python3 not needed here.
 # Env vars:
 #   OPERATOR_DIR        path to the rossoctl/operator repo clone; Step 1 builds
-#                       the operator image (which carries the bundle-service
-#                       binary) and renders the bundle-service templates from
-#                       its local chart                   (default: ../operator)
+#                       the bundle-service image from its own Dockerfile and
+#                       applies the raw manifests under
+#                       operator/config/bundleservice/    (default: ../operator)
 #   ROSSOCTL_DIR        path to the rossoctl/rossoctl repo clone (the chart)
 #   CORTEX_DIR          path to the rossoctl/cortex repo clone; the authbridge
 #                       source built in Step 2 lives there, not in this repo
-#                       (default: ../cortex)
+#                       (default: ../cortex). The Go module root is the
+#                       authbridge/ subdirectory of that clone — see
+#                       AUTHBRIDGE_DIR
+#   AUTHBRIDGE_DIR      the authbridge Go module root inside the cortex clone
+#                       (default: $CORTEX_DIR/authbridge)
 #   CLUSTER_NAME        kind cluster name                 (default: rossoctl)
 #   RELEASE_NAME        helm release name                 (default: rossoctl)
 #   RELEASE_NAMESPACE   namespace the chart is installed in (default: rossoctl-system)
@@ -33,8 +37,9 @@
 #   GO_BUILD_TAGS       authbridge plugin build tags (default: the cortex "full"
 #                       profile, from scripts/profile-tags; derived with a local
 #                       `go`, or in a golang container when go is absent)
-#   OPERATOR_IMAGE      local operator image (bundle-service runs from it)
-#                       (default: localhost/rossoctl-operator:<operator HEAD short sha>)
+#   BUNDLE_SERVICE_IMAGE
+#                       local bundle-service image built + loaded by Step 1
+#                       (default: localhost/bundle-service:local)
 #   CONTAINER_RUNTIME   docker | podman                   (default: docker, auto-falls back to podman)
 #   AUTHBRIDGE_PROFILE  plugin profile for the Step 2 build (default: full — the
 #                       proxy-sidecar set, the only one carrying the opa plugin)
@@ -53,30 +58,36 @@ ROSSOCTL_DIR="${ROSSOCTL_DIR:-$(cd "$REPO_ROOT/../rossoctl" 2>/dev/null && pwd |
 # this extracted repo — default to a sibling ../cortex clone, override with
 # CORTEX_DIR.
 CORTEX_DIR="${CORTEX_DIR:-$(cd "$REPO_ROOT/../cortex" 2>/dev/null && pwd || echo "")}"
+# Inside the cortex clone the authbridge Go module root is the authbridge/
+# subdirectory, not the clone root: go.work lives there, and the proxy
+# Dockerfile COPYs authlib/ and storage/ relative to it. Both the image build
+# and the profile-tags helper therefore run against AUTHBRIDGE_DIR.
+AUTHBRIDGE_DIR="${AUTHBRIDGE_DIR:-${CORTEX_DIR:+$CORTEX_DIR/authbridge}}"
 CLUSTER_NAME="${CLUSTER_NAME:-rossoctl}"
 RELEASE_NAME="${RELEASE_NAME:-rossoctl}"
 RELEASE_NAMESPACE="${RELEASE_NAMESPACE:-rossoctl-system}"
 AGENT_NAMESPACE="${AGENT_NAMESPACE:-team1}"
 IMAGE_TAG="${IMAGE_TAG:-localhost/authbridge:local}"
 
-if [ -z "$OPERATOR_DIR" ] || [ ! -f "$OPERATOR_DIR/operator/Dockerfile" ] || [ ! -d "$OPERATOR_DIR/charts/operator/templates/bundleservice" ]; then
+if [ -z "$OPERATOR_DIR" ] || [ ! -f "$OPERATOR_DIR/operator/cmd/bundle-service/Dockerfile" ] || [ ! -d "$OPERATOR_DIR/operator/config/bundleservice" ]; then
   echo "ERROR: Set OPERATOR_DIR to point to your rossoctl/operator repo clone" >&2
-  echo "       (Step 1 needs \$OPERATOR_DIR/operator/Dockerfile and the bundle-service" >&2
-  echo "        templates in \$OPERATOR_DIR/charts/operator/templates/bundleservice/)" >&2
+  echo "       (Step 1 needs \$OPERATOR_DIR/operator/cmd/bundle-service/Dockerfile and the" >&2
+  echo "        bundle-service manifests in \$OPERATOR_DIR/operator/config/bundleservice/)" >&2
   exit 1
 fi
 if [ -z "$ROSSOCTL_DIR" ] || [ ! -d "$ROSSOCTL_DIR" ]; then
   echo "ERROR: Set ROSSOCTL_DIR to point to your rossoctl/rossoctl repo clone" >&2
   exit 1
 fi
-if [ -z "$CORTEX_DIR" ] || [ ! -f "$CORTEX_DIR/cmd/authbridge-proxy/Dockerfile" ]; then
+if [ -z "$AUTHBRIDGE_DIR" ] || [ ! -f "$AUTHBRIDGE_DIR/cmd/authbridge-proxy/Dockerfile" ]; then
   echo "ERROR: Set CORTEX_DIR to point to your rossoctl/cortex repo clone" >&2
   echo "       (Step 2 builds the authbridge-proxy image from" >&2
-  echo "        \$CORTEX_DIR/cmd/authbridge-proxy/Dockerfile, which lives in the cortex" >&2
-  echo "        monorepo, not in this repo)" >&2
+  echo "        \$CORTEX_DIR/authbridge/cmd/authbridge-proxy/Dockerfile, which lives in" >&2
+  echo "        the cortex monorepo, not in this repo. Override AUTHBRIDGE_DIR if the" >&2
+  echo "        authbridge module root is not \$CORTEX_DIR/authbridge)" >&2
   exit 1
 fi
-OPERATOR_IMAGE="${OPERATOR_IMAGE:-localhost/rossoctl-operator:$(git -C "$OPERATOR_DIR" rev-parse --short HEAD)}"
+BUNDLE_SERVICE_IMAGE="${BUNDLE_SERVICE_IMAGE:-localhost/bundle-service:local}"
 
 VALUES_FILE="${ROSSOCTL_DIR}/charts/rossoctl/values.yaml"
 CHART_DIR="${ROSSOCTL_DIR}/charts/rossoctl"
@@ -117,43 +128,61 @@ load_image_to_kind() {
 OVERLAY_FILE="$(mktemp "${TMPDIR:-/tmp}/opa-kind-enable-overlay.XXXXXX")"
 TMPFILES+=("$OVERLAY_FILE")
 
-echo "==> Step 1/5: deploying bundle-service from the operator chart (${OPERATOR_DIR}, image ${OPERATOR_IMAGE})"
-# The bundle service ships inside the operator image (selected by the container
-# `command:`) and is installed by the operator chart behind
-# bundleService.enabled. No released operator chart carries it yet, so — like
-# operator/hack/kind-reload-all.sh — build the image from the clone and render
-# only the bundle-service templates from its local chart. The rest of the
-# operator (the controller-manager) is left as installed.
-"$CONTAINER_RUNTIME" build -t "$OPERATOR_IMAGE" -f "$OPERATOR_DIR/operator/Dockerfile" "$OPERATOR_DIR/operator"
-load_image_to_kind "$OPERATOR_IMAGE"
+echo "==> Step 1/5: deploying bundle-service from the operator clone (${OPERATOR_DIR}, image ${BUNDLE_SERVICE_IMAGE})"
+# The bundle service is its own binary with its own Dockerfile
+# (operator/cmd/bundle-service, ENTRYPOINT /bundle-service). The operator image
+# builds only cmd/main.go — the manager — so it cannot run the bundle service,
+# and the operator chart carries no bundle-service templates (nor a
+# bundleService value) at all. The manifests live as raw kustomize-style YAML
+# under operator/config/bundleservice/, referenced by no kustomization. So:
+# build that image from the clone, load it into Kind, and apply those manifests
+# with the namespace and image rewritten. The rest of the operator (the
+# controller-manager) is left as installed.
+( cd "$OPERATOR_DIR/operator" \
+  && "$CONTAINER_RUNTIME" build -t "$BUNDLE_SERVICE_IMAGE" -f cmd/bundle-service/Dockerfile . )
+load_image_to_kind "$BUNDLE_SERVICE_IMAGE"
+# The CRD must exist before default-policy.yaml (an AuthorizationPolicy CR) is applied.
 kubectl apply -f "$OPERATOR_DIR/operator/config/crd/bases/agent.rossoctl.dev_authorizationpolicies.yaml"
-# A bundle-service from the removed operator/hack/bundle-service-kind.sh selects
-# on `app: bundle-service` only. The chart's selector adds the
-# app.kubernetes.io/{name,instance} labels, and a Deployment selector is
-# immutable, so delete that legacy Deployment before the apply.
-#
-# The chart's bundle-service NetworkPolicy is NOT applied: it admits only pods
-# labelled rossoctl.dev/authbridge=true, and nothing (operator webhook, chart,
-# AuthBridge) sets that label today. On a CNI that enforces NetworkPolicy it
-# would block every AuthBridge bundle fetch. The removed hack script applied no
-# NetworkPolicy either, so this keeps the earlier dev-cluster behavior.
+# A Deployment's selector is immutable, so a live bundle-service whose selector
+# differs from the manifest's must be deleted before the apply. The raw manifest
+# selects on `app: bundle-service` — the same selector the removed
+# operator/hack/bundle-service-kind.sh used — so the usual case is an in-place
+# update and this block no-ops. It only fires for a Deployment left behind by
+# some other install (e.g. a chart render adding app.kubernetes.io labels).
 if kubectl get deployment bundle-service -n "$RELEASE_NAMESPACE" >/dev/null 2>&1 \
-  && [ -z "$(kubectl get deployment bundle-service -n "$RELEASE_NAMESPACE" \
-        -o jsonpath='{.spec.selector.matchLabels.app\.kubernetes\.io/instance}')" ]; then
+  && [ "$(kubectl get deployment bundle-service -n "$RELEASE_NAMESPACE" \
+        -o jsonpath='{.spec.selector.matchLabels}')" != '{"app":"bundle-service"}' ]; then
   kubectl delete deployment bundle-service -n "$RELEASE_NAMESPACE" --wait=true
 fi
-helm template rossoctl-operator "$OPERATOR_DIR/charts/operator" \
-  --namespace "$RELEASE_NAMESPACE" \
-  --set bundleService.enabled=true \
-  --set bundleService.container.image.repository="${OPERATOR_IMAGE%:*}" \
-  --set bundleService.container.image.tag="${OPERATOR_IMAGE##*:}" \
-  --set bundleService.container.image.pullPolicy=Never \
-  --show-only templates/bundleservice/serviceaccount.yaml \
-  --show-only templates/bundleservice/rbac.yaml \
-  --show-only templates/bundleservice/deployment.yaml \
-  --show-only templates/bundleservice/service.yaml \
-  --show-only templates/bundleservice/default-policy.yaml \
-  | kubectl apply -f -
+# Two rewrites on the way to kubectl:
+#   - namespace: the manifests carry kustomize `namespace: system` placeholders,
+#     and default-policy.yaml is pinned to rossoctl-system — both become
+#     $RELEASE_NAMESPACE.
+#   - image: the manifest's ghcr.io/rossoctl/bundle-service:latest becomes the
+#     locally built image with pullPolicy: Never. Without this Kind would try to
+#     pull from ghcr.io (a `:latest` tag defaults to imagePullPolicy: Always)
+#     and never run the image just built.
+# networkpolicy.yaml is deliberately NOT applied: it admits only pods labelled
+# rossoctl.dev/authbridge=true, and nothing (operator webhook, chart, AuthBridge)
+# sets that label today. On a CNI that enforces NetworkPolicy it would block
+# every AuthBridge bundle fetch. The removed hack script applied no NetworkPolicy
+# either, so this keeps the earlier dev-cluster behavior.
+for manifest in serviceaccount rbac service deployment default-policy; do
+  cat "$OPERATOR_DIR/operator/config/bundleservice/${manifest}.yaml"
+  echo "---"
+done | awk -v img="$BUNDLE_SERVICE_IMAGE" -v ns="$RELEASE_NAMESPACE" '
+  /^[[:space:]]*namespace:[[:space:]]*(system|rossoctl-system)[[:space:]]*$/ {
+    sub(/namespace:.*/, "namespace: " ns)
+  }
+  /^[[:space:]]*image:[[:space:]]*ghcr\.io\/rossoctl\/bundle-service:/ {
+    match($0, /^[[:space:]]*/)
+    indent = substr($0, 1, RLENGTH)
+    print indent "image: " img
+    print indent "imagePullPolicy: Never"
+    next
+  }
+  { print }
+' | kubectl apply -f -
 kubectl rollout status deployment/bundle-service -n "$RELEASE_NAMESPACE" --timeout=180s
 kubectl get pods -n "$RELEASE_NAMESPACE" -l app=bundle-service
 
@@ -164,14 +193,14 @@ echo "==> Step 2/5: building + loading authbridge-proxy (${IMAGE_TAG}) via ${CON
 # standalone module, and the cortex go.work would want to write go.work.sum.
 if [ -z "${GO_BUILD_TAGS:-}" ]; then
   if command -v go &> /dev/null; then
-    GO_BUILD_TAGS="$(GOWORK=off go -C "$CORTEX_DIR/scripts/profile-tags" run . full)"
+    GO_BUILD_TAGS="$(GOWORK=off go -C "$AUTHBRIDGE_DIR/scripts/profile-tags" run . full)"
   else
-    GO_BUILD_TAGS="$("$CONTAINER_RUNTIME" run --rm -e GOWORK=off -v "$CORTEX_DIR:/src:ro" -w /src \
+    GO_BUILD_TAGS="$("$CONTAINER_RUNTIME" run --rm -e GOWORK=off -v "$AUTHBRIDGE_DIR:/src:ro" -w /src \
       docker.io/library/golang:1.26-alpine go -C scripts/profile-tags run . full)"
   fi
 fi
 echo "    GO_BUILD_TAGS=${GO_BUILD_TAGS}"
-( cd "$CORTEX_DIR" && "$CONTAINER_RUNTIME" build -t "$IMAGE_TAG" -f cmd/authbridge-proxy/Dockerfile \
+( cd "$AUTHBRIDGE_DIR" && "$CONTAINER_RUNTIME" build -t "$IMAGE_TAG" -f cmd/authbridge-proxy/Dockerfile \
     --build-arg GO_BUILD_TAGS="$GO_BUILD_TAGS" . )
 load_image_to_kind "$IMAGE_TAG"
 
