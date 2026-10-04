@@ -193,10 +193,20 @@ def generate_total_corpus(
     for scope in inbound_scope_names:
         if scope not in reachable_inbound:
             inbound_pairs.append((rng.choice(user_names), scope))
-    reachable_target = {s for _, s in outbound_subject_pairs} | {s for _, s in outbound_target_pairs}
+    # Checked independently, not as a union: the real pipeline only ever renders a user->tool pair
+    # through an agent role that targets the same scope (the PCE's outbound-subject derivation is
+    # gated on an outbound-target grant existing for that scope) -- a scope that already has a
+    # user-role (subject) grant but zero agent-role (target) grant would otherwise look "reachable"
+    # from the union and skip repair, leaving that scope's subject pairs permanently unrenderable
+    # in Rego even though the ground truth says they should be granted. Each side gets its own
+    # independent top-up instead, so every tool scope ends up with at least one grant on *both*
+    # sides, not just one or the other.
+    reachable_subject = {s for _, s in outbound_subject_pairs}
+    reachable_target = {s for _, s in outbound_target_pairs}
     for scope in target_scope_names:
-        if scope not in reachable_target:
+        if scope not in reachable_subject:
             outbound_subject_pairs.append((rng.choice(user_names), scope))
+        if scope not in reachable_target:
             outbound_target_pairs.append((rng.choice(agent_role_names), scope))
 
     users = {f"scale-user-{i:03d}": role for i, role in enumerate(user_names)}

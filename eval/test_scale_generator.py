@@ -92,6 +92,23 @@ class TestGenerateTotalCorpus:
         with pytest.raises(ValueError, match="n_roles"):
             generate_total_corpus(n_services=10, n_roles=0, seed=0)
 
+    def test_every_target_scope_has_both_a_subject_and_a_target_grant(self) -> None:
+        # The real pipeline only ever renders a user->tool pair through an agent role that also
+        # targets that same scope -- a tool scope with a user-role grant but zero agent-role grant
+        # can never appear in the rendered Rego even though the ground truth says it should be
+        # reachable. The repair pass must top up both sides independently, not just "the scope has
+        # *some* grant from either side" -- small sizes make an unlucky density draw on one side
+        # likely, so sweep several (small) sizes and seeds, not just the fixed-100 default where
+        # the gap this guards against is astronomically unlikely to show up by chance alone.
+        for n_services, n_roles in [(10, 3), (6, 2)]:
+            for seed in range(15):
+                corpus = generate_total_corpus(n_services=n_services, n_roles=n_roles, seed=seed)
+                target_scopes = _target_scope_names(corpus)
+                subject_covered = {s for _, s in corpus.OUTBOUND_SUBJECT_PAIRS}
+                target_covered = {s for _, s in corpus.OUTBOUND_PAIRS}
+                assert target_scopes <= subject_covered, f"seed={seed}: missing subject grant"
+                assert target_scopes <= target_covered, f"seed={seed}: missing target grant"
+
     def test_raises_clearly_on_fewer_than_two_services_instead_of_crashing_in_the_repair_pass(self) -> None:
         # n_services=1 -> n_agents = 1 // 2 = 0 -> no agent role for the repair pass to pick from.
         with pytest.raises(ValueError, match="n_services"):
