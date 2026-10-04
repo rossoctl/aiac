@@ -210,7 +210,11 @@ def test_scale_total_corpus_structural_prb(total_corpus_prb_result: dict, record
     record_property("wall_clock_seconds", total_corpus_prb_result["elapsed_seconds"])
     record_property("total_tokens", cost.total_tokens)
     record_property("token_coverage", cost.coverage)
-    record_property("decision_count", cost.total_calls)
+    # cost.total_calls is len(usage_by_name), which orchestrate_prb_concurrent never adds a failed
+    # job's name to (see its own docstring) -- so it alone would silently undercount the decisions
+    # this run actually attempted. Add failed_decisions back in so decision_count means "attempted",
+    # not "completed with some usage report, however empty".
+    record_property("decision_count", cost.total_calls + len(failed_decisions))
     record_property("best_effort_notes", best_effort_notes)
     # Every name in failed_decisions is already counted once via `missing` (orchestrate_prb_
     # concurrent never adds a failed job's name to reasoning_by_scope/reasoning_by_agent_role) --
@@ -223,9 +227,10 @@ def test_scale_total_corpus_structural_prb(total_corpus_prb_result: dict, record
     record_property("structural_pass", not missing and not duplicates)
     record_property("structural_issue_count", len(missing) + len(duplicates))
     print(
-        f"[scale:total_corpus:structural:prb] decisions={cost.total_calls} "
-        f"wall_clock={total_corpus_prb_result['elapsed_seconds']:.1f}s tokens={cost.total_tokens} "
-        f"(coverage={cost.coverage:.2f}) missing={missing} duplicates={duplicates} "
+        f"[scale:total_corpus:structural:prb] decisions={cost.total_calls + len(failed_decisions)} "
+        f"({len(failed_decisions)} failed) wall_clock={total_corpus_prb_result['elapsed_seconds']:.1f}s "
+        f"tokens={cost.total_tokens} (coverage={cost.coverage:.2f}, over {cost.total_calls} completed calls) "
+        f"missing={missing} duplicates={duplicates} "
         f"best_effort_notes={best_effort_notes or '{}'} failed_decisions={failed_decisions or '{}'}"
     )
     assert not missing, f"decisions never ran: {missing}"
@@ -581,7 +586,8 @@ def test_scale_total_corpus_structural_e2e(total_corpus_e2e_result: dict, record
     record_property("structural_issue_count", issue_count)
     print(
         f"[scale:total_corpus:structural:e2e] wall_clock={total_corpus_e2e_result['elapsed_seconds']:.1f}s "
-        f"tokens={cost.total_tokens} (coverage={cost.coverage:.2f}) missing_decisions={missing_decisions_} "
+        f"tokens={cost.total_tokens} (coverage={cost.coverage:.2f}, over {cost.total_calls} completed calls, "
+        f"{len(failed_decisions)} failed) missing_decisions={missing_decisions_} "
         f"missing_rego={missing_files} agents_with_no_rules={agents_with_no_rules} "
         f"rego_duplicates={rego_duplicates} best_effort_notes={best_effort_notes or '{}'} "
         f"failed_decisions={failed_decisions or '{}'}"
