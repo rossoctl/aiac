@@ -12,7 +12,6 @@ from aiac.policy.model.models import PolicyRule, RuleEffect
 from eval.scale_generator import generate_total_corpus
 from eval.scale_structural import (
     CostSummary,
-    duplicate_rego_entries,
     duplicate_rule_triples,
     invalid_selected_names,
     missing_decisions,
@@ -97,23 +96,6 @@ class TestDuplicateRuleTriples:
             PolicyRule(role=_role("r1"), scope=_scope("s1"), effect=RuleEffect.DENY),
         ]
         assert duplicate_rule_triples(rules) == []
-
-
-class TestDuplicateRegoEntries:
-    def test_no_duplicates(self) -> None:
-        assert duplicate_rego_entries({"role-a": ["scope-1", "scope-2"]}) == []
-
-    def test_names_the_exact_key_and_repeated_candidate(self) -> None:
-        assert duplicate_rego_entries({"role-a": ["scope-1", "scope-1"]}) == [("role-a", "scope-1")]
-
-    def test_only_the_repeated_entry_is_flagged_not_the_whole_key(self) -> None:
-        assert duplicate_rego_entries({"role-a": ["scope-1", "scope-1", "scope-2"]}) == [("role-a", "scope-1")]
-
-    def test_different_keys_are_independent(self) -> None:
-        assert duplicate_rego_entries({"role-a": ["scope-1"], "role-b": ["scope-1"]}) == []
-
-    def test_empty_map_has_no_duplicates(self) -> None:
-        assert duplicate_rego_entries({}) == []
 
 
 class TestOrphanedScopeNames:

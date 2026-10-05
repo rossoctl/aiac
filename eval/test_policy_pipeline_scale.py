@@ -35,6 +35,12 @@ PRB-level cases need only ``LLM_BASE_URL``/``LLM_MODEL``/``LLM_API_KEY``
 (``require_env_or_skip``, first line of each fixture). End-to-end cases additionally need
 ``KEYCLOAK_URL``+admin creds and ``opa`` on ``PATH``.
 
+**Never run this file with ``-n`` (pytest-xdist)** -- each of the four fixtures is
+``_skip_if_xdist()``-guarded (second line of each fixture, right after ``require_env_or_skip``)
+and skips cleanly under it: see that function's own docstring for why ``-n``'s default
+load-balancing is actively unsafe here (duplicate expensive runs, e2e port/realm collisions), not
+merely "nothing to parallelize."
+
 Size overrides (mirrors ``PRB_CONSISTENCY_REPEATS``'s existing convention -- use a small size while
 iterating, the full fixed-100 size for an actual regression run). Selection stays marker-only, same
 as every other suite -- never a file path -- so ``-k scale`` narrows to this suite's own
@@ -67,7 +73,8 @@ from aiac.agent.policy_rules_builder.graph import ROLE_GRAPH, SCOPE_GRAPH  # noq
 from aiac.idp.configuration.api import Configuration  # noqa: E402
 from aiac.idp.configuration.models import Role, RoleKind, Scope  # noqa: E402
 from aiac.policy.computation.engine import compute_and_apply  # noqa: E402
-from aiac.policy.model.models import RuleEffect  # noqa: E402
+from aiac.policy.model.models import PolicyRule, RuleEffect  # noqa: E402
+from aiac.policy.model_store.library.api import get_service_policy  # noqa: E402
 from eval.correctness_scorer import score_scenario  # noqa: E402
 from eval.prb_direct import build_roles_and_scopes  # noqa: E402
 from eval.scale_generator import (  # noqa: E402
@@ -80,13 +87,12 @@ from eval.scale_generator import (  # noqa: E402
 )
 from eval.scale_prb import _invoke_with_usage, capture_precheck_drops, orchestrate_prb_concurrent  # noqa: E402
 from eval.scale_structural import (  # noqa: E402
-    duplicate_rego_entries,
     duplicate_rule_triples,
     missing_decisions,
     missing_rego,
     summarize_usage,
 )
-from eval.test_policy_pipeline_correctness_e2e import _e2e_grant_sets, _rego_map  # noqa: E402
+from eval.test_policy_pipeline_correctness_e2e import _e2e_grant_sets  # noqa: E402
 from eval.test_policy_pipeline_eval import (  # noqa: E402
     _connect_admin,
     _rego_path,
@@ -111,6 +117,25 @@ SCALE_SEED = int(os.environ.get("SCALE_SEED", "0"))
 # (ports DEFAULT_IDP_PORT+i*10 for i in range(8)) even if both happened to run in the same session.
 _TOTAL_CORPUS_E2E_PORTS = {"idp": 7500, "store": 7502, "opa": 7501}
 _PER_DECISION_E2E_PORTS = {"idp": 7510, "store": 7512, "opa": 7511}
+
+
+def _skip_if_xdist() -> None:
+    """Each of the four fixtures below is ``scope="module"``, meant to be built **once** and
+    shared by its structural and correctness test. Under ``pytest-xdist``'s default load-balancing
+    (``-n`` with no ``--dist loadgroup``), individual test *items* -- not whole modules -- get
+    distributed across workers, so a structural test and its correctness sibling can land on
+    different worker processes; each then builds its own independent copy of the "shared once"
+    fixture, running the ~100-150-call total-corpus PRB twice. Worse, for the e2e fixtures two
+    workers would bind the exact same fixed ports (``_TOTAL_CORPUS_E2E_PORTS``/
+    ``_PER_DECISION_E2E_PORTS``), clear the same ``rego_out/policy_pipeline_scale/*`` directory, and
+    provision the same Keycloak realm name concurrently -- a port-bind failure or corrupted
+    Rego/realm state, not a clean, attributable test failure. Skip rather than risk that silently,
+    same discipline ``require_env_or_skip`` already uses for a missing env var."""
+    if os.environ.get("PYTEST_XDIST_WORKER"):
+        pytest.skip(
+            "Scale suite's module-scoped fixtures are not safe under pytest-xdist's default "
+            "load-balancing (duplicate expensive runs, e2e port/realm collisions) -- rerun without -n."
+        )
 
 
 def _provision_scale_realm_and_services(
@@ -151,6 +176,32 @@ def _provision_scale_realm_and_services(
     return idp, store, opa
 
 
+def _merged_rules_for(service_ids: set[str]) -> list[PolicyRule]:
+    """Query the real, persisted post-``compute_and_apply`` ``ServicePolicyModel`` for every
+    service in ``service_ids`` (``aiac.policy.model_store.library.api.get_service_policy``,
+    the same read API the PCE's own merge engine uses) and concatenate every
+    ``inbound_allow_rules``/``inbound_deny_rules`` entry.
+
+    This is the actual merge-engine output, queried **before** the Rego renderer gets anywhere
+    near it -- unlike checking the rendered Rego data maps, which ``aiac.pdp.service.policy.opa.
+    rego._group_rules``/``_group_rules_deprefixed`` always de-duplicate on the way out (``if
+    rule.scope.name not in scopes: scopes.append(...)``), so a duplicate ``(role, scope, effect)``
+    that survived the merge engine's own dedup bug would be silently collapsed before any check
+    reading the rendered Rego could ever see it. ``get_service_policy`` 404s to a fresh empty SPM
+    for a service with no row yet, so it's safe to call for every service unconditionally, not
+    only ones already known to have rules.
+
+    Must be called while the Policy Model Store is still running -- i.e. inside the fixture's own
+    ``with running_services(...)`` block, before it tears the store down. The caller's returned
+    dict carries the result forward so the structural test (which runs after the fixture has
+    already returned) can check it with no live service of its own."""
+    rules: list[PolicyRule] = []
+    for service_id in sorted(service_ids):
+        spm = get_service_policy(service_id)
+        rules += spm.inbound_allow_rules + spm.inbound_deny_rules
+    return rules
+
+
 # ======================================================================================
 # Total-corpus dimension, PRB level
 # ======================================================================================
@@ -161,6 +212,7 @@ def total_corpus_prb_result(tmp_path_factory: pytest.TempPathFactory) -> dict:
     """Run the generated total-corpus scenario through the PRB exactly once (shared by both the
     structural and correctness tests below, so the ~100-150-call run is only paid for once)."""
     require_env_or_skip("LLM_BASE_URL", "LLM_MODEL", "LLM_API_KEY")
+    _skip_if_xdist()
     corpus = generate_total_corpus(n_services=TOTAL_CORPUS_SIZE, n_roles=TOTAL_CORPUS_ROLES, seed=SCALE_SEED)
     scenario = corpus.as_namespace()
     roles, scopes = build_roles_and_scopes(scenario)
@@ -286,6 +338,7 @@ def per_decision_prb_result(tmp_path_factory: pytest.TempPathFactory) -> dict:
     (see ``eval.scale_prb``'s module docstring on why total-corpus's ~100+ *independent* calls
     warrant threading and these two single calls don't)."""
     require_env_or_skip("LLM_BASE_URL", "LLM_MODEL", "LLM_API_KEY")
+    _skip_if_xdist()
     corpus = generate_per_decision(n_candidates=PER_DECISION_CANDIDATES, seed=SCALE_SEED)
     tmp_dir = tmp_path_factory.mktemp("scale_per_decision")
     start = time.perf_counter()
@@ -469,6 +522,7 @@ def total_corpus_e2e_result(tmp_path_factory: pytest.TempPathFactory) -> dict:
     require_env_or_skip(
         "KEYCLOAK_URL", "KEYCLOAK_ADMIN_USERNAME", "KEYCLOAK_ADMIN_PASSWORD", "LLM_BASE_URL", "LLM_MODEL", "LLM_API_KEY"
     )
+    _skip_if_xdist()
     opa_bin()  # skip cleanly if opa is not on PATH / OPA_BIN unset
     corpus = generate_total_corpus(n_services=TOTAL_CORPUS_SIZE, n_roles=TOTAL_CORPUS_ROLES, seed=SCALE_SEED)
     scenario = corpus.as_namespace()
@@ -492,12 +546,17 @@ def total_corpus_e2e_result(tmp_path_factory: pytest.TempPathFactory) -> dict:
         )
         compute_and_apply(rules, override=False)
         elapsed = time.perf_counter() - start
+        # Must happen in here, before running_services tears the store down -- see
+        # _merged_rules_for's own docstring for why this, not the rendered Rego, is where a real
+        # merge-engine duplicate would actually show up.
+        merged_rules = _merged_rules_for(set(scenario.AGENTS) | set(scenario.TOOLS))
 
     return {
         "corpus": corpus,
         "scenario": scenario,
         "rego_dir": rego_dir,
         "rules": rules,
+        "merged_rules": merged_rules,
         "reasoning_by_scope": reasoning_by_scope,
         "reasoning_by_agent_role": reasoning_by_agent_role,
         "best_effort_notes": best_effort_notes,
@@ -548,24 +607,14 @@ def test_scale_total_corpus_structural_e2e(total_corpus_e2e_result: dict, record
     ]
     missing_files = missing_rego(rego_paths)
 
-    # Real merge-engine duplication check: query every rendered document the real PDP Policy
-    # Writer + OPA actually wrote for each agent that has any (same _rego_map helper
-    # _e2e_grant_sets uses to score correctness), and flag any candidate name listed more than
-    # once under one role/scope -- the one way compute_and_apply's documented role.id+scope.id+
-    # effect dedup could actually fail. See duplicate_rego_entries' own docstring for why this,
-    # not duplicate_rule_triples(rules), is the real e2e-level no-duplication check.
-    rego_duplicates = [
-        (f"{agent_id}/{doc}", key, candidate)
-        for agent_id in sorted(agents_with_rules)
-        for rego, doc in (
-            (_rego_path(rego_dir, agent_id, "inbound"), "inbound.request.subject_role_allow_scopes"),
-            (_rego_path(rego_dir, agent_id, "inbound"), "inbound.request.subject_role_deny_scopes"),
-            (_rego_path(rego_dir, agent_id, "outbound"), "outbound.request.subject_role_allow_scopes"),
-            (_rego_path(rego_dir, agent_id, "outbound"), "outbound.request.subject_role_deny_scopes"),
-            (_rego_path(rego_dir, agent_id, "outbound"), "outbound.request.agent_role_scopes"),
-        )
-        for key, candidate in duplicate_rego_entries(_rego_map(rego, doc))
-    ]
+    # Real merge-engine duplication check: duplicate_rule_triples applied to the actual persisted
+    # post-compute_and_apply SPM (merged_rules, queried inside the fixture while the Policy Model
+    # Store was still running -- see _merged_rules_for's own docstring). NOT the rendered Rego:
+    # aiac.pdp.service.policy.opa.rego's own grouping functions always de-duplicate a scope list on
+    # the way out, so a duplicate that survived a real merge-engine bug would already be collapsed
+    # by the time any check reading rendered Rego could see it (confirmed in review -- the
+    # Rego-reading version of this check could never fail).
+    merged_duplicates = duplicate_rule_triples(total_corpus_e2e_result["merged_rules"])
     cost = summarize_usage(total_corpus_e2e_result["usage_by_name"])
     best_effort_notes = total_corpus_e2e_result["best_effort_notes"]
     failed_decisions = total_corpus_e2e_result["failed_decisions"]
@@ -573,7 +622,7 @@ def test_scale_total_corpus_structural_e2e(total_corpus_e2e_result: dict, record
     record_property("missing_decisions", missing_decisions_)
     record_property("missing_rego", missing_files)
     record_property("agents_with_no_rules", agents_with_no_rules)  # reported only, see above
-    record_property("rego_duplicates", rego_duplicates)
+    record_property("merged_duplicates", merged_duplicates)
     record_property("wall_clock_seconds", total_corpus_e2e_result["elapsed_seconds"])
     record_property("total_tokens", cost.total_tokens)
     record_property("token_coverage", cost.coverage)
@@ -581,7 +630,7 @@ def test_scale_total_corpus_structural_e2e(total_corpus_e2e_result: dict, record
     # Already counted once via missing_decisions_ -- recorded/printed only as *why*, see
     # orchestrate_prb_concurrent's docstring.
     record_property("failed_decisions", failed_decisions)
-    issue_count = len(missing_decisions_) + len(missing_files) + len(rego_duplicates)
+    issue_count = len(missing_decisions_) + len(missing_files) + len(merged_duplicates)
     record_property("structural_pass", issue_count == 0)
     record_property("structural_issue_count", issue_count)
     print(
@@ -589,12 +638,14 @@ def test_scale_total_corpus_structural_e2e(total_corpus_e2e_result: dict, record
         f"tokens={cost.total_tokens} (coverage={cost.coverage:.2f}, over {cost.total_calls} completed calls, "
         f"{len(failed_decisions)} failed) missing_decisions={missing_decisions_} "
         f"missing_rego={missing_files} agents_with_no_rules={agents_with_no_rules} "
-        f"rego_duplicates={rego_duplicates} best_effort_notes={best_effort_notes or '{}'} "
+        f"merged_duplicates={merged_duplicates} best_effort_notes={best_effort_notes or '{}'} "
         f"failed_decisions={failed_decisions or '{}'}"
     )
     assert not missing_decisions_, f"decisions never ran: {missing_decisions_}"
     assert not missing_files, f"agent/direction with no rendered rego despite having rules: {missing_files}"
-    assert not rego_duplicates, f"duplicate candidate name(s) in the rendered Rego: {rego_duplicates}"
+    assert not merged_duplicates, (
+        f"duplicate (role, scope, effect) triple in the persisted post-merge policy: {merged_duplicates}"
+    )
 
 
 def test_scale_total_corpus_correctness_e2e(total_corpus_e2e_result: dict, record_property) -> None:
@@ -647,6 +698,7 @@ def per_decision_e2e_result(tmp_path_factory: pytest.TempPathFactory) -> dict:
     require_env_or_skip(
         "KEYCLOAK_URL", "KEYCLOAK_ADMIN_USERNAME", "KEYCLOAK_ADMIN_PASSWORD", "LLM_BASE_URL", "LLM_MODEL", "LLM_API_KEY"
     )
+    _skip_if_xdist()
     opa_bin()
     corpus = generate_per_decision(n_candidates=PER_DECISION_CANDIDATES, seed=SCALE_SEED)
     scenario = corpus.e2e_scenario.as_namespace()
@@ -688,11 +740,15 @@ def per_decision_e2e_result(tmp_path_factory: pytest.TempPathFactory) -> dict:
             )
         compute_and_apply(scope_rules + role_rules, override=False)
         elapsed = time.perf_counter() - start
+        # Must happen in here, before running_services tears the store down -- see
+        # _merged_rules_for's own docstring.
+        merged_rules = _merged_rules_for(set(scenario.AGENTS) | set(scenario.TOOLS))
 
     return {
         "corpus": corpus,
         "scenario": scenario,
         "rego_dir": rego_dir,
+        "merged_rules": merged_rules,
         "scope_candidate_names": corpus.scope_candidate_roles,
         "scope_selected": [r.role.name for r in scope_rules if r.effect == RuleEffect.ALLOW],
         "scope_denied": [r.role.name for r in scope_rules if r.effect == RuleEffect.DENY],
@@ -713,11 +769,11 @@ def per_decision_e2e_result(tmp_path_factory: pytest.TempPathFactory) -> dict:
 def test_scale_per_decision_structural_e2e(per_decision_e2e_result: dict, record_property) -> None:
     """Per-decision dimension, e2e level: no hallucinated candidate name (checked against
     ``*_dropped_names``, captured straight from production's own precheck step -- see
-    ``per_decision_prb_result``'s own comment for why), no duplicate entry in the real rendered
-    Rego (the actual PCE merge output, not the pre-merge PRB rules -- see
-    ``duplicate_rego_entries``'s docstring), and both agents' expected Rego file actually rendered
-    (fidelity + completeness, gated). Latency/cost (now including PCE+Rego rendering) are reported
-    and trended, never gated."""
+    ``per_decision_prb_result``'s own comment for why), no duplicate entry in the persisted
+    post-merge policy (the actual PCE output, not the pre-merge PRB rules or the rendered Rego --
+    see ``_merged_rules_for``'s own docstring), and both agents' expected Rego file actually
+    rendered (fidelity + completeness, gated). Latency/cost (now including PCE+Rego rendering) are
+    reported and trended, never gated."""
     r = per_decision_e2e_result
     scope_invalid = r["scope_dropped_names"]
     role_invalid = r["role_dropped_names"]
@@ -730,47 +786,47 @@ def test_scale_per_decision_structural_e2e(per_decision_e2e_result: dict, record
     # finding (already tracked, non-gating, by the correctness test's under_grants), not a
     # structural defect. Mirrors the total-corpus structural test's own agents_with_rules gating.
     rego_paths = []
-    rego_duplicates: list[tuple[str, str, str]] = []
     if r["scope_rules"]:
-        inbound_rego = _rego_path(r["rego_dir"], PER_DECISION_SCOPE_AGENT_ID, "inbound")
-        rego_paths.append((f"{PER_DECISION_SCOPE_AGENT_ID}/inbound", inbound_rego))
-        for doc in ("inbound.request.subject_role_allow_scopes", "inbound.request.subject_role_deny_scopes"):
-            rego_duplicates += [
-                (f"scope_decision/{doc}", key, candidate)
-                for key, candidate in duplicate_rego_entries(_rego_map(inbound_rego, doc))
-            ]
+        rego_paths.append(
+            (
+                f"{PER_DECISION_SCOPE_AGENT_ID}/inbound",
+                _rego_path(r["rego_dir"], PER_DECISION_SCOPE_AGENT_ID, "inbound"),
+            )
+        )
     if r["role_rules"]:
-        outbound_rego = _rego_path(r["rego_dir"], PER_DECISION_ROLE_AGENT_ID, "outbound")
-        rego_paths.append((f"{PER_DECISION_ROLE_AGENT_ID}/outbound", outbound_rego))
-        doc = "outbound.request.agent_role_scopes"
-        rego_duplicates += [
-            (f"role_decision/{doc}", key, candidate)
-            for key, candidate in duplicate_rego_entries(_rego_map(outbound_rego, doc))
-        ]
+        rego_paths.append(
+            (
+                f"{PER_DECISION_ROLE_AGENT_ID}/outbound",
+                _rego_path(r["rego_dir"], PER_DECISION_ROLE_AGENT_ID, "outbound"),
+            )
+        )
     missing_files = missing_rego(rego_paths)
+    merged_duplicates = duplicate_rule_triples(r["merged_rules"])
     cost = summarize_usage(r["usage_by_name"])
     best_effort_notes = {k: v for k, v in (("scope_decision", r["scope_note"]), ("role_decision", r["role_note"])) if v}
 
     record_property("scope_invalid_names", scope_invalid)
     record_property("role_invalid_names", role_invalid)
-    record_property("rego_duplicates", rego_duplicates)
+    record_property("merged_duplicates", merged_duplicates)
     record_property("missing_rego", missing_files)
     record_property("wall_clock_seconds", r["elapsed_seconds"])
     record_property("total_tokens", cost.total_tokens)
     record_property("token_coverage", cost.coverage)
     record_property("best_effort_notes", best_effort_notes)
-    issue_count = len(scope_invalid) + len(role_invalid) + len(rego_duplicates) + len(missing_files)
+    issue_count = len(scope_invalid) + len(role_invalid) + len(merged_duplicates) + len(missing_files)
     record_property("structural_pass", issue_count == 0)
     record_property("structural_issue_count", issue_count)
     print(
         f"[scale:per_decision:structural:e2e] n_candidates={len(r['scope_candidate_names'])} "
         f"wall_clock={r['elapsed_seconds']:.1f}s tokens={cost.total_tokens} (coverage={cost.coverage:.2f}) "
         f"scope_invalid={scope_invalid} role_invalid={role_invalid} missing_rego={missing_files} "
-        f"rego_duplicates={rego_duplicates} best_effort_notes={best_effort_notes or '{}'}"
+        f"merged_duplicates={merged_duplicates} best_effort_notes={best_effort_notes or '{}'}"
     )
     assert not scope_invalid, f"hallucinated candidate role name(s): {scope_invalid}"
     assert not role_invalid, f"hallucinated candidate scope name(s): {role_invalid}"
-    assert not rego_duplicates, f"duplicate candidate name(s) in the rendered Rego: {rego_duplicates}"
+    assert not merged_duplicates, (
+        f"duplicate (role, scope, effect) triple in the persisted post-merge policy: {merged_duplicates}"
+    )
     assert not missing_files, f"expected rego files never rendered: {missing_files}"
 
 

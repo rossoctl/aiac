@@ -368,34 +368,35 @@ _EXPECTED_CONSISTENCY_SCENARIO_COUNT = 8
 # this module doesn't need to import a live-LLM test module just to read a handful of constants.
 # Split by what each override actually changes, not lumped into one flat dict: SCALE_SEED changes
 # the whole generated corpus/truth table (a different seed's precision/recall aren't comparable to
-# the baseline's at all, not just "smaller") and SCALE_CONCURRENCY changes the latency figures
-# (eval.scale_prb.DEFAULT_CONCURRENCY) -- both apply to every Scale suite row regardless of
-# dimension. The size overrides don't: total-corpus and per-decision read disjoint env vars, so a
-# per-decision row must not be penalized for a total-corpus-only size override in the same session
-# (and vice versa) -- see _scale_run_matches_fixed_100.
+# the baseline's at all, not just "smaller") -- true of both dimensions, so it's shared. Every
+# other override is dimension-specific, including SCALE_CONCURRENCY: it only governs
+# orchestrate_prb_concurrent's thread pool (eval.scale_prb.DEFAULT_CONCURRENCY), which only the
+# total-corpus fixtures call -- the per-decision fixtures make exactly two sequential calls and
+# never read it at all, so it must not tag *their* rows "partial" either.
 _SCALE_SHARED_DEFAULTS = {
     "SCALE_SEED": "0",
-    "SCALE_CONCURRENCY": "20",
 }
 _SCALE_DIMENSION_DEFAULTS = {
-    "total_corpus": {"SCALE_TOTAL_CORPUS_SIZE": "100", "SCALE_TOTAL_CORPUS_ROLES": "10"},
+    "total_corpus": {"SCALE_TOTAL_CORPUS_SIZE": "100", "SCALE_TOTAL_CORPUS_ROLES": "10", "SCALE_CONCURRENCY": "20"},
     "per_decision": {"SCALE_PER_DECISION_CANDIDATES": "100"},
 }
 
 
 def _scale_run_matches_fixed_100(scale_suite: str) -> bool:
     """True only when every env-var override *this suite's own dimension* actually reads (plus
-    ``SCALE_SEED``/``SCALE_CONCURRENCY``, which apply to both -- see the dicts above) is unset or
-    still at its documented fixed-100 default. Checked per-suite, not globally: a total-corpus-only
-    size override (``SCALE_TOTAL_CORPUS_SIZE=10`` while iterating) must not also tag the
-    *per-decision* rows in the same session "partial" -- those ran at the real fixed-100 size and
-    are perfectly valid baseline points, dropped from the trend chart for no reason if lumped in
-    with the dimension that was actually overridden. A run with any relevant override in place --
-    a reduced size, a different seed (an entirely different generated corpus/truth table, not
-    merely "smaller"), or a different concurrency (skews the latency figures alone) -- produces
-    precision/recall/latency/cost numbers that are not comparable to the fixed-100 regression
-    baseline, regardless of whether both halves of a dimension/level ran -- so it must never be
-    tagged "regression" alongside real fixed-100 runs on the same trend-log line."""
+    ``SCALE_SEED``, which applies to both -- see the dicts above) is unset or still at its
+    documented fixed-100 default. Checked per-suite, not globally: a total-corpus-only override
+    (``SCALE_TOTAL_CORPUS_SIZE``/``_ROLES``/``SCALE_CONCURRENCY`` -- the last one only governs
+    ``orchestrate_prb_concurrent``'s thread pool, which the per-decision fixtures never call at
+    all) must not also tag the *per-decision* rows in the same session "partial" -- those ran at
+    the real fixed-100 size and are perfectly valid baseline points, dropped from the trend chart
+    for no reason if lumped in with the dimension that was actually overridden. A run with any
+    relevant override in place -- a reduced size, a different seed (an entirely different
+    generated corpus/truth table, not merely "smaller"), or a different concurrency (skews the
+    latency figures alone) -- produces precision/recall/latency/cost numbers that are not
+    comparable to the fixed-100 regression baseline, regardless of whether both halves of a
+    dimension/level ran -- so it must never be tagged "regression" alongside real fixed-100 runs
+    on the same trend-log line."""
     dimension = "total_corpus" if "total_corpus" in scale_suite else "per_decision"
     defaults = {**_SCALE_SHARED_DEFAULTS, **_SCALE_DIMENSION_DEFAULTS[dimension]}
     return all(os.environ.get(var, default) == default for var, default in defaults.items())
@@ -463,7 +464,7 @@ def _render_scale_block(lines: list[str], props: dict) -> None:
     for label, key in (
         ("Missing decisions", "missing_decisions"),
         ("Duplicate (role, scope, effect) triples", "duplicate_triples"),
-        ("Duplicate entries in rendered Rego", "rego_duplicates"),
+        ("Duplicate (role, scope, effect) triples in the persisted post-merge policy", "merged_duplicates"),
         ("Orphaned scopes", "orphaned_scopes"),
         ("Hallucinated candidate role names", "scope_invalid_names"),
         ("Hallucinated candidate scope names", "role_invalid_names"),
