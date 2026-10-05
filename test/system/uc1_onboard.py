@@ -17,7 +17,8 @@ assertions (``cr_matches_side``, ``deny_origin``); the verdict tables do not dep
 Every rung follows the same shape against **one** live rossoctl/Kind cluster with the AuthBridge OPA
 pipeline wired into both legs:
 
-    start from a no-workloads slate (undeploy + delete registrations) + policy-store clear
+    capture the leftover CRs of an earlier run to the pytest host (``capture_aiac_crs``, ``pre-run-slate``)
+      → start from a no-workloads slate (undeploy + delete registrations) + policy-store clear
       → deploy the rung's workloads in order, one at a time — each deploy fires the EVENT-DRIVEN
         trigger (operator registers a Keycloak client → Keycloak CLIENT_CREATED → the aiac-event-listener
         SPI publishes on NATS → the agent consumer runs onboard_service, upserting the AuthorizationPolicy
@@ -25,6 +26,8 @@ pipeline wired into both legs:
       → enable the outbound token-exchange leg (Part B: route + optional client scope + agent restart)
       → poll bundle-service + OPA until this run's CR is reflected in real decisions
       → drive REAL HTTP requests through AuthBridge and assert the real plugin's allow/deny
+      → capture every AIAC CR + the global combiner to the pytest host (``teardown``) — the first
+        teardown step, on the success and the failure path, best-effort (it never raises)
       → teardown full-to-pristine (undeploy + delete all registrations + delete CRs, verified)
 
 The only thing that differs between rungs is *which workloads are onboarded and in what order*, so
@@ -52,19 +55,25 @@ This module owns:
   ``aiac_crs`` / ``aiac_cr_uids`` (every CR with the managed-by label), ``cr_has_request_packages``,
   ``cr_has_grants``, ``rego_is_pass_through``, ``live_enforcement_side``, ``cr_matches_side`` /
   ``cr_side_mismatches``, and ``deny_origin`` + ``outbound_raw`` (where a deny comes from).
+* **CR capture (post-mortem evidence)** — ``capture_aiac_crs``: before each teardown and each Controller
+  restore, and before the pre-run slate, write every AIAC CR (the managed-by label, all namespaces) and
+  the global combiner as YAML to the pytest host, one directory per capture under ``CR_CAPTURE_DIR``
+  (``AIAC_CR_CAPTURE_DIR``; default the gitignored ``test/system/artifacts/cr-captures``). Read-only and
+  best-effort: it never masks a test failure and never stops a teardown.
 * **Failure path (rung 5)** — ``pristine_stack`` (the slate + teardown of ``onboarded_stack`` with no
   deploy / convergence, for a flow that must not converge), ``controller_llm_unusable`` (the LLM-seam
-  failure injection, restored on exit), ``publish_service_event`` (re-fire the onboarding trigger for
-  an existing client), and the quarantine readers (``workload_client``, ``spm_present``,
-  ``controller_logs``) plus the MCP session probe ``mcp_session_decisions``.
+  failure injection, restored on exit after a CR capture), ``publish_service_event`` (re-fire the
+  onboarding trigger for an existing client), and the quarantine readers (``workload_client``,
+  ``spm_present``, ``controller_logs``) plus the MCP session probe ``mcp_session_decisions``.
 * **Controller restart (rungs 6 and 7)** — ``restart_controller`` (rollout restart + wait until no old
   pod is left; the resync at start ends before the new pod is Ready), and ``controller_enforcement_side``
-  (patch ``AIAC_ENFORCEMENT_SIDE`` in the Controller's ConfigMap + restart; the start value and a second
-  restart on every exit path).
+  (patch ``AIAC_ENFORCEMENT_SIDE`` in the Controller's ConfigMap + restart; on every exit path a CR
+  capture, then the start value and a second restart).
 
 It imports only stdlib + ``requests`` + ``launcher`` + the pure-data ``scenario_uc1`` (never
-``aiac``), so it is importable before the env-before-import dance, exactly like ``scenario_uc1`` and
-``launcher``. It defines **no** ``test_*`` functions, so pytest does not collect it.
+``aiac``; PyYAML only inside the capture's ``_to_yaml``), so it is importable before the
+env-before-import dance, exactly like ``scenario_uc1`` and ``launcher``. It defines **no** ``test_*``
+functions, so pytest does not collect it.
 """
 
 from __future__ import annotations
@@ -78,6 +87,7 @@ import subprocess
 import sys
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator, Sequence
 
@@ -90,6 +100,7 @@ if str(REPO_ROOT) not in sys.path:  # so ``import test.system.*`` resolves
 
 from test.system import scenario_uc1 as scn  # noqa: E402
 from test.system.launcher import (  # noqa: E402
+    BUNDLE_SERVICE_NAMESPACE,
     DENY_ORIGIN_AGENT_OUTBOUND,
     DENY_ORIGIN_TOOL_INBOUND,
     _kubectl_try,
@@ -170,6 +181,17 @@ OTHER_SIDE: dict[str, str] = {TARGET_SIDE: AGENT_SIDE, AGENT_SIDE: TARGET_SIDE}
 
 # The label the OPA Policy Writer puts on every CR it owns (``_MANAGED_BY_LABEL`` in the writer).
 MANAGED_BY_SELECTOR = "app.kubernetes.io/managed-by=aiac-pdp-policy-writer"
+
+# The global combiner (D20): the ``default`` AuthorizationPolicy (scope ``global``) in the bundle-service
+# namespace, applied by ``k8s/opa-kind-enable.sh``. It has no managed-by label (``PUT /policy`` would
+# delete it), so the harness reads it by name, as the Controller start check #4 does.
+COMBINER_CR_NAME = "default"
+
+# --- CR capture (post-mortem evidence) -----------------------------------------------------
+# Before a teardown deletes or rewrites the AIAC CRs, ``capture_aiac_crs`` writes every AIAC CR and the
+# global combiner to the pytest host, so a failed run keeps the CRs that made its decisions. One new
+# subdirectory per capture under this root. Default: the gitignored ``test/system/artifacts/cr-captures/``.
+CR_CAPTURE_DIR = Path(os.environ.get("AIAC_CR_CAPTURE_DIR") or HERE / "artifacts" / "cr-captures").expanduser()
 
 # --- Live-cluster loop knobs (handoff 08) ---------------------------------------------------
 
@@ -953,8 +975,9 @@ def _scrub_to_pristine(admin) -> None:
     ran the same sequence inline. Each step is best-effort (its helper tolerates already-absent
     objects), and the five steps touch independent object classes (Keycloak clients + ``*-aud`` scopes,
     the agent's and the tool's CR, stray AuthorizationPolicy CRs, prefixed roles/scopes, and the Policy
-    Store), so their order is not load-bearing. The caller owns undeploying the workloads first and
-    verifying the result — this only scrubs registrations + state, it does not delete Deployments."""
+    Store), so their order is not load-bearing. The caller owns capturing the CRs before
+    (``capture_aiac_crs``), undeploying the workloads first and verifying the result — this only
+    scrubs registrations + state, it does not delete Deployments."""
     delete_workload_registrations(admin, TEST_REALM)  # clients + *-aud scopes + credentials Secret
     delete_workload_crs()  # this run's (or a prior run's) agent and tool CRs
     sweep_authpolicies()  # any leaked AuthorizationPolicy CR — the OPA bundle self-cleans from the CR set
@@ -975,7 +998,8 @@ def onboarded_stack(
     (``side`` = ``live_enforcement_side()``, read once at setup).
 
     Flow (event-driven trigger): skip cleanly (never false-pass) if the OPA pipeline or the event path
-    is not wired, or the integration env is unset; **start from a no-workloads slate** (a leftover
+    is not wired, or the integration env is unset; capture any leftover CR to the pytest host
+    (``capture_aiac_crs``, phase ``pre-run-slate``); **start from a no-workloads slate** (a leftover
     workload + its Keycloak client would stop the fresh deploy from re-firing ``CLIENT_CREATED``, so the
     event would never trigger), provision users/roles + clear the store; **load** the demo image(s) into
     the Kind node (``load_workload_images`` — build-if-absent, the images precondition), then **deploy**
@@ -985,11 +1009,14 @@ def onboarded_stack(
     ``POST /apply`` called) — waiting for each to converge before the next; enable the outbound leg
     (Part B: route + optional client scope + agent restart); then **poll real decisions** until
     ``bundle-service`` + OPA reflect this run's CR (and token-exchange has settled) before yielding.
-    Teardown is **full-to-pristine** — the workloads and every registration are removed and the removal
-    is verified. The workload order is the rung's identity — e.g. rung 2 passes ``[agent, tool]`` so
-    tool onboarding completes the tool check (under target side it writes github-tool's own CR with
-    both gates; under agent side it completes the agent's outbound gate); rung 3 passes
-    ``[tool, agent]`` and must converge to the same live decisions.
+    Teardown first captures every AIAC CR and the global combiner to the pytest host
+    (``capture_aiac_crs``, phase ``teardown``; best-effort, it never masks a failure), then is
+    **full-to-pristine** — the workloads and every registration are removed and the removal is
+    verified. The capture directories are named for the test module that started the stack. The
+    workload order is the rung's identity — e.g. rung 2 passes ``[agent, tool]`` so tool onboarding
+    completes the tool check (under target side it writes github-tool's own CR with both gates; under
+    agent side it completes the agent's outbound gate); rung 3 passes ``[tool, agent]`` and must
+    converge to the same live decisions.
 
     **Policy-agnostic parametrization (#149).** Every keyword defaults to today's Policy-A behavior,
     so the rung callers (which pass only a positional ``workloads``) are byte-for-byte unchanged, while
@@ -1023,7 +1050,9 @@ def onboarded_stack(
     # re-fires ``CLIENT_CREATED`` if there is no client for it yet, so a leftover workload + its Keycloak
     # client from a prior run would silently swallow the event and onboarding would never trigger. Remove
     # both workloads and every registration first (best-effort, tolerant of already-absent), then poll the
-    # clients actually gone before deploying.
+    # clients actually gone before deploying. Capture the CRs first: a prior run's leftovers are evidence.
+    label = _capture_label()  # the rung, read once here (a session fixture is torn down after the session)
+    capture_aiac_crs("pre-run-slate", label=label)
     undeploy_workload(scn.AGENT_WORKLOAD)
     undeploy_workload(scn.TOOL_WORKLOAD)
     _scrub_to_pristine(
@@ -1194,6 +1223,9 @@ def onboarded_stack(
             )
         yield ctx
     finally:
+        # Capture every AIAC CR and the combiner to the pytest host FIRST — the undeploy and the scrub
+        # remove or change them. Best-effort: it never raises, on the success and the failure path.
+        capture_aiac_crs("teardown", label=label)
         # Teardown — full-to-pristine, best-effort per step (each helper tolerates already-absent objects).
         for workload in reversed(workloads):  # undeploy in reverse deploy order
             undeploy_workload(workload)
@@ -1430,6 +1462,196 @@ def cr_matches_side(policies: dict[str, str] | None, kind: str, side: str) -> bo
 
 
 # ======================================================================================
+# CR capture — every AIAC CR and the global combiner to the pytest host, before a teardown
+# ======================================================================================
+#
+# The teardown deletes the CRs (``_scrub_to_pristine``) and a Controller restore rewrites them (the
+# resync), so without a capture a failed run keeps no record of the CR that made a wrong allow/deny.
+# ``capture_aiac_crs`` runs FIRST in each teardown and restore, and before the pre-run slate (the
+# leftovers of an earlier run are evidence too). It only reads (``kubectl get``) and it never raises.
+#
+# Layout, under ``CR_CAPTURE_DIR`` (``AIAC_CR_CAPTURE_DIR``; default ``test/system/artifacts/cr-captures``):
+#
+#   <UTC time>__<test module>__<phase>/   e.g. 20261005T143012.482913Z__test_uc1_onboard_resync__teardown
+#       index.yaml                        the label, the phase, the time, one entry per CR, the read errors
+#       <namespace>__<name>.yaml          one full CR, without metadata.managedFields
+#
+# The phases: ``pre-run-slate`` (before the pre-run cleanup), ``teardown`` (the first teardown step),
+# ``pre-side-restore`` / ``pre-env-restore`` (before a Controller restore) and ``pre-cr-delete`` (rung 6,
+# before it deletes github-tool's CR by hand).
+
+CAPTURE_INDEX_FILE = "index.yaml"
+
+
+def _name_part(text: str, fallback: str) -> str:
+    """``text`` as one safe part of a file name: each run of characters other than ``[A-Za-z0-9._-]``
+    becomes ``-`` (a Kubernetes name or a module stem stays as it is); ``fallback`` when nothing is left."""
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", text).strip("-.") or fallback
+
+
+def _capture_label() -> str:
+    """The default label of a capture: the file stem of the running test module, from
+    ``PYTEST_CURRENT_TEST`` (``<path>::<name> (<when>)``), for example ``test_uc1_onboard_resync``;
+    ``"no-test"`` outside a test. A stack reads it once at its start: pytest tears a session-scoped
+    fixture down after the last test of the session, which can be in another module."""
+    current = os.environ.get("PYTEST_CURRENT_TEST", "")
+    return _name_part(Path(current.split("::", 1)[0]).stem, "no-test")
+
+
+def _capture_dir_name(stamp: datetime, label: str, phase: str) -> str:
+    """The directory name of one capture: ``<UTC time>__<label>__<phase>``, for example
+    ``20261005T143012.482913Z__test_uc1_onboard_resync__teardown``. The UTC time has a fixed width and
+    comes first, so the names sort in time order."""
+    utc = stamp.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    return f"{utc}__{_name_part(label, 'no-test')}__{_name_part(phase, 'capture')}"
+
+
+def _cr_file_name(item: dict) -> str:
+    """The file of the CR ``item`` in a capture: ``<namespace>__<name>.yaml``. Unique in a capture,
+    which holds one kind with one object per ``_cr_key``."""
+    meta = item.get("metadata") or {}
+    namespace = _name_part(meta.get("namespace", ""), "no-namespace")
+    return f"{namespace}__{_name_part(meta.get('name', ''), 'no-name')}.yaml"
+
+
+def _strip_managed_fields(item: dict) -> dict:
+    """A copy of the CR ``item`` without ``metadata.managedFields`` (the server-side-apply field owners:
+    noise for a post-mortem). Everything else is kept, ``spec.policies[*].content`` (the Rego) included;
+    ``item`` is not changed."""
+    stripped = dict(item)
+    if isinstance(item.get("metadata"), dict):
+        stripped["metadata"] = {k: v for k, v in item["metadata"].items() if k != "managedFields"}
+    return stripped
+
+
+def _to_yaml(doc: dict) -> str:
+    """``doc`` as YAML, with the keys in their order and each multi-line string (the Rego in
+    ``spec.policies[*].content``) as a ``|`` block, as ``kubectl get -o yaml`` prints it. PyYAML (a
+    dependency of ``kubernetes``) is imported here, so the module keeps its stdlib + ``requests`` imports."""
+    import yaml
+
+    class _BlockDumper(yaml.SafeDumper):
+        pass
+
+    def _str(dumper: yaml.SafeDumper, data: str) -> yaml.ScalarNode:
+        return dumper.represent_scalar("tag:yaml.org,2002:str", data, style="|" if "\n" in data else None)
+
+    _BlockDumper.add_representer(str, _str)
+    return yaml.dump(doc, Dumper=_BlockDumper, sort_keys=False, allow_unicode=True)
+
+
+def _combiner_cr_items() -> list[dict]:
+    """The global combiner (``COMBINER_CR_NAME`` in ``BUNDLE_SERVICE_NAMESPACE``) as a list of one, or an
+    empty list when it is absent. Raises when the API is unreachable."""
+    out = kubectl(
+        "get",
+        "authorizationpolicy",
+        COMBINER_CR_NAME,
+        "-n",
+        BUNDLE_SERVICE_NAMESPACE,
+        "-o",
+        "json",
+        "--ignore-not-found",
+        timeout=30,
+    )
+    return [json.loads(out)] if out.strip() else []
+
+
+def _new_capture_dir(root: Path, name: str) -> Path:
+    """Make and return the new directory ``root/name``; when it exists (two captures in the same
+    microsecond with the same label and phase), ``root/name-2``, ``root/name-3``, … — never an old one."""
+    root.mkdir(parents=True, exist_ok=True)
+    suffix = 1
+    while True:
+        target = root / (name if suffix == 1 else f"{name}-{suffix}")
+        try:
+            target.mkdir()
+            return target
+        except FileExistsError:
+            suffix += 1
+
+
+def _write_cr_capture(
+    items: Sequence[dict],
+    root: Path,
+    *,
+    label: str,
+    phase: str,
+    errors: Sequence[str] = (),
+    now: datetime | None = None,
+) -> Path:
+    """Write the CR objects ``items`` as one capture (the layout above) into a new directory under
+    ``root``, and return that directory (absolute). A CR that is in ``items`` two times (same
+    ``_cr_key``) is written once. ``errors`` (the sources that could not be read) go into the index.
+    Raises on a file-system error."""
+    stamp = now or datetime.now(timezone.utc)
+    target = _new_capture_dir(root.resolve(), _capture_dir_name(stamp, label, phase))
+    crs = {_cr_key(item): _strip_managed_fields(item) for item in items}
+    index: list[dict] = []
+    for key in sorted(crs):
+        item = crs[key]
+        meta = item.get("metadata") or {}
+        file_name = _cr_file_name(item)
+        (target / file_name).write_text(_to_yaml(item), encoding="utf-8")
+        index.append(
+            {
+                "file": file_name,
+                "namespace": meta.get("namespace"),
+                "name": meta.get("name"),
+                "scope": (item.get("spec") or {}).get("scope"),
+                "uid": meta.get("uid"),
+                "resourceVersion": meta.get("resourceVersion"),
+            }
+        )
+    summary = {
+        "label": label,
+        "phase": phase,
+        "captured_at": stamp.astimezone(timezone.utc).isoformat(),
+        "crs": index,
+        "errors": list(errors),
+    }
+    (target / CAPTURE_INDEX_FILE).write_text(_to_yaml(summary), encoding="utf-8")
+    return target
+
+
+def capture_aiac_crs(phase: str, *, label: str | None = None, root: Path | None = None) -> Path | None:
+    """Capture every AIAC CR (``_aiac_cr_items``: the managed-by label, all namespaces) and the global
+    combiner (``_combiner_cr_items``) to the pytest host, in a new directory under ``root`` (default
+    ``CR_CAPTURE_DIR``) named for the UTC time, ``label`` (default ``_capture_label``: the running test
+    module) and ``phase`` (the layout above). Call it FIRST in a teardown or restore, before anything
+    deletes or changes a CR, for post-mortem debugging of a wrong allow/deny.
+
+    Read-only (``kubectl get`` only) and best-effort: it never raises, so a caller in a ``finally``
+    neither masks the test failure nor stops its teardown. A source that cannot be read is logged and
+    put in the index (``errors``), and the capture goes on with the other source; no CR at all is a
+    valid capture (``crs: []``). Any other error is logged and gives ``None``. The absolute directory is
+    logged at WARNING, the level that a pytest failure report shows by default (``pyproject.toml`` sets
+    no ``log_level``). Returns the directory, or ``None`` when nothing was written."""
+    try:
+        label = label or _capture_label()
+        items: list[dict] = []
+        errors: list[str] = []
+        sources = (
+            (f"AIAC CRs ({MANAGED_BY_SELECTOR})", _aiac_cr_items),
+            (f"global combiner ({BUNDLE_SERVICE_NAMESPACE}/{COMBINER_CR_NAME})", _combiner_cr_items),
+        )
+        for source, read in sources:
+            try:
+                items += read()
+            except Exception as exc:  # noqa: BLE001 — a failed read must not stop the capture or the teardown
+                detail = str(getattr(exc, "stderr", None) or exc).strip()[:300]
+                errors.append(f"{source}: {detail}")
+                log.warning("CR capture (%s): cannot read the %s: %s", phase, source, detail)
+        target = _write_cr_capture(items, root or CR_CAPTURE_DIR, label=label, phase=phase, errors=errors)
+    except Exception as exc:  # noqa: BLE001 — best-effort: never mask the test failure or stop the teardown
+        log.warning("CR capture (%s) failed, nothing written; the teardown goes on: %s", phase, exc)
+        return None
+    count = len({_cr_key(item) for item in items})
+    log.warning("CR capture (%s): %d CR(s) written to %s", phase, count, target)
+    return target
+
+
+# ======================================================================================
 # Failure path (rung 5), Controller restart (rung 6) and side switch (rung 7) — LLM-seam injection,
 # re-fired trigger, Controller rollouts, the enforcement-side switch, MCP session probe, pristine stack
 # ======================================================================================
@@ -1498,8 +1720,10 @@ def controller_env(overrides: dict[str, str]) -> Iterator[None]:
     An explicit container ``env`` entry wins over the ``envFrom`` ConfigMap/Secret, so the committed
     ``aiac-agent-config`` is never edited. Both the set and the restore are one JSON patch of the pod
     template's ``env`` list (a template change rolls the Controller), and both wait for the old pod to
-    be gone (``_wait_controller_rolled``). Like ``ensure_agent_policy``, a test-owned mutation of the
-    running Controller, never written into a committed manifest."""
+    be gone (``_wait_controller_rolled``). The restore rolls the Controller, and its resync can rewrite
+    or delete AIAC CRs, so the ``finally`` first captures them (``capture_aiac_crs``, phase
+    ``pre-env-restore``). Like ``ensure_agent_policy``, a test-owned mutation of the running Controller,
+    never written into a committed manifest."""
     dep = json.loads(
         kubectl("get", "deployment", CONTROLLER_DEPLOYMENT, "-n", CONTROLLER_NAMESPACE, "-o", "json", timeout=30)
     )
@@ -1530,6 +1754,8 @@ def controller_env(overrides: dict[str, str]) -> Iterator[None]:
         _wait_controller_rolled()
         yield
     finally:
+        # The restore rolls the Controller, and its resync rewrites the AIAC CRs: capture them first.
+        capture_aiac_crs("pre-env-restore")
         _patch(
             [{"op": "add", "path": path, "value": original}]
             if original is not None
@@ -1584,9 +1810,10 @@ def controller_enforcement_side(side: str) -> Iterator[None]:
     the resync (D28, ``PUT /policy`` with the full policy model of ``side``), which writes every AIAC CR
     in the new side; the new pod is Ready only after that, so the resync has run when the block starts.
 
-    On every exit path — also when the restart of the switch or the block raises — put back the exact
-    start value (an absent key stays absent) and restart the Controller again, so its resync writes
-    every CR in the start side. A failure of that restore raises ``EnforcementSideRestoreError``. A
+    On every exit path — also when the restart of the switch or the block raises — capture the AIAC CRs
+    of ``side`` to the pytest host (``capture_aiac_crs``, phase ``pre-side-restore``), then put back the
+    exact start value (an absent key stays absent) and restart the Controller again, so its resync
+    writes every CR in the start side. A failure of that restore raises ``EnforcementSideRestoreError``. A
     test-owned mutation of the running Controller, like ``controller_env``; never written into a
     committed manifest."""
     if side not in OTHER_SIDE:
@@ -1602,6 +1829,8 @@ def controller_enforcement_side(side: str) -> Iterator[None]:
         restart_controller()
         yield
     finally:
+        # The switch back rewrites every AIAC CR in the start side: capture the CRs of ``side`` first.
+        capture_aiac_crs("pre-side-restore")
         try:
             _set_enforcement_side_value(original)
             restart_controller()
@@ -1721,9 +1950,10 @@ def pristine_stack(workloads: Sequence[str], *, policy_md: str = scn.POLICY_ABST
     ``live_enforcement_side()``); the caller deploys.
 
     Same skip gates (pipeline wiring, env, event path — before any mutation), same no-workloads slate
-    (undeploy + ``_scrub_to_pristine`` + ``reenable_provisioned_clients`` + clients-gone poll), same
-    realm/users provisioning + ``sub`` mapper gate, ``policy.md`` mount and image load for
-    ``workloads``; and the same full-to-pristine teardown, verified (clients gone, no CR left)."""
+    (a ``pre-run-slate`` CR capture, then undeploy + ``_scrub_to_pristine`` +
+    ``reenable_provisioned_clients`` + clients-gone poll), same realm/users provisioning + ``sub``
+    mapper gate, ``policy.md`` mount and image load for ``workloads``; and the same teardown: a
+    ``teardown`` CR capture first, then full-to-pristine, verified (clients gone, no CR left)."""
     require_pipeline(namespace=NAMESPACE, workloads=[])
     creds = require_env_or_skip("KEYCLOAK_URL", "KEYCLOAK_ADMIN_USERNAME", "KEYCLOAK_ADMIN_PASSWORD")
     keycloak_url = creds["KEYCLOAK_URL"]
@@ -1731,6 +1961,8 @@ def pristine_stack(workloads: Sequence[str], *, policy_md: str = scn.POLICY_ABST
     require_event_path(admin=admin, realm=TEST_REALM)
     side = live_enforcement_side()
 
+    label = _capture_label()
+    capture_aiac_crs("pre-run-slate", label=label)
     undeploy_workload(scn.AGENT_WORKLOAD)
     undeploy_workload(scn.TOOL_WORKLOAD)
     _scrub_to_pristine(admin)
@@ -1748,6 +1980,7 @@ def pristine_stack(workloads: Sequence[str], *, policy_md: str = scn.POLICY_ABST
         load_workload_images(list(workloads))
         yield {"admin": admin, "namespace": NAMESPACE, "keycloak_url": keycloak_url, "realm": TEST_REALM, "side": side}
     finally:
+        capture_aiac_crs("teardown", label=label)  # FIRST: the undeploy and the scrub remove the CRs
         for workload in reversed(list(workloads)):
             undeploy_workload(workload)
         _scrub_to_pristine(admin)

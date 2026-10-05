@@ -225,8 +225,9 @@ cleanly** when any of it is absent (they never stand it up, and never false-pass
 sequentially, each converging before the next → enable outbound leg (rungs 2/3, 6, 7) → poll bundle → drive
 real requests + assert → full teardown.**
 
-1. **Clean slate, then setup — ordering matters.** First the pre-run reset to a no-workloads slate:
-   `undeploy_workload` for both workloads, then `_scrub_to_pristine` — `delete_workload_registrations`
+1. **Clean slate, then setup — ordering matters.** First `capture_aiac_crs` writes the leftover CRs of
+   an earlier run to the pytest host (phase `pre-run-slate`; see step 6). Then the pre-run reset to a
+   no-workloads slate: `undeploy_workload` for both workloads, then `_scrub_to_pristine` — `delete_workload_registrations`
    (the two Keycloak clients, their `*-aud` scopes, the credentials Secret), `delete_workload_crs` (the
    agent's and the tool's `AuthorizationPolicy` CRs), `sweep_authpolicies` (every other `AuthorizationPolicy` CR),
    `cleanup_provisioned` (the **agent's and tool's** provisioned realm roles + client scopes), and
@@ -318,6 +319,13 @@ real requests + assert → full teardown.**
       - Verdicts are **computed from** `scenario_uc1.py`, never from the policy. A failing node names the
         exact cell.
 6. **Teardown → pristine.** Restore the cluster to its pre-test (no-workloads) state:
+   - **Capture the CRs first** (`capture_aiac_crs`, phase `teardown`), on the success and the failure
+     path: every AIAC CR (the managed-by label, all namespaces) and the global combiner, written as YAML
+     (without `metadata.managedFields`) to the pytest host for post-mortem debugging — one directory
+     `<UTC time>__<test module>__<phase>/` per capture, with one `<namespace>__<name>.yaml` per CR and an
+     `index.yaml`, under `AIAC_CR_CAPTURE_DIR` (default: the gitignored `test/system/artifacts/cr-captures/`).
+     Read-only and best-effort: a capture failure is logged, never raised. A Controller restore (rungs 5
+     and 7) and rung 6's hand delete of github-tool's CR capture first too.
    - **Undeploy** each workload (`kubectl delete -f` the manifests, **reverse** deploy order).
    - **Delete the Keycloak clients explicitly** — the two clients `{ns}/github-agent` and
      `{ns}/github-tool`, their credentials Secret, and the `*-aud` audience scope. Do **not** rely on an

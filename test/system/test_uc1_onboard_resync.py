@@ -20,7 +20,8 @@ and the later phases report "not reached":
    ``spec.policies`` and the same uid (updated in place or not at all — a delete and a new create would
    open a deny window under D20); and the convergence signals still hold (``dev-user`` inbound allow,
    ``devops-user`` inbound deny, ``dev-user`` outbound ``source-read`` allow).
-2. **No CR, so deny (D20).** Delete github-tool's CR by hand. Poll until the ``dev-user``
+2. **No CR, so deny (D20).** Capture every AIAC CR to the pytest host (``uc1.capture_aiac_crs``, phase
+   ``pre-cr-delete``), then delete github-tool's CR by hand. Poll until the ``dev-user``
    ``source-read`` call, which phase 1 allowed, is denied. github-tool now has no client CR, so the
    changed combiner denies the call on github-tool's inbound (HTTP 403 with an OPA body), under both
    sides — ``deny_origin`` must give github-tool's inbound.
@@ -144,6 +145,7 @@ def _run_phases(ctx: dict, run: dict) -> None:
     run["restarted"] = {**_snapshot(), "signals": _hold(ctx)}
 
     # --- Phase 2 — delete github-tool's CR by hand: the combiner denies it (D20) ---------------
+    uc1.capture_aiac_crs("pre-cr-delete")  # keep the CRs after the restart of phase 1 (best-effort)
     uc1.delete_authpolicy(TOOL)
     run["no_cr"] = {"cr": uc1.authpolicy_policies(TOOL), "probe": _poll_probe(ctx, "deny")}
 

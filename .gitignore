@@ -25,6 +25,11 @@ eval/dashboard.html
 # uc1-onboarding demo's captured .rego snapshots — regenerated per run, not source of truth.
 demo/use-cases/uc1-onboarding/generated/
 
+# system-test CR captures (test/system/uc1_onboard.py capture_aiac_crs): every AIAC CR + the global
+# combiner, written before each teardown for post-mortem debugging; one directory per capture,
+# regenerated per run, not source of truth. AIAC_CR_CAPTURE_DIR moves them elsewhere.
+test/system/artifacts/
+
 # Python bytecode / build / tool caches (regenerated; never source of truth)
 __pycache__/
 *.py[cod]
