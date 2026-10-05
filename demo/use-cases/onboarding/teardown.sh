@@ -28,6 +28,9 @@
 #     system test suite both depend on, and which that runbook calls harmless to leave.
 #   - the operator's `*-aud` audience client scopes, which it owns and recreates.
 #   - container images already loaded into the Kind node (inert; `docker image rm` them by hand).
+#     Consequence worth knowing: because these survive, a later `./enable.sh` finds the stack images
+#     present and SKIPS rebuilding them, so a source change made since would not reach the cluster.
+#     Re-install with `./enable.sh --rebuild` to force those builds.
 #
 # Usage:
 #   ./teardown.sh --dry-run        # list everything that WOULD be removed; change nothing
@@ -382,7 +385,11 @@ Still in place, by design (platform state this demo does not own):
   - container images in the Kind node (inert). Remove by hand if you want the disk back:
       docker image rm localhost/aiac-{pdp-config,pdp-policy-opa,policy-model-store,agent}:local \\
                       localhost/github-{agent,tool}:latest
+    Because they survive, a plain './enable.sh' will SKIP rebuilding the stack images and re-load
+    these — so any source change you made since would not reach the cluster. Use --rebuild below.
 $([ "$DO_OPA" -eq 0 ] && printf '%s' "  - the OPA pipeline overlay in ${NS} — re-run with --include-opa to revert it.")
 
 To stand the demo back up: see demo.md, Part 1.
+  ./enable.sh --rebuild     # rebuild the four stack images from current source, then install
+  ./enable.sh               # reuse the images already built (faster; no source change since)
 EOF

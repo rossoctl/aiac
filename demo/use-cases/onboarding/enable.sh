@@ -16,6 +16,16 @@
 #   ./enable.sh --stack-only   # just the AIAC stack
 #   ./enable.sh --broker-only  # just the NATS broker
 #   ./enable.sh --spi-only     # just the Keycloak SPI listener
+#   ./enable.sh --rebuild      # force a rebuild of the four stack images (combinable with the above)
+#
+# The three --*-only flags are mutually exclusive; --rebuild is a modifier that combines with any of
+# them. By default step_stack SKIPS building a stack image that is already present locally, which is
+# what you want on a re-run but not after a source change: teardown.sh deliberately leaves local
+# images alone, so a post-teardown ./enable.sh otherwise re-loads the stale ones into Kind. --rebuild
+# bypasses that presence check. It does not pass --no-cache — the changed COPY layer is what
+# invalidates the cache — so reach for a manual `docker build --no-cache` if you suspect a stale base
+# image or dependency layer. It has no effect on the Keycloak SPI image, which step_spi rebuilds
+# unconditionally on every run, nor on github-agent/github-tool, which this script never builds.
 #
 # Env vars:
 #   CLUSTER_NAME        kind cluster name                          (default: rossoctl)
@@ -62,13 +72,38 @@ fi
 DO_STACK=1
 DO_BROKER=1
 DO_SPI=1
-case "${1:-}" in
-  --stack-only) DO_BROKER=0; DO_SPI=0 ;;
-  --broker-only) DO_STACK=0; DO_SPI=0 ;;
-  --spi-only) DO_STACK=0; DO_BROKER=0 ;;
-  "") ;;
-  *) echo "Usage: $0 [--stack-only|--broker-only|--spi-only]" >&2; exit 1 ;;
-esac
+FORCE_REBUILD=0
+USAGE="Usage: $0 [--stack-only|--broker-only|--spi-only] [--rebuild]"
+# A loop, not a case on $1, so --rebuild can combine with a mode flag. MODE_FLAG tracks which mode
+# was chosen: two of them would zero every DO_* between them (--stack-only then --broker-only leaves
+# all three at 0 and the script a no-op), so reject the second rather than silently doing nothing.
+MODE_FLAG=""
+for arg in "$@"; do
+  case "$arg" in
+    --stack-only|--broker-only|--spi-only)
+      if [ -n "$MODE_FLAG" ] && [ "$MODE_FLAG" != "$arg" ]; then
+        echo "Error: ${MODE_FLAG} and ${arg} are mutually exclusive." >&2
+        echo "$USAGE" >&2
+        exit 1
+      fi
+      MODE_FLAG="$arg"
+      case "$arg" in
+        --stack-only) DO_BROKER=0; DO_SPI=0 ;;
+        --broker-only) DO_STACK=0; DO_SPI=0 ;;
+        --spi-only) DO_STACK=0; DO_BROKER=0 ;;
+      esac
+      ;;
+    --rebuild) FORCE_REBUILD=1 ;;
+    "") ;;
+    *) echo "$USAGE" >&2; exit 1 ;;
+  esac
+done
+# --rebuild only drives step_stack's build loop, which --spi-only/--broker-only skip entirely. Say so
+# rather than letting the operator believe a rebuild happened.
+if [ "$FORCE_REBUILD" -eq 1 ] && [ "$DO_STACK" -eq 0 ]; then
+  echo "==> NOTE: --rebuild has no effect with ${MODE_FLAG} — it only forces the four stack image"
+  echo "    builds, which ${MODE_FLAG} skips. (The Keycloak SPI image is always rebuilt anyway.)"
+fi
 
 TMPFILES=()
 # -rf, not -f: TMPFILES holds both files and the mktemp -d build dir (the derived-image context).
@@ -121,11 +156,12 @@ step_stack() {
     "localhost/aiac-policy-model-store:local|src/aiac/policy/model_store/service/Dockerfile|src"
     "localhost/aiac-agent:local|src/aiac/agent/controller/Dockerfile|src"
   )
+  [ "$FORCE_REBUILD" -eq 1 ] && echo "==> [stack] --rebuild: building all four images, ignoring what is present locally"
   local entry image dockerfile context
   for entry in "${images[@]}"; do
     IFS='|' read -r image dockerfile context <<< "$entry"
-    if "$CONTAINER_RUNTIME" image inspect "$image" >/dev/null 2>&1; then
-      echo "==> [stack] '${image}' already present locally, skipping build"
+    if [ "$FORCE_REBUILD" -eq 0 ] && "$CONTAINER_RUNTIME" image inspect "$image" >/dev/null 2>&1; then
+      echo "==> [stack] '${image}' already present locally, skipping build (--rebuild to force)"
     else
       echo "==> [stack] Building '${image}' from ${context} (${dockerfile})"
       ( cd "$AIAC_DIR" && "$CONTAINER_RUNTIME" build -t "$image" -f "$dockerfile" "$context" )

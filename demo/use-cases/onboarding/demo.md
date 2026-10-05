@@ -192,6 +192,20 @@ copy-paste commands for environments it doesn't fit. Three independently runnabl
 | NATS broker | `--broker-only` | Applies `event-broker-deployment.yaml`, creating `aiac-event-broker-service` in `aiac-system`. The SPI's compiled-in default `NATS_URL` (`nats://aiac-event-broker-service:4222`) is a **bare name that cannot resolve from the `keycloak` namespace**, so `--spi-only` sets the cross-namespace FQDN (`....aiac-system.svc.cluster.local`) on the Keycloak StatefulSet — the two sides agree because the script makes them agree, not by default |
 | Keycloak SPI | `--spi-only` | Builds the shaded jar in a Maven container (no JDK needed on your machine), builds a derived Keycloak image with the jar in `/opt/keycloak/providers/` + `kc.sh build`, `kind load`s it, `kubectl set image`s the live `keycloak` StatefulSet (including the `NATS_URL` FQDN above), and enables the listener on the realm's admin-events config |
 
+The stack step **skips building an image that is already present locally**, which is what you want on
+a re-run but not after a source change — and `teardown.sh` deliberately leaves local images alone, so
+a post-teardown `./enable.sh` would re-load the *stale* ones into Kind. Pass `--rebuild` (combinable
+with any of the three flags above) to force all four builds:
+
+```bash
+./enable.sh --rebuild                # reinstall Part 1, rebuilding the stack images
+./enable.sh --stack-only --rebuild   # just rebuild + redeploy the stack after editing src/aiac/
+```
+
+It does not imply `--no-cache`; the changed `COPY` layer is what invalidates the cache. The SPI image
+is rebuilt on every `--spi-only` run regardless, and `github-agent`/`github-tool` are built elsewhere
+(`demo/assets/kind-load.sh`, in Part 4).
+
 The Keycloak change is a **live, reversible patch**, not a chart edit — a later `helm upgrade` of the
 `rossoctl` release would revert it (same spirit as `opa-kind-enable.sh`'s overlay). Undo it
 deliberately with `./restore.sh --include-infra`.
