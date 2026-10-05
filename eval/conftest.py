@@ -664,6 +664,19 @@ def _write_trend_log() -> None:
             scale_metrics.update(pool_scale_metrics(structural))
         if correctness:
             scale_metrics.update(pool_correctness_metrics(correctness))
+        # Both pooling functions above emit "scenarios_scored" (len(entries)) under the same key,
+        # so when both halves ran, the correctness update just silently overwrote the structural
+        # half's value with its own. Harmless only because this suite's own design guarantees at
+        # most one entry per half -- one structural test function, one correctness test function,
+        # neither parametrized -- so the two counts are always equal when both ran. Asserted here
+        # instead of relying on that invariant silently via dict-overwrite order, so a future
+        # change that breaks it (e.g. parametrizing either test) fails loudly instead of quietly
+        # reporting whichever count happened to be written last.
+        if structural and correctness:
+            assert len(structural) == len(correctness), (
+                f"{scale_suite}: structural scored {len(structural)} run(s) but correctness scored "
+                f"{len(correctness)} -- scenarios_scored would silently pick one over the other"
+            )
         append_row(scale_suite, scale_metrics, run_type=run_type)
 
 
