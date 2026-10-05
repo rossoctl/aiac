@@ -211,7 +211,7 @@ existing `"precision" in props and "recall" in props` branch with no new renderi
 | `SCALE_TOTAL_CORPUS_ROLES` (optional) | Total-corpus dimension's `n_roles`. Default `10`. |
 | `SCALE_PER_DECISION_CANDIDATES` (optional) | Per-decision dimension's `n_candidates`. Default `100`. |
 | `SCALE_SEED` (optional) | Generator seed, for both dimensions. Default `0`. |
-| `SCALE_CONCURRENCY` (optional) | Max concurrent PRB/Keycloak-admin calls (`eval.scale_prb.concurrency`). Default `20`. |
+| `SCALE_CONCURRENCY` (optional) | Max concurrent PRB decision calls (`eval.scale_prb.concurrency`) -- total-corpus only; the e2e fixtures' Keycloak-admin calls run one at a time regardless. Default `20`. |
 | `OPA_BIN` (optional) | Path to the `opa` binary for the end-to-end cases; falls back to `opa` on `PATH`. Skips cleanly (not fails) if neither resolves. |
 
 No `AIAC_POLICY_FILE` env var to set by hand — every fixture points it at a generated policy text

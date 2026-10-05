@@ -8,11 +8,13 @@ sequentially (production code, not modified here). Running them one after anothe
 fresh state dict, its own freshly-built ``ChatOpenAI`` client (``_build_llm()`` is called fresh
 per ``_structured_call``) -- so nothing about them shares mutable state across calls.
 ``run_concurrently``/``orchestrate_prb_concurrent`` fan the same call set out across a
-``ThreadPoolExecutor`` instead, capped by ``SCALE_CONCURRENCY`` (mirrors
-``EVAL_PIPELINE_PARALLELISM``'s existing override convention) to stay under a typical LLM
-endpoint's rate limits. ``run_concurrently`` is the shared primitive, reused as-is by the e2e
-level's Keycloak provisioning loops (independent per-entity admin-API calls) in
-``eval/test_policy_pipeline_scale.py``.
+``ThreadPoolExecutor`` instead, capped by ``SCALE_CONCURRENCY`` -- max concurrent PRB decision
+calls, nothing else (mirrors ``EVAL_PIPELINE_PARALLELISM``'s existing override convention) -- to
+stay under a typical LLM endpoint's rate limits. ``run_concurrently`` is a general fan-out
+primitive, but ``orchestrate_prb_concurrent`` is its only caller today: the e2e fixtures'
+Keycloak-admin provisioning (``provision_keycloak_admin``/``provision_via_config`` in
+``eval/test_policy_pipeline_scale.py``) calls run one at a time, not through this or
+``SCALE_CONCURRENCY`` at all.
 
 **Usage-metadata tracking under threads**: LangChain's ``get_usage_metadata_callback()`` is a
 context-var-scoped callback handler. Confirmed empirically (not merely assumed) that its context
@@ -79,9 +81,23 @@ def _invoke_with_usage(
 
 
 class PrecheckDrops(logging.Handler):
-    """Collects the names ``_precheck``'s own diagnostic warning reports as dropped (a candidate
-    the LLM selected or denied that was never offered to it -- see ``capture_precheck_drops``
-    below). Not meant to be instantiated directly outside that context manager."""
+    """Collects the names the **most recently logged** ``_precheck`` call reported as dropped (a
+    candidate the LLM selected or denied that was never offered to it -- see
+    ``capture_precheck_drops`` below). Not meant to be instantiated directly outside that context
+    manager.
+
+    One decision call can retry ``propose``/``_precheck`` more than once:
+    ``aiac.agent.policy_rules_builder.graph._audit`` can reject a proposal for a reason unrelated
+    to any dropped name and route back to a fresh ``propose``, which runs ``_precheck`` again. So
+    more than one precheck call can log during one decision, and ``emit`` below keeps only the
+    latest one's names (replacing, not accumulating) rather than blaming the final response for an
+    earlier, superseded attempt's hallucination.
+
+    This is still a best-effort read of a log stream, not an exact per-attempt record:
+    ``_precheck`` logs only when it actually drops something, so a *clean* attempt leaves no
+    signal to reset on. If the attempt that ends up used was clean but an *earlier* one wasn't,
+    this still reports that earlier attempt's names -- there is no way to distinguish "nothing
+    dropped since" from "nothing logged since" from log output alone."""
 
     def __init__(self) -> None:
         super().__init__(level=logging.WARNING)
@@ -91,8 +107,8 @@ class PrecheckDrops(logging.Handler):
     def emit(self, record: logging.LogRecord) -> None:
         if record.msg == _PRECHECK_DROP_MESSAGE and record.args:
             granted, denied = record.args
-            self.granted.extend(granted)
-            self.denied.extend(denied)
+            self.granted = list(granted)
+            self.denied = list(denied)
 
 
 @contextmanager
