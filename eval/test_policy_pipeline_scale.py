@@ -398,17 +398,18 @@ def per_decision_prb_result(tmp_path_factory: pytest.TempPathFactory) -> dict:
 
 
 def test_scale_per_decision_structural_prb(per_decision_prb_result: dict, record_property) -> None:
-    """Per-decision dimension, PRB level: no hallucinated candidate name logged for this decision
-    (fidelity, gated) and no duplicate rule. Latency/cost are reported and trended, never gated.
+    """Per-decision dimension, PRB level: no hallucinated candidate name in the attempt whose
+    rules actually got used (fidelity, gated) and no duplicate rule. Latency/cost are reported and
+    trended, never gated.
 
     Fidelity is checked against ``*_dropped_names`` -- the names ``eval.scale_prb.
     capture_precheck_drops`` recovered directly from production's own ``_precheck`` step, before
     it silently filtered them out. The post-filter ``*_selected``/``*_denied`` lists below can
     never contain a hallucinated name by the time a caller sees them, so checking fidelity against
     those (as this test once did) could never actually fail -- see that function's own docstring.
-    ``*_dropped_names`` itself is the *last logged* precheck attempt's drops, not necessarily the
-    exact attempt whose rules got used -- see ``PrecheckDrops``'s own docstring for the one case
-    (a clean final retry after an earlier hallucinating one) this still can't distinguish.
+    ``*_dropped_names`` reflects every ``_precheck`` call made during the decision, correctly
+    reset to empty by a clean retry even after an earlier attempt hallucinated -- see
+    ``capture_precheck_drops``'s own docstring for how.
 
     Completeness here is *not* "every candidate appears in selected or denied" -- production's own
     selection schema carries only explicit grants/prohibitions with no enumerated "everyone else is
@@ -770,10 +771,10 @@ def per_decision_e2e_result(tmp_path_factory: pytest.TempPathFactory) -> dict:
 
 
 def test_scale_per_decision_structural_e2e(per_decision_e2e_result: dict, record_property) -> None:
-    """Per-decision dimension, e2e level: no hallucinated candidate name logged for this decision
-    (checked against ``*_dropped_names``, captured straight from production's own precheck step --
-    see ``per_decision_prb_result``'s own comment for why, and ``PrecheckDrops``'s own docstring
-    for the "last logged attempt" caveat), no duplicate entry in the persisted
+    """Per-decision dimension, e2e level: no hallucinated candidate name in the attempt whose
+    rules actually got used (checked against ``*_dropped_names``, captured straight from
+    production's own precheck step -- see ``per_decision_prb_result``'s own comment for why), no
+    duplicate entry in the persisted
     post-merge policy (the actual PCE output, not the pre-merge PRB rules or the rendered Rego --
     see ``_merged_rules_for``'s own docstring), and both agents' expected Rego file actually
     rendered (fidelity + completeness, gated). Latency/cost (now including PCE+Rego rendering) are
