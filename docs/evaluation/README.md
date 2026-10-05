@@ -37,7 +37,7 @@ directly — real shell/CI exports still take precedence.
 | `EVAL_PIPELINE_PARALLELISM` (optional) | `eval`, `eval` | Max concurrent workers provisioning scenarios in the shared `pipeline` fixture; defaults to the scenario count (8). |
 | `PRB_CONSISTENCY_REPEATS` (optional) | `eval` | Repeats per scenario; default 5, must be ≥ 2. |
 | `SCALE_TOTAL_CORPUS_SIZE` / `SCALE_TOTAL_CORPUS_ROLES` / `SCALE_PER_DECISION_CANDIDATES` / `SCALE_SEED` (optional) | `eval` (`test_policy_pipeline_scale.py`) | Corpus-size overrides; defaults 100/10/100/0. Override to a small size while iterating — see [policy-eval-scale.md](policy-eval-scale.md). |
-| `SCALE_CONCURRENCY` (optional) | `eval` (`test_policy_pipeline_scale.py`) | Max concurrent PRB/Keycloak-admin calls; default 20. |
+| `SCALE_CONCURRENCY` (optional) | `eval` (`test_policy_pipeline_scale.py`) | Max concurrent PRB decision calls, total-corpus only -- the e2e fixtures' Keycloak-admin calls run one at a time regardless; default 20. |
 | `EVAL_REPORT_TZ` (optional) | none (report only) | Timezone for the Markdown report's timestamp/filename; default UTC. |
 
 Minimal repo-root `.env` for the PRB-level suites only:

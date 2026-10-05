@@ -61,3 +61,13 @@ class TestCapturePrecheckDrops:
             _log_precheck_drop(["ghost-role-2"], [])
         assert first.granted == ["ghost-role-1"]
         assert second.granted == ["ghost-role-2"]
+
+    def test_a_retried_attempt_replaces_not_accumulates_an_earlier_drop(self) -> None:
+        # A rejected proposal can route back to a fresh propose/_precheck pass within the SAME
+        # decision call (aiac.agent.policy_rules_builder.graph._audit's retry routing) -- if that
+        # retry drops a *different* name, the capture must reflect only the latest attempt, not
+        # the union of every attempt's drops.
+        with capture_precheck_drops() as cap:
+            _log_precheck_drop(["ghost-role-attempt-1"], [])
+            _log_precheck_drop(["ghost-role-attempt-2"], [])
+        assert cap.granted == ["ghost-role-attempt-2"]
