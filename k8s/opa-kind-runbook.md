@@ -52,11 +52,15 @@ read the delegation chain (see [Part B](#part-b--outbound-token-exchange--opa)).
   `github-agent` + `github-tool` deployed in namespace `team1`.
 - The three sibling repo clones the enable/restore scripts need:
   - `OPERATOR_DIR` → `rossoctl/operator` clone (default: `../operator`). The
-    enable script builds the bundle-service image from
-    `operator/cmd/bundle-service/Dockerfile` and applies the raw manifests in
-    `operator/config/bundleservice/`. The bundle service is **not** in the
-    operator image (that image builds only `cmd/main.go`, the manager) and the
-    operator chart has no bundle-service templates.
+    enable script builds the operator image from `operator/Dockerfile` and
+    renders the bundle-service manifests from
+    `charts/operator/templates/bundleservice/`. Since operator PR #540 the
+    bundle service ships **inside** the operator image (one image carrying
+    `/manager`, `/bundle-service` and `/token-broker`, selected per-Deployment
+    via `command:`), and its manifests are Helm templates gated on
+    `bundleService.enabled`. **This path is resolved against your current
+    directory, not against the script** — pass an absolute path unless you are
+    running from the repo root.
   - `ROSSOCTL_DIR` → `rossoctl/rossoctl` clone, i.e. the Helm chart
     (default: `../rossoctl`)
   - `CORTEX_DIR` → `rossoctl/cortex` clone (default: `../cortex`). The enable
@@ -157,34 +161,42 @@ OPERATOR_DIR=../operator ROSSOCTL_DIR=../rossoctl CORTEX_DIR=../cortex ./k8s/opa
 
 The script does these steps:
 
-1. **Bundle service.** No operator chart carries the bundle service — it has no
-   chart templates and no `bundleService` value — so the script deploys it from
-   the raw manifests in the operator clone:
-   - It builds the bundle-service image from
-     `$OPERATOR_DIR/operator/cmd/bundle-service/Dockerfile` (build context:
-     `$OPERATOR_DIR/operator`) and loads it into Kind. `BUNDLE_SERVICE_IMAGE`
-     overrides the tag, default `localhost/bundle-service:local`. The bundle
-     service is its **own** binary (`ENTRYPOINT /bundle-service`) — the operator
-     image builds only `cmd/main.go`, the manager, and cannot run it.
-   - It applies the `AuthorizationPolicy` CRD from the operator clone, before
-     the `default-policy.yaml` CR that needs it.
-   - It deletes an existing `bundle-service` Deployment only when its selector
-     differs from the manifest's `app: bundle-service` (a Deployment selector is
-     immutable). The manifest reuses the selector the removed
-     `operator/hack/bundle-service-kind.sh` set, so the usual case is an
-     in-place update and nothing is deleted.
-   - It applies `serviceaccount`, `rbac`, `service`, `deployment` and
-     `default-policy` from `$OPERATOR_DIR/operator/config/bundleservice/`,
-     rewriting the kustomize `namespace: system` placeholders (and
-     `default-policy`'s pinned `rossoctl-system`) to `$RELEASE_NAMESPACE`, and
-     the manifest's `ghcr.io/rossoctl/bundle-service:latest` to the locally
-     built image with `imagePullPolicy: Never` — otherwise the `:latest` tag
-     would default to `Always` and send Kind to ghcr.io instead of running the
-     image just built. The rest of the operator stays as installed.
-   - It does **not** apply `networkpolicy.yaml`. That policy admits only pods
+1. **Bundle service.** The operator chart *does* carry bundle-service templates
+   and a `bundleService` value as of operator PR #540 — but the rossoctl chart's
+   `operator-chart` dependency is pinned to a published `0.4.0-rc.3` that
+   **predates** that fold (no tag in the operator repo contains it; the newest,
+   `v0.2.0-alpha.31`, has no bundleservice templates at all). So the script
+   renders those templates from the local clone instead:
+   - It builds the operator image from `$OPERATOR_DIR/operator/Dockerfile`
+     (build context: `$OPERATOR_DIR/operator`) and loads it into Kind.
+     `OPERATOR_IMAGE` overrides the tag, default `localhost/operator:local`.
+     That one image carries `/manager`, `/bundle-service` and `/token-broker`;
+     `ENTRYPOINT` stays `/manager`, and the bundleservice Deployment selects its
+     binary with `command: [/bundle-service]`.
+   - It applies the `AuthorizationPolicy` CRD from the operator clone and waits
+     for it to be `established`, before the `default-policy` CR that needs it.
+   - It deletes an existing `bundle-service` Deployment when the selector's
+     `app.kubernetes.io/instance` label does not match `$RELEASE_NAME` (a
+     Deployment selector is immutable). This covers both a Deployment left by
+     the old raw manifests, which selected on `app: bundle-service` alone, and
+     one from a run under a different release name.
+   - It renders `serviceaccount`, `rbac`, `service`, `deployment` and
+     `default-policy` from `$OPERATOR_DIR/charts/operator` via
+     `helm template --show-only`, with `bundleService.enabled=true` and the
+     image pointed at the locally built one with `imagePullPolicy: Never` —
+     otherwise the chart's `IfNotPresent` default (or an `Always` implied by a
+     `:latest` tag) would send Kind to the registry instead of running the image
+     just built. The rest of the operator stays as installed.
+   - It uses `helm template --show-only`, **not** a second `helm install` of the
+     clone's chart: `templates/manager/manager.yaml` and
+     `templates/rbac/role.yaml` carry no `enabled` flag, so installing that
+     chart as its own release would stand up a duplicate controller-manager and
+     collide on the cluster-scoped operator ClusterRole.
+   - It does **not** render `networkpolicy.yaml`. That policy admits only pods
      labelled `rossoctl.dev/authbridge=true`, and nothing sets that label today.
      On a CNI that enforces NetworkPolicy it would block every AuthBridge
-     bundle fetch.
+     bundle fetch. Kind's default CNI does not enforce it, so the chart's own
+     SECURITY note treats a kind cluster as having no access control regardless.
 2. **AuthBridge image.** It builds `localhost/authbridge:local` from
    `$AUTHBRIDGE_DIR/cmd/authbridge-proxy/Dockerfile` (build context:
    `$AUTHBRIDGE_DIR`, i.e. `$CORTEX_DIR/authbridge`) and loads it into the

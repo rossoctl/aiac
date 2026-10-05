@@ -18,9 +18,11 @@
 # Requires: kubectl, helm, kind, docker (or podman), python3 not needed here.
 # Env vars:
 #   OPERATOR_DIR        path to the rossoctl/operator repo clone; Step 1 builds
-#                       the bundle-service image from its own Dockerfile and
-#                       applies the raw manifests under
-#                       operator/config/bundleservice/    (default: ../operator)
+#                       the operator image from operator/Dockerfile and renders
+#                       the bundle-service manifests from the clone's
+#                       charts/operator/templates/bundleservice/
+#                                                           (default: ../operator)
+#                       NOTE: this is relative to your CWD, not to this script.
 #   ROSSOCTL_DIR        path to the rossoctl/rossoctl repo clone (the chart)
 #   CORTEX_DIR          path to the rossoctl/cortex repo clone; the authbridge
 #                       source built in Step 2 lives there, not in this repo
@@ -37,9 +39,12 @@
 #   GO_BUILD_TAGS       authbridge plugin build tags (default: the cortex "full"
 #                       profile, from scripts/profile-tags; derived with a local
 #                       `go`, or in a golang container when go is absent)
-#   BUNDLE_SERVICE_IMAGE
-#                       local bundle-service image built + loaded by Step 1
-#                       (default: localhost/bundle-service:local)
+#   OPERATOR_IMAGE      local operator image built + loaded by Step 1. Since
+#                       operator PR #540 this single image carries /manager,
+#                       /bundle-service and /token-broker, so there is no
+#                       separate bundle-service image to build
+#                       (default: localhost/operator:local). Replaces the
+#                       former BUNDLE_SERVICE_IMAGE.
 #   CONTAINER_RUNTIME   docker | podman                   (default: docker, auto-falls back to podman)
 #   AUTHBRIDGE_PROFILE  plugin profile for the Step 2 build (default: full — the
 #                       proxy-sidecar set, the only one carrying the opa plugin)
@@ -69,10 +74,17 @@ RELEASE_NAMESPACE="${RELEASE_NAMESPACE:-rossoctl-system}"
 AGENT_NAMESPACE="${AGENT_NAMESPACE:-team1}"
 IMAGE_TAG="${IMAGE_TAG:-localhost/authbridge:local}"
 
-if [ -z "$OPERATOR_DIR" ] || [ ! -f "$OPERATOR_DIR/operator/cmd/bundle-service/Dockerfile" ] || [ ! -d "$OPERATOR_DIR/operator/config/bundleservice" ]; then
+if [ -z "$OPERATOR_DIR" ] || [ ! -f "$OPERATOR_DIR/operator/Dockerfile" ] || [ ! -d "$OPERATOR_DIR/charts/operator/templates/bundleservice" ]; then
   echo "ERROR: Set OPERATOR_DIR to point to your rossoctl/operator repo clone" >&2
-  echo "       (Step 1 needs \$OPERATOR_DIR/operator/cmd/bundle-service/Dockerfile and the" >&2
-  echo "        bundle-service manifests in \$OPERATOR_DIR/operator/config/bundleservice/)" >&2
+  echo "       (Step 1 needs \$OPERATOR_DIR/operator/Dockerfile and the bundle-service" >&2
+  echo "        Helm templates in \$OPERATOR_DIR/charts/operator/templates/bundleservice/)" >&2
+  echo "       OPERATOR_DIR is resolved against your current directory, not this script —" >&2
+  echo "       pass an absolute path if you are not running from the repo root." >&2
+  if [ -n "$OPERATOR_DIR" ] \
+    && [ -f "$OPERATOR_DIR/operator/cmd/bundle-service/Dockerfile" ]; then
+    echo "       (that clone predates operator PR #540, which folded bundle-service into" >&2
+    echo "        the operator image — update it, or use an older revision of this script)" >&2
+  fi
   exit 1
 fi
 if [ -z "$ROSSOCTL_DIR" ] || [ ! -d "$ROSSOCTL_DIR" ]; then
@@ -87,7 +99,21 @@ if [ -z "$AUTHBRIDGE_DIR" ] || [ ! -f "$AUTHBRIDGE_DIR/cmd/authbridge-proxy/Dock
   echo "        authbridge module root is not \$CORTEX_DIR/authbridge)" >&2
   exit 1
 fi
-BUNDLE_SERVICE_IMAGE="${BUNDLE_SERVICE_IMAGE:-localhost/bundle-service:local}"
+OPERATOR_IMAGE="${OPERATOR_IMAGE:-localhost/operator:local}"
+
+# Split OPERATOR_IMAGE into the repository + tag the chart takes as two separate
+# values. Only a colon AFTER the last slash is a tag separator — the registry
+# host may itself carry a port (localhost:5000/operator).
+case "${OPERATOR_IMAGE##*/}" in
+  *:*)
+    OPERATOR_IMAGE_REPO="${OPERATOR_IMAGE%:*}"
+    OPERATOR_IMAGE_TAG="${OPERATOR_IMAGE##*:}"
+    ;;
+  *)
+    OPERATOR_IMAGE_REPO="$OPERATOR_IMAGE"
+    OPERATOR_IMAGE_TAG="latest"
+    ;;
+esac
 
 VALUES_FILE="${ROSSOCTL_DIR}/charts/rossoctl/values.yaml"
 CHART_DIR="${ROSSOCTL_DIR}/charts/rossoctl"
@@ -128,61 +154,73 @@ load_image_to_kind() {
 OVERLAY_FILE="$(mktemp "${TMPDIR:-/tmp}/opa-kind-enable-overlay.XXXXXX")"
 TMPFILES+=("$OVERLAY_FILE")
 
-echo "==> Step 1/5: deploying bundle-service from the operator clone (${OPERATOR_DIR}, image ${BUNDLE_SERVICE_IMAGE})"
-# The bundle service is its own binary with its own Dockerfile
-# (operator/cmd/bundle-service, ENTRYPOINT /bundle-service). The operator image
-# builds only cmd/main.go — the manager — so it cannot run the bundle service,
-# and the operator chart carries no bundle-service templates (nor a
-# bundleService value) at all. The manifests live as raw kustomize-style YAML
-# under operator/config/bundleservice/, referenced by no kustomization. So:
-# build that image from the clone, load it into Kind, and apply those manifests
-# with the namespace and image rewritten. The rest of the operator (the
-# controller-manager) is left as installed.
+echo "==> Step 1/5: deploying bundle-service from the operator clone (${OPERATOR_DIR}, image ${OPERATOR_IMAGE})"
+# Since operator PR #540 ("fold bundle service and token broker to operator
+# image") the bundle service is neither its own image nor its own raw manifest
+# set. One image now carries /manager, /bundle-service and /token-broker, and
+# the manifests live as Helm templates in
+# charts/operator/templates/bundleservice/ gated on `bundleService.enabled`,
+# with the binary selected per-Deployment by `command:` against the image's
+# ENTRYPOINT ["/manager"].
+#
+# Those templates are rendered from the LOCAL clone rather than by enabling
+# bundleService on the rossoctl chart's operator-chart subchart, because that
+# dependency is pinned to a published 0.4.0-rc.3 that predates the fold — no tag
+# in the operator repo contains it, and the newest (v0.2.0-alpha.31) carries no
+# bundleservice templates at all. `--set operator-chart.bundleService.enabled=
+# true` against it would render nothing, silently, leaving OPA with no bundle
+# source while Steps 2-5 still reported success.
+#
+# `helm template --show-only` rather than a second `helm install` of the clone's
+# chart: templates/manager/manager.yaml and templates/rbac/role.yaml carry no
+# enabled flag, so installing it as its own release would stand up a duplicate
+# controller-manager and collide on the cluster-scoped operator ClusterRole.
+# Rendering only the five bundleservice templates keeps the installed operator
+# (from the pinned subchart) exactly as it is.
 ( cd "$OPERATOR_DIR/operator" \
-  && "$CONTAINER_RUNTIME" build -t "$BUNDLE_SERVICE_IMAGE" -f cmd/bundle-service/Dockerfile . )
-load_image_to_kind "$BUNDLE_SERVICE_IMAGE"
-# The CRD must exist before default-policy.yaml (an AuthorizationPolicy CR) is applied.
+  && "$CONTAINER_RUNTIME" build -t "$OPERATOR_IMAGE" -f Dockerfile . )
+load_image_to_kind "$OPERATOR_IMAGE"
+# The CRD must exist, and be established, before default-policy.yaml (an
+# AuthorizationPolicy CR) is applied in the same stream below.
 kubectl apply -f "$OPERATOR_DIR/operator/config/crd/bases/agent.rossoctl.dev_authorizationpolicies.yaml"
-# A Deployment's selector is immutable, so a live bundle-service whose selector
-# differs from the manifest's must be deleted before the apply. The raw manifest
-# selects on `app: bundle-service` — the same selector the removed
-# operator/hack/bundle-service-kind.sh used — so the usual case is an in-place
-# update and this block no-ops. It only fires for a Deployment left behind by
-# some other install (e.g. a chart render adding app.kubernetes.io labels).
+kubectl wait --for=condition=established --timeout=60s \
+  crd/authorizationpolicies.agent.rossoctl.dev
+# A Deployment's selector is immutable. The pre-fold raw manifests selected on
+# `app: bundle-service` alone, while the chart template adds
+# chart.selectorLabels (app.kubernetes.io/name + app.kubernetes.io/instance), so
+# a bundle-service left behind by an older run of this script — or by a run
+# under a different RELEASE_NAME — must be deleted before the rendered manifest
+# can be applied. Comparing the instance label covers both cases: it is absent
+# on the old raw Deployment and differs on a renamed release.
 if kubectl get deployment bundle-service -n "$RELEASE_NAMESPACE" >/dev/null 2>&1 \
   && [ "$(kubectl get deployment bundle-service -n "$RELEASE_NAMESPACE" \
-        -o jsonpath='{.spec.selector.matchLabels}')" != '{"app":"bundle-service"}' ]; then
+        -o jsonpath='{.spec.selector.matchLabels.app\.kubernetes\.io/instance}' \
+        2>/dev/null)" != "$RELEASE_NAME" ]; then
   kubectl delete deployment bundle-service -n "$RELEASE_NAMESPACE" --wait=true
 fi
-# Two rewrites on the way to kubectl:
-#   - namespace: the manifests carry kustomize `namespace: system` placeholders,
-#     and default-policy.yaml is pinned to rossoctl-system — both become
-#     $RELEASE_NAMESPACE.
-#   - image: the manifest's ghcr.io/rossoctl/bundle-service:latest becomes the
-#     locally built image with pullPolicy: Never. Without this Kind would try to
-#     pull from ghcr.io (a `:latest` tag defaults to imagePullPolicy: Always)
-#     and never run the image just built.
-# networkpolicy.yaml is deliberately NOT applied: it admits only pods labelled
+# pullPolicy: Never so Kind runs the image just built instead of trying to pull
+# it (the chart defaults to IfNotPresent, and a `:latest` tag would imply
+# Always).
+#
+# networkpolicy.yaml is deliberately NOT rendered: it admits only pods labelled
 # rossoctl.dev/authbridge=true, and nothing (operator webhook, chart, AuthBridge)
 # sets that label today. On a CNI that enforces NetworkPolicy it would block
-# every AuthBridge bundle fetch. The removed hack script applied no NetworkPolicy
-# either, so this keeps the earlier dev-cluster behavior.
-for manifest in serviceaccount rbac service deployment default-policy; do
-  cat "$OPERATOR_DIR/operator/config/bundleservice/${manifest}.yaml"
-  echo "---"
-done | awk -v img="$BUNDLE_SERVICE_IMAGE" -v ns="$RELEASE_NAMESPACE" '
-  /^[[:space:]]*namespace:[[:space:]]*(system|rossoctl-system)[[:space:]]*$/ {
-    sub(/namespace:.*/, "namespace: " ns)
-  }
-  /^[[:space:]]*image:[[:space:]]*ghcr\.io\/rossoctl\/bundle-service:/ {
-    match($0, /^[[:space:]]*/)
-    indent = substr($0, 1, RLENGTH)
-    print indent "image: " img
-    print indent "imagePullPolicy: Never"
-    next
-  }
-  { print }
-' | kubectl apply -f -
+# every AuthBridge bundle fetch. Kind's default CNI does not enforce it, so the
+# chart's own SECURITY note treats a kind cluster as having no access control
+# either way — and the removed operator/hack/bundle-service-kind.sh applied no
+# NetworkPolicy either, so this keeps the earlier dev-cluster behavior.
+helm template "$RELEASE_NAME" "$OPERATOR_DIR/charts/operator" \
+  --namespace "$RELEASE_NAMESPACE" \
+  --set bundleService.enabled=true \
+  --set bundleService.container.image.repository="$OPERATOR_IMAGE_REPO" \
+  --set bundleService.container.image.tag="$OPERATOR_IMAGE_TAG" \
+  --set bundleService.container.image.pullPolicy=Never \
+  --show-only templates/bundleservice/serviceaccount.yaml \
+  --show-only templates/bundleservice/rbac.yaml \
+  --show-only templates/bundleservice/service.yaml \
+  --show-only templates/bundleservice/deployment.yaml \
+  --show-only templates/bundleservice/default-policy.yaml \
+  | kubectl apply -f -
 kubectl rollout status deployment/bundle-service -n "$RELEASE_NAMESPACE" --timeout=180s
 kubectl get pods -n "$RELEASE_NAMESPACE" -l app=bundle-service
 

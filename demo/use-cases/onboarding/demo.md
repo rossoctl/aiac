@@ -97,7 +97,8 @@ Policies reach the plugin via the bundle service every AuthBridge workload polls
   of your current directory. Each is auto-detected from the script's own location, so you normally set
   none of these; override only if a clone lives elsewhere, and then use an **absolute** path (a
   relative one is resolved against your shell's cwd, and the scripts `cd` into these directories):
-  - `OPERATOR_DIR` → `rossoctl/operator` clone (bundle-service)
+  - `OPERATOR_DIR` → `rossoctl/operator` clone; Part 2 builds the operator image from it and
+    renders the bundle-service manifests from its `charts/operator`
   - `ROSSOCTL_DIR` → `rossoctl/rossoctl` clone, i.e. the Helm chart
   - `CORTEX_DIR` → `rossoctl/cortex` clone; Part 2 builds the AuthBridge proxy image from
     `$CORTEX_DIR/authbridge`, which lives in the cortex monorepo, not in this repo
@@ -216,10 +217,7 @@ agent's pipeline. It does **not** modify `charts/rossoctl/values.yaml` on disk.
 ```bash
 ../../../k8s/opa-kind-enable.sh
 ```
-
-The clone paths are auto-detected (see Prerequisites) — passing `OPERATOR_DIR=../operator` from this
-directory does **not** work, since that resolves against your cwd, not the script's. AuthBridge
-plugins are opt-in build tags, so the image build passes `GO_BUILD_TAGS` resolved from the `full`
+AuthBridge plugins are opt-in build tags, so the image build passes `GO_BUILD_TAGS` resolved from the `full`
 profile in `cortex/authbridge/scripts/profile-tags` — the only non-envoy profile carrying `opa`. It is
 resolved in a `golang` container when the host has no `go`; override with `AUTHBRIDGE_PROFILE` or an
 explicit `GO_BUILD_TAGS`.
