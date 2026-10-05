@@ -84,9 +84,14 @@ doesn't already parallelize scenarios internally:
 # (all four mechanical/semantic x invariance/sensitivity combinations feed the trend log)
 .venv/bin/pytest eval/test_policy_pipeline_robustness.py -m eval -n 8 -v
 
-# scale — procedurally generated fixed-100 corpus; each dimension/level shares one fixture
-# between its structural and correctness test, so -n has nothing independent to parallelize
-# across (concurrency happens inside the PRB-level fixture itself, via SCALE_CONCURRENCY).
+# scale — procedurally generated fixed-100 corpus; never pass -n here. Each dimension/level
+# shares one module-scoped fixture between its structural and correctness test, which -n's
+# default load-balancing can split across workers -- each then pays for its own independent
+# copy (duplicating the ~100-150-call total-corpus PRB), and the e2e fixtures bind fixed
+# ports/realm names that would collide across workers. The suite skips cleanly if it ever
+# detects PYTEST_XDIST_WORKER rather than risk that silently (concurrency instead happens
+# inside the PRB-level fixture itself, via SCALE_CONCURRENCY -- -n has nothing independent
+# left to parallelize across anyway).
 # PRB-level only, or e2e only, or both -- see policy-eval-scale.md's Runbook for size overrides.
 .venv/bin/pytest eval/test_policy_pipeline_scale.py -m eval -v -s
 ```

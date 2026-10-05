@@ -13,9 +13,9 @@ Four structural properties, per ``docs/evaluation/eval-framework.md`` §5:
       candidate name -- fed the names ``eval.scale_prb``'s precheck-drop log capture reports, see
       its own docstring for why), ``missing_decisions`` (total-corpus PRB-level: every decision
       ran), ``missing_rego`` (e2e).
-    - no duplication     -- ``duplicate_rule_triples`` (PRB level, over the raw pre-merge PRB
-      output) and ``duplicate_rego_entries`` (e2e level, over the real rendered Rego) -- see each
-      function's own docstring for why they are two different checks, not the same check reused.
+    - no duplication     -- ``duplicate_rule_triples``, over two different inputs depending on
+      level (PRB: the raw pre-merge PRB output; e2e: the real persisted post-merge
+      ``ServicePolicyModel``, **not** the rendered Rego -- see its own docstring for why).
     - no orphans         -- ``orphaned_scope_names`` is a pure invariant of the **generator's**
       output (never the LLM's), so it is exercised directly, parametrized across several
       ``(size, seed)`` combinations, in ``eval/test_scale_generator.py`` (offline, every ``pytest``
@@ -85,41 +85,33 @@ def missing_rego(rego_paths: list[tuple[str, Path]]) -> list[str]:
 
 
 def duplicate_rule_triples(rules: list[PolicyRule]) -> list[tuple[str, str, str]]:
-    """No-duplication over the **raw PRB output** (before any merge runs): every ``(role_name,
-    scope_name, effect)`` triple should appear at most once. This is **not** a merge-engine check
-    -- no merge has happened yet at this point, and ``aiac.agent.policy_rules_builder.graph.
-    _assemble_rules`` already builds each call's rules from a ``set`` of granted/denied names
-    iterated over a fixed, unique candidate list, so a single PRB call cannot itself emit a
-    (role, scope, effect) triple twice, and this suite's own disjoint user-role/agent-role and
-    inbound-scope/target-scope naming (``eval.scale_generator``) makes two *different* calls
-    coincidentally producing the same triple impossible too. What this still catches: a bug in
-    *this test's own* candidate-list construction (``eval.scale_prb.orchestrate_prb_concurrent``'s
-    ``inbound_scopes``/``target_scopes``/``agent_roles`` lists, or the per-decision fixtures'
-    candidate lists) accidentally listing the same scope/role twice, which ``_assemble_rules``
-    would then faithfully restate twice. For an actual merge-engine duplication defect, see
-    ``duplicate_rego_entries`` below, which checks the real rendered output instead. Returns every
-    triple that occurred more than once (sorted), not a count."""
+    """No-duplication: every ``(role_name, scope_name, effect)`` triple should appear at most once
+    in ``rules``. Used two ways by the Scale suite, over two different inputs:
+
+    - **PRB level**, over the raw pre-merge PRB output. Not a merge-engine check -- no merge has
+      happened yet, and ``aiac.agent.policy_rules_builder.graph._assemble_rules`` already builds
+      each call's rules from a ``set`` of granted/denied names iterated over a fixed, unique
+      candidate list, so a single PRB call cannot itself emit a triple twice, and this suite's own
+      disjoint user-role/agent-role and inbound-scope/target-scope naming (``eval.scale_generator``)
+      makes two *different* calls coincidentally producing the same triple impossible too. What it
+      still catches: a bug in *this test's own* candidate-list construction
+      (``eval.scale_prb.orchestrate_prb_concurrent``'s ``inbound_scopes``/``target_scopes``/
+      ``agent_roles`` lists, or the per-decision fixtures' candidate lists) accidentally listing the
+      same scope/role twice, which ``_assemble_rules`` would then faithfully restate twice.
+    - **e2e level**, over the real persisted post-``compute_and_apply`` ``ServicePolicyModel``
+      rules (``eval.test_policy_pipeline_scale._merged_rules_for``, queried via
+      ``aiac.policy.model_store.library.api.get_service_policy`` while the Policy Model Store is
+      still running) -- the one place a real merge-engine dedup-by-``role.id``+``scope.id``+
+      ``effect`` bug could actually show up. **Not** the rendered Rego: ``aiac.pdp.service.policy.
+      opa.rego``'s own grouping functions (``_group_rules``/``_group_rules_deprefixed``) always
+      de-duplicate a scope list on the way out, so a duplicate that survived a real merge-engine
+      bug would already be collapsed before any check reading rendered Rego could ever see it --
+      confirmed in review, an earlier version of this e2e check read the rendered Rego instead and
+      could never fail.
+
+    Returns every triple that occurred more than once (sorted), not a count."""
     counts = Counter((r.role.name, r.scope.name, r.effect.value) for r in rules)
     return sorted(triple for triple, n in counts.items() if n > 1)
-
-
-def duplicate_rego_entries(rego_map: dict[str, list[str]]) -> list[tuple[str, str]]:
-    """No-duplication over the **real rendered Rego** (e2e level only): given one
-    ``{role_or_scope_name: [candidate_name, ...]}`` map exactly as
-    ``eval.test_policy_pipeline_correctness_e2e._rego_map`` returns it for one document, returns
-    every ``(key, repeated_candidate)`` pair whose list names the same candidate more than once --
-    the one way a real Policy Computation Engine merge defect (``aiac.policy.computation.engine.
-    compute_and_apply``, which documents deduping by ``role.id`` + ``scope.id`` + ``effect`` when
-    appending additively) could actually show up on disk. ``duplicate_rule_triples`` above cannot
-    see this: it operates on the pre-merge PRB output, not what actually got written. Call once per
-    rendered document (inbound/outbound x allow/deny, see ``_e2e_grant_sets``'s own doc table) and
-    merge the results -- kept generic over the map shape rather than tied to one document's role-
-    vs-scope-keyed orientation, so every document uses the same call."""
-    found: list[tuple[str, str]] = []
-    for key, candidates in rego_map.items():
-        counts = Counter(candidates)
-        found += [(key, candidate) for candidate, n in counts.items() if n > 1]
-    return sorted(found)
 
 
 def orphaned_scope_names(scenario: SimpleNamespace) -> list[str]:

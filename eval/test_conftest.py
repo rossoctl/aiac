@@ -63,12 +63,13 @@ class TestScaleRunMatchesFixed100:
         ):
             assert not _scale_run_matches_fixed_100(suite), suite
 
-    def test_concurrency_override_affects_every_suite(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_concurrency_override_only_affects_total_corpus_suites(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # orchestrate_prb_concurrent's thread pool is the only thing SCALE_CONCURRENCY governs,
+        # and only the total-corpus fixtures call it -- the per-decision fixtures make exactly
+        # two sequential calls and never read this var at all, so their rows must stay "regression"
+        # eligible.
         monkeypatch.setenv("SCALE_CONCURRENCY", "1")
-        for suite in (
-            "scale_total_corpus_prb",
-            "scale_total_corpus_e2e",
-            "scale_per_decision_prb",
-            "scale_per_decision_e2e",
-        ):
-            assert not _scale_run_matches_fixed_100(suite), suite
+        assert not _scale_run_matches_fixed_100("scale_total_corpus_prb")
+        assert not _scale_run_matches_fixed_100("scale_total_corpus_e2e")
+        assert _scale_run_matches_fixed_100("scale_per_decision_prb")
+        assert _scale_run_matches_fixed_100("scale_per_decision_e2e")
