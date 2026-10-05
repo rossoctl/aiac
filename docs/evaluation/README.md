@@ -93,7 +93,7 @@ doesn't already parallelize scenarios internally:
 # inside the PRB-level fixture itself, via SCALE_CONCURRENCY -- -n has nothing independent
 # left to parallelize across anyway).
 # PRB-level only, or e2e only, or both -- see policy-eval-scale.md's Runbook for size overrides.
-.venv/bin/pytest eval/test_policy_pipeline_scale.py -m eval -v -s
+.venv/bin/pytest -m eval -k scale -v -s
 ```
 
 Every suite's parametrized test is the first thing to call `require_env_or_skip(...)`, so a
