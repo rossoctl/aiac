@@ -26,16 +26,21 @@
 #   ROSSOCTL_DIR        path to the rossoctl/rossoctl repo clone (the chart)
 #   CORTEX_DIR          path to the rossoctl/cortex repo clone; the authbridge
 #                       source built in Step 2 lives there, not in this repo
-#                       (default: ../cortex). The Go module root is the
-#                       authbridge/ subdirectory of that clone — see
-#                       AUTHBRIDGE_DIR
-#   AUTHBRIDGE_DIR      the authbridge Go module root inside the cortex clone
-#                       (default: $CORTEX_DIR/authbridge)
+#                       (default: ../cortex). Since cortex commit afb49e9f
+#                       ("Flatten authbridge/ into the repo root") the Go module
+#                       root IS the clone root — see AUTHBRIDGE_DIR
+#   AUTHBRIDGE_DIR      the authbridge Go module root (default: $CORTEX_DIR).
+#                       Kept as a separate override only for a clone whose
+#                       module root is not the clone root; before the flatten
+#                       this defaulted to $CORTEX_DIR/authbridge
 #   CLUSTER_NAME        kind cluster name                 (default: rossoctl)
 #   RELEASE_NAME        helm release name                 (default: rossoctl)
 #   RELEASE_NAMESPACE   namespace the chart is installed in (default: rossoctl-system)
 #   AGENT_NAMESPACE     namespace to restart agent pods in (default: team1)
-#   IMAGE_TAG           local authbridge-proxy image tag  (default: localhost/authbridge:local)
+#   IMAGE_TAG           local tag for the authbridge proxy-sidecar image built
+#                       from cmd/cortex (default: localhost/authbridge:local).
+#                       The tag name stays "authbridge" because it feeds the
+#                       chart's operator-chart.defaults.images.authbridge.
 #   GO_BUILD_TAGS       authbridge plugin build tags (default: the cortex "full"
 #                       profile, from scripts/profile-tags; derived with a local
 #                       `go`, or in a golang container when go is absent)
@@ -63,11 +68,18 @@ ROSSOCTL_DIR="${ROSSOCTL_DIR:-$(cd "$REPO_ROOT/../rossoctl" 2>/dev/null && pwd |
 # this extracted repo — default to a sibling ../cortex clone, override with
 # CORTEX_DIR.
 CORTEX_DIR="${CORTEX_DIR:-$(cd "$REPO_ROOT/../cortex" 2>/dev/null && pwd || echo "")}"
-# Inside the cortex clone the authbridge Go module root is the authbridge/
-# subdirectory, not the clone root: go.work lives there, and the proxy
-# Dockerfile COPYs authlib/ and storage/ relative to it. Both the image build
-# and the profile-tags helper therefore run against AUTHBRIDGE_DIR.
-AUTHBRIDGE_DIR="${AUTHBRIDGE_DIR:-${CORTEX_DIR:+$CORTEX_DIR/authbridge}}"
+# The authbridge Go module root used to be the authbridge/ subdirectory of the
+# cortex clone; cortex commit afb49e9f flattened it into the repo root (it held
+# 1,006 of 1,061 tracked files and separated nothing), so the module root is now
+# the clone root itself. Both the image build and the profile-tags helper run
+# against AUTHBRIDGE_DIR, and the cmd/cortex Dockerfile COPYs core/ and
+# cmd/cortex/ relative to it.
+#
+# NOTE: a clone that has been through the flatten may still have an untracked
+# authbridge/ directory left behind (stale compiled binaries, go.work.sum,
+# __pycache__). Its presence does NOT mean the module root is still there —
+# authbridge/install.sh is the only tracked file under it.
+AUTHBRIDGE_DIR="${AUTHBRIDGE_DIR:-$CORTEX_DIR}"
 CLUSTER_NAME="${CLUSTER_NAME:-rossoctl}"
 RELEASE_NAME="${RELEASE_NAME:-rossoctl}"
 RELEASE_NAMESPACE="${RELEASE_NAMESPACE:-rossoctl-system}"
@@ -91,12 +103,18 @@ if [ -z "$ROSSOCTL_DIR" ] || [ ! -d "$ROSSOCTL_DIR" ]; then
   echo "ERROR: Set ROSSOCTL_DIR to point to your rossoctl/rossoctl repo clone" >&2
   exit 1
 fi
-if [ -z "$AUTHBRIDGE_DIR" ] || [ ! -f "$AUTHBRIDGE_DIR/cmd/authbridge-proxy/Dockerfile" ]; then
+if [ -z "$AUTHBRIDGE_DIR" ] || [ ! -f "$AUTHBRIDGE_DIR/cmd/cortex/Dockerfile" ]; then
   echo "ERROR: Set CORTEX_DIR to point to your rossoctl/cortex repo clone" >&2
-  echo "       (Step 2 builds the authbridge-proxy image from" >&2
-  echo "        \$CORTEX_DIR/authbridge/cmd/authbridge-proxy/Dockerfile, which lives in" >&2
-  echo "        the cortex monorepo, not in this repo. Override AUTHBRIDGE_DIR if the" >&2
-  echo "        authbridge module root is not \$CORTEX_DIR/authbridge)" >&2
+  echo "       (Step 2 builds the authbridge proxy-sidecar image from" >&2
+  echo "        \$CORTEX_DIR/cmd/cortex/Dockerfile, which lives in the cortex" >&2
+  echo "        monorepo, not in this repo. Override AUTHBRIDGE_DIR if the Go module" >&2
+  echo "        root is not the clone root)" >&2
+  if [ -n "$AUTHBRIDGE_DIR" ] \
+    && [ -f "$AUTHBRIDGE_DIR/authbridge/cmd/authbridge-proxy/Dockerfile" ]; then
+    echo "       (that clone predates cortex afb49e9f + a86e6708, which flattened" >&2
+    echo "        authbridge/ into the repo root and renamed cmd/authbridge-proxy to" >&2
+    echo "        cmd/cortex — update it, or use an older revision of this script)" >&2
+  fi
   exit 1
 fi
 OPERATOR_IMAGE="${OPERATOR_IMAGE:-localhost/operator:local}"
@@ -224,7 +242,7 @@ helm template "$RELEASE_NAME" "$OPERATOR_DIR/charts/operator" \
 kubectl rollout status deployment/bundle-service -n "$RELEASE_NAMESPACE" --timeout=180s
 kubectl get pods -n "$RELEASE_NAMESPACE" -l app=bundle-service
 
-echo "==> Step 2/5: building + loading authbridge-proxy (${IMAGE_TAG}) via ${CONTAINER_RUNTIME}"
+echo "==> Step 2/5: building + loading the authbridge proxy-sidecar — cortex (${IMAGE_TAG}) via ${CONTAINER_RUNTIME}"
 # AuthBridge plugins are opt-in build tags: an untagged build registers none and
 # the Dockerfile refuses it. Use the "full" profile, as the cortex CI does for
 # the authbridge image (scripts/profile-tags). GOWORK=off: the profile tool is a
@@ -238,7 +256,7 @@ if [ -z "${GO_BUILD_TAGS:-}" ]; then
   fi
 fi
 echo "    GO_BUILD_TAGS=${GO_BUILD_TAGS}"
-( cd "$AUTHBRIDGE_DIR" && "$CONTAINER_RUNTIME" build -t "$IMAGE_TAG" -f cmd/authbridge-proxy/Dockerfile \
+( cd "$AUTHBRIDGE_DIR" && "$CONTAINER_RUNTIME" build -t "$IMAGE_TAG" -f cmd/cortex/Dockerfile \
     --build-arg GO_BUILD_TAGS="$GO_BUILD_TAGS" . )
 load_image_to_kind "$IMAGE_TAG"
 
@@ -261,9 +279,21 @@ cat > "$OVERLAY_FILE" <<YAML
 #     lets outbound policy reason about WHAT the agent's token was
 #     exchanged for — e.g. "deny github-full-access to non-admin agents" —
 #     without re-parsing the minted token and without a fail-closed JWT
-#     gate that would reject passthrough egress. input.identity stays
-#     empty outbound (no JWT is validated on this leg); input.delegation is
-#     the outbound identity signal.
+#     gate that would reject passthrough egress.
+#     token-exchange ALSO synthesizes input.identity on this leg, even though
+#     no JWT is validated here: a matched route yields
+#     identity.{subject, client_id, service_id, scopes}, where service_id is
+#     the route's target_audience and subject is the delegating end user.
+#     Verified in a live outbound Decision Log:
+#       identity:map[client_id:…/sa/github-agent service_id:…/sa/github-tool
+#                    subject:dev-user scopes:[openid agent-team1-github-tool-aud]]
+#     This matters because the AIAC-generated outbound policy keys its gates on
+#     input.identity.subject and input.identity.service_id — it could not work
+#     at all if identity were empty here. A host with NO matching route gets no
+#     exchange and therefore no identity, so those gates go undefined and the
+#     default-deny takes over (the whole-matrix denial you see when the demo's
+#     WIRE phase has not run). input.delegation carries the complementary
+#     per-hop audit trail.
 #   - token-exchange uses the chart's default shape (client-secret identity
 #     from /shared, passthrough default policy). Per-destination routes
 #     come from the authproxy-routes ConfigMap; hosts with no route fall

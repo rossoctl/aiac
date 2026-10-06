@@ -64,12 +64,16 @@ read the delegation chain (see [Part B](#part-b--outbound-token-exchange--opa)).
   - `ROSSOCTL_DIR` → `rossoctl/rossoctl` clone, i.e. the Helm chart
     (default: `../rossoctl`)
   - `CORTEX_DIR` → `rossoctl/cortex` clone (default: `../cortex`). The enable
-    script builds the `authbridge-proxy` image from
-    `authbridge/cmd/authbridge-proxy/Dockerfile`. The authbridge Go module root
-    is the `authbridge/` subdirectory of the clone, not the clone root — that
-    is where `go.work` lives and what the Dockerfile's `COPY authlib/` /
-    `COPY storage/` resolve against. Override `AUTHBRIDGE_DIR` if your clone
-    puts the module elsewhere. This clone is required: the enable script stops
+    script builds the authbridge proxy-sidecar image from
+    `cmd/cortex/Dockerfile`. The authbridge Go module root is now the **clone
+    root** — cortex commit `afb49e9f` flattened the old `authbridge/`
+    subdirectory into the repo root, and `a86e6708` renamed
+    `cmd/authbridge-proxy` → `cmd/cortex`. The Dockerfile's `COPY core/` /
+    `COPY cmd/cortex/` resolve against that root. Override `AUTHBRIDGE_DIR` if
+    your clone puts the module elsewhere. A clone that went through the flatten
+    may still have an **untracked** `authbridge/` directory left behind (stale
+    binaries, `go.work.sum`); that does not mean the module root is still
+    there. This clone is required: the enable script stops
     if it is missing. The restore script does not need it.
 - `kubectl`, `helm`, `kind`, and `docker` (or `podman`) on `PATH`.
   - If `kubectl` reports `connection refused` reaching the API server, the Kind
@@ -198,11 +202,12 @@ The script does these steps:
      bundle fetch. Kind's default CNI does not enforce it, so the chart's own
      SECURITY note treats a kind cluster as having no access control regardless.
 2. **AuthBridge image.** It builds `localhost/authbridge:local` from
-   `$AUTHBRIDGE_DIR/cmd/authbridge-proxy/Dockerfile` (build context:
-   `$AUTHBRIDGE_DIR`, i.e. `$CORTEX_DIR/authbridge`) and loads it into the
+   `$AUTHBRIDGE_DIR/cmd/cortex/Dockerfile` (build context: `$AUTHBRIDGE_DIR`,
+   i.e. `$CORTEX_DIR` itself since the flatten) and loads it into the
    `rossoctl` Kind cluster. AuthBridge plugins are opt-in build tags, so the
    build passes `GO_BUILD_TAGS` with the cortex `full` profile
-   (`authbridge/scripts/profile-tags`, as the cortex CI does). The script
+   (`scripts/profile-tags`, as the cortex CI does) — `full` is one of only two
+   profiles carrying the `opa` plugin. The script
    derives it with a local `go`, or in a `golang` container when `go` is not
    installed. Set `GO_BUILD_TAGS` to override it.
 3. **Pipeline.** It `helm upgrade`s the chart with a temporary overlay that
