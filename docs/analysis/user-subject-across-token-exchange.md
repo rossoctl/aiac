@@ -236,7 +236,7 @@ AIAC keeps the username keys. The Rego does not change.
 | Keycloak realm, realm-default placement (one time; not recommended inside the scope) | Create one client scope (for example `aiac-username-sub`) with the user-property mapper `username → sub` (access, ID, userinfo, introspection). Make it a realm default client scope. This also reaches clients that AIAC does not manage (§1.6). Assign it as a default scope to each existing client that mints user tokens: each login client (`rossoctl`) and each agent client that does a token exchange. Then delete the per-client `username-to-sub` on `rossoctl`, so that there is one source | The realm setup scripts; the runbook; the rossoctl guide (other team) |
 | Alternative placement | Put the mapper on each audience scope (`agent-<ns>-<workload>-aud`). The operator creates these scopes and already has the code to add a protocol mapper to a scope, so a second mapper is a small change. Note: the operator attaches each audience scope also to the platform clients and makes it a realm default scope (§1.4), so the mapper reaches login tokens too, not only exchanged tokens | `operator/internal/keycloak/audience.go` (other team) |
 | Operator | New workload clients get the realm default scopes, because the operator sets no explicit scopes (§1.4). So the realm-default placement covers new clients with no operator change | — |
-| AIAC-owned placement (B-AIAC, recommended in §8.1) | The scope is **not** a realm default. AIAC links it as a default scope to each service's client at onboarding, with the existing IdP call `POST /services/{id}/scopes/{scope_id}`, in the same provisioning step that tags the client with `client.type` (§1.6). It changes only AIAC-managed clients (§1.6) and needs no operator change | `src/aiac/agent/uc/onboarding/` (the onboarding flow); the IdP service already has the endpoint |
+| AIAC-owned placement (B-AIAC, recommended in §8.1) | The scope is **not** a realm default. AIAC links it as a default scope to each service's client at onboarding, with the existing IdP call `POST /services/{id}/scopes/{scope_id}`, in the same provisioning step that tags the client with `client.type` (§1.6). It changes only AIAC-managed clients (§1.6) and needs no operator change. The login client `rossoctl` keeps its own `username-to-sub` mapper, for backward compatibility (§8.1) | `src/aiac/agent/uc/onboarding/` (the onboarding flow); the IdP service already has the endpoint |
 | AIAC source | Realm-default placement: no change. B-AIAC: one call in the onboarding flow | — |
 | Test harness | Extend the precondition check to the exchanged token. A practical form: after registration, check with the admin API that the agent client has the scope with the mapper | `test/system/uc1_onboard.py:1073`, `test/system/launcher.py` |
 | Docs | Add the realm prerequisite. The runbook text that says the tool leg has `subject = dev-user` becomes true | Runbook, specs |
@@ -429,10 +429,20 @@ stable as a user ID. The criteria that are left:
 
 **B-AIAC — the recommended placement of option B:**
 
-1. One-time realm step: create a client scope `aiac-username-sub` with one user-property mapper
-   (`username` → claim `sub`; access token, ID token, userinfo, introspection). Link it as a
-   default scope to `rossoctl`, and delete the per-client `username-to-sub` mapper, so that there
-   is one source.
+1. AIAC creates, idempotently, a client scope `aiac-username-sub` with one user-property mapper
+   (`username` → claim `sub`; access token, ID token, userinfo, introspection). The scope must
+   **not** carry the `aiac.managed` marker, for two reasons:
+   - it is linked to many clients, and a marked scope with more than one owner is an Assumption 2
+     violation: `GET /services/{id}/scopes` returns `409`, so the catalog read fails
+     (`docs/specs/components/idp-configuration-service.md:107,197`);
+   - a marked scope would become an own scope of each linked service and enter the policy model
+     and the PRB candidates.
+
+   The login client `rossoctl` does **not** change. It keeps its own `username-to-sub` mapper,
+   which has the same mapping. That mapper runs only for tokens issued for `rossoctl` (the login
+   token), and the scope covers the tokens issued for the AIAC-managed agents (the exchanged
+   tokens). So the rossoctl guide, its examples, the runbook prerequisite and the other users of
+   `rossoctl` keep working, and AIAC never modifies a shared client.
 2. At onboarding, AIAC links `aiac-username-sub` as a default scope to the onboarded service's
    client. Do it in the provisioning step that tags the client with `client.type`
    (`provision/nodes.py:470`), so it happens before `compute_and_apply` writes the CR. The scope
@@ -455,6 +465,11 @@ Risks that are left with B-AIAC:
   username again.
 - A client is AIAC-managed only after onboarding, and before that the global combiner denies its
   pod (no CR). So a failed link shows as a deny, and the check in step 4 finds it.
+- Two sources of one rule: the `rossoctl` mapper (login tokens) and `aiac-username-sub`
+  (exchanged tokens). They must stay equal (username → `sub`). The harness checks both: the login
+  token (`verify_subject_mapper`) and the scope link (step 4).
+- The `rossoctl` mapper stays a manual prerequisite (the runbook), as today. Any other login
+  client that calls AIAC agents directly needs the same mapper.
 
 **Both enforcement sides (§1.7).** B-AIAC fixes both sides with one setup. Each exchanged token for
 a managed agent then has `sub` = username, so the inbound of a second agent sees the username, and
