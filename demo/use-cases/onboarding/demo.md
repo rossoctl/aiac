@@ -26,7 +26,7 @@ target.
 | Step | Command | What it does |
 |---|---|---|
 | [1](#step-1--install-aiac) | `make enable` | Install the AIAC stack, NATS broker, Keycloak SPI listener |
-| [2](#step-2--wire-opa-into-both-authbridge-legs) | `../../../k8s/opa-kind-enable.sh` | Turn on the OPA plugin in both AuthBridge legs (cluster-level, no make target) |
+| [2](#step-2--wire-opa-into-both-authbridge-legs) | `make opa` | Turn on the OPA plugin in both AuthBridge legs (cluster-level, one-time) |
 | [3](#step-3--provision-users-roles-and-the-policy) | `make users` | Create the three demo users + roles, mount `policy.md` |
 | [4](#step-4--deploy-the-workloads-this-is-the-trigger) | `make trigger` | Deploy `github-agent`/`github-tool` and verify onboarding fired |
 | [5](#step-5--enforce-live) | `make enforce` | Wire the outbound leg, then probe the live OPA plugin |
@@ -38,7 +38,7 @@ First run, in full:
 
 ```bash
 make enable
-../../../k8s/opa-kind-enable.sh
+make opa
 make users
 make e2e
 ```
@@ -271,11 +271,11 @@ of the `rossoctl` release reverts it. Undo it deliberately with `make restore AR
 ## Step 2 — Wire OPA into both AuthBridge legs
 
 ```bash
-../../../k8s/opa-kind-enable.sh
+make opa      # wraps ../../../k8s/opa-kind-enable.sh
 ```
 
-This is a **cluster-level, one-time** change owned by `k8s/`, not by this demo, which is why it has
-no `make` target.
+This is a **cluster-level, one-time** change owned by `k8s/`, not by this demo — `make opa` is only
+a thin wrapper over the `k8s/` script.
 
 ### What happens
 
@@ -304,7 +304,7 @@ kubectl get configmap authbridge-runtime-config -n team1 \
 `driver.sh`'s preflight checks this and refuses to run without it, so steps 4–5 cannot silently
 proceed unwired. Full background, including the exact `input` document the plugin builds on each
 leg, is in [`k8s/opa-kind-runbook.md`](../../../k8s/opa-kind-runbook.md). Revert with
-`k8s/opa-kind-restore.sh`.
+`make opa-restore` (wraps `k8s/opa-kind-restore.sh`).
 
 ---
 

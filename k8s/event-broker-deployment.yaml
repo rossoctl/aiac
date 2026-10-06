@@ -1,4 +1,22 @@
 ---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: aiac-event-broker-config
+  namespace: aiac-system
+data:
+  # nats-server has no level setting below its default, only verbosity flags ABOVE it, so the
+  # container's command maps this key onto them (case-insensitive):
+  #   TRACE -> -DV (debug + protocol trace)   DEBUG -> -D   anything else -> nats' default
+  #   (INFO / WARNING / ERROR / CRITICAL all give the default notices + warnings + errors).
+  # Change it with:
+  #   kubectl patch configmap aiac-event-broker-config -n aiac-system --type merge \
+  #     -p '{"data":{"LOG_LEVEL":"DEBUG"}}' \
+  #     && kubectl rollout restart deployment/aiac-event-broker -n aiac-system
+  # Restarting this broker drops the emptyDir JetStream data (see the volumes note below).
+  LOG_LEVEL: "INFO"
+
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -27,7 +45,21 @@ spec:
         - name: nats
           image: nats:2.14-alpine
           imagePullPolicy: IfNotPresent
-          args: ["-js", "-sd", "/data/jetstream"]
+          # Wrapped in sh so LOG_LEVEL (aiac-event-broker-config) can pick the verbosity flags;
+          # exec keeps nats-server as PID 1 so it still receives SIGTERM directly.
+          command:
+            - sh
+            - -c
+            - |
+              case "$(echo "${LOG_LEVEL:-INFO}" | tr '[:lower:]' '[:upper:]')" in
+                TRACE) flags="-DV" ;;
+                DEBUG) flags="-D" ;;
+                *) flags="" ;;
+              esac
+              exec nats-server -js -sd /data/jetstream $flags
+          envFrom:
+            - configMapRef:
+                name: aiac-event-broker-config
           ports:
             - containerPort: 4222
           # JetStream data lives on its own volume; the rest of the root filesystem is

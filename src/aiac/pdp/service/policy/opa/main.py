@@ -26,6 +26,12 @@ from aiac.pdp.service.policy.opa.rego import (
     identity_ref,
 )
 from aiac.policy.model.models import AgentPolicyModel, PolicyModel
+from aiac.shared.logging_config import configure_logging
+
+# Before the app object exists, so LOG_LEVEL governs this writer's (and the kubernetes
+# client's) logs. Without it the root logger has no handler and defaults to WARNING — see
+# ``aiac.shared.logging_config``.
+configure_logging()
 
 # --------------------------------------------------------------------------- #
 # CR coordinates & write identity — code constants, never env vars (Q6, Q8a). #

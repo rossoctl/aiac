@@ -1,6 +1,8 @@
 import base64
 import json
+import logging
 import os
+import sys
 import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -41,6 +43,31 @@ _DISCOVERY_AUDIENCE_MAPPER = "aiac-discovery-audience"
 # Keycloak deployment property, not something we can force here); when unset it only records the
 # observed ``iss`` for the caller / rollout gate.
 _EXPECTED_ISSUER_ENV = "AIAC_KEYCLOAK_ISSUER"
+
+
+def _log_level() -> int:
+    """Root-logger level from ``LOG_LEVEL`` (default ``INFO``): a name (case-insensitive) or a
+    number; an unrecognized value falls back to ``INFO`` rather than stopping the service.
+    Defined locally because this service image ships only ``main.py`` (the aiac library is not
+    on its path); it mirrors ``aiac.shared.logging_config.log_level``."""
+    raw = os.getenv("LOG_LEVEL", "INFO").strip()
+    if raw.isdigit():
+        return int(raw)
+    level = logging.getLevelName(raw.upper())
+    return level if isinstance(level, int) else logging.INFO
+
+
+def _configure_logging() -> None:
+    """Point the root logger at stdout at ``LOG_LEVEL``. Mirrors
+    ``aiac.shared.logging_config.configure_logging`` (same format, same idempotence)."""
+    level = _log_level()
+    logging.basicConfig(level=level, format="%(levelname)s:%(name)s:%(message)s", stream=sys.stdout)
+    logging.getLogger().setLevel(level)
+
+
+# Before the app object exists — without it the root logger has no handler and defaults to
+# WARNING, so LOG_LEVEL would have no effect on this service's (or python-keycloak's) logs.
+_configure_logging()
 
 
 class _InvariantViolation(Exception):
