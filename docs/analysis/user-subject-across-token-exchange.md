@@ -115,6 +115,23 @@ From the Keycloak source and docs at tag `26.5.2`. `GH/` = `github.com/keycloak/
 | The mappers of an optional scope run only when `scope` names it. `audience` never adds a scope | `TokenManager.java` L662-676; `token-exchange.adoc` L156-170 |
 | 26.5.2 has no delegation (`act`, `may_act`). The feature `token-exchange-delegation` is experimental in 26.7 and preview in 26.8 | `GH/docs/guides/securing-apps/token-exchange.adoc` L290-291, L327 |
 
+**The Keycloak gates on the exchange.** Before OPA decides anything, Keycloak itself limits which
+agent can exchange a token toward which tool:
+
+| Gate | What Keycloak checks | Failure |
+|---|---|---|
+| 1 — requester allowed | The requester (agent) client has `standard.token.exchange.enabled` | V2 declines the request. In this realm the legacy V1 then takes it (§1.5); with V1 off, `400` "Standard token exchange is not enabled for the requested client" |
+| 2 — target reachable | The tool's audience scope (`agent-<ns>-<tool>-aud`) is linked to the requester client. V2 checks `scope` only against the requester's scopes (`StandardTokenExchangeProvider.java` L183-204) | A requested scope that is not linked: `400 invalid_scope`. No `scope` and no linked scope that gives the requested `audience`: `400` "Requested audience not available" |
+
+Gate 2 is a topological boundary (which agent may reach which tool), separate from the per-user and
+per-tool decisions in OPA. **To verify:** whether it still separates agents. The operator makes
+each audience scope a realm default scope (§1.4), so a client that is created after a tool's
+audience scope exists may get that scope by default, and then pass gate 2 for that tool.
+
+The earlier reference `docs/analysis/keycloak-access-control-analysis.md` (removed; see git history)
+also described a Keycloak-native RBAC model (composite roles, scope-to-role gating,
+`fullScopeAllowed=false`). AIAC does not use it: OPA is the PDP (`docs/specs/PRD.md:70-76`).
+
 ### 1.6 Evaluation scope
 
 This analysis covers only **AIAC-managed agents and tools**: the services that AIAC onboards, whose
@@ -487,4 +504,5 @@ Side findings, not part of the decision:
 | Operator clients, audience scopes, realm template | `operator/internal/keycloak/{admin,audience}.go`, `operator/internal/bootstrap/keycloak.go` |
 | Keycloak token exchange (26.5.2) | `github.com/keycloak/keycloak/blob/26.5.2/docs/guides/securing-apps/token-exchange.adoc`; `…/docs/documentation/upgrading/topics/changes/changes-26_2_0.adoc` (see §1.5) |
 | `sub` semantics | OpenID Connect Core 1.0 §2, §5.7; RFC 9068 §2.2 |
-| Related reference | `docs/analysis/keycloak-access-control-analysis.md` |
+| OPA as PDP, AuthBridge as PEP | `docs/specs/PRD.md:70-76` |
+| Routes, exchange scope, OPA input (runbook) | `k8s/opa-kind-runbook.md` (B.1, B.2, B.5) |
