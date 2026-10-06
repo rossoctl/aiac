@@ -4,7 +4,7 @@
 >
 > The AuthBridge and operator facts come from their source code (§1.4). The Keycloak facts come
 > from the Keycloak 26.5.2 source and docs (§1.5). Statements marked **To verify** are not
-> confirmed yet.
+> confirmed yet. The live evidence is for the target side; §1.7 covers the agent side.
 
 ---
 
@@ -21,6 +21,9 @@ renders keys users by **username**. So the user gate never passes, and the tool 
 
 The inbound of the agent does not have this problem, because the login token of the user has
 `sub` = username. So one user has two different subject values on the two legs of one call.
+
+The agent side has the same cause, but it fails later: at the second agent of an agent chain, not at
+the first exchange (§1.7).
 
 ### 1.1 Requirement
 
@@ -159,6 +162,31 @@ tokens do not go through the AIAC token exchange or the OPA PEP. Where an option
 that other consumers share (the login client), the file says so in a boundary note, but it does
 not score that effect.
 
+### 1.7 Enforcement sides
+
+The live evidence (§1.2) is for the **target side**. The **agent side** (D23) has the same cause:
+the first check that reads the subject of an exchanged token fails. Which check that is depends on
+the side and on the number of hops.
+
+Where each user check gets its subject:
+
+| Check | Side | Subject comes from | One hop: user → agent → tool | Two hops: user → agent A → agent B → tool |
+|---|---|---|---|---|
+| Agent inbound user gate (`rego.py:256`) | Both | `sub` of the incoming token (`jwt-validation`) | Login token: username ✓ | Agent A: username ✓. Agent B: the token from A's exchange, user ID ✗ |
+| Agent outbound per-tool gate (`rego.py:323`) | Agent side | `delegation.origin` = the `sub` of the token that came **into** the agent (`tokenexchange/plugin.go:785-832`) | Login token: username ✓ | Agent A: username ✓. Agent B: the exchanged token, user ID ✗ |
+| Tool inbound user gate | Target side | `sub` of the exchanged token | User ID ✗ (the UC-1 failure) | User ID ✗ |
+| Tool inbound | Agent side | — (pass-through) | Not checked | Not checked |
+
+So:
+
+- **Target side:** it fails at one hop. This is the UC-1 rung-2 failure.
+- **Agent side:** one hop works, which is why the runbook's agent-side example (B.5) shows
+  `dev-user`. It fails at the second agent of a chain, in both that agent's inbound and its
+  outbound. AIAC models such a chain: the delegation scenario `dispatch-agent` → `customs-agent`
+  (`test/system/scenario_eval_agent_delegation.py`).
+
+The agent-side rows come from the code paths. They are not run live (§9).
+
 ---
 
 ## 2. Option A — `sub` = user ID everywhere; AIAC keys users by user ID
@@ -288,7 +316,7 @@ None of the variants exists today: the subject claim is not configurable, and no
 
 | Layer | Change | Where |
 |---|---|---|
-| AuthBridge | One of C1–C3. For the agent side, the outbound identity uses `delegation.origin`, which is the `sub` of the incoming bearer (`tokenexchange/plugin.go:785-832`). It must use the same claim | `cortex` repo (other team) |
+| AuthBridge | One of C1–C3. **For the agent side, a second change is required:** the outbound identity uses `delegation.origin`, which the token-exchange plugin takes from the identity subject when one is set, otherwise from the raw `sub` of the incoming bearer (`tokenexchange/plugin.go:785-832`). It must use the same claim. C1 alone fixes only the inbound checks. If `username-to-sub` is removed, the agent-side outbound check fails even at one hop without this change (§1.7) | `cortex` repo (other team) |
 | AuthBridge configuration | Set the claim in the pipeline configuration. The operator builds each workload's `config.yaml` from the namespace `authbridge-runtime-config` | `k8s/opa-kind-enable.sh`; `operator/internal/webhook/injector/pod_mutator.go:1103-1220` |
 | Keycloak | Each token must have `preferred_username`. Login tokens have it (observed). A V2 token has it when the agent client has `profile` as a default scope (§1.5). The operator's realm template makes `profile` a realm default scope (§1.4), and the exchanged token's scope list includes `profile` (decision log). So exchanged tokens have it, unless the token is a lightweight access token. **To verify** once with a decoded exchanged token. AIAC no longer needs `username-to-sub`. If it is removed, login tokens have no `sub`. **To verify:** does `jwt-validation` accept a token without `sub`? | Realm |
 | AIAC source | C1 and C3: no change. C2: the subject expression in each gate of the writer | `rego.py` |
@@ -428,8 +456,16 @@ Risks that are left with B-AIAC:
 - A client is AIAC-managed only after onboarding, and before that the global combiner denies its
   pod (no CR). So a failed link shows as a deny, and the check in step 4 finds it.
 
+**Both enforcement sides (§1.7).** B-AIAC fixes both sides with one setup. Each exchanged token for
+a managed agent then has `sub` = username, so the inbound of a second agent sees the username, and
+its outbound `delegation.origin` (taken from that token) is the username too. One hop does not
+change. A switch of the enforcement side (`AIAC_ENFORCEMENT_SIDE`) needs no identity change. The
+urgency differs: the target side needs the fix now (UC-1 fails at one hop); the agent side needs
+it for agent chains.
+
 **Why option C later:** C keeps `sub` standard and needs no per-client link, because `profile` is
-already a realm default. When AuthBridge has a `subject_claim` option (C1), AIAC can remove
+already a realm default. On the agent side, C needs two AuthBridge changes (`jwt-validation` and
+the delegation origin of the token-exchange plugin), not one (§4). When AuthBridge has a `subject_claim` option (C1), AIAC can remove
 `aiac-username-sub` with no change to policies, because both B and C give the same username as
 the subject.
 
@@ -442,6 +478,9 @@ the platform. A also needs no setup on the exchange path. Its costs (the AIAC Id
 migration, UUIDs in logs, the change of the shared login client) are the price of that guarantee. Of B and
 C, C is better, because it keeps `sub` standard.
 
+A is valid on both enforcement sides: after the login-client change, the login token, each exchanged
+token and `delegation.origin` all carry the user ID (§1.7).
+
 ---
 
 ## 9. Open questions (To verify)
@@ -453,13 +492,17 @@ Open:
 2. Whether the exchanged token has `preferred_username` (option C). Very probable (§4); confirm
    once with a decoded token.
 3. Whether `build_policy()` rebuilds all SPMs from the IdP (migration for option A).
-5. Which Keycloak code sets `sub` = user ID in the exchanged token, because no scope in this realm
+4. Which Keycloak code sets `sub` = user ID in the exchanged token, because no scope in this realm
    has the standard Subject mapper (§1.2). The observed behaviour is clear; only the cause is
    unknown.
-6. Whether any AIAC-managed agent or tool receives backchannel logout tokens, which keep
+5. Whether any AIAC-managed agent or tool receives backchannel logout tokens, which keep
    `sub` = user ID (option B). Expected: no, because they are resource servers behind AuthBridge.
-7. Whether the platform owners accept the username precondition of §8.1 (no rename, no reuse) as
+6. Whether the platform owners accept the username precondition of §8.1 (no rename, no reuse) as
    a written rule.
+7. The agent-side one-hop result of §1.7 (works today) on the live cluster, with the side-switch
+   test (rung 7).
+8. The agent-side two-hop result of §1.7 (fails at the second agent) on the live cluster. It is
+   inferred from the code paths only.
 
 Closed:
 
