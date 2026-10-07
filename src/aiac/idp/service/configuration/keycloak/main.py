@@ -137,6 +137,17 @@ def _is_aiac_managed(attributes: dict | None) -> bool:
     return value == "true"
 
 
+def _read_error(e: KeycloakError) -> JSONResponse:
+    """The response for a ``KeycloakError`` on a read that names one entity: a read of one service
+    (``GET /services/{id}`` and its roles, scopes and discovery token) and the composites of one role
+    (a sub-read of the library's ``get_service``). ``404`` when Keycloak answers ``404`` (the entity
+    does not exist, or a reader asks for a new client before Keycloak commits it), else ``502``. The
+    ``404`` lets the caller tell an entity that is not there (yet) from an IdP outage: the library does
+    not retry a ``4xx``, and the onboarding reads ``get_service`` again for a short time."""
+    status = 404 if e.response_code == 404 else 502
+    return JSONResponse(status_code=status, content={"error": str(e)})
+
+
 def _get_or_create_admin(realm: str) -> KeycloakAdmin:
     if realm not in _cache:
         with _lock:
@@ -371,7 +382,7 @@ def get_service(service_id: str, admin: KeycloakAdmin = Depends(get_admin)):
     try:
         return admin.get_client(service_id)
     except KeycloakError as e:
-        return JSONResponse(status_code=502, content={"error": str(e)})
+        return _read_error(e)
 
 
 @app.get("/services/{service_id}/discovery-token")
@@ -432,7 +443,7 @@ def mint_discovery_token(
             access_token=access_token, client_id=client_id, issuer=iss, audience=aud_list
         ).model_dump()
     except KeycloakError as e:
-        return JSONResponse(status_code=502, content={"error": str(e)})
+        return _read_error(e)
 
 
 @app.post("/services/{service_id}/type", status_code=200)
@@ -517,7 +528,7 @@ def list_service_roles(service_id: str, admin: KeycloakAdmin = Depends(get_admin
     except KeycloakError as e:
         if e.response_code == 400:
             return []
-        return JSONResponse(status_code=502, content={"error": str(e)})
+        return _read_error(e)
 
 
 @app.post("/services/{service_id}/roles/{role_id}", status_code=201)
@@ -593,7 +604,7 @@ def list_service_scopes(service_id: str, admin: KeycloakAdmin = Depends(get_admi
     except _InvariantViolation as e:
         return JSONResponse(status_code=409, content={"error": str(e)})
     except KeycloakError as e:
-        return JSONResponse(status_code=502, content={"error": str(e)})
+        return _read_error(e)
 
 
 @app.post("/services/{service_id}/scopes", status_code=201)
@@ -731,7 +742,7 @@ def list_role_composites(role_name: str, admin: KeycloakAdmin = Depends(get_admi
     try:
         return admin.get_composite_realm_roles_of_role(role_name=role_name)
     except KeycloakError as e:
-        return JSONResponse(status_code=502, content={"error": str(e)})
+        return _read_error(e)
 
 
 @app.get("/scopes")

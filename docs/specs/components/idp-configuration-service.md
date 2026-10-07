@@ -14,12 +14,12 @@ A FastAPI web service that proxies Keycloak Admin REST API endpoints. Returns Id
 | GET | `/roles` | `GET /admin/realms/{realm}/roles` (full representation, `brief_representation=False`) | All realm-level roles, including attributes (so the `aiac.managed` marker is visible) |
 | GET | `/subjects/{subject_id}/assignments` | `GET /admin/realms/{realm}/users/{subject_id}/role-mappings` | Realm and service permission assignments for a subject |
 | GET | `/services` | `GET /admin/realms/{realm}/clients` | All services (clients) |
-| GET | `/services/{service_id}` | `GET /admin/realms/{realm}/clients/{service_id}` | Single service by ID |
+| GET | `/services/{service_id}` | `GET /admin/realms/{realm}/clients/{service_id}` | Single service by ID; `404` when Keycloak does not find the client |
 | POST | `/services/{service_id}/type` | `admin.get_client(service_id)` → `admin.update_client(service_id, {"attributes": {...}})` | Set a service's type via the `client.type` client attribute; an empty `type` clears the attribute via read-merge (same pattern as set) |
 | GET | `/scopes` | `GET /admin/realms/{realm}/client-scopes` | All scopes |
 | GET | `/services/{service_id}/roles` | `admin.get_client_roles(service_id)` **+** `aiac.managed` realm roles on the service account | **An agent's own roles (`R_A`)** from **two** sources: this service's client roles, **plus** the `aiac.managed` realm roles assigned to its service account (the `Configuration` library's provisioning path). Both surfaced as `kind = Agent`. See "Agent roles are client roles" below. |
 | GET | `/services/{service_id}/scopes` | `admin.get_client_default_client_scopes(service_id)` | Default client scopes assigned to a service |
-| GET | `/roles/{role_name}/composites` | `GET /admin/realms/{realm}/roles/{role-name}/composites` | Current composite permissions assigned to a role |
+| GET | `/roles/{role_name}/composites` | `GET /admin/realms/{realm}/roles/{role-name}/composites` | Current composite permissions assigned to a role; `404` when Keycloak does not find the role |
 | POST | `/scopes` | `POST /admin/realms/{realm}/client-scopes` | Create realm-level scope |
 | POST | `/services/{service_id}/scopes` | `admin.create_client_scope(...)` → `admin.add_client_default_client_scope(service_id, scope_id, {})` | Create an `aiac.managed` scope and assign it to the service as a default scope |
 | POST | `/services/{service_id}/scopes/{scope_id}` | `PUT /admin/realms/{realm}/clients/{service_id}/default-client-scopes/{scope_id}` | Assign existing scope as default scope to service |
@@ -43,7 +43,8 @@ A FastAPI web service that proxies Keycloak Admin REST API endpoints. Returns Id
 `GET /services/{service_id}`:
 1. Calls `admin.get_client(service_id)`.
 2. Returns `200 OK` with the client JSON on success.
-3. Returns `502 Bad Gateway` with `{"error": ...}` on `KeycloakError`.
+3. Returns `404 Not Found` with `{"error": ...}` when Keycloak answers `404` (python-keycloak raises `KeycloakGetError` with `response_code == 404`; the body is `{"error": str(e)}`). Keycloak's own body has no `message` key, so python-keycloak puts the raw Keycloak response in the error message, for example `{"error": "404: b'{\"error\":\"Could not find client\"}'"}`. Keycloak answers `404` when the client does not exist, and also when a reader asks for a new client before Keycloak commits it ([D33](../PRD.md#key-architectural-decisions)). The `404` lets the caller tell a missing client from an IdP outage: the `Configuration` library does not retry a `4xx`, and the UC1 onboarding waits a short time for a new client (see the AIAC Agent UC1 spec).
+4. Returns `502 Bad Gateway` with `{"error": ...}` on every other `KeycloakError`.
 
 All service reads (`GET /services`, `GET /services/{service_id}`) return the Keycloak client representation **unmodified**, so client `attributes` — including `client.type` — flow through verbatim for the library's generic-model mapping (`Service._resolve_keycloak_fields`) to resolve service type. The Keycloak attribute name is confined to this service (writes) and the library mapping layer (reads); it is never exposed to library callers.
 
@@ -63,9 +64,9 @@ Accepts JSON body `{"name": ..., "description": ...}`. It:
 
 `POST /services/{service_id}/scopes/{scope_id}`:
 1. Calls `admin.add_client_default_client_scope(service_id, scope_id, {})` to assign the scope as a default scope to the service.
-2. Returns `201 Created` on success.
-3. Returns `409 Conflict` if the scope is already assigned to the service.
-4. Returns `502 Bad Gateway` with `{"error": ...}` on `KeycloakError`.
+2. Returns `201 Created` on success. A repeat is also a success, with no second link: Keycloak skips a scope that is already linked to the client, as a default or as an optional scope, and gives no error (Keycloak 26.5.2, `JpaRealmProvider.addClientScopes`). A scope that is linked as an optional scope stays optional.
+3. Returns `409 Conflict` with `{"error": ...}` only when Keycloak itself answers `409`. A scope that is already assigned does not give a `409`.
+4. Returns `502 Bad Gateway` with `{"error": ...}` on other `KeycloakError`.
 
 `POST /services/{service_id}/subject-scope` (the subject is the username on every leg — [D31](../PRD.md#key-architectural-decisions)):
 Accepts no body. UC-1 Provision calls it at each onboarding, for agents and tools. It:
@@ -106,8 +107,11 @@ serviceId]`:
    `clientId`.
 3. Returns `200 OK` with the merged JSON array (client-role ids dedup against the realm-role set).
 4. Returns `[]` if `KeycloakError` has `response_code == 400` (service has no client roles — not an
-   error); a missing service account is caught and simply contributes no realm roles.
-5. Returns `502 Bad Gateway` with `{"error": ...}` on other `KeycloakError`.
+   error); a missing service account (Keycloak answers `400` or `404` on the service-account lookup)
+   is caught and simply contributes no realm roles.
+5. Returns `404 Not Found` with `{"error": ...}` when Keycloak answers `404` for the client (the same
+   rule as `GET /services/{service_id}`).
+6. Returns `502 Bad Gateway` with `{"error": ...}` on other `KeycloakError`.
 
 > **Redesign note (SPM/APM + provisioning reconciliation).** Under the original SPM/APM redesign this
 > endpoint sourced roles **only** from the client's client roles (`admin.get_client_roles`), on the
@@ -122,16 +126,17 @@ serviceId]`:
 1. Calls `admin.get_client_default_client_scopes(service_id)` to return the realm-level client scopes assigned as defaults to the service.
 2. Sets `serviceId` (this service's `clientId`) on each scope.
 3. Returns `200 OK` with a JSON array of client scope objects. The array has **every** default scope of the client, also the scopes that have no `aiac.managed` marker: the Keycloak built-ins (for example `profile`) and the shared subject scope `aiac-username-sub` (D31). The consumers keep only the marked scopes (the `Scope.aiac_managed` filter: the PCE `owned_scopes`, and the own and other scopes in the AIAC Agent `focal_entities`), so an unmarked scope never becomes an own scope of the service.
-4. Returns `409 Conflict` if an `aiac.managed` scope has more than one owning client (Assumption 2). An unmarked scope is not checked, so `aiac-username-sub`, which is linked to many clients, does not cause a `409`.
-5. Returns `502 Bad Gateway` with `{"error": ...}` on `KeycloakError`.
+4. Returns `409 Conflict` if an `aiac.managed` scope has more than one owning client (Assumption 2). An unmarked scope is not checked, so `aiac-username-sub`, which is linked to many clients, does not cause a `409`. **Known defect:** on a live system this `409` does not fire today (see Assumption 2 below).
+5. Returns `404 Not Found` with `{"error": ...}` when Keycloak answers `404` for the client (the same rule as `GET /services/{service_id}`). A `404` from the owner-index scan (another client is deleted during the scan) also gives `404`; on a live system the scan does not run today (the known defect above).
+6. Returns `502 Bad Gateway` with `{"error": ...}` on other `KeycloakError`.
 
 `POST /services/{service_id}/roles/{role_id}`:
 1. Calls `admin.get_client_service_account_user(service_id)` to get the service account user.
 2. Extracts `user["id"]` from the result.
 3. Resolves the role via `admin.get_realm_role_by_id(role_id)`, then calls `admin.assign_realm_roles(user_id, [role])` to assign the realm role to the service account.
-4. Returns `201 Created` on success.
-5. Returns `409 Conflict` if the role is already assigned.
-6. Returns `502 Bad Gateway` with `{"error": ...}` on `KeycloakError`.
+4. Returns `201 Created` on success. A repeat is also a success, with no second mapping: Keycloak skips the grant of a role that the service account already has, and gives no error (Keycloak 26.5.2, `UserAdapter.grantRole`).
+5. Returns `409 Conflict` with `{"error": ...}` only when Keycloak itself answers `409`. A role that is already assigned does not give a `409`.
+6. Returns `502 Bad Gateway` with `{"error": ...}` on other `KeycloakError`.
 
 `GET /services/{service_id}/discovery-token`:
 1. Calls `admin.get_client(service_id)` to resolve `client_id = client["clientId"]`.
@@ -149,7 +154,8 @@ serviceId]`:
    Returns `502 Bad Gateway` if either assertion fails — this endpoint never returns a token the
    consuming AuthBridge sidecar's `jwt-validation` plugin would reject.
 6. Returns `200 OK` with `{"access_token": ..., "client_id": ..., "issuer": ..., "audience": [...]}`.
-7. Returns `502 Bad Gateway` with `{"error": ...}` on `KeycloakError`.
+7. Returns `404 Not Found` with `{"error": ...}` when Keycloak answers `404` (the same rule as
+   `GET /services/{service_id}`), and `502 Bad Gateway` with `{"error": ...}` on other `KeycloakError`.
 
 `DELETE /services/{service_id}/roles/{role_id}` (teardown — remove role mapping + delete realm role):
 1. Calls `admin.get_client_service_account_user(service_id)` and extracts `user["id"]`.
@@ -186,8 +192,12 @@ All GET endpoints return `200 OK` with a JSON array on success, except `/subject
 - `/health` returns `503` with `{"status": "unavailable", "error": ...}`.
 - `GET /roles` and `GET /services/{service_id}/scopes` return `409 Conflict` on an Assumption 1 / Assumption 2 violation.
 - `POST /services/{service_id}/subject-scope` returns `409 Conflict` when the shared subject scope `aiac-username-sub` carries the `aiac.managed` marker (D31).
+- `POST /roles`, `POST /scopes`, `POST /services/{service_id}/roles/{role_id}` and `POST /services/{service_id}/scopes/{scope_id}` return `409 Conflict` when Keycloak answers `409` (for the two creates: the name already exists).
 - The two `DELETE` endpoints return `200 OK` when Keycloak answers `404` (idempotent teardown).
 - `GET /services/{service_id}/roles` returns `[]` when Keycloak answers `400`.
+- The four reads of one service (`GET /services/{service_id}`, `GET /services/{service_id}/roles`, `GET /services/{service_id}/scopes` and `GET /services/{service_id}/discovery-token`) and `GET /roles/{role_name}/composites` return `404 Not Found` with `{"error": ...}` when Keycloak answers `404` ([D33](../PRD.md#key-architectural-decisions)). They are the reads of the onboarding read path that name one entity. The composites read is a sub-read of the library's `get_service`: a `404` there means that a composite role was deleted during the read, and the next `get_service` does not list the role. The other endpoints keep `502` for a Keycloak `404`: the other reads (`/subjects`, `/subjects/{subject_id}/assignments`, `/roles`, `/scopes`, `/services`) do not read one entity, and the writes run only after a read found the client.
+
+A Keycloak `4xx` that is not in this list also gives `502`: for example a `400` for a bad request, a `403` for a missing admin permission, or a `404` on a write for a client that was deleted. The IdP library retries every `5xx` (see [`library-idp.md` → Transport retries](library-idp.md)), so it also sends such a request up to `UPSTREAM_MAX_RETRIES` times in total, and it gets the same answer each time.
 
 ### AIAC provisioning marker (`aiac.managed`)
 
@@ -215,7 +225,7 @@ Under the SPM/APM policy-model redesign the Policy Computation Engine (PCE) perf
 **Fail-loud enforcement at this boundary** (detectable here via membership queries; do not silently pick a side):
 
 - **Assumption 1 — no cross-kind role.** A role held by _both_ human users and agent service accounts cannot be represented by a single `actorIds` list. On violation, **raise/log** rather than choosing one kind.
-- **Assumption 2 — single scope owner.** Keycloak client scopes are realm-level and assignable to many clients. `GET /services/{service_id}/scopes` enforces this: an **AIAC-managed** scope (see the `aiac.managed` marker above) that more than one client exposes as a default scope is an invariant violation → `409 Conflict`. (The library's `get_services_by_scope` is only a client-side filter and does not check this.) The shared subject scope `aiac-username-sub` (D31) is outside this rule: it is linked to every AIAC-managed client, but it has no marker, so the owner check skips it.
+- **Assumption 2 — single scope owner.** Keycloak client scopes are realm-level and assignable to many clients. `GET /services/{service_id}/scopes` enforces this: an **AIAC-managed** scope (see the `aiac.managed` marker above) that more than one client exposes as a default scope is an invariant violation → `409 Conflict`. (The library's `get_services_by_scope` is only a client-side filter and does not check this.) The shared subject scope `aiac-username-sub` (D31) is outside this rule: it is linked to every AIAC-managed client, but it has no marker, so the owner check skips it. **Known defect (live check, 2026-10-06):** Keycloak's `GET /clients/{id}/default-client-scopes` returns only `id` and `name`, so `list_service_scopes` never sees the `aiac.managed` attribute, never builds the owner index, and never gives the `409`. The unit-test fixtures hide this, because they give `attributes` in that list. This is an open follow-up; see the status note in [the analysis](../../analysis/user-subject-across-token-exchange.md) §8.1.
 
 ## Configuration
 
@@ -286,4 +296,4 @@ docker build -f src/aiac/idp/service/configuration/keycloak/Dockerfile \
 - Unset type (`POST /services/{service_id}/type` with an empty type): `get_client(service_id)` → drop the `client.type` attribute → `update_client(service_id, {"attributes": {...}})` (read-merge, same as set).
 - `POST /services/{service_id}/subject-scope`: `_ensure_subject_scope(admin)` — find `aiac-username-sub` (`_SUBJECT_SCOPE`) by name in `get_client_scopes()` → `create_client_scope(...)` if it is absent (a `409` → find it by name again) → raise `_InvariantViolation` if it has the `aiac.managed` marker → `get_mappers_from_client_scope(scope_id)` → `add_mapper_to_client_scope(scope_id, ...)` if no mapper has the name `username-to-sub` (`_SUBJECT_MAPPER`; a `409` is success), or else `_converge_subject_mapper` makes the existing `username-to-sub` mapper the same as `_SUBJECT_MAPPER_REPRESENTATION` (it compares the type and only the keys of the expected config: no write if they agree; `update_mapper_in_client_scope(scope_id, mapper_id, {..., "id": mapper_id})` if only the config is wrong; `delete_mapper_from_client_scope` then add if the type is wrong, with `404`/`409` as success; other mappers that write `sub` are not changed) → `get_client_scope(scope_id)`. Then `delete_client_optional_client_scope(service_id, scope_id)` if the scope is in `get_client_optional_client_scopes(service_id)` → `add_client_default_client_scope(service_id, scope_id, {})`. `_InvariantViolation` → `409`; `KeycloakError` → `502`.
 - `POST /services/{service_id}/enabled`: `update_client(service_id, {"enabled": <bool>})` → `get_client(service_id)` (re-fetch). This is the writer for `Service.enabled`; all service reads already return the client representation unmodified (see above), so `enabled` is surfaced on read for `get_service` / `get_services`.
-- On `KeycloakError`, return HTTP 502 with `{"error": str(e)}`.
+- On `KeycloakError`, return HTTP 502 with `{"error": str(e)}`, with the exceptions in the error list above. The four reads of one service and `GET /roles/{role_name}/composites` return `_read_error(e)`: `404` when `e.response_code == 404`, else `502`, with the same body.
