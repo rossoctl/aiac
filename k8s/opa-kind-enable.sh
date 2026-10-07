@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# opa-kind-enable.sh — k8s/opa-kind-runbook.md Step 1 (the enable Steps 1-5), on the fly.
+# opa-kind-enable.sh — k8s/opa-kind-runbook.md "Enable" (Steps 1-6), on the fly.
+#
+# Step 6 runs opa-kind-verify.sh, so a successful exit means the wiring was
+# checked, not just applied.
 #
 # Wires the OPA plugin into every agent's inbound AND outbound AuthBridge
 # pipeline on a Kind cluster, alongside the full parser set (a2a-parser,
@@ -26,13 +29,11 @@
 #   ROSSOCTL_DIR        path to the rossoctl/rossoctl repo clone (the chart)
 #   CORTEX_DIR          path to the rossoctl/cortex repo clone; the authbridge
 #                       source built in Step 2 lives there, not in this repo
-#                       (default: ../cortex). Since cortex commit afb49e9f
-#                       ("Flatten authbridge/ into the repo root") the Go module
-#                       root IS the clone root — see AUTHBRIDGE_DIR
+#                       (default: ../cortex). The Go module root is the clone
+#                       root — see AUTHBRIDGE_DIR
 #   AUTHBRIDGE_DIR      the authbridge Go module root (default: $CORTEX_DIR).
-#                       Kept as a separate override only for a clone whose
-#                       module root is not the clone root; before the flatten
-#                       this defaulted to $CORTEX_DIR/authbridge
+#                       Override only for a clone whose module root is not the
+#                       clone root
 #   CLUSTER_NAME        kind cluster name                 (default: rossoctl)
 #   RELEASE_NAME        helm release name                 (default: rossoctl)
 #   RELEASE_NAMESPACE   namespace the chart is installed in (default: rossoctl-system)
@@ -41,21 +42,17 @@
 #                       from cmd/cortex (default: localhost/authbridge:local).
 #                       The tag name stays "authbridge" because it feeds the
 #                       chart's operator-chart.defaults.images.authbridge.
-#   GO_BUILD_TAGS       authbridge plugin build tags (default: the cortex "full"
-#                       profile, from scripts/profile-tags; derived with a local
-#                       `go`, or in a golang container when go is absent)
-#   OPERATOR_IMAGE      local operator image built + loaded by Step 1. Since
-#                       operator PR #540 this single image carries /manager,
-#                       /bundle-service and /token-broker, so there is no
-#                       separate bundle-service image to build
-#                       (default: localhost/operator:local). Replaces the
-#                       former BUNDLE_SERVICE_IMAGE.
+#   OPERATOR_IMAGE      local operator image built + loaded by Step 1. This
+#                       single image carries /manager, /bundle-service and
+#                       /token-broker, so there is no separate bundle-service
+#                       image to build       (default: localhost/operator:local)
 #   CONTAINER_RUNTIME   docker | podman                   (default: docker, auto-falls back to podman)
 #   AUTHBRIDGE_PROFILE  plugin profile for the Step 2 build (default: full — the
 #                       proxy-sidecar set, the only one carrying the opa plugin)
 #   GO_BUILD_TAGS       explicit include_plugin_* tag list, bypassing the
 #                       profile-tags helper entirely (default: derived from
-#                       AUTHBRIDGE_PROFILE)
+#                       AUTHBRIDGE_PROFILE with a local `go`, or in a golang
+#                       container when go is absent)
 
 set -euo pipefail
 
@@ -68,17 +65,13 @@ ROSSOCTL_DIR="${ROSSOCTL_DIR:-$(cd "$REPO_ROOT/../rossoctl" 2>/dev/null && pwd |
 # this extracted repo — default to a sibling ../cortex clone, override with
 # CORTEX_DIR.
 CORTEX_DIR="${CORTEX_DIR:-$(cd "$REPO_ROOT/../cortex" 2>/dev/null && pwd || echo "")}"
-# The authbridge Go module root used to be the authbridge/ subdirectory of the
-# cortex clone; cortex commit afb49e9f flattened it into the repo root (it held
-# 1,006 of 1,061 tracked files and separated nothing), so the module root is now
-# the clone root itself. Both the image build and the profile-tags helper run
-# against AUTHBRIDGE_DIR, and the cmd/cortex Dockerfile COPYs core/ and
-# cmd/cortex/ relative to it.
+# The authbridge Go module root is the cortex clone root. Both the image build
+# and the profile-tags helper run against AUTHBRIDGE_DIR, and the cmd/cortex
+# Dockerfile COPYs core/ and cmd/cortex/ relative to it.
 #
-# NOTE: a clone that has been through the flatten may still have an untracked
-# authbridge/ directory left behind (stale compiled binaries, go.work.sum,
-# __pycache__). Its presence does NOT mean the module root is still there —
-# authbridge/install.sh is the only tracked file under it.
+# NOTE: an older clone may still have an untracked authbridge/ directory left
+# behind (stale compiled binaries, go.work.sum, __pycache__). Its presence does
+# NOT mean the module root is there.
 AUTHBRIDGE_DIR="${AUTHBRIDGE_DIR:-$CORTEX_DIR}"
 CLUSTER_NAME="${CLUSTER_NAME:-rossoctl}"
 RELEASE_NAME="${RELEASE_NAME:-rossoctl}"
@@ -94,8 +87,8 @@ if [ -z "$OPERATOR_DIR" ] || [ ! -f "$OPERATOR_DIR/operator/Dockerfile" ] || [ !
   echo "       pass an absolute path if you are not running from the repo root." >&2
   if [ -n "$OPERATOR_DIR" ] \
     && [ -f "$OPERATOR_DIR/operator/cmd/bundle-service/Dockerfile" ]; then
-    echo "       (that clone predates operator PR #540, which folded bundle-service into" >&2
-    echo "        the operator image — update it, or use an older revision of this script)" >&2
+    echo "       (that clone predates bundle-service being folded into the operator" >&2
+    echo "        image — update it, or use an older revision of this script)" >&2
   fi
   exit 1
 fi
@@ -111,13 +104,14 @@ if [ -z "$AUTHBRIDGE_DIR" ] || [ ! -f "$AUTHBRIDGE_DIR/cmd/cortex/Dockerfile" ];
   echo "        root is not the clone root)" >&2
   if [ -n "$AUTHBRIDGE_DIR" ] \
     && [ -f "$AUTHBRIDGE_DIR/authbridge/cmd/authbridge-proxy/Dockerfile" ]; then
-    echo "       (that clone predates cortex afb49e9f + a86e6708, which flattened" >&2
-    echo "        authbridge/ into the repo root and renamed cmd/authbridge-proxy to" >&2
-    echo "        cmd/cortex — update it, or use an older revision of this script)" >&2
+    echo "       (that clone predates authbridge/ being flattened into the repo root" >&2
+    echo "        and cmd/authbridge-proxy being renamed to cmd/cortex — update it, or" >&2
+    echo "        use an older revision of this script)" >&2
   fi
   exit 1
 fi
 OPERATOR_IMAGE="${OPERATOR_IMAGE:-localhost/operator:local}"
+AUTHBRIDGE_PROFILE="${AUTHBRIDGE_PROFILE:-full}"
 
 # Split OPERATOR_IMAGE into the repository + tag the chart takes as two separate
 # values. Only a colon AFTER the last slash is a tag separator — the registry
@@ -172,22 +166,19 @@ load_image_to_kind() {
 OVERLAY_FILE="$(mktemp "${TMPDIR:-/tmp}/opa-kind-enable-overlay.XXXXXX")"
 TMPFILES+=("$OVERLAY_FILE")
 
-echo "==> Step 1/5: deploying bundle-service from the operator clone (${OPERATOR_DIR}, image ${OPERATOR_IMAGE})"
-# Since operator PR #540 ("fold bundle service and token broker to operator
-# image") the bundle service is neither its own image nor its own raw manifest
-# set. One image now carries /manager, /bundle-service and /token-broker, and
-# the manifests live as Helm templates in
-# charts/operator/templates/bundleservice/ gated on `bundleService.enabled`,
-# with the binary selected per-Deployment by `command:` against the image's
-# ENTRYPOINT ["/manager"].
+echo "==> Step 1/6: deploying bundle-service from the operator clone (${OPERATOR_DIR}, image ${OPERATOR_IMAGE})"
+# The bundle service is not its own image: one operator image carries
+# /manager, /bundle-service and /token-broker, and the manifests live as Helm
+# templates in charts/operator/templates/bundleservice/ gated on
+# `bundleService.enabled`, with the binary selected per-Deployment by `command:`
+# against the image's ENTRYPOINT ["/manager"].
 #
 # Those templates are rendered from the LOCAL clone rather than by enabling
-# bundleService on the rossoctl chart's operator-chart subchart, because that
-# dependency is pinned to a published 0.4.0-rc.3 that predates the fold — no tag
-# in the operator repo contains it, and the newest (v0.2.0-alpha.31) carries no
-# bundleservice templates at all. `--set operator-chart.bundleService.enabled=
-# true` against it would render nothing, silently, leaving OPA with no bundle
-# source while Steps 2-5 still reported success.
+# bundleService on the rossoctl chart's operator-chart subchart, because the
+# operator chart version that subchart pins carries no bundleservice templates.
+# `--set operator-chart.bundleService.enabled=true` against it would render
+# nothing, silently, leaving OPA with no bundle source (Step 6's verify would
+# then fail on the missing bundle-service).
 #
 # `helm template --show-only` rather than a second `helm install` of the clone's
 # chart: templates/manager/manager.yaml and templates/rbac/role.yaml carry no
@@ -203,7 +194,7 @@ load_image_to_kind "$OPERATOR_IMAGE"
 kubectl apply -f "$OPERATOR_DIR/operator/config/crd/bases/agent.rossoctl.dev_authorizationpolicies.yaml"
 kubectl wait --for=condition=established --timeout=60s \
   crd/authorizationpolicies.agent.rossoctl.dev
-# A Deployment's selector is immutable. The pre-fold raw manifests selected on
+# A Deployment's selector is immutable. Older raw manifests selected on
 # `app: bundle-service` alone, while the chart template adds
 # chart.selectorLabels (app.kubernetes.io/name + app.kubernetes.io/instance), so
 # a bundle-service left behind by an older run of this script — or by a run
@@ -225,8 +216,7 @@ fi
 # sets that label today. On a CNI that enforces NetworkPolicy it would block
 # every AuthBridge bundle fetch. Kind's default CNI does not enforce it, so the
 # chart's own SECURITY note treats a kind cluster as having no access control
-# either way — and the removed operator/hack/bundle-service-kind.sh applied no
-# NetworkPolicy either, so this keeps the earlier dev-cluster behavior.
+# either way.
 helm template "$RELEASE_NAME" "$OPERATOR_DIR/charts/operator" \
   --namespace "$RELEASE_NAMESPACE" \
   --set bundleService.enabled=true \
@@ -242,17 +232,18 @@ helm template "$RELEASE_NAME" "$OPERATOR_DIR/charts/operator" \
 kubectl rollout status deployment/bundle-service -n "$RELEASE_NAMESPACE" --timeout=180s
 kubectl get pods -n "$RELEASE_NAMESPACE" -l app=bundle-service
 
-echo "==> Step 2/5: building + loading the authbridge proxy-sidecar — cortex (${IMAGE_TAG}) via ${CONTAINER_RUNTIME}"
+echo "==> Step 2/6: building + loading the authbridge proxy-sidecar — cortex (${IMAGE_TAG}) via ${CONTAINER_RUNTIME}"
 # AuthBridge plugins are opt-in build tags: an untagged build registers none and
 # the Dockerfile refuses it. Use the "full" profile, as the cortex CI does for
-# the authbridge image (scripts/profile-tags). GOWORK=off: the profile tool is a
+# the authbridge image (scripts/profile-tags); AUTHBRIDGE_PROFILE overrides it.
+# GOWORK=off: the profile tool is a
 # standalone module, and the cortex go.work would want to write go.work.sum.
 if [ -z "${GO_BUILD_TAGS:-}" ]; then
   if command -v go &> /dev/null; then
-    GO_BUILD_TAGS="$(GOWORK=off go -C "$AUTHBRIDGE_DIR/scripts/profile-tags" run . full)"
+    GO_BUILD_TAGS="$(GOWORK=off go -C "$AUTHBRIDGE_DIR/scripts/profile-tags" run . "$AUTHBRIDGE_PROFILE")"
   else
     GO_BUILD_TAGS="$("$CONTAINER_RUNTIME" run --rm -e GOWORK=off -v "$AUTHBRIDGE_DIR:/src:ro" -w /src \
-      docker.io/library/golang:1.26-alpine go -C scripts/profile-tags run . full)"
+      docker.io/library/golang:1.26-alpine go -C scripts/profile-tags run . "$AUTHBRIDGE_PROFILE")"
   fi
 fi
 echo "    GO_BUILD_TAGS=${GO_BUILD_TAGS}"
@@ -260,40 +251,31 @@ echo "    GO_BUILD_TAGS=${GO_BUILD_TAGS}"
     --build-arg GO_BUILD_TAGS="$GO_BUILD_TAGS" . )
 load_image_to_kind "$IMAGE_TAG"
 
-echo "==> Step 3/5: writing throwaway pipeline overlay (${VALUES_FILE} stays untouched)"
+echo "==> Step 3/6: writing throwaway pipeline overlay (${VALUES_FILE} stays untouched)"
 cat > "$OVERLAY_FILE" <<YAML
 # Throwaway overlay — merged on top of the real values.yaml at helm-upgrade
 # time, never written back to it. Adds OPA plus the full parser set
 # (a2a-parser, mcp-parser, inference-parser) to both pipeline legs:
 #   - Parsers run before jwt-validation/opa so their signals (input.a2a,
 #     input.mcp, input.inference) are always populated, even if a later
-#     gate denies the request — matches the a2a-parser convention in
-#     authbridge/demos/ibac/k8s/ibac-patch.yaml.
-#   - opa runs after jwt-validation on inbound so input.identity is set
-#     (see authbridge/docs/opa-migration-guide.md Step 1).
+#     gate denies the request.
+#   - opa runs after jwt-validation on inbound so input.identity is set.
 #   - On OUTBOUND, opa runs AFTER token-exchange so the delegation signal
 #     is populated: token-exchange records the target audience + granted
 #     scopes it minted a token for (RFC 8693) into the delegation chain,
 #     and OPA exposes it as input.delegation (origin, actor, depth, and a
 #     chain of {subject_id, audience, scopes, strategy, from_cache}). This
 #     lets outbound policy reason about WHAT the agent's token was
-#     exchanged for — e.g. "deny github-full-access to non-admin agents" —
-#     without re-parsing the minted token and without a fail-closed JWT
+#     exchanged for without re-parsing the minted token and without a fail-closed JWT
 #     gate that would reject passthrough egress.
 #     token-exchange ALSO synthesizes input.identity on this leg, even though
 #     no JWT is validated here: a matched route yields
 #     identity.{subject, client_id, service_id, scopes}, where service_id is
-#     the route's target_audience and subject is the delegating end user.
-#     Verified in a live outbound Decision Log:
-#       identity:map[client_id:…/sa/github-agent service_id:…/sa/github-tool
-#                    subject:dev-user scopes:[openid agent-team1-github-tool-aud]]
-#     This matters because the AIAC-generated outbound policy keys its gates on
-#     input.identity.subject and input.identity.service_id — it could not work
-#     at all if identity were empty here. A host with NO matching route gets no
-#     exchange and therefore no identity, so those gates go undefined and the
-#     default-deny takes over (the whole-matrix denial you see when the demo's
-#     WIRE phase has not run). input.delegation carries the complementary
-#     per-hop audit trail.
+#     the route's target_audience and subject is the delegating end user, so
+#     outbound policy can key on input.identity the same way as inbound. A
+#     host with NO matching route gets no exchange and therefore no identity,
+#     so gates keyed on it go undefined and the policy's default applies.
+#     input.delegation carries the complementary per-hop audit trail.
 #   - token-exchange uses the chart's default shape (client-secret identity
 #     from /shared, passthrough default policy). Per-destination routes
 #     come from the authproxy-routes ConfigMap; hosts with no route fall
@@ -337,7 +319,7 @@ authBridge:
             bundle_url: "http://bundle-service.${RELEASE_NAMESPACE}.svc.cluster.local:8080"
 YAML
 
-echo "==> Step 4/5: helm upgrade (base values.yaml + overlay — base file not modified)"
+echo "==> Step 4/6: helm upgrade (base values.yaml + overlay — base file not modified)"
 ( cd "$CHART_DIR" && helm dependency build )
 helm upgrade "$RELEASE_NAME" "$CHART_DIR" -n "$RELEASE_NAMESPACE" \
   -f "$VALUES_FILE" \
@@ -348,17 +330,19 @@ helm upgrade "$RELEASE_NAME" "$CHART_DIR" -n "$RELEASE_NAMESPACE" \
   --set operator-chart.featureGates.injectTools=true \
   --wait --timeout 5m
 
-echo "==> Step 5/5: restarting authbridge pods in ${AGENT_NAMESPACE}"
+echo "==> Step 5/6: restarting authbridge pods in ${AGENT_NAMESPACE}"
 # --ignore-not-found so this no-ops cleanly when the namespace has no agent pods yet.
 kubectl delete pods -n "$AGENT_NAMESPACE" -l rossoctl.io/type=agent --ignore-not-found
+
+echo "==> Step 6/6: verifying (opa-kind-verify.sh)"
+NS="$AGENT_NAMESPACE" SYS_NS="$RELEASE_NAMESPACE" IMAGE_TAG="$IMAGE_TAG" KIND_CLUSTER="$CLUSTER_NAME" \
+  "$SCRIPT_DIR/opa-kind-verify.sh"
 
 cat <<EOF
 ==> Done.
 
-Verify OPA + parsers are wired into both legs (expect 2 'name: opa' matches):
-  kubectl get configmap authbridge-runtime-config -n ${AGENT_NAMESPACE} \\
-    -o jsonpath='{.data.config\.yaml}' | grep -c 'name: opa'
-
+Re-check later with:
+  ./k8s/opa-kind-verify.sh
 Restore the original pipeline with:
-  ./opa-kind-restore.sh
+  ./k8s/opa-kind-restore.sh
 EOF

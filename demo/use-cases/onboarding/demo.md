@@ -676,7 +676,7 @@ make teardown ARGS=--include-opa   # also revert step 2's overlay (needs the cha
   ([`INSTALL.md`](../../assets/INSTALL.md): "a precondition, not an output"). A fresh install gives
   you an *empty* `team1`, so emptying it *is* the post-install state.
 - **the realm fix-up** (Direct Access Grants, the `username → sub` mapper) — one-time cluster state
-  that `k8s/opa-kind-runbook.md`'s probes and the `-m system` suite both depend on.
+  that this demo and the `-m system` suite both depend on.
 - **the operator's `*-aud` audience client scopes**, which it owns and recreates.
 - **step 2's OPA overlay**, unless you pass `--include-opa`.
 - **container images already in the Kind node.** Inert; the script prints the `docker image rm` line.

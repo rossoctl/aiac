@@ -612,7 +612,7 @@ def delete_agent_cr() -> None:
 
 
 # ======================================================================================
-# Outbound token-exchange leg prep (runbook Part B) — so OPA is actually consulted outbound
+# Outbound token-exchange leg prep — so OPA is actually consulted outbound
 # ======================================================================================
 #
 # The outbound OPA gate is only reached if ``token-exchange`` first intercepts + exchanges the agent's
@@ -627,12 +627,12 @@ def _tool_audience() -> str:
 
 
 def _tool_aud_scope() -> str:
-    """The realm client-scope whose audience mapper stamps the github-tool audience (runbook B.2)."""
+    """The realm client-scope whose audience mapper stamps the github-tool audience."""
     return f"agent-{NAMESPACE}-{scn.TOOL_WORKLOAD}-aud"
 
 
 def ensure_github_tool_route(namespace: str) -> None:
-    """Ensure ``authproxy-routes`` carries an outbound route for the github-tool host (runbook B.1).
+    """Ensure ``authproxy-routes`` carries an outbound route for the github-tool host.
 
     Reads the current ``routes.yaml``, appends the github-tool route if it is not already present
     (preserving any existing routes, e.g. the weather route), and patches it back. Creates the
@@ -685,7 +685,7 @@ def ensure_github_tool_route(namespace: str) -> None:
 
 
 def grant_exchange_scope(admin) -> None:
-    """Grant the agent's Keycloak client the github-tool audience scope as **optional** (runbook B.2),
+    """Grant the agent's Keycloak client the github-tool audience scope as **optional**,
     so the ``client_credentials`` token exchange to the github-tool audience succeeds.
 
     Resolves the agent client by its SPIFFE ``clientId`` (``.../sa/github-agent``) or its
@@ -722,7 +722,7 @@ def grant_exchange_scope(admin) -> None:
 
 def restart_agent(namespace: str) -> None:
     """Restart the agent Deployment so it reloads the outbound route (routes are read once at
-    startup — runbook B.3) and its OPA sidecar re-fetches the recomposed bundle on its next poll."""
+    startup) and its OPA sidecar re-fetches the recomposed bundle on its next poll."""
     kubectl("rollout", "restart", f"deployment/{AGENT_DEPLOYMENT}", "-n", namespace, timeout=60)
     kubectl_rollout_status(f"deployment/{AGENT_DEPLOYMENT}", namespace=namespace, timeout=180)
 
@@ -966,7 +966,7 @@ def onboarded_stack(
                     f"operator did not register Keycloak client {NAMESPACE}/{workload!r} within "
                     f"{DEPLOY_TIMEOUT:.0f}s of deploying it — is the event path wired (NATS broker + "
                     "aiac-event-listener SPI)? (The rollout already passed, so the image is loaded.) "
-                    "See k8s/opa-kind-runbook.md."
+                    "See docs/testing/uc1-onboarding-pipeline.md Preconditions."
                 )
             if workload == scn.AGENT_WORKLOAD:
                 # Option A′ — one representative ENFORCED decision proves OPA loaded the agent's bundle.

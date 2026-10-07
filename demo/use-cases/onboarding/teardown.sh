@@ -24,8 +24,8 @@
 #     (demo/assets/INSTALL.md: "a precondition, not an output"); a fresh install gives you an EMPTY
 #     team1, not no team1. Deleting it would force an installer re-run.
 #   - the `rossoctl` client's Direct Access Grants + username->sub protocol mapper from demo.md's
-#     Prerequisites. One-time cluster-wide state that k8s/opa-kind-runbook.md's probes and the
-#     system test suite both depend on, and which that runbook calls harmless to leave.
+#     Prerequisites. One-time cluster-wide state that this demo and the system test suite
+#     both depend on, and which is harmless to leave.
 #   - the operator's `*-aud` audience client scopes, which it owns and recreates.
 #   - container images already loaded into the Kind node (inert; `docker image rm` them by hand).
 #     Consequence worth knowing: because these survive, a later `./enable.sh` finds the stack images
@@ -380,7 +380,7 @@ Still in place, by design (platform state this demo does not own):
   - the ${NS} namespace itself — the Rossoctl installer owns it; a fresh install leaves it empty,
     not absent. Nothing of the demo remains inside it.
   - the 'rossoctl' client's Direct Access Grants + username->sub mapper (demo.md Prerequisites).
-    k8s/opa-kind-runbook.md's probes and the system test suite both rely on these.
+    This demo and the system test suite both rely on these.
   - the operator's '*-aud' audience client scopes, which it owns and recreates.
   - container images in the Kind node (inert). Remove by hand if you want the disk back:
       docker image rm localhost/aiac-{pdp-config,pdp-policy-opa,policy-model-store,agent}:local \\

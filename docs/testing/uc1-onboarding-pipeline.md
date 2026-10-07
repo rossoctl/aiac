@@ -417,7 +417,7 @@ SPI installed + `aiac-event-listener` enabled on the realm**, and a real LLM in-
 deploy, and tear down** the workloads themselves — deployment and image-loading are no longer prerequisites
 (the fixture runs `demo/assets/kind-load.sh` before deploy, so only the `kind` CLI + `kubectl` + a container
 runtime on the pytest host are assumed). Stand the pipeline up with `k8s/opa-kind-enable.sh`;
-the full prerequisites, wiring, and manual probe commands are in `k8s/opa-kind-runbook.md`, and the SPI
+its prerequisites, wiring and verification are in `k8s/opa-kind-runbook.md`, and the SPI
 setup is in `keycloak-spi/README.md`.
 
 ```bash

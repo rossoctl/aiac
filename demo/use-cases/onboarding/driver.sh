@@ -13,8 +13,8 @@
 #   Phase VERIFY-TRIGGER  poll Keycloak for the brand-new clients, aiac-agent logs for evidence it
 #                         consumed both over NATS, and the AuthorizationPolicy CR AIAC wrote.
 #   Phase WIRE            wire AuthBridge's own outbound leg (authproxy-routes + optional
-#                         client-scope) — same two sub-steps as k8s/opa-kind-runbook.md Part
-#                         B.1/B.2; AIAC's own onboarding does not do this.
+#                         client-scope) — demo-owned wiring the platform runbook
+#                         (k8s/opa-kind-runbook.md) leaves out; AIAC's own onboarding does not do this.
 #   Phase ENFORCE         real HTTP probes through the live AuthBridge OPA plugin, reproducing
 #                         #646's acceptance table.
 #   Phase REPLAY-TRIGGER  opt-in only (--only-replay-trigger): re-prove the trigger on a cluster
@@ -23,7 +23,7 @@
 #                         re-registers them. Not part of a default run — DEPLOY is the real story;
 #                         this exists for when tearing the workloads down isn't worth it.
 #
-# step()/pass()/warn()/die() style matches k8s/opa-kind-driver.sh: fails loudly and specifically the
+# step()/pass()/warn()/die() style matches k8s/opa-kind-verify.sh: fails loudly and specifically the
 # moment an observed result doesn't match, rather than continuing silently.
 #
 # Usage:
@@ -125,7 +125,7 @@ done
 # Fix the destination once, so the end-of-run and die()-path collections write to the same directory.
 [ "$DO_COLLECT" -eq 1 ] && COLLECT_DIR="${COLLECT_ROOT}/onboarding-logs-$(date -u +%Y%m%dT%H%M%SZ)"
 
-# ── Output helpers (same palette/shape as k8s/opa-kind-driver.sh) ───────
+# ── Output helpers (same palette/shape as k8s/opa-kind-verify.sh) ───────
 if [ -t 1 ]; then
   C_RED=$'\033[31m'; C_GRN=$'\033[32m'; C_YEL=$'\033[33m'
   C_CYN=$'\033[36m'; C_BLD=$'\033[1m'; C_RST=$'\033[0m'
