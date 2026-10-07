@@ -34,9 +34,10 @@ from aiac.policy.model.models import PolicyRule, ServicePolicyModel
 class RoleHolders:
     """The current holders of every role, from one read of the catalog and of the realm roles."""
 
-    def __init__(self, services: Iterable[Service], roles: Iterable[Role] = (), *, focus_service: str | None = None):
-        """``services`` is the ``get_services()`` catalog; ``roles`` the ``get_roles()`` realm roles;
-        ``focus_service`` the clientId of the service that a run builds (it counts as live)."""
+    def __init__(self, services: Iterable[Service], roles: Iterable[Role], *, focus_service: str | None = None):
+        """``services`` is the ``get_services()`` catalog; ``roles`` the ``get_roles()`` realm roles
+        (required: with no roles, every user role has no holder); ``focus_service`` the clientId of
+        the service that a run builds (it counts as live)."""
         agents: dict[str, set[str]] = {}
         for svc in services:
             if svc.enabled or svc.serviceId == focus_service:

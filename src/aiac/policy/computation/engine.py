@@ -122,6 +122,7 @@ import logging
 import os
 import threading
 from collections.abc import Iterable
+from dataclasses import dataclass, field
 
 from aiac.idp.configuration.api import Configuration
 from aiac.idp.configuration.models import ClientId, Role, RoleKind, Scope, Service, ServiceType
@@ -447,6 +448,15 @@ def _live_services(catalog: dict[str, Service], focus_service: str | None = None
     return catalog.keys() - _disabled_services(catalog, focus_service)
 
 
+def _live_current(
+    models: Iterable[ServicePolicyModel], live: set[str], holders: RoleHolders
+) -> list[ServicePolicyModel]:
+    """The SPMs of ``models`` whose service is ``live``, sorted by service id, each with the current
+    holders of its roles (D32) — what a target-side render of stored SPMs deploys."""
+    ordered = sorted(models, key=lambda model: model.service_id)
+    return [holders.refresh_model(model) for model in ordered if model.service_id in live]
+
+
 def _routable(rule: PolicyRule, live: set[str]) -> bool:
     """True iff ``rule`` (with the current holders, D32) can take effect: its scope owner is
     ``live``, and an ``Agent``-kind role has at least one holder. The holders are live services
@@ -569,10 +579,10 @@ def _rerender_role(role_id: str, side: EnforcementSide) -> None:
     catalog, holders = _read_idp()
     live = _live_services(catalog)
     if side == EnforcementSide.TARGET_SIDE:
-        # The store finds the SPMs by role id only.
+        # The event gives only the role id, and ``get_service_policies_by_role`` sends only
+        # ``role.id`` to the store, so the other fields of this Role are placeholders.
         role = Role(id=role_id, name=role_id, composite=False)
-        found = sorted(get_service_policies_by_role(role), key=lambda model: model.service_id)
-        services = [holders.refresh_model(model) for model in found if model.service_id in live]
+        services = _live_current(get_service_policies_by_role(role), live, holders)
         if services:
             apply_policy(TargetSidePolicyModel(services=services))
         return
@@ -799,13 +809,13 @@ def _decommission(service_id: str, side: EnforcementSide) -> None:
         return
 
     # (3)-(6) Tear down X's footprint in the store (see ``_remove_footprint``).
-    changed, shared, agents = _remove_footprint(service_id, catalog, spms, spm)
+    footprint = _remove_footprint(service_id, catalog, spms, spm)
 
     # (7) Delete the CR of X (D20), for an agent and for a tool. A 404 counts as success.
     delete_service_cr(service_id)
 
     # (8) Redeploy the affected live services of the side (X excluded) in one call (D23).
-    _redeploy_after_removal(service_id, changed, shared, agents, catalog, spms, spm, side)
+    _redeploy_after_removal(service_id, footprint, catalog, spms, spm, side)
 
 
 def _resync(side: EnforcementSide) -> None:
@@ -819,7 +829,7 @@ def _resync(side: EnforcementSide) -> None:
     # even for a moment. Each CR names the current role holders, so the resync repairs a missed
     # role-members event.
     live = _live_services(catalog)
-    live_stored = [holders.refresh_model(model) for model in stored if model.service_id in live]
+    live_stored = _live_current(stored, live, holders)
     if side == EnforcementSide.TARGET_SIDE:
         replace_policy(TargetSidePolicyModel(services=live_stored))
     else:
@@ -864,7 +874,7 @@ def _quarantine_in(
     spms, spm = _spm_cache(catalog, holders)
 
     # (3)-(6) Tear down X's footprint in the store (see ``_remove_footprint``).
-    changed, shared, agents = _remove_footprint(service_id, catalog, spms, spm, deleted_roles)
+    footprint = _remove_footprint(service_id, catalog, spms, spm, deleted_roles)
 
     # (7) Delete the CR of X (D20), for an agent and for a tool. In an AIAC setup the global combiner
     # denies a pod that has no client CR, so the delete denies every request to and from X. A 404
@@ -872,12 +882,26 @@ def _quarantine_in(
     delete_service_cr(service_id)
 
     # (8) Redeploy the affected live services of the side (X excluded) in one call (D23).
-    _redeploy_after_removal(service_id, changed, shared, agents, catalog, spms, spm, side)
+    _redeploy_after_removal(service_id, footprint, catalog, spms, spm, side)
+
+
+@dataclass
+class _Footprint:
+    """What ``_remove_footprint`` found for service X; X is in none of the sets.
+
+    ``changed``: the services whose SPM the purge changed, written to the store. ``shared``: the
+    services whose SPM has an edge of a shared role of X, not written (their rules did not change).
+    ``agents``: the agents whose agent-side policy uses X — the agents that targeted X, and the
+    remaining holders of each shared role of X that has an edge."""
+
+    changed: set[str] = field(default_factory=set)
+    shared: set[str] = field(default_factory=set)
+    agents: set[str] = field(default_factory=set)
 
 
 def _remove_footprint(
     service_id: str, catalog: dict[str, Service], spms, spm, extra_roles: Iterable[Role] = ()
-) -> tuple[set[str], set[str], set[str]]:
+) -> _Footprint:
     """Tear down service X's footprint in the store — the steps ``decommission`` and ``quarantine``
     share. ``extra_roles`` are X's roles that ``SPM(X)`` no longer lists (``quarantine``'s
     rollback-deleted roles); their edges are purged as X's own. A role that another service in
@@ -885,19 +909,13 @@ def _remove_footprint(
     too. X is not a holder of it any more (X is disabled or absent), so the SPMs that have an edge
     of that role keep their rules but get a new render without X.
 
-    Returns ``(changed, shared, agents)``: the services whose SPM the purge changed, written to the
-    store; the services whose SPM has an edge of a shared role of X, not written (their rules did
-    not change); and the agents whose agent-side policy uses X — the agents that targeted X, and
-    the remaining holders of each shared role of X that has an edge. X is in none of the sets."""
+    Returns the :class:`_Footprint` of X."""
     spm_x = spm(service_id)
 
     # (3) Targeters — the agents whose outbound loses X: they hold an Agent-kind inbound edge (allow
     # or deny) on SPM(X) (their_role → X_scope), which goes when SPM(X) is deleted in step 5. So
     # they are read first.
-    agents = _targeters(spm_x)
-
-    changed: set[str] = set()
-    shared: set[str] = set()
+    footprint = _Footprint(agents=_targeters(spm_x))
 
     # (4) Purge X's outbound footprint — X_role → other_scope edges (allow AND deny) stored on OTHER
     # services' SPMs. Dedup by id: an extra role can also still be on SPM(X). Skip a role that
@@ -913,15 +931,15 @@ def _remove_footprint(
             model = spm(stored.service_id)
             if role.id not in held_elsewhere:
                 if _purge_role(model, role.id):
-                    changed.add(model.service_id)
+                    footprint.changed.add(model.service_id)
                 continue
             # (4b) A shared role: the edges stay, but the cached SPM already names only the current
             # holders, so the redeploy takes X out of the callee's CR (a client delete gives no
             # role-mapping event). The remaining holders carry these edges on their outbound (agent
             # side).
-            shared.add(model.service_id)
+            footprint.shared.add(model.service_id)
             edges = model.inbound_allow_rules + model.inbound_deny_rules
-            agents.update(actor for edge in edges if edge.role.id == role.id for actor in edge.role.actorIds)
+            footprint.agents.update(actor for edge in edges if edge.role.id == role.id for actor in edge.role.actorIds)
 
     # (5) Delete SPM(X) — removes every user→X and agent→X inbound edge in one shot, so X leaves the
     # managed set — and evict it from the cache so the redeploy cannot resurrect it.
@@ -930,18 +948,16 @@ def _remove_footprint(
 
     # (6) Persist every changed (footprint-purged) SPM. A shared SPM is not written: its rules did
     # not change.
-    for changed_id in sorted(changed):
+    for changed_id in sorted(footprint.changed):
         apply_service_policy(changed_id, spms[changed_id])
 
-    agents.discard(service_id)
-    return changed, shared, agents
+    footprint.agents.discard(service_id)
+    return footprint
 
 
 def _redeploy_after_removal(
     service_id: str,
-    changed: set[str],
-    shared: set[str],
-    agents: set[str],
+    footprint: _Footprint,
     catalog: dict[str, Service],
     spms: dict[str, ServicePolicyModel],
     spm,
@@ -950,15 +966,16 @@ def _redeploy_after_removal(
     """The policy-model stage of ``quarantine`` and ``decommission`` (D23): redeploy the affected
     live services of ``side``, X (``service_id``) excluded, in one call, with the current role
     holders. Target side: the services whose SPM the purge changed, and the services whose SPM has
-    an edge of a shared role of X (``shared``, see ``_remove_footprint``). Agent side: ``agents``
-    (the agents that targeted X, and the remaining holders of a shared role of X), and the agents
-    among the changed and the shared services (their inbound ``source_roles[X]`` went); each is
-    re-derived from the store, from which SPM(X) is gone."""
+    an edge of a shared role of X (``footprint.changed`` and ``footprint.shared``). Agent side:
+    ``footprint.agents`` (the agents that targeted X, and the remaining holders of a shared role of
+    X), and the agents among the changed and the shared services (their inbound
+    ``source_roles[X]`` went); each is re-derived from the store, from which SPM(X) is gone."""
     live = _live_services(catalog) - {service_id}
+    touched = footprint.changed | footprint.shared
     if side == EnforcementSide.TARGET_SIDE:
-        _deploy((changed | shared) & live, spms)
+        _deploy(touched & live, spms)
         return
-    affected = agents | {sid for sid in changed | shared if _is_agent(catalog, sid)}
+    affected = footprint.agents | {sid for sid in touched if _is_agent(catalog, sid)}
     _deploy_agent_side(affected & live, spm, catalog)
 
 

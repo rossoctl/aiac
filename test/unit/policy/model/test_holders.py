@@ -45,33 +45,33 @@ def _spm(allow=(), deny=()):
 # Agent-kind roles — the live services in the catalog that hold the role.      #
 # --------------------------------------------------------------------------- #
 def test_an_agent_role_is_held_by_every_live_service_that_has_it():
-    holders = RoleHolders([_agent(_AGENT_2, SHARED), _agent(_AGENT_1, SHARED)])
+    holders = RoleHolders([_agent(_AGENT_2, SHARED), _agent(_AGENT_1, SHARED)], [])
 
     assert holders.of(_agent_role(SHARED.id, _AGENT_1)) == [_AGENT_1, _AGENT_2]  # sorted, not the stored copy
 
 
 def test_the_catalog_order_does_not_change_the_holders():
-    one = RoleHolders([_agent(_AGENT_1, SHARED), _agent(_AGENT_2, SHARED)])
-    two = RoleHolders([_agent(_AGENT_2, SHARED), _agent(_AGENT_1, SHARED)])
+    one = RoleHolders([_agent(_AGENT_1, SHARED), _agent(_AGENT_2, SHARED)], [])
+    two = RoleHolders([_agent(_AGENT_2, SHARED), _agent(_AGENT_1, SHARED)], [])
 
     assert one.of(SHARED) == two.of(SHARED) == [_AGENT_1, _AGENT_2]
 
 
 def test_a_disabled_service_is_not_a_holder():
-    holders = RoleHolders([_agent(_AGENT_1, SHARED), _agent(_AGENT_2, SHARED, enabled=False)])
+    holders = RoleHolders([_agent(_AGENT_1, SHARED), _agent(_AGENT_2, SHARED, enabled=False)], [])
 
     assert holders.of(SHARED) == [_AGENT_1]
 
 
 def test_the_focus_service_is_a_holder_while_it_is_disabled():
     # A re-onboarding applies before ``reenable_service``: the focus service counts as live.
-    holders = RoleHolders([_agent(_AGENT_1, SHARED, enabled=False)], focus_service=_AGENT_1)
+    holders = RoleHolders([_agent(_AGENT_1, SHARED, enabled=False)], [], focus_service=_AGENT_1)
 
     assert holders.of(SHARED) == [_AGENT_1]
 
 
 def test_an_agent_role_that_no_live_service_has_has_no_holder():
-    holders = RoleHolders([_agent(_AGENT_1)])
+    holders = RoleHolders([_agent(_AGENT_1)], [])
 
     assert holders.of(_agent_role(SHARED.id, _AGENT_1)) == []
 
@@ -112,7 +112,7 @@ def test_a_user_role_is_not_resolved_from_the_catalog():
 # --------------------------------------------------------------------------- #
 def test_refresh_role_sets_the_current_holders_on_a_copy():
     stale = _agent_role(SHARED.id, _AGENT_1)
-    holders = RoleHolders([_agent(_AGENT_1, SHARED), _agent(_AGENT_2, SHARED)])
+    holders = RoleHolders([_agent(_AGENT_1, SHARED), _agent(_AGENT_2, SHARED)], [])
 
     fresh = holders.refresh_role(stale)
 
