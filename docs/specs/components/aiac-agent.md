@@ -100,6 +100,11 @@ On handler failure, the consumer classifies the exception by **type**, not by HT
 
 - **Permanent** — `PolicyConflictError`, `PolicyContradictionError`, `PolicyRulesBuilderError`, `UnparseableLLMResponseError`, and `EnforcementPreconditionError` (a failed UC1 precondition check, D30). The consumer calls `term()` and routes the message to `aiac.apply.dlq` **immediately**. There is no redelivery, because the same input cannot succeed on a retry. A failed precondition check needs a fix in the cluster first. After the fix, the operator starts the onboarding again (see [`uc1-service-onboarding.md` → Precondition checks](aiac-agent/uc1-service-onboarding.md#precondition-checks-d30)).
 - **Retryable** — `LLMAccessError`, plus any genuinely unknown or transient error. The consumer does **not** ack. NATS redelivers after `AckWait`, up to `MAX_DELIVER` (5) deliveries, then routes the message to `aiac.apply.dlq`.
+- **Retryable, not visible yet** — `ServiceNotVisibleError` (UC1 only). The IdP still answers `404` for the new service after the Orchestrator's bounded wait on the first read (the event-before-commit race; see [`uc1-service-onboarding.md` → The first read waits for a new client](aiac-agent/uc1-service-onboarding.md#the-first-read-waits-for-a-new-client-d33)). The client can become visible some seconds later, so the consumer does not wait for `AckWait`:
+  - Below `MAX_DELIVER`, the consumer calls `nak(delay=…)` with the delay `AIAC_NOT_VISIBLE_NAK_DELAY_SECONDS` (default `30` s; see [Configuration](#configuration) below). NATS redelivers the message after the delay, not after `AckWait` (600 s). The consumer does not ack the message, and it does not call `term()`.
+  - Each nak uses one of the `MAX_DELIVER` (5) deliveries. At delivery 5, the consumer routes the message to `aiac.apply.dlq` and calls `term()`, with no nak, as for every other retryable error. With the default knobs, a service that the IdP never shows gets to the DLQ after about 260 s (≈4.3 min) plus the time of the reads: four times the 28 s wait of the Orchestrator (`ONBOARD_CLIENT_WAIT_*`) plus the 30 s delay, then one more 28 s wait.
+  - If the nak itself fails (for example, a dropped connection), the consumer logs the error and returns. The callback does not crash. The message stays unacked, so NATS redelivers it after `AckWait`.
+  - The consumer naks only this error class. `ServiceNotVisibleError` is a subclass of `HTTPException(502)`, and the consumer checks the type, not the status: a different `HTTPException(502)` (for example, an IdP outage) stays in the class above, with the redelivery after `AckWait`. `AckWait` stays `600` s, because it is sized for long LLM onboardings (`stream.py`).
 
 Both entry paths log through the shared `log_by_type` helper (`agent/shared/error_logging.py`), because FastAPI exception handlers do **not** fire on the NATS path.
 
@@ -116,6 +121,9 @@ Sharing one process also creates a **loop-starvation hazard**, which is why the 
 | Variable | Default | Source |
 |---|---|---|
 | `NATS_URL` | `nats://aiac-event-broker-service:4222` | ConfigMap (`aiac-pdp-config`) |
+| `AIAC_NOT_VISIBLE_NAK_DELAY_SECONDS` | `30` | env (optional; not set in `k8s/`; code default) — the nak delay, in seconds, for a `ServiceNotVisibleError` (see [Ack contract](#ack-contract)) |
+
+The consumer reads `AIAC_NOT_VISIBLE_NAK_DELAY_SECONDS` from the environment at each nak. A non-numeric, non-finite, zero or negative value falls back to the default (with a delay of `0`, nats-py sends a nak with no delay, and NATS redelivers at once). Keep the value well below `AckWait` (600 s). The JetStream consumer config (`AckWait` 600 s, `MAX_DELIVER` 5) does not change, and the nak delay needs no other consumer setting.
 
 ---
 
@@ -234,11 +242,14 @@ The `/apply/*` endpoints return bare HTTP status codes: `200 OK` on success (no 
 | `ONBOARD_LABEL_WAIT_BACKOFF` | `2.0` | env (optional; not set in `k8s/`; code default) |
 | `ONBOARD_CARD_WAIT_ATTEMPTS` | `15` | env (optional; not set in `k8s/`; code default) |
 | `ONBOARD_CARD_WAIT_BACKOFF` | `2.0` | env (optional; not set in `k8s/`; code default) |
+| `ONBOARD_CLIENT_WAIT_ATTEMPTS` | `15` | env (optional; not set in `k8s/`; code default) |
+| `ONBOARD_CLIENT_WAIT_BACKOFF` | `2.0` | env (optional; not set in `k8s/`; code default) |
 | `AIAC_MCP_DISCOVERY_READY_TIMEOUT` | `180` | env (optional; not set in `k8s/`; code default) — UC1 `analyze_tool`'s wait for the MCP endpoint and for the bootstrap CR; it covers the OPA bundle poll |
+| `AIAC_NOT_VISIBLE_NAK_DELAY_SECONDS` | `30` | env (optional; not set in `k8s/`; code default) — the NATS consumer's nak delay for a `ServiceNotVisibleError` (see [NATS Consumer → Ack contract](#ack-contract)) |
 | `AIAC_POLICY_FILE` | `/etc/aiac/policy.md` | env (optional; not set in `k8s/`; code default) |
 | `AIAC_RAG_INGEST_URL` | — | env (optional; `aiac-init` only; not set in `k8s/`) |
 
-`UPSTREAM_MAX_RETRIES` governs the IdP, MCP, and Kubernetes transport seams only. The `LLM_*` knobs govern the PRB's LLM seam (see [Error Handling → Two retry layers](#two-retry-layers)). The `ONBOARD_LABEL_WAIT_*` knobs bound UC1 `classify_service`'s wait for the operator-applied `rossoctl.io/type` pod label, and the `ONBOARD_CARD_WAIT_*` knobs bound `analyze_agent`'s wait for the agent's AgentCard `status.card.skills` to sync — **two separate deploy→onboard races** (see [`uc1-service-onboarding.md`](aiac-agent/uc1-service-onboarding.md)): up to `*_ATTEMPTS` looks, `*_BACKOFF` seconds apart (both default `15` / `2.0`, ≈30s of slack). A non-numeric or below-minimum value falls back to the default rather than crashing onboarding.
+`UPSTREAM_MAX_RETRIES` governs the IdP, MCP, and Kubernetes transport seams only. The `LLM_*` knobs govern the PRB's LLM seam (see [Error Handling → Two retry layers](#two-retry-layers)). The `ONBOARD_LABEL_WAIT_*` knobs bound UC1 `classify_service`'s wait for the operator-applied `rossoctl.io/type` pod label, and the `ONBOARD_CARD_WAIT_*` knobs bound `analyze_agent`'s wait for the agent's AgentCard `status.card.skills` to sync — **two separate deploy→onboard races** (see [`uc1-service-onboarding.md`](aiac-agent/uc1-service-onboarding.md)). The `ONBOARD_CLIENT_WAIT_*` knobs bound the UC1 Orchestrator's wait on the first `get_service`, when the IdP answers `404` for a new client that Keycloak has not committed yet — the event-before-commit race, D33 (see [`uc1-service-onboarding.md` → The first read waits for a new client](aiac-agent/uc1-service-onboarding.md#the-first-read-waits-for-a-new-client-d33)). Each wait makes up to `*_ATTEMPTS` looks, `*_BACKOFF` seconds apart (all three default `15` / `2.0`, ≈30s of slack). A non-numeric, non-finite (for example `inf`) or below-minimum value falls back to the default rather than crashing onboarding.
 
 **`AIAC_ENFORCEMENT_SIDE` and `AIAC_AC_MODEL` are different settings.** `AIAC_ENFORCEMENT_SIDE` tells **where** the check runs. Under target side, each callee (agent or tool) checks the access to itself in its own inbound OPA, from its own CR. Under agent side (the legacy method), each agent's outbound OPA checks the agent's calls to tools, and each tool gets a pass-through CR. `AIAC_AC_MODEL` names a **modeling paradigm** (RBAC, ABAC or REBAC), and no code reads it. One value of `AIAC_ENFORCEMENT_SIDE` applies to every callee, so the two sides never exist together (D16). The PDP Policy Writer does not read this variable: it reads the side from the tag of the policy model that it gets. A side change is a ConfigMap patch and a Controller restart (see [Start sequence](#start-sequence)).
 
@@ -252,7 +263,7 @@ ChromaDB collections: `aiac-policies` and `aiac-domain-knowledge`. **Status: not
 
 The Agent keeps two retry layers distinct.
 
-**Transport retries.** The Agent retries each upstream transport call up to `UPSTREAM_MAX_RETRIES` times with exponential backoff (`tenacity`) before the error propagates. The retry primitive is the project-level shared `run_upstream(fn)` helper (`aiac/shared/upstream.py`). It is transport-agnostic: it re-raises the original exception after the final attempt. The Agent applies retry at the **transport boundary**, not at the agent call sites — inside the idp-library `Configuration` (its `_request` helper), inside the provision MCP helper (`_mcp_tools_list`), and inside the provision Kubernetes seam (`uc/onboarding/provision/kube.py`). Each caller then maps the re-raised failure to the upstream status below.
+**Transport retries.** The Agent makes each upstream transport call up to `UPSTREAM_MAX_RETRIES` attempts in total (default `3`: the first attempt and two retries), with exponential backoff (`tenacity`; 1 s, 2 s, …, at most 30 s), before the error propagates. It retries only a transient failure: a connection error, a timeout or a `5xx`. A `4xx` is raised at once (see [`library-idp.md` → Transport retries](library-idp.md)). The retry primitive is the project-level shared `run_upstream(fn)` helper (`aiac/shared/upstream.py`). It is transport-agnostic: it re-raises the original exception after the final attempt. The Agent applies retry at the **transport boundary**, not at the agent call sites — inside the idp-library `Configuration` (its `_request` helper), inside the provision MCP helper (`_mcp_tools_list`), and inside the provision Kubernetes seam (`uc/onboarding/provision/kube.py`). Each caller then maps the re-raised failure to the upstream status below.
 
 **LLM-seam retries.** The Policy Rules Builder (PRB) retries its own LLM seam with dedicated knobs — `LLM_MAX_RETRIES`, `LLM_RETRY_BACKOFF_MIN`, and `LLM_RETRY_BACKOFF_MAX` (specified in [`aiac-agent/policy-rules-builder.md`](aiac-agent/policy-rules-builder.md)). `UPSTREAM_MAX_RETRIES` does **not** govern LLM calls. It stays for the IdP, MCP, and Kubernetes transport seams only.
 
@@ -268,7 +279,7 @@ The Agent keeps two retry layers distinct.
 
 ### Exception → HTTP status
 
-The PRB raises a typed exception hierarchy (specified in [`aiac-agent/policy-rules-builder.md`](aiac-agent/policy-rules-builder.md)). The UC1 precondition checks (D30) raise one more type, `EnforcementPreconditionError`. Each consuming caller maps the exception to an HTTP status.
+The PRB raises a typed exception hierarchy (specified in [`aiac-agent/policy-rules-builder.md`](aiac-agent/policy-rules-builder.md)). The UC1 precondition checks (D30) raise one more type, `EnforcementPreconditionError`, and the UC1 first read raises `ServiceNotVisibleError` (D33). Each consuming caller maps the exception to an HTTP status.
 
 | Exception | Raised where | HTTP status |
 |---|---|---|
@@ -279,6 +290,7 @@ The PRB raises a typed exception hierarchy (specified in [`aiac-agent/policy-rul
 | `PolicyContradictionError` | PRB `_audit`, genuine contradiction | `422` |
 | `PolicyConflictError` (carries a `ConflictReport`) | `ServicePolicyBuilder.build` (UC1) | `422` |
 | `EnforcementPreconditionError` (carries `failures: list[str]`) | UC1 Orchestrator, the precondition checks (D30), before Provision | `409` |
+| `ServiceNotVisibleError` (an `HTTPException`) | UC1 Orchestrator, the first `get_service`, when the IdP still answers `404` after the client wait (D33) | `502` |
 
 The base class `PolicyRulesBuilderBaseError` is a `500` safety net: any unforeseen PRB error still returns a defined status, not an untyped `500`. Both `LLMAccessError` and `UnparseableLLMResponseError` map to `502`, but they differ on the async path (see [Async failure classification](#async-failure-classification)). The HTTP status is decoupled from the async retry class.
 
@@ -292,7 +304,7 @@ Upstream failures and PRB exceptions propagate as HTTP error responses on the sy
 
 ### Async failure classification
 
-On the NATS path the failure class is decided by **exception type**, never by HTTP status code. Permanent failures route straight to the dead-letter subject; retryable failures are redelivered. See [NATS Consumer → Ack contract](#ack-contract).
+On the NATS path the failure class is decided by **exception type**, never by HTTP status code. Permanent failures route straight to the dead-letter subject; retryable failures are redelivered. `ServiceNotVisibleError` is the only retryable failure that the consumer naks with a delay. It answers `502` on the HTTP route, as a plain `HTTPException(502)` does, but the consumer tells the two apart by type. See [NATS Consumer → Ack contract](#ack-contract).
 
 ---
 
