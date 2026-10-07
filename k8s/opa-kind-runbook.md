@@ -716,10 +716,11 @@ built:
     the party performing the exchange — **not** the target audience.
   - `scopes` = the scopes the downstream token was minted with (the last hop).
   - `service_id` = the **downstream service** the token was minted for (the last
-    hop's target `audience` — here the `github-tool` SPIFFE ID). This mirrors the
-    inbound identity, where `jwt-validation` surfaces the validated JWT's
-    audience; on the outbound leg the equivalent "who is this token for" signal
-    is the exchange target, exposed as `service_id`. The agent-side outbound
+    hop's target `audience` — here the `github-tool` SPIFFE ID). The inbound
+    identity has no such field: the OPA plugin puts only `subject`, `client_id`
+    and `scopes` into the inbound `input.identity`. On the outbound leg, the
+    "who is this token for" signal is the exchange target, exposed as
+    `service_id`. The agent-side outbound
     package keys on it via `target_allow_scopes[input.identity.service_id]`;
     the target-side pass-through does not read it. Omitted when the last hop is
     a non-exchange hop that recorded no audience.
