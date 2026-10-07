@@ -85,6 +85,8 @@ Accepts no body. UC-1 Provision calls it at each onboarding, for agents and tool
 
 Why the scope: the Keycloak standard token exchange (V2) applies only the scopes of the requester client (the agent). So the `username-to-sub` mapper of the login client (`rossoctl`) never gets into an exchanged token, but the mapper of a scope that is linked to the agent client does. The endpoint links the scope only to the client `service_id`. It never changes another client (the login client `rossoctl` keeps its own mapper and does not get the scope), and it never makes the scope a realm default scope. If the scope or its mapper is deleted, the next onboarding creates it again. If the mapper is changed, the next onboarding changes it back. See [the analysis](../../analysis/user-subject-across-token-exchange.md) (§1.5, §8.1).
 
+Limits of the link: (1) the mapping follows the requester, so every token that a managed agent exchanges gets `sub` = the username, for every audience of its routes, also a target that AIAC does not manage (a client-credentials token of the agent gets `service-account-<clientId>`); (2) AuthBridge caches each exchanged token until 30 s before it expires, so after a late link a token from before the link can still carry the user ID until it expires (or until the agent pod restarts). See [D31 → Known limits](../PRD.md#6-rossoctl--keycloak--opa-interfaces).
+
 `POST /roles`:
 Accepts JSON body `{"name": ..., "description": ...}`. It:
 1. Calls `admin.create_realm_role({"name": ..., "description": ..., "attributes": {"aiac.managed": ["true"]}})` to create the role at realm level. The `aiac.managed` attribute is the AIAC provisioning marker (realm-role attribute values are lists of strings).
