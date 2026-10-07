@@ -24,9 +24,10 @@
              and the later keycloak-services advisories, are provided-scope
              (Keycloak supplies these jars at runtime) — they don't ship in the
              shaded provider jar. keycloak-services is deliberately NOT a
-             dependency here: this SPI imports only org.keycloak.Config (core),
+             dependency of the SPI code: it imports only org.keycloak.Config (core),
              org.keycloak.models.* (server-spi), and org.keycloak.events.*
-             (server-spi-private). -->
+             (server-spi-private). It is a test-scope dependency only (see
+             below). -->
         <keycloak.version>26.7.3</keycloak.version>
         <!-- Verify against Maven Central at implementation/upgrade time. -->
         <jnats.version>2.20.6</jnats.version>
@@ -34,6 +35,9 @@
              provided-scope so it isn't shaded. Was previously pulled transitively
              via keycloak-services (dropped). -->
         <jboss.logging.version>3.6.3.Final</jboss.logging.version>
+        <!-- Test-only: mocks KeycloakSession / KeycloakTransactionManager / the jnats Connection
+             in AiacEventListenerProviderTest. -->
+        <mockito.version>5.24.0</mockito.version>
     </properties>
 
     <dependencies>
@@ -74,6 +78,38 @@
             <artifactId>junit-jupiter</artifactId>
             <version>5.11.3</version>
             <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.mockito</groupId>
+            <artifactId>mockito-core</artifactId>
+            <version>${mockito.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.mockito</groupId>
+            <artifactId>mockito-junit-jupiter</artifactId>
+            <version>${mockito.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <!-- Test-only: Keycloak's own DefaultKeycloakTransactionManager, for
+             AiacEventListenerProviderKeycloakManagerTest. It pins the commit order that the
+             publish-after-commit design (D33) depends on: the main transactions commit first, the
+             after-completion transactions after them, and a failed main commit rolls the
+             after-completion transactions back. Test scope, so it is not shaded and does not ship.
+             No transitive dependency: the manager needs only the provided Keycloak SPI jars,
+             jboss-logging and opentelemetry-api (from server-spi-private). To drop it, remove this
+             dependency and that test class; the mocked tests stay. -->
+        <dependency>
+            <groupId>org.keycloak</groupId>
+            <artifactId>keycloak-services</artifactId>
+            <version>${keycloak.version}</version>
+            <scope>test</scope>
+            <exclusions>
+                <exclusion>
+                    <groupId>*</groupId>
+                    <artifactId>*</artifactId>
+                </exclusion>
+            </exclusions>
         </dependency>
     </dependencies>
 
