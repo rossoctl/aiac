@@ -12,6 +12,7 @@ missing/invalid label — actionable, never silent.
 """
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from fastapi import HTTPException
@@ -236,7 +237,9 @@ def classify_service(state: OnboardingProvisionState) -> dict:
     }
 
 
-def await_labelled_pods(namespace: str, workload_name: str, settled=None) -> tuple[ServiceType, list]:
+def await_labelled_pods(
+    namespace: str, workload_name: str, settled: Callable[[ServiceType, list], bool] | None = None
+) -> tuple[ServiceType, list]:
     """The service type (from the operator's ``rossoctl.io/type`` pod label) and the live (not
     terminating) pods of ``workload_name``, tolerating the deploy->onboard RACE (the pod or its label
     may not be there yet — see the module knobs above).
