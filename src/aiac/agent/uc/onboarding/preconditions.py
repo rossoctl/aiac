@@ -42,15 +42,8 @@ from aiac.idp.configuration.models import Service, ServiceType
 from aiac.policy.computation import enforcement_side
 from aiac.policy.model.models import EnforcementSide
 
-from .provision.kube import is_not_found, list_pods, read_configmap
-from .provision.nodes import (
-    LABEL_WAIT,
-    label_missing_detail,
-    owned_pods,
-    pod_service_type,
-    poll_until_ready,
-    split_client_name,
-)
+from .provision.kube import is_not_found, read_configmap
+from .provision.nodes import await_labelled_pods, split_client_name
 
 SIDECAR_CONTAINER = "authbridge-proxy"
 PIPELINE_CONFIGMAP = "authbridge-runtime-config"
@@ -104,41 +97,18 @@ def _checks_apply(side: EnforcementSide, service_type: ServiceType) -> bool:
 
 
 def _await_pods(namespace: str, workload: str, side: EnforcementSide) -> tuple[ServiceType, list]:
-    """The type and the live (not terminating) pods of ``workload``, with the bounded re-poll.
+    """The type and the live (not terminating) pods of ``workload``, with Provision's bounded
+    re-poll (:func:`await_labelled_pods`).
 
     The poll ends early when a labelled pod is there and, if the checks apply to the type (see
     :func:`_checks_apply`), every pod passes #1 and #6. When the budget ends, the last-seen pods are
     returned (so #1 / #6 report them), or, if no labelled pod was seen at the last look,
     ``HTTPException(502)`` (as ``classify_service``)."""
-    no_pod_detail = f"no pod owned by workload {workload!r} in namespace {namespace!r}"
-    detail = no_pod_detail
-    last: tuple[ServiceType, list] | None = None
 
-    def _probe():
-        nonlocal detail, last
-        detail, last = no_pod_detail, None
-        try:
-            items = list_pods(namespace)
-        except Exception as e:
-            raise HTTPException(502, f"Kubernetes pod LIST failed in namespace {namespace!r}: {e}")
-        pods = [p for p in owned_pods(items, workload) if getattr(p.metadata, "deletion_timestamp", None) is None]
-        if not pods:
-            return None
-        service_type = pod_service_type(pods[0], workload)  # an invalid label raises 502 now
-        if service_type is None:
-            detail = label_missing_detail(workload, pods[0])
-            return None
-        last = (service_type, pods)
-        if not _checks_apply(side, service_type):
-            return last
-        return None if _check_sidecar(pods, namespace) or _check_probes(pods) else last
+    def _settled(service_type: ServiceType, pods: list) -> bool:
+        return not _checks_apply(side, service_type) or not (_check_sidecar(pods, namespace) or _check_probes(pods))
 
-    ready = poll_until_ready(_probe, LABEL_WAIT)
-    if ready is not None:
-        return ready
-    if last is not None:
-        return last
-    raise HTTPException(502, detail)
+    return await_labelled_pods(namespace, workload, _settled)
 
 
 def _pod_name(pod) -> str:

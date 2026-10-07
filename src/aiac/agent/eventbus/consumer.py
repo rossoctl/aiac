@@ -21,7 +21,6 @@ Controller stops before it serves.
 import asyncio
 import functools
 import logging
-import math
 import os
 from contextlib import asynccontextmanager
 from urllib.parse import unquote
@@ -48,6 +47,7 @@ from aiac.agent.policy_rules_builder.graph import (
     PolicyRulesBuilderError,
     UnparseableLLMResponseError,
 )
+from aiac.agent.shared.env import env_num
 from aiac.agent.shared.error_logging import log_by_type
 from aiac.agent.uc.onboarding.orchestrator import ServiceNotVisibleError, onboard_service, reenable_service
 from aiac.agent.uc.onboarding.preconditions import EnforcementPreconditionError
@@ -98,11 +98,8 @@ _NOT_VISIBLE_NAK_DELAY_DEFAULT = 30.0
 def _not_visible_nak_delay() -> float:
     """The nak delay in seconds for a not-visible service; an unset, non-numeric, non-finite, zero
     or negative value falls back to the default (nats-py sends a plain nak, with no delay, for 0)."""
-    try:
-        value = float(os.getenv(_NOT_VISIBLE_NAK_DELAY_ENV, str(_NOT_VISIBLE_NAK_DELAY_DEFAULT)))
-    except (TypeError, ValueError):
-        return _NOT_VISIBLE_NAK_DELAY_DEFAULT
-    return value if math.isfinite(value) and value > 0 else _NOT_VISIBLE_NAK_DELAY_DEFAULT
+    delay = env_num(_NOT_VISIBLE_NAK_DELAY_ENV, _NOT_VISIBLE_NAK_DELAY_DEFAULT, float, minimum=0.0)
+    return delay if delay > 0 else _NOT_VISIBLE_NAK_DELAY_DEFAULT
 
 
 async def _nak_not_visible(msg: Msg) -> None:

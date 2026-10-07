@@ -13,10 +13,11 @@ from kubernetes import client, config
 
 from aiac.shared.upstream import run_upstream
 
-_AGENTCARD_GROUP = "agent.rossoctl.dev"
-_AGENTCARD_VERSION = "v1alpha1"
+# The rossoctl CRD group and version: the AgentCard and the AuthorizationPolicy CRs use both.
+_ROSSOCTL_GROUP = "agent.rossoctl.dev"
+_ROSSOCTL_VERSION = "v1alpha1"
 _AGENTCARD_PLURAL = "agentcards"
-_AUTHZ_POLICY_PLURAL = "authorizationpolicies"  # same group and version as the AgentCard CRs
+_AUTHZ_POLICY_PLURAL = "authorizationpolicies"
 
 
 # --------------------------------------------------------------------------- #
@@ -58,8 +59,8 @@ def list_agentcards(namespace: str | None) -> dict:
     """List AgentCard CRs in ``namespace`` (raw dict response), with bounded transport retries."""
     return run_upstream(
         lambda: _custom_objects().list_namespaced_custom_object(
-            group=_AGENTCARD_GROUP,
-            version=_AGENTCARD_VERSION,
+            group=_ROSSOCTL_GROUP,
+            version=_ROSSOCTL_VERSION,
             namespace=namespace,
             plural=_AGENTCARD_PLURAL,
         )
@@ -75,8 +76,8 @@ def read_authorization_policy(name: str, namespace: str) -> dict:
     """A single ``AuthorizationPolicy`` CR by name (raw dict response), with bounded transport retries."""
     return run_upstream(
         lambda: _custom_objects().get_namespaced_custom_object(
-            group=_AGENTCARD_GROUP,
-            version=_AGENTCARD_VERSION,
+            group=_ROSSOCTL_GROUP,
+            version=_ROSSOCTL_VERSION,
             namespace=namespace,
             plural=_AUTHZ_POLICY_PLURAL,
             name=name,
