@@ -71,9 +71,9 @@ AIAC enforces a strict three-layer model:
 | **Policy Decision (PDP)** | OPA | Evaluates the Rego rules that AIAC renders; decides what a caller may access |
 | **Policy Enforcement (PEP)** | AuthBridge | Intercepts traffic; exchanges tokens; carries no policy knowledge |
 
-The PEP (AuthBridge) is a pure enforcement layer. It performs RFC 8693 token exchanges sending only the target `audience` — no `scope` parameter. OPA evaluates the caller's role against the Rego rules and returns an allow/deny decision for the request (default deny; for each invoked MCP tool: in the tool's inbound under target side, in the calling agent's outbound under agent side); the IdP (Keycloak, via AuthBridge) issues the exchanged token for the target `audience`.
+The PEP (AuthBridge) is a pure enforcement layer. It performs RFC 8693 token exchanges for the target `audience`, and it sends a `scope` parameter only when the route has `token_scopes`. OPA evaluates the caller's role against the Rego rules and returns an allow/deny decision for the request (default deny; for each invoked MCP tool: in the tool's inbound under target side, in the calling agent's outbound under agent side); the IdP (Keycloak, via AuthBridge) issues the exchanged token for the target `audience`.
 
-This means `token_scopes` is absent from `authproxy-routes`. Route configuration carries routing intent only (`host` → `target_audience`). Policy intent lives entirely in OPA, kept current by AIAC.
+AIAC needs no `token_scopes` in `authproxy-routes`. The routes that the operator generates have none. A hand-written route can set it: the UC-1 route of the system harness and of the runbook asks for the audience scope of the tool (`…-aud`), and the demo `github-agent` route also asks for `github-full-access`, which the production `github-tool` reads to select a GitHub PAT. These scopes are outside the AIAC policy: the Rego that AIAC renders reads only `input.identity.subject`, `client_id` and `service_id`, never the scopes of the token. Route configuration carries routing intent (`host` → `target_audience`). The AIAC policy intent lives entirely in OPA, kept current by AIAC.
 
 ### Enforcement side
 
