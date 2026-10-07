@@ -162,6 +162,59 @@ class TestCandidateRoles:
         assert [s.id for s in result.other_scopes] == ["other-scope-id"]
 
 
+class TestSharedRoles:
+    """A realm role that more than one service holds (a shared role, D32). ``GET /services/{id}/roles``
+    gives each service's copy with ``actorIds`` = only that service. The candidate is one role with
+    every current holder (the same ``RoleHolders`` rule as the PCE render)."""
+
+    TEAM1 = "spiffe://localtest.me/ns/team1/sa/github-agent"
+    TEAM2 = "spiffe://localtest.me/ns/team2/sa/github-agent"
+
+    def _holder(self, client_id, role, *, enabled=True):
+        copy = role.model_copy(update={"actorIds": [client_id]})
+        return _service(
+            f"uuid-{client_id}", ref=client_id, roles=[copy], service_type=ServiceType.AGENT, enabled=enabled
+        )
+
+    def test_a_role_that_two_other_services_hold_is_one_candidate_with_both_holders(self):
+        # One entry for each role id: the PRB prompt lists each candidate role once.
+        shared = _role("github-agent.source_operations", role_id="shared-id", kind=RoleKind.AGENT)
+        focus = _service(FOCUS_ID, scopes=[_scope("github-tool.source-read", service_id=FOCUS_ID)])
+
+        result = _resolve(
+            ServiceType.TOOL,
+            services=[focus, self._holder(self.TEAM2, shared), self._holder(self.TEAM1, shared)],
+            subjects=[],
+        )
+
+        assert [(r.id, r.actorIds) for r in result.candidate_roles] == [("shared-id", [self.TEAM1, self.TEAM2])]
+
+    def test_a_disabled_holder_is_not_merged(self):
+        shared = _role("github-agent.source_operations", role_id="shared-id", kind=RoleKind.AGENT)
+        focus = _service(FOCUS_ID)
+
+        result = _resolve(
+            ServiceType.TOOL,
+            services=[focus, self._holder(self.TEAM1, shared), self._holder(self.TEAM2, shared, enabled=False)],
+            subjects=[],
+        )
+
+        assert [(r.id, r.actorIds) for r in result.candidate_roles] == [("shared-id", [self.TEAM1])]
+
+    def test_a_user_role_keeps_its_members(self):
+        # The members that GET /roles gives (sorted, as the render gives them), once for the role.
+        developer = _role("developer", role_id="dev-id").model_copy(update={"actorIds": ["bob", "alice"]})
+        focus = _service(FOCUS_ID)
+
+        result = _resolve(
+            ServiceType.TOOL,
+            services=[focus],
+            subjects=[_subject("alice", roles=[developer]), _subject("bob", roles=[developer])],
+        )
+
+        assert [(r.id, r.actorIds) for r in result.candidate_roles] == [("dev-id", ["alice", "bob"])]
+
+
 class TestServiceType:
     def test_service_type_echoed_from_parameter_not_focus_type(self):
         # focus.type is TOOL, but the requested classification is AGENT — the result must carry
