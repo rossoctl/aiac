@@ -15,6 +15,7 @@ mocked at the engine's import boundary via a small in-memory ``FakeStore`` that 
 real Policy Store library (fresh-empty SPM on 404, ``get_service_policies_by_role`` scanning both
 inbound lists, ``list_service_policies`` returning every stored SPM):
   - ``Configuration.get_services``                          (IdP catalog: type + own roles/scopes)
+  - ``Configuration.get_roles``                             (the current members of each user role)
   - ``engine.get_service_policy`` / ``get_service_policies_by_role`` / ``list_service_policies`` /
     ``apply_service_policy`` / ``delete_service_policy``    (Policy Store library)
   - ``engine.apply_policy`` / ``replace_policy`` / ``delete_service_cr``  (PDP Policy Writer library)
@@ -43,6 +44,7 @@ from aiac.policy.model.models import (
     ServicePolicyModel,
     TargetSidePolicyModel,
 )
+from aiac.policy.model.projection import project_inbound
 
 
 # --------------------------------------------------------------------------- #
@@ -230,21 +232,39 @@ _BOUNDARY = (
 
 
 @contextmanager
-def engine_env(catalog, store):
-    """Patch the engine boundary; yield ``compute_and_apply``. Multiple calls share the store."""
+def engine_env(catalog, store, roles=None):
+    """Patch the engine boundary; yield ``compute_and_apply``. Multiple calls share the store.
+
+    ``Configuration.get_roles`` (the current members of each user role, D32) gives ``roles`` when the
+    test gives them. Else the realm agrees with every snapshot the test gives: each User-kind role in
+    the store and in the rules given so far, with its own ``actorIds`` (the latest rule wins). A test
+    that changes the membership of a user role gives ``roles``."""
+    given: dict[str, Role] = {}
+
+    def get_roles():
+        if roles is not None:
+            return list(roles)
+        found = {r.role.id: r.role for m in store.data.values() for r in _inbound(m) if r.role.kind == RoleKind.USER}
+        return list({**found, **given}.values())
+
     with ExitStack() as stack:
         stack.enter_context(patch.dict(os.environ, {"KEYCLOAK_REALM": "test-realm"}))
         stack.enter_context(patch.object(Configuration, "get_services", return_value=list(catalog)))
+        stack.enter_context(patch.object(Configuration, "get_roles", side_effect=get_roles))
         for name in _BOUNDARY:
             stack.enter_context(patch(f"aiac.policy.computation.engine.{name}", side_effect=getattr(store, name)))
         from aiac.policy.computation.engine import compute_and_apply
 
-        yield compute_and_apply
+        def compute(rules, *args, **kwargs):
+            given.update({r.role.id: r.role for r in rules if r.role.kind == RoleKind.USER})
+            return compute_and_apply(rules, *args, **kwargs)
+
+        yield compute
 
 
-def run_engine(rules, *, catalog=None, store_initial=None, override=False, focus_service=None) -> FakeStore:
+def run_engine(rules, *, catalog=None, store_initial=None, override=False, focus_service=None, roles=None) -> FakeStore:
     store = FakeStore(store_initial)
-    with engine_env(catalog or [], store) as compute_and_apply:
+    with engine_env(catalog or [], store, roles) as compute_and_apply:
         if focus_service is None:
             compute_and_apply(rules, override=override)
         else:
@@ -2079,13 +2099,26 @@ def run_resync(*, catalog, store) -> FakeStore:
     return store
 
 
+def _without_holder(model, role_id):
+    """``model`` with no holder on the edges of ``role_id`` — a role whose only holder is disabled
+    (D32: the render uses the current holders, and a disabled service is not one)."""
+    fresh = model.model_copy(deep=True)
+    for edge in _inbound(fresh):
+        if edge.role.id == role_id:
+            edge.role.actorIds = []
+    return fresh
+
+
 def test_resync_replaces_every_cr_with_the_live_stored_spms():
     catalog, initial = _resync_fixture()
     store = run_resync(catalog=catalog, store=FakeStore(initial))
 
-    # one PUT; the disabled and the absent services are not in it (the PUT deletes their CRs)
+    # one PUT; the disabled and the absent services are not in it (the PUT deletes their CRs), and
+    # the disabled failed-agent is not a holder of its role on the tool
     assert store.policy_replaces == [
-        TargetSidePolicyModel(services=[initial["github-agent"], initial["github-tool"]]),
+        TargetSidePolicyModel(
+            services=[initial["github-agent"], _without_holder(initial["github-tool"], "r-failed-src")]
+        ),
     ]
 
 
@@ -2224,14 +2257,16 @@ def test_policy_model_for_returns_the_stored_spm_as_the_only_entry():
     catalog, initial = _resync_fixture()
     store = FakeStore(initial)
 
+    # the stored SPM with the current holders: the disabled failed-agent is not one
     assert _read_model("github-tool", store=store, catalog=catalog) == TargetSidePolicyModel(
-        services=[initial["github-tool"]]
+        services=[_without_holder(initial["github-tool"], "r-failed-src")]
     )
     assert store.calls == []  # writes nothing
 
 
 def test_agent_side_policy_model_for_an_agent_is_its_apm(agent_side):
-    # Derived from the store, as at a deploy; the stored SPM gives the type and the identity.
+    # Derived from the store, as at a deploy; the stored SPM gives the type and the identity. The
+    # catalog gives the current holders (D32).
     catalog, initial = _resync_fixture()
     store = FakeStore(initial)
 
@@ -2239,7 +2274,7 @@ def test_agent_side_policy_model_for_an_agent_is_its_apm(agent_side):
     AS = initial["github-agent"].owned_scopes[0]
     UR = initial["github-agent"].inbound_allow_rules[0].role
     TS = initial["github-tool"].owned_scopes[0]
-    assert _read_model("github-agent", store=store) == AgentSidePolicyModel(
+    assert _read_model("github-agent", store=store, catalog=catalog) == AgentSidePolicyModel(
         agents=[
             AgentPolicyModel(
                 agent_id="github-agent",
@@ -2416,6 +2451,7 @@ _ENTRY_POINTS = {
     "resync": lambda pce: pce.resync(),
     "bootstrap": lambda pce: pce.bootstrap("github-tool", ServiceType.TOOL),
     "policy_model_for": lambda pce: pce.policy_model_for("github-agent"),
+    "rerender_role": lambda pce: pce.rerender_role("r-agent-src"),
 }
 
 
@@ -2429,9 +2465,363 @@ def test_an_unknown_side_raises_from_every_entry_point_and_writes_nothing(monkey
     with (
         engine_env(catalog, store),
         patch.object(Configuration, "get_services", side_effect=AssertionError("read the IdP")),
+        patch.object(Configuration, "get_roles", side_effect=AssertionError("read the IdP")),
         pytest.raises(ValueError, match="AIAC_ENFORCEMENT_SIDE"),
     ):
         _ENTRY_POINTS[entry_point](policy.computation)
 
     assert store.calls == []
     assert store.data == initial
+
+
+# =========================================================================== #
+# Render-time role holders (D32; handoff 19, Bug 1 and Bug 4). A stored edge   #
+# keeps a copy of ``Role.actorIds`` from the run that built it (a snapshot).   #
+# Every render uses the current holders instead: an Agent-kind role is held by #
+# each live service in the catalog that has it, and a User-kind role by the    #
+# members that get_roles() gives now. A membership change needs no PRB run.    #
+# =========================================================================== #
+_A1 = "spiffe://localtest.me/ns/team1/sa/github-agent"
+_A2 = "spiffe://localtest.me/ns/team2/sa/github-agent"
+_T1 = "spiffe://localtest.me/ns/team1/sa/github-tool"
+
+
+def _shared(*holders) -> Role:
+    """The shared realm role ``github-agent.source_operations`` (Provision reuses it by name in team1
+    and team2). ``GET /services/{id}/roles`` gives each service's copy with only that service."""
+    return _role("r-src-op", "github-agent.source_operations", kind=RoleKind.AGENT, actor_ids=list(holders))
+
+
+def _source_read() -> Scope:
+    return _scope("s-source-read", "github-tool.source-read", service_id=_T1)
+
+
+def _sharing_catalog(*, a2_enabled=True):
+    """Both agents hold the shared role; the tool owns the scope."""
+    return [
+        _agent(_A1, roles=[_shared(_A1)]),
+        _agent(_A2, roles=[_shared(_A2)], enabled=a2_enabled),
+        _tool(_T1, scopes=[_source_read()]),
+    ]
+
+
+def _stored_tool(*rules) -> ServicePolicyModel:
+    return _spm(_T1, type=ServiceType.TOOL, owned_scopes=[_source_read()], inbound=list(rules))
+
+
+def _source_roles(model):
+    """The callers that the target-side CR of ``model`` names (the writer's ``project_inbound``)."""
+    return {caller: [r.id for r in roles] for caller, roles in project_inbound(model).source_roles.items()}
+
+
+def _subject_roles(model):
+    return {user: [r.id for r in roles] for user, roles in project_inbound(model).subject_roles.items()}
+
+
+def _render_tool(path, *, catalog, initial, roles=None, role_id="r-src-op") -> ServicePolicyModel:
+    """Run one render path that makes no PRB call, and return the tool's target-side entry that it
+    deploys: ``rerender_role`` (the role-members event), ``resync`` (the Controller start), or an
+    unrelated ``compute_and_apply`` (a new user rule on the tool)."""
+    store = FakeStore(initial)
+    with engine_env(catalog, store, roles) as compute:
+        from aiac.policy import computation
+
+        if path == "rerender_role":
+            computation.rerender_role(role_id)
+        elif path == "resync":
+            computation.resync()
+        else:
+            compute([_rule(_user_role("r-user-ops", "ops", users=["ops-user"]), _source_read())])
+    pushes = store.policy_replaces if path == "resync" else store.policy_pushes
+    return next(spm for push in pushes for spm in push.services if spm.service_id == _T1)
+
+
+_RENDER_PATHS = ["rerender_role", "resync", "compute_and_apply"]
+
+
+# ---- Bug 1: every holder of a shared role is in the tool CR --------------- #
+@pytest.mark.parametrize("first, second", [(_A1, _A2), (_A2, _A1)], ids=["team1-first", "team2-first"])
+def test_both_onboarding_orders_put_every_holder_of_a_shared_role_in_the_tool_cr(first, second):
+    # Each agent's build sees only its own copy of the role, so the second rule is a duplicate of
+    # the first (same role, scope and effect). The tool's CR still names both holders.
+    TS = _source_read()
+    tool = _tool(_T1, scopes=[TS])
+    agents = {sid: _agent(sid, roles=[_shared(sid)]) for sid in (_A1, _A2)}
+    store = FakeStore({_T1: _stored_tool()})
+    with engine_env([tool, agents[first]], store) as compute:
+        compute([_rule(_shared(first), TS)], focus_service=first)
+    with engine_env([tool, agents[first], agents[second]], store) as compute:
+        compute([_rule(_shared(second), TS)], focus_service=second)
+
+    assert _source_roles(store.pushed_service(_T1)) == {_A1: ["r-src-op"], _A2: ["r-src-op"]}
+    assert store.data[_T1] == _stored_tool(_rule(_shared(_A1, _A2), TS))  # the same in both orders
+
+
+def test_a_duplicate_rule_whose_holders_are_current_writes_and_deploys_nothing():
+    TS = _source_read()
+    initial = {_T1: _stored_tool(_rule(_shared(_A1, _A2), TS))}
+    store = run_engine([_rule(_shared(_A2), TS)], catalog=_sharing_catalog(), store_initial=initial)
+
+    assert store.calls == []
+
+
+@pytest.mark.parametrize("path", _RENDER_PATHS)
+def test_a_holder_added_later_is_in_the_next_render(path):
+    # The stored edge is the old snapshot (team1 only); team2 got the role after the rule was stored.
+    initial = {_T1: _stored_tool(_rule(_shared(_A1), _source_read()))}
+    tool = _render_tool(path, catalog=_sharing_catalog(), initial=initial)
+
+    assert _source_roles(tool) == {_A1: ["r-src-op"], _A2: ["r-src-op"]}
+
+
+@pytest.mark.parametrize("path", _RENDER_PATHS)
+@pytest.mark.parametrize("gone", ["disabled", "absent", "unassigned"])
+def test_a_removed_or_disabled_holder_is_gone_from_the_next_render(path, gone):
+    catalog = {
+        "disabled": _sharing_catalog(a2_enabled=False),
+        "absent": [svc for svc in _sharing_catalog() if svc.serviceId != _A2],
+        "unassigned": [_agent(_A1, roles=[_shared(_A1)]), _agent(_A2), _tool(_T1, scopes=[_source_read()])],
+    }[gone]
+    initial = {_T1: _stored_tool(_rule(_shared(_A1, _A2), _source_read()))}
+    tool = _render_tool(path, catalog=catalog, initial=initial)
+
+    assert _source_roles(tool) == {_A1: ["r-src-op"]}
+
+
+# ---- Bug 4: the members of a user role ------------------------------------ #
+def _developer(*users) -> Role:
+    return _user_role("r-user-dev", "developer", users=list(users))
+
+
+@pytest.mark.parametrize("path", ["rerender_role", "resync"])
+def test_a_user_who_gets_a_role_after_the_rule_was_stored_is_in_subject_roles(path):
+    initial = {_T1: _stored_tool(_rule(_developer("dev-user"), _source_read()))}
+    roles = [_developer("dev-user", "new-user")]
+    tool = _render_tool(path, catalog=_sharing_catalog(), initial=initial, roles=roles, role_id="r-user-dev")
+
+    assert _subject_roles(tool) == {"dev-user": ["r-user-dev"], "new-user": ["r-user-dev"]}
+
+
+@pytest.mark.parametrize("path", ["rerender_role", "resync"])
+def test_a_user_who_loses_a_role_is_not_in_subject_roles(path):
+    # The revocation reaches the CR, although the stored snapshot still names dev-user.
+    initial = {_T1: _stored_tool(_rule(_developer("dev-user", "ops-user"), _source_read()))}
+    roles = [_developer("ops-user")]
+    tool = _render_tool(path, catalog=_sharing_catalog(), initial=initial, roles=roles, role_id="r-user-dev")
+
+    assert _subject_roles(tool) == {"ops-user": ["r-user-dev"]}
+
+
+def test_a_user_role_that_get_roles_does_not_list_has_no_holder():
+    # A deleted role: fail closed, no user keeps its grant.
+    initial = {_T1: _stored_tool(_rule(_developer("dev-user"), _source_read()))}
+    tool = _render_tool("resync", catalog=_sharing_catalog(), initial=initial, roles=[])
+
+    assert _subject_roles(tool) == {}
+
+
+# ---- rerender_role (R7) ---------------------------------------------------- #
+def _rerender_fixture():
+    """The shared role has edges on the live tool, on a disabled tool and on a tool that is absent
+    from the catalog (deleted). other-tool has no edge of the role."""
+    TS = _source_read()
+    DS = _scope("s-disabled-read", service_id="disabled-tool")
+    GS = _scope("s-ghost-read", service_id="ghost-tool")
+    OS = _scope("s-other-read", service_id="other-tool")
+    stale = _shared(_A1)
+    initial = {
+        _T1: _stored_tool(_rule(stale, TS), _rule(_developer("dev-user"), TS)),
+        "disabled-tool": _spm("disabled-tool", type=ServiceType.TOOL, owned_scopes=[DS], inbound=[_rule(stale, DS)]),
+        "ghost-tool": _spm("ghost-tool", type=ServiceType.TOOL, owned_scopes=[GS], inbound=[_rule(stale, GS)]),
+        "other-tool": _spm(
+            "other-tool", type=ServiceType.TOOL, owned_scopes=[OS], inbound=[_rule(_developer("dev-user"), OS)]
+        ),
+    }
+    catalog = _sharing_catalog() + [
+        _tool("disabled-tool", scopes=[DS], enabled=False),
+        _tool("other-tool", scopes=[OS]),
+    ]
+    return catalog, initial
+
+
+def run_rerender(role_id, *, catalog, store, roles=None) -> FakeStore:
+    with engine_env(catalog, store, roles):
+        from aiac.policy.computation import rerender_role
+
+        rerender_role(role_id)
+    return store
+
+
+def test_rerender_role_applies_the_live_spms_that_have_the_role_and_writes_no_spm():
+    catalog, initial = _rerender_fixture()
+    store = run_rerender("r-src-op", catalog=catalog, store=FakeStore(initial))
+
+    TS = _source_read()
+    expected = _stored_tool(_rule(_shared(_A1, _A2), TS), _rule(_developer("dev-user"), TS))
+    assert store.policy_pushes == [TargetSidePolicyModel(services=[expected])]
+    assert [op for op, _ in store.calls] == ["apply_policy"]  # no SPM write, no CR delete, no PUT
+    assert store.data == initial  # the stored snapshot stays
+    assert [r.id for r in store.by_role_calls] == ["r-src-op"]
+
+
+def test_rerender_role_of_a_role_that_no_spm_has_makes_no_call():
+    catalog, initial = _rerender_fixture()
+    store = run_rerender("r-unused", catalog=catalog, store=FakeStore(initial))
+
+    assert store.calls == []
+
+
+def test_agent_side_rerender_role_rederives_every_live_stored_agent(agent_side):
+    # An agent that lost the role cannot be found from the current holders, so every live stored
+    # agent is re-derived, in one call. The disabled agent and the tools get nothing.
+    TS = _source_read()
+    catalog = _sharing_catalog() + [_agent("failed-agent", enabled=False)]
+    initial = {
+        _T1: _stored_tool(_rule(_shared(_A1), TS)),
+        _A1: _spm(_A1, owned_roles=[_shared(_A1)]),
+        _A2: _spm(_A2, owned_roles=[_shared(_A2)]),
+        "failed-agent": _spm("failed-agent"),
+    }
+    store = run_rerender("r-src-op", catalog=catalog, store=FakeStore(initial))
+
+    def apm(agent_id):
+        return AgentPolicyModel(
+            agent_id=agent_id,
+            agent_roles=[_shared(agent_id)],
+            agent_scopes=[],
+            source_roles={},
+            subject_roles={},
+            target_allow_scopes={_T1: [TS]},
+            outbound_target_allow_rules=[_rule(_shared(_A1, _A2), TS)],
+        )
+
+    assert store.policy_pushes == [AgentSidePolicyModel(agents=[apm(_A1), apm(_A2)])]
+    assert [op for op, _ in store.calls] == ["apply_policy"]
+
+
+def test_agent_side_rerender_role_with_no_live_stored_agent_makes_no_call(agent_side):
+    catalog, initial = _rerender_fixture()  # tools only
+    store = run_rerender("r-src-op", catalog=catalog, store=FakeStore(initial))
+
+    assert store.calls == []
+
+
+def test_rerender_role_holds_the_pce_lock():
+    catalog, initial = _rerender_fixture()
+    store = FakeStore(initial)
+    with engine_env(catalog, store):
+        from aiac.policy.computation import rerender_role
+
+        _blocks_while_pce_lock_held(lambda: rerender_role("r-src-op"))
+
+
+def test_rerender_role_failure_is_logged_and_reraised(caplog):
+    catalog, initial = _rerender_fixture()
+    with (
+        engine_env(catalog, FakeStore(initial)),
+        patch("aiac.policy.computation.engine.apply_policy", side_effect=RuntimeError("writer down")),
+    ):
+        from aiac.policy.computation import rerender_role
+
+        with pytest.raises(RuntimeError, match="writer down"):
+            rerender_role("r-src-op")
+
+    assert "rerender_role failed" in caplog.text
+
+
+# ---- the routing guard with a shared role (R4) ----------------------------- #
+def test_guard_routes_a_shared_role_that_a_live_service_still_holds():
+    # The build saw only the copy of team2, now disabled. team1 still holds the role, so the grant is
+    # team1's too: the rule is routed, with the live holder only.
+    TS = _source_read()
+    store = run_engine([_rule(_shared(_A2), TS)], catalog=_sharing_catalog(a2_enabled=False))
+
+    assert store.data[_T1].inbound_allow_rules == [_rule(_shared(_A1), TS)]
+    assert _source_roles(store.pushed_service(_T1)) == {_A1: ["r-src-op"]}
+
+
+def test_guard_drops_a_role_that_no_live_service_holds_now():
+    # The stale copy names team1, which is live but does not hold the role now; its only holder,
+    # team2, is disabled.
+    TS = _source_read()
+    catalog = [_agent(_A1), _agent(_A2, roles=[_shared(_A2)], enabled=False), _tool(_T1, scopes=[TS])]
+    store = run_engine([_rule(_shared(_A1), TS)], catalog=catalog)
+
+    assert _T1 not in store.data
+    assert store.apply_policy_count == 0
+
+
+# ---- the read model (R8) --------------------------------------------------- #
+def test_policy_model_for_shows_the_current_holders():
+    TS = _source_read()
+    store = FakeStore({_T1: _stored_tool(_rule(_shared(_A1), TS), _rule(_developer("dev-user"), TS))})
+    with engine_env(_sharing_catalog(), store, roles=[_developer("new-user")]):
+        from aiac.policy.computation import policy_model_for
+
+        model = policy_model_for(_T1)
+
+    assert model == TargetSidePolicyModel(
+        services=[_stored_tool(_rule(_shared(_A1, _A2), TS), _rule(_developer("new-user"), TS))]
+    )
+    assert store.calls == []
+
+
+# ---- quarantine and decommission of one holder of a shared role ------------ #
+# The removed holder's role stays (team1 still holds it), so no SPM loses an     #
+# edge. The callees that have an edge of the role still get a new render: their  #
+# CRs must not name the removed holder. A client delete gives no role-mapping     #
+# event, so nothing else repairs the CRs before the resync.                       #
+def _shared_removal_fixture(op):
+    """team1 and team2 hold the shared role, and both call the tool and agent-b; the stored edges name
+    both. team2 is removed: quarantined (disabled, still in the catalog) or decommissioned (absent)."""
+    TS = _source_read()
+    BS = _scope("s-b-inbound", "agent-b.inbound", service_id="agent-b")
+    both = _shared(_A1, _A2)
+    initial = {
+        _T1: _stored_tool(_rule(both, TS)),
+        "agent-b": _spm("agent-b", owned_scopes=[BS], inbound=[_rule(both, BS)]),
+        _A1: _spm(_A1, owned_roles=[_shared(_A1)]),
+        _A2: _spm(_A2, owned_roles=[_shared(_A2)]),
+    }
+    catalog = [_agent(_A1, roles=[_shared(_A1)]), _agent("agent-b", scopes=[BS]), _tool(_T1, scopes=[TS])]
+    if op == "quarantine":
+        catalog.append(_agent(_A2, roles=[_shared(_A2)], enabled=False))
+    return catalog, initial
+
+
+def _remove(op, service_id, *, catalog, store) -> FakeStore:
+    with engine_env(catalog, store):
+        from aiac.policy import computation
+
+        getattr(computation, op)(service_id)
+    return store
+
+
+@pytest.mark.parametrize("op", ["quarantine", "decommission"])
+def test_removing_one_holder_of_a_shared_role_redeploys_its_callees_without_it(op):
+    catalog, initial = _shared_removal_fixture(op)
+    store = _remove(op, _A2, catalog=catalog, store=FakeStore(initial))
+
+    (push,) = store.policy_pushes  # one call, with the callees of the shared role
+    assert [spm.service_id for spm in push.services] == ["agent-b", _T1]
+    assert [_source_roles(spm) for spm in push.services] == [{_A1: ["r-src-op"]}] * 2
+    # Their rules did not change, so the store keeps them as they are: only SPM(team2) goes.
+    assert store.service_writes == []
+    assert store.data == {sid: m for sid, m in initial.items() if sid != _A2}
+    assert [call for call, _ in store.calls] == ["delete", "delete_service_cr", "apply_policy"]
+
+
+@pytest.mark.parametrize("op", ["quarantine", "decommission"])
+def test_agent_side_removing_one_holder_of_a_shared_role_rederives_the_agents_that_use_it(agent_side, op):
+    # agent-b's inbound names the holders; team1's outbound carries the role's edges. The tool keeps
+    # its pass-through.
+    catalog, initial = _shared_removal_fixture(op)
+    store = _remove(op, _A2, catalog=catalog, store=FakeStore(initial))
+
+    (push,) = store.policy_pushes
+    assert [apm.agent_id for apm in push.agents] == ["agent-b", _A1]
+    apm_b, apm_a1 = push.agents
+    assert {caller: [r.id for r in roles] for caller, roles in apm_b.source_roles.items()} == {_A1: ["r-src-op"]}
+    assert [rule.role.actorIds for rule in apm_a1.outbound_target_allow_rules] == [[_A1], [_A1]]
+    assert push.pass_through == []
+    assert store.service_writes == []
