@@ -189,6 +189,33 @@ A service that leaves the set (quarantine, decommission) loses its CR, and is
 then denied.
 _Avoid_: onboarded services, known services.
 
+**Role holder**:
+A user or an agent that holds a role **now**. For an `Agent`-kind role: each
+live service (in the catalog and enabled) whose roles contain the role. For a
+`User`-kind role: each direct member that the IdP gives now (`get_roles()`).
+The PCE reads the holders from the IdP at render time (D32). The `actorIds` in
+a stored edge is only a snapshot, not the authority. A role that comes only
+through a group or a composite parent role gives no holder.
+_Avoid_: actor list of an edge, stored members.
+
+**Shared role**:
+A realm role that more than one agent holds. Across namespaces, Provision
+reuses it by name for agents with the same workload name (`team1/github-agent`
+and `team2/github-agent` share `github-agent.source_operations`). In one
+namespace, an admin assigns it to a second agent. A realm is a tenant and one
+policy covers the realm, so every **role holder** of a shared role gets the
+same allow and deny. It is deleted only when its last holder goes (D32).
+_Avoid_: duplicate role, name collision (the sharing is by design).
+
+**Shared scope**:
+A client scope that more than one service links, for example
+`github-tool.source-read` of `team1/github-tool` and `team2/github-tool`. The
+IdP gives **one copy for each owner**, with `Scope.serviceId` = that owner, so
+each copy routes to the SPM of its owner. The PRB decides it once, and the
+assembly gives one rule for each copy. It is deleted only when its last owner
+goes (D32).
+_Avoid_: multi-owner scope (as a fault), name collision.
+
 ## Enforcement
 
 **Enforcement side**:
