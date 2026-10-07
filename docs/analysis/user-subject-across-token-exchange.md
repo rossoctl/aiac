@@ -556,8 +556,7 @@ Open:
 5. Whether any AIAC-managed agent or tool receives backchannel logout tokens, which keep
    `sub` = user ID (option B). Expected: no, because they are resource servers behind AuthBridge.
 6. *Closed on 2026-10-06; see Closed.*
-7. The agent-side one-hop result of §1.7 (works today) on the live cluster, with the side-switch
-   test (rung 7).
+7. *Closed on 2026-10-07; see Closed.*
 8. The agent-side two-hop result of §1.7 (fails at the second agent) on the live cluster. It is
    inferred from the code paths only.
 
@@ -577,6 +576,17 @@ Closed:
 - Question 6 (closed on 2026-10-06): the username precondition of §8.1 (no rename, no reuse) is a
   written rule. Decided with the user on 2026-10-06, and recorded as a platform prerequisite in PRD
   §8 (D31).
+- Question 7 (closed on 2026-10-07): the agent side works at one hop on the live cluster. With D31
+  deployed, rung 7 (the side switch) passed (40 tests): the verdicts are the same under target side
+  and under agent side, and the deny comes from the enforcement point of each side.
+- D31 works on the live cluster (2026-10-07, `kind-rossoctl`, target side). Rung 2 (agent, then tool)
+  passed (23 tests), also the new `test_subject_scope_linked` and
+  `test_exchanged_token_subject_is_username`: a standard token exchange as the agent client gives
+  `sub` = the username for each user. The decision log of github-tool's inbound OPA shows
+  `subject: dev-user` and `subject: test-user` for the agent → tool calls (§1.2 showed the user ID).
+  Its self-discovery calls, which run before the tool's own Provision links the scope, still show
+  the user ID of the tool's service account; the self-discovery rule keys on `client_id`, so this
+  has no effect. Rungs 1 and 3 passed too (5 and 19 tests).
 
 Side findings, not part of the decision:
 
