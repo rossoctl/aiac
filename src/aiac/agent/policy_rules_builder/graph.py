@@ -245,7 +245,13 @@ def _scope_focal(s: Scope) -> str:
 
 
 def _scope_cands(ss: list[Scope]) -> str:
-    return "\n".join(_scope_focal(s) for s in ss)
+    # A shared scope (D32) has one copy for each owner: the same id and name, another serviceId. The
+    # LLM decides it once, so list each scope id one time (its first copy, in candidate order). The
+    # build node still iterates over every copy (``_assemble_rules``), so each owner's SPM gets the rule.
+    first_copies: dict[str, Scope] = {}
+    for s in ss:
+        first_copies.setdefault(s.id, s)
+    return "\n".join(_scope_focal(s) for s in first_copies.values())
 
 
 def _role_cands(rs: list[Role]) -> str:
@@ -310,7 +316,8 @@ def _assemble_rules(candidates, granted_names, denied_names, make_rule):
     the typed candidate (never LLM string fields). ``make_rule(candidate, effect)`` constructs the
     PolicyRule for the pass's direction (role-focal or scope-focal). Shared by both build nodes AND
     the eval best-effort replica (``eval.best_effort_rules``) so the assembly lives in ONE place and
-    the eval cannot silently diverge from the real graph."""
+    the eval cannot silently diverge from the real graph. Do not dedup here: each owner's copy of a
+    shared scope (D32; one name, one rule per ``serviceId``) must get its own rule."""
     granted = set(granted_names)
     denied = set(denied_names)
     allows = [make_rule(c, RuleEffect.ALLOW) for c in candidates if c.name in granted]
