@@ -38,7 +38,9 @@ assert on the record, so a failed phase reports its own facts and the later phas
    and ``Tool`` is kept; the tool's CR, which phase 3 recorded, is **deleted**; its SPM (written in phase
    3) is gone; the agent's CR, by side (target side: unchanged since phase 3 — its inbound grants stay
    and its outbound stays a pass-through; agent side: every outbound grant binding is empty and its
-   inbound grants stay); the ``dev-user`` outbound call that phase 3 allowed is now blocked.
+   inbound grants stay); the shared subject scope ``aiac-username-sub`` stays — it still exists and is
+   still a default scope of the disabled tool client (phase 3 linked it, and the link is not in the
+   created-manifest, D31); the ``dev-user`` outbound call that phase 3 allowed is now blocked.
 
 **Failure injection — a permanent error, on purpose.** ``controller_llm_unusable`` points the in-cluster
 Controller's ``LLM_BASE_URL`` (an explicit container env over the ``aiac-agent-config`` ``envFrom``; the
@@ -291,6 +293,10 @@ def _run_phases(ctx: dict, run: dict) -> None:
             cr=uc1.authpolicy_policies(TOOL),
             spm=uc1.spm_present(tool["clientId"]),
             agent_cr=uc1.authpolicy_policies(AGENT),  # after the quarantine deployed the affected services
+            # The shared subject scope after the rollback (D31): the phase-3 onboarding linked it, and the
+            # failed re-onboarding's Provision linked it again (the link is idempotent). The rollback
+            # deletes only the created-manifest, so the scope and the link stay.
+            subject_scope=uc1.subject_scope_link_problems(admin, TOOL),
         )
         run["tool_failed"] = failed
     failed["outbound"] = _poll_blocked(ctx, "dev-user", PROBE_TOOL)
@@ -371,14 +377,16 @@ def test_failed_agent_inbound_denied(run: dict) -> None:
     assert decision == "deny", f"dev-user inbound to the quarantined agent: {decision!r} (want 'deny')"
 
 
-def test_rollback_keeps_the_subject_scope(run: dict) -> None:
-    """The rollback of the failed agent keeps the shared subject scope (D31): ``aiac-username-sub`` still
-    exists (with its mapper and no marker) and is still a **default** scope of the disabled agent client.
-    Provision linked it before the build failed, and the link is not in the created-manifest, so the
-    rollback (which deletes only the manifest) does not touch it — a shared scope is never deleted."""
-    problems = _failed(run, "agent_failed")["subject_scope"]
+@pytest.mark.parametrize("key", ["agent_failed", "tool_failed"])
+def test_rollback_keeps_the_subject_scope(run: dict, key: str) -> None:
+    """The rollback of the failed service (the agent, then the tool) keeps the shared subject scope
+    (D31): ``aiac-username-sub`` still exists (with its mapper and no marker) and is still a **default**
+    scope of the disabled client. Provision linked it before the build failed (for the tool, its phase-3
+    onboarding linked it too), and the link is not in the created-manifest, so the rollback (which
+    deletes only the manifest) does not touch it — a shared scope is never deleted."""
+    problems = _failed(run, key)["subject_scope"]
     assert not problems, (
-        f"the subject scope {uc1.SUBJECT_SCOPE!r} is not in place after the rollback of the failed agent: {problems}"
+        f"the subject scope {uc1.SUBJECT_SCOPE!r} is not in place after the rollback of {key}: {problems}"
     )
 
 
