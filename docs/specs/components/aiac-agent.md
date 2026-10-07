@@ -6,12 +6,13 @@ A LangGraph-based AI agent service that enforces a natural-language access contr
 
 - **Event Broker** → `aiac.apply.service.{id}` subject (originated by the Keycloak SPI on a `CLIENT` `CREATE` admin event)
 - **Event Broker** → `aiac.apply.role.{name}` subject (percent-encoded role name; originated by Keycloak SPI role created/updated)
+- **Event Broker** → `aiac.apply.role-members.{role-id}` subject (the Keycloak role id; originated by the Keycloak SPI when a user or an agent service account gets or loses a realm role, D32). The Controller calls the PCE `rerender_role`, with no PRB run (see [Role-membership change](#role-membership-change-d32)).
 - **Event Broker** → `aiac.apply.policy.build` subject (originated by RAG Ingest Service post-ingest). **Status: not built yet** — no RAG Ingest Service exists; nothing publishes this subject.
 - **Operator/admin call** → `POST /apply/policy/rebuild` directly via `kubectl port-forward` (HTTP only — not routed through Event Broker)
 
 The Agent subscribes to the Event Broker as a durable competing consumer (`aiac-agent-consumer` queue group). It acknowledges each message only after successful processing — ensuring at-least-once delivery and automatic replay on pod restart.
 
-The `/apply/*` HTTP endpoints are retained as a debugging escape hatch. The **NATS consumer is a thin adapter layer** that receives events from the Event Broker and calls the same use-case handlers, `compute_and_apply` and (UC1) `reenable_service` that the `/apply/*` routes call — there is no duplicated business logic.
+The `/apply/*` HTTP endpoints are retained as a debugging escape hatch. The **NATS consumer is a thin adapter layer** that receives events from the Event Broker and calls the same use-case handlers, `compute_and_apply` and (UC1) `reenable_service` that the `/apply/*` routes call — or, for a role-membership change, the same PCE `rerender_role` that `POST /apply/role-members/{role_id}` calls. There is no duplicated business logic.
 
 The service is structured as a **Controller** (FastAPI routes) that dispatches to the **Service Onboarding Orchestrator** (UC1) or directly to the Policy Update and Role Update sub-agents (UC2, UC3). Each producing sub-agent calls the **shared Policy Rules Builder** (`agent/policy_rules_builder/`) directly, merges the results internally, and returns a single `list[PolicyRule]` and an `override` flag to the Controller. The Controller calls `compute_and_apply(merged_rules, override)` from `aiac.policy.computation` (PCE) once.
 
@@ -74,13 +75,16 @@ flowchart TD
     SA6  -->|"(list[PolicyRule], override)"| CTRL
 
     CTRL -->|"merged rules"| PCE
+    CTRL -->|"role-members/:id\nrerender_role (no PRB)"| PCE
 ```
 
 ---
 
 ## NATS Consumer
 
-A thin adapter started as an **asyncio background task** in the FastAPI `lifespan` handler, as the last step of the [start sequence](#start-sequence). It binds the `aiac-agent-consumer` durable queue group on the `aiac-events` NATS JetStream stream (stream subjects `aiac.apply.>`), with the filter subjects `aiac.apply.service.*`, `aiac.apply.role.*` and `aiac.apply.policy.build` — never the DLQ subject.
+A thin adapter started as an **asyncio background task** in the FastAPI `lifespan` handler, as the last step of the [start sequence](#start-sequence). It binds the `aiac-agent-consumer` durable queue group on the `aiac-events` NATS JetStream stream (stream subjects `aiac.apply.>`), with the filter subjects `aiac.apply.service.*`, `aiac.apply.role.*`, `aiac.apply.role-members.*` and `aiac.apply.policy.build` — never the DLQ subject.
+
+Before it subscribes, the consumer start updates an existing durable consumer to the config of the code (`ensure_consumer` in `eventbus/stream.py`): the filter subjects, the ack policy, `max_deliver` and `ack_wait`. Reason: nats-py `subscribe()` binds to an existing durable consumer with the config that the server has, so a new filter subject would not get to a running cluster. The update keeps the deliver subject and the deliver group of the consumer. A missing consumer is created by `subscribe()`, as before. See [`event-broker.md` → Consumer config at start](event-broker.md#consumer-config-at-start).
 
 ### Dispatch table
 
@@ -88,18 +92,21 @@ A thin adapter started as an **asyncio background task** in the FastAPI `lifespa
 |---|---|
 | `aiac.apply.service.{id}` | Service Onboarding Orchestrator (UC1) |
 | `aiac.apply.role.{name}` | Role Update sub-agent (UC3) |
+| `aiac.apply.role-members.{role-id}` | None: the PCE `rerender_role(role_id)` directly, with no `compute_and_apply` and no re-enable (D32) |
 | `aiac.apply.policy.build` | Policy Update Build sub-agent (UC2) |
+
+The prefixes `aiac.apply.role.` and `aiac.apply.role-members.` are different: `aiac.apply.role.role-members` is the role subject of a role named `role-members`. The role id of `aiac.apply.role-members.{role-id}` is a UUID, so the consumer gives it to `rerender_role` as it is, with no decode (a role name in `aiac.apply.role.{name}` is percent-decoded).
 
 > **Follow-up:** `aiac.apply.offboard.{id}` (Service Offboarding, UC4) is the intended subject for event-driven offboard. It is **not yet wired** into the consumer — offboard is reachable today only via the `POST /apply/offboard/{service_id}` HTTP route.
 
 ### Ack contract
 
-The consumer **awaits** the internal handler before it issues the NATS acknowledgement. On handler success → ack. The internal handlers are **synchronous** and slow (they run the LLM Policy Rules Builder and `compute_and_apply`), so the consumer callback does **not** call them inline on the event loop. It offloads each handler to a **threadpool executor** — `await loop.run_in_executor(None, ...)` — and awaits that future. This keeps the ack-after-processing contract (the await still completes before the ack) **and** frees the event loop while the slow work runs. Offloading is not the same as fire-and-forget: the consumer still awaits completion, so it never acks early (see below).
+The consumer **awaits** the internal handler before it issues the NATS acknowledgement. On handler success → ack. The internal handlers are **synchronous** and slow (they run the LLM Policy Rules Builder and `compute_and_apply`), so the consumer callback does **not** call them inline on the event loop. It offloads each handler to a **threadpool executor** — `await loop.run_in_executor(None, ...)` — and awaits that future. The PCE `rerender_role` of a role-membership subject is synchronous too (IdP, Policy Store and PDP calls), so the consumer offloads it in the same way. This keeps the ack-after-processing contract (the await still completes before the ack) **and** frees the event loop while the slow work runs. Offloading is not the same as fire-and-forget: the consumer still awaits completion, so it never acks early (see below).
 
 On handler failure, the consumer classifies the exception by **type**, not by HTTP status code:
 
 - **Permanent** — `PolicyConflictError`, `PolicyContradictionError`, `PolicyRulesBuilderError`, `UnparseableLLMResponseError`, and `EnforcementPreconditionError` (a failed UC1 precondition check, D30). The consumer calls `term()` and routes the message to `aiac.apply.dlq` **immediately**. There is no redelivery, because the same input cannot succeed on a retry. A failed precondition check needs a fix in the cluster first. After the fix, the operator starts the onboarding again (see [`uc1-service-onboarding.md` → Precondition checks](aiac-agent/uc1-service-onboarding.md#precondition-checks-d30)).
-- **Retryable** — `LLMAccessError`, plus any genuinely unknown or transient error. The consumer does **not** ack. NATS redelivers after `AckWait`, up to `MAX_DELIVER` (5) deliveries, then routes the message to `aiac.apply.dlq`.
+- **Retryable** — `LLMAccessError`, plus any genuinely unknown or transient error. The consumer does **not** ack. NATS redelivers after `AckWait`, up to `MAX_DELIVER` (5) deliveries, then routes the message to `aiac.apply.dlq`. A failed `rerender_role` (a role-membership subject; it re-raises each IdP, Policy Store or PDP error) is in this class. A redelivery is safe, because each run reads the current holders.
 - **Retryable, not visible yet** — `ServiceNotVisibleError` (UC1 only). The IdP still answers `404` for the new service after the Orchestrator's bounded wait on the first read (the event-before-commit race; see [`uc1-service-onboarding.md` → The first read waits for a new client](aiac-agent/uc1-service-onboarding.md#the-first-read-waits-for-a-new-client-d33)). The client can become visible some seconds later, so the consumer does not wait for `AckWait`:
   - Below `MAX_DELIVER`, the consumer calls `nak(delay=…)` with the delay `AIAC_NOT_VISIBLE_NAK_DELAY_SECONDS` (default `30` s; see [Configuration](#configuration) below). NATS redelivers the message after the delay, not after `AckWait` (600 s). The consumer does not ack the message, and it does not call `term()`.
   - Each nak uses one of the `MAX_DELIVER` (5) deliveries. At delivery 5, the consumer routes the message to `aiac.apply.dlq` and calls `term()`, with no nak, as for every other retryable error. With the default knobs, a service that the IdP never shows gets to the DLQ after about 260 s (≈4.3 min) plus the time of the reads: four times the 28 s wait of the Orchestrator (`ONBOARD_CLIENT_WAIT_*`) plus the 30 s delay, then one more 28 s wait.
@@ -136,6 +143,7 @@ The Controller is a FastAPI routes layer (`controller/routes.py`). Its responsib
 - Receive the `(list[PolicyRule], override)` tuple returned by the Orchestrator or sub-agent (rules already merged by the sub-agent; UC1 also returns `client_id`).
 - Call `compute_and_apply(merged_rules, override)` from `aiac.policy.computation` (PCE) once. For UC1, the onboarding route and the NATS consumer also pass `focus_service` (the clientId of the service being onboarded, which `onboard_service` returns — not the UUID in the path), so the PCE routing guard keeps the rules of a disabled (quarantined) service that re-onboards.
 - For UC1, after `compute_and_apply` succeeds, call `reenable_service(service_id)` (by the UUID).
+- For a role-membership change (`POST /apply/role-members/{role_id}`), call the PCE `rerender_role(role_id)` directly, with no sub-agent and no `compute_and_apply` (see [Role-membership change](#role-membership-change-d32)).
 - Return a bare HTTP status code to the caller; write summary and debug info to the log.
 - Serve the read-only view `GET /policy/services/{service_id:path}` (D18; see [Endpoints](#endpoints)).
 - Run the [start sequence](#start-sequence) in the FastAPI `lifespan` handler.
@@ -154,8 +162,10 @@ The FastAPI `lifespan` handler runs these steps in this order, at every Controll
    1. It calls `replace_policy` (`PUT /policy`) with the full policy model of the current side. Under target side, this is a `TargetSidePolicyModel` with every stored SPM. Under agent side, this is an `AgentSidePolicyModel` with the APMs of every stored agent SPM, and `pass_through` = the clientId of every stored tool SPM. Only live services are in the model: a disabled service, or a service that is absent from the IdP catalog, is not in it. The `PUT` also deletes each AIAC CR whose service is not in the model.
    2. It quarantines each disabled service that still has an SPM.
 
+   The resync renders each CR with the current role holders from the IdP (D32), so it also repairs a role-membership event that the Controller did not get.
+
    If the resync fails, the Controller stops.
-4. **Start the NATS consumer** as a background task (see [NATS Consumer](#nats-consumer)).
+4. **Start the NATS consumer** as a background task (see [NATS Consumer](#nats-consumer)). The consumer start first updates an existing durable consumer to the config of the code, then subscribes.
 
 Uvicorn accepts a connection only after the lifespan start ends. So the Controller serves no request during steps 1–3: no onboarding runs during the resync, and `GET /health` does not answer yet. The Controller probes in `k8s/agent-deployment.yaml` are `httpGet /health`, so the Deployment also has a `startupProbe` on `/health`. Its budget (`failureThreshold` × `periodSeconds`) must be longer than the start sequence. The readiness and liveness probes start only after the startup probe passes, so a long resync does not cause a restart.
 
@@ -176,9 +186,20 @@ Each use case (and the UC1 Orchestrator) is specified in a dedicated sub-PRD:
 | Service Onboarding | [aiac-agent/uc1-service-onboarding.md](aiac-agent/uc1-service-onboarding.md) | `aiac.apply.service.{id}`, `POST /apply/service/{id}` | Orchestrator sequences: precondition checks (D30) → (tool only) the PCE `bootstrap` → Service Provision → Service Policy Builder (IdP reader + PRB invoker) |
 | Policy Update | [aiac-agent/uc2-policy-update.md](aiac-agent/uc2-policy-update.md) | `aiac.apply.policy.build`, `POST /apply/policy/build`, `POST /apply/policy/rebuild` | |
 | Role Update | [aiac-agent/uc3-role-update.md](aiac-agent/uc3-role-update.md) | `aiac.apply.role.{name}`, `POST /apply/role/{id}` | |
+| Role-membership change (D32) | (see [Role-membership change](#role-membership-change-d32)) | `aiac.apply.role-members.{role-id}`, `POST /apply/role-members/{role_id}` | Not a use case: no sub-agent, no rules, no PRB run. The consumer and the route call the PCE `rerender_role(role_id)` **directly**. |
 | Service Offboarding | (see PCE `decommission`) | `POST /apply/offboard/{service_id}` (`aiac.apply.offboard.{id}` — NATS wiring is a follow-up) | Thin stub sub-agent returns the clientId unchanged; the Controller route calls the PCE's `decommission(service_id)` **directly** (whole-service teardown, not a rule fold — bypasses the PRB and `compute_and_apply`). Keyed by **clientId, not UUID** (an offboarded client is gone from `get_services()`). **Status: not built yet** — the sub-agent does no clientId validation or resolution (issue 3.21). |
 
 > **Note:** Policy rule application is fully specified in [policy-computation-engine.md](policy-computation-engine.md). The Policy Rules Builder is specified in [aiac-agent/policy-rules-builder.md](aiac-agent/policy-rules-builder.md). **UC4 (Service Offboarding) is the exception:** it produces no rules — its stub handler returns the clientId unchanged, and the Controller route calls the PCE's authoritative `decommission(service_id)` (specified in [policy-computation-engine.md → Decommission](policy-computation-engine.md#decommission-service-offboard)) to tear down the service's entire policy footprint.
+
+### Role-membership change (D32)
+
+A user or an agent service account gets or loses a realm role in Keycloak. This changes who holds the role, not the policy (role → scope). But the CRs contain the holders of each role (`source_roles`, `subject_roles`), so the CRs that use the role must be rendered again. A PRB run is not necessary.
+
+- **Trigger.** The Keycloak SPI publishes `aiac.apply.role-members.{role-id}` for each role of a `REALM_ROLE_MAPPING` admin event, after the commit (see [`event-broker.md` → Role-membership events](event-broker.md#role-membership-events)). The operator route `POST /apply/role-members/{role_id}` does the same work. Use it to repair a lost event at once (the SPI publish is at most once, D33). `role_id` is the Keycloak role id (a UUID).
+- **Work.** The consumer and the route call the PCE `rerender_role(role_id)` and nothing else: no sub-agent, no `compute_and_apply`, no re-enable. `rerender_role` holds the PCE lock (D22), reads the IdP catalog and the roles one time, re-renders the CRs that use the role with the current holders, makes no PRB call and writes no SPM (see [`policy-computation-engine.md`](policy-computation-engine.md)).
+- **Result.** The route returns `200` with no body on success. A dependency error (IdP, Policy Store, PDP) propagates, as on the other `/apply/*` routes. On the NATS path, the failure is retryable (see [Ack contract](#ack-contract)).
+- **Provision gives the event too.** UC1 Provision maps a role to the service account of the service, and a UC1 rollback unmaps it. Each gives `aiac.apply.role-members.{role-id}`. So when a new agent gets a shared role, the CRs that use the role get the new holder at once. A new role has no SPM edge, so its event changes no CR.
+- **A missed event.** The resync at the next Controller start renders each CR with the current holders (see [Start sequence](#start-sequence)).
 
 ### IdP access — library, not service
 
@@ -194,6 +215,7 @@ Every sub-agent (UC1 Provision + Service Policy Builder, UC2 Build + Rebuild, UC
 | POST | `/apply/policy/build` | Policy Update | Build |
 | POST | `/apply/policy/rebuild` | Policy Update | Rebuild |
 | POST | `/apply/role/{role_id}` | Role Update | Role |
+| POST | `/apply/role-members/{role_id}` | — | — (calls PCE `rerender_role` directly, D32) |
 | POST | `/apply/service/{service_id}` | Service Onboarding | Provision |
 | POST | `/apply/offboard/{service_id}` | Service Offboarding | Offboard (calls PCE `decommission` directly) |
 | GET | `/policy/services/{service_id:path}` | — | — (read-only; calls PCE `policy_model_for`) |
@@ -338,7 +360,7 @@ src/aiac/
 ├── shared/                             ← project-level shared: run_upstream (upstream.py) — transport retry primitive
 └── agent/
     ├── controller/
-    ├── eventbus/                       ← consumer.py (NATS consumer, lifespan); stream.py (stream/consumer config, ensure_stream)
+    ├── eventbus/                       ← consumer.py (NATS consumer, lifespan); stream.py (stream/consumer config, ensure_stream, ensure_consumer)
     ├── init/                           ← wait_and_provision.py (aiac-init container: health gates + stream provisioning)
     ├── llm.py                          ← shared LLM seam (client, retry, sanitized LLM errors) for the PRB and the Policy Digester
     ├── policy_digester/                ← Policy Digester (digest.py, prompts.py)

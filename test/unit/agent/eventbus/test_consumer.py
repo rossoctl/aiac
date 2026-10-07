@@ -3,10 +3,13 @@
 Covers subject-based dispatch and the ack/DLQ contract: ack on success,
 no ack (implicit redelivery) on failure below MAX_DELIVER, a delayed nak for a
 service that the IdP does not show yet (``ServiceNotVisibleError``), and DLQ
-publish + term() once MAX_DELIVER is reached.
+publish + term() once MAX_DELIVER is reached. A role-membership subject
+(``aiac.apply.role-members.{role-id}``) goes to the PCE ``rerender_role``, with no
+use-case handler and no ``compute_and_apply``.
 """
 
 import asyncio
+import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -144,6 +147,124 @@ def test_dispatch_passes_no_focus_service_for_a_role_subject():
     pce.assert_called_once_with([], True, focus_service=None)
     reenable.assert_not_called()
     msg.ack.assert_called_once()
+
+
+# A role-membership change (D32): the Keycloak SPI publishes ``aiac.apply.role-members.{role-id}`` when a
+# user or a service account gets or loses a realm role. The role id is a UUID.
+ROLE_ID = "5f0c2a8e-1b7d-4c3e-9a61-2d8f4e7b9c10"
+
+
+def test_dispatch_routes_role_members_subject_to_rerender_role_with_no_prb_run():
+    # A membership change does not change the policy, only who holds the role: the consumer re-renders
+    # the CRs that use the role. No use-case handler (so no PRB run), no compute_and_apply, no re-enable.
+    consumer = AiacEventConsumer()
+    consumer._nc = AsyncMock()
+    msg = _fake_msg(f"aiac.apply.role-members.{ROLE_ID}")
+
+    with (
+        patch("aiac.agent.eventbus.consumer.rerender_role") as rerender,
+        patch("aiac.agent.eventbus.consumer.update_role") as role,
+        patch("aiac.agent.eventbus.consumer.onboard_service") as onboard,
+        patch("aiac.agent.eventbus.consumer.compute_and_apply") as pce,
+        patch("aiac.agent.eventbus.consumer.reenable_service") as reenable,
+    ):
+        asyncio.run(consumer._dispatch(msg))
+
+    rerender.assert_called_once_with(ROLE_ID)
+    role.assert_not_called()
+    onboard.assert_not_called()
+    pce.assert_not_called()
+    reenable.assert_not_called()
+    msg.ack.assert_called_once()
+    msg.term.assert_not_called()
+
+
+def test_dispatch_runs_rerender_role_in_the_thread_pool():
+    # rerender_role is synchronous (IdP, store and PDP calls): it must not run on the event loop, which
+    # also serves /health.
+    consumer = AiacEventConsumer()
+    consumer._nc = AsyncMock()
+    msg = _fake_msg(f"aiac.apply.role-members.{ROLE_ID}")
+    threads = []
+
+    with patch(
+        "aiac.agent.eventbus.consumer.rerender_role",
+        side_effect=lambda _role_id: threads.append(threading.current_thread()),
+    ):
+        asyncio.run(consumer._dispatch(msg))
+
+    assert len(threads) == 1
+    assert threads[0] is not threading.main_thread()
+    msg.ack.assert_called_once()
+
+
+def test_dispatch_routes_a_role_named_role_members_to_update_role():
+    # The two prefixes are different: "aiac.apply.role.role-members" is the role subject of a role NAMED
+    # "role-members", not a role-membership change.
+    consumer = AiacEventConsumer()
+    consumer._nc = AsyncMock()
+    msg = _fake_msg("aiac.apply.role.role-members")
+
+    with (
+        patch("aiac.agent.eventbus.consumer.update_role", return_value=([], True)) as role,
+        patch("aiac.agent.eventbus.consumer.compute_and_apply") as pce,
+        patch("aiac.agent.eventbus.consumer.rerender_role") as rerender,
+    ):
+        asyncio.run(consumer._dispatch(msg))
+
+    role.assert_called_once_with("role-members")
+    pce.assert_called_once_with([], True, focus_service=None)
+    rerender.assert_not_called()
+    msg.ack.assert_called_once()
+
+
+def test_dispatch_does_not_rerender_for_a_role_subject():
+    consumer = AiacEventConsumer()
+    consumer._nc = AsyncMock()
+    msg = _fake_msg("aiac.apply.role.role-1")
+
+    with (
+        patch("aiac.agent.eventbus.consumer.update_role", return_value=([], True)),
+        patch("aiac.agent.eventbus.consumer.compute_and_apply"),
+        patch("aiac.agent.eventbus.consumer.rerender_role") as rerender,
+    ):
+        asyncio.run(consumer._dispatch(msg))
+
+    rerender.assert_not_called()
+
+
+def test_dispatch_leaves_a_failed_rerender_unacked_before_max_deliver():
+    # A dependency error of rerender_role (IdP, store or PDP) is retryable: left unacked, so NATS
+    # redelivers it after ACK_WAIT. Logged once.
+    consumer = AiacEventConsumer()
+    consumer._nc = nc = _fake_nc()
+    msg = _fake_msg(f"aiac.apply.role-members.{ROLE_ID}", num_delivered=MAX_DELIVER - 1)
+    exc = HTTPException(502, "IdP config unavailable")
+
+    with (
+        patch("aiac.agent.eventbus.consumer.rerender_role", side_effect=exc),
+        patch("aiac.agent.eventbus.consumer.log_by_type") as log,
+    ):
+        asyncio.run(consumer._dispatch(msg))
+
+    msg.ack.assert_not_called()
+    msg.nak.assert_not_called()
+    msg.term.assert_not_called()
+    nc.jetstream.assert_not_called()
+    log.assert_called_once_with(exc)
+
+
+def test_dispatch_routes_a_failed_rerender_to_dlq_at_max_deliver():
+    consumer = AiacEventConsumer()
+    consumer._nc = nc = _fake_nc()
+    msg = _fake_msg(f"aiac.apply.role-members.{ROLE_ID}", num_delivered=MAX_DELIVER)
+
+    with patch("aiac.agent.eventbus.consumer.rerender_role", side_effect=RuntimeError("pdp boom")):
+        asyncio.run(consumer._dispatch(msg))
+
+    msg.ack.assert_not_called()
+    msg.term.assert_called_once()
+    nc.jetstream.return_value.publish.assert_called_once_with(DLQ_SUBJECT, msg.data)
 
 
 def test_dispatch_does_not_reenable_when_pce_apply_raises():
@@ -417,15 +538,25 @@ def test_start_connects_and_subscribes_with_expected_config():
     fake_js = AsyncMock()
     fake_nc = MagicMock()
     fake_nc.jetstream.return_value = fake_js
+    # The parent mock records the order of the three calls.
+    calls = MagicMock()
+    calls.ensure_stream = AsyncMock()
+    calls.ensure_consumer = AsyncMock()
+    calls.subscribe = fake_js.subscribe = AsyncMock()
 
     with (
         patch("aiac.agent.eventbus.consumer.nats.connect", AsyncMock(return_value=fake_nc)) as connect,
-        patch("aiac.agent.eventbus.consumer.ensure_stream", AsyncMock()) as ensure_stream_mock,
+        patch("aiac.agent.eventbus.consumer.ensure_stream", calls.ensure_stream),
+        patch("aiac.agent.eventbus.consumer.ensure_consumer", calls.ensure_consumer),
     ):
         asyncio.run(consumer.start())
 
     connect.assert_called_once_with(consumer._nats_url, max_reconnect_attempts=-1)
-    ensure_stream_mock.assert_called_once_with(fake_js)
+    calls.ensure_stream.assert_called_once_with(fake_js)
+    # The start updates an existing durable consumer to the config of the code BEFORE the subscribe,
+    # because nats-py binds to an existing durable consumer with its old config.
+    calls.ensure_consumer.assert_called_once_with(fake_js)
+    assert [c[0] for c in calls.mock_calls] == ["ensure_stream", "ensure_consumer", "subscribe"]
     _, kwargs = fake_js.subscribe.call_args
     assert kwargs["subject"] == "aiac.apply.>"
     assert kwargs["queue"] == CONSUMER_NAME
