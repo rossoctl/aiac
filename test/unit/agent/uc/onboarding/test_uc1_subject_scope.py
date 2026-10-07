@@ -126,8 +126,8 @@ def test_missing_scope_is_one_problem_that_names_the_scope_and_the_clients() -> 
 
 @pytest.mark.parametrize("marker", ["true", ["true"]], ids=["client-scope-string", "role-list"])
 def test_marked_scope_is_a_problem(marker: object) -> None:
-    """A scope with the ``aiac.managed`` marker would break Assumption 2 (it is linked to many
-    clients) and become an own scope of each linked service."""
+    """A scope with the ``aiac.managed`` marker (it is linked to many clients) would become an own
+    scope of each linked service."""
     problems = _problems(scope=_scope(**{"aiac.managed": marker}))
     assert len(problems) == 1
     assert uc1.SUBJECT_SCOPE in problems[0] and "aiac.managed" in problems[0]

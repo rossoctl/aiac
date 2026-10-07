@@ -876,8 +876,8 @@ def restart_agent(namespace: str) -> None:
 #
 # The second source is AIAC's own step, so a missing link is an AIAC fault: ``require_subject_scope``
 # fails the run (it is not a skip). The scope has no ``aiac.managed`` marker (it is shared by many
-# clients, so a marker would break Assumption 2 and make it an own scope of each linked service), and it
-# is never linked to ``rossoctl`` (two mappers would write the same claim).
+# clients, so a marker would make it an own scope of each linked service), and it is never linked to
+# ``rossoctl`` (two mappers would write the same claim).
 
 # The shared subject scope and the mapping it must carry. The harness never imports ``aiac``, so these
 # repeat ``_SUBJECT_SCOPE`` / ``_SUBJECT_MAPPER`` and the mapper representation of the IdP service.
@@ -973,8 +973,7 @@ def subject_scope_problems(
     if _carries_aiac_managed(scope.get("attributes")):
         problems.append(
             f"client scope {SUBJECT_SCOPE!r} carries the {AIAC_MANAGED_ATTRIBUTE!r} marker; the shared subject "
-            "scope must not (a marked scope linked to many clients breaks Assumption 2 and becomes an own "
-            "scope of each linked service)"
+            "scope must not (a marked scope linked to many clients becomes an own scope of each linked service)"
         )
     if not any(is_subject_mapper(mapper) for mapper in mappers):
         found = ", ".join(_mapper_summary(mapper) for mapper in mappers) or "none"

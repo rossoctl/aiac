@@ -1,6 +1,7 @@
 """Unit tests for aiac.idp.configuration."""
 
 import copy
+import logging
 import pickle
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -290,6 +291,33 @@ class TestGetServices:
         ):
             result = Configuration.for_realm(REALM).get_services()
         assert result[0].roles[0].name == "viewer"
+
+    def test_each_owner_of_a_shared_scope_gets_its_own_copy(self, monkeypatch):
+        # A shared scope (D32): two clients link one aiac.managed scope. Each service gets its own
+        # copy, with that owner's clientId as serviceId, so each copy routes to its owner's SPM.
+        monkeypatch.setenv("AIAC_PDP_CONFIG_URL", BASE)
+        services = [
+            {"id": "uuid-1", "clientId": "team1/github-tool", "enabled": True},
+            {"id": "uuid-2", "clientId": "team2/github-tool", "enabled": True},
+        ]
+        shared = {"id": "s-read", "name": "github-tool.source-read", "description": "Read source"}
+        all_scopes = [{**shared, "attributes": {"aiac.managed": "true"}}]
+        with patch(
+            "aiac.idp.configuration.api.requests.get",
+            side_effect=[
+                _ok(services),  # GET /services
+                _ok([]),  # GET /roles
+                _ok(all_scopes),  # GET /scopes
+                _ok([]),  # GET /services/uuid-1/roles
+                _ok([{"id": "s-read", "name": shared["name"], "serviceId": "team1/github-tool"}]),
+                _ok([]),  # GET /services/uuid-2/roles
+                _ok([{"id": "s-read", "name": shared["name"], "serviceId": "team2/github-tool"}]),
+            ],
+        ):
+            team1, team2 = Configuration.for_realm(REALM).get_services()
+        assert team1.scopes == [Scope.model_validate({**all_scopes[0], "serviceId": "team1/github-tool"})]
+        assert team2.scopes == [Scope.model_validate({**all_scopes[0], "serviceId": "team2/github-tool"})]
+        assert team1.scopes[0].aiac_managed and team2.scopes[0].aiac_managed
 
     def test_raises_on_non_2xx(self, monkeypatch):
         monkeypatch.setenv("AIAC_PDP_CONFIG_URL", BASE)
@@ -604,7 +632,7 @@ class TestLinkSubjectScope:
 
     def test_returned_scope_is_not_aiac_managed(self, monkeypatch):
         # The subject scope is shared by every managed client, so it never carries the marker:
-        # a marked scope would become an own scope of each linked service (and break Assumption 2).
+        # a marked scope would become an own scope of each linked service.
         monkeypatch.setenv("AIAC_PDP_CONFIG_URL", BASE)
         with patch("aiac.idp.configuration.api.requests.post", return_value=_ok(self.SUBJECT_SCOPE, 200)):
             result = Configuration.for_realm(REALM).link_subject_scope(self._make_service())
@@ -661,6 +689,54 @@ class TestCreateServiceRole:
         mapper.assert_called_once_with(svc, existing)
         assert result is existing
 
+    # A reused role is shared (D32): it keeps its first description, Keycloak is not updated, and a
+    # different new description is logged as a WARNING (handoff 19 Bug 3).
+    def _reuse(self, cfg, existing, role_def):
+        svc = self._svc()
+        with (
+            patch.object(cfg, "get_roles", return_value=[existing]),
+            patch.object(cfg, "create_role") as create,
+            patch.object(cfg, "get_service", return_value=svc),
+            patch.object(cfg, "map_role_to_service", return_value=svc),
+            patch("aiac.idp.configuration.api.requests") as http,
+        ):
+            result = cfg.create_service_role("svc-1", role_def)
+        create.assert_not_called()
+        http.assert_not_called()  # no update of the kept description
+        return result
+
+    def test_reuse_with_a_different_description_warns_and_keeps_the_first(self, caplog):
+        cfg = Configuration.for_realm(REALM)
+        existing = Role(id="r-1", name="app.agent", description="First agent", composite=False)
+        with caplog.at_level(logging.WARNING, logger="aiac.idp.configuration.api"):
+            result = self._reuse(cfg, existing, SimpleNamespace(name="app.agent", description="Second agent"))
+        assert result.description == "First agent"
+        [record] = caplog.records
+        assert record.levelno == logging.WARNING
+        assert all(text in record.getMessage() for text in ("app.agent", "First agent", "Second agent"))
+
+    @pytest.mark.parametrize(("kept", "new"), [("Agent role", "Agent role"), (None, "")], ids=["same", "none-is-empty"])
+    def test_reuse_with_the_same_description_does_not_warn(self, kept, new, caplog):
+        cfg = Configuration.for_realm(REALM)
+        existing = Role(id="r-1", name="app.agent", description=kept, composite=False)
+        with caplog.at_level(logging.WARNING, logger="aiac.idp.configuration.api"):
+            self._reuse(cfg, existing, SimpleNamespace(name="app.agent", description=new))
+        assert caplog.records == []
+
+    def test_new_role_does_not_warn(self, caplog):
+        cfg = Configuration.for_realm(REALM)
+        created = Role(id="r-1", name="app.agent", description="Agent role", composite=False)
+        svc = self._svc()
+        with (
+            caplog.at_level(logging.WARNING, logger="aiac.idp.configuration.api"),
+            patch.object(cfg, "get_roles", return_value=[]),
+            patch.object(cfg, "create_role", return_value=created),
+            patch.object(cfg, "get_service", return_value=svc),
+            patch.object(cfg, "map_role_to_service", return_value=svc),
+        ):
+            cfg.create_service_role("svc-1", SimpleNamespace(name="app.agent", description="Agent role"))
+        assert caplog.records == []
+
 
 class TestCreateServiceScope:
     def _svc(self):
@@ -697,6 +773,57 @@ class TestCreateServiceScope:
         create.assert_not_called()
         mapper.assert_called_once_with(svc, existing)
         assert result is existing
+
+    # A reused scope is shared (D32): it keeps its first description, Keycloak is not updated, and a
+    # different new description is logged as a WARNING (handoff 19 Bug 3).
+    def _reuse(self, cfg, existing, scope_def):
+        svc = self._svc()
+        with (
+            patch.object(cfg, "get_scopes", return_value=[existing]),
+            patch.object(cfg, "create_scope") as create,
+            patch.object(cfg, "get_service", return_value=svc),
+            patch.object(cfg, "map_scope_to_service", return_value=svc),
+            patch("aiac.idp.configuration.api.requests") as http,
+        ):
+            result = cfg.create_service_scope("svc-1", scope_def)
+        create.assert_not_called()
+        http.assert_not_called()  # no update of the kept description
+        return result
+
+    def test_reuse_with_a_different_description_warns_and_keeps_the_first(self, caplog):
+        cfg = Configuration.for_realm(REALM)
+        existing = Scope(id="s-1", name="github-tool.source-read", description="Read the source")
+        with caplog.at_level(logging.WARNING, logger="aiac.idp.configuration.api"):
+            result = self._reuse(
+                cfg, existing, SimpleNamespace(name="github-tool.source-read", description="Read a repository")
+            )
+        assert result.description == "Read the source"
+        [record] = caplog.records
+        assert record.levelno == logging.WARNING
+        message = record.getMessage()
+        assert all(text in message for text in ("github-tool.source-read", "Read the source", "Read a repository"))
+
+    @pytest.mark.parametrize(("kept", "new"), [("Read tool", "Read tool"), (None, "")], ids=["same", "none-is-empty"])
+    def test_reuse_with_the_same_description_does_not_warn(self, kept, new, caplog):
+        cfg = Configuration.for_realm(REALM)
+        existing = Scope(id="s-1", name="app.read", description=kept)
+        with caplog.at_level(logging.WARNING, logger="aiac.idp.configuration.api"):
+            self._reuse(cfg, existing, SimpleNamespace(name="app.read", description=new))
+        assert caplog.records == []
+
+    def test_new_scope_does_not_warn(self, caplog):
+        cfg = Configuration.for_realm(REALM)
+        created = Scope(id="s-1", name="app.read", description="Read tool")
+        svc = self._svc()
+        with (
+            caplog.at_level(logging.WARNING, logger="aiac.idp.configuration.api"),
+            patch.object(cfg, "get_scopes", return_value=[]),
+            patch.object(cfg, "create_scope", return_value=created),
+            patch.object(cfg, "get_service", return_value=svc),
+            patch.object(cfg, "map_scope_to_service", return_value=svc),
+        ):
+            cfg.create_service_scope("svc-1", SimpleNamespace(name="app.read", description="Read tool"))
+        assert caplog.records == []
 
 
 # ---------------------------------------------------------------------------
