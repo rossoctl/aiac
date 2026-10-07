@@ -569,6 +569,13 @@ Open:
 7. *Closed on 2026-10-07; see Closed.*
 8. The agent-side two-hop result of §1.7 (fails at the second agent) on the live cluster. It is
    inferred from the code paths only.
+9. Added 2026-10-08. Check D31 again when AuthBridge starts to send an `actor_token`. On cortex
+   `main` (`00cd25be`, 2026-10-07) the exchange client can send `actor_token` /
+   `actor_token_type` (`core/plugins/tokenexchange/exchange/client.go`), but no plugin sets it
+   (`core/auth/auth.go`: "actor-token chaining is not yet wired by any plugin"). Keycloak 26.5.2's
+   standard exchange (V2) has no delegation support (§1.5), so a request with an `actor_token` could
+   fail or go to another engine. On the same commit, `jwt-validation` still takes the subject only
+   from `sub` (`validation/jwks.go`), so option C still needs an AuthBridge change.
 
 Closed:
 
