@@ -64,6 +64,16 @@ _SUITE_BY_NODEID_MARKER = {
     "::test_prb_sensitive_to_mechanical_edit[": "robustness_mechanical_sensitivity",
     "::test_prb_invariant_to_semantic_perturbation[": "robustness_semantic_invariance",
     "::test_prb_sensitive_to_semantic_perturbation[": "robustness_semantic_sensitivity",
+    # Scale (#2469): each dimension/level's *correctness* test function maps straight to its own
+    # trend-log suite -- unlike the dicts above, the matching *structural* test function isn't
+    # listed here at all, since it never records "precision"/"recall" and so never becomes a
+    # ScenarioEntry this dashboard charts (see eval/conftest.py's own _SCALE_TEST_MARKERS for the
+    # structural half). Neither test function is parametrized (one fixture-backed case per
+    # dimension/level, not an 8-scenario sweep), so no trailing "[" like the markers above.
+    "::test_scale_total_corpus_correctness_prb": "scale_total_corpus_prb",
+    "::test_scale_total_corpus_correctness_e2e": "scale_total_corpus_e2e",
+    "::test_scale_per_decision_correctness_prb": "scale_per_decision_prb",
+    "::test_scale_per_decision_correctness_e2e": "scale_per_decision_e2e",
 }
 
 _RUN_RE = re.compile(r"^Run: (.+)$")
@@ -218,14 +228,34 @@ def parse_reports(reports_dir: Path) -> list[ParsedReport]:
 # Full Correctness/Robustness corpus size (eval.test_policy_pipeline_eval.SCENARIOS) -- the same
 # value as eval/conftest.py's own _EXPECTED_SCENARIO_COUNT, kept as a separate plain constant
 # rather than imported so this module stays a self-contained, dependency-light tool (see the
-# module docstring). Bump alongside conftest.py's copy if the corpus grows.
+# module docstring). Bump alongside conftest.py's copy if the corpus grows. This is the *default*
+# "full" threshold -- see _EXPECTED_COUNT_BY_SUITE for suites whose own full size isn't 8.
 _EXPECTED_SCENARIO_COUNT = 8
+
+# Suites whose "full" scored-entry count isn't the shared 8-scenario corpus -- explicit overrides,
+# checked before the default above. The Scale suite's four correctness test functions (#2469) are
+# each exactly one fixture-backed test case (one generated total-corpus/per-decision scenario per
+# dimension/level), never a sweep over multiple named scenarios, so "full" for them is 1, not 8 --
+# without this override _full_suites (and therefore render_scenario_table/_find_matching_report)
+# would exclude every Scale entry from the drill-down unconditionally, no matter how many times the
+# suite ran cleanly.
+_EXPECTED_COUNT_BY_SUITE: dict[str, int] = {
+    "scale_total_corpus_prb": 1,
+    "scale_total_corpus_e2e": 1,
+    "scale_per_decision_prb": 1,
+    "scale_per_decision_e2e": 1,
+}
+
+
+def _expected_count(suite: str) -> int:
+    return _EXPECTED_COUNT_BY_SUITE.get(suite, _EXPECTED_SCENARIO_COUNT)
 
 
 def _full_suites(report: ParsedReport) -> set[str]:
-    """The suites within ``report`` that have at least ``_EXPECTED_SCENARIO_COUNT`` *scored*
-    entries (``e.precision is not None`` -- see ``render_scenario_table``'s docstring for why that's
-    the same thing ``eval/conftest.py``'s ``_write_trend_log`` counts) -- exactly the suites
+    """The suites within ``report`` that have at least their own expected *scored* entry count
+    (``_expected_count`` -- 8 for the shared correctness/robustness corpus, 1 for each Scale suite;
+    ``e.precision is not None`` -- see ``render_scenario_table``'s docstring for why that's the same
+    thing ``eval/conftest.py``'s ``_write_trend_log`` counts) -- exactly the suites
     ``render_scenario_table`` actually renders a row for. Shared with ``_find_matching_report`` so a
     trend-log row never links to a report where its own suite's entries would be filtered out as
     partial -- matching by suite *presence* alone (the previous behavior) could link a genuine
@@ -234,7 +264,7 @@ def _full_suites(report: ParsedReport) -> set[str]:
     section at all if every suite in that report is partial."""
     scored = [e for e in report.entries if e.suite is not None and e.precision is not None]
     counts = Counter(e.suite for e in scored)
-    return {suite for suite, count in counts.items() if count >= _EXPECTED_SCENARIO_COUNT}
+    return {suite for suite, count in counts.items() if count >= _expected_count(suite)}
 
 
 # Both timestamps come from separate ``datetime.now()`` calls inside the same
@@ -273,12 +303,36 @@ def _report_anchor(report: ParsedReport) -> str:
 
 # Bookkeeping keys every trend-log row carries (eval/trend_log.py's `append_row`, plus
 # `scenarios_scored` that every pooling function adds) that are never themselves a plottable
-# metric -- everything else on a row is one, whatever the suite. This is what actually makes the
-# chart generic over suite (each suite's own `eval/conftest.py` call site decides its row's metric
-# *names* -- e.g. `pool_correctness_metrics`'s precision/recall/denial_precision, reused as-is by
-# both Correctness suites and both Robustness families, plus whatever else that call site mixes in
-# (a family's own invariance_rate/sensitivity_rate); this module never hardcodes any of them).
-_ROW_BOOKKEEPING_KEYS = {"timestamp", "suite", "run_type", "model", "scenarios_scored"}
+# metric -- everything else on a row *used* to be one, whatever the suite, back when every metric
+# any pooling function produced was naturally 0-1-bounded (a rate or a score). This chart hardcodes
+# a fixed 0-1 y-axis (see render_svg_chart) on exactly that assumption, so it breaks silently, not
+# loudly, for a metric that isn't: `pool_scale_metrics` (#2469) also emits `total_tokens` (raw token
+# counts, unbounded) and `mean_wall_clock_seconds` (raw seconds, unbounded) for latency/cost --
+# "reported and trended" per the Scale spec, meaning committed to `trend_log.jsonl` for the
+# record, not necessarily meant to share a 0-1 rate chart with precision/recall. Confirmed
+# empirically: without this exclusion, a real run's `total_tokens` line plotted at y ≈
+# -1.7 billion, wildly off-canvas. `structural_issue_count` (a raw count, unbounded on a failing
+# run) is excluded for the same reason -- `structural_pass_rate` is the 0-1-bounded signal that
+# actually belongs on this chart, mirroring how Consistency charts `agreement_rate`, never its own
+# raw `mismatches` count.
+_ROW_BOOKKEEPING_KEYS = {
+    "timestamp",
+    "suite",
+    "run_type",
+    "model",
+    "scenarios_scored",
+    "total_tokens",
+    "mean_wall_clock_seconds",
+    "structural_issue_count",
+}
+
+# Belt-and-suspenders beyond the explicit names above: a future pooling function's metric name
+# ending in one of these unit/tally suffixes is unbounded by construction (a raw token count, a
+# wall-clock duration, an issue tally) and must never share this chart's fixed 0-1 y-axis with a
+# precision/recall/rate/coverage metric -- excluded by shape, not only by an exact name someone
+# remembered to add to _ROW_BOOKKEEPING_KEYS after the fact (that denylist-by-name is exactly how
+# `total_tokens` first plotted at y ≈ -1.7 billion before being named above).
+_UNBOUNDED_METRIC_SUFFIXES = ("_tokens", "_seconds", "_count")
 
 # Fixed palette metrics are assigned from, in first-seen order, so the same metric name gets the
 # same color across repeated calls/renders for one suite. Cycles if a suite ever reports more
@@ -291,11 +345,13 @@ _AXIS_COLOR = "#9aa0a6"  # legible against the dark chart background, but not co
 
 def _metric_colors(rows: list[dict[str, Any]]) -> dict[str, str]:
     """Discover every metric key actually present across ``rows`` (first-seen order, skipping
-    ``_ROW_BOOKKEEPING_KEYS`` and any non-numeric value) and assign each a stable palette color."""
+    ``_ROW_BOOKKEEPING_KEYS``, any key shaped like an unbounded metric
+    (``_UNBOUNDED_METRIC_SUFFIXES``), and any non-numeric value) and assign each a stable palette
+    color."""
     names: list[str] = []
     for row in rows:
         for key, value in row.items():
-            if key in _ROW_BOOKKEEPING_KEYS or key in names:
+            if key in _ROW_BOOKKEEPING_KEYS or key in names or key.endswith(_UNBOUNDED_METRIC_SUFFIXES):
                 continue
             if isinstance(value, (int, float)):
                 names.append(key)

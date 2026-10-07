@@ -295,10 +295,24 @@ def _read_back(config: Configuration) -> tuple[dict[str, Role], dict[str, Scope]
 
     Scopes are sourced from each service's scope list (not the standalone get_scopes()), so that
     scope.serviceId is populated — a required input for the PCE's SPM routing.
+
+    The flat ``config.get_roles()`` call does not reliably carry the correct ``kind``/``actorIds``
+    for an agent-owned role (confirmed empirically: it can return ``kind=USER`` with an unrelated
+    ``actorIds`` value for a role actually owned by an agent) — each service's own ``.roles`` list
+    does (``Configuration._build_service`` merges the authoritative per-service ``kind``/
+    ``actorIds`` in from the per-service roles endpoint, which ``get_roles()``'s plain ``/roles``
+    call never queries). Overlaid below, once, for every role any service actually owns, piggy-
+    backing on the ``get_services()`` call already made for scopes rather than paying for a
+    second one — so every caller gets the correct attribution for free, not just one that
+    remembers to patch it locally. Getting this wrong is why ``compute_and_apply`` could
+    misattribute an agent role's rules away from its owning agent's own outbound APM, leaving an
+    agent that genuinely received grants with no rendered outbound Rego at all.
     """
     roles = {r.name: r for r in config.get_roles()}
     scopes: dict[str, Scope] = {}
     for svc in config.get_services():
+        for role in svc.roles:
+            roles[role.name] = role
         for s in svc.scopes:
             # One entry for each name: no eval scenario shares a scope between tools. (A shared scope is
             # valid, D32; it then has one copy for each owner, and this map keeps the first one.)
