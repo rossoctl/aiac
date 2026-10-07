@@ -6,8 +6,11 @@ HTTP routes use, awaiting completion before acking. On a **permanent** failure (
 ``_PERMANENT_ERRORS``: a policy conflict or contradiction, a PRB fault, an unparseable LLM
 response, or a failed UC1 precondition check) the message is republished to the DLQ subject and
 terminated at the FIRST delivery. On any other failure the message is left unacked (NATS
-redelivers) until ``num_delivered`` reaches ``MAX_DELIVER``, at which point it is republished to
-the DLQ subject and terminated (stops redelivery on this consumer).
+redelivers after ``ACK_WAIT_SECONDS``) until ``num_delivered`` reaches ``MAX_DELIVER``, at which
+point it is republished to the DLQ subject and terminated (stops redelivery on this consumer). One
+retryable failure is nak'd instead of left unacked: ``ServiceNotVisibleError`` (the IdP does not show
+a new service yet, the event-before-commit race), so NATS redelivers it after a short delay
+(``AIAC_NOT_VISIBLE_NAK_DELAY_SECONDS``), not after ``ACK_WAIT_SECONDS``.
 
 Also owns the FastAPI ``lifespan``: it runs the Controller start sequence (the enforcement side,
 start check #4, then the PCE resync; see ``controller.start``) and starts the consumer only after
@@ -18,6 +21,7 @@ Controller stops before it serves.
 import asyncio
 import functools
 import logging
+import math
 import os
 from contextlib import asynccontextmanager
 from urllib.parse import unquote
@@ -45,7 +49,7 @@ from aiac.agent.policy_rules_builder.graph import (
     UnparseableLLMResponseError,
 )
 from aiac.agent.shared.error_logging import log_by_type
-from aiac.agent.uc.onboarding.orchestrator import onboard_service, reenable_service
+from aiac.agent.uc.onboarding.orchestrator import ServiceNotVisibleError, onboard_service, reenable_service
 from aiac.agent.uc.onboarding.preconditions import EnforcementPreconditionError
 from aiac.agent.uc.policy_update.build import build_policy
 from aiac.agent.uc.role_update.role import update_role
@@ -69,7 +73,8 @@ _POLICY_BUILD_SUBJECT = "aiac.apply.policy.build"
 # check — that one needs a fix in the cluster first), so they are DLQ'd + term()ed on the
 # FIRST delivery. Everything else — LLMAccessError (a transient LLM
 # outage that may clear) and genuinely unknown/transient errors — is RETRYABLE: left
-# unacked to redeliver until MAX_DELIVER, then DLQ'd. LLMAccessError is a sibling of the
+# unacked to redeliver until MAX_DELIVER, then DLQ'd (ServiceNotVisibleError is nak'd with a
+# short delay instead; see _NOT_VISIBLE_NAK_DELAY_ENV below). LLMAccessError is a sibling of the
 # permanent PRB errors under PolicyRulesBuilderBaseError, so isinstance() below correctly
 # excludes it from the permanent set.
 _PERMANENT_ERRORS: tuple[type[Exception], ...] = (
@@ -79,6 +84,43 @@ _PERMANENT_ERRORS: tuple[type[Exception], ...] = (
     UnparseableLLMResponseError,
     EnforcementPreconditionError,
 )
+
+# The event-before-commit race (handoff 20): the IdP can still answer 404 for a new service after the
+# orchestrator's bounded wait (``ServiceNotVisibleError``). The client can become visible in some
+# seconds, so the consumer naks that message with this delay instead of leaving it unacked: the
+# redelivery then comes after the delay, not after ACK_WAIT (600 s). Each nak uses one of the
+# MAX_DELIVER deliveries. Only this error class is nak'd; ACK_WAIT stays sized for long LLM
+# onboardings (see stream.py). Read from the env at call time; keep it well below ACK_WAIT.
+_NOT_VISIBLE_NAK_DELAY_ENV = "AIAC_NOT_VISIBLE_NAK_DELAY_SECONDS"
+_NOT_VISIBLE_NAK_DELAY_DEFAULT = 30.0
+
+
+def _not_visible_nak_delay() -> float:
+    """The nak delay in seconds for a not-visible service; an unset, non-numeric, non-finite, zero
+    or negative value falls back to the default (nats-py sends a plain nak, with no delay, for 0)."""
+    try:
+        value = float(os.getenv(_NOT_VISIBLE_NAK_DELAY_ENV, str(_NOT_VISIBLE_NAK_DELAY_DEFAULT)))
+    except (TypeError, ValueError):
+        return _NOT_VISIBLE_NAK_DELAY_DEFAULT
+    return value if math.isfinite(value) and value > 0 else _NOT_VISIBLE_NAK_DELAY_DEFAULT
+
+
+async def _nak_not_visible(msg: Msg) -> None:
+    """Nak ``msg`` with the not-visible delay (nats-py takes the delay in seconds). A failed nak (for
+    example a dropped connection) must not crash the callback: it is logged, and the message stays
+    unacked, so NATS redelivers it after ACK_WAIT."""
+    delay = _not_visible_nak_delay()
+    try:
+        await msg.nak(delay=delay)
+    except Exception:
+        logger.exception("nak of %s failed; NATS redelivers it after ACK_WAIT", msg.subject)
+        return
+    logger.info(
+        "nak'd %s (service not visible yet, delivery %d); redelivery in %.0fs",
+        msg.subject,
+        msg.metadata.num_delivered,
+        delay,
+    )
 
 
 def _handle(subject: str) -> tuple[list[PolicyRule], bool, ClientId | None]:
@@ -189,7 +231,11 @@ class AiacEventConsumer:
                     "permanent" if permanent else "retryable",
                     msg.metadata.num_delivered,
                 )
-            # Retryable + still under MAX_DELIVER: leave unacked so NATS redelivers.
+            elif isinstance(exc, ServiceNotVisibleError):
+                # Retryable + still under MAX_DELIVER, and the IdP does not show the new service yet:
+                # nak with a short delay, so the redelivery comes after the delay, not after ACK_WAIT.
+                await _nak_not_visible(msg)
+            # Any other retryable failure still under MAX_DELIVER: leave unacked so NATS redelivers.
             return
         await msg.ack()
 
