@@ -104,7 +104,7 @@ that leg.
 ## Before you start
 
 **Cluster.** A Kind cluster named `rossoctl` with the rossoctl platform installed — SPIRE, Keycloak,
-and the rossoctl operator. Namespace `team1` must exist; 
+and the rossoctl operator. Namespace `team1` must exist;
 
 **Tools.** `kubectl`, `helm`, `kind`, `curl`, `python3`, and `docker` or `podman` on `PATH`.
 
@@ -270,7 +270,7 @@ kubectl get configmap authbridge-runtime-config -n team1 \
 
 Now insert opa in both inbound and outbound legs of AuthBridge
 ```bash
-make opa  
+make opa
 ```
 
 This is a **cluster-level, one-time** change owned by `k8s/`.
