@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from eval.conftest import _scale_run_matches_fixed_100
+from eval.conftest import _scale_run_matches_fixed_100, _scenario_name_from_nodeid
 
 
 @pytest.fixture(autouse=True)
@@ -73,3 +73,23 @@ class TestScaleRunMatchesFixed100:
         assert not _scale_run_matches_fixed_100("scale_total_corpus_e2e")
         assert _scale_run_matches_fixed_100("scale_per_decision_prb")
         assert _scale_run_matches_fixed_100("scale_per_decision_e2e")
+
+
+class TestScenarioNameFromNodeid:
+    def test_extracts_trailing_bracket_id(self) -> None:
+        nodeid = "eval/test_policy_pipeline_eval.py::test_prb_correctness[baseline]"
+        assert _scenario_name_from_nodeid(nodeid) == "baseline"
+
+    def test_extracts_id_with_special_characters(self) -> None:
+        nodeid = "eval/test_policy_pipeline_robustness.py::test_prb_sensitive_to_mechanical_edit[agent_delegation]"
+        assert _scenario_name_from_nodeid(nodeid) == "agent_delegation"
+
+    def test_non_parametrized_nodeid_returned_unchanged(self) -> None:
+        nodeid = "eval/test_policy_pipeline_scale.py::test_scale_total_corpus_correctness_prb"
+        assert _scenario_name_from_nodeid(nodeid) == nodeid
+
+    def test_bracket_not_at_end_is_not_mistaken_for_parametrize_id(self) -> None:
+        # Defensive: a nodeid with a literal "[" that doesn't end in "]" (shouldn't occur in
+        # practice) falls through to the unchanged-return branch rather than mis-slicing.
+        nodeid = "eval/test_policy_pipeline_eval.py::test_prb_correctness[baseline"
+        assert _scenario_name_from_nodeid(nodeid) == nodeid

@@ -275,13 +275,31 @@ produced whenever the supporting evidence is present:
 | Sensitivity family failures (output did not change when it should have) | Flag which policy-text edit types the PRB is insensitive to (e.g. negation words, exception clauses, restriction words like "only"/"just"); recommend adding those edit patterns to the Robustness corpus and reviewing PRB prompts for those constructs. |
 | Invariance family failures (output changed when it shouldn't have) | Flag which surface-form changes destabilize the PRB; recommend prompt hardening or normalization pre-processing. |
 | Consistency disagreements | Note whether disagreements cluster on specific scenarios (structural prompt sensitivity) or appear random (temperature/batching noise); recommend `temperature=0` enforcement or a retry-with-majority-vote strategy accordingly. |
-| Scale correctness degradation above a threshold | Identify whether degradation is in per-decision scale (large candidate lists) or total-corpus scale; recommend context-window management changes (chunking, summarization) or candidate-list pruning strategies respectively. |
+| Scale correctness mistake (over-grant, under-grant, or incorrect denial in a Scale-suite scenario) | Identify whether the mistake is in per-decision scale (large candidate lists) or total-corpus scale; recommend context-window management changes (chunking, summarization) or candidate-list pruning strategies respectively. |
 
 Recommendations that have no supporting evidence in the current run are
 omitted (not printed as vacuous "no issues found" items). Each
 recommendation references the specific failing scenario(s) or metric
 cell(s) that produced it, so the reader can verify the evidence directly
 in the same report.
+
+**Implementation decisions** (referenced as "decision 1"/"decision 4" in
+`eval/recommendations.py`/`eval/conftest.py`):
+
+- **Decision 1 — no numeric degradation threshold for the Scale row.** The Scale
+  suite's correctness check reuses the same zero-tolerance gate as the
+  Correctness suites (any over-grant/under-grant/incorrect denial already
+  fails the test) — there is no accumulated history within a single run to
+  compute a "rate" or "degradation" against, so any occurrence of a mistake
+  IS the finding, with no threshold to cross.
+- **Decision 4 — Consistency's cluster-vs-random classification is a
+  deterministic fraction**, computed once per run from the share of
+  Consistency scenarios that disagreed: at most half → "clusters on these scenario(s)"
+   (structural prompt sensitivity); more than half → "appears
+   random/widespread" (temperature/batching noise). This is a heuristic,
+   not a statistical test, and reads as degenerate on a very small or
+   `-k`-filtered run (e.g. a single scored scenario) — acceptable because
+   the suite's documented full-corpus run always scores all 8 scenarios.
 
 ## 10. Framework trust
 

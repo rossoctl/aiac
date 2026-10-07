@@ -63,7 +63,7 @@ Both suites also ``record_property`` two raw counts alongside the floats above �
 ``true_positives`` and ``denied_total`` — not rendered in the Markdown report (the floats and pair
 breakdowns already cover a human reader) but read back here by ``_write_trend_log`` to pool a
 run's precision/recall/denial_precision into one committed, append-only trend-log row per suite
-(``eval/trend_log.py``, spec: ``docs/evaluation/eval-framework.md`` §9) — pooled by summed count
+(``eval/dashboard/trend_log.py``, spec: ``docs/evaluation/eval-framework.md`` §9) — pooled by summed count
 across every scenario that reached ``score_scenario`` in the run, not averaged per-scenario, so a
 run with an uneven pair count per scenario isn't skewed by weighting every scenario equally. A
 scenario whose own setup failed never recorded these, so it contributes nothing to the pooled row
@@ -80,7 +80,7 @@ four test functions across two families x two tiers that must stay unblended) in
 committed trend-log row per family/tier combination -- ``suite="robustness_mechanical_invariance"``/
 ``"robustness_semantic_invariance"``/``"robustness_mechanical_sensitivity"``/
 ``"robustness_semantic_sensitivity"`` -- each carrying that row's own precision/recall/
-denial_precision (``eval/trend_log.py``'s ``pool_correctness_metrics``, the same pooling the two
+denial_precision (``eval/dashboard/trend_log.py``'s ``pool_correctness_metrics``, the same pooling the two
 Correctness suites use, so the resulting chart is directly comparable to theirs: two measuring
 performance against the *original* inputs, two against *deliberately edited/reworded* inputs) plus
 that row's own pass/fail rate (``invariance_rate``/``sensitivity_rate``).
@@ -91,7 +91,7 @@ when consistent) -- rendered in the Markdown report as an explicit "Inconsistent
 mismatch detail when ``True``) via ``_render_consistency_block``, on every entry, pass or fail,
 unlike every other test in this suite besides the correctness/robustness metrics blocks above -- and
 pooled by nodeid substring (``_CONSISTENCY_TEST_MARKERS``) into its own committed trend-log row,
-``suite="consistency"``, carrying an ``agreement_rate`` (``eval/trend_log.py``'s
+``suite="consistency"``, carrying an ``agreement_rate`` (``eval/dashboard/trend_log.py``'s
 ``pool_consistency_metrics`` -- its own smaller pooling function, since there's no truth table here
 to produce a ``pool_correctness_metrics``-shaped precision/recall).
 
@@ -107,8 +107,25 @@ through to the existing ``_render_metrics_block`` branch above with no special-c
 pooled by nodeid substring (``_SCALE_TEST_MARKERS``, mapping to ``(suite, "structural" |
 "correctness")`` rather than a bare suite name) and merged into one row per dimension/level --
 ``scale_total_corpus_prb``/``scale_per_decision_prb`` (and their ``_e2e`` counterparts) -- via
-``eval/trend_log.py``'s ``pool_scale_metrics`` for the structural half and the existing
+``eval/dashboard/trend_log.py``'s ``pool_scale_metrics`` for the structural half and the existing
 ``pool_correctness_metrics`` for the correctness half.
+
+Below the per-category drill-down, ``pytest_sessionfinish`` appends an **"Improvement
+recommendations" section** (spec: ``docs/evaluation/eval-framework.md`` §9.1, #2472), generated
+after every run and omitted entirely when it has no supporting evidence. ``_collect_recommendation_
+evidence`` makes a dedicated pass over ``_reports`` (deliberately separate from ``_write_trend_
+log``'s own loop above, which stays untouched) and attributes every already-recorded property dict
+to its scenario (via ``_scenario_name_from_nodeid``) and finding type -- over/under-grants from the
+two Correctness suites, sensitivity/invariance from their respective Robustness suites (split by
+which boolean prop each ``_ROBUSTNESS_TEST_MARKERS`` entry records), inconsistent scenarios from the
+Consistency suite (plus a deterministic cluster-vs-random classification, ``_classify_consistency_
+disagreements``, computed from the fraction of inconsistent scenarios -- no LLM needed to count),
+and over/under-grant/incorrectly-denied mistakes from the Scale suite's correctness tests. That
+evidence is handed to ``eval.recommendations.build_recommendations``, which gathers it into
+``EvidenceCase``s and makes ONE batched structured-LLM call to cluster them into distinct
+recommendation patterns (falling back to a deterministic, clearly-labeled grouping if the call
+fails or returns nothing usable) -- ``_render_recommendations_section`` renders the result as one
+``###`` sub-heading per recommendation, with its own evidence lines.
 """
 
 from __future__ import annotations
@@ -122,7 +139,8 @@ from zoneinfo import ZoneInfo
 import pytest
 from dotenv import load_dotenv
 
-from eval.trend_log import append_row, pool_consistency_metrics, pool_correctness_metrics, pool_scale_metrics
+from eval.dashboard.trend_log import append_row, pool_consistency_metrics, pool_correctness_metrics, pool_scale_metrics
+from eval.recommendations import build_recommendations
 
 HERE = Path(__file__).resolve().parent
 REPORTS_DIR = HERE / "reports"
@@ -159,6 +177,17 @@ _EVAL_SUITE_PATH_PREFIX = "eval/test_policy_pipeline_"
 
 def _is_eval_suite_nodeid(nodeid: str) -> bool:
     return nodeid.split("::", 1)[0].startswith(_EVAL_SUITE_PATH_PREFIX)
+
+
+def _scenario_name_from_nodeid(nodeid: str) -> str:
+    """Extract a parametrized test's scenario name from its trailing ``[...]`` (e.g.
+    ``eval/test_policy_pipeline_eval.py::test_prb_correctness[baseline]`` -> ``"baseline"``) --
+    used by ``_collect_recommendation_evidence`` to attribute each recorded property dict to the
+    scenario it came from. Returns the nodeid unchanged for a non-parametrized test (e.g. the Scale
+    suite's structural/correctness tests, which run once per dimension/level, not per scenario)."""
+    if nodeid.endswith("]") and "[" in nodeid:
+        return nodeid[nodeid.rindex("[") + 1 : -1]
+    return nodeid
 
 
 def pytest_collection_modifyitems(session: pytest.Session, config: pytest.Config, items: list) -> None:
@@ -263,7 +292,7 @@ _ROBUSTNESS_SCORED_TEST_MARKERS = (
     "::test_prb_sensitive_to_semantic_perturbation[",
 )
 
-# Nodeid substring -> trend-log suite name (eval/trend_log.py). With the five former ``eval_*``
+# Nodeid substring -> trend-log suite name (eval/dashboard/trend_log.py). With the five former ``eval_*``
 # markers collapsed to one flat ``eval`` marker, every suite under `eval/` is disambiguated by its
 # own test function's nodeid rather than by marker — the same ``::test_prb_correctness[``/
 # ``::test_e2e_correctness[`` substrings ``_CORRECTNESS_TEST_MARKERS`` already uses. Deliberately
@@ -318,7 +347,7 @@ _ROBUSTNESS_TEST_MARKERS = {
 # invariance_rate/sensitivity_rate, which _write_trend_log injects on top of pool_correctness_
 # metrics' output separately). Kept as its own dict (not folded into _TREND_LOG_SUITES) since its
 # entries are pooled by pool_consistency_metrics, not pool_correctness_metrics -- see
-# eval/trend_log.py.
+# eval/dashboard/trend_log.py.
 _CONSISTENCY_TEST_MARKERS = {
     "::test_prb_consistent_across_repeats[": "consistency",
 }
@@ -327,7 +356,7 @@ _CONSISTENCY_TEST_MARKERS = {
 # docs/evaluation/policy-eval-scale.md). Unlike every dict above, each Scale trend-log row
 # (e.g. "scale_total_corpus_prb") is built from *two* separate test functions -- a structural test
 # (record_property("structural_pass"/"structural_issue_count"/...), pooled by
-# eval.trend_log.pool_scale_metrics) and a correctness test (the familiar precision/recall shape,
+# eval.dashboard.trend_log.pool_scale_metrics) and a correctness test (the familiar precision/recall shape,
 # pooled by the existing pool_correctness_metrics) -- so this dict's value is a
 # (suite, "structural" | "correctness") pair rather than a bare suite name; _write_trend_log pools
 # each half separately then merges them into one row. Neither test function is parametrized (each
@@ -502,6 +531,102 @@ def _render_scale_block(lines: list[str], props: dict) -> None:
             "Failed decision calls (raised an exception, see reason)",
             _format_best_effort_notes(failed_decisions),
         )
+
+
+def _classify_consistency_disagreements(entries: list[tuple[str, dict]]) -> str:
+    """Decision 4 (``docs/evaluation/eval-framework.md`` §9.1, #2472): a minority of this run's
+    Consistency scenarios inconsistent (<= 50%) classifies as clustering on those scenario(s)
+    (structural prompt sensitivity); more than half classifies as appearing random/widespread
+    (temperature/batching noise). Computed deterministically from the fraction of inconsistent
+    scenarios -- no LLM needed to count -- then handed to the LLM as part of the Consistency
+    finding's evidence (``eval.recommendations.consistency_cases``) so its pattern-level writeup
+    stays consistent with this classification rather than re-deriving its own."""
+    if not entries:
+        return "no consistency data"
+    inconsistent = sum(1 for _scenario, props in entries if props.get("inconsistent"))
+    if inconsistent == 0:
+        return "no disagreements"
+    fraction = inconsistent / len(entries)
+    return "clusters on these scenario(s)" if fraction <= 0.5 else "appears random/widespread"
+
+
+def _collect_recommendation_evidence() -> dict:
+    """One new pass over ``_reports``, deliberately separate from ``_write_trend_log``'s existing
+    loop (not merged into it) so the already-shipped trend-log writer stays untouched. Reuses the
+    existing marker dicts as-is (``_TREND_LOG_SUITES``/``_ROBUSTNESS_TEST_MARKERS``/
+    ``_CONSISTENCY_TEST_MARKERS``/``_SCALE_TEST_MARKERS``) but additionally captures each entry's
+    scenario name (via ``_scenario_name_from_nodeid``) and splits ``_ROBUSTNESS_TEST_MARKERS`` into
+    sensitivity vs invariance groups by which boolean prop each marker records (``"sensitive"`` vs
+    ``"invariant"``) -- the input shape ``eval.recommendations.build_recommendations`` expects."""
+    correctness_entries: list[tuple[str, str, dict]] = []
+    sensitivity_entries: list[tuple[str, str, dict]] = []
+    invariance_entries: list[tuple[str, str, dict]] = []
+    consistency_entries: list[tuple[str, dict]] = []
+    scale_entries: list[tuple[str, dict]] = []
+
+    for nodeid, report in _reports.items():
+        props = dict(report.user_properties)
+        for substring, suite in _TREND_LOG_SUITES.items():
+            if substring in nodeid:
+                if "over_grants" in props or "under_grants" in props:
+                    correctness_entries.append((suite, _scenario_name_from_nodeid(nodeid), props))
+                break
+        for substring, (prop_name, robustness_suite, _rate_key) in _ROBUSTNESS_TEST_MARKERS.items():
+            if substring in nodeid:
+                if prop_name in props:
+                    scenario = _scenario_name_from_nodeid(nodeid)
+                    if prop_name == "sensitive":
+                        sensitivity_entries.append((robustness_suite, scenario, props))
+                    else:
+                        invariance_entries.append((robustness_suite, scenario, props))
+                break
+        for substring in _CONSISTENCY_TEST_MARKERS:
+            if substring in nodeid:
+                if "inconsistent" in props:
+                    consistency_entries.append((_scenario_name_from_nodeid(nodeid), props))
+                break
+        for substring, (scale_suite, check_type) in _SCALE_TEST_MARKERS.items():
+            if substring in nodeid and check_type == "correctness":
+                if "over_grants" in props or "under_grants" in props or "incorrectly_denied" in props:
+                    scale_entries.append((scale_suite, props))
+                break
+
+    return {
+        "over_grant": correctness_entries,
+        "under_grant": correctness_entries,
+        "sensitivity": sensitivity_entries,
+        "invariance": invariance_entries,
+        "consistency": consistency_entries,
+        "consistency_classification": _classify_consistency_disagreements(consistency_entries),
+        "scale_mistake": scale_entries,
+    }
+
+
+def _render_recommendations_section(lines: list[str], evidence: dict) -> None:
+    """Calls ``eval.recommendations.build_recommendations`` and renders the "Improvement
+    recommendations" section below the drill-down (spec §9.1, #2472) -- **omits the whole section**
+    when the result is empty (no ``_none_`` fallback here, unlike the six pass/fail category
+    sections above: the spec is explicit that an empty category must not render as a vacuous pass
+    statement)."""
+    recommendations = build_recommendations(
+        over_grant=evidence["over_grant"],
+        under_grant=evidence["under_grant"],
+        sensitivity=evidence["sensitivity"],
+        invariance=evidence["invariance"],
+        consistency=evidence["consistency"],
+        consistency_classification=evidence["consistency_classification"],
+        scale_mistake=evidence["scale_mistake"],
+    )
+    if not recommendations:
+        return
+    lines.append("## Improvement recommendations")
+    lines.append("")
+    for rec in recommendations:
+        lines.append(f"### {rec.heading}")
+        lines.append("")
+        _render_field(lines, "Recommendation", rec.body)
+        _render_field(lines, "Evidence", "\n".join(rec.evidence))
+        lines.append("")
 
 
 def _render_entry(lines: list[str], nodeid: str, report: pytest.TestReport, category: str) -> None:
@@ -716,6 +841,16 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
             continue
         for nodeid, report in entries:
             _render_entry(lines, nodeid, report, cat)
+
+    try:
+        _render_recommendations_section(lines, _collect_recommendation_evidence())
+    except Exception as err:
+        # The six category sections above have already been appended to `lines` by this point --
+        # an unexpected failure drafting recommendations (a bug in evidence-gathering, or an LLM/
+        # settings error _draft_patterns itself didn't already sanitize to []) must not cost the
+        # rest of this already-computed report, which `report_path.write_text` below still owes
+        # every run regardless of whether this section can be produced.
+        print(f"\nImprovement recommendations section failed, omitting it: {err!r}")
 
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     suffix = now.strftime("%d_%m_%H_%M_%S")
