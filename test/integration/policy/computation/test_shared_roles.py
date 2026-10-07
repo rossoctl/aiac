@@ -31,8 +31,10 @@ Controller calls ``rerender_role(role_id)`` for it (R7). ``Stack.deliver_role_ev
 for each event that the realm recorded. ``Stack.drop_role_events`` loses the events, so that the
 resync must repair the CRs.
 
-Before D32 (on HEAD ``2069752``), cases 1 and 2 failed by an assertion: an agent that holds the shared
-role was missing from the tool CR's ``source_roles``.
+Before D32 (on HEAD ``2069752``), ``rerender_role`` did not exist, so every test stopped with an
+``AttributeError``. With a no-op ``rerender_role`` stub, 12 of the 17 tests failed: cases 1 and 2 by
+an assertion (an agent that holds the shared role was missing from the tool CR's ``source_roles``),
+and cases 3 and 4 too. See ``docs/testing/shared-roles-integration.md`` for the split.
 """
 
 import json
