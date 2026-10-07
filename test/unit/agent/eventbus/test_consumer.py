@@ -1,7 +1,8 @@
 """Unit tests for aiac.agent.eventbus.consumer.
 
 Covers subject-based dispatch and the ack/DLQ contract: ack on success,
-no ack (implicit redelivery) on failure below MAX_DELIVER, and DLQ
+no ack (implicit redelivery) on failure below MAX_DELIVER, a delayed nak for a
+service that the IdP does not show yet (``ServiceNotVisibleError``), and DLQ
 publish + term() once MAX_DELIVER is reached.
 """
 
@@ -9,9 +10,17 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from fastapi import HTTPException
 from nats.js.api import AckPolicy
 
-from aiac.agent.eventbus.consumer import AiacEventConsumer, _handle, lifespan
+from aiac.agent.eventbus.consumer import (
+    _NOT_VISIBLE_NAK_DELAY_DEFAULT,
+    _NOT_VISIBLE_NAK_DELAY_ENV,
+    AiacEventConsumer,
+    _handle,
+    _not_visible_nak_delay,
+    lifespan,
+)
 from aiac.agent.eventbus.stream import (
     ACK_WAIT_SECONDS,
     CONSUMER_FILTER_SUBJECTS,
@@ -28,6 +37,7 @@ from aiac.agent.policy_rules_builder.graph import (
     PolicyRulesBuilderError,
     UnparseableLLMResponseError,
 )
+from aiac.agent.uc.onboarding.orchestrator import ServiceNotVisibleError
 from aiac.agent.uc.onboarding.preconditions import EnforcementPreconditionError
 
 # What onboard_service returns for the onboarded service: the subject carries the Keycloak UUID, the
@@ -41,6 +51,7 @@ def _fake_msg(subject: str, num_delivered: int = 1) -> MagicMock:
     msg.data = b'{"id":"x"}'
     msg.metadata.num_delivered = num_delivered
     msg.ack = AsyncMock()
+    msg.nak = AsyncMock()
     msg.term = AsyncMock()
     return msg
 
@@ -184,6 +195,7 @@ def test_dispatch_leaves_message_unacked_before_max_deliver():
         asyncio.run(consumer._dispatch(msg))
 
     msg.ack.assert_not_called()
+    msg.nak.assert_not_called()  # only a not-visible service is nak'd; NATS redelivers after ACK_WAIT
     msg.term.assert_not_called()
     consumer._nc.jetstream.assert_not_called()
 
@@ -246,6 +258,7 @@ def test_dispatch_leaves_retryable_llm_access_error_unacked_below_max_deliver():
         asyncio.run(consumer._dispatch(msg))
 
     msg.ack.assert_not_called()
+    msg.nak.assert_not_called()
     msg.term.assert_not_called()
     consumer._nc.jetstream.assert_not_called()
     log.assert_called_once_with(exc)
@@ -268,6 +281,121 @@ def test_dispatch_routes_retryable_llm_access_error_to_dlq_at_max_deliver():
     msg.term.assert_called_once()
     consumer._nc.jetstream.return_value.publish.assert_called_once_with(DLQ_SUBJECT, msg.data)
     log.assert_called_once_with(exc)
+
+
+# The IdP still answers 404 for the service after the orchestrator's bounded wait (the
+# event-before-commit race, handoff 20): the client can become visible in some seconds, so the consumer
+# naks with a short delay instead of waiting ACK_WAIT (600 s) for the redelivery.
+def _not_visible() -> ServiceNotVisibleError:
+    return ServiceNotVisibleError("IdP has no service svc-1 yet")
+
+
+@pytest.mark.parametrize("num_delivered", [1, MAX_DELIVER - 1])
+def test_dispatch_naks_not_visible_service_with_delay_below_max_deliver(monkeypatch, num_delivered):
+    monkeypatch.delenv(_NOT_VISIBLE_NAK_DELAY_ENV, raising=False)
+    consumer = AiacEventConsumer()
+    consumer._nc = nc = _fake_nc()
+    msg = _fake_msg("aiac.apply.service.svc-1", num_delivered=num_delivered)
+    exc = _not_visible()
+
+    with (
+        patch("aiac.agent.eventbus.consumer.onboard_service", side_effect=exc),
+        patch("aiac.agent.eventbus.consumer.log_by_type") as log,
+    ):
+        asyncio.run(consumer._dispatch(msg))
+
+    msg.nak.assert_called_once_with(delay=_NOT_VISIBLE_NAK_DELAY_DEFAULT)
+    msg.ack.assert_not_called()
+    msg.term.assert_not_called()
+    nc.jetstream.assert_not_called()
+    log.assert_called_once_with(exc)
+
+
+def test_dispatch_naks_not_visible_service_with_the_configured_delay(monkeypatch):
+    monkeypatch.setenv(_NOT_VISIBLE_NAK_DELAY_ENV, "5")
+    consumer = AiacEventConsumer()
+    consumer._nc = _fake_nc()
+    msg = _fake_msg("aiac.apply.service.svc-1", num_delivered=1)
+
+    with patch("aiac.agent.eventbus.consumer.onboard_service", side_effect=_not_visible()):
+        asyncio.run(consumer._dispatch(msg))
+
+    msg.nak.assert_called_once_with(delay=5.0)
+
+
+def test_dispatch_routes_not_visible_service_to_dlq_at_max_deliver():
+    # At MAX_DELIVER the not-visible service goes to the DLQ like every other retryable failure: no
+    # nak (a nak would ask for a delivery that the consumer's max_deliver does not allow).
+    consumer = AiacEventConsumer()
+    consumer._nc = nc = _fake_nc()
+    msg = _fake_msg("aiac.apply.service.svc-1", num_delivered=MAX_DELIVER)
+
+    with patch("aiac.agent.eventbus.consumer.onboard_service", side_effect=_not_visible()):
+        asyncio.run(consumer._dispatch(msg))
+
+    msg.nak.assert_not_called()
+    msg.ack.assert_not_called()
+    msg.term.assert_called_once()
+    nc.jetstream.return_value.publish.assert_called_once_with(DLQ_SUBJECT, msg.data)
+
+
+def test_dispatch_does_not_nak_another_http_502():
+    # Only the not-visible class is nak'd. Another 502 from onboard_service (for example an IdP
+    # outage) keeps the old behaviour: no ack and no nak, so NATS redelivers after ACK_WAIT.
+    consumer = AiacEventConsumer()
+    consumer._nc = nc = _fake_nc()
+    msg = _fake_msg("aiac.apply.service.svc-1", num_delivered=1)
+    exc = HTTPException(502, "IdP config unavailable resolving service svc-1")
+
+    with patch("aiac.agent.eventbus.consumer.onboard_service", side_effect=exc):
+        asyncio.run(consumer._dispatch(msg))
+
+    msg.nak.assert_not_called()
+    msg.ack.assert_not_called()
+    msg.term.assert_not_called()
+    nc.jetstream.assert_not_called()
+
+
+def test_dispatch_survives_a_failed_nak(caplog):
+    # A failed nak (for example a dropped connection) must not crash the callback: the consumer logs
+    # it, and NATS redelivers the unacked message after ACK_WAIT.
+    consumer = AiacEventConsumer()
+    consumer._nc = nc = _fake_nc()
+    msg = _fake_msg("aiac.apply.service.svc-1", num_delivered=1)
+    msg.nak.side_effect = RuntimeError("connection closed")
+
+    with (
+        patch("aiac.agent.eventbus.consumer.onboard_service", side_effect=_not_visible()),
+        caplog.at_level("ERROR", logger="aiac.agent.eventbus.consumer"),
+    ):
+        asyncio.run(consumer._dispatch(msg))
+
+    msg.nak.assert_called_once()
+    msg.ack.assert_not_called()
+    msg.term.assert_not_called()
+    nc.jetstream.assert_not_called()
+    assert any(r.name == "aiac.agent.eventbus.consumer" and "nak" in r.getMessage() for r in caplog.records)
+
+
+def test_not_visible_nak_delay_defaults_to_about_30_seconds(monkeypatch):
+    monkeypatch.delenv(_NOT_VISIBLE_NAK_DELAY_ENV, raising=False)
+
+    assert _not_visible_nak_delay() == _NOT_VISIBLE_NAK_DELAY_DEFAULT == 30.0
+
+
+def test_not_visible_nak_delay_reads_the_env(monkeypatch):
+    monkeypatch.setenv(_NOT_VISIBLE_NAK_DELAY_ENV, "12.5")
+
+    assert _not_visible_nak_delay() == 12.5
+
+
+@pytest.mark.parametrize("raw", ["", "abc", "0", "-1", "nan", "inf"])
+def test_not_visible_nak_delay_falls_back_to_the_default_on_a_bad_value(monkeypatch, raw):
+    # A bad value must not crash the callback. A delay of 0 (or less) is bad too: nats-py then sends
+    # a plain nak, and NATS redelivers at once.
+    monkeypatch.setenv(_NOT_VISIBLE_NAK_DELAY_ENV, raw)
+
+    assert _not_visible_nak_delay() == _NOT_VISIBLE_NAK_DELAY_DEFAULT
 
 
 def test_start_with_retry_retries_on_failure_then_succeeds():
