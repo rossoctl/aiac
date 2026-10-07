@@ -1,4 +1,4 @@
-# Onboarding an agent and a tool, end to end
+# End to end demo of onboarding an agent and a tool
 
 AIAC discovers a GitHub agent and a GitHub tool running in your cluster, reads a **two-line
 plain-English policy**, and generates enforceable least-privilege authorization for both — who may
@@ -227,6 +227,29 @@ Both `github-agent`/`github-tool` — are **NOT** deployed hence step 4 is a gen
 >   -p '{"data":{"LLM_BASE_URL":"https://your-endpoint","LLM_MODEL":"your-model"}}'
 > kubectl rollout restart deployment/aiac-agent -n aiac-system
 > ```
+
+### Change log level
+> Every AIAC workload ships at `INFO`. Yoo can raise or lower it on the running cluster, without
+> rebuilding any image, see examples for aiac agent and aiac-event broker
+
+> ``` bash
+> kubectl patch configmap aiac-agent-config -n aiac-system --type merge \
+>  -p '{"data":{"LOG_LEVEL":"DEBUG"}}' \
+>  && kubectl rollout restart deployment/aiac-agent -n aiac-system
+>```
+> Another example for fhe event broker
+> ``` bash
+> kubectl patch configmap aiac-event-broker-config -n aiac-system --type merge \
+>  -p '{"data":{"LOG_LEVEL":"DEBUG"}}' \
+>  && kubectl rollout restart deployment/aiac-event-broker -n aiac-system
+>``` 
+> As with the LLM settings, you patch the ConfigMap and then restart the workload.
+> ```bash 
+> kubectl rollout status deployment/aiac-agent -n aiac-system
+> kubectl logs deployment/aiac-agent -n aiac-system -c aiac-agent -f      # Controller
+> kubectl logs deployment/aiac-agent -n aiac-system -c aiac-init          # init container
+>```
+
 
 ### Verify
 
