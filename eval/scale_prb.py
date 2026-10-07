@@ -53,8 +53,8 @@ def concurrency() -> int:
 def run_concurrently(fns: list[Callable[[], T]], *, max_workers: int | None = None) -> list[T]:
     """Run each zero-arg callable in ``fns`` on a thread pool, returning results in the same order
     as ``fns`` (``ThreadPoolExecutor.map`` preserves input order while still executing
-    concurrently). The shared fan-out primitive both ``orchestrate_prb_concurrent`` below and the
-    e2e provisioning loops (``eval/test_policy_pipeline_scale.py``) build on."""
+    concurrently). The fan-out primitive that ``orchestrate_prb_concurrent`` below builds on (its
+    only caller today, see the module docstring)."""
     if not fns:
         return []
     with ThreadPoolExecutor(max_workers=max_workers or concurrency()) as executor:
@@ -86,10 +86,10 @@ def capture_precheck_drops() -> Iterator[PrecheckDrops]:
     """Temporarily wrap ``aiac.agent.policy_rules_builder.graph``'s module-level ``_precheck``
     (restored in ``finally``, no on-disk production code touched) so every call it makes during
     the ``with`` block -- not just the ones that log something -- updates ``PrecheckDrops`` with
-    exactly what that call dropped. ``eval.scale_structural.invalid_selected_names`` cannot see
-    this itself: by the time a PRB call returns, the final state's ``selected_names``/
-    ``denied_names`` are already the post-``_precheck`` *filtered* lists, so an invented name is
-    already gone from everything a caller can read off the result.
+    exactly what that call dropped. A caller cannot see this from the result: by the time a PRB
+    call returns, the final state's ``selected_names``/``denied_names`` are already the
+    post-``_precheck`` *filtered* lists, so an invented name is already gone from everything a
+    caller can read off the result.
 
     Replaces, never accumulates, on every call -- correctly resetting to empty on a clean attempt,
     not just overwriting a dirty one with another dirty one. This matters because one decision

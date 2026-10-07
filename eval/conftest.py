@@ -47,8 +47,9 @@ A scenario whose own *setup* fails (a Keycloak/PRB/PCE error, or an uncaught
 before ``score_scenario``/``_record_scoring`` ever ran) never gets those properties recorded at
 all. Such an entry still gets the crash detail *and* the same six-field metrics block, values
 marked ``unavailable`` with why -- identified by nodeid (``::test_prb_correctness[``/
-``::test_e2e_correctness[``/the three robustness test functions, see ``_CORRECTNESS_TEST_MARKERS``/
-``_ROBUSTNESS_SCORED_TEST_MARKERS``) since there are no properties to dispatch on -- rather than
+``::test_e2e_correctness[``/the robustness test functions/the Scale correctness test functions, see
+``_CORRECTNESS_TEST_MARKERS``/``_ROBUSTNESS_SCORED_TEST_MARKERS``/``_SCALE_CORRECTNESS_TEST_MARKERS``)
+since there are no properties to dispatch on -- rather than
 silently falling back to the generic docstring + crash-message rendering every other test in this
 suite gets.
 
@@ -344,6 +345,13 @@ _SCALE_TEST_MARKERS: dict[str, tuple[str, str]] = {
     "::test_scale_per_decision_correctness_e2e": ("scale_per_decision_e2e", "correctness"),
 }
 
+# The Scale correctness test functions (from _SCALE_TEST_MARKERS above). When a Scale fixture's
+# setup fails, these get the same "unavailable, here's why" metrics block as
+# _CORRECTNESS_TEST_MARKERS/_ROBUSTNESS_SCORED_TEST_MARKERS, not only a crash message.
+_SCALE_CORRECTNESS_TEST_MARKERS = tuple(
+    marker for marker, (_suite, check_type) in _SCALE_TEST_MARKERS.items() if check_type == "correctness"
+)
+
 # Full Correctness corpus size (eval.test_policy_pipeline_eval.SCENARIOS) -- kept as a plain
 # constant rather than imported, so this module (loaded for every eval/ run, marked or not) stays
 # free of that file's heavy Keycloak/launcher imports. A run that scores fewer scenarios than this
@@ -400,6 +408,19 @@ def _scale_run_matches_fixed_100(scale_suite: str) -> bool:
     dimension = "total_corpus" if "total_corpus" in scale_suite else "per_decision"
     defaults = {**_SCALE_SHARED_DEFAULTS, **_SCALE_DIMENSION_DEFAULTS[dimension]}
     return all(os.environ.get(var, default) == default for var, default in defaults.items())
+
+
+def _reduced_size_scale_suites() -> list[str]:
+    """The Scale suites that ran in this session at a size other than fixed-100 (see
+    ``_scale_run_matches_fixed_100``). The report names them in its header, so ``eval/dashboard.py``
+    does not count such a run as a full one (a report has no ``run_type`` of its own)."""
+    ran = {
+        scale_suite
+        for nodeid in _reports
+        for marker, (scale_suite, _check_type) in _SCALE_TEST_MARKERS.items()
+        if marker in nodeid
+    }
+    return sorted(suite for suite in ran if not _scale_run_matches_fixed_100(suite))
 
 
 def _format_best_effort_notes(notes: dict[str, str]) -> str:
@@ -538,7 +559,8 @@ def _render_entry(lines: list[str], nodeid: str, report: pytest.TestReport, cate
             lines.append(f"- **What it tests:** {description}")
         _render_scale_block(lines, props)
     elif category in ("failed", "error") and any(
-        marker in nodeid for marker in _CORRECTNESS_TEST_MARKERS + _ROBUSTNESS_SCORED_TEST_MARKERS
+        marker in nodeid
+        for marker in _CORRECTNESS_TEST_MARKERS + _ROBUSTNESS_SCORED_TEST_MARKERS + _SCALE_CORRECTNESS_TEST_MARKERS
     ):
         doc = _docstrings.get(nodeid)
         if doc:
@@ -665,18 +687,18 @@ def _write_trend_log() -> None:
         if correctness:
             scale_metrics.update(pool_correctness_metrics(correctness))
         # Both pooling functions above emit "scenarios_scored" (len(entries)) under the same key,
-        # so when both halves ran, the correctness update just silently overwrote the structural
-        # half's value with its own. Harmless only because this suite's own design guarantees at
-        # most one entry per half -- one structural test function, one correctness test function,
-        # neither parametrized -- so the two counts are always equal when both ran. Asserted here
-        # instead of relying on that invariant silently via dict-overwrite order, so a future
-        # change that breaks it (e.g. parametrizing either test) fails loudly instead of quietly
-        # reporting whichever count happened to be written last.
-        if structural and correctness:
-            assert len(structural) == len(correctness), (
-                f"{scale_suite}: structural scored {len(structural)} run(s) but correctness scored "
-                f"{len(correctness)} -- scenarios_scored would silently pick one over the other"
+        # so when both halves ran, the correctness update overwrote the structural half's value
+        # with its own. Harmless only while each half has exactly one entry (one structural test
+        # function, one correctness test function, neither parametrized). If a future change breaks
+        # that, tag the row "partial" and say so -- not an assert: this runs inside
+        # pytest_sessionfinish before the Markdown report is written, so an exception here would
+        # drop the remaining trend rows and the report of a long live-LLM run.
+        if structural and correctness and len(structural) != len(correctness):
+            print(
+                f"\n[eval trend log] {scale_suite}: structural scored {len(structural)} run(s) but "
+                f"correctness scored {len(correctness)} -- scenarios_scored is ambiguous, row tagged partial"
             )
+            run_type = "partial"
         append_row(scale_suite, scale_metrics, run_type=run_type)
 
 
@@ -704,8 +726,10 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
         f"Run: {now.isoformat()}",
         f"Exit status: {exitstatus}",
         f"Total: {total} — " + ", ".join(f"{cat}={len(buckets[cat])}" for cat in order),
-        "",
     ]
+    if reduced := _reduced_size_scale_suites():
+        lines.append(f"Reduced-size Scale suites: {', '.join(reduced)}")
+    lines.append("")
     for cat in order:
         entries = buckets[cat]
         lines.append(f"## {cat} ({len(entries)})")

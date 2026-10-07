@@ -53,10 +53,9 @@ as every other suite -- never a file path -- so ``-k scale`` narrows to this sui
 from __future__ import annotations
 
 import os
-import shutil
 import sys
-import tempfile
 import time
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -74,7 +73,7 @@ from aiac.idp.configuration.api import Configuration  # noqa: E402
 from aiac.idp.configuration.models import Role, RoleKind, Scope  # noqa: E402
 from aiac.policy.computation.engine import compute_and_apply  # noqa: E402
 from aiac.policy.model.models import PolicyRule, RuleEffect  # noqa: E402
-from aiac.policy.model_store.library.api import get_service_policy  # noqa: E402
+from aiac.policy.model_store.library.api import list_service_policies  # noqa: E402
 from eval.correctness_scorer import score_scenario  # noqa: E402
 from eval.prb_direct import build_roles_and_scopes  # noqa: E402
 from eval.scale_generator import (  # noqa: E402
@@ -98,6 +97,7 @@ from eval.test_policy_pipeline_eval import (  # noqa: E402
     _rego_path,
     grant_sets,
     opa_bin,
+    prepare_pipeline,
     provision_keycloak_admin,
     provision_via_config,
     truth,
@@ -138,48 +138,45 @@ def _skip_if_xdist() -> None:
         )
 
 
+@pytest.fixture(scope="module")
+def scale_env() -> Iterator[pytest.MonkeyPatch]:
+    """One ``MonkeyPatch`` for every env write that the four fixtures below make
+    (``AIAC_POLICY_FILE``, and the realm/URL/enforcement-side vars of ``prepare_pipeline``). It is
+    undone when this module ends, so later tests in the session do not inherit a policy file of
+    this suite or a URL of a store that is already shut down."""
+    with pytest.MonkeyPatch.context() as mp:
+        yield mp
+
+
 def _provision_scale_realm_and_services(
-    scenario, *, rego_dir: Path, db_prefix: str, ports: dict[str, int]
+    mp: pytest.MonkeyPatch, scenario, *, rego_dir: Path, db_prefix: str, ports: dict[str, int]
 ) -> tuple[Service, Service, Service]:
-    """Shared prefix of both e2e fixtures below: connect to Keycloak and provision the realm, wipe
-    and recreate ``rego_dir``, point the four ``AIAC_*_URL`` env vars at ``ports``, and build the
-    idp/store/opa ``Service`` triple -- everything each fixture needs before its own distinct
-    PRB-calling logic runs inside its own ``with running_services(...)`` block (one fans a whole
-    scenario's decisions out via ``orchestrate_prb_concurrent``, the other makes exactly two
-    sequential ``_invoke_graph`` calls against two different policy files, so that part can't be
-    shared here). Mirrors ``eval.test_policy_pipeline_eval._provision_scenario``'s own idp/store/opa
-    construction shape -- not reused directly, since that function also runs its own fixed
-    ``orchestrate_prb`` call inside its own ``with`` block."""
+    """Shared prefix of both e2e fixtures below: connect to Keycloak and provision the realm, then
+    ``eval.test_policy_pipeline_eval.prepare_pipeline`` -- the same env + idp/store/opa setup that
+    ``_provision_scenario`` uses, so a new pipeline setting (e.g. the enforcement side) reaches this
+    suite too. Each env write goes through ``mp``, so it is restored when the fixture's own
+    ``MonkeyPatch.context()`` ends and does not leak into later tests in the session. The PRB-calling
+    logic stays in each fixture (one fans a whole scenario's decisions out via
+    ``orchestrate_prb_concurrent``, the other makes exactly two sequential ``_invoke_graph`` calls
+    against two different policy files)."""
     admin = _connect_admin()
-    os.environ["KEYCLOAK_REALM"] = scenario.REALM_DEFAULT
     provision_keycloak_admin(admin, scenario.REALM_DEFAULT, scenario)
-
-    if rego_dir.exists():
-        shutil.rmtree(rego_dir)
-    rego_dir.mkdir(parents=True)
-    db_path = Path(tempfile.mkdtemp(prefix=db_prefix)) / "policy_model.db"
-
-    os.environ["AIAC_PDP_CONFIG_URL"] = f"http://127.0.0.1:{ports['idp']}"
-    os.environ["AIAC_POLICY_STORE_URL"] = f"http://127.0.0.1:{ports['store']}"
-    os.environ["AIAC_POLICY_MODEL_STORE_URL"] = f"http://127.0.0.1:{ports['store']}"
-    os.environ["AIAC_PDP_POLICY_URL"] = f"http://127.0.0.1:{ports['opa']}"
-
-    idp = Service("aiac.idp.service.configuration.keycloak.main:app", port=ports["idp"])
-    store = Service(
-        "aiac.policy.model_store.service.main:app", port=ports["store"], env={"SERVICEPOLICY_DB_PATH": str(db_path)}
+    host = "127.0.0.1"
+    return prepare_pipeline(
+        mp.setenv,
+        realm=scenario.REALM_DEFAULT,
+        rego_dir=rego_dir,
+        db_prefix=db_prefix,
+        idp=(host, ports["idp"]),
+        store=(host, ports["store"]),
+        opa=(host, ports["opa"]),
     )
-    opa = Service(
-        "aiac.pdp.service.policy.opa.main:app",
-        port=ports["opa"],
-        env={"REGO_OUTPUT_DIR": str(rego_dir), "POLICY_WRITER_DUMP_REGO": "true"},
-    )
-    return idp, store, opa
 
 
 def _merged_rules_for(service_ids: set[str]) -> list[PolicyRule]:
     """Query the real, persisted post-``compute_and_apply`` ``ServicePolicyModel`` for every
-    service in ``service_ids`` (``aiac.policy.model_store.library.api.get_service_policy``,
-    the same read API the PCE's own merge engine uses) and concatenate every
+    service in ``service_ids`` (``aiac.policy.model_store.library.api.list_service_policies``, one
+    request for every stored SPM -- the same read the PCE's own resync uses) and concatenate every
     ``inbound_allow_rules``/``inbound_deny_rules`` entry.
 
     This is the actual merge-engine output, queried **before** the Rego renderer gets anywhere
@@ -187,18 +184,17 @@ def _merged_rules_for(service_ids: set[str]) -> list[PolicyRule]:
     rego._group_rules``/``_group_rules_deprefixed`` always de-duplicate on the way out (``if
     rule.scope.name not in scopes: scopes.append(...)``), so a duplicate ``(role, scope, effect)``
     that survived the merge engine's own dedup bug would be silently collapsed before any check
-    reading the rendered Rego could ever see it. ``get_service_policy`` 404s to a fresh empty SPM
-    for a service with no row yet, so it's safe to call for every service unconditionally, not
-    only ones already known to have rules.
+    reading the rendered Rego could ever see it. A service with no stored row has no rules, so
+    leaving it out of the listing is correct.
 
     Must be called while the Policy Model Store is still running -- i.e. inside the fixture's own
     ``with running_services(...)`` block, before it tears the store down. The caller's returned
     dict carries the result forward so the structural test (which runs after the fixture has
     already returned) can check it with no live service of its own."""
     rules: list[PolicyRule] = []
-    for service_id in sorted(service_ids):
-        spm = get_service_policy(service_id)
-        rules += spm.inbound_allow_rules + spm.inbound_deny_rules
+    for spm in sorted(list_service_policies(), key=lambda spm: spm.service_id):
+        if spm.service_id in service_ids:
+            rules += spm.inbound_allow_rules + spm.inbound_deny_rules
     return rules
 
 
@@ -208,7 +204,7 @@ def _merged_rules_for(service_ids: set[str]) -> list[PolicyRule]:
 
 
 @pytest.fixture(scope="module")
-def total_corpus_prb_result(tmp_path_factory: pytest.TempPathFactory) -> dict:
+def total_corpus_prb_result(tmp_path_factory: pytest.TempPathFactory, scale_env: pytest.MonkeyPatch) -> dict:
     """Run the generated total-corpus scenario through the PRB exactly once (shared by both the
     structural and correctness tests below, so the ~100-150-call run is only paid for once)."""
     require_env_or_skip("LLM_BASE_URL", "LLM_MODEL", "LLM_API_KEY")
@@ -219,7 +215,7 @@ def total_corpus_prb_result(tmp_path_factory: pytest.TempPathFactory) -> dict:
 
     policy_path = tmp_path_factory.mktemp("scale_total_corpus") / "policy.md"
     policy_path.write_text(corpus.policy_text)
-    os.environ["AIAC_POLICY_FILE"] = str(policy_path)
+    scale_env.setenv("AIAC_POLICY_FILE", str(policy_path))
 
     start = time.perf_counter()
     orchestrated = orchestrate_prb_concurrent(roles, scopes, scenario, best_effort=True)
@@ -329,7 +325,7 @@ def test_scale_total_corpus_correctness_prb(total_corpus_prb_result: dict, recor
 
 
 @pytest.fixture(scope="module")
-def per_decision_prb_result(tmp_path_factory: pytest.TempPathFactory) -> dict:
+def per_decision_prb_result(tmp_path_factory: pytest.TempPathFactory, scale_env: pytest.MonkeyPatch) -> dict:
     """Run the two generated per-decision scenarios (one SCOPE_GRAPH call facing a large
     candidate-role list, one symmetric ROLE_GRAPH call facing a large candidate-scope list)
     exactly once, shared by the structural and correctness tests below. Sequential, not
@@ -349,11 +345,11 @@ def per_decision_prb_result(tmp_path_factory: pytest.TempPathFactory) -> dict:
     ]
     focal_scope = Scope(id="scope-focal", name=FOCAL_SCOPE_NAME, description="", serviceId="scale-tool-per-decision")
     (tmp_dir / "scope_policy.md").write_text(corpus.scope_policy_text)
-    os.environ["AIAC_POLICY_FILE"] = str(tmp_dir / "scope_policy.md")
+    scale_env.setenv("AIAC_POLICY_FILE", str(tmp_dir / "scope_policy.md"))
     # capture_precheck_drops recovers the LLM's raw proposed names, before production's own
-    # _precheck step silently filters out anything not in `candidate_roles` -- without it,
-    # invalid_selected_names below would only ever see already-filtered names and could never
-    # actually detect a hallucination. Safe here (unlike inside orchestrate_prb_concurrent):
+    # _precheck step silently filters out anything not in `candidate_roles` -- without it, the
+    # fidelity check below would only ever see already-filtered names and could never actually
+    # detect a hallucination. Safe here (unlike inside orchestrate_prb_concurrent):
     # these two calls are sequential, not concurrent -- see that context manager's own docstring.
     with capture_precheck_drops() as scope_drops:
         scope_rules, _, scope_note, scope_usage = _invoke_with_usage(
@@ -368,7 +364,7 @@ def per_decision_prb_result(tmp_path_factory: pytest.TempPathFactory) -> dict:
     ]
     focal_role = Role(id="role-focal", name=FOCAL_ROLE_NAME, description="", composite=False, kind=RoleKind.AGENT)
     (tmp_dir / "role_policy.md").write_text(corpus.role_policy_text)
-    os.environ["AIAC_POLICY_FILE"] = str(tmp_dir / "role_policy.md")
+    scale_env.setenv("AIAC_POLICY_FILE", str(tmp_dir / "role_policy.md"))
     with capture_precheck_drops() as role_drops:
         role_rules, _, role_note, role_usage = _invoke_with_usage(
             ROLE_GRAPH, role=focal_role, scopes=candidate_scopes, best_effort=True
@@ -412,9 +408,9 @@ def test_scale_per_decision_structural_prb(per_decision_prb_result: dict, record
     ``capture_precheck_drops``'s own docstring for how.
 
     Completeness here is *not* "every candidate appears in selected or denied" -- production's own
-    selection schema carries only explicit grants/prohibitions with no enumerated "everyone else is
-    denied" complement (see ``eval.scale_structural.invalid_selected_names``'s docstring), so a
-    candidate absent from both is an ordinary implicit deny. A truncation/needle-in-a-haystack
+    selection schema (``RoleSelection``/``ScopeSelection``, ``aiac.agent.policy_rules_builder.
+    graph``) carries only explicit grants/prohibitions with no enumerated "everyone else is denied"
+    complement, so a candidate absent from both is an ordinary implicit deny. A truncation/needle-in-a-haystack
     failure instead shows up as an under-grant in the correctness test below."""
     r = per_decision_prb_result
     scope_invalid = r["scope_dropped_names"]
@@ -505,7 +501,7 @@ def test_scale_per_decision_correctness_prb(per_decision_prb_result: dict, recor
 
 
 @pytest.fixture(scope="module")
-def total_corpus_e2e_result(tmp_path_factory: pytest.TempPathFactory) -> dict:
+def total_corpus_e2e_result(tmp_path_factory: pytest.TempPathFactory, scale_env: pytest.MonkeyPatch) -> dict:
     """Provision the generated total-corpus scenario through real Keycloak, run the PRB
     concurrently, apply via the real Policy Computation Engine, and render real Rego through the
     real PDP Policy Writer + OPA -- the only level that can catch merge/rendering/OPA-semantics
@@ -533,12 +529,16 @@ def total_corpus_e2e_result(tmp_path_factory: pytest.TempPathFactory) -> dict:
 
     rego_dir = HERE / "rego_out" / "policy_pipeline_scale" / "total_corpus"
     idp, store, opa = _provision_scale_realm_and_services(
-        scenario, rego_dir=rego_dir, db_prefix="aiac-store-scale-total-corpus-", ports=_TOTAL_CORPUS_E2E_PORTS
+        scale_env,
+        scenario,
+        rego_dir=rego_dir,
+        db_prefix="aiac-store-scale-total-corpus-",
+        ports=_TOTAL_CORPUS_E2E_PORTS,
     )
 
     policy_path = tmp_path_factory.mktemp("scale_total_corpus_e2e") / "policy.md"
     policy_path.write_text(corpus.policy_text)
-    os.environ["AIAC_POLICY_FILE"] = str(policy_path)
+    scale_env.setenv("AIAC_POLICY_FILE", str(policy_path))
     with running_services([idp, store, opa], src=SRC):
         config = Configuration.for_realm(scenario.REALM_DEFAULT)
         provision_via_config(config, scenario)
@@ -691,7 +691,7 @@ def test_scale_total_corpus_correctness_e2e(total_corpus_e2e_result: dict, recor
 
 
 @pytest.fixture(scope="module")
-def per_decision_e2e_result(tmp_path_factory: pytest.TempPathFactory) -> dict:
+def per_decision_e2e_result(tmp_path_factory: pytest.TempPathFactory, scale_env: pytest.MonkeyPatch) -> dict:
     """Provision ``eval.scale_generator.PerDecisionCorpus.e2e_scenario`` -- two agents, one owning
     the per-decision focal scope, one owning the per-decision focal role plus a tool owning every
     candidate scope -- through real Keycloak, then call ``_invoke_graph`` **directly** (not
@@ -709,7 +709,11 @@ def per_decision_e2e_result(tmp_path_factory: pytest.TempPathFactory) -> dict:
 
     rego_dir = HERE / "rego_out" / "policy_pipeline_scale" / "per_decision"
     idp, store, opa = _provision_scale_realm_and_services(
-        scenario, rego_dir=rego_dir, db_prefix="aiac-store-scale-per-decision-", ports=_PER_DECISION_E2E_PORTS
+        scale_env,
+        scenario,
+        rego_dir=rego_dir,
+        db_prefix="aiac-store-scale-per-decision-",
+        ports=_PER_DECISION_E2E_PORTS,
     )
 
     tmp_dir = tmp_path_factory.mktemp("scale_per_decision_e2e")
@@ -729,7 +733,7 @@ def per_decision_e2e_result(tmp_path_factory: pytest.TempPathFactory) -> dict:
         # and for the same reason: one process-global env var, two different policy texts, so this
         # must stay sequential, not fanned out via eval.scale_prb's concurrency helper.
         (tmp_dir / "scope_policy.md").write_text(corpus.scope_policy_text)
-        os.environ["AIAC_POLICY_FILE"] = str(tmp_dir / "scope_policy.md")
+        scale_env.setenv("AIAC_POLICY_FILE", str(tmp_dir / "scope_policy.md"))
         # See per_decision_prb_result's own comment: these two calls are sequential, not
         # concurrent, so capturing precheck drops here is safe.
         with capture_precheck_drops() as scope_drops:
@@ -737,7 +741,7 @@ def per_decision_e2e_result(tmp_path_factory: pytest.TempPathFactory) -> dict:
                 SCOPE_GRAPH, roles=candidate_role_objs, scope=focal_scope_obj, best_effort=True
             )
         (tmp_dir / "role_policy.md").write_text(corpus.role_policy_text)
-        os.environ["AIAC_POLICY_FILE"] = str(tmp_dir / "role_policy.md")
+        scale_env.setenv("AIAC_POLICY_FILE", str(tmp_dir / "role_policy.md"))
         with capture_precheck_drops() as role_drops:
             role_rules, _, role_note, role_usage = _invoke_with_usage(
                 ROLE_GRAPH, role=focal_role_obj, scopes=candidate_scope_objs, best_effort=True
