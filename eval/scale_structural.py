@@ -1,7 +1,7 @@
 """Structural-check helpers for the Scale suite (spec: ``docs/evaluation/policy-eval-scale.md``).
 
 Pure logic, no LLM, no I/O of its own -- every function here takes data the suite already has in
-hand (a candidate list, a flat ``list[PolicyRule]``, a generated corpus, a usage-metadata dict) and
+hand (a flat ``list[PolicyRule]``, a generated corpus, a usage-metadata dict) and
 returns the **concrete offending entities**, never a bare boolean, so a report reader is never left
 inferring a failure's cause from a crash message alone (per the spec's no-opaque-failures
 discipline -- same convention ``eval/correctness_scorer.py``'s over-/under-grant pair sets and the
@@ -9,10 +9,10 @@ consistency suite's ``mismatches`` list already establish). Everything a check p
 meant to be handed straight to ``record_property`` and rendered unconditionally, pass or fail.
 
 Four structural properties, per ``docs/evaluation/eval-framework.md`` §5:
-    - completeness       -- ``invalid_selected_names`` (per-decision fidelity: no hallucinated
-      candidate name -- fed the names ``eval.scale_prb``'s precheck-drop log capture reports, see
-      its own docstring for why), ``missing_decisions`` (total-corpus PRB-level: every decision
-      ran), ``missing_rego`` (e2e).
+    - completeness       -- ``missing_decisions`` (total-corpus PRB-level: every decision ran),
+      ``missing_rego`` (e2e). Per-decision fidelity (no hallucinated candidate name) needs no
+      helper here: the suite reads the names ``eval.scale_prb.capture_precheck_drops`` recovers
+      from production's own ``_precheck`` step, which are hallucinations by definition.
     - no duplication     -- ``duplicate_rule_triples``, over two different inputs depending on
       level (PRB: the raw pre-merge PRB output; e2e: the real persisted post-merge
       ``ServicePolicyModel``, **not** the rendered Rego -- see its own docstring for why).
@@ -40,23 +40,6 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from aiac.policy.model.models import PolicyRule
-
-
-def invalid_selected_names(candidates: list[str], selected: list[str], denied: list[str]) -> list[str]:
-    """Per-decision completeness/fidelity: every name in ``selected``/``denied`` must be one of
-    the real ``candidates`` handed to that PRB call -- a name that is neither is a hallucination,
-    the LLM inventing a candidate that was never in its own input. This is the one fidelity signal
-    genuinely distinct from correctness scoring here: production's own selection schema
-    (``RoleSelection``/``ScopeSelection``, ``aiac.agent.policy_rules_builder.graph``) carries only
-    *explicit* grants and *explicit* prohibitions -- there is no enumerated "everyone else is
-    denied" complement, and this corpus's grammar never emits explicit prohibitions -- so a
-    candidate simply absent from both lists is an ordinary (and expected) implicit deny, **not** a
-    dropped/incomplete response; checking for that would flag every non-granted candidate as
-    "missing" on every run. A hallucinated name, in contrast, is never a legitimate implicit deny
-    and is worth surfacing on its own even though it would also already show up as an over-grant
-    in the correctness score. Returns the exact hallucinated names (sorted)."""
-    candidate_set = set(candidates)
-    return sorted(name for name in set(selected) | set(denied) if name not in candidate_set)
 
 
 def missing_decisions(

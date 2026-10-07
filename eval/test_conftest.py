@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import pytest
 
-from eval.conftest import _scale_run_matches_fixed_100
+import eval.conftest as eval_conftest
+from eval.conftest import _reduced_size_scale_suites, _scale_run_matches_fixed_100
 
 
 @pytest.fixture(autouse=True)
@@ -73,3 +74,23 @@ class TestScaleRunMatchesFixed100:
         assert not _scale_run_matches_fixed_100("scale_total_corpus_e2e")
         assert _scale_run_matches_fixed_100("scale_per_decision_prb")
         assert _scale_run_matches_fixed_100("scale_per_decision_e2e")
+
+
+class TestReducedSizeScaleSuites:
+    def _ran(self, monkeypatch: pytest.MonkeyPatch, *names: str) -> None:
+        nodeids = [f"eval/test_policy_pipeline_scale.py::{name}" for name in names]
+        monkeypatch.setattr(eval_conftest, "_reports", dict.fromkeys(nodeids))
+
+    def test_names_only_the_suites_that_ran_at_a_reduced_size(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._ran(monkeypatch, "test_scale_total_corpus_correctness_prb", "test_scale_per_decision_structural_prb")
+        monkeypatch.setenv("SCALE_TOTAL_CORPUS_SIZE", "10")
+        assert _reduced_size_scale_suites() == ["scale_total_corpus_prb"]
+
+    def test_ignores_a_reduced_suite_that_did_not_run(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._ran(monkeypatch, "test_scale_per_decision_correctness_prb")
+        monkeypatch.setenv("SCALE_TOTAL_CORPUS_SIZE", "10")
+        assert _reduced_size_scale_suites() == []
+
+    def test_empty_at_fixed_100(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._ran(monkeypatch, "test_scale_total_corpus_correctness_e2e")
+        assert _reduced_size_scale_suites() == []

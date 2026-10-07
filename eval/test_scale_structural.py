@@ -13,7 +13,6 @@ from eval.scale_generator import generate_total_corpus
 from eval.scale_structural import (
     CostSummary,
     duplicate_rule_triples,
-    invalid_selected_names,
     missing_decisions,
     missing_rego,
     orphaned_scope_names,
@@ -27,19 +26,6 @@ def _role(name: str) -> Role:
 
 def _scope(name: str) -> Scope:
     return Scope(id=f"scope-{name}", name=name, description="", serviceId="svc")
-
-
-class TestInvalidSelectedNames:
-    def test_none_invalid_when_every_name_is_a_real_candidate(self) -> None:
-        assert invalid_selected_names(["a", "b", "c"], selected=["a"], denied=["b"]) == []
-
-    def test_names_the_exact_hallucinated_name(self) -> None:
-        assert invalid_selected_names(["a", "b"], selected=["a", "zzz"], denied=[]) == ["zzz"]
-
-    def test_a_non_granted_non_denied_candidate_is_not_flagged(self) -> None:
-        # Production's own schema carries only explicit grants/prohibitions -- a candidate in
-        # neither list is an ordinary implicit deny, not an incomplete response.
-        assert invalid_selected_names(["a", "b", "c"], selected=["a"], denied=[]) == []
 
 
 class TestMissingDecisions:
