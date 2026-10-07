@@ -6,7 +6,7 @@ import os
 from unittest.mock import MagicMock, patch
 
 from fastapi.testclient import TestClient
-from keycloak.exceptions import KeycloakError
+from keycloak.exceptions import KeycloakError, KeycloakGetError
 
 from aiac.idp.service.configuration.keycloak.main import _cache, app, get_admin
 
@@ -197,12 +197,27 @@ class TestListServiceRoles:
         assert role["kind"] == "Agent"
         assert role["actorIds"] == ["github-agent"]
 
-    def test_returns_502_on_keycloak_error(self):
+    def test_returns_502_on_other_keycloak_error(self):
+        # A Keycloak 404 gives 404 (see TestKeycloakNotFoundProduces404); any other error is a 502.
         admin = MagicMock()
-        admin.get_client_roles.side_effect = KeycloakError(error_message="not found", response_code=404)
+        admin.get_client_roles.side_effect = KeycloakError(error_message="backend failure", response_code=500)
         resp = _make_client(admin).get(f"/services/svc-uuid/roles?realm={REALM}")
         assert resp.status_code == 502
         assert "error" in resp.json()
+
+    def test_missing_service_account_contributes_no_realm_roles(self):
+        # A Keycloak 404 on the service-account lookup means "the client has no service account":
+        # the client roles are returned. It is not the 404 of a missing client.
+        admin = MagicMock()
+        admin.get_client.return_value = {"id": "svc-uuid", "clientId": "github-agent"}
+        admin.get_client_roles.return_value = [{"id": "cr1", "name": "invoke", "containerId": "svc-uuid"}]
+        admin.get_client_service_account_user.side_effect = KeycloakGetError(
+            error_message="Service account not enabled for the client", response_code=404
+        )
+        resp = _make_client(admin).get(f"/services/svc-uuid/roles?realm={REALM}")
+        assert resp.status_code == 200
+        assert [r["id"] for r in resp.json()] == ["cr1"]
+        admin.get_realm_roles_of_user.assert_not_called()
 
     def test_returns_empty_list_when_client_has_no_client_roles(self):
         admin = MagicMock()
@@ -282,9 +297,12 @@ class TestListServiceScopes:
         _make_client(admin).get(f"/services/svc-uuid/scopes?realm={REALM}")
         admin.get_client_default_client_scopes.assert_called_once_with("svc-uuid")
 
-    def test_returns_502_on_keycloak_error(self):
+    def test_returns_502_on_other_keycloak_error(self):
+        # A Keycloak 404 gives 404 (see TestKeycloakNotFoundProduces404); any other error is a 502.
         admin = MagicMock()
-        admin.get_client_default_client_scopes.side_effect = KeycloakError(error_message="not found", response_code=404)
+        admin.get_client_default_client_scopes.side_effect = KeycloakError(
+            error_message="backend failure", response_code=500
+        )
         resp = _make_client(admin).get(f"/services/svc-uuid/scopes?realm={REALM}")
         assert resp.status_code == 502
         assert "error" in resp.json()
@@ -547,9 +565,10 @@ class TestGetService:
         assert resp.json()["id"] == "svc-uuid"
         admin.get_client.assert_called_once_with("svc-uuid")
 
-    def test_returns_502_on_keycloak_error(self):
+    def test_returns_502_on_other_keycloak_error(self):
+        # A Keycloak 404 gives 404 (see TestKeycloakNotFoundProduces404); any other error is a 502.
         admin = MagicMock()
-        admin.get_client.side_effect = KeycloakError(error_message="not found", response_code=404)
+        admin.get_client.side_effect = KeycloakError(error_message="backend failure", response_code=500)
         resp = _make_client(admin).get(f"/services/svc-uuid?realm={REALM}")
         assert resp.status_code == 502
         assert "error" in resp.json()
@@ -640,10 +659,11 @@ class TestMintDiscoveryToken:
         assert resp.status_code == 502
         assert "iss" in resp.json()["error"]
 
-    def test_502_on_keycloak_error(self, monkeypatch):
+    def test_502_on_other_keycloak_error(self, monkeypatch):
+        # A Keycloak 404 gives 404 (see TestKeycloakNotFoundProduces404); any other error is a 502.
         monkeypatch.setenv("KEYCLOAK_URL", "http://kc-internal:8080")
         admin = MagicMock()
-        admin.get_client.side_effect = KeycloakError(error_message="not found", response_code=404)
+        admin.get_client.side_effect = KeycloakError(error_message="backend failure", response_code=500)
         resp = _make_client(admin).get(f"/services/svc-uuid/discovery-token?realm={REALM}")
         assert resp.status_code == 502
         assert "error" in resp.json()
@@ -1745,6 +1765,67 @@ class TestKeycloakErrorProduces502:
         admin = MagicMock()
         admin.get_client.side_effect = _keycloak_error()
         assert _make_client(admin).get(f"/services/s1/discovery-token?realm={REALM}").status_code == 502
+
+    def teardown_method(self):
+        app.dependency_overrides.clear()
+
+
+# ---------------------------------------------------------------------------
+# Keycloak 404 → 404 on the reads of one service (the onboarding read path, handoff 20)
+# ---------------------------------------------------------------------------
+
+
+def _client_not_found():
+    # What python-keycloak raises when Keycloak does not find the client, for example a new client
+    # that a reader asks for before Keycloak commits it.
+    return KeycloakGetError(error_message="Could not find client", response_code=404)
+
+
+class TestKeycloakNotFoundProduces404:
+    """A Keycloak ``404`` on a read of one service gives ``404`` with ``{"error": ...}``, not
+    ``502``, so that the library and the onboarding can tell a client that is not there (or not
+    there yet) from an IdP outage. Every other ``KeycloakError`` stays ``502`` (per-route tests)."""
+
+    def test_get_service(self):
+        admin = MagicMock()
+        admin.get_client.side_effect = _client_not_found()
+        resp = _make_client(admin).get(f"/services/s1?realm={REALM}")
+        assert resp.status_code == 404
+        assert resp.json() == {"error": "404: Could not find client"}
+
+    def test_list_service_roles(self):
+        admin = MagicMock()
+        admin.get_client.side_effect = _client_not_found()
+        resp = _make_client(admin).get(f"/services/s1/roles?realm={REALM}")
+        assert resp.status_code == 404
+        assert resp.json() == {"error": "404: Could not find client"}
+
+    def test_list_service_scopes(self):
+        admin = MagicMock()
+        admin.get_client_default_client_scopes.side_effect = _client_not_found()
+        resp = _make_client(admin).get(f"/services/s1/scopes?realm={REALM}")
+        assert resp.status_code == 404
+        assert resp.json() == {"error": "404: Could not find client"}
+
+    def test_mint_discovery_token(self, monkeypatch):
+        monkeypatch.setenv("KEYCLOAK_URL", "http://kc-internal:8080")
+        admin = MagicMock()
+        admin.get_client.side_effect = _client_not_found()
+        resp = _make_client(admin).get(f"/services/s1/discovery-token?realm={REALM}")
+        assert resp.status_code == 404
+        assert resp.json() == {"error": "404: Could not find client"}
+
+    def test_list_role_composites(self):
+        # A sub-read of get_service: a composite role deleted between GET /roles and this read. A 404
+        # is not retried by the library, and the onboarding reads get_service again (the role is then
+        # not listed). A 502 would be retried for a failure that always repeats.
+        admin = MagicMock()
+        admin.get_composite_realm_roles_of_role.side_effect = KeycloakGetError(
+            error_message="Could not find role", response_code=404
+        )
+        resp = _make_client(admin).get(f"/roles/gone/composites?realm={REALM}")
+        assert resp.status_code == 404
+        assert resp.json() == {"error": "404: Could not find role"}
 
     def teardown_method(self):
         app.dependency_overrides.clear()
