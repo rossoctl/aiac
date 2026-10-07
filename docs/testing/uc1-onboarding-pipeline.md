@@ -294,8 +294,13 @@ real requests + assert → full teardown.**
      (`ONBOARD_CLIENT_WAIT_ATTEMPTS` / `ONBOARD_CLIENT_WAIT_BACKOFF`, about 30 s by default), are
      defense in depth. Use the default gates when the deployed SPI image has the fix, or when both the
      IdP Configuration Service and the Controller images have it. Otherwise one race hit can still fail
-     the gate. **To verify live (handoff 20):** rungs 1, 2 and 3 pass with the default gates (rung 2 at
-     least twice). Remove this marker after that run.
+     the gate. Verified live on 2026-10-07 (`kind-rossoctl`, with the fix in all three images: the SPI,
+     `aiac-pdp-config` and `aiac-agent`): rungs 1, 2 (twice) and 3 passed with the default gates, each
+     rung in its own pytest call. In all 7 onboardings, the Controller's first IdP read came 0.05-0.2 s
+     after the Keycloak `CREATE` admin event and got `200`. The IdP log had no `404` and the Controller
+     log had no `Could not find client`. Thus the bounded wait and the delayed nak did not trigger; only
+     unit tests cover them. The run did not test the case where only the IdP Configuration Service and
+     the Controller images have the fix.
    - **The race hint in a gate failure.** When the agent gate or the tool gate times out, its
      `RuntimeError` message ends with a hint if the Controller log shows the race:
      `controller_commit_race_hint` reads the Controller log (`kubectl logs`, the current

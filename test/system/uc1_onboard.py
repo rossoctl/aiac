@@ -246,7 +246,8 @@ ONBOARD_TIMEOUT = float(os.environ.get("AIAC_ONBOARD_TIMEOUT", "600"))
 # the new client: the Controller's first IdP read gets 404 and the onboarding waits for the NATS
 # redelivery after ``ACK_WAIT`` (600 s), so one race hit fails the gate. With the fix deployed, do not
 # raise the budgets for this race: a gate that times out says when the Controller log shows it
-# (``controller_commit_race_hint``). Not verified live yet (handoff 20: rungs 1-3 with these defaults).
+# (``controller_commit_race_hint``). Verified live on 2026-10-07 with the fix in all three images (handoff 20:
+# rungs 1, 2 twice and 3 passed with these defaults; the bounded wait and the nak did not trigger).
 
 # The demo manifests each workload deploys, in apply order (agent: ConfigMaps THEN Deployment; tool:
 # a single Deployment manifest). ``deploy.sh`` (demo/assets) applies this same set + order — keep the
