@@ -159,7 +159,66 @@ All Keycloak interactions are consolidated here; the PDP Policy Writer (OPA) doe
 > consistent with a role's `actorIds` (both from the same service-side source). See the per-method
 > audit notes below.
 
-**Transport retries.** Every HTTP call is issued through a private `_request(method, path, **kwargs)` helper that wraps the request in the project-level `run_upstream` retry primitive (`aiac.shared.upstream`): transient failures are retried up to `UPSTREAM_MAX_RETRIES` times (default `3`) with exponential backoff before a non-2xx status is raised as `RuntimeError`. Retry lives inside the library (not in callers), and applies at the leaf request, so composite methods (`create_service_role` / `create_service_scope`) retry each sub-request without compounding.
+**Errors.** A non-2xx response raises `IdPHTTPError` (in `aiac.idp.configuration.api`). It is a `RuntimeError` subclass, so a caller that catches `RuntimeError` (or `Exception`) does not change. It keeps the HTTP status and the response:
+
+```python
+class IdPHTTPError(RuntimeError):
+    def __init__(self, status: int, text: str, response: requests.Response | None = None) -> None: ...
+    status: int                           # the HTTP status of the IdP Configuration Service response
+    response: requests.Response | None    # None if not given
+    # str(error) == f"HTTP {status}: {text}" — the same message as before
+```
+
+A caller that must tell one status from another reads `.status`, not the message. For example, the
+UC1 Orchestrator reads `status == 404` on the first `get_service` to find a client that Keycloak has
+not committed yet. A pickled or copied (`copy.copy`, `copy.deepcopy`) `IdPHTTPError` keeps its
+status, message, response and notes. A transport failure (connection error, timeout) is not an
+`IdPHTTPError`: the `requests` exception goes to the caller unchanged after the last attempt.
+
+**Transport retries.** Every HTTP call is issued through a private `_request(method, path, **kwargs)` helper that wraps the request in the project-level `run_upstream` retry primitive (`aiac.shared.upstream`). `run_upstream` retries only a transient failure (`is_transient`):
+
+| Failure | Retried? |
+|---|---|
+| Connection error, timeout | Yes |
+| `IdPHTTPError` with a `5xx` status (for example `502`, `503`) | Yes |
+| `IdPHTTPError` with a `4xx` status (for example `400`, `404`, `409`) | No: raised at the first attempt |
+
+The status is the status of the IdP Configuration Service, not of Keycloak. The service keeps a
+Keycloak `404` only on the reads that name one entity, and a Keycloak `409` only on some writes. It
+changes most other Keycloak errors to `502`, a Keycloak `4xx` included (see
+[`idp-configuration-service.md`](idp-configuration-service.md), the error list). So the library also
+retries a request that Keycloak refuses with a `4xx` on those routes, and it gets the same answer each
+time.
+
+A request is made at most `UPSTREAM_MAX_RETRIES` times in total (default `3`: the first attempt and
+two retries), with exponential backoff between the attempts: 1 s, 2 s, 4 s, …, at most 30 s. After
+the last attempt, the last error is raised (not a tenacity `RetryError`). `UPSTREAM_MAX_RETRIES` is
+read at each call; a value that is not a positive integer gives the default. Retry lives inside the library (not in callers), and applies at the leaf request, so composite methods (`create_service_role` / `create_service_scope`) retry each sub-request without compounding.
+
+`is_transient` reads the status from `.response.status_code` first, then from `.status`. Only an
+`int` (or a numeric string) counts as a status, so a stand-in response with no status (for example a
+`MagicMock` in a unit test) does not hide the `.status` of the error.
+
+**Retry safety of the writes.** A write is retried too. A `5xx` can come after Keycloak committed the
+write (for example, the read-back after the write failed, or the Keycloak answer was lost). The
+retried write then makes no duplicate, as follows:
+
+| Primitive | Route | A repeat after a committed first attempt |
+|---|---|---|
+| `create_role` | `POST /roles` | Keycloak refuses a second realm role with the same name: the service answers `409`, so the call raises `IdPHTTPError(409)` (not retried). The role exists, but this call fails. |
+| `create_scope` | `POST /scopes` | The same as `create_role`, for the client-scope name. |
+| `map_role_to_service` | `POST /services/{id}/roles/{role_id}` | No second mapping and no error: Keycloak skips the grant of a role that the service account already has. |
+| `map_scope_to_service` | `POST /services/{id}/scopes/{scope_id}` | No second link and no error: Keycloak skips a scope that is already linked to the client. |
+| `set_service_type`, `set_service_enabled` | `POST /services/{id}/type`, `POST /services/{id}/enabled` | Writes the same value again. |
+| `link_subject_scope` | `POST /services/{id}/subject-scope` | Idempotent (see the method below). |
+| `delete_service_role`, `delete_service_scope` | `DELETE /services/{id}/roles/{role_id}`, `DELETE /services/{id}/scopes/{scope_id}` | Idempotent: an already-gone object is success. |
+| `mint_discovery_token` | `GET /services/{id}/discovery-token` | Mints a new token; no state change. |
+
+> **Known gap — a retried create.** The two create routes are not idempotent: a retried
+> `create_role` / `create_scope` whose first attempt was committed fails with `409`. UC1 Provision
+> then fails with `502`. The new role or scope is not in the created-manifest (the call failed), so
+> the rollback does not delete it; the next run reuses it by name and does not record it as created.
+> This gap existed before the retry (the first `5xx` failed the run the same way).
 
 ### Dependencies
 ```
@@ -229,14 +288,14 @@ class Configuration:
 
 `get_scopes()` — simple read:
 1. Issue `GET {AIAC_PDP_CONFIG_URL}/scopes`, always appending `?realm=<self.realm>`.
-2. Raise `RuntimeError` on non-2xx HTTP status.
+2. Raise `IdPHTTPError` on non-2xx HTTP status.
 3. Parse the response into `list[Scope]` and return.
 
 `get_subjects()` — enriched with per-subject realm role assignments:
 1. `GET {AIAC_PDP_CONFIG_URL}/subjects?realm=<self.realm>` — fetch the base user list. Keycloak does not include role assignments in the user representation.
 2. Call `_all_roles_map()` once to build a `{id: Role}` lookup (fully hydrated via `get_roles()`).
 3. For each subject, delegate to `_build_subject(raw, all_roles)` which issues `GET /subjects/{id}/assignments?realm=<self.realm>`, extracts `realmMappings` role IDs, filters the roles map, and returns a validated `Subject` with `roles` populated.
-4. Raise `RuntimeError` on any non-2xx HTTP status (primary or secondary calls).
+4. Raise `IdPHTTPError` on any non-2xx HTTP status (primary or secondary calls).
 
 `get_services()` — fully-enriched read:
 1. `GET {AIAC_PDP_CONFIG_URL}/services?realm=<self.realm>` — fetch the base service list.
@@ -253,7 +312,7 @@ class Configuration:
    - `GET /services/{id}/scopes?realm=<self.realm>` → filter `all_scopes` map → `Service.scopes`, and
      **stamp each scope's `serviceId` = this service's `clientId`** (the owning client — the PCE's SPM
      routing key; `all_scopes` from `GET /scopes` carries no owner).
-4. Raise `RuntimeError` on any non-2xx response.
+4. Raise `IdPHTTPError` on any non-2xx response.
 5. Return `list[Service]` with fully-enriched `roles` (including `childRoles`) and `scopes` (including `description`).
 
 > **Performance note:** `get_services()` issues 2N + 1 + (roles overhead) HTTP requests where N is the number of services. `get_roles()` is called once and its fully-enriched objects are shared across all services. If this becomes a bottleneck, enrichment should be moved server-side.
@@ -262,14 +321,14 @@ class Configuration:
 1. `GET {AIAC_PDP_CONFIG_URL}/services/{service_id}?realm=<self.realm>` — fetch the single service.
 2. Call `get_roles()` and `get_scopes()` to build lookup maps (same as `get_services()`).
 3. Delegate to `_build_service(raw, all_roles, all_scopes)`.
-4. Raise `RuntimeError` on any non-2xx response.
+4. Raise `IdPHTTPError` on any non-2xx response.
 5. Return a single enriched `Service`.
 
 > **Note:** Callers that previously called `get_services()` and filtered by ID should be switched to `get_service(service_id)` to avoid fetching the full list.
 
 `mint_discovery_token(service_id)` — thin wrapper over the config service's minting endpoint:
 1. `GET {AIAC_PDP_CONFIG_URL}/services/{service_id}/discovery-token?realm=<self.realm>`.
-2. Raise `RuntimeError` on non-2xx HTTP status.
+2. Raise `IdPHTTPError` on non-2xx HTTP status.
 3. Return `response.json()["access_token"]` — the raw bearer token string. The config service (which
    holds the Keycloak admin) does the minting and the in-endpoint `iss`/`aud` verification; this method
    does no decoding itself.
@@ -277,18 +336,18 @@ class Configuration:
 `get_roles()` — enriched read:
 1. `GET {AIAC_PDP_CONFIG_URL}/roles?realm=<self.realm>` — fetch all realm roles.
 2. For each role, if `role.composite` is `True`: `GET /roles/{name}/composites?realm=<self.realm>` → `Role.childRoles`
-3. Raise `RuntimeError` on any non-2xx response.
+3. Raise `IdPHTTPError` on any non-2xx response.
 4. Return `list[Role]` with `childRoles` populated.
 
 `get_services_by_role(role: Role) -> list[Service]`:
 1. Fetches the fully-enriched service list via `get_services()` and filters it **client-side**: returns those services whose `.roles` contains a role with `role.id`. The server `GET /services` endpoint has no `role_id` filter, so filtering happens in the library.
 2. Returns an empty list when no service owns the role (e.g. a realm-level role).
-3. Raises `RuntimeError` on any underlying non-2xx (propagated from `get_services()` / `_build_service()`).
+3. Raises `IdPHTTPError` on any underlying non-2xx (propagated from `get_services()` / `_build_service()`).
 
 `get_services_by_scope(scope: Scope) -> list[Service]`:
 1. Fetches the fully-enriched service list via `get_services()` and filters it **client-side**: returns those services whose `.scopes` contains a scope with `scope.id`. The server `GET /services` endpoint has no `scope_id` filter, so filtering happens in the library.
 2. Returns an empty list when no service exposes the scope.
-3. Raises `RuntimeError` on any underlying non-2xx (propagated from `get_services()` / `_build_service()`).
+3. Raises `IdPHTTPError` on any underlying non-2xx (propagated from `get_services()` / `_build_service()`).
 
 > **Performance note:** because both methods delegate to `get_services()`, each call inherits its full fan-out cost (see the `get_services()` performance note above — `2N + 1 + roles` HTTP requests for N services). Acceptable for the low-frequency PCE resolution path. If it becomes a bottleneck, the right fix is a real server-side `role_id` / `scope_id` filter on `GET /services`.
 
@@ -309,7 +368,7 @@ class Configuration:
 `get_subjects_by_role(role: Role) -> list[Subject]`:
 1. `GET {AIAC_PDP_CONFIG_URL}/subjects?role_id={role.id}&realm=<self.realm>`
 2. Returns all subjects (users) that have this role directly assigned, as the service returns them. There is no per-subject enrichment (`Subject.roles` stays `[]`).
-3. Raises `RuntimeError` on non-2xx. Returns an empty list when no subject holds the role.
+3. Raises `IdPHTTPError` on non-2xx. Returns an empty list when no subject holds the role.
 
 > **Note:** This method returns only subjects with a **direct** assignment of the given role. Composite role traversal (resolving `childRoles` and querying each) is the caller's responsibility. The PCE does no flattening: its rules arrive pre-flattened.
 
@@ -321,49 +380,49 @@ class Configuration:
 
 `create_scope`:
 1. Issues `POST {AIAC_PDP_CONFIG_URL}/scopes` with body `{"name": scope_name, "description": scope_description}`, appending `?realm=<self.realm>`.
-2. Raises `RuntimeError` on non-2xx HTTP status (including 409 if a scope with that name already exists).
+2. Raises `IdPHTTPError` on non-2xx HTTP status (including 409 if a scope with that name already exists).
 3. Returns the created `Scope` instance parsed from the response.
 
 `map_scope_to_service`:
 1. Issues `POST {AIAC_PDP_CONFIG_URL}/services/{service.id}/scopes/{scope.id}`, appending `?realm=<self.realm>`.
-2. Raises `RuntimeError` on non-2xx HTTP status (including 409 if the scope is already mapped to the service).
+2. Raises `IdPHTTPError` on non-2xx HTTP status. A scope that is already linked to the service is not an error: Keycloak skips the link, so a second call changes nothing (idempotent).
 3. Re-fetches the service via `GET {AIAC_PDP_CONFIG_URL}/services/{service.id}`, appending `?realm=<self.realm>`.
 4. Returns the updated `Service` instance parsed from the response.
 
 `create_role`:
 1. Issues `POST {AIAC_PDP_CONFIG_URL}/roles` with body `{"name": role_name, "description": role_description}`, appending `?realm=<self.realm>`.
-2. Raises `RuntimeError` on non-2xx HTTP status (including 409 if a role with that name already exists).
+2. Raises `IdPHTTPError` on non-2xx HTTP status (including 409 if a role with that name already exists).
 3. Returns the created `Role` instance parsed from the response.
 
 `map_role_to_service`:
 1. Issues `POST {AIAC_PDP_CONFIG_URL}/services/{service.id}/roles/{role.id}`, appending `?realm=<self.realm>`.
-2. Raises `RuntimeError` on non-2xx HTTP status (including 409 if the role is already mapped to the service).
+2. Raises `IdPHTTPError` on non-2xx HTTP status. A role that the service account already has is not an error: Keycloak skips the grant, so a second call changes nothing (idempotent).
 3. Re-fetches the service via `GET {AIAC_PDP_CONFIG_URL}/services/{service.id}`, appending `?realm=<self.realm>`.
 4. Returns the updated `Service` instance parsed from the response.
 
 `create_service_role(service_id: str, role) -> Role`: idempotent create-or-get + map.
 1. `get_roles()` and reuse an existing realm role whose `name == role.name`; otherwise `create_role(role.name, role.description)`.
 2. `map_role_to_service(get_service(service_id), resolved_role)` (itself idempotent).
-3. Raises `RuntimeError` on any underlying non-2xx HTTP status. Returns the resolved `Role`.
+3. Raises `IdPHTTPError` on any underlying non-2xx HTTP status. Returns the resolved `Role`.
 4. `role` is any object exposing `.name` / `.description` (e.g. the aiac-agent `RoleDefinition`); the library does not import the agent layer.
 
 `create_service_scope(service_id: str, scope) -> Scope`: idempotent create-or-get + map.
 1. `get_scopes()` and reuse an existing client scope whose `name == scope.name`; otherwise `create_scope(scope.name, scope.description)`.
 2. `map_scope_to_service(get_service(service_id), resolved_scope)` (itself idempotent).
-3. Raises `RuntimeError` on any underlying non-2xx HTTP status. Returns the resolved `Scope`.
+3. Raises `IdPHTTPError` on any underlying non-2xx HTTP status. Returns the resolved `Scope`.
 4. `scope` is any object exposing `.name` / `.description` (e.g. the aiac-agent `ScopeDefinition`).
 
 `set_service_type(service: Service, service_type: ServiceType) -> Service`:
 1. Issues `POST {AIAC_PDP_CONFIG_URL}/services/{service.id}/type` with body `{"type": <value>}` (the `ServiceType`'s `Agent`/`Tool` value; a bare `"Agent"`/`"Tool"` string is accepted too since `ServiceType` is a `str` enum), appending `?realm=<self.realm>`.
 2. The service persists the value onto the Keycloak client as the **`client.type`** attribute (a plain string, capitalized). The Keycloak attribute name is an IdP-Service/mapping-layer detail — callers pass the generic `service_type` and never see it.
-3. Raises `RuntimeError` on non-2xx HTTP status.
+3. Raises `IdPHTTPError` on non-2xx HTTP status.
 4. Returns the updated `Service` instance parsed from the response (`type` now resolved from the new attribute).
 
 `link_subject_scope(service: Service) -> Scope`: link the shared subject scope to the service ([D31](../PRD.md#key-architectural-decisions)).
 1. Issues `POST {AIAC_PDP_CONFIG_URL}/services/{service.id}/subject-scope` with no body, appending `?realm=<self.realm>`.
 2. The service makes sure that the client scope **`aiac-username-sub`** and its `username-to-sub` mapper (`username` → claim `sub`) exist, with **no** `aiac.managed` marker, and links the scope as a **default** client scope of the service's client (an optional link is changed to a default link). Then a token that this client gets as the requester of a token exchange has `sub` = the username. The scope name and the mapper are IdP-Service details — callers pass only the `Service`.
 3. Idempotent: an existing scope, mapper or link is not an error, so a second call changes nothing. An existing `username-to-sub` mapper with a wrong type or config is changed back to the expected mapper.
-4. Raises `RuntimeError` on non-2xx HTTP status (via `_request`), including `409` if the existing `aiac-username-sub` carries the `aiac.managed` marker.
+4. Raises `IdPHTTPError` on non-2xx HTTP status (via `_request`), including `409` if the existing `aiac-username-sub` carries the `aiac.managed` marker.
 5. Returns the `Scope` instance parsed from the response. Its `aiac_managed` is `False`, so it is never an own scope of a service. The scope is shared by every AIAC-managed client, so UC1 never puts it into the created-manifest, and the rollback never deletes it (see `idp-configuration-service.md` → `POST /services/{service_id}/subject-scope`).
 
 `delete_service_role(service: Service, role: Role) -> None`: teardown of a role this service created.
@@ -371,20 +430,20 @@ class Configuration:
 2. The service removes the role mapping from the service account **first**, then deletes the realm role (**unmap-then-delete** order — a still-mapped role cannot be deleted cleanly).
 3. Idempotent: deleting an already-gone role is not an error.
 4. Subject to shared-object safety (below): a role that another service still references is **not** deleted — it is at most unmapped from this service.
-5. Raises `RuntimeError` on non-2xx HTTP status. Returns `None`.
+5. Raises `IdPHTTPError` on non-2xx HTTP status. Returns `None`.
 
 `delete_service_scope(service: Service, scope: Scope) -> None`: teardown of a scope this service created.
 1. Issues `DELETE {AIAC_PDP_CONFIG_URL}/services/{service.id}/scopes/{scope.id}`, appending `?realm=<self.realm>`.
 2. The service removes the scope mapping from the client **first**, then deletes the client scope (**unmap-then-delete** order).
 3. Idempotent: deleting an already-gone scope is not an error.
 4. Subject to shared-object safety (below): a scope that another service still references is **not** deleted — it is at most unmapped from this service.
-5. Raises `RuntimeError` on non-2xx HTTP status. Returns `None`.
+5. Raises `IdPHTTPError` on non-2xx HTTP status. Returns `None`.
 
 `set_service_enabled(service: Service, enabled: bool) -> Service`: the **writer** for the `Service.enabled` field.
 1. Issues `POST {AIAC_PDP_CONFIG_URL}/services/{service.id}/enabled` with body `{"enabled": <bool>}`, appending `?realm=<self.realm>`.
 2. The service calls `update_client(enabled=…)` on the Keycloak client.
 3. Idempotent: disabling an already-disabled client (or enabling an already-enabled one) is not an error.
-4. Raises `RuntimeError` on non-2xx HTTP status. Returns the updated `Service` with the new `enabled` value.
+4. Raises `IdPHTTPError` on non-2xx HTTP status. Returns the updated `Service` with the new `enabled` value.
 
 > **Shared-object safety.** Provisioning uses **create-or-reuse-by-name** (`create_service_role` /
 > `create_service_scope` reuse an existing realm role / client scope of the same name), so one role
@@ -407,6 +466,7 @@ Read from a `.env` file co-located with `api.py` (`src/aiac/idp/configuration/.e
 |----------|---------|
 | `AIAC_PDP_CONFIG_URL` | `http://127.0.0.1:7071` |
 | `KEYCLOAK_REALM` | none — required by `for_default_realm()` |
+| `UPSTREAM_MAX_RETRIES` | `3` — the attempts per request, in total (read at each call by `aiac.shared.upstream`; see **Transport retries**) |
 
 > **TBD:** whether `AIAC_PDP_CONFIG_URL` should be renamed to `AIAC_IDP_CONFIG_URL`. Not yet decided — keep `AIAC_PDP_CONFIG_URL` until this is resolved.
 

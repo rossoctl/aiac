@@ -1,11 +1,14 @@
 """Unit tests for aiac.idp.configuration."""
 
+import copy
+import pickle
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+import requests
 
-from aiac.idp.configuration.api import Configuration
+from aiac.idp.configuration.api import Configuration, IdPHTTPError
 from aiac.idp.configuration.models import Role, RoleKind, Scope, Service, ServiceType, Subject
 
 REALM = "rossoctl"
@@ -14,8 +17,9 @@ BASE = "http://127.0.0.1:7071"
 
 @pytest.fixture(autouse=True)
 def _single_attempt(monkeypatch):
-    """Configuration now retries transient failures internally (``_request`` → ``run_upstream``).
-    Pin the budget to a single attempt so error-path unit tests stay fast and single-call."""
+    """Configuration now retries transient failures internally (``_request`` → ``run_upstream``),
+    a ``5xx`` included (``IdPHTTPError`` keeps the status). Pin the budget to a single attempt so
+    error-path unit tests stay fast and single-call. ``TestTransientRetry`` sets its own budget."""
     monkeypatch.setenv("UPSTREAM_MAX_RETRIES", "1")
 
 
@@ -1504,3 +1508,121 @@ class TestServiceEnabledRoundTrip:
         ):
             result = Configuration.for_realm(REALM).get_services()
         assert result[0].enabled is False
+
+
+# ---------------------------------------------------------------------------
+# Transient retry — the error keeps the status, a 5xx is retried, a 4xx is not
+#
+# _check raises IdPHTTPError (a RuntimeError subclass) with the HTTP status and
+# the response, so run_upstream (aiac.shared.upstream) retries a 5xx up to
+# UPSTREAM_MAX_RETRIES with exponential backoff (1 s, 2 s, ...) and raises a 4xx
+# at once. The fixture sets a budget of 3 attempts (it overrides _single_attempt)
+# and records each backoff instead of sleeping: tenacity's default sleep calls
+# time.sleep at run time, so patch time.sleep, not tenacity.nap.sleep.
+# ---------------------------------------------------------------------------
+
+
+def _real_response(status: int, text: str = "boom") -> requests.Response:
+    """A real ``requests.Response`` (not a MagicMock), so ``.ok`` / ``.text`` / ``.status_code`` are
+    the library's own."""
+    resp = requests.Response()
+    resp.status_code = status
+    resp._content = text.encode()
+    return resp
+
+
+class TestTransientRetry:
+    SERVICE_ID = "svc-001"
+
+    @pytest.fixture(autouse=True)
+    def waits(self, monkeypatch):
+        monkeypatch.setenv("AIAC_PDP_CONFIG_URL", BASE)
+        monkeypatch.setenv("UPSTREAM_MAX_RETRIES", "3")
+        recorded: list[float] = []
+        monkeypatch.setattr("time.sleep", recorded.append)
+        return recorded
+
+    @pytest.mark.parametrize("status", [500, 502, 503])
+    def test_5xx_is_retried_up_to_the_budget_then_raised(self, status, waits):
+        with patch("aiac.idp.configuration.api.requests.get", return_value=_err(status)) as m:
+            with pytest.raises(IdPHTTPError) as ei:
+                Configuration.for_realm(REALM).get_scopes()
+        assert m.call_count == 3  # UPSTREAM_MAX_RETRIES
+        assert ei.value.status == status
+        assert waits == [1, 2]  # exponential backoff, no real sleep
+
+    def test_5xx_then_200_succeeds(self, waits):
+        scopes = [{"id": "s1", "name": "read:data"}]
+        with patch("aiac.idp.configuration.api.requests.get", side_effect=[_err(502), _ok(scopes)]) as m:
+            result = Configuration.for_realm(REALM).get_scopes()
+        assert [s.name for s in result] == ["read:data"]
+        assert m.call_count == 2
+        assert waits == [1]
+
+    @pytest.mark.parametrize("status", [400, 404, 409])
+    def test_4xx_is_not_retried(self, status, waits):
+        with patch("aiac.idp.configuration.api.requests.get", return_value=_err(status)) as m:
+            with pytest.raises(IdPHTTPError) as ei:
+                Configuration.for_realm(REALM).get_service(self.SERVICE_ID)
+        assert m.call_count == 1
+        assert ei.value.status == status
+        assert waits == []
+
+    def test_real_response_5xx_is_retried_and_4xx_is_not(self, waits):
+        with patch("aiac.idp.configuration.api.requests.get", return_value=_real_response(503)) as m:
+            with pytest.raises(IdPHTTPError):
+                Configuration.for_realm(REALM).get_scopes()
+        assert m.call_count == 3
+        with patch("aiac.idp.configuration.api.requests.get", return_value=_real_response(404)) as m:
+            with pytest.raises(IdPHTTPError):
+                Configuration.for_realm(REALM).get_service(self.SERVICE_ID)
+        assert m.call_count == 1
+
+    def test_write_5xx_is_retried_and_write_409_is_not(self, waits):
+        # A write is retried at the same leaf (_request). library-idp.md ("Retry safety of the
+        # writes") tells what a repeated write of each primitive does.
+        with patch("aiac.idp.configuration.api.requests.post", return_value=_err(502)) as m:
+            with pytest.raises(IdPHTTPError):
+                Configuration.for_realm(REALM).create_scope("read:data", "Read access")
+        assert m.call_count == 3
+        with patch("aiac.idp.configuration.api.requests.post", return_value=_err(409)) as m:
+            with pytest.raises(IdPHTTPError):
+                Configuration.for_realm(REALM).create_scope("read:data", "Read access")
+        assert m.call_count == 1
+
+    def test_error_is_a_runtime_error_that_keeps_the_status_and_the_response(self):
+        resp = _err(404)
+        with patch("aiac.idp.configuration.api.requests.get", return_value=resp):
+            with pytest.raises(RuntimeError) as ei:
+                Configuration.for_realm(REALM).get_service(self.SERVICE_ID)
+        assert isinstance(ei.value, IdPHTTPError)
+        assert ei.value.status == 404
+        assert ei.value.response is resp
+        assert str(ei.value) == "HTTP 404: internal error"  # the message text does not change
+
+    @pytest.mark.parametrize(
+        "clone",
+        [
+            pytest.param(lambda e: pickle.loads(pickle.dumps(e)), id="pickle"),
+            pytest.param(copy.copy, id="copy"),
+            pytest.param(copy.deepcopy, id="deepcopy"),
+        ],
+    )
+    @pytest.mark.parametrize("with_response", [True, False], ids=["response", "no-response"])
+    def test_error_survives_pickle_and_copy(self, clone, with_response):
+        # BaseException rebuilds a copy from ``self.args`` (the message only), which would call
+        # IdPHTTPError(message) and fail with a TypeError. A checkpointer, a process pool or a log
+        # handler that copies the error must get the same error back.
+        resp = _real_response(502, "upstream down") if with_response else None
+        err = IdPHTTPError(502, "upstream down", resp)
+        err.add_note("first get_service")
+        got = clone(err)
+        assert type(got) is IdPHTTPError
+        assert got.status == 502
+        assert str(got) == "HTTP 502: upstream down"
+        assert got.__notes__ == ["first get_service"]
+        if with_response:
+            assert got.response.status_code == 502
+            assert got.response.text == "upstream down"
+        else:
+            assert got.response is None

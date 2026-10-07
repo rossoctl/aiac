@@ -9,6 +9,26 @@ from aiac.idp.configuration.models import Role, Scope, Service, ServiceType, Sub
 from aiac.shared.upstream import run_upstream
 
 
+class IdPHTTPError(RuntimeError):
+    """A non-OK response from the IdP Configuration Service. It keeps the HTTP ``status`` and the
+    ``response``, so ``aiac.shared.upstream.is_transient`` retries a ``5xx`` and not a ``4xx``. It is
+    a ``RuntimeError`` subclass, so the callers that catch ``RuntimeError`` do not change, and the
+    message stays ``"HTTP {status}: {text}"``. A caller that must tell one status from another (for
+    example a ``404`` for a client that Keycloak has not committed yet) reads ``.status``, not the
+    message. A pickled or copied error keeps its status, text, response and notes."""
+
+    def __init__(self, status: int, text: str, response=None) -> None:
+        super().__init__(f"HTTP {status}: {text}")
+        self.status = status
+        self.response = response
+        self._text = text
+
+    def __reduce__(self):
+        # BaseException rebuilds an error from ``self.args`` (the message only), which does not
+        # match this ``__init__``. Rebuild from the three arguments, then restore ``__dict__``.
+        return (type(self), (self.status, self._text, self.response), self.__dict__)
+
+
 class _NamedDefinition(Protocol):
     """Structural type for a not-yet-persisted role/scope: just a name + description.
     Lets ``create_service_role`` / ``create_service_scope`` accept the agent layer's
@@ -56,18 +76,23 @@ class Configuration:
         return {"realm": self.realm}
 
     def _check(self, resp) -> None:
+        """Raise :class:`IdPHTTPError` (with the status and the response) on a non-OK response."""
         if not resp.ok:
-            raise RuntimeError(f"HTTP {resp.status_code}: {resp.text}")
+            raise IdPHTTPError(resp.status_code, resp.text, resp)
 
     def _request(self, method: str, path: str, **kwargs):
         """Issue an HTTP request to the config service with bounded transport retries.
 
         Dispatches to the named ``requests.get`` / ``requests.post`` (not ``requests.request``)
         so callers and tests keep a stable, mockable surface. Retries transient failures via
-        ``run_upstream`` and raises on a non-OK response (``_check``), so callers just consume
-        ``resp.json()``. Retrying at this leaf boundary means composite methods
+        ``run_upstream``: a connection error, a timeout or a ``5xx`` is tried again up to
+        ``UPSTREAM_MAX_RETRIES`` attempts (default 3) with exponential backoff (1 s, 2 s, …); a
+        ``4xx`` is raised at once. A non-OK response raises :class:`IdPHTTPError` (``_check``), so
+        callers just consume ``resp.json()``. Retrying at this leaf boundary means composite methods
         (``create_service_role`` / ``create_service_scope``) retry each sub-request without
-        compounding.
+        compounding. Writes are retried too: a repeated write makes no duplicate, but a repeated
+        ``create_role`` / ``create_scope`` whose first attempt was committed answers ``409`` (see
+        ``library-idp.md``).
         """
         caller = getattr(requests, method.lower())
 
@@ -145,7 +170,7 @@ class Configuration:
         """Mint a bearer token whose ``aud`` contains the tool's clientId, for authenticating UC-1
         tool discovery against the tool's AuthBridge sidecar. The config service (which holds the
         Keycloak admin) does the minting; this returns the raw ``access_token`` string. Raises
-        ``RuntimeError`` on a non-OK response (via ``_check``)."""
+        ``IdPHTTPError`` (a ``RuntimeError``) on a non-OK response (via ``_check``)."""
         resp = self._request("GET", f"/services/{service_id}/discovery-token", params=self._params())
         return resp.json()["access_token"]
 
@@ -203,7 +228,8 @@ class Configuration:
         ensures the client scope ``aiac-username-sub`` and its ``username`` → ``sub`` mapper, with
         **no** ``aiac.managed`` marker, and links it as a default client scope of this service's
         client. Exchanged tokens for the service then carry ``sub`` = username. Idempotent — an
-        existing scope, mapper or link is not an error. Raises ``RuntimeError`` on a non-OK status.
+        existing scope, mapper or link is not an error. Raises ``IdPHTTPError`` (a ``RuntimeError``)
+        on a non-OK status.
 
         The scope is shared by every managed client, so UC-1 never puts it into the created-manifest
         (a rollback never deletes it). Returns the ``Scope``; its ``aiac_managed`` is ``False``.
@@ -218,8 +244,8 @@ class Configuration:
         Issues ``POST /services/{service.id}/enabled`` with body ``{"enabled": <bool>}``; the config
         service calls ``update_client(enabled=…)`` on the Keycloak client. Idempotent — disabling an
         already-disabled client (or enabling an already-enabled one) is not an error. Raises
-        ``RuntimeError`` on a non-OK status. Returns the updated ``Service`` with the new ``enabled``
-        value (``get_service`` / ``get_services`` surface it on subsequent reads).
+        ``IdPHTTPError`` (a ``RuntimeError``) on a non-OK status. Returns the updated ``Service`` with
+        the new ``enabled`` value (``get_service`` / ``get_services`` surface it on subsequent reads).
         """
         resp = self._request(
             "POST",

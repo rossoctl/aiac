@@ -37,12 +37,17 @@ def max_retries() -> int:
 
 def _status_code(exc: BaseException) -> int | None:
     """Best-effort HTTP status of an exception: ``requests`` HTTPError carries it on
-    ``.response.status_code``; a Kubernetes ``ApiException`` carries it on ``.status``."""
+    ``.response.status_code``; a Kubernetes ``ApiException`` and the IdP library's ``IdPHTTPError``
+    carry it on ``.status``. Only an ``int`` or a numeric ``str`` is a status: a stand-in response
+    with no status (for example a ``MagicMock``, where ``int(MagicMock())`` is 1) is skipped, so it
+    does not hide the error's own ``.status``. A ``bool`` is not a status."""
     resp = getattr(exc, "response", None)
     for candidate in (getattr(resp, "status_code", None), getattr(exc, "status", None)):
+        if isinstance(candidate, bool) or not isinstance(candidate, (int, str)):
+            continue
         try:
-            return int(candidate)  # type: ignore[arg-type]
-        except (TypeError, ValueError):
+            return int(candidate)
+        except ValueError:
             continue
     return None
 
@@ -80,9 +85,9 @@ def is_transient(exc: BaseException) -> bool:
 
 def run_upstream(fn: Callable[[], T]) -> T:
     """Run ``fn`` with bounded retries (``UPSTREAM_MAX_RETRIES``, default 3) and exponential
-    backoff, retrying **only transient failures** (``is_transient``) and reraising the last
-    error so the caller can convert it to a 502. Returns whatever ``fn`` returns (the return
-    type is preserved for callers)."""
+    backoff (1 s, 2 s, 4 s, … at most 30 s between attempts), retrying **only transient failures**
+    (``is_transient``) and reraising the last error so the caller can convert it to a 502. Returns
+    whatever ``fn`` returns (the return type is preserved for callers)."""
     retryer = Retrying(
         retry=retry_if_exception(is_transient),
         stop=stop_after_attempt(max_retries()),
