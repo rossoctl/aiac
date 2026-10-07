@@ -145,7 +145,9 @@ read the delegation chain (see [Part B](#part-b--outbound-token-exchange--opa)).
   `aiac-username-sub` to `rossoctl`: each one covers a different token. If AIAC
   has not onboarded `github-agent`, the link is not there: the exchanged token
   then has `sub` = the Keycloak user ID, and `github-tool`'s inbound denies the
-  B.4 probe. To check the link of `github-agent`:
+  B.4 probe. The driver (`k8s/opa-kind-driver.sh`) checks this default link
+  before B.4, and stops at once with the cause and the fix when the link is
+  missing or optional only. To check the link of `github-agent`:
 
   ```bash
   KC=http://keycloak.localtest.me:8080
