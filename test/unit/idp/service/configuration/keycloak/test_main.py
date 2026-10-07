@@ -897,6 +897,9 @@ _SUBJECT_MAPPER_PAYLOAD = {
     },
 }
 
+# The correct mapper as Keycloak returns it: the representation plus its id.
+_SUBJECT_MAPPER_EXISTING = {**_SUBJECT_MAPPER_PAYLOAD, "id": "m1"}
+
 # Admin calls whose first argument is a Keycloak client id (the link side of the endpoint).
 _CLIENT_SCOPED_CALLS = {
     "get_client_optional_client_scopes",
@@ -912,14 +915,18 @@ _CLIENT_SCOPED_CALLS = {
 class _FakeSubjectScopeAdmin:
     """A small stateful stand-in for the Keycloak admin API, so a test can call the endpoint more
     than once and assert the converged state. It models the Keycloak behaviours the endpoint
-    relies on: a duplicate scope or mapper name is a 409, and a client-scope link is skipped
-    with no error when the scope is already linked to that client as default OR optional."""
+    relies on: a duplicate scope or mapper name is a 409, a client-scope link is skipped
+    with no error when the scope is already linked to that client as default OR optional, and a
+    mapper update (PUT) of an unknown mapper id is a 404 and replaces the type and the full config.
+    Each mapper write is recorded in ``mapper_writes``."""
 
     def __init__(self):
         self.scopes: dict[str, dict] = {}
         self.mappers: dict[str, list[dict]] = {}
         self.default_links: dict[str, list[str]] = {}
         self.optional_links: dict[str, list[str]] = {}
+        self.mapper_writes: list[str] = []
+        self._next_mapper = 0
 
     def get_client_scopes(self):
         return [dict(s) for s in self.scopes.values()]
@@ -941,7 +948,27 @@ class _FakeSubjectScopeAdmin:
     def add_mapper_to_client_scope(self, scope_id, payload):
         if any(m["name"] == payload["name"] for m in self.mappers[scope_id]):
             raise KeycloakError(error_message="Conflict", response_code=409)
-        self.mappers[scope_id].append(json.loads(json.dumps(payload)))
+        self.mapper_writes.append("add")
+        self._next_mapper += 1
+        self.mappers[scope_id].append({**json.loads(json.dumps(payload)), "id": f"mapper-{self._next_mapper}"})
+
+    def _mapper(self, scope_id, mapper_id):
+        mapper = next((m for m in self.mappers[scope_id] if m["id"] == mapper_id), None)
+        if mapper is None:
+            raise KeycloakError(error_message="Model not found", response_code=404)
+        return mapper
+
+    def update_mapper_in_client_scope(self, scope_id, mapper_id, payload):
+        mapper = self._mapper(scope_id, mapper_id)
+        if payload.get("id") != mapper_id:  # Keycloak 26.0 reads the mapper id from the payload
+            raise KeycloakError(error_message="mapping with id None does not exist", response_code=500)
+        self.mapper_writes.append("update")
+        mapper["protocolMapper"] = payload["protocolMapper"]
+        mapper["config"] = dict(payload["config"])  # Keycloak replaces the full config map
+
+    def delete_mapper_from_client_scope(self, scope_id, mapper_id):
+        self.mappers[scope_id].remove(self._mapper(scope_id, mapper_id))
+        self.mapper_writes.append("delete")
 
     def get_client_optional_client_scopes(self, client_id):
         return [self.scopes[sid] for sid in self.optional_links.get(client_id, [])]
@@ -1007,11 +1034,13 @@ class TestLinkSubjectScope:
     def test_existing_scope_with_mapper_is_noop(self):
         # Idempotent: the scope and its mapper exist, so nothing is created or added again.
         admin = MagicMock()
-        self._wire(admin, existing=self._existing(), mappers=[{"id": "m1", "name": "username-to-sub"}])
+        self._wire(admin, existing=self._existing(), mappers=[_SUBJECT_MAPPER_EXISTING])
         resp = _make_client(admin).post(self._URL)
         assert resp.status_code == 200
         admin.create_client_scope.assert_not_called()
         admin.add_mapper_to_client_scope.assert_not_called()
+        admin.update_mapper_in_client_scope.assert_not_called()
+        admin.delete_mapper_from_client_scope.assert_not_called()
 
     def test_existing_scope_without_mapper_gets_the_mapper(self):
         # Self-healing: someone deleted the mapper, so the next onboarding adds it again.
@@ -1026,7 +1055,7 @@ class TestLinkSubjectScope:
         # An unmarked scope with no attributes map at all is not an invariant breach.
         admin = MagicMock()
         existing = {"id": _SUBJECT_SCOPE_ID, "name": "aiac-username-sub"}
-        self._wire(admin, existing=existing, mappers=[{"name": "username-to-sub"}])
+        self._wire(admin, existing=existing, mappers=[_SUBJECT_MAPPER_EXISTING])
         resp = _make_client(admin).post(self._URL)
         assert resp.status_code == 200
         admin.add_client_default_client_scope.assert_called_once_with("svc-uuid", _SUBJECT_SCOPE_ID, {})
@@ -1085,7 +1114,7 @@ class TestLinkSubjectScope:
         self._wire(
             admin,
             existing=self._existing(),
-            mappers=[{"name": "username-to-sub"}],
+            mappers=[_SUBJECT_MAPPER_EXISTING],
             optional=[{"id": _SUBJECT_SCOPE_ID, "name": "aiac-username-sub"}],
         )
         resp = _make_client(admin).post(self._URL)
@@ -1193,6 +1222,137 @@ class TestLinkSubjectScope:
         resp = _make_client(admin).post(self._URL)
         assert resp.status_code == 502
         assert "error" in resp.json()
+
+    # -- convergence of an existing username-to-sub mapper (D31) --------------------------------
+
+    @staticmethod
+    def _seeded_fake(protocol_mapper="oidc-usermodel-property-mapper", **config_changes):
+        # A fake realm whose subject scope already has a mapper named username-to-sub with the
+        # given type and the expected config changed by ``config_changes``.
+        admin = _FakeSubjectScopeAdmin()
+        scope_id = admin.create_client_scope(_SUBJECT_SCOPE_PAYLOAD)
+        config = {**_SUBJECT_MAPPER_PAYLOAD["config"], **config_changes}
+        admin.mappers[scope_id].append(
+            {**_SUBJECT_MAPPER_PAYLOAD, "id": "m-old", "protocolMapper": protocol_mapper, "config": config}
+        )
+        return admin, scope_id
+
+    def test_wrong_claim_name_is_updated_to_exact_config(self):
+        # A mapper named username-to-sub that writes preferred_username leaves sub = user ID.
+        admin, scope_id = self._seeded_fake(**{"claim.name": "preferred_username"})
+        resp = _make_client(admin).post(self._URL)
+        assert resp.status_code == 200
+        assert admin.mapper_writes == ["update"]
+        (mapper,) = admin.mappers[scope_id]
+        assert mapper["id"] == "m-old"  # updated in place, not added again
+        assert mapper["protocolMapper"] == "oidc-usermodel-property-mapper"
+        assert mapper["config"] == _SUBJECT_MAPPER_PAYLOAD["config"]
+
+    def test_update_payload_is_the_representation_with_the_mapper_id(self):
+        admin = MagicMock()
+        wrong = {**_SUBJECT_MAPPER_EXISTING, "config": {**_SUBJECT_MAPPER_PAYLOAD["config"], "claim.name": "x"}}
+        self._wire(admin, existing=self._existing(), mappers=[wrong])
+        resp = _make_client(admin).post(self._URL)
+        assert resp.status_code == 200
+        admin.update_mapper_in_client_scope.assert_called_once_with(
+            _SUBJECT_SCOPE_ID, "m1", {**_SUBJECT_MAPPER_PAYLOAD, "id": "m1"}
+        )
+        admin.add_mapper_to_client_scope.assert_not_called()
+        admin.delete_mapper_from_client_scope.assert_not_called()
+
+    def test_wrong_token_claim_flag_is_updated(self):
+        # access.token.claim=false: the access token (the one AuthBridge reads) keeps sub = user ID.
+        admin, scope_id = self._seeded_fake(**{"access.token.claim": "false"})
+        assert _make_client(admin).post(self._URL).status_code == 200
+        assert admin.mapper_writes == ["update"]
+        assert admin.mappers[scope_id][0]["config"] == _SUBJECT_MAPPER_PAYLOAD["config"]
+
+    def test_missing_config_key_is_updated(self):
+        admin, scope_id = self._seeded_fake()
+        del admin.mappers[scope_id][0]["config"]["introspection.token.claim"]
+        assert _make_client(admin).post(self._URL).status_code == 200
+        assert admin.mapper_writes == ["update"]
+        assert admin.mappers[scope_id][0]["config"] == _SUBJECT_MAPPER_PAYLOAD["config"]
+
+    def test_extra_keycloak_config_keys_only_is_noop(self):
+        # Keycloak can add keys of its own (e.g. lightweight.claim): only OUR keys are compared.
+        admin, scope_id = self._seeded_fake(**{"lightweight.claim": "false"})
+        assert _make_client(admin).post(self._URL).status_code == 200
+        assert admin.mapper_writes == []
+        assert admin.mappers[scope_id][0]["config"]["lightweight.claim"] == "false"
+
+    def test_wrong_type_is_deleted_and_added_again(self):
+        # A different mapper type is not changed in place: delete the old mapper, add the right one.
+        admin, scope_id = self._seeded_fake(protocol_mapper="oidc-hardcoded-claim-mapper")
+        assert _make_client(admin).post(self._URL).status_code == 200
+        assert admin.mapper_writes == ["delete", "add"]
+        (mapper,) = admin.mappers[scope_id]
+        assert mapper["id"] != "m-old"
+        assert {k: v for k, v in mapper.items() if k != "id"} == _SUBJECT_MAPPER_PAYLOAD
+
+    def test_wrong_type_concurrent_delete_404_and_add_409_are_success(self):
+        # A concurrent onboarding fixed the type first: our delete gets 404 and our add gets 409.
+        admin = MagicMock()
+        wrong = {**_SUBJECT_MAPPER_EXISTING, "protocolMapper": "oidc-hardcoded-claim-mapper"}
+        self._wire(admin, existing=self._existing(), mappers=[wrong])
+        admin.delete_mapper_from_client_scope.side_effect = KeycloakError(error_message="Not found", response_code=404)
+        admin.add_mapper_to_client_scope.side_effect = KeycloakError(error_message="Conflict", response_code=409)
+        resp = _make_client(admin).post(self._URL)
+        assert resp.status_code == 200
+        admin.delete_mapper_from_client_scope.assert_called_once_with(_SUBJECT_SCOPE_ID, "m1")
+        admin.add_mapper_to_client_scope.assert_called_once_with(_SUBJECT_SCOPE_ID, _SUBJECT_MAPPER_PAYLOAD)
+        admin.update_mapper_in_client_scope.assert_not_called()
+
+    def test_wrong_type_delete_error_returns_502(self):
+        admin = MagicMock()
+        wrong = {**_SUBJECT_MAPPER_EXISTING, "protocolMapper": "oidc-hardcoded-claim-mapper"}
+        self._wire(admin, existing=self._existing(), mappers=[wrong])
+        admin.delete_mapper_from_client_scope.side_effect = KeycloakError(error_message="boom", response_code=500)
+        resp = _make_client(admin).post(self._URL)
+        assert resp.status_code == 502
+        admin.add_mapper_to_client_scope.assert_not_called()
+        admin.add_client_default_client_scope.assert_not_called()
+
+    def test_converged_mapper_second_call_makes_no_write(self):
+        admin, scope_id = self._seeded_fake(**{"claim.name": "preferred_username"})
+        client = _make_client(admin)
+        assert client.post(self._URL).status_code == 200
+        writes_after_first = list(admin.mapper_writes)
+        assert client.post(self._URL).status_code == 200
+        assert admin.mapper_writes == writes_after_first == ["update"]
+
+    def test_fresh_realm_second_call_makes_no_mapper_write(self):
+        admin = _FakeSubjectScopeAdmin()
+        client = _make_client(admin)
+        assert client.post(self._URL).status_code == 200
+        assert client.post(self._URL).status_code == 200
+        assert admin.mapper_writes == ["add"]
+
+    def test_update_error_returns_502(self):
+        admin = MagicMock()
+        wrong = {**_SUBJECT_MAPPER_EXISTING, "config": {**_SUBJECT_MAPPER_PAYLOAD["config"], "claim.name": "x"}}
+        self._wire(admin, existing=self._existing(), mappers=[wrong])
+        admin.update_mapper_in_client_scope.side_effect = KeycloakError(error_message="boom", response_code=500)
+        resp = _make_client(admin).post(self._URL)
+        assert resp.status_code == 502
+        assert "error" in resp.json()
+        admin.add_client_default_client_scope.assert_not_called()
+
+    def test_other_sub_mapper_is_left_alone(self):
+        # Another mapper (a different name) that also writes sub is not AIAC's: it is not changed,
+        # not deleted, and it does not fail the onboarding.
+        admin, scope_id = self._seeded_fake()
+        other = {
+            "id": "m-other",
+            "name": "operator-sub",
+            "protocol": "openid-connect",
+            "protocolMapper": "oidc-hardcoded-claim-mapper",
+            "config": {"claim.name": "sub", "claim.value": "x", "access.token.claim": "true"},
+        }
+        admin.mappers[scope_id].append(json.loads(json.dumps(other)))
+        assert _make_client(admin).post(self._URL).status_code == 200
+        assert admin.mapper_writes == []
+        assert admin.mappers[scope_id][1] == other
 
     def test_missing_realm_returns_422(self):
         app.dependency_overrides.clear()

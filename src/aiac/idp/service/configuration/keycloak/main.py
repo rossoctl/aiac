@@ -199,10 +199,12 @@ def _ensure_subject_scope(admin: KeycloakAdmin) -> dict:
     Create the scope (with no ``aiac.managed`` marker) when it is absent, and add the
     ``oidc-usermodel-property-mapper`` (named ``_SUBJECT_MAPPER``) when the scope does not have it;
     a second call is a no-op, and a deleted scope or mapper is created again on the next call.
-    Different services onboard concurrently, so a 409 from a concurrent create or mapper add is
-    success. An existing scope that carries the marker violates D31 (it would trip Assumption 2 and
-    become an own scope of every linked service): raise ``_InvariantViolation``. Returns the full
-    scope representation.
+    An existing mapper of that name is converged to ``_SUBJECT_MAPPER_REPRESENTATION``
+    (``_converge_subject_mapper``): a wrong mapper would keep ``sub`` = the Keycloak user ID while
+    onboarding reports success. Different services onboard concurrently, so a 409 from a concurrent
+    create or mapper add is success. An existing scope that carries the marker violates D31 (it
+    would trip Assumption 2 and become an own scope of every linked service): raise
+    ``_InvariantViolation``. Returns the full scope representation.
     """
     scope = _find_client_scope(admin, _SUBJECT_SCOPE)
     if scope is None:
@@ -225,15 +227,59 @@ def _ensure_subject_scope(admin: KeycloakAdmin) -> dict:
         )
     scope_id = scope["id"]
 
+    # Only the mapper named ``_SUBJECT_MAPPER`` is AIAC's. Another mapper in the scope that also
+    # writes ``sub`` is left as it is and does not fail the call: AIAC did not make it, so to
+    # delete or change it would destroy an operator's configuration, and to fail would block every
+    # onboarding over a state this endpoint cannot prove wrong (it can be the same mapping under
+    # another name).
     mappers = admin.get_mappers_from_client_scope(scope_id)
-    if not any(m.get("name") == _SUBJECT_MAPPER for m in mappers):
-        try:
-            admin.add_mapper_to_client_scope(scope_id, _SUBJECT_MAPPER_REPRESENTATION)
-        except KeycloakError as e:
-            # 409: a concurrent onboarding added the mapper first — the mapper is there.
-            if e.response_code != 409:
-                raise
+    existing = next((m for m in mappers if m.get("name") == _SUBJECT_MAPPER), None)
+    if existing is None:
+        _add_subject_mapper(admin, scope_id)
+    else:
+        _converge_subject_mapper(admin, scope_id, existing)
     return admin.get_client_scope(scope_id)
+
+
+def _add_subject_mapper(admin: KeycloakAdmin, scope_id: str) -> None:
+    """Add ``_SUBJECT_MAPPER_REPRESENTATION`` to the subject scope; a 409 is success."""
+    try:
+        admin.add_mapper_to_client_scope(scope_id, _SUBJECT_MAPPER_REPRESENTATION)
+    except KeycloakError as e:
+        # 409: a concurrent onboarding added the mapper first — the mapper is there.
+        if e.response_code != 409:
+            raise
+
+
+def _converge_subject_mapper(admin: KeycloakAdmin, scope_id: str, existing: dict) -> None:
+    """Make the existing ``_SUBJECT_MAPPER`` in the subject scope equal the expected mapper (D31).
+
+    Compare the mapper type and only the keys of ``_SUBJECT_MAPPER_REPRESENTATION["config"]``:
+    Keycloak can add config keys of its own, and these must not cause a write at each call. A
+    correct mapper gets no write. A wrong config gets an in-place update (PUT, 204): Keycloak
+    replaces the full config map, and Keycloak 26.0 reads the mapper id from the payload (not from
+    the path), so the payload carries the ``id``. A wrong type is not changed in place (the admin
+    console does not offer a type change, so do not rely on the PUT for it): delete the mapper,
+    then add the expected one. A 404 on that delete or a 409 on that add is a concurrent onboarding that did
+    the same fix first, so it is success. Any other ``KeycloakError`` propagates (HTTP 502).
+    """
+    expected = _SUBJECT_MAPPER_REPRESENTATION
+    config = existing.get("config") or {}
+    type_ok = existing.get("protocolMapper") == expected["protocolMapper"]
+    config_ok = all(config.get(key) == value for key, value in expected["config"].items())
+    if type_ok and config_ok:
+        return
+    mapper_id = existing["id"]
+    if type_ok:
+        admin.update_mapper_in_client_scope(scope_id, mapper_id, {**expected, "id": mapper_id})
+        return
+    try:
+        admin.delete_mapper_from_client_scope(scope_id, mapper_id)
+    except KeycloakError as e:
+        # 404: a concurrent onboarding deleted the wrong mapper first.
+        if e.response_code != 404:
+            raise
+    _add_subject_mapper(admin, scope_id)
 
 
 @asynccontextmanager
