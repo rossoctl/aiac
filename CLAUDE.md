@@ -54,6 +54,8 @@ Config: `k8s/`, `pyproject.toml`, `pyrightconfig.json`. Each service has a
 
 - Build and deploy: `k8s/aiac-deployment-guide.md`. The OPA pipeline on Kind:
   `k8s/opa-kind-runbook.md`.
+- Deploy parameters (for example the access-control scheme,
+  `ac-side=agent|target`): `docs/agents/deploy.md`.
 - Hardening rules for Dockerfiles and manifests (non-root UID 10001, `fsGroup`,
   `securityContext`, probes, limits): `.claude/rules/container-hardening.md`.
   Claude Code loads it when you work on those files.
@@ -71,8 +73,3 @@ GitHub issues in this repo's own remote (`rossoctl/aiac`), filtered by the `aiac
 ### Domain docs
 
 Single-context, scoped to `aiac/` (`CONTEXT.md` glossary at the `aiac/` root; design decisions documented in the relevant PRD/spec under `docs/specs/`). Consult decisions on demand, not up front. See `docs/agents/domain.md`.
-
-### Deploy parameters
-
-Deploy-time parameters for the `deploy` skill (for example the access-control
-scheme, `ac-side=agent|target`) are declared in `docs/agents/deploy.md`.
