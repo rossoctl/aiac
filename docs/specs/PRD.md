@@ -78,8 +78,9 @@ This means `token_scopes` is absent from `authproxy-routes`. Route configuration
 ### Enforcement side
 
 The enforcement side tells where OPA checks the access to a **callee** (a service that is called,
-agent or tool). One global switch selects the side for every callee (D16). Every managed service
-has a CR under both sides (D20).
+agent or tool). One global switch selects the side for every callee (D16). Target side is the
+primary method, and agent side is the legacy method that AIAC still supports (D15). Every managed
+service has a CR under both sides (D20).
 
 | Side | Who checks a call to a tool | The CR of an agent | The CR of a tool |
 |---|---|---|---|
