@@ -128,6 +128,46 @@ def test_apply_role_dispatches_to_role_subagent_with_role_id():
     pce.assert_called_once_with([], True)
 
 
+def test_apply_role_members_rerenders_the_role_with_no_prb_run():
+    # D32: a role-membership change (the operator route of the aiac.apply.role-members event) re-renders the
+    # CRs that use the role. It calls no use-case handler (no PRB run) and no compute_and_apply.
+    role_id = "5f0c2a8e-1b7d-4c3e-9a61-2d8f4e7b9c10"
+    with (
+        patch("aiac.agent.controller.routes.rerender_role") as rerender,
+        patch("aiac.agent.controller.routes.update_role") as role,
+        patch("aiac.agent.controller.routes.compute_and_apply") as pce,
+    ):
+        resp = client.post(f"/apply/role-members/{role_id}")
+
+    assert resp.status_code == 200
+    assert resp.content == b""
+    rerender.assert_called_once_with(role_id)
+    role.assert_not_called()
+    pce.assert_not_called()
+
+
+def test_apply_role_members_surfaces_a_dependency_error_status():
+    # rerender_role re-raises a dependency error (IdP, store or PDP); the route surfaces its status.
+    with patch("aiac.agent.controller.routes.rerender_role", side_effect=HTTPException(status_code=502)):
+        resp = client.post("/apply/role-members/role-1")
+
+    assert resp.status_code == 502
+
+
+def test_apply_role_does_not_rerender():
+    # /apply/role/{role_id} (UC3) and /apply/role-members/{role_id} are different routes.
+    with (
+        patch("aiac.agent.controller.routes.update_role", return_value=([], True)) as role,
+        patch("aiac.agent.controller.routes.compute_and_apply"),
+        patch("aiac.agent.controller.routes.rerender_role") as rerender,
+    ):
+        resp = client.post("/apply/role/role-members")
+
+    assert resp.status_code == 200
+    role.assert_called_once_with("role-members")
+    rerender.assert_not_called()
+
+
 def test_apply_offboard_dispatches_to_decommission_with_client_id():
     # Offboard resolves the service key through the UC stub then calls decommission directly
     # (no compute_and_apply — it is a whole-service teardown, not a rule fold).
