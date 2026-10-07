@@ -275,8 +275,8 @@ class TestCrossKindEnforcement:
 
 class TestListServiceScopes:
     def test_returns_json_array_with_owner_service_id(self):
-        # Scope.serviceId = the owning client (the service exposing the scope), resolved to the
-        # client's serviceId (clientId) — the single owner for a per-service scope listing.
+        # Scope.serviceId = the owner of this copy: the listed service, resolved to its serviceId
+        # (clientId). A scope that more clients link is listed for each (see TestSharedScopes).
         admin = MagicMock()
         admin.get_client_default_client_scopes.return_value = [
             {"id": "sc1", "name": "profile"},
@@ -312,64 +312,82 @@ class TestListServiceScopes:
 
 
 # ---------------------------------------------------------------------------
-# Assumption 2 (single scope owner) — fail loud (handoff 02)
+# Shared scopes (D32): one copy for each owner; delete at the last owner
 # ---------------------------------------------------------------------------
 
 
-class TestSingleScopeOwnerEnforcement:
-    _MANAGED = {"id": "aud-1", "name": "svc-a-aud", "attributes": {"aiac.managed": "true"}}
+class _FakeDefaultScopesAdmin:
+    """A small stateful stand-in for the Keycloak default-scope reads and writes, in the live shape:
+    each item of ``get_client_default_client_scopes`` has only ``id`` and ``name`` (Keycloak never
+    returns ``attributes`` there; live check on realm ``rossoctl``, 2026-10-06). ``links`` maps a
+    client UUID to the scope ids it links as default scopes; an unmap changes it, so a later read
+    sees the state after the unmap."""
 
-    def test_aiac_managed_scope_with_multiple_owners_returns_409(self):
-        # An AIAC-managed client scope must have exactly one owning client; if more than one
-        # client exposes it as a default scope, a single Scope.serviceId cannot represent it.
-        admin = MagicMock()
-        admin.get_client_default_client_scopes.return_value = [self._MANAGED]
-        admin.get_client.return_value = {"id": "svc-a", "clientId": "svc-a"}
-        admin.get_clients.return_value = [{"id": "svc-a"}, {"id": "svc-b"}]
-        resp = _make_client(admin).get(f"/services/svc-a/scopes?realm={REALM}")
-        assert resp.status_code == 409
-        assert "error" in resp.json()
+    _NAMES = {"sc-shared": "github-tool.source-read", "sc-own": "github-tool.issue-read", "sc-profile": "profile"}
 
-    def test_aiac_managed_scope_with_single_owner_is_ok(self):
-        admin = MagicMock()
-        admin.get_client.return_value = {"id": "svc-a", "clientId": "svc-a"}
-        admin.get_clients.return_value = [{"id": "svc-a"}, {"id": "svc-b"}]
+    def __init__(self, links: dict[str, list[str]]):
+        self.client_ids = {"uuid-1": "team1/github-tool", "uuid-2": "team2/github-tool"}
+        self.links = {uuid: list(scope_ids) for uuid, scope_ids in links.items()}
+        self.deleted: list[str] = []
 
-        def _defaults(client_id):
-            return [self._MANAGED] if client_id == "svc-a" else []
+    def get_clients(self):
+        return [{"id": uuid, "clientId": client_id} for uuid, client_id in self.client_ids.items()]
 
-        admin.get_client_default_client_scopes.side_effect = _defaults
-        resp = _make_client(admin).get(f"/services/svc-a/scopes?realm={REALM}")
-        assert resp.status_code == 200
-        assert resp.json()[0]["serviceId"] == "svc-a"
+    def get_client(self, uuid):
+        return {"id": uuid, "clientId": self.client_ids[uuid]}
 
-    def test_non_managed_scope_skips_owner_scan(self):
-        # Built-in / non-AIAC scopes are not subject to the single-owner invariant (Keycloak
-        # ships them assigned to many clients) — no cross-client scan runs for them.
-        admin = MagicMock()
-        admin.get_client_default_client_scopes.return_value = [{"id": "sc1", "name": "profile"}]
-        admin.get_client.return_value = {"id": "svc-a", "clientId": "svc-a"}
-        resp = _make_client(admin).get(f"/services/svc-a/scopes?realm={REALM}")
-        assert resp.status_code == 200
+    def get_client_default_client_scopes(self, uuid):
+        return [{"id": scope_id, "name": self._NAMES[scope_id]} for scope_id in self.links.get(uuid, [])]
+
+    def delete_client_default_client_scope(self, uuid, scope_id):
+        self.links[uuid].remove(scope_id)
+
+    def delete_client_scope(self, scope_id):
+        self.deleted.append(scope_id)
+
+
+class TestSharedScopes:
+    _BOTH = {"uuid-1": ["sc-profile", "sc-shared"], "uuid-2": ["sc-shared", "sc-own"]}
+
+    def test_scope_that_two_clients_link_is_listed_for_each_with_its_client_id(self):
+        # A shared scope is valid (D32). Each client's listing gives its own copy, with that client's
+        # clientId as serviceId, so each copy routes to its owner's SPM. No owner scan, no 409.
+        admin = MagicMock(wraps=_FakeDefaultScopesAdmin(self._BOTH))
+        client = _make_client(admin)
+        team1 = client.get(f"/services/uuid-1/scopes?realm={REALM}")
+        team2 = client.get(f"/services/uuid-2/scopes?realm={REALM}")
+        assert team1.status_code == 200 and team2.status_code == 200
+        assert team1.json() == [
+            {"id": "sc-profile", "name": "profile", "serviceId": "team1/github-tool"},
+            {"id": "sc-shared", "name": "github-tool.source-read", "serviceId": "team1/github-tool"},
+        ]
+        assert team2.json() == [
+            {"id": "sc-shared", "name": "github-tool.source-read", "serviceId": "team2/github-tool"},
+            {"id": "sc-own", "name": "github-tool.issue-read", "serviceId": "team2/github-tool"},
+        ]
         admin.get_clients.assert_not_called()
 
-    def test_unmarked_subject_scope_skips_owner_scan(self):
-        # D31: the shared subject scope aiac-username-sub is linked to every AIAC-managed client,
-        # but it carries no aiac.managed marker, so the Assumption-2 owner scan skips it like a
-        # built-in — no 409 although many clients link it, and the listing still returns it.
-        subject_scope = {
-            "id": "subj-id",
-            "name": "aiac-username-sub",
-            "attributes": {"include.in.token.scope": "false", "display.on.consent.screen": "false"},
-        }
-        admin = MagicMock()
-        admin.get_client_default_client_scopes.return_value = [{"id": "sc1", "name": "profile"}, subject_scope]
-        admin.get_client.return_value = {"id": "svc-a", "clientId": "svc-a"}
-        admin.get_clients.return_value = [{"id": "svc-a"}, {"id": "svc-b"}]
-        resp = _make_client(admin).get(f"/services/svc-a/scopes?realm={REALM}")
+    def test_delete_keeps_a_scope_that_another_client_links(self):
+        fake = _FakeDefaultScopesAdmin(self._BOTH)
+        resp = _make_client(fake).delete(f"/services/uuid-1/scopes/sc-shared?realm={REALM}")
         assert resp.status_code == 200
-        assert [s["name"] for s in resp.json()] == ["profile", "aiac-username-sub"]
-        admin.get_clients.assert_not_called()
+        assert fake.links == {"uuid-1": ["sc-profile"], "uuid-2": ["sc-shared", "sc-own"]}  # unmapped here only
+        assert fake.deleted == []
+
+    def test_delete_removes_a_scope_that_no_other_client_links(self):
+        fake = _FakeDefaultScopesAdmin(self._BOTH)
+        resp = _make_client(fake).delete(f"/services/uuid-2/scopes/sc-own?realm={REALM}")
+        assert resp.status_code == 200
+        assert fake.links == {"uuid-1": ["sc-profile", "sc-shared"], "uuid-2": ["sc-shared"]}
+        assert fake.deleted == ["sc-own"]
+
+    def test_delete_at_the_last_owner_removes_the_shared_scope(self):
+        fake = _FakeDefaultScopesAdmin(self._BOTH)
+        client = _make_client(fake)
+        client.delete(f"/services/uuid-1/scopes/sc-shared?realm={REALM}")
+        assert fake.deleted == []
+        client.delete(f"/services/uuid-2/scopes/sc-shared?realm={REALM}")
+        assert fake.deleted == ["sc-shared"]
 
     def teardown_method(self):
         app.dependency_overrides.clear()
@@ -1023,7 +1041,7 @@ class TestLinkSubjectScope:
 
     def test_absent_scope_is_created_without_marker(self):
         # The scope is created with its own, narrow payload — never through POST /scopes, which
-        # always stamps aiac.managed (a marked shared scope would break Assumption 2).
+        # always stamps aiac.managed (a marked subject scope would become an own scope of each linked service).
         admin = MagicMock()
         self._wire(admin)
         resp = _make_client(admin).post(self._URL)
@@ -1189,8 +1207,8 @@ class TestLinkSubjectScope:
         admin.add_client_default_client_scope.assert_called_once_with("svc-uuid", _SUBJECT_SCOPE_ID, {})
 
     def test_marked_existing_scope_returns_409_and_does_not_link(self):
-        # A marked shared scope would trip Assumption 2 (the catalog read fails with 409) and
-        # become an own scope of every linked service — an invariant breach, surfaced as 409.
+        # A marked subject scope would become an own scope of every linked service (D31) — an
+        # invariant breach, surfaced as 409.
         admin = MagicMock()
         self._wire(admin, existing=self._existing({"aiac.managed": "true"}))
         resp = _make_client(admin).post(self._URL)

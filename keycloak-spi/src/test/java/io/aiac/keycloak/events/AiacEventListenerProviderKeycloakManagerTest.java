@@ -1,7 +1,9 @@
 package io.aiac.keycloak.events;
 
+import static io.aiac.keycloak.events.AiacEventListenerProviderTest.TWO_ROLES;
 import static io.aiac.keycloak.events.AiacEventListenerProviderTest.adminEvent;
 import static io.aiac.keycloak.events.AiacEventListenerProviderTest.payload;
+import static io.aiac.keycloak.events.AiacEventListenerProviderTest.roleMapping;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -125,6 +127,33 @@ class AiacEventListenerProviderKeycloakManagerTest {
 
         verify(mainTransaction).rollback();
         verify(mainTransaction, never()).commit();
+        verifyNoInteractions(natsConnection);
+    }
+
+    @Test
+    void aRoleMappingIsPublishedAfterTheMainCommitWithOneSubjectForEachRole() {
+        transactionManager.begin();
+        transactionManager.enlist(mainTransaction);
+        provider.onEvent(roleMapping(OperationType.DELETE, TWO_ROLES), false);
+        verifyNoInteractions(natsConnection);
+
+        transactionManager.commit();
+
+        InOrder order = inOrder(mainTransaction, natsConnection);
+        order.verify(mainTransaction).commit();
+        order.verify(natsConnection).publish(eq("aiac.apply.role-members.role-1"), aryEq(payload("role-1")));
+        order.verify(natsConnection).publish(eq("aiac.apply.role-members.role-2"), aryEq(payload("role-2")));
+    }
+
+    @Test
+    void aRolledBackRoleMappingPublishesNothing() {
+        transactionManager.begin();
+        transactionManager.enlist(mainTransaction);
+        provider.onEvent(roleMapping(OperationType.CREATE, TWO_ROLES), false);
+
+        transactionManager.rollback();
+
+        verify(mainTransaction).rollback();
         verifyNoInteractions(natsConnection);
     }
 

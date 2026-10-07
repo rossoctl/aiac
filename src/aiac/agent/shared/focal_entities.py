@@ -13,7 +13,9 @@ excluded/included by **ownership** (role id / ``scope.serviceId``), never by nam
 - ``own_roles`` / ``own_scopes`` — the focus service's own ``aiac.managed`` roles/scopes.
 - ``candidate_roles`` — the flattened, de-duplicated union of (a) other services'
   ``aiac.managed`` roles (``kind=Agent``) and (b) realm roles held by at least one user
-  (composite-expanded, and not owned by any service; ``kind=User``).
+  (composite-expanded, and not owned by any service; ``kind=User``). There is one entry for each
+  role id, with its current holders (``RoleHolders``, the rule that the PCE uses at render time,
+  D32): a role that two services hold (a shared role) is one candidate with both holders.
 - ``other_scopes`` — other services' ``aiac.managed`` scopes, sourced from ``get_services()``
   so each scope carries its owning ``serviceId`` (the SPM routing key the PCE needs).
 
@@ -36,6 +38,7 @@ from pydantic import BaseModel, ConfigDict
 from aiac.agent.shared.roles import flatten_role
 from aiac.idp.configuration.api import Configuration
 from aiac.idp.configuration.models import Role, Scope, ServiceType
+from aiac.policy.model.holders import RoleHolders
 
 
 class FocalEntitySet(BaseModel):
@@ -56,15 +59,17 @@ def _config() -> Configuration:
     return Configuration.for_default_realm()
 
 
-def _flatten_dedup(roles: list[Role]) -> list[Role]:
-    """Union of every role's closure, de-duplicated by ``role.id``."""
+def _flatten_dedup(roles: list[Role], holders: RoleHolders) -> list[Role]:
+    """Union of every role's closure, de-duplicated by ``role.id``. Each role carries its current
+    holders (``holders``, D32): the copies of a shared role (one per holding service, each with only
+    that service in ``actorIds``) merge into one role with every holder."""
     out: list[Role] = []
     seen: set[str] = set()
     for role in roles:
         for member in flatten_role(role):
             if member.id not in seen:
                 seen.add(member.id)
-                out.append(member)
+                out.append(holders.refresh_role(member))
     return out
 
 
@@ -131,7 +136,11 @@ def resolve_focal_entities(
     # true) and (b) route any resulting rule to ``SPM("")``, a 422 dead-end.
     other_scopes = [s for other in others for s in other.scopes if s.aiac_managed]
 
-    candidate_roles = _flatten_dedup(user_roles + other_agent_roles)
+    # The holders of each candidate role, by the rule that the PCE uses at render time (D32): the
+    # live services that hold an agent role (the focus counts as live), and the members of a user
+    # role. The subjects' roles come from GET /roles, so they carry those members.
+    holders = RoleHolders(services, user_roles, focus_service=focus.serviceId)
+    candidate_roles = _flatten_dedup(user_roles + other_agent_roles, holders)
 
     return FocalEntitySet(
         own_scopes=own_scopes,

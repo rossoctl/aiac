@@ -41,7 +41,7 @@ _DISCOVERY_AUDIENCE_MAPPER = "aiac-discovery-audience"
 # exchange: the standard token exchange (V2) applies only the requester client's scopes, so the
 # login client's own ``username-to-sub`` mapper never reaches an exchanged token. The scope is
 # linked to many clients, so it deliberately has NO ``aiac.managed`` marker: a marked scope would
-# trip Assumption 2 and become an own scope of every linked service. Never a realm default scope.
+# become an own scope of every linked service. Never a realm default scope.
 _SUBJECT_SCOPE = "aiac-username-sub"
 
 # Name of the one protocol mapper in ``_SUBJECT_SCOPE``. It is the same mapping as the login
@@ -101,30 +101,15 @@ def _assert_single_kind(members: list[dict], role_name: str) -> None:
 
 
 def _build_scope_owner_index(admin: "KeycloakAdmin") -> dict[str, list[str]]:
-    """Map each client-scope id -> the clientIds exposing it as a default scope, from a single
-    pass over all clients. Building this once per request turns the Assumption-2 check from an
-    O(scopes × clients) nested rescan (a full ``get_clients`` + per-client default-scope fetch
-    for every scope) into a single scan plus O(1) lookups."""
+    """Map each client-scope id -> the client UUIDs that link it as a default scope, from a single
+    pass over all clients. The delete guard of ``delete_scope_from_service`` uses it: a scope that
+    another client still links is shared (D32) and is kept. It reads only the scope ``id``, which
+    is all that ``get_client_default_client_scopes`` gives besides the ``name``."""
     index: dict[str, list[str]] = {}
     for client in admin.get_clients():
         for s in admin.get_client_default_client_scopes(client["id"]):
             index.setdefault(s["id"], []).append(client["id"])
     return index
-
-
-def _assert_single_owner(scope: dict, owner_index: dict[str, list[str]]) -> None:
-    """Assumption 2 (single scope owner): an AIAC-managed client scope must be exposed as a
-    default scope by exactly one client. Keycloak client scopes are realm-level and assignable
-    to many clients, so this is not a Keycloak guarantee — look the scope up in the precomputed
-    ``owner_index`` and fail loud on more than one owner, since a single ``Scope.serviceId``
-    cannot represent it."""
-    scope_id = scope["id"]
-    owners = owner_index.get(scope_id, [])
-    if len(owners) > 1:
-        raise _InvariantViolation(
-            f"AIAC-managed scope '{scope.get('name', scope_id)}' is exposed by {len(owners)} "
-            f"clients (Assumption 2: a scope has exactly one owner)"
-        )
 
 
 def _is_aiac_managed(attributes: dict | None) -> bool:
@@ -214,8 +199,8 @@ def _ensure_subject_scope(admin: KeycloakAdmin) -> dict:
     (``_converge_subject_mapper``): a wrong mapper would keep ``sub`` = the Keycloak user ID while
     onboarding reports success. Different services onboard concurrently, so a 409 from a concurrent
     create or mapper add is success. An existing scope that carries the marker violates D31 (it
-    would trip Assumption 2 and become an own scope of every linked service): raise
-    ``_InvariantViolation``. Returns the full scope representation.
+    would become an own scope of every linked service): raise ``_InvariantViolation``. Returns the
+    full scope representation.
     """
     scope = _find_client_scope(admin, _SUBJECT_SCOPE)
     if scope is None:
@@ -233,7 +218,7 @@ def _ensure_subject_scope(admin: KeycloakAdmin) -> dict:
         raise _InvariantViolation(
             f"client scope '{_SUBJECT_SCOPE}' carries the '{_AIAC_MANAGED_ATTRIBUTE}' marker, but the "
             f"shared subject scope (D31) must not: it is linked to every AIAC-managed client, so a "
-            f"marked scope breaks Assumption 2 and becomes an own scope of each linked service. "
+            f"marked scope becomes an own scope of each linked service. "
             f"Remove the '{_AIAC_MANAGED_ATTRIBUTE}' attribute from the scope"
         )
     scope_id = scope["id"]
@@ -586,23 +571,13 @@ def list_service_scopes(service_id: str, admin: KeycloakAdmin = Depends(get_admi
     try:
         scopes = admin.get_client_default_client_scopes(service_id)
         if scopes:
-            # Scope.serviceId = the owning client. For a per-service listing the owner is this
-            # service; resolve its serviceId (clientId). AIAC-managed scopes must have exactly
-            # one owner (Assumption 2) — enforce fail-loud. Built-ins are shared by design, so
-            # they are exempt from the single-owner scan.
+            # Scope.serviceId = the owner of this copy: this service, resolved to its serviceId
+            # (clientId). A scope that more clients link (a shared scope, D32) is listed for each of
+            # them, each time with that client as serviceId, so each copy routes to its owner's SPM.
             owner = admin.get_client(service_id)["clientId"]
-            # Build the scope->owners reverse index at most once per request, only when there is
-            # an AIAC-managed scope to check (built-ins are exempt).
-            owner_index: dict[str, list[str]] | None = None
             for scope in scopes:
-                if _is_aiac_managed(scope.get("attributes")):
-                    if owner_index is None:
-                        owner_index = _build_scope_owner_index(admin)
-                    _assert_single_owner(scope, owner_index)  # Assumption 2, fail loud
                 scope["serviceId"] = owner
         return scopes
-    except _InvariantViolation as e:
-        return JSONResponse(status_code=409, content={"error": str(e)})
     except KeycloakError as e:
         return _read_error(e)
 

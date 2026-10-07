@@ -64,7 +64,9 @@ def get_service_policy(service_id: str) -> ServicePolicyModel
     # (Matches the existing "engine creates a fresh model on 404" convention.)
 
 def get_service_policy_by_scope(scope: Scope) -> ServicePolicyModel | None
-    # Singular: a scope has exactly one owning service (Assumption 2).
+    # Singular: each copy of a scope has one owner, scope.serviceId. A scope that
+    # several services share has one copy for each owner (D32), so the caller
+    # gets the SPM of the owner of the copy that it passes.
     # Sugar over get_service_policy(scope.serviceId) — resolves the owner via
     # scope.serviceId; no dedicated HTTP route.
     # Returns None ONLY when the scope has no resolved owner (scope.serviceId
