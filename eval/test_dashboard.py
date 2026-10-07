@@ -147,6 +147,68 @@ def test_parse_report_handles_multiline_fenced_under_grants(tmp_path: Path) -> N
     assert entry.under_grants == "outbound_subject: (a, b), (c, d)\noutbound_target: (e, f)"
 
 
+def test_parse_report_handles_a_longer_fence_around_a_body_with_its_own_triple_backtick(tmp_path: Path) -> None:
+    """Confirmed as a real finding in PR review: ``eval/conftest.py``'s ``_render_field`` sizes its
+    fence longer than the longest backtick run already inside the value (e.g. an LLM-drafted
+    recommendation body quoting its own fenced code) -- the parser must accept any 3-or-more
+    backtick fence and close only on a line matching that SAME length, not hardcode exactly 3
+    (which would both miss the real close and mistake the inner ``` for it)."""
+    body = (
+        "## passed (1)\n\n"
+        "### `eval/test_policy_pipeline_correctness_e2e.py::test_e2e_correctness[agent_delegation]`\n"
+        "- **Precision:** 1.000\n"
+        "- **Recall:** 1.000\n"
+        "- **Denial precision:** 1.000\n"
+        "- **Over-grants:** none\n"
+        "- **Under-grants:** none\n"
+        "- **Incorrectly denied:** none\n"
+        "- **Reason:**\n"
+        "  ````\n"
+        "  Wrap the fix like:\n"
+        "  ```python\n"
+        "  raise ValueError\n"
+        "  ```\n"
+        "  ````\n\n"
+    )
+    path = _write_report(tmp_path, body)
+
+    report = parse_report(path)
+
+    entry = report.entries[0]
+    assert entry.failure == "Wrap the fix like:\n```python\nraise ValueError\n```"
+
+
+def test_parse_report_stops_before_the_recommendations_section(tmp_path: Path) -> None:
+    """Confirmed as a real finding in PR review: the "## Improvement recommendations" section
+    eval/conftest.py appends after the per-category drill-down is recommendation prose, not
+    per-scenario data -- its own "- **Recommendation:**"/"- **Evidence:**" bullets must not get
+    attributed to the preceding section's last ScenarioEntry (harmless today only because neither
+    label happens to be one _assign_field recognizes -- parse_report stops here on purpose instead
+    of relying on that accident)."""
+    body = (
+        "## passed (1)\n\n"
+        "### `eval/test_policy_pipeline_correctness_prb.py::test_prb_correctness[baseline]`\n"
+        "- **Precision:** 1.000\n"
+        "- **Recall:** 1.000\n"
+        "- **Denial precision:** 1.000\n"
+        "- **Over-grants:** none\n"
+        "- **Under-grants:** none\n"
+        "- **Incorrectly denied:** none\n\n"
+        "## Improvement recommendations\n\n"
+        "### Over-interpreting 'only'\n\n"
+        "- **Recommendation:** Add a prompt constraint for restriction words.\n"
+        "- **Evidence:** correctness_prb/baseline: over-granted pairs -> inbound: (role-a, scope-a)\n"
+    )
+    path = _write_report(tmp_path, body)
+
+    report = parse_report(path)
+
+    assert len(report.entries) == 1
+    entry = report.entries[0]
+    assert entry.failure is None
+    assert entry.over_grants == "none"
+
+
 def test_parse_report_setup_failure_leaves_metrics_none(tmp_path: Path) -> None:
     body = (
         "## error (1)\n\n"

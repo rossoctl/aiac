@@ -81,6 +81,19 @@ _RUN_RE = re.compile(r"^Run: (.+)$")
 _HEADING_RE = re.compile(r"^## (\w+) \(\d+\)$")
 _ENTRY_RE = re.compile(r"^### `(.+)`$")
 _BULLET_RE = re.compile(r"^- \*\*(.+?):\*\*\s?(.*)$")
+# A code fence line is 3-OR-MORE backticks (``eval/conftest.py``'s ``_render_field`` sizes the
+# fence longer than the longest backtick run already inside the value it wraps, per CommonMark) --
+# never hardcoded to exactly 3, and the closing fence must match the opening fence's exact length
+# (see ``parse_report``), not just satisfy this pattern on its own.
+_FENCE_RE = re.compile(r"^`{3,}$")
+# The literal heading eval/conftest.py's _render_recommendations_section writes (never matches
+# _HEADING_RE's own "## Word (N)" pattern, since this section has no per-category count suffix) --
+# everything from here to end of file is recommendation prose, not per-scenario data, and must
+# never be mistaken for one: a "- **Recommendation:**"/"- **Evidence:**" bullet attaching to the
+# PRECEDING section's last ScenarioEntry (confirmed as a real finding in PR review) is harmless
+# only by the accident that neither label is in _LABEL_FIELDS today -- parse_report stops here on
+# purpose instead of relying on that accident to hold forever.
+_RECOMMENDATIONS_HEADING = "## Improvement recommendations"
 _SCENARIO_RE = re.compile(r"\[([^\[\]]+)\]$")
 
 # Bullet label -> ScenarioEntry field name, mirroring the labels ``eval/conftest.py``'s
@@ -165,21 +178,24 @@ def parse_report(path: Path) -> ParsedReport:
     entry: ScenarioEntry | None = None
     pending_label: str | None = None
     fenced_lines: list[str] = []
+    fence = ""
 
     i, n = 0, len(lines)
     while i < n:
         line = lines[i]
 
         if pending_label is not None:
-            if line.strip() == "```":
+            if line.strip() == fence:
                 if entry is not None:
                     _assign_field(entry, pending_label, "\n".join(fenced_lines))
-                pending_label, fenced_lines = None, []
+                pending_label, fenced_lines, fence = None, [], ""
             else:
                 fenced_lines.append(line[2:] if line.startswith("  ") else line)
             i += 1
             continue
 
+        if line == _RECOMMENDATIONS_HEADING:
+            break
         if run_m := _RUN_RE.match(line):
             run_at = datetime.fromisoformat(run_m.group(1))
         elif heading_m := _HEADING_RE.match(line):
@@ -199,9 +215,10 @@ def parse_report(path: Path) -> ParsedReport:
             entries.append(entry)
         elif bullet_m := _BULLET_RE.match(line):
             label, value = bullet_m.group(1), bullet_m.group(2)
-            if value == "" and i + 1 < n and lines[i + 1].strip() == "```":
-                pending_label, fenced_lines = label, []
-                i += 1  # skip the opening ``` fence too
+            next_stripped = lines[i + 1].strip() if i + 1 < n else ""
+            if value == "" and _FENCE_RE.match(next_stripped):
+                pending_label, fenced_lines, fence = label, [], next_stripped
+                i += 1  # skip the opening fence line too
             elif entry is not None:
                 _assign_field(entry, label, value)
         i += 1

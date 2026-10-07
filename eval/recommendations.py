@@ -12,16 +12,19 @@ Three layers, in this file:
    produced at least one case. Sends every case's id/finding-type/evidence/remedy-menu in one
    request and asks the model to cluster them into DISTINCT underlying error patterns — explicitly
    merging cases that share a root cause rather than echoing one output per input case. Reuses the
-   shared ``aiac.agent.llm`` seam (``load_llm_settings``/``build_llm``/``call_with_retry``/
-   ``raise_sanitized``) on the bare ``LLM_*`` profile, the same pattern
-   ``aiac.agent.policy_rules_builder.graph._structured_call`` already uses for schema-constrained
-   calls — no new LLM plumbing invented here.
-3. **Deterministic fallback** inside ``build_recommendations``: if the call fails (any ``LLMError``)
-   or every returned pattern's ``case_ids`` turn out to be unrecognized (defends against a
-   hallucinated id), falls back to one ``Recommendation`` per ``(finding_type, fallback_key)``, body
-   text a static, clearly-labeled note, evidence = that group's cases' evidence lines verbatim. This
-   keeps the feature honest — never silently blank, never a fabricated-sounding recommendation when
-   the model didn't actually produce one.
+   shared ``aiac.agent.llm`` seam (``load_llm_settings``/``build_llm``/``call_with_retry``) on the
+   bare ``LLM_*`` profile, the same pattern ``aiac.agent.policy_rules_builder.graph._structured_call``
+   already uses for schema-constrained calls — no new LLM plumbing invented here. Returns ``[]`` on
+   ANY exception (settings/client-construction error, transport failure, or the structured-output
+   call returning ``None`` outright instead of raising) -- the caller never needs to distinguish why
+   it got nothing back.
+3. **Deterministic fallback** inside ``build_recommendations``: for every case left uncovered after
+   validating the drafted patterns' ``case_ids`` against the known set (whether because the call
+   above returned ``[]``, or a pattern simply omitted a case or named it with a hallucinated id),
+   falls back to one ``Recommendation`` per ``(finding_type, fallback_key)``, body text a static,
+   clearly-labeled note, evidence = that group's cases' evidence lines verbatim. This keeps the
+   feature honest — never silently blank, never a fabricated-sounding recommendation when the model
+   didn't actually produce one, and never a case quietly dropped because the model omitted it.
 """
 
 from __future__ import annotations
@@ -31,7 +34,7 @@ from dataclasses import dataclass
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel
 
-from aiac.agent.llm import LLMError, build_llm, call_with_retry, load_llm_settings, raise_sanitized
+from aiac.agent.llm import build_llm, call_with_retry, load_llm_settings
 
 
 @dataclass(frozen=True)
@@ -56,19 +59,40 @@ class Recommendation:
     evidence: list[str]  # one line per case this recommendation covers
 
 
-def _format_pairs(pairs_by_gate: dict) -> str:
+# Cap on how many (role, scope) pairs one gate contributes to one evidence string -- a large
+# corpus (the Scale suite's total-corpus dimension in particular, ~9M tokens / hundreds of
+# generated entities) can produce hundreds or thousands of under-granted pairs for a single
+# finding, and every evidence string this module builds goes into ONE batched _draft_patterns
+# request. An unbounded pair list there can overflow the model's context window outright, failing
+# the whole batched call (and with it, every case's chance at an LLM-drafted recommendation, not
+# just this one's) rather than just this one case's own detail.
+_MAX_PAIRS_PER_GATE = 20
+
+
+def format_pairs(pairs_by_gate: dict, *, sep: str = "; ", limit: int | None = _MAX_PAIRS_PER_GATE) -> str:
     """Render a ``{gate: [(role, scope), ...]}`` dict (as produced by ``ScenarioScore.over_grants``
-    /``under_grants``/``incorrectly_denied``) as one semicolon-joined string, or ``"none"`` --
-    deliberately NOT a copy of ``eval.conftest._format_pairs_dict`` (which joins the same shape with
-    newlines for Markdown rendering): every call site here feeds a single-line evidence string, both
-    for the per-case prompt line sent to the LLM and for the fallback recommendation's evidence list,
-    so a newline would corrupt either. Kept as its own small function (not imported from
-    ``eval.conftest``, which imports FROM this module) to avoid a circular import."""
+    /``under_grants``/``incorrectly_denied``) as one line per non-empty gate joined by ``sep``, or
+    ``"none"``. Shared with ``eval.conftest._format_pairs_dict``, which imports this and passes
+    ``sep="\\n"``, ``limit=None`` for its unbounded, newline-per-gate Markdown rendering into the
+    gitignored, human-read-only per-run report -- unbounded there is a deliberate choice (a reader
+    may want every pair of even a 100-entity Scale-suite run, not a truncated sample), not an
+    assumption that the pairs are always few. Every call site in THIS module instead keeps the
+    defaults: ``sep="; "`` so a value stays single-line (both the per-case prompt line sent to the
+    LLM and the fallback recommendation's evidence list would otherwise be corrupted by an embedded
+    newline), and ``limit`` so one gate's pair list is capped at ``_MAX_PAIRS_PER_GATE`` with a
+    trailing ``"... and N more"`` -- bounding what goes into the batched LLM request, which the
+    Markdown report has no such reason to do."""
     if not pairs_by_gate:
         return "none"
-    return "; ".join(
-        f"{gate}: " + ", ".join(f"({r}, {s})" for r, s in pairs) for gate, pairs in sorted(pairs_by_gate.items())
-    )
+    parts = []
+    for gate, pairs in sorted(pairs_by_gate.items()):
+        shown = pairs if limit is None else pairs[:limit]
+        pair_str = ", ".join(f"({r}, {s})" for r, s in shown)
+        omitted = len(pairs) - len(shown)
+        if omitted > 0:
+            pair_str = f"{pair_str}, ... and {omitted} more" if pair_str else f"... and {omitted} more"
+        parts.append(f"{gate}: {pair_str}")
+    return sep.join(parts)
 
 
 # Remedy-menu constants -- the spec's own recommendation-form framing per finding type
@@ -122,7 +146,7 @@ def over_grant_cases(entries: list[tuple[str, str, dict]]) -> list[EvidenceCase]
             EvidenceCase(
                 case_id=f"{suite}:{scenario}:over_grant",
                 finding_type="over_grant",
-                evidence=f"{suite}/{scenario}: over-granted pairs -> {_format_pairs(over_grants)}",
+                evidence=f"{suite}/{scenario}: over-granted pairs -> {format_pairs(over_grants)}",
                 remedy_menu=_OVER_GRANT_REMEDY,
                 fallback_key=suite,
             )
@@ -130,26 +154,43 @@ def over_grant_cases(entries: list[tuple[str, str, dict]]) -> list[EvidenceCase]
     return cases
 
 
+def _pairs_not_in(pairs_by_gate: dict, other_by_gate: dict) -> dict:
+    """``pairs_by_gate`` minus every pair already present in ``other_by_gate``, per gate -- drops a
+    gate entirely once nothing is left. Used by ``under_grant_cases`` so ``incorrectly_denied``
+    (normally a SUBSET of ``under_grants``) only ever adds evidence for the genuinely distinct edge
+    case -- a pair that landed in BOTH -- instead of restating the same pairs twice."""
+    result: dict = {}
+    for gate, pairs in pairs_by_gate.items():
+        other = set(other_by_gate.get(gate, []))
+        remaining = [pair for pair in pairs if pair not in other]
+        if remaining:
+            result[gate] = remaining
+    return result
+
+
 def under_grant_cases(entries: list[tuple[str, str, dict]]) -> list[EvidenceCase]:
-    """Mirrors ``over_grant_cases`` for ``under_grants`` -- PLUS ``incorrectly_denied``.
-    ``incorrectly_denied`` (an explicit deny for a pair that should be granted) is normally a
-    subset of ``under_grants`` (``eval.correctness_scorer``'s own docstring), but a pair that is
-    simultaneously ``granted`` AND ``denied`` -- e.g. a coarse scope split by the auditor into one
-    approved sub-decision and one best-effort-rejected sub-decision for the same (role, scope) pair
-    -- lands in ``incorrectly_denied`` without ever appearing in ``under_grants`` (it IS in
-    ``granted``, so ``expected - granted`` excludes it). Checking both keeps that edge case from
-    silently vanishing from the recommendations section."""
+    """Mirrors ``over_grant_cases`` for ``under_grants`` -- PLUS the part of ``incorrectly_denied``
+    not already in ``under_grants``. ``incorrectly_denied`` (an explicit deny for a pair that should
+    be granted) is normally a SUBSET of ``under_grants`` (``eval.correctness_scorer``'s own
+    docstring) -- restating it in full would double the same pairs in the evidence text and the
+    tokens sent to the LLM for no new information. The genuinely distinct edge case this still
+    needs to catch is a pair that is simultaneously ``granted`` AND ``denied`` -- e.g. a coarse
+    scope split by the auditor into one approved sub-decision and one best-effort-rejected
+    sub-decision for the same (role, scope) pair -- which lands in ``incorrectly_denied`` without
+    ever appearing in ``under_grants`` (it IS in ``granted``, so ``expected - granted`` excludes
+    it). ``_pairs_not_in`` isolates exactly that: whatever's in ``incorrectly_denied`` but not
+    already in ``under_grants``."""
     cases = []
     for suite, scenario, props in entries:
         under_grants = props.get("under_grants") or {}
-        incorrectly_denied = props.get("incorrectly_denied") or {}
-        if not under_grants and not incorrectly_denied:
+        incorrectly_denied_only = _pairs_not_in(props.get("incorrectly_denied") or {}, under_grants)
+        if not under_grants and not incorrectly_denied_only:
             continue
         detail_parts = []
         if under_grants:
-            detail_parts.append(f"under-granted pairs -> {_format_pairs(under_grants)}")
-        if incorrectly_denied:
-            detail_parts.append(f"explicitly (incorrectly) denied pairs -> {_format_pairs(incorrectly_denied)}")
+            detail_parts.append(f"under-granted pairs -> {format_pairs(under_grants)}")
+        if incorrectly_denied_only:
+            detail_parts.append(f"also explicitly (incorrectly) denied -> {format_pairs(incorrectly_denied_only)}")
         evidence = f"{suite}/{scenario}: " + "; ".join(detail_parts)
         cases.append(
             EvidenceCase(
@@ -177,8 +218,8 @@ def sensitivity_cases(entries: list[tuple[str, str, dict]]) -> list[EvidenceCase
         edit_type = props.get("edit_type", "unknown")
         evidence = (
             f"{suite}/{scenario} (edit_type={edit_type}): perturbation={props.get('perturbation', '')!r}; "
-            f"expected grants -> {_format_pairs(props.get('expected_grants') or {})}; "
-            f"actual grants -> {_format_pairs(props.get('actual_grants') or {})}"
+            f"expected grants -> {format_pairs(props.get('expected_grants') or {})}; "
+            f"actual grants -> {format_pairs(props.get('actual_grants') or {})}"
         )
         cases.append(
             EvidenceCase(
@@ -205,8 +246,8 @@ def invariance_cases(entries: list[tuple[str, str, dict]]) -> list[EvidenceCase]
             continue
         evidence = (
             f"{suite}/{scenario}: perturbation={props.get('perturbation', '')!r}; "
-            f"expected grants -> {_format_pairs(props.get('expected_grants') or {})}; "
-            f"actual grants -> {_format_pairs(props.get('actual_grants') or {})}"
+            f"expected grants -> {format_pairs(props.get('expected_grants') or {})}; "
+            f"actual grants -> {format_pairs(props.get('actual_grants') or {})}"
         )
         cases.append(
             EvidenceCase(
@@ -231,7 +272,12 @@ def consistency_cases(entries: list[tuple[str, dict]], classification: str) -> l
     for scenario, props in entries:
         if not props.get("inconsistent"):
             continue
-        evidence = f"consistency/{scenario} ({classification}): mismatches -> {props.get('mismatches') or 'none'}"
+        # ``mismatches`` (test_policy_pipeline_consistency.py's own record_property) is already
+        # newline-joined when a scenario disagreed on more than one gate/run -- ``!r`` here (same
+        # convention sensitivity_cases/invariance_cases use for `perturbation`) keeps this case's
+        # evidence a single line, so _case_prompt_line's per-case indentation and
+        # ``"\n".join(rec.evidence)`` in the rendered report both still read as one case each.
+        evidence = f"consistency/{scenario} ({classification}): mismatches -> {(props.get('mismatches') or 'none')!r}"
         cases.append(
             EvidenceCase(
                 case_id=f"consistency:{scenario}",
@@ -259,8 +305,8 @@ def scale_mistake_cases(entries: list[tuple[str, dict]]) -> list[EvidenceCase]:
         if not (over_grants or under_grants or incorrectly_denied):
             continue
         evidence = (
-            f"{suite}: over-grants -> {_format_pairs(over_grants)}; under-grants -> "
-            f"{_format_pairs(under_grants)}; incorrectly denied -> {_format_pairs(incorrectly_denied)}"
+            f"{suite}: over-grants -> {format_pairs(over_grants)}; under-grants -> "
+            f"{format_pairs(under_grants)}; incorrectly denied -> {format_pairs(incorrectly_denied)}"
         )
         cases.append(
             EvidenceCase(
@@ -320,25 +366,26 @@ def _draft_patterns(cases: list[EvidenceCase]) -> list[_Pattern]:
     shared LLM structured-output seam, and returns the drafted patterns. Returns ``[]`` on any
     exception -- not just a transport/parse failure from ``call_with_retry``, but also a settings
     or client-construction error from ``load_llm_settings``/``build_llm`` (e.g. a malformed env
-    var) -- so the caller (``build_recommendations``) can always treat an empty result as "fall
-    back to the deterministic grouping", never as a crash that would otherwise propagate out of
-    ``pytest_sessionfinish`` and abort the per-cell report before it's written."""
+    var), or ``result`` coming back a shape ``.patterns`` can't be read off (``None``, or anything
+    else unexpected) -- so the caller (``build_recommendations``) can always treat an empty result
+    as "fall back to the deterministic grouping", never as a crash that would otherwise propagate
+    out of ``pytest_sessionfinish`` and abort the per-cell report before it's written. The whole
+    body stays inside one ``try`` on purpose (confirmed as a real finding in PR review: an earlier
+    version only guarded the call itself, so a result that was present but the wrong shape still
+    raised past this function)."""
     try:
         settings = load_llm_settings()
         runnable = build_llm(settings).with_structured_output(_PatternBatch)
         messages = _build_draft_messages(cases)
         result = call_with_retry(runnable, messages, settings=settings)
-    except Exception as err:
-        try:
-            raise_sanitized(err)
-        except LLMError:
+        # ``with_structured_output`` can return None instead of raising when the model's response
+        # can't be coerced into the schema (e.g. it answered in plain text) -- treat that the same
+        # as any other unusable response.
+        if result is None:
             return []
-    # ``with_structured_output`` can return None instead of raising when the model's response
-    # can't be coerced into the schema (e.g. it answered in plain text) -- treat that the same as
-    # any other unusable response, not an AttributeError on `.patterns`.
-    if result is None:
+        return result.patterns
+    except Exception:
         return []
-    return result.patterns
 
 
 def _fallback_recommendations(cases: list[EvidenceCase]) -> list[Recommendation]:
@@ -364,8 +411,7 @@ def _fallback_recommendations(cases: list[EvidenceCase]) -> list[Recommendation]
 
 def build_recommendations(
     *,
-    over_grant: list[tuple[str, str, dict]],
-    under_grant: list[tuple[str, str, dict]],
+    correctness: list[tuple[str, str, dict]],
     sensitivity: list[tuple[str, str, dict]],
     invariance: list[tuple[str, str, dict]],
     consistency: list[tuple[str, dict]],
@@ -380,10 +426,17 @@ def build_recommendations(
     case or gave it a hallucinated id -- goes through the deterministic ``(finding_type,
     fallback_key)`` grouping instead, so no case is ever silently dropped from the section (the
     module docstring's "never silently blank" guarantee extends to every individual case, not just
-    to the section as a whole). Returns the final list sorted by heading for stable rendering."""
+    to the section as a whole). Returns the final list sorted by heading for stable rendering.
+
+    ``correctness`` feeds BOTH ``over_grant_cases`` and ``under_grant_cases`` -- the two findings
+    read the same Correctness-suite entries (one looking at ``over_grants``, the other at
+    ``under_grants``/``incorrectly_denied``), so there used to be two separate parameters a caller
+    could (and once did) accidentally pass different lists to, silently producing an over-grant
+    finding and an under-grant finding that don't actually agree on which run they describe. One
+    parameter makes that impossible."""
     cases: list[EvidenceCase] = [
-        *over_grant_cases(over_grant),
-        *under_grant_cases(under_grant),
+        *over_grant_cases(correctness),
+        *under_grant_cases(correctness),
         *sensitivity_cases(sensitivity),
         *invariance_cases(invariance),
         *consistency_cases(consistency, consistency_classification),
@@ -398,7 +451,9 @@ def build_recommendations(
     recommendations: list[Recommendation] = []
     covered_ids: set[str] = set()
     for pattern in patterns:
-        pattern_covered_ids = [case_id for case_id in pattern.case_ids if case_id in cases_by_id]
+        # dict.fromkeys dedupes while preserving order -- a pattern naming the same case_id twice
+        # must not duplicate that case's evidence line in the rendered recommendation.
+        pattern_covered_ids = list(dict.fromkeys(cid for cid in pattern.case_ids if cid in cases_by_id))
         if not pattern_covered_ids:
             continue
         covered_ids.update(pattern_covered_ids)

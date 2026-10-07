@@ -22,6 +22,7 @@ from eval.recommendations import (
     _Pattern,
     build_recommendations,
     consistency_cases,
+    format_pairs,
     invariance_cases,
     over_grant_cases,
     scale_mistake_cases,
@@ -29,6 +30,42 @@ from eval.recommendations import (
     under_grant_cases,
 )
 from test.system.launcher import require_env_or_skip
+
+# =========================================================================== #
+# format_pairs -- shared with eval.conftest._format_pairs_dict                #
+# =========================================================================== #
+
+
+class TestFormatPairs:
+    def test_empty_dict_is_none(self) -> None:
+        assert format_pairs({}) == "none"
+
+    def test_default_sep_is_single_line(self) -> None:
+        pairs = {"inbound": [("role-a", "scope-a")], "outbound": [("role-b", "scope-b")]}
+        rendered = format_pairs(pairs)
+        assert "\n" not in rendered
+        assert "; " in rendered
+
+    def test_custom_sep_for_markdown_rendering(self) -> None:
+        pairs = {"inbound": [("role-a", "scope-a")], "outbound": [("role-b", "scope-b")]}
+        rendered = format_pairs(pairs, sep="\n", limit=None)
+        assert rendered == "inbound: (role-a, scope-a)\noutbound: (role-b, scope-b)"
+
+    def test_pairs_beyond_the_limit_are_summarized_not_dropped_silently(self) -> None:
+        """Confirmed as a real finding in PR review: a corpus the size of the Scale suite's
+        total-corpus dimension can produce hundreds of pairs for one gate, and the unbounded
+        version used to put every single one into one batched LLM request."""
+        pairs = {"inbound": [(f"role-{i}", f"scope-{i}") for i in range(25)]}
+        rendered = format_pairs(pairs, limit=5)
+        assert rendered.count("role-") == 5  # only the first 5 pairs are spelled out
+        assert "... and 20 more" in rendered
+
+    def test_no_limit_means_unbounded(self) -> None:
+        pairs = {"inbound": [(f"role-{i}", f"scope-{i}") for i in range(25)]}
+        rendered = format_pairs(pairs, limit=None)
+        assert "..." not in rendered
+        assert rendered.count("role-") == 25
+
 
 # =========================================================================== #
 # over_grant_cases / under_grant_cases                                        #
@@ -105,6 +142,24 @@ class TestUnderGrantCases:
         cases = under_grant_cases(entries)
         assert len(cases) == 1
         assert "role-a" in cases[0].evidence and "role-b" in cases[0].evidence
+
+    def test_a_pair_in_both_dicts_is_not_restated_twice(self) -> None:
+        """Confirmed as a real finding in PR review: incorrectly_denied is normally a SUBSET of
+        under_grants, so restating the exact same pair under both labels doubles the evidence text
+        and the tokens sent to the LLM for no new information."""
+        entries = [
+            (
+                "correctness_prb",
+                "baseline",
+                {
+                    "under_grants": {"inbound": [("role-a", "scope-a")]},
+                    "incorrectly_denied": {"inbound": [("role-a", "scope-a")]},
+                },
+            )
+        ]
+        [case] = under_grant_cases(entries)
+        assert case.evidence.count("role-a") == 1
+        assert "also explicitly" not in case.evidence
 
 
 # =========================================================================== #
@@ -186,17 +241,38 @@ class TestConsistencyCases:
         assert "gate=inbound" in case.evidence
 
     def test_classification_boundary_at_exactly_half_vs_just_above(self) -> None:
-        from eval.conftest import _classify_consistency_disagreements
+        """Classified against the full expected corpus (_EXPECTED_CONSISTENCY_SCENARIO_COUNT),
+        not the count of entries passed in -- both cases below score the full corpus."""
+        from eval.conftest import _EXPECTED_CONSISTENCY_SCENARIO_COUNT, _classify_consistency_disagreements
 
-        half = [("a", {"inconsistent": True}), ("b", {"inconsistent": False})]
+        n = _EXPECTED_CONSISTENCY_SCENARIO_COUNT
+        half = [(f"s{i}", {"inconsistent": i < n // 2}) for i in range(n)]
         assert _classify_consistency_disagreements(half) == "clusters on these scenario(s)"
 
-        just_above_half = [
-            ("a", {"inconsistent": True}),
-            ("b", {"inconsistent": True}),
-            ("c", {"inconsistent": False}),
-        ]
+        just_above_half = [(f"s{i}", {"inconsistent": i < n // 2 + 1}) for i in range(n)]
         assert _classify_consistency_disagreements(just_above_half) == "appears random/widespread"
+
+    def test_fewer_than_expected_scenarios_is_not_conclusive(self) -> None:
+        """Confirmed as a real finding in PR review: a `-k`-filtered run that scores too few
+        scenarios must not force a cluster-vs-random verdict against ITS OWN small count -- e.g. a
+        single inconsistent scenario out of 1 scored is 100% by that measure, which previously read
+        as "appears random/widespread" when it is, by construction, the single-scenario clustering
+        case."""
+        from eval.conftest import _EXPECTED_CONSISTENCY_SCENARIO_COUNT, _classify_consistency_disagreements
+
+        single_inconsistent = [("baseline", {"inconsistent": True})]
+        result = _classify_consistency_disagreements(single_inconsistent)
+        assert result == f"not conclusive (1/{_EXPECTED_CONSISTENCY_SCENARIO_COUNT} scenarios scored this run)"
+
+    def test_more_than_expected_scenarios_is_also_not_conclusive(self) -> None:
+        """Mirrors _write_trend_log's own "regression" gate (`== _EXPECTED_CONSISTENCY_SCENARIO_
+        COUNT`, not `<=`) -- a corpus that grew past the constant without a bump must not silently
+        compute a fraction above 1.0 here either."""
+        from eval.conftest import _EXPECTED_CONSISTENCY_SCENARIO_COUNT, _classify_consistency_disagreements
+
+        grown = [(f"s{i}", {"inconsistent": True}) for i in range(_EXPECTED_CONSISTENCY_SCENARIO_COUNT + 1)]
+        result = _classify_consistency_disagreements(grown)
+        assert result.startswith("not conclusive")
 
 
 # =========================================================================== #
@@ -241,10 +317,9 @@ _OVER_GRANT_ENTRY = ("correctness_prb", "baseline", {"over_grants": {"inbound": 
 
 
 class TestBuildRecommendations:
-    def _call(self, over_grant=(), **overrides) -> list[Recommendation]:
+    def _call(self, correctness=(), **overrides) -> list[Recommendation]:
         kwargs = dict(
-            over_grant=list(over_grant),
-            under_grant=[],
+            correctness=list(correctness),
             sensitivity=[],
             invariance=[],
             consistency=[],
@@ -267,7 +342,7 @@ class TestBuildRecommendations:
             case_ids=["correctness_prb:baseline:over_grant"],
         )
         monkeypatch.setattr("eval.recommendations._draft_patterns", lambda cases: [stub])
-        [rec] = self._call(over_grant=[_OVER_GRANT_ENTRY])
+        [rec] = self._call(correctness=[_OVER_GRANT_ENTRY])
         assert rec.heading == "Over-interpreting 'only'"
         assert rec.body == "Add a prompt constraint for restriction words."
         assert len(rec.evidence) == 1
@@ -280,19 +355,29 @@ class TestBuildRecommendations:
             case_ids=["correctness_prb:baseline:over_grant", "hallucinated:nonexistent:over_grant"],
         )
         monkeypatch.setattr("eval.recommendations._draft_patterns", lambda cases: [stub])
-        [rec] = self._call(over_grant=[_OVER_GRANT_ENTRY])
+        [rec] = self._call(correctness=[_OVER_GRANT_ENTRY])
+        assert len(rec.evidence) == 1
+
+    def test_a_case_id_repeated_in_one_pattern_is_not_restated_twice(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        stub = _Pattern(
+            heading="pattern",
+            recommendation="rec",
+            case_ids=["correctness_prb:baseline:over_grant", "correctness_prb:baseline:over_grant"],
+        )
+        monkeypatch.setattr("eval.recommendations._draft_patterns", lambda cases: [stub])
+        [rec] = self._call(correctness=[_OVER_GRANT_ENTRY])
         assert len(rec.evidence) == 1
 
     def test_pattern_left_with_zero_valid_ids_is_omitted(self, monkeypatch: pytest.MonkeyPatch) -> None:
         stub = _Pattern(heading="pattern", recommendation="rec", case_ids=["hallucinated:nonexistent:over_grant"])
         monkeypatch.setattr("eval.recommendations._draft_patterns", lambda cases: [stub])
         # Falls through to the deterministic fallback since no pattern survived validation.
-        [rec] = self._call(over_grant=[_OVER_GRANT_ENTRY])
+        [rec] = self._call(correctness=[_OVER_GRANT_ENTRY])
         assert "LLM pattern analysis unavailable" in rec.body
 
     def test_empty_draft_patterns_triggers_deterministic_fallback(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr("eval.recommendations._draft_patterns", lambda cases: [])
-        [rec] = self._call(over_grant=[_OVER_GRANT_ENTRY])
+        [rec] = self._call(correctness=[_OVER_GRANT_ENTRY])
         assert "LLM pattern analysis unavailable" in rec.body
         assert "correctness_prb" in rec.heading
         assert len(rec.evidence) == 1
@@ -312,7 +397,7 @@ class TestBuildRecommendations:
             case_ids=["correctness_prb:baseline:over_grant"],  # omits the e2e case entirely
         )
         monkeypatch.setattr("eval.recommendations._draft_patterns", lambda cases: [stub])
-        recs = self._call(over_grant=[_OVER_GRANT_ENTRY, other_entry])
+        recs = self._call(correctness=[_OVER_GRANT_ENTRY, other_entry])
         assert len(recs) == 2
         drafted = next(r for r in recs if r.heading == "pattern covering only one case")
         assert len(drafted.evidence) == 1 and "role-a" in drafted.evidence[0]
@@ -337,7 +422,7 @@ class TestBuildRecommendations:
             case_ids=["correctness_prb:baseline:over_grant", "hallucinated:nonexistent:over_grant"],
         )
         monkeypatch.setattr("eval.recommendations._draft_patterns", lambda cases: [stub])
-        recs = self._call(over_grant=[_OVER_GRANT_ENTRY, other_entry])
+        recs = self._call(correctness=[_OVER_GRANT_ENTRY, other_entry])
         assert len(recs) == 2
         assert any("LLM pattern analysis unavailable" in r.body and "role-b" in r.evidence[0] for r in recs)
 

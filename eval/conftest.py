@@ -131,6 +131,7 @@ fails or returns nothing usable) -- ``_render_recommendations_section`` renders 
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -140,7 +141,7 @@ import pytest
 from dotenv import load_dotenv
 
 from eval.dashboard.trend_log import append_row, pool_consistency_metrics, pool_correctness_metrics, pool_scale_metrics
-from eval.recommendations import build_recommendations
+from eval.recommendations import build_recommendations, format_pairs
 
 HERE = Path(__file__).resolve().parent
 REPORTS_DIR = HERE / "reports"
@@ -266,17 +267,40 @@ def _longest_backtick_run(text: str) -> int:
     return longest
 
 
+def _sanitize_recommendation_heading(heading: str) -> str:
+    """Make an LLM-drafted recommendation heading safe to write as a bare ``### heading`` line
+    (confirmed as a real finding in PR review). An embedded line break would spill the rest of the
+    heading onto its own line, which ``eval.dashboard.dashboard``'s parser (reading the report via
+    ``splitlines()``, which splits on ``\\r``/``\\x0b``/``\\x0c``/``\\u2028``/``\\u2029`` too, not
+    only ``\\n``) could then misread as a new bullet/entry -- ``" ".join(heading.split())``
+    collapses every one of those (plus runs of plain whitespace) to a single space, not just
+    ``\\n``. A heading wrapped in backticks (e.g. a quoted nodeid) would make the WHOLE
+    ``### `...``` line match that parser's own scenario-entry pattern, fabricating a
+    ``ScenarioEntry`` that was never a real test case."""
+    return " ".join(heading.split()).replace("`", "")
+
+
 def _render_field(lines: list[str], label: str, text: str) -> None:
-    """Append a ``- **label:** text`` bullet, code-fencing ``text`` if it spans multiple lines.
-    The fence is always longer than the longest backtick run inside ``text`` itself (see
-    ``_longest_backtick_run``), so a value containing its own fenced/inline code (e.g. an
-    LLM-drafted recommendation body) can never prematurely close the outer fence and corrupt the
-    rest of the report."""
-    if "\n" in text:
+    """Append a ``- **label:** text`` bullet, code-fencing ``text`` if it spans multiple lines --
+    gated on ``text and text.splitlines() != [text]`` rather than a bare ``"\\n" in text`` check, so
+    a value containing any OTHER line boundary ``splitlines()`` recognizes (``\\r``/``\\x0b``/
+    ``\\x0c``/``\\u2028``/``\\u2029``), or even a lone TRAILING ``\\n`` with nothing after it
+    (``splitlines()`` drops a trailing empty line, so ``"x\\n".splitlines() == ["x"]`` -- a bare
+    ``!= 1`` length check would miss exactly this case and write ``text``'s literal embedded newline
+    straight into one unfenced bullet line) still gets fenced instead of writing a literal line
+    break into what would otherwise render as one unfenced bullet. The ``text and`` guard matters
+    too: ``"".splitlines() == []``, which is NOT ``== [""]``, so without it an empty value would
+    wrongly take the fenced branch and render as an empty fenced block instead of the plain
+    ``- **label:**`` the single-line branch already handles correctly. The fence itself is always
+    longer than the longest backtick run inside ``text`` (see ``_longest_backtick_run``), so a
+    value containing its own fenced/inline code (e.g. an LLM-drafted recommendation body) can never
+    prematurely close the outer fence and corrupt the rest of the report."""
+    text_lines = text.splitlines()
+    if text and text_lines != [text]:
         fence = "`" * max(_longest_backtick_run(text) + 1, 3)
         lines.append(f"- **{label}:**")
         lines.append(f"  {fence}")
-        lines.extend(f"  {line}" for line in text.splitlines())
+        lines.extend(f"  {line}" for line in text_lines)
         lines.append(f"  {fence}")
     else:
         lines.append(f"- **{label}:** {text}")
@@ -284,12 +308,16 @@ def _render_field(lines: list[str], label: str, text: str) -> None:
 
 def _format_pairs_dict(pairs_by_gate: dict) -> str:
     """Render a ``{gate: [(role, scope), ...]}`` dict (as produced by ``ScenarioScore.over_grants``
-    /``under_grants``/``incorrectly_denied``) as one line per non-empty gate, or ``"none"``."""
-    if not pairs_by_gate:
-        return "none"
-    return "\n".join(
-        f"{gate}: " + ", ".join(f"({r}, {s})" for r, s in pairs) for gate, pairs in sorted(pairs_by_gate.items())
-    )
+    /``under_grants``/``incorrectly_denied``) as one line per non-empty gate, or ``"none"`` --
+    newline-joined, deliberately UNBOUNDED (``limit=None``), unlike
+    ``eval.recommendations.format_pairs``'s own LLM-prompt-sized default. This is the gitignored,
+    human-read-only per-run Markdown report (not something fed back into an LLM request), so there
+    is no context-window reason to cap it here -- including for the Scale suite's correctness
+    tests (``_render_metrics_block`` is their render path too, via the ``"precision" in props``
+    branch they share with the two Correctness suites), where a reader may genuinely want to see
+    every one of a 100-entity run's pairs, not a truncated sample. Delegates to the shared function
+    instead of keeping its own duplicate copy."""
+    return format_pairs(pairs_by_gate, sep="\n", limit=None)
 
 
 # Nodeid substrings identifying the two correctness suites' single test function each (parametrized
@@ -394,6 +422,45 @@ _SCALE_TEST_MARKERS: dict[str, tuple[str, str]] = {
     "::test_scale_per_decision_structural_e2e": ("scale_per_decision_e2e", "structural"),
     "::test_scale_per_decision_correctness_e2e": ("scale_per_decision_e2e", "correctness"),
 }
+
+
+@dataclass(frozen=True)
+class _NodeidClassification:
+    """One test's nodeid classified against the four marker dicts above -- see
+    ``_classify_nodeid``. ``prop_name``/``rate_key`` are set only for ``family="robustness"``;
+    ``check_type`` only for ``family="scale"``."""
+
+    family: str  # "correctness" | "robustness" | "consistency" | "scale"
+    suite: str
+    prop_name: str | None = None  # "invariant" | "sensitive"
+    rate_key: str | None = None  # "invariance_rate" | "sensitivity_rate"
+    check_type: str | None = None  # "structural" | "correctness"
+
+
+def _classify_nodeid(nodeid: str) -> _NodeidClassification | None:
+    """The one shared lookup from a test's nodeid to which trend-log/suite family it belongs to --
+    used by both ``_write_trend_log`` and ``_collect_recommendation_evidence`` (confirmed as a real
+    finding in PR review: the two used to repeat this same four-dict nodeid-substring match
+    independently, so a marker added to one and not the other would silently diverge between the
+    trend log and the recommendations section, with no error). Checks the four marker dicts in a
+    fixed order and returns on the first match -- safe because their substrings are each a distinct
+    test function name, so a nodeid matches at most one of them."""
+    for substring, suite in _TREND_LOG_SUITES.items():
+        if substring in nodeid:
+            return _NodeidClassification(family="correctness", suite=suite)
+    for substring, (prop_name, robustness_suite, rate_key) in _ROBUSTNESS_TEST_MARKERS.items():
+        if substring in nodeid:
+            return _NodeidClassification(
+                family="robustness", suite=robustness_suite, prop_name=prop_name, rate_key=rate_key
+            )
+    for substring, consistency_suite in _CONSISTENCY_TEST_MARKERS.items():
+        if substring in nodeid:
+            return _NodeidClassification(family="consistency", suite=consistency_suite)
+    for substring, (scale_suite, check_type) in _SCALE_TEST_MARKERS.items():
+        if substring in nodeid:
+            return _NodeidClassification(family="scale", suite=scale_suite, check_type=check_type)
+    return None
+
 
 # Full Correctness corpus size (eval.test_policy_pipeline_eval.SCENARIOS) -- kept as a plain
 # constant rather than imported, so this module (loaded for every eval/ run, marked or not) stays
@@ -556,30 +623,43 @@ def _render_scale_block(lines: list[str], props: dict) -> None:
 
 
 def _classify_consistency_disagreements(entries: list[tuple[str, dict]]) -> str:
-    """Decision 4 (``docs/evaluation/eval-framework.md`` §9.1, #2472): a minority of this run's
-    Consistency scenarios inconsistent (<= 50%) classifies as clustering on those scenario(s)
-    (structural prompt sensitivity); more than half classifies as appearing random/widespread
-    (temperature/batching noise). Computed deterministically from the fraction of inconsistent
-    scenarios -- no LLM needed to count -- then handed to the LLM as part of the Consistency
-    finding's evidence (``eval.recommendations.consistency_cases``) so its pattern-level writeup
-    stays consistent with this classification rather than re-deriving its own."""
+    """Decision 4 (``docs/evaluation/eval-framework.md`` §9.1, #2472): a minority of the FULL
+    Consistency corpus (``_EXPECTED_CONSISTENCY_SCENARIO_COUNT``) inconsistent classifies as
+    clustering on those scenario(s) (structural prompt sensitivity); more than half classifies as
+    appearing random/widespread (temperature/batching noise). Computed deterministically -- no LLM
+    needed to count -- then handed to the LLM as part of the Consistency finding's evidence
+    (``eval.recommendations.consistency_cases``) so its pattern-level writeup stays consistent with
+    this classification rather than re-deriving its own.
+
+    Classified against the full expected corpus size, NOT the count of scenarios that happened to
+    run this session (confirmed as a real finding in PR review): a `-k`-filtered run scores too
+    few scenarios for "more than half disagreed" to mean anything against ITS OWN count -- e.g. a
+    single-scenario run that's inconsistent is 1/1 = 100% by that measure, which used to read as
+    "appears random/widespread" when it is, by construction, the single-scenario clustering case.
+    Gated on ``!=``, not ``<`` -- mirroring exactly how ``_write_trend_log`` decides "regression"
+    vs "partial" for this same suite (``len(entries) == _EXPECTED_CONSISTENCY_SCENARIO_COUNT``) --
+    so a corpus that somehow grew past the constant without a bump is also reported inconclusive
+    here, consistent with that trend-log row being tagged "partial" rather than silently computing
+    a fraction above 1.0."""
     if not entries:
         return "no consistency data"
     inconsistent = sum(1 for _scenario, props in entries if props.get("inconsistent"))
     if inconsistent == 0:
         return "no disagreements"
-    fraction = inconsistent / len(entries)
+    if len(entries) != _EXPECTED_CONSISTENCY_SCENARIO_COUNT:
+        return f"not conclusive ({len(entries)}/{_EXPECTED_CONSISTENCY_SCENARIO_COUNT} scenarios scored this run)"
+    fraction = inconsistent / _EXPECTED_CONSISTENCY_SCENARIO_COUNT
     return "clusters on these scenario(s)" if fraction <= 0.5 else "appears random/widespread"
 
 
 def _collect_recommendation_evidence() -> dict:
     """One new pass over ``_reports``, deliberately separate from ``_write_trend_log``'s existing
-    loop (not merged into it) so the already-shipped trend-log writer stays untouched. Reuses the
-    existing marker dicts as-is (``_TREND_LOG_SUITES``/``_ROBUSTNESS_TEST_MARKERS``/
-    ``_CONSISTENCY_TEST_MARKERS``/``_SCALE_TEST_MARKERS``) but additionally captures each entry's
-    scenario name (via ``_scenario_name_from_nodeid``) and splits ``_ROBUSTNESS_TEST_MARKERS`` into
-    sensitivity vs invariance groups by which boolean prop each marker records (``"sensitive"`` vs
-    ``"invariant"``) -- the input shape ``eval.recommendations.build_recommendations`` expects."""
+    loop (not merged into it) so the already-shipped trend-log writer stays untouched -- but both
+    now share ``_classify_nodeid`` for the nodeid-to-suite/family lookup itself, rather than each
+    repeating the same four-dict match independently. Additionally captures each entry's scenario
+    name (via ``_scenario_name_from_nodeid``) and splits the robustness family by
+    ``classification.prop_name`` (``"sensitive"`` vs ``"invariant"``) -- the input shape
+    ``eval.recommendations.build_recommendations`` expects."""
     correctness_entries: list[tuple[str, str, dict]] = []
     sensitivity_entries: list[tuple[str, str, dict]] = []
     invariance_entries: list[tuple[str, str, dict]] = []
@@ -587,35 +667,29 @@ def _collect_recommendation_evidence() -> dict:
     scale_entries: list[tuple[str, dict]] = []
 
     for nodeid, report in _reports.items():
+        classification = _classify_nodeid(nodeid)
+        if classification is None:
+            continue
         props = dict(report.user_properties)
-        for substring, suite in _TREND_LOG_SUITES.items():
-            if substring in nodeid:
-                if "over_grants" in props or "under_grants" in props:
-                    correctness_entries.append((suite, _scenario_name_from_nodeid(nodeid), props))
-                break
-        for substring, (prop_name, robustness_suite, _rate_key) in _ROBUSTNESS_TEST_MARKERS.items():
-            if substring in nodeid:
-                if prop_name in props:
-                    scenario = _scenario_name_from_nodeid(nodeid)
-                    if prop_name == "sensitive":
-                        sensitivity_entries.append((robustness_suite, scenario, props))
-                    else:
-                        invariance_entries.append((robustness_suite, scenario, props))
-                break
-        for substring in _CONSISTENCY_TEST_MARKERS:
-            if substring in nodeid:
-                if "inconsistent" in props:
-                    consistency_entries.append((_scenario_name_from_nodeid(nodeid), props))
-                break
-        for substring, (scale_suite, check_type) in _SCALE_TEST_MARKERS.items():
-            if substring in nodeid and check_type == "correctness":
-                if "over_grants" in props or "under_grants" in props or "incorrectly_denied" in props:
-                    scale_entries.append((scale_suite, props))
-                break
+        if classification.family == "correctness":
+            if "over_grants" in props or "under_grants" in props:
+                correctness_entries.append((classification.suite, _scenario_name_from_nodeid(nodeid), props))
+        elif classification.family == "robustness":
+            if classification.prop_name in props:
+                scenario = _scenario_name_from_nodeid(nodeid)
+                if classification.prop_name == "sensitive":
+                    sensitivity_entries.append((classification.suite, scenario, props))
+                else:
+                    invariance_entries.append((classification.suite, scenario, props))
+        elif classification.family == "consistency":
+            if "inconsistent" in props:
+                consistency_entries.append((_scenario_name_from_nodeid(nodeid), props))
+        elif classification.family == "scale" and classification.check_type == "correctness":
+            if "over_grants" in props or "under_grants" in props or "incorrectly_denied" in props:
+                scale_entries.append((classification.suite, props))
 
     return {
-        "over_grant": correctness_entries,
-        "under_grant": correctness_entries,
+        "correctness": correctness_entries,
         "sensitivity": sensitivity_entries,
         "invariance": invariance_entries,
         "consistency": consistency_entries,
@@ -631,8 +705,7 @@ def _render_recommendations_section(lines: list[str], evidence: dict) -> None:
     sections above: the spec is explicit that an empty category must not render as a vacuous pass
     statement)."""
     recommendations = build_recommendations(
-        over_grant=evidence["over_grant"],
-        under_grant=evidence["under_grant"],
+        correctness=evidence["correctness"],
         sensitivity=evidence["sensitivity"],
         invariance=evidence["invariance"],
         consistency=evidence["consistency"],
@@ -644,7 +717,7 @@ def _render_recommendations_section(lines: list[str], evidence: dict) -> None:
     lines.append("## Improvement recommendations")
     lines.append("")
     for rec in recommendations:
-        lines.append(f"### {rec.heading}")
+        lines.append(f"### {_sanitize_recommendation_heading(rec.heading)}")
         lines.append("")
         _render_field(lines, "Recommendation", rec.body)
         _render_field(lines, "Evidence", "\n".join(rec.evidence))
@@ -741,34 +814,26 @@ def _write_trend_log() -> None:
     scale_structural_entries: dict[str, list[dict]] = {}
     scale_correctness_entries: dict[str, list[dict]] = {}
     for nodeid, report in _reports.items():
-        for nodeid_marker, suite in _TREND_LOG_SUITES.items():
-            if nodeid_marker in report.nodeid:
-                props = dict(report.user_properties)
+        classification = _classify_nodeid(nodeid)
+        if classification is None:
+            continue
+        props = dict(report.user_properties)
+        if classification.family == "correctness":
+            if "true_positives" in props:
+                by_suite.setdefault(classification.suite, []).append(props)
+        elif classification.family == "robustness":
+            if classification.prop_name in props:
+                robustness_flags.setdefault(classification.suite, []).append(bool(props[classification.prop_name]))
                 if "true_positives" in props:
-                    by_suite.setdefault(suite, []).append(props)
-                break
-        for substring, (prop_name, robustness_suite, _rate_key) in _ROBUSTNESS_TEST_MARKERS.items():
-            if substring in nodeid:
-                props = dict(report.user_properties)
-                if prop_name in props:
-                    robustness_flags.setdefault(robustness_suite, []).append(bool(props[prop_name]))
-                    if "true_positives" in props:
-                        robustness_entries.setdefault(robustness_suite, []).append(props)
-                break
-        for substring, consistency_suite in _CONSISTENCY_TEST_MARKERS.items():
-            if substring in nodeid:
-                props = dict(report.user_properties)
-                if "inconsistent" in props:
-                    consistency_entries.setdefault(consistency_suite, []).append(props)
-                break
-        for substring, (scale_suite, check_type) in _SCALE_TEST_MARKERS.items():
-            if substring in nodeid:
-                props = dict(report.user_properties)
-                if check_type == "structural" and "structural_pass" in props:
-                    scale_structural_entries.setdefault(scale_suite, []).append(props)
-                elif check_type == "correctness" and "true_positives" in props:
-                    scale_correctness_entries.setdefault(scale_suite, []).append(props)
-                break
+                    robustness_entries.setdefault(classification.suite, []).append(props)
+        elif classification.family == "consistency":
+            if "inconsistent" in props:
+                consistency_entries.setdefault(classification.suite, []).append(props)
+        elif classification.family == "scale":
+            if classification.check_type == "structural" and "structural_pass" in props:
+                scale_structural_entries.setdefault(classification.suite, []).append(props)
+            elif classification.check_type == "correctness" and "true_positives" in props:
+                scale_correctness_entries.setdefault(classification.suite, []).append(props)
 
     for suite, entries in by_suite.items():
         if entries:
