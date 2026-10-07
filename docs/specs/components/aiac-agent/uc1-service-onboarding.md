@@ -60,7 +60,7 @@ flowchart TD
 `onboarding/orchestrator.py`
 
 **Sequence:**
-0. Read the `Service` once (`get_service(service_id)`, by the UUID) and take its clientId (`Service.serviceId`) — the only service id the PCE takes. This read comes before Provision, so if it fails, nothing exists yet that needs compensation: the Orchestrator raises `HTTPException(502)`, as Provision does for the same read. The rollback reuses this `Service`.
+0. Read the `Service` once (`get_service(service_id)`, by the UUID) and take its clientId (`Service.serviceId`) — the only service id the PCE takes. A `404` on this read means that the new client is not visible yet: the Orchestrator reads it again for a bounded time (see [The first read waits for a new client](#the-first-read-waits-for-a-new-client-d33) below). This read comes before Provision, so if it fails, nothing exists yet that needs compensation: the Orchestrator raises `HTTPException(502)`, as Provision does for the same read — `ServiceNotVisibleError` (a `502`) when the client is still not visible after the wait, and a plain `HTTPException(502)` at once for any other error. The rollback reuses this `Service`.
 1. Run the [precondition checks](#precondition-checks-d30) (D30) on the focus service. They run before Provision and before the PRB. A failed check raises `EnforcementPreconditionError`. Nothing has changed yet, so there is no rollback and no quarantine.
 1b. For an enabled tool only, call the PCE `bootstrap(client_id, ServiceType.TOOL)`. A disabled (quarantined) tool gets no bootstrap: its discovery fails at the token mint anyway (C5), and the CR would stay until the next resync (see [Tool discovery and the bootstrap CR](#tool-discovery-and-the-bootstrap-cr)). It writes the tool's CR before Provision, so that discovery passes D20. The type comes from the pod label that the checks read. An agent gets no bootstrap.
 2. Call `build_provision_graph().invoke(...)` → get back `service_type` and the created-manifest (`created_roles`, `created_scopes`).
@@ -70,6 +70,37 @@ flowchart TD
 No LLM calls or response assembly in the Orchestrator beyond sequencing and the compensating rollback (see [Failure & Rollback](#failure--rollback)).
 
 **Replay safety (at-least-once delivery):** Service Provision IdP writes are **idempotent** (create-or-get by name: `create_service_role` / `create_service_scope` return the existing entity on a duplicate call; `link_subject_scope` converges to one state — the scope with its mapper, linked as a default scope — so a second call changes nothing). The PCE reconcile is also idempotent. If the pod crashes between Service Provision completing and the PCE call, NATS redelivers and the full pipeline re-runs safely to convergence — the success re-run stays idempotent. A build **failure**, however, triggers a **compensating rollback** and a PCE **quarantine** (see [Failure & Rollback](#failure--rollback)) before the error propagates. A failed precondition check changes nothing.
+
+### The first read waits for a new client (D33)
+
+**Why.** The Keycloak SPI listener runs inside the admin request. Without the SPI fix (publish after the commit, [D33](../../PRD.md#key-architectural-decisions)), the `CLIENT_CREATED` event, and with it the `aiac.apply.service.{id}` message, can come **before** Keycloak commits the new client. Then the first `get_service` gets `404`: the IdP Configuration Service keeps the Keycloak `404` (see [`../idp-configuration-service.md`](../idp-configuration-service.md)), and the IdP library raises `IdPHTTPError` with `status == 404` and does not retry a `4xx` (see [`../library-idp.md`](../library-idp.md)). If the Orchestrator failed at once, the next try would be the NATS redelivery after `AckWait` (600 s). During that time the new agent or tool has no CR, so the global combiner denies it (D20).
+
+**The wait.** The Orchestrator (`_read_service`) treats a `404` on this first read as "not visible yet" and reads the `Service` again. The read is the whole `get_service`, so a `404` on one of its sub-reads (the roles or the scopes of the service, or the composites of a role that was deleted during the read) also gives a new read. The library retries a `5xx` first (`UPSTREAM_MAX_RETRIES`), and it does not retry a `404`. The poll uses the same mechanic as the label wait of `classify_service` (`poll_until_ready`, see [Nodes](#nodes)):
+
+| Knob | Default | Meaning |
+|---|---|---|
+| `ONBOARD_CLIENT_WAIT_ATTEMPTS` | `15` | The maximum number of reads (minimum `1`). |
+| `ONBOARD_CLIENT_WAIT_BACKOFF` | `2.0` | The seconds between two reads (minimum `0`). There is no sleep after the last read. |
+
+The default budget is ≈30 s (15 reads, 28 s of sleep). The knobs are read from the environment at call time. A non-numeric, non-finite (for example `inf`) or below-minimum value falls back to the default. `k8s/` does not set them.
+
+- When a read returns the `Service`, the onboarding continues at once (the precondition checks, then the bootstrap of a tool, then Provision).
+- When the client is still not visible after the budget, the Orchestrator raises `ServiceNotVisibleError`. It is a subclass of `HTTPException(502)`, with the detail `IdP config unavailable resolving service '<uuid>': the client is not visible after <n> reads (ONBOARD_CLIENT_WAIT_*): HTTP 404: …`, and the last `404` as its `__cause__`. The route `POST /apply/service/{service_id}` answers `502`. The NATS consumer treats it as retryable, and naks it with a delay: `AIAC_NOT_VISIBLE_NAK_DELAY_SECONDS` (default `30` s). So the redelivery comes after the delay, not after `AckWait` (600 s). Each nak uses one of the `MAX_DELIVER` (5) deliveries (see [aiac-agent.md → Ack contract](../aiac-agent.md#ack-contract)).
+- Any other error of the read is not the race: a `5xx` (after the library retries), another `4xx`, or a connection error. The Orchestrator raises a plain `HTTPException(502, "IdP config unavailable resolving service '<uuid>': …")` at once, chained to the error, as before.
+
+In each failure case nothing has changed yet: no precondition check, no bootstrap, no Provision, no rollback, no client disable and no quarantine. Provision's `classify_service` reads the `Service` again, with no wait: the first read already saw the client.
+
+**Every `404` waits.** The Orchestrator cannot tell a client that Keycloak has not committed yet from a client that does not exist. So each `404` on the first read costs the full budget (≈28 s with the defaults) before the `502`:
+
+- **The manual route.** Before this change, `POST /apply/service/{service_id}` with an unknown UUID (for example, a typing error) or with the UUID of a deleted client answered `502` at once. Now it answers `502` (`ServiceNotVisibleError`) after the wait. During the wait, the request holds one threadpool worker and the lock of that UUID only, so the onboarding of other services is not blocked. Give the caller a timeout that is longer than the budget (for example, `curl --max-time 60`).
+- **The event path.** An event for a client that never becomes visible costs the full budget at each delivery: a phantom event (Keycloak rolled back the create after the event; this can occur only without the SPI fix), or an event that comes after the client was deleted (for example, a redelivery after a teardown). The consumer handles one message at a time, so the next messages wait during each budget. With the default knobs, the message gets to `aiac.apply.dlq` after five deliveries, and the five budgets block the consumer for about 140 s in total (see [aiac-agent.md → Ack contract](../aiac-agent.md#ack-contract) for the nak delay between the deliveries).
+- **A wrong configuration.** Some configuration errors also give a `404` on this read, so they also wait for the whole budget and then give `ServiceNotVisibleError`, not the race: a wrong realm (Keycloak answers `404` for the realm, and the IdP Configuration Service keeps it), or a wrong path in `AIAC_PDP_CONFIG_URL` (FastAPI answers `404` with `{"detail": "Not Found"}`). The detail of `ServiceNotVisibleError` ends with the body of the last `404`. Read it to tell these cases from a client that is not visible.
+
+This cost is accepted: the default budget is short, and after the SPI fix an event for a client that does not exist is rare.
+
+**Keep the budget short.** The wait runs inside the per-service lock (`_service_lock`), and the NATS consumer handles one message at a time. So a wait blocks the next messages for its whole budget.
+
+**Defense in depth.** The SPI fix removes the race at its root: the SPI publishes the event only after a successful commit. The wait stays as a second protection, for example when an SPI image without the fix is deployed.
 
 ---
 

@@ -6,10 +6,11 @@ trigger, it sequences the two sub-agents and returns ``(list[PolicyRule], overri
 (``client_id`` is the service's clientId, which the Controller passes to the PCE as ``focus_service``):
 
     0. The precondition checks (D30, see ``preconditions``) — run FIRST, after the one IdP read
-       that resolves the clientId: the pod has the AuthBridge sidecar (#1), the namespace pipeline
-       has ``opa`` (and ``mcp-parser`` for a tool) inbound, and under agent side also ``opa``
-       outbound (#2), no app container has an ``httpGet`` probe (#6). The scope depends on the
-       enforcement side: every service under target side, agents only under agent side (a tool
+       that resolves the clientId (a ``404`` on that read is the event-before-commit race: it is read
+       again for a bounded time, see ``CLIENT_WAIT``): the pod has the AuthBridge sidecar (#1),
+       the namespace pipeline has ``opa`` (and ``mcp-parser`` for a tool) inbound, and under agent
+       side also ``opa`` outbound (#2), no app container has an ``httpGet`` probe (#6). The scope
+       depends on the enforcement side: every service under target side, agents only under agent side (a tool
        then gets a pass-through CR, which needs no check; its pod type is still read). A failed
        check raises ``EnforcementPreconditionError``.
        Then, for an enabled TOOL only, the PCE ``bootstrap`` writes the tool's first CR (under
@@ -48,8 +49,9 @@ from aiac.agent.policy_rules_builder.graph import (
 from aiac.agent.uc.onboarding.policy_builder.builder import ServicePolicyBuilder
 from aiac.agent.uc.onboarding.preconditions import check_preconditions
 from aiac.agent.uc.onboarding.provision.graph import build_provision_graph
+from aiac.agent.uc.onboarding.provision.nodes import WaitConfig, poll_until_ready
 from aiac.agent.uc.onboarding.provision.state import OnboardingProvisionState, Trigger
-from aiac.idp.configuration.api import Configuration
+from aiac.idp.configuration.api import Configuration, IdPHTTPError
 from aiac.idp.configuration.models import ClientId, Service, ServiceType, ServiceUuid
 from aiac.policy.computation import bootstrap, quarantine
 from aiac.policy.model.models import PolicyRule
@@ -70,6 +72,29 @@ _ROLLBACK_ERRORS = (
     LLMAccessError,
     UnparseableLLMResponseError,
 )
+
+
+class ServiceNotVisibleError(HTTPException):
+    """The IdP still answers ``404`` for the service after the bounded wait on the first read (see
+    :func:`_read_service`). It is an ``HTTPException(502)``, so the HTTP route answers ``502`` as
+    before, and the consumer can tell it from the other retryable failures."""
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(502, detail)
+
+
+# Event-before-commit race tolerance for the first IdP read (handoff 20). The Keycloak SPI listener runs
+# inside the admin request, so the ``CLIENT_CREATED`` event (and the ``aiac.apply.service.{id}``
+# message) can come BEFORE Keycloak commits the new client: the first ``get_service`` then gets
+# ``404``. A ``404`` on that read is therefore a transient not-visible state, read again before we
+# give up with a 502; without the wait, the next try is the NATS redelivery after ACK_WAIT (600 s).
+# The SPI fix (publish after the commit) removes the race; this wait is defense in depth. The wait
+# runs inside ``_service_lock``, and the NATS consumer handles one message at a time, so it blocks
+# the other onboardings: keep the default short (≈30 s, as LABEL_WAIT). Tests set it fast.
+# A 404 cannot tell a not-yet-committed client from one that does not exist, so an unknown or
+# deleted UUID (a manual POST, a phantom event, a redelivery after a teardown) also waits the
+# whole budget before its 502; before this wait it was a 502 at once.
+CLIENT_WAIT = WaitConfig("ONBOARD_CLIENT_WAIT_ATTEMPTS", "ONBOARD_CLIENT_WAIT_BACKOFF", 15, 2.0)
 
 
 # --------------------------------------------------------------------------- #
@@ -147,6 +172,42 @@ def _config() -> Configuration:
     return Configuration.for_default_realm()
 
 
+def _read_service(config: Configuration, service_id: ServiceUuid) -> Service:
+    """The first IdP read of ``onboard_service``: ``get_service(service_id)``, tolerant of the
+    event-before-commit race (see ``CLIENT_WAIT``).
+
+    A ``404`` (``IdPHTTPError`` with ``status == 404``) means that the new client is not visible
+    yet (or that it does not exist: the two look the same, so an unknown UUID also waits the whole
+    budget): the read is polled again, up to ``ONBOARD_CLIENT_WAIT_ATTEMPTS`` reads with
+    ``ONBOARD_CLIENT_WAIT_BACKOFF`` seconds between them. A client that is still not visible after
+    the budget raises :class:`ServiceNotVisibleError` (a ``502``). Any other error (a ``5xx`` after
+    the library retries, another ``4xx``, a ``RuntimeError``) is a real failure, never the race: it
+    raises ``HTTPException(502)`` at once."""
+    last_not_found: IdPHTTPError | None = None
+    reads = 0
+
+    def _probe():
+        nonlocal last_not_found, reads
+        reads += 1
+        try:
+            return config.get_service(service_id)
+        except Exception as e:
+            if isinstance(e, IdPHTTPError) and e.status == 404:
+                last_not_found = e
+                return None
+            # The same boundary as Provision's classify_service: an IdP outage or a bad request is
+            # a 502, not a raw error that the Controller turns into a 500.
+            raise HTTPException(502, f"IdP config unavailable resolving service {service_id!r}: {e}") from e
+
+    service = poll_until_ready(_probe, CLIENT_WAIT)
+    if service is None:
+        raise ServiceNotVisibleError(
+            f"IdP config unavailable resolving service {service_id!r}: the client is not visible after "
+            f"{reads} reads (ONBOARD_CLIENT_WAIT_*): {last_not_found}"
+        ) from last_not_found
+    return service
+
+
 def _loggable(value: object) -> str:
     """Neutralize a value for single-line logging: coerce to ``str`` and drop CR/LF so a
     user-controlled ``service_id`` or entity name cannot forge or inject extra log lines
@@ -201,9 +262,12 @@ def onboard_service(service_id: ServiceUuid) -> tuple[list[PolicyRule], bool, Cl
     ``service_id`` is the Keycloak internal client UUID that the trigger carries. The Orchestrator
     reads the ``Service`` from the IdP **once**, before Provision, and resolves its clientId
     (``Service.serviceId``) — the only service id the PCE takes. The caller passes the returned
-    ``client_id`` to ``compute_and_apply`` as ``focus_service``, so it makes no second IdP read. If
-    the read fails, nothing exists yet that needs compensation: it raises ``HTTPException(502)``
-    (as Provision's ``classify_service`` does) before Provision.
+    ``client_id`` to ``compute_and_apply`` as ``focus_service``, so it makes no second IdP read. The
+    SPI event can come before Keycloak commits the new client, so a ``404`` on this read is polled
+    again for a bounded time (``ONBOARD_CLIENT_WAIT_*``, default ≈30 s, see :func:`_read_service`).
+    If the read fails, nothing exists yet that needs compensation: it raises ``HTTPException(502)``
+    (as Provision's ``classify_service`` does) before Provision — ``ServiceNotVisibleError`` when
+    the client is still not visible after the wait, at once for any other error.
 
     Then the precondition checks (D30, :func:`~aiac.agent.uc.onboarding.preconditions.check_preconditions`)
     run, before Provision and the PRB. They read the enforcement side: under target side they check
@@ -243,12 +307,9 @@ def onboard_service(service_id: ServiceUuid) -> tuple[list[PolicyRule], bool, Cl
     lock (one agent replica only); cross-replica serialization is out of scope."""
     with _service_lock(service_id):
         config = _config()
-        try:
-            service = config.get_service(service_id)
-        except Exception as e:
-            # The same boundary as Provision's classify_service: an IdP outage or an unknown UUID
-            # is a 502, not a raw error that the Controller turns into a 500.
-            raise HTTPException(502, f"IdP config unavailable resolving service {service_id!r}: {e}") from e
+        # A 404 is the event-before-commit race: read again for a bounded time (ServiceNotVisibleError
+        # after the budget). Any other error is a 502 at once.
+        service = _read_service(config, service_id)
         client_id = ClientId(service.serviceId)
 
         # D30: the precondition checks run FIRST, before anything changes. A failed check raises

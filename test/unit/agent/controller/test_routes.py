@@ -24,6 +24,7 @@ from aiac.agent.policy_rules_builder.graph import (
     PolicyRulesBuilderError,
     UnparseableLLMResponseError,
 )
+from aiac.agent.uc.onboarding.orchestrator import ServiceNotVisibleError
 from aiac.agent.uc.onboarding.preconditions import EnforcementPreconditionError
 from aiac.idp.configuration.models import Role, Scope, ServiceType
 from aiac.policy.model.models import PolicyRule, RuleEffect, ServicePolicyModel, TargetSidePolicyModel
@@ -226,6 +227,24 @@ def test_handler_upstream_error_surfaces_status_and_skips_pce():
 
     assert resp.status_code == 502
     pce.assert_not_called()
+
+
+def test_service_not_visible_after_the_wait_surfaces_502_and_skips_pce():
+    # Handoff 20: the IdP still answers 404 for the new client after the bounded wait on the first
+    # read. ServiceNotVisibleError is an HTTPException(502) subclass, so the route answers 502 with
+    # its detail, as for the other failed reads. Nothing is applied and the client is not re-enabled.
+    detail = "IdP config unavailable resolving service 'svc-new': the client is not visible after the wait"
+    with (
+        patch("aiac.agent.controller.routes.onboard_service", side_effect=ServiceNotVisibleError(detail)),
+        patch("aiac.agent.controller.routes.compute_and_apply") as pce,
+        patch("aiac.agent.controller.routes.reenable_service") as reenable,
+    ):
+        resp = client.post("/apply/service/svc-new")
+
+    assert resp.status_code == 502
+    assert resp.json() == {"detail": detail}
+    pce.assert_not_called()
+    reenable.assert_not_called()
 
 
 def test_apply_service_does_not_reenable_when_pce_apply_raises():
