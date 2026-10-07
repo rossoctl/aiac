@@ -218,12 +218,13 @@ Legend: `<|--` inheritance (a subclass); `*--` composition (owned, deleted with 
 
 The two-layer model requires ownership and a user/agent distinction on the IdP types. These fields are **defined in `aiac.idp.configuration.models`** (the deep population from Keycloak is handoff 02's concern), but the policy model depends on them for SPM routing and APM derivation:
 
-- **`Scope.serviceId: str`** — the single owning service's `serviceId`. This is the SPM routing key: a rule `(role, scope)` routes to `SPM(scope.serviceId)`. See Assumption 2 (a scope has exactly one owner).
+- **`Scope.serviceId: str`** — the `serviceId` of the owner of **this copy** of the scope. This is the SPM routing key: a rule `(role, scope)` routes to `SPM(scope.serviceId)`. A scope that several services share ([D32](../PRD.md#key-architectural-decisions)) has one copy for each owner, each with its own `serviceId`, so each copy routes to the SPM of its owner. One policy decision gives one rule for each copy.
 - **`RoleKind(str, Enum)`** — `USER = "User"`, `AGENT = "Agent"` (mirrors `ServiceType`'s style).
 - **`Role.kind: RoleKind`** — whether the role is held by users or by agent service accounts.
 - **`Role.actorIds: list[str]`** — context-dependent on `kind`:
   - `kind == AGENT` ⇔ a Keycloak **client role** on the agent's client, or an `aiac.managed` **realm role** on the agent's service account; `actorIds` = the owning **agent `serviceId`(s)** (usually one).
   - `kind == USER` ⇔ a Keycloak **realm role**; `actorIds` = the **holder usernames**.
+  - **On a stored edge, `actorIds` is a snapshot** of the holders at build time. It is not the authority ([D32](../PRD.md#key-architectural-decisions)). At each operation the PCE replaces it with the **current holders** (`RoleHolders`, `aiac.policy.model.holders`): for an `Agent`-kind role, the live services whose roles contain the role; for a `User`-kind role, the direct members that `get_roles()` gives now. So a holder that comes later is added, and a holder that goes is removed, with no new rule. The store schema does not change; the PCE refreshes the stored snapshot when it writes an SPM for another reason. See [`policy-computation-engine.md`](policy-computation-engine.md).
 
 A `model_validator` on `Role` enforces what it can locally (`kind` present/valid; `actorIds` is a `list[str]`). The **cross-kind** invariant (Assumption 1) and the **client/realm ⇔ agent/user** invariant (Assumption 3) are enforced **upstream at construction** (the Keycloak IdP boundary), because the raw Keycloak facts are only visible there — see handoff 02 for that enforcement and field population.
 
@@ -361,7 +362,7 @@ A pure function with zero I/O. It projects the inbound edges of one SPM into the
 | `subject_roles` | `dict[str, list[Role]]` | Username → the roles that the user holds, from `role.actorIds` of every `User`-kind edge. **Effect-agnostic.** |
 | `source_roles` | `dict[str, list[Role]]` | Calling clientId → the roles that the agent holds, from `role.actorIds` of every `Agent`-kind edge. **Effect-agnostic.** |
 
-The split is by `role.kind` (`User` → subject, `Agent` → source) and by effect (the SPM's allow list or deny list). The identity maps register the role of **every** edge, allow and deny. So a role that appears only in a DENY edge is still in the map, and the Rego deny lookup can resolve it. Rules dedup by `(role.id, scope.id, effect)`. Map entries dedup by `role.id`.
+The PCE gives `project_inbound` SPMs whose edges carry the current role holders (D32), so `subject_roles` and `source_roles` show who holds each role now, not who held it when the rule was built. The split is by `role.kind` (`User` → subject, `Agent` → source) and by effect (the SPM's allow list or deny list). The identity maps register the role of **every** edge, allow and deny. So a role that appears only in a DENY edge is still in the map, and the Rego deny lookup can resolve it. Rules dedup by `(role.id, scope.id, effect)`. Map entries dedup by `role.id`.
 
 Two consumers use it:
 
@@ -433,10 +434,10 @@ gates = project_inbound(tool_spm)
 
 ## Assumptions
 
-The two-layer model rests on three invariants. All three are **AIAC invariants**, not Keycloak guarantees, and the ones that require raw Keycloak facts are enforced upstream at the IdP boundary (handoff 02):
+The two-layer model rests on two invariants, 1 and 3 below (the former Assumption 2 is removed, [D32](../PRD.md#key-architectural-decisions)). Both are **AIAC invariants**, not Keycloak guarantees, and they are enforced upstream at the IdP boundary (handoff 02), because they need raw Keycloak facts:
 
 1. **No role spans both kinds.** A role is held by users *or* by agent service accounts, never both. This is what lets `Role.actorIds` be a single list. Enforced upstream at construction (cross-kind invariant not visible to the local `Role` validator).
-2. **No scope shared across services.** A scope has exactly one owner → a single `Scope.serviceId`. This reconciles with the existing `get_services_by_scope(scope) -> list[Service]` (plural, because Keycloak client scopes are realm-level and assignable to many clients): for AIAC-managed scopes that list is always length 1.
+2. **Removed by D32** (it was: no scope shared across services). A shared scope is valid: a realm is a tenant, and one policy covers all its AIAC-managed services. Each owner gets its own copy of the scope, with `Scope.serviceId` = that owner, so `SPM(scope.serviceId)` stays unambiguous for each copy. `get_services_by_scope(scope) -> list[Service]` can give more than one service.
 3. **Agent role ⇔ a client role on the agent's client, or an `aiac.managed` realm role on its service account; user role ⇔ a realm role held by users.** The IdP config service sources agent roles from `Service.roles` and sets `Role.kind`: `GET /services/{id}/roles` marks agent roles `Agent`, and `GET /roles` marks realm roles `User`. Enforced upstream at construction.
 
 ---

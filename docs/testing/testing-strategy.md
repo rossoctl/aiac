@@ -33,7 +33,7 @@ covers:
 | Level | Marker | Location | Needs |
 |---|---|---|---|
 | **unit** | *(untagged)* | `test/unit/` (mirrors `src/aiac/`) | Nothing external — in-process, a single unit under test — **except a live LLM endpoint when the test also carries the orthogonal `llm` tag** (see below); those are deselected by the default `pytest`. Runs in the default `pytest`. |
-| **integration** | `integration` | *(reserved — no such tests yet)* | Several AIAC units cooperating in-process on a laptop, **no cluster**. The marker exists so the level has a home; the directory is intentionally absent until the first such test. |
+| **integration** | `integration` | `test/integration/` (mirrors `src/aiac/`) | Several AIAC units cooperating in-process on a laptop, **no cluster**, no LLM endpoint. Deselected by the default `pytest`; run with `-m integration`. The first test is the D32 test of shared roles and scopes (`test/integration/policy/computation/test_shared_roles.py`). |
 | **system** | `system` | `test/system/` | A live Kind cluster / Rosso / deployed AIAC — see [`k8s/opa-kind-runbook.md`](../../k8s/opa-kind-runbook.md). Closes the real OPA evaluation loop through AuthBridge. |
 
 ## The `llm` tag (orthogonal)
@@ -67,8 +67,11 @@ Use this ladder. The first match wins:
    does not exist, create it.
 2. **Several AIAC units cooperating in-process, no cluster** → **integration**.
    Tag the module with `pytestmark = pytest.mark.integration` (or the single test
-   with `@pytest.mark.integration`). When you add the first one, create
-   `test/integration/` as a mirror of `src/aiac/`.
+   with `@pytest.mark.integration`). Put it under `test/integration/`, at the
+   path that mirrors the main module under test (`test/integration/` is a
+   mirror of `src/aiac/`, as `test/unit/` is). If the mirror directory does not
+   exist, create it. Stub the LLM seam; a test that calls a real LLM also gets
+   the `llm` tag (see below).
 3. **Needs a live Kind cluster / Rosso / deployed AIAC** → **system**. Put it in
    `test/system/` and tag it `@pytest.mark.system`. It **must skip cleanly** when
    the cluster or env is missing. Use `require_env_or_skip`. Do not use

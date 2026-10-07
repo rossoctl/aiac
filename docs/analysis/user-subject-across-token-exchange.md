@@ -440,7 +440,8 @@ stable as a user ID. The criteria that are left:
    **not** carry the `aiac.managed` marker, for two reasons:
    - it is linked to many clients, and a marked scope with more than one owner is an Assumption 2
      violation: `GET /services/{id}/scopes` returns `409`, so the catalog read fails
-     (`docs/specs/components/idp-configuration-service.md:107,197`);
+     (`docs/specs/components/idp-configuration-service.md:107,197`); *D32 (2026-10-07) removed
+     Assumption 2 and its check, so this reason no longer applies; see the status note below*;
    - a marked scope would become an own scope of each linked service and enter the policy model
      and the PRB candidates.
 
@@ -508,6 +509,11 @@ stable as a user ID. The criteria that are left:
 >   A marked shared scope would therefore not give a live `409`; it would become an own scope of each
 >   linked service. This is a separate defect (record it as its own issue); the "no marker" rule of
 >   D31 does not depend on it.
+> - Status (2026-10-07): D32 (PRD §5) removed Assumption 2 and its check, so this defect is closed.
+>   A realm is a tenant and one policy covers the realm, so a shared `aiac.managed` scope is valid:
+>   `GET /services/{id}/scopes` lists it for each owner, with that owner as `serviceId`, and gives no
+>   `409`. The "no marker" rule of D31 stays, for the second reason in step 1: a marked
+>   `aiac-username-sub` would become an own scope of each linked service.
 
 Risks that are left with B-AIAC:
 
