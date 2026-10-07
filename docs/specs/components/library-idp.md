@@ -362,7 +362,7 @@ class Configuration:
 `link_subject_scope(service: Service) -> Scope`: link the shared subject scope to the service ([D31](../PRD.md#key-architectural-decisions)).
 1. Issues `POST {AIAC_PDP_CONFIG_URL}/services/{service.id}/subject-scope` with no body, appending `?realm=<self.realm>`.
 2. The service makes sure that the client scope **`aiac-username-sub`** and its `username-to-sub` mapper (`username` → claim `sub`) exist, with **no** `aiac.managed` marker, and links the scope as a **default** client scope of the service's client (an optional link is changed to a default link). Then a token that this client gets as the requester of a token exchange has `sub` = the username. The scope name and the mapper are IdP-Service details — callers pass only the `Service`.
-3. Idempotent: an existing scope, mapper or link is not an error, so a second call changes nothing.
+3. Idempotent: an existing scope, mapper or link is not an error, so a second call changes nothing. An existing `username-to-sub` mapper with a wrong type or config is changed back to the expected mapper.
 4. Raises `RuntimeError` on non-2xx HTTP status (via `_request`), including `409` if the existing `aiac-username-sub` carries the `aiac.managed` marker.
 5. Returns the `Scope` instance parsed from the response. Its `aiac_managed` is `False`, so it is never an own scope of a service. The scope is shared by every AIAC-managed client, so UC1 never puts it into the created-manifest, and the rollback never deletes it (see `idp-configuration-service.md` → `POST /services/{service_id}/subject-scope`).
 
