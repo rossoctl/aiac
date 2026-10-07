@@ -84,6 +84,13 @@ class TestClassifyServiceHappyPaths:
         result = _run(service=_service(), pods=[pod])
         assert result["service_type"] is ServiceType.TOOL
 
+    def test_terminating_pod_is_skipped(self):
+        # The wait reads only live pods, as the precondition checks do (one shared wait).
+        old = _pod({})
+        old.metadata.deletion_timestamp = "2026-10-08T00:00:00Z"
+        result = _run(service=_service(), pods=[old, _pod({"rossoctl.io/type": "tool"})])
+        assert result["service_type"] is ServiceType.TOOL
+
 
 class TestClassifyService502s:
     def test_label_absent_is_502_naming_workload_and_label(self):

@@ -11,13 +11,13 @@ as an `HTTPException(502, ...)` whose message names the workload and the specifi
 missing/invalid label — actionable, never silent.
 """
 
-import math
 import os
 import time
 from dataclasses import dataclass
 
 from fastapi import HTTPException
 
+from aiac.agent.shared.env import env_num
 from aiac.idp.configuration.api import Configuration
 from aiac.idp.configuration.models import ServiceType
 from aiac.shared.upstream import run_upstream
@@ -59,24 +59,13 @@ LABEL_WAIT = WaitConfig("ONBOARD_LABEL_WAIT_ATTEMPTS", "ONBOARD_LABEL_WAIT_BACKO
 _CARD_WAIT = WaitConfig("ONBOARD_CARD_WAIT_ATTEMPTS", "ONBOARD_CARD_WAIT_BACKOFF", 15, 2.0)
 
 
-def _env_num(name: str, default, cast, minimum):
-    """Read ``name`` from the environment, tolerant of an unset / non-numeric / non-finite /
-    below-``minimum`` value — a bad value must not crash onboarding, it falls back to the default.
-    ``inf`` is refused because ``time.sleep(inf)`` raises ``OverflowError`` outside the probe."""
-    try:
-        value = cast(os.environ[name])
-    except (KeyError, TypeError, ValueError):
-        return default
-    return value if math.isfinite(value) and value >= minimum else default
-
-
 def poll_until_ready(probe, cfg: WaitConfig):
     """Re-poll ``probe`` up to ``cfg`` attempts, backing off between looks (skipped after the last).
     ``probe`` returns a non-``None`` 'ready' result to stop, or ``None`` to retry; it may raise to fail
     the whole wait immediately (a real error, never a race). Returns the ready result, or ``None`` once
     the attempt budget is exhausted — the caller then decides what an exhausted wait means."""
-    attempts = _env_num(cfg.attempts_env, cfg.default_attempts, int, minimum=1)
-    backoff = _env_num(cfg.backoff_env, cfg.default_backoff, float, minimum=0.0)
+    attempts = env_num(cfg.attempts_env, cfg.default_attempts, int, minimum=1)
+    backoff = env_num(cfg.backoff_env, cfg.default_backoff, float, minimum=0.0)
     for attempt in range(attempts):
         result = probe()
         if result is not None:
@@ -189,11 +178,6 @@ def owned_pods(pods, workload_name: str) -> list:
     return [pod for pod in pods if _owned_by(pod, workload_name)]
 
 
-def _select_pod(pods, workload_name: str):
-    """The first pod owned by ``workload_name``, or ``None``."""
-    return next(iter(owned_pods(pods, workload_name)), None)
-
-
 def split_client_name(service_id: str, name: str | None) -> tuple[str, str]:
     """``(namespace, workload_name)`` from the Keycloak ``client.name`` (``<namespace>/<workload>``).
     A name with no ``/`` raises ``HTTPException(502)``: the pod of the service cannot be found."""
@@ -247,7 +231,7 @@ def classify_service(state: OnboardingProvisionState) -> dict:
 
     namespace, workload_name = split_client_name(service_id, service.name)
 
-    service_type = _await_service_type(namespace, workload_name)
+    service_type, _ = await_labelled_pods(namespace, workload_name)
 
     return {
         "service_id": service_id,
@@ -257,40 +241,50 @@ def classify_service(state: OnboardingProvisionState) -> dict:
     }
 
 
-def _await_service_type(namespace: str, workload_name: str) -> ServiceType:
-    """Resolve the service type from the operator's ``rossoctl.io/type`` pod label, tolerating the
-    deploy->onboard RACE (the label may not be patched yet — see the module knobs above).
+def await_labelled_pods(namespace: str, workload_name: str, settled=None) -> tuple[ServiceType, list]:
+    """The service type (from the operator's ``rossoctl.io/type`` pod label) and the live (not
+    terminating) pods of ``workload_name``, tolerating the deploy->onboard RACE (the pod or its label
+    may not be there yet — see the module knobs above).
 
     A briefly-absent label — or a not-yet-created pod — is a transient not-ready state, re-polled
     a bounded number of times. A label present with an INVALID value (not ``agent``/``tool``) is a
-    real misconfiguration that no wait can fix, so it fails immediately. Retries exhausted -> 502
-    naming the workload and the label (unchanged contract for a genuinely never-labelled workload)."""
+    real misconfiguration that no wait can fix, so it fails immediately. The poll ends at the first
+    look that finds a labelled pod for which ``settled(service_type, pods)`` is true (with no
+    ``settled``, at the first labelled pod). Retries exhausted -> the labelled ``(service_type,
+    pods)`` of the last look if it had one (the caller reports them), else 502 naming the workload
+    and the label (unchanged contract for a genuinely never-labelled workload). Provision's
+    ``classify_service`` and the UC1 precondition checks (D30) share this wait."""
     no_pod_detail = f"no pod owned by workload {workload_name!r} in namespace {namespace!r}"
     detail = no_pod_detail
+    last: tuple[ServiceType, list] | None = None
 
     def _probe():
-        nonlocal detail
-        # Re-derive per attempt so the exhausted-wait 502 reflects the LAST-seen state: a pod that
+        nonlocal detail, last
+        # Re-derive per attempt so the exhausted wait reflects the LAST-seen state: a pod that
         # disappears mid-poll must report "no pod", not a stale "label missing" from an earlier attempt.
-        detail = no_pod_detail
+        detail, last = no_pod_detail, None
         try:
-            pods = list_pods(namespace)
+            items = list_pods(namespace)
         except Exception as e:
             raise HTTPException(502, f"Kubernetes pod LIST failed in namespace {namespace!r}: {e}")
 
-        pod = _select_pod(pods, workload_name)
-        if pod is None:
+        pods = [p for p in owned_pods(items, workload_name) if getattr(p.metadata, "deletion_timestamp", None) is None]
+        if not pods:
             return None
         # Present but not agent/tool raises now: a real misconfiguration, never a race.
-        service_type = pod_service_type(pod, workload_name)
+        service_type = pod_service_type(pods[0], workload_name)
         if service_type is None:
-            detail = label_missing_detail(workload_name, pod)
-        return service_type
+            detail = label_missing_detail(workload_name, pods[0])
+            return None
+        last = (service_type, pods)
+        return last if settled is None or settled(service_type, pods) else None
 
-    service_type = poll_until_ready(_probe, LABEL_WAIT)
-    if service_type is None:
-        raise HTTPException(502, detail)
-    return service_type
+    ready = poll_until_ready(_probe, LABEL_WAIT)
+    if ready is not None:
+        return ready
+    if last is not None:
+        return last
+    raise HTTPException(502, detail)
 
 
 def _await_agent_skills(namespace: str, workload: str):
