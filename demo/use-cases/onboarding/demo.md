@@ -242,9 +242,9 @@ Both `github-agent`/`github-tool` — are **NOT** deployed hence step 4 is a gen
 > kubectl patch configmap aiac-event-broker-config -n aiac-system --type merge \
 >  -p '{"data":{"LOG_LEVEL":"DEBUG"}}' \
 >  && kubectl rollout restart deployment/aiac-event-broker -n aiac-system
->``` 
+>```
 > As with the LLM settings, you patch the ConfigMap and then restart the workload.
-> ```bash 
+> ```bash
 > kubectl rollout status deployment/aiac-agent -n aiac-system
 > kubectl logs deployment/aiac-agent -n aiac-system -c aiac-agent -f      # Controller
 > kubectl logs deployment/aiac-agent -n aiac-system -c aiac-init          # init container
