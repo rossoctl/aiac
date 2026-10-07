@@ -27,9 +27,13 @@ booleans (``eval/test_policy_pipeline_consistency.py``, #2468) into an ``agreeme
 just run-to-run agreement. Deliberately framed as *agreement* (higher is better), not
 *disagreement* (lower is better): every other metric on the dashboard's shared 0-1 axis
 (precision/recall/denial_precision, invariance_rate/sensitivity_rate) reads "line goes up = good",
-and an unlabeled inverted-polarity line among them would silently read backwards. A future Scale
-ticket whose metric shape doesn't fit either will need its own pooling function, written the same
-way, then handed to the same ``append_row``.
+and an unlabeled inverted-polarity line among them would silently read backwards.
+``pool_scale_metrics`` pools the Scale suite's structural-check entries
+(``eval/test_policy_pipeline_scale.py``, #2469) into a ``structural_pass_rate``/
+``structural_issue_count``/latency/cost aggregate — its correctness half reuses
+``pool_correctness_metrics`` as-is (the same precision/recall/denial_precision shape), so each
+Scale suite row is built from both pooling functions' output merged together
+(``eval/conftest.py``'s ``_write_trend_log``).
 """
 
 from __future__ import annotations
@@ -75,6 +79,46 @@ def pool_correctness_metrics(entries: list[dict[str, Any]]) -> dict[str, Any]:
         "precision": precision,
         "recall": recall,
         "denial_precision": denial_precision,
+    }
+
+
+def pool_scale_metrics(entries: list[dict[str, Any]]) -> dict[str, Any]:
+    """Pool the Scale suite's structural-check entries (``test_policy_pipeline_scale.py``, #2469)
+    into one run's aggregate. Unlike ``pool_correctness_metrics``/``pool_consistency_metrics``,
+    both scale dimensions (total-corpus, per-decision) record the same two common fields
+    regardless of which concrete checks ran underneath -- ``structural_pass`` (bool: did every
+    gated check -- completeness/no-duplication/no-orphans -- pass) and
+    ``structural_issue_count`` (int: total offending entities found across every gated check) --
+    so this one pooling function covers both dimensions' rows without needing to know each
+    dimension's own field taxonomy (``missing_decisions``/``duplicate_triples``/``orphaned_scopes``
+    for total-corpus; ``scope_invalid_names``/``role_invalid_names``/``duplicate_triples`` for
+    per-decision -- see ``eval.scale_structural``). ``wall_clock_seconds``/``total_tokens``/
+    ``token_coverage`` are latency/cost, reported and trended only (no SLA to gate against).
+
+    Pooled by summed count / mean, not per-entry-averaged floats blended into a single number that
+    hides which run contributed what -- mirrors ``pool_correctness_metrics``'s summed-not-averaged
+    philosophy. In practice each dimension/level is a single test case per run (not an 8-scenario
+    sweep), so ``entries`` is usually length 1 -- pooling is kept generic anyway, the same reason
+    ``pool_correctness_metrics``/``pool_consistency_metrics`` are, so a future ticket that adds more
+    structural entries per run needs no new pooling function."""
+    runs = len(entries)
+    issue_count = sum(e.get("structural_issue_count", 0) for e in entries)
+    clean_runs = sum(1 for e in entries if e.get("structural_pass"))
+    total_tokens = sum(e.get("total_tokens", 0) for e in entries)
+    wall_clock_values = [e["wall_clock_seconds"] for e in entries if e.get("wall_clock_seconds") is not None]
+    coverage_values = [e["token_coverage"] for e in entries if e.get("token_coverage") is not None]
+    return {
+        # "scenarios_scored", not "runs_scored": every pooling function in this module uses this
+        # exact key for its row count, and eval/dashboard.py's _ROW_BOOKKEEPING_KEYS excludes it
+        # from the trend chart by that exact name -- a different name here would have silently
+        # slipped through as a plottable "metric" instead (confirmed: it did, until this was
+        # caught in review).
+        "scenarios_scored": runs,
+        "structural_pass_rate": clean_runs / runs if runs else 1.0,
+        "structural_issue_count": issue_count,
+        "total_tokens": total_tokens,
+        "mean_wall_clock_seconds": sum(wall_clock_values) / len(wall_clock_values) if wall_clock_values else 0.0,
+        "mean_token_coverage": sum(coverage_values) / len(coverage_values) if coverage_values else 1.0,
     }
 
 

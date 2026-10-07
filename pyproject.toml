@@ -32,6 +32,10 @@ dependencies = [
 test = [
     "pytest>=9.1.1",
     "pytest-xdist>=3.8.0",
+    # httpx2 is what `starlette.testclient` wants from Starlette 1.x on: it falls
+    # back to the httpx 0.x runtime dep and warns (StarletteDeprecationWarning)
+    # when httpx2 is absent. Test-only — the services still ship httpx 0.28.1.
+    "httpx2>=2.13.1",
 ]
 
 [tool.uv]

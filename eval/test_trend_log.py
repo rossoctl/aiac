@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from eval.trend_log import append_row, pool_consistency_metrics, pool_correctness_metrics
+from eval.trend_log import append_row, pool_consistency_metrics, pool_correctness_metrics, pool_scale_metrics
 
 
 def test_pool_empty_entries_is_vacuously_perfect() -> None:
@@ -147,6 +147,65 @@ def test_pool_consistency_all_disagree_has_zero_agreement_rate() -> None:
     metrics = pool_consistency_metrics(entries)
 
     assert metrics == {"scenarios_scored": 2, "agreement_rate": 0.0}
+
+
+def test_pool_scale_empty_entries_is_vacuously_clean() -> None:
+    metrics = pool_scale_metrics([])
+
+    assert metrics == {
+        "scenarios_scored": 0,
+        "structural_pass_rate": 1.0,
+        "structural_issue_count": 0,
+        "total_tokens": 0,
+        "mean_wall_clock_seconds": 0.0,
+        "mean_token_coverage": 1.0,
+    }
+
+
+def test_pool_scale_one_clean_run() -> None:
+    entries = [
+        {
+            "structural_pass": True,
+            "structural_issue_count": 0,
+            "wall_clock_seconds": 12.5,
+            "total_tokens": 5000,
+            "token_coverage": 1.0,
+        }
+    ]
+
+    metrics = pool_scale_metrics(entries)
+
+    assert metrics["scenarios_scored"] == 1
+    assert metrics["structural_pass_rate"] == 1.0
+    assert metrics["structural_issue_count"] == 0
+    assert metrics["total_tokens"] == 5000
+    assert metrics["mean_wall_clock_seconds"] == 12.5
+    assert metrics["mean_token_coverage"] == 1.0
+
+
+def test_pool_scale_a_failing_run_lowers_pass_rate_and_sums_issues() -> None:
+    entries = [
+        {"structural_pass": False, "structural_issue_count": 3, "wall_clock_seconds": 10.0, "total_tokens": 100},
+        {"structural_pass": True, "structural_issue_count": 0, "wall_clock_seconds": 20.0, "total_tokens": 200},
+    ]
+
+    metrics = pool_scale_metrics(entries)
+
+    assert metrics["scenarios_scored"] == 2
+    assert metrics["structural_pass_rate"] == 0.5
+    assert metrics["structural_issue_count"] == 3
+    assert metrics["total_tokens"] == 300
+    assert metrics["mean_wall_clock_seconds"] == 15.0
+
+
+def test_pool_scale_missing_token_coverage_defaults_vacuously() -> None:
+    entries = [{"structural_pass": True, "structural_issue_count": 0}]
+
+    metrics = pool_scale_metrics(entries)
+
+    assert metrics["mean_token_coverage"] == 1.0
+    assert metrics["mean_wall_clock_seconds"] == 0.0
+    assert metrics["total_tokens"] == 0
 
 
 def test_append_row_writes_one_json_line(tmp_path: Path) -> None:
