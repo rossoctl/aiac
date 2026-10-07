@@ -459,7 +459,8 @@ stable as a user ID. The criteria that are left:
 4. A check: the Controller (or the harness) verifies that the onboarded agent client has the
    scope, and the system test decodes one exchanged token and checks `sub` = username.
 5. Turn off the legacy token exchange (V1). V1 uses the scopes of the *target* client, so a
-   request that falls back to V1 would not get the mapper (§1.5, §9 side findings).
+   request that falls back to V1 would not get the mapper (§1.5, §9 side findings). *Corrected on
+   2026-10-07: this is true only for a target without the link; see the status note.*
 
 > **Status (2026-10-06): decided, D31.** The user chose B-AIAC, with the username precondition and
 > with `rossoctl` unchanged. The steps above are implemented as follows:
@@ -482,8 +483,16 @@ stable as a user ID. The criteria that are left:
 >    onboarded client links the scope; a failure, not a skip), `verify_subject_mapper` (the login
 >    token, unchanged), and the rung-2 test `test_exchanged_token_subject_is_username` (it decodes an
 >    exchanged token).
-> 5. A platform follow-up, not done here: `KC_FEATURES` is in the Keycloak deployment of the rossoctl
->    platform, not in this repo.
+> 5. Optional, and not done here: `KC_FEATURES` is in the Keycloak deployment of the rossoctl
+>    platform, not in this repo. Correction (2026-10-07): AIAC does not depend on it. V1 handles a
+>    request only when V2 declines it (the requester has no `standard.token.exchange.enabled`, or
+>    the request has `requested_subject` / `requested_issuer` / `subject_issuer`); the AuthBridge
+>    requests meet none of these conditions. If V1 handles a request, it uses the target client's
+>    scopes, and AIAC links the scope to each managed agent **and** tool, so an onboarded target
+>    still gets `sub` = the username. A target without the link is not onboarded, so it has no CR and
+>    the global combiner denies it (D20). A wrong subject can only cause a deny (usernames are the
+>    only keys, and each rules-based package denies by default, D25). Turning V1 off makes a request
+>    that V2 declines fail loudly (`400`); Keycloak recommends it.
 >
 > Two facts found during the implementation:
 >
