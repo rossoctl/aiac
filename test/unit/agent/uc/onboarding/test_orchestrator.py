@@ -23,10 +23,12 @@ its import site.
 
 import ast
 import inspect
+import json
 import threading
 from unittest.mock import MagicMock, patch
 
 import pytest
+import requests
 from fastapi import HTTPException
 
 from aiac.agent.policy_rules_builder.conflict_detection import PolicyConflictError
@@ -41,6 +43,7 @@ from aiac.agent.uc.onboarding.preconditions import EnforcementPreconditionError
 from aiac.agent.uc.onboarding.provision import kube, nodes
 from aiac.agent.uc.onboarding.provision.state import OnboardingProvisionState, Trigger
 from aiac.agent.uc.onboarding.provision.types import ScopeDefinition, ServiceProvision
+from aiac.idp.configuration.api import Configuration, IdPHTTPError
 from aiac.idp.configuration.models import Role, Scope, Service, ServiceType
 from test.unit.agent.uc.onboarding import kube_fakes as kf
 
@@ -205,6 +208,305 @@ class TestServiceReadFails:
         config.set_service_enabled.assert_not_called()
         quarantine.assert_not_called()
         assert SERVICE_ID not in orchestrator._service_locks
+
+
+def _not_found() -> IdPHTTPError:
+    """The library error for a client that Keycloak does not find (yet): the IdP service answers 404."""
+    return IdPHTTPError(404, '{"detail":"Could not find client"}')
+
+
+class TestFirstReadWaitsForANewClient:
+    """Handoff 20 (the event-before-commit race): the Keycloak SPI event can come before Keycloak
+    commits the new client, so the first ``get_service`` answers 404. The Orchestrator reads again
+    for a bounded budget (``ONBOARD_CLIENT_WAIT_*``) and then onboards the service. A client that is
+    still not visible after the budget raises ``ServiceNotVisibleError`` (a 502). Any other read
+    error is a 502 at once. The fake IdP below reproduces the race deterministically."""
+
+    @pytest.fixture(autouse=True)
+    def fast_client_wait(self, monkeypatch):
+        monkeypatch.setenv("ONBOARD_CLIENT_WAIT_ATTEMPTS", "3")
+        monkeypatch.setenv("ONBOARD_CLIENT_WAIT_BACKOFF", "0")
+
+    @pytest.mark.parametrize("misses", [1, 2])
+    def test_a_client_that_is_not_visible_yet_is_read_again_and_onboarded(self, misses):
+        rules = [object()]
+        config = MagicMock()
+        config.get_service.side_effect = [_not_found()] * misses + [_service()]
+        graph = _graph()
+
+        with (
+            patch.object(orchestrator, "build_provision_graph", return_value=graph),
+            patch.object(orchestrator, "ServicePolicyBuilder") as spb,
+            patch.object(orchestrator, "_config", return_value=config),
+        ):
+            spb.build.return_value = rules
+            result = orchestrator.onboard_service(SERVICE_ID)
+
+        assert result == (rules, False, CLIENT_ID)
+        assert config.get_service.call_count == misses + 1
+        assert all(c.args == (SERVICE_ID,) for c in config.get_service.call_args_list)
+        graph.invoke.assert_called_once()
+        assert SERVICE_ID not in orchestrator._service_locks
+
+    def test_a_client_that_stays_not_visible_raises_service_not_visible_after_the_budget(
+        self, k8s, quarantine, bootstrap
+    ):
+        # Nothing changed yet, so the failure is the same as today's failed read: no precondition
+        # checks, no bootstrap, no Provision, no PRB, no rollback, no quarantine.
+        config = MagicMock()
+        config.get_service.side_effect = _not_found()
+        graph = _graph()
+
+        with (
+            patch.object(orchestrator, "build_provision_graph", return_value=graph),
+            patch.object(orchestrator, "ServicePolicyBuilder") as spb,
+            patch.object(orchestrator, "_config", return_value=config),
+        ):
+            with pytest.raises(orchestrator.ServiceNotVisibleError) as ei:
+                orchestrator.onboard_service(SERVICE_ID)
+
+        assert isinstance(ei.value, HTTPException)
+        assert ei.value.status_code == 502
+        assert f"IdP config unavailable resolving service {SERVICE_ID!r}" in ei.value.detail
+        assert "not visible" in ei.value.detail
+        assert isinstance(ei.value.__cause__, IdPHTTPError) and ei.value.__cause__.status == 404
+        assert config.get_service.call_count == 3
+        k8s.list_namespaced_pod.assert_not_called()
+        k8s.read_namespaced_config_map.assert_not_called()
+        bootstrap.assert_not_called()
+        graph.invoke.assert_not_called()
+        spb.build.assert_not_called()
+        config.set_service_enabled.assert_not_called()
+        config.delete_service_role.assert_not_called()
+        config.delete_service_scope.assert_not_called()
+        quarantine.assert_not_called()
+        assert SERVICE_ID not in orchestrator._service_locks
+
+    @pytest.mark.parametrize(
+        "error",
+        [IdPHTTPError(500, "Keycloak error"), IdPHTTPError(403, "forbidden"), RuntimeError("IdP config unavailable")],
+        ids=["http-500", "http-403", "runtime-error"],
+    )
+    def test_any_other_read_error_is_a_502_at_once(self, error, quarantine):
+        config = MagicMock()
+        config.get_service.side_effect = error
+        graph = _graph()
+
+        with (
+            patch.object(orchestrator, "build_provision_graph", return_value=graph),
+            patch.object(orchestrator, "ServicePolicyBuilder") as spb,
+            patch.object(orchestrator, "_config", return_value=config),
+        ):
+            with pytest.raises(HTTPException) as ei:
+                orchestrator.onboard_service(SERVICE_ID)
+
+        assert not isinstance(ei.value, orchestrator.ServiceNotVisibleError)
+        assert ei.value.status_code == 502
+        assert f"IdP config unavailable resolving service {SERVICE_ID!r}" in ei.value.detail
+        assert ei.value.__cause__ is error
+        config.get_service.assert_called_once_with(SERVICE_ID)
+        graph.invoke.assert_not_called()
+        spb.build.assert_not_called()
+        quarantine.assert_not_called()
+
+    def test_the_wait_sleeps_the_backoff_between_reads_but_not_after_the_last(self, monkeypatch):
+        monkeypatch.setenv("ONBOARD_CLIENT_WAIT_BACKOFF", "0.5")
+        config = MagicMock()
+        config.get_service.side_effect = _not_found()
+
+        with (
+            patch.object(orchestrator, "_config", return_value=config),
+            patch.object(nodes.time, "sleep") as sleep,
+        ):
+            with pytest.raises(orchestrator.ServiceNotVisibleError):
+                orchestrator.onboard_service(SERVICE_ID)
+
+        assert [c.args for c in sleep.call_args_list] == [(0.5,), (0.5,)]
+
+    def test_the_default_budget_is_about_30_seconds(self, monkeypatch):
+        # The wait blocks the NATS consumer (one message at a time), so the default stays short:
+        # 15 reads with 2 s between them (28 s of sleep).
+        monkeypatch.delenv("ONBOARD_CLIENT_WAIT_ATTEMPTS")
+        monkeypatch.delenv("ONBOARD_CLIENT_WAIT_BACKOFF")
+        config = MagicMock()
+        config.get_service.side_effect = _not_found()
+
+        with (
+            patch.object(orchestrator, "_config", return_value=config),
+            patch.object(nodes.time, "sleep") as sleep,
+        ):
+            with pytest.raises(orchestrator.ServiceNotVisibleError):
+                orchestrator.onboard_service(SERVICE_ID)
+
+        assert config.get_service.call_count == 15
+        assert sum(c.args[0] for c in sleep.call_args_list) == pytest.approx(28.0)
+
+    @pytest.mark.parametrize("value", ["inf", "-inf", "nan", "-1", "x"])
+    def test_a_backoff_that_is_not_a_finite_number_above_the_minimum_falls_back_to_the_default(
+        self, monkeypatch, value
+    ):
+        # time.sleep(inf) raises OverflowError outside the probe, so the route would answer 500 and
+        # the consumer would not see ServiceNotVisibleError.
+        monkeypatch.setenv("ONBOARD_CLIENT_WAIT_BACKOFF", value)
+        config = MagicMock()
+        config.get_service.side_effect = _not_found()
+
+        with (
+            patch.object(orchestrator, "_config", return_value=config),
+            patch.object(nodes.time, "sleep") as sleep,
+        ):
+            with pytest.raises(orchestrator.ServiceNotVisibleError):
+                orchestrator.onboard_service(SERVICE_ID)
+
+        assert [c.args for c in sleep.call_args_list] == [(2.0,), (2.0,)]
+
+
+# The first read against the real IdP library (handoff 20). The class above gives the Orchestrator a
+# mocked Configuration and an IdPHTTPError that the test builds. The class below gives it the real
+# Configuration, with only ``requests.get`` scripted, so that the race fix is pinned across the
+# layers: the IdP service's 404 -> ``Configuration._check`` (IdPHTTPError) -> ``run_upstream`` (a
+# 4xx is not retried, a 5xx is) -> ``_read_service`` / ``poll_until_ready``.
+IDP_URL = "http://idp"
+CLIENT_UUID = "3e0af988-1111-4222-8333-444455556666"
+WORKLOAD_CLIENT_ID = "team1/github-agent"
+SERVICE_PATH = f"/services/{CLIENT_UUID}"
+SERVICE_ROLES_PATH = f"/services/{CLIENT_UUID}/roles"
+_CLIENT = {"id": CLIENT_UUID, "clientId": WORKLOAD_CLIENT_ID, "enabled": True}
+
+
+def _idp_error_body(keycloak_status: int, keycloak_error: str) -> dict:
+    """The IdP service's body for a Keycloak error: ``{"error": str(KeycloakError)}``. Keycloak 26
+    answers ``{"error": "<text>"}``, which has no ``message`` key, so python-keycloak puts the raw
+    response bytes in the error message: ``404: b'{"error":"Could not find client"}'``."""
+    raw = json.dumps({"error": keycloak_error}, separators=(",", ":")).encode()
+    return {"error": f"{keycloak_status}: {raw!r}"}
+
+
+_IDP_404 = _idp_error_body(404, "Could not find client")
+_IDP_502 = _idp_error_body(503, "unknown_error")  # the IdP service answers 502 for a Keycloak 503
+
+
+def _http(status: int, body) -> requests.Response:
+    """A real ``requests.Response``, so ``.ok``, ``.status_code`` and ``.text`` are the library's own."""
+    resp = requests.Response()
+    resp.status_code = status
+    resp._content = json.dumps(body).encode()
+    return resp
+
+
+class _ScriptedIdP:
+    """``requests.get`` for the IdP Configuration Service. A scripted path gives its answers in turn,
+    and the last one repeats; every other path gives ``200 []``. It records the path of each call."""
+
+    def __init__(self, scripts: dict[str, list[tuple[int, object]]]) -> None:
+        self.scripts = {path: list(answers) for path, answers in scripts.items()}
+        self.paths: list[str] = []
+
+    def get(self, url: str, params=None, **kwargs) -> requests.Response:
+        path = url.removeprefix(IDP_URL)
+        self.paths.append(path)
+        answers = self.scripts.get(path)
+        if not answers:
+            return _http(200, [])
+        status, body = answers.pop(0) if len(answers) > 1 else answers[0]
+        return _http(status, body)
+
+    def count(self, path: str) -> int:
+        return self.paths.count(path)
+
+
+class TestFirstReadAgainstTheRealLibrary:
+    @pytest.fixture(autouse=True)
+    def sleeps(self, monkeypatch):
+        monkeypatch.setenv("AIAC_PDP_CONFIG_URL", IDP_URL)
+        monkeypatch.setenv("UPSTREAM_MAX_RETRIES", "3")
+        monkeypatch.setenv("ONBOARD_CLIENT_WAIT_ATTEMPTS", "3")
+        # Not 1 s or 2 s, so the recorder tells a poll backoff from a library backoff (1 s, 2 s, ...).
+        monkeypatch.setenv("ONBOARD_CLIENT_WAIT_BACKOFF", "0.5")
+        recorded: list[float] = []
+        # tenacity and poll_until_ready both call time.sleep at run time.
+        monkeypatch.setattr("time.sleep", recorded.append)
+        return recorded
+
+    @staticmethod
+    def _read(idp: _ScriptedIdP) -> Service:
+        with patch("aiac.idp.configuration.api.requests.get", side_effect=idp.get):
+            return orchestrator._read_service(Configuration.for_realm("r"), CLIENT_UUID)
+
+    def test_a_404_is_read_again_by_the_poll_and_not_by_the_library(self, sleeps):
+        idp = _ScriptedIdP({SERVICE_PATH: [(404, _IDP_404), (200, _CLIENT)]})
+
+        service = self._read(idp)
+
+        assert service.serviceId == WORKLOAD_CLIENT_ID
+        assert idp.count(SERVICE_PATH) == 2
+        assert sleeps == [0.5]  # one poll backoff, no library backoff
+
+    def test_a_client_that_stays_404_raises_service_not_visible_with_the_idp_body(self, sleeps):
+        idp = _ScriptedIdP({SERVICE_PATH: [(404, _IDP_404)]})
+
+        with pytest.raises(orchestrator.ServiceNotVisibleError) as ei:
+            self._read(idp)
+
+        assert ei.value.status_code == 502
+        # The harness race hint (test/system/uc1_onboard.py) looks for this text in the Controller log.
+        assert "Could not find client" in ei.value.detail
+        assert isinstance(ei.value.__cause__, IdPHTTPError) and ei.value.__cause__.status == 404
+        assert idp.count(SERVICE_PATH) == 3
+        assert sleeps == [0.5, 0.5]
+
+    @pytest.mark.parametrize(
+        ("scripts", "service_reads", "expected_sleeps"),
+        [
+            pytest.param(
+                {SERVICE_PATH: [(502, _IDP_502), (404, _IDP_404), (200, _CLIENT)]},
+                3,
+                [1, 0.5],
+                id="5xx-then-404-then-client",
+            ),
+            pytest.param(
+                {SERVICE_PATH: [(200, _CLIENT)], SERVICE_ROLES_PATH: [(404, _IDP_404), (200, [])]},
+                2,
+                [0.5],
+                id="404-on-the-service-roles-sub-read",
+            ),
+            pytest.param(
+                {
+                    "/roles": [(200, [{"id": "r1", "name": "gone", "composite": True}]), (200, [])],
+                    "/roles/gone/composites": [(404, _idp_error_body(404, "Could not find role"))],
+                    SERVICE_PATH: [(200, _CLIENT)],
+                },
+                2,
+                [0.5],
+                id="composite-role-deleted-during-the-read",
+            ),
+        ],
+    )
+    def test_the_library_retry_and_the_poll_together_onboard_the_client(
+        self, sleeps, scripts, service_reads, expected_sleeps
+    ):
+        # A 5xx is retried in the library (1 s); a 404 is not, and the poll reads the whole
+        # get_service again (0.5 s). A 404 on a sub-read of get_service also makes the poll read it
+        # again, and the next read succeeds.
+        idp = _ScriptedIdP(scripts)
+
+        service = self._read(idp)
+
+        assert service.serviceId == WORKLOAD_CLIENT_ID
+        assert idp.count(SERVICE_PATH) == service_reads
+        assert sleeps == expected_sleeps
+
+    def test_a_5xx_that_stays_is_a_502_after_the_library_retries_and_no_poll(self, sleeps):
+        idp = _ScriptedIdP({SERVICE_PATH: [(502, _IDP_502)]})
+
+        with pytest.raises(HTTPException) as ei:
+            self._read(idp)
+
+        assert not isinstance(ei.value, orchestrator.ServiceNotVisibleError)
+        assert ei.value.status_code == 502
+        assert isinstance(ei.value.__cause__, IdPHTTPError) and ei.value.__cause__.status == 502
+        assert idp.count(SERVICE_PATH) == 3  # UPSTREAM_MAX_RETRIES attempts in total
+        assert sleeps == [1, 2]  # the library backoff only
 
 
 class TestSuccessDoesNotReEnableClient:

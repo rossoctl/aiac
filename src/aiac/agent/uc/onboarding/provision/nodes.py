@@ -11,6 +11,7 @@ as an `HTTPException(502, ...)` whose message names the workload and the specifi
 missing/invalid label — actionable, never silent.
 """
 
+import math
 import os
 import time
 from dataclasses import dataclass
@@ -30,11 +31,12 @@ _MCP_LABEL = "protocol.rossoctl.io/mcp"
 
 
 @dataclass(frozen=True)
-class _WaitConfig:
-    """A bounded deploy->onboard race-tolerance poll. ``attempts_env``/``backoff_env`` name the
+class WaitConfig:
+    """A bounded onboarding race-tolerance poll. ``attempts_env``/``backoff_env`` name the
     environment knobs (read at poll time, falling back to the defaults on an unset / non-numeric /
-    below-minimum value). Bundled so the two onboarding races below share one poll mechanic
-    (``poll_until_ready``) instead of each repeating the read-env + range + backoff loop."""
+    non-finite / below-minimum value). Bundled so the onboarding races (the two below, and the orchestrator's
+    ``CLIENT_WAIT``) share one poll mechanic (``poll_until_ready``) instead of each repeating the
+    read-env + range + backoff loop."""
 
     attempts_env: str
     backoff_env: str
@@ -47,27 +49,28 @@ class _WaitConfig:
 # ``classify_service`` can run BEFORE the operator has patched the label onto the pod. A briefly-absent
 # label is therefore a transient not-ready state, re-polled before we give up with a 502. Defaults
 # ≈ 30s of slack (well under the NATS ACK_WAIT and the system-test convergence poll); tests set fast.
-LABEL_WAIT = _WaitConfig("ONBOARD_LABEL_WAIT_ATTEMPTS", "ONBOARD_LABEL_WAIT_BACKOFF", 15, 2.0)
+LABEL_WAIT = WaitConfig("ONBOARD_LABEL_WAIT_ATTEMPTS", "ONBOARD_LABEL_WAIT_BACKOFF", 15, 2.0)
 
 # Deploy->onboard race tolerance for the AgentCard skill sync — a SECOND, later race than the label one
 # above. The operator syncs the fetched A2A card onto ``status.card.skills`` only AFTER the agent pod is
 # Ready, which lags the Keycloak-client registration that triggers onboarding. So ``analyze_agent`` can
 # run while ``status.card.skills`` is still empty. An absent card / empty skill list is therefore a
 # transient not-ready state, re-polled before we fall back to a default access scope. Same ≈30s slack.
-_CARD_WAIT = _WaitConfig("ONBOARD_CARD_WAIT_ATTEMPTS", "ONBOARD_CARD_WAIT_BACKOFF", 15, 2.0)
+_CARD_WAIT = WaitConfig("ONBOARD_CARD_WAIT_ATTEMPTS", "ONBOARD_CARD_WAIT_BACKOFF", 15, 2.0)
 
 
 def _env_num(name: str, default, cast, minimum):
-    """Read ``name`` from the environment, tolerant of an unset / non-numeric / below-``minimum``
-    value — a bad value must not crash onboarding, it falls back to the default."""
+    """Read ``name`` from the environment, tolerant of an unset / non-numeric / non-finite /
+    below-``minimum`` value — a bad value must not crash onboarding, it falls back to the default.
+    ``inf`` is refused because ``time.sleep(inf)`` raises ``OverflowError`` outside the probe."""
     try:
         value = cast(os.environ[name])
     except (KeyError, TypeError, ValueError):
         return default
-    return value if value >= minimum else default
+    return value if math.isfinite(value) and value >= minimum else default
 
 
-def poll_until_ready(probe, cfg: _WaitConfig):
+def poll_until_ready(probe, cfg: WaitConfig):
     """Re-poll ``probe`` up to ``cfg`` attempts, backing off between looks (skipped after the last).
     ``probe`` returns a non-``None`` 'ready' result to stop, or ``None`` to retry; it may raise to fail
     the whole wait immediately (a real error, never a race). Returns the ready result, or ``None`` once
