@@ -16,12 +16,13 @@ philosophy, reporting) lives in [`eval-framework.md`](eval-framework.md).
 | `test_policy_pipeline_consistency.py` | `eval` | PRB-level | [policy-eval-robustness-consistency.md](policy-eval-robustness-consistency.md) | PRB run N times (default 5) on identical input, exact grant-set equality gate. Feeds the committed trend log (agreement rate). |
 | `test_policy_pipeline_robustness.py` | `eval` | PRB-level | [policy-eval-robustness-consistency.md](policy-eval-robustness-consistency.md) | PRB grant sets checked for **invariance** and **sensitivity**, each perturbed at both a **mechanical** and a **semantic** (LLM-drafted, human sign-off required — see [SIGNOFF.md](../../eval/scenarios_perturbed/SIGNOFF.md)) tier, each of the four combinations its own metric, feeding the trend log. |
 | `test_policy_pipeline_faithfulness.py` | `eval` | PRB-level | none here (see [`../specs/digested-policy.md`](../specs/digested-policy.md)) | Digests each source policy live, runs the PRB on the digest, and scores it against the truth table — zero-tolerance over-grant gate. Writes no trend-log row. |
+| `test_policy_pipeline_scale.py` | `eval` | Both | [policy-eval-scale.md](policy-eval-scale.md) | A **procedurally generated** (not hand-authored) fixed-100-service corpus, checked on two independent dimensions (**total-corpus**, **per-decision**) × two check types (**structural**, **correctness**) × two levels (PRB, e2e) — eight test functions, never blended into one score. Feeds the committed trend log, one row per dimension/level. |
 
-All six carry the single flat `eval` marker (the former per-suite `eval_*` markers were
+All seven carry the single flat `eval` marker (the former per-suite `eval_*` markers were
 collapsed into one — select an individual suite by its file path or `-k`, as the runbook below
-does). All need only `LLM_BASE_URL`/`LLM_MODEL`/`LLM_API_KEY` at minimum; the two end-to-end
-suites (`test_policy_pipeline_eval.py`, `test_policy_pipeline_correctness_e2e.py`) additionally
-need a live Keycloak and `opa`.
+does). All need only `LLM_BASE_URL`/`LLM_MODEL`/`LLM_API_KEY` at minimum; the three suites with an
+end-to-end level (`test_policy_pipeline_eval.py`, `test_policy_pipeline_correctness_e2e.py`,
+`test_policy_pipeline_scale.py`'s `_e2e` cases) additionally need a live Keycloak and `opa`.
 
 ## `.env`
 
@@ -31,11 +32,13 @@ directly — real shell/CI exports still take precedence.
 
 | Variable | Required by | Purpose |
 |---|---|---|
-| `LLM_BASE_URL`, `LLM_MODEL`, `LLM_API_KEY` | All six scripts | The PRB's real LLM calls. `LLM_MODEL` is also the pinned model version recorded on every trend-log row. |
-| `KEYCLOAK_URL`, `KEYCLOAK_ADMIN_USERNAME`, `KEYCLOAK_ADMIN_PASSWORD` | `test_policy_pipeline_eval.py`, `test_policy_pipeline_correctness_e2e.py` | Real Keycloak admin API — the shared `pipeline` fixture provisions one realm per scenario. |
-| `OPA_BIN` (optional) | `test_policy_pipeline_eval.py`, `test_policy_pipeline_correctness_e2e.py` | Path to the `opa` binary; falls back to `opa` on `PATH`. Both suites skip cleanly (not fail) if neither resolves. |
+| `LLM_BASE_URL`, `LLM_MODEL`, `LLM_API_KEY` | All seven scripts | The PRB's real LLM calls. `LLM_MODEL` is also the pinned model version recorded on every trend-log row. |
+| `KEYCLOAK_URL`, `KEYCLOAK_ADMIN_USERNAME`, `KEYCLOAK_ADMIN_PASSWORD` | `test_policy_pipeline_eval.py`, `test_policy_pipeline_correctness_e2e.py`, `test_policy_pipeline_scale.py` (`_e2e` cases) | Real Keycloak admin API — the shared `pipeline` fixture provisions one realm per scenario. |
+| `OPA_BIN` (optional) | `test_policy_pipeline_eval.py`, `test_policy_pipeline_correctness_e2e.py`, `test_policy_pipeline_scale.py` (`_e2e` cases) | Path to the `opa` binary; falls back to `opa` on `PATH`. Each suite skips cleanly (not fail) if neither resolves. |
 | `EVAL_PIPELINE_PARALLELISM` (optional) | `test_policy_pipeline_eval.py`, `test_policy_pipeline_correctness_e2e.py` | Max concurrent workers provisioning scenarios in the shared `pipeline` fixture; defaults to the scenario count (8). |
 | `PRB_CONSISTENCY_REPEATS` (optional) | `test_policy_pipeline_consistency.py` | Repeats per scenario; default 5, must be ≥ 2. |
+| `SCALE_TOTAL_CORPUS_SIZE` / `SCALE_TOTAL_CORPUS_ROLES` / `SCALE_PER_DECISION_CANDIDATES` / `SCALE_SEED` (optional) | `test_policy_pipeline_scale.py` | Corpus-size overrides; defaults 100/10/100/0. Override to a small size while iterating — see [policy-eval-scale.md](policy-eval-scale.md). |
+| `SCALE_CONCURRENCY` (optional) | `test_policy_pipeline_scale.py` | Max concurrent PRB decision calls, total-corpus only -- the e2e fixtures' Keycloak-admin calls run one at a time regardless; default 20. |
 | `EVAL_REPORT_TZ` (optional) | none (report only) | Timezone for the Markdown report's timestamp/filename; default UTC. |
 
 Minimal repo-root `.env` for the PRB-level suites only:
@@ -80,6 +83,17 @@ doesn't already parallelize scenarios internally:
 # robustness — PRB-direct, no shared fixture, -n parallelizes cleanly.
 # (all four mechanical/semantic x invariance/sensitivity combinations feed the trend log)
 .venv/bin/pytest eval/test_policy_pipeline_robustness.py -m eval -n 8 -v
+
+# scale — procedurally generated fixed-100 corpus; never pass -n here. Each dimension/level
+# shares one module-scoped fixture between its structural and correctness test, which -n's
+# default load-balancing can split across workers -- each then pays for its own independent
+# copy (duplicating the ~100-150-call total-corpus PRB), and the e2e fixtures bind fixed
+# ports/realm names that would collide across workers. The suite skips cleanly if it ever
+# detects PYTEST_XDIST_WORKER rather than risk that silently (concurrency instead happens
+# inside the PRB-level fixture itself, via SCALE_CONCURRENCY -- -n has nothing independent
+# left to parallelize across anyway).
+# PRB-level only, or e2e only, or both -- see policy-eval-scale.md's Runbook for size overrides.
+.venv/bin/pytest -m eval -k scale -v -s
 ```
 
 Every suite calls `require_env_or_skip(...)` first (in the parametrized test, or in the shared
@@ -90,11 +104,14 @@ cleanly** (never a false pass) rather than failing deep into a run.
 
 Every run of any `eval/test_policy_pipeline_*.py` suite above writes a Markdown report to the
 gitignored `eval/reports/` (`report_<DD_MM_HH_MM_SS>.md`) — see `eval/conftest.py`. The two
-Correctness suites, each of the four Robustness family × tier tests, and the Consistency suite
-additionally append one row each to the **committed** `eval/trend_log.jsonl` (spec:
+Correctness suites, each of the four Robustness family × tier tests, the Consistency suite, and the
+Scale suite (one row per dimension/level) additionally append one row each to the **committed**
+`eval/trend_log.jsonl` (spec:
 [eval-framework.md §9](eval-framework.md#9-reporting-and-trend-persistence)) — see
-[policy-eval-correctness-prb.md § Trend log](policy-eval-correctness-prb.md#trend-log) and
-[policy-eval-robustness-consistency.md § Trend log](policy-eval-robustness-consistency.md#trend-log).
+[policy-eval-correctness-prb.md § Trend log](policy-eval-correctness-prb.md#trend-log),
+[policy-eval-robustness-consistency.md § Trend log](policy-eval-robustness-consistency.md#trend-log),
+and [policy-eval-scale.md § Test report and trend
+log](policy-eval-scale.md#test-report-and-trend-log).
 
 ## Dashboard
 
