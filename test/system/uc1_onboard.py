@@ -74,6 +74,12 @@ This module owns:
   failure injection, restored on exit after a CR capture), ``publish_service_event`` (re-fire the
   onboarding trigger for an existing client), and the quarantine readers (``workload_client``,
   ``spm_present``, ``controller_logs``) plus the MCP session probe ``mcp_session_decisions``.
+* **The event-before-commit race hint (handoff 20, D33)** — the pure ``commit_race_hint`` (Controller
+  log text in, hint out: a line with Keycloak's 404 ``Could not find client`` or the Controller's
+  ``ServiceNotVisibleError``, optionally only for one client UUID) and its live reader
+  ``controller_commit_race_hint`` (a bounded ``kubectl logs`` from just before the deploy; read-only and
+  best-effort, it never raises). Each deploy gate that times out appends the hint (``append_hint``), so
+  the message says when the onboarding event probably came before the Keycloak commit.
 * **Controller restart (rungs 6 and 7)** — ``restart_controller`` (rollout restart + wait until no old
   pod is left; the resync at start ends before the new pod is Ready), and ``controller_enforcement_side``
   (patch ``AIAC_ENFORCEMENT_SIDE`` in the Controller's ConfigMap + restart; on every exit path a CR
@@ -96,7 +102,7 @@ import subprocess
 import sys
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Collection, Iterator, Mapping, Sequence
 
@@ -232,6 +238,15 @@ DEPLOY_TIMEOUT = float(os.environ.get("AIAC_DEPLOY_TIMEOUT", "180"))
 # to ``AIAC_MCP_DISCOVERY_READY_TIMEOUT``, default 180 s, for the bundle poll), Provision, and the real
 # PRB (LLM). The tool's convergence gate polls up to this budget (``AIAC_ONBOARD_TIMEOUT``, seconds).
 ONBOARD_TIMEOUT = float(os.environ.get("AIAC_ONBOARD_TIMEOUT", "600"))
+
+# Both deploy gates (the agent's on ``BUNDLE_TIMEOUT``, the tool's on ``ONBOARD_TIMEOUT``) hold with the
+# defaults when the handoff-20 fix (D33) is deployed: the SPI image that publishes after the commit, or
+# both the IdP Configuration Service that keeps a Keycloak 404 and the Controller that reads a new client
+# again for a bounded time. Without it, the SPI can publish ``CLIENT_CREATED`` before Keycloak commits
+# the new client: the Controller's first IdP read gets 404 and the onboarding waits for the NATS
+# redelivery after ``ACK_WAIT`` (600 s), so one race hit fails the gate. With the fix deployed, do not
+# raise the budgets for this race: a gate that times out says when the Controller log shows it
+# (``controller_commit_race_hint``). Not verified live yet (handoff 20: rungs 1-3 with these defaults).
 
 # The demo manifests each workload deploys, in apply order (agent: ConfigMaps THEN Deployment; tool:
 # a single Deployment manifest). ``deploy.sh`` (demo/assets) applies this same set + order — keep the
@@ -1393,6 +1408,7 @@ def onboarded_stack(
         # ``deploy_workload`` fires the event-driven trigger (deploy -> operator -> CLIENT_CREATED ->
         # SPI -> NATS -> consumer). The order is the rung's ordering proof.
         for workload in workloads:
+            deployed_at = datetime.now(timezone.utc)  # the log window of the race hint (handoff 20)
             deploy_workload(workload)
             if not wait_for_registration(admin, workload):
                 raise RuntimeError(
@@ -1414,10 +1430,15 @@ def onboarded_stack(
                     timeout=BUNDLE_TIMEOUT,
                     interval=BUNDLE_POLL_INTERVAL,
                 ):
+                    # The hint says when the Controller log shows the event-before-commit race (handoff 20):
+                    # then the onboarding had not run yet, and OPA had no CR of the agent to load.
                     raise RuntimeError(
-                        f"agent did not converge after deploy: {gate.label()}={gate.decide(probe_ctx)!r} "
-                        f"(want {gate.expected!r}) within {BUNDLE_TIMEOUT:.0f}s — OPA had not loaded the agent's "
-                        "bundle. See k8s/opa-kind-runbook.md and issue #139."
+                        append_hint(
+                            f"agent did not converge after deploy: {gate.label()}={gate.decide(probe_ctx)!r} "
+                            f"(want {gate.expected!r}) within {BUNDLE_TIMEOUT:.0f}s — OPA had not loaded the "
+                            "agent's bundle. See k8s/opa-kind-runbook.md and issue #139.",
+                            controller_commit_race_hint(deployed_at, admin=admin, workload=workload),
+                        )
                     )
             else:
                 # Tool — it has its own CR (D20): under target side its inbound decides the tool calls,
@@ -1433,12 +1454,15 @@ def onboarded_stack(
 
                 if not poll_until(_tool_converged, timeout=ONBOARD_TIMEOUT, interval=5):
                     raise RuntimeError(
-                        f"tool did not converge after deploy within {ONBOARD_TIMEOUT:.0f}s: {seen['state']} "
-                        f"(scopes = all of {sorted(scn.TOOL_SCOPES)} provisioned; spm = SPM({scn.TOOL_WORKLOAD}) "
-                        f"stored; cr = its AuthorizationPolicy CR with both request packages). A failed "
-                        "onboarding check (D30: the tool pod has no authbridge-proxy sidecar — injectTools; no "
-                        "opa / mcp-parser in the namespace inbound pipeline; an httpGet probe) leaves no CR — "
-                        "see the Controller log and k8s/opa-kind-enable.sh."
+                        append_hint(
+                            f"tool did not converge after deploy within {ONBOARD_TIMEOUT:.0f}s: {seen['state']} "
+                            f"(scopes = all of {sorted(scn.TOOL_SCOPES)} provisioned; spm = "
+                            f"SPM({scn.TOOL_WORKLOAD}) stored; cr = its AuthorizationPolicy CR with both request "
+                            "packages). A failed onboarding check (D30: the tool pod has no authbridge-proxy "
+                            "sidecar — injectTools; no opa / mcp-parser in the namespace inbound pipeline; an "
+                            "httpGet probe) leaves no CR — see the Controller log and k8s/opa-kind-enable.sh.",
+                            controller_commit_race_hint(deployed_at, admin=admin, workload=workload),
+                        )
                     )
 
             # The workload converged, so its Provision ran and linked the subject scope (D31). Fail fast
@@ -2156,12 +2180,94 @@ def controller_llm_unusable():
     return controller_env({LLM_BASE_URL_ENV: UNUSABLE_LLM_BASE_URL})
 
 
-def controller_logs() -> str:
-    """The current Controller pod's full log (the app container). The consumer logs each PRB failure
-    (``log_by_type``) and each dead-letter move at ERROR, so both reach the pod's stderr."""
-    return kubectl(
-        "logs", "-n", CONTROLLER_NAMESPACE, resolve_controller_pod(), "-c", CONTROLLER_DEPLOYMENT, timeout=60
+def controller_logs(*, since: datetime | None = None, tail: int | None = None) -> str:
+    """The current Controller pod's log (the app container): the full log, or with ``since`` only the
+    lines from that time (``--since-time``, RFC 3339 in UTC) and with ``tail`` at most the last ``tail``
+    lines. The consumer logs each PRB failure (``log_by_type``) and each dead-letter move at ERROR, so
+    both reach the pod's stderr."""
+    args = ["logs", "-n", CONTROLLER_NAMESPACE, resolve_controller_pod(), "-c", CONTROLLER_DEPLOYMENT]
+    if since is not None:
+        args.append(f"--since-time={since.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}")
+    if tail is not None:
+        args.append(f"--tail={tail}")
+    return kubectl(*args, timeout=60)
+
+
+# --- The event-before-commit race (handoff 20, D33) — the hint for a deploy gate that times out -----
+# Before handoff 20 the ``aiac-event-listener`` SPI published ``CLIENT_CREATED`` inside Keycloak's admin
+# request, before the commit. The Controller's first IdP read could then get Keycloak's 404 "Could not
+# find client", and the onboarding started only with the NATS redelivery after ``ACK_WAIT`` (600 s).
+# Now the SPI publishes after the commit and the Controller reads a new client again for a bounded time
+# (``ONBOARD_CLIENT_WAIT_*``). A deploy gate that still times out appends the hint to its message.
+
+# A Controller line of the race: Keycloak's 404 text (not ``client scope`` or a longer word), or the
+# Controller's own error for a client that is still not visible after the bounded wait.
+_COMMIT_RACE_LINE = re.compile(r"Could not find client(?![A-Za-z]| scope)|ServiceNotVisibleError")
+# The live read is bounded: from this slack (seconds) before the deploy (the host and the cluster clocks
+# can differ a little), and at most the last ``CONTROLLER_LOG_TAIL`` lines.
+CONTROLLER_LOG_SLACK_SECONDS = 30.0
+CONTROLLER_LOG_TAIL = 5000
+# The hint quotes the first matching line, cut to this length.
+_HINT_LINE_CHARS = 400
+
+
+def commit_race_hint(log_text: str, *, service_uuid: str | None = None) -> str:
+    """The gate-message hint for the event-before-commit race (handoff 20, D33), from the Controller log
+    text ``log_text``: ``""`` when no line shows the race, else one paragraph with the number of
+    matching lines, the first one (cut to ``_HINT_LINE_CHARS``), the probable cause and what to check.
+
+    A matching line has Keycloak's ``Could not find client`` (not ``Could not find client scope``) or the
+    Controller's ``ServiceNotVisibleError``. With ``service_uuid`` only the lines that name that client
+    UUID count (the Controller's error line names the service it read), so a redelivery for a client
+    that an earlier run deleted gives no hint. Pure — no I/O."""
+    lines = [
+        line.strip()
+        for line in log_text.splitlines()
+        if _COMMIT_RACE_LINE.search(line) and (service_uuid is None or service_uuid in line)
+    ]
+    if not lines:
+        return ""
+    first = lines[0] if len(lines[0]) <= _HINT_LINE_CHARS else lines[0][: _HINT_LINE_CHARS - 3] + "..."
+    which = "for this client" if service_uuid is not None else "(any client)"
+    return (
+        f"The Controller log has {len(lines)} line(s) that show Keycloak's 404 'Could not find client' "
+        f"(or ServiceNotVisibleError) {which}, first: {first!r}. The onboarding event probably "
+        "came before Keycloak committed the new client (the event-before-commit race, handoff 20 / D33): "
+        "the first IdP read got 404, so the onboarding waited for a NATS redelivery. Check that the "
+        "Keycloak image has the aiac-event-listener SPI that publishes after the commit, and that the "
+        "Controller has the bounded wait on its first read (ONBOARD_CLIENT_WAIT_ATTEMPTS / "
+        "ONBOARD_CLIENT_WAIT_BACKOFF, about 30 s by default)."
     )
+
+
+def append_hint(message: str, hint: str) -> str:
+    """``message`` with ``hint`` after it (one space), or ``message`` alone when there is no hint."""
+    return f"{message} {hint}" if hint else message
+
+
+def controller_commit_race_hint(since: datetime | None = None, *, admin=None, workload: str | None = None) -> str:
+    """``commit_race_hint`` over the live Controller log, for the failure message of a deploy gate.
+
+    Reads only a bounded part of the log: the lines from ``CONTROLLER_LOG_SLACK_SECONDS`` before
+    ``since`` (the deploy start; ``None`` = no time window), at most the last ``CONTROLLER_LOG_TAIL``.
+    With ``admin`` and ``workload`` only the lines of that workload's client (its UUID) count; a client
+    that is gone, or a failed lookup, counts every line. Call it while the Controller pod that ran the
+    onboarding still runs: a restarted pod has a new log. Read-only and best-effort: a failure is logged
+    at WARNING and gives ``""``, never an exception, so the hint cannot replace the gate's own error."""
+    uuid = None
+    if admin is not None and workload is not None:
+        try:
+            client = workload_client(admin, workload)
+            uuid = client.get("id") if client else None
+        except Exception as exc:  # noqa: BLE001 — best-effort: without the UUID every line counts
+            log.warning("race hint: the client lookup of %r failed, so every line counts: %s", workload, exc)
+    start = since - timedelta(seconds=CONTROLLER_LOG_SLACK_SECONDS) if since is not None else None
+    try:
+        return commit_race_hint(controller_logs(since=start, tail=CONTROLLER_LOG_TAIL), service_uuid=uuid)
+    except Exception as exc:  # noqa: BLE001 — best-effort: a hint never replaces the gate's own error
+        detail = (getattr(exc, "stderr", "") or str(exc)).strip()[:300]
+        log.warning("race hint: could not read the Controller log: %s", detail)
+        return ""
 
 
 def publish_service_event(service_uuid: str) -> None:

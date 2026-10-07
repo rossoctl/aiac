@@ -77,13 +77,18 @@ restarts. They import three shared modules:
   `restart_controller` (rollout restart + wait for Ready), and `controller_enforcement_side(side)`
   (patch `AIAC_ENFORCEMENT_SIDE` in `aiac-agent-config`, restart the Controller, and restore the
   original value with a second restart on every exit path). The subject-scope check (D31) is
-  `SUBJECT_SCOPE` (`aiac-username-sub`), the pure helper `subject_scope_problems`, and
-  `require_subject_scope` (see *[Per-rung flow](#per-rung-flow)*, step 2).
+  `SUBJECT_SCOPE` (`aiac-username-sub`), the pure helper `subject_scope_problems`, its live reader
+  `subject_scope_link_problems`, and `require_subject_scope` (see *[Per-rung flow](#per-rung-flow)*,
+  step 2). The rung-2 `sub` probes are `login_subject` (a password-grant token through `rossoctl`) and
+  `exchanged_subject` (a token exchanged as the agent client to the tool audience). The race hint
+  (handoff 20, D33) is the pure helper `commit_race_hint`, its live reader
+  `controller_commit_race_hint`, and `append_hint` (see *[Per-rung flow](#per-rung-flow)*, step 2).
   Resolution-by-`name` (`"{ns}/github-agent"` / `"{ns}/github-tool"`) is still how the harness
   **reads back** Keycloak state; it no longer resolves an internal UUID to trigger onboarding (except
   rung 5, which re-fires the trigger for an existing client — see below).
 - `launcher.py` — the shared live-cluster half: `kubectl` wrappers, `port_forward`, `resolve_pod`,
-  `mint_token`, `jwt_claim`, `inbound_probe` / `outbound_probe`, `inbound_outcome` / `outbound_outcome`
+  `mint_token`, `exchange_token` (an RFC 8693 token exchange as a client; it raises
+  `TokenExchangeError`), `jwt_claim`, `inbound_probe` / `outbound_probe`, `inbound_outcome` / `outbound_outcome`
   (classified by body, not status: an OPA denial → `deny`, a token-exchange refusal → `error`),
   `poll_until`, and the skip gates (`require_pipeline`,
   `require_env_or_skip`, `require_event_path`, `verify_subject_mapper`). There is **no** `opa_eval`, no `kubectl_cp` of
@@ -278,10 +283,40 @@ real requests + assert → full teardown.**
 
      Sequential deploy-and-wait is what keeps rung order meaningful (rung 2: agent→tool; rung 3:
      tool→agent) and the order-independence proof intact.
+   - **The gate budgets and the event-before-commit race (handoff 20, D33).** The agent gate polls up
+     to `AIAC_BUNDLE_TIMEOUT` (default 300 s) and the tool gate up to `AIAC_ONBOARD_TIMEOUT` (default
+     600 s). An SPI without the handoff-20 fix publishes `CLIENT_CREATED` before Keycloak commits the
+     new client. Then the Controller's first IdP read gets Keycloak's `404 "Could not find client"`,
+     and the onboarding starts only with the NATS redelivery after `ACK_WAIT` (600 s), so one race hit
+     fails the gate. The fix has two layers. The Keycloak image with the SPI that publishes after the
+     commit removes the race. The IdP Configuration Service (`aiac-pdp-config`), which keeps a Keycloak
+     `404`, and the Controller (`aiac-agent`), which then reads a new client again for a bounded time
+     (`ONBOARD_CLIENT_WAIT_ATTEMPTS` / `ONBOARD_CLIENT_WAIT_BACKOFF`, about 30 s by default), are
+     defense in depth. Use the default gates when the deployed SPI image has the fix, or when both the
+     IdP Configuration Service and the Controller images have it. Otherwise one race hit can still fail
+     the gate. **To verify live (handoff 20):** rungs 1, 2 and 3 pass with the default gates (rung 2 at
+     least twice). Remove this marker after that run.
+   - **The race hint in a gate failure.** When the agent gate or the tool gate times out, its
+     `RuntimeError` message ends with a hint if the Controller log shows the race:
+     `controller_commit_race_hint` reads the Controller log (`kubectl logs`, the current
+     `app=aiac-agent` pod in `aiac-system`, container `aiac-agent`) from 30 s before the deploy, at most
+     the last 5000 lines. The pure helper `commit_race_hint` keeps only the lines with Keycloak's
+     `Could not find client` (not `Could not find client scope`) or the Controller's
+     `ServiceNotVisibleError` that name the UUID of the workload's client (if the client is gone or
+     its lookup fails, every such line counts). So a redelivery for a client of an earlier run gives no hint.
+     The hint gives the number of
+     these lines and the first one, says that the onboarding event probably came before the Keycloak
+     commit (handoff 20 / D33), and tells what to check: that the Keycloak image has the
+     `aiac-event-listener` SPI that publishes after the commit, and that the Controller has the bounded
+     wait (`ONBOARD_CLIENT_WAIT_*`). With no such line there is no hint. The read is read-only and
+     best-effort: a failure gives a warning and no hint, never an exception, so the gate's own error
+     stays.
    - **The subject scope (D31), for each workload.** Right after a workload converges,
      `onboarded_stack` calls `require_subject_scope(admin, workload)`. It checks with the admin API
-     that `aiac-username-sub` exists, has the `username-to-sub` mapper and no `aiac.managed` marker,
-     and is a default scope of the workload's client. AIAC makes this link at onboarding, so a missing
+     that `aiac-username-sub` exists, has a mapper with the `username → sub` mapping (it checks the
+     mapper type and mapping, not the mapper name) and no `aiac.managed` marker, and is a default scope
+     of the workload's client, and that the login client `rossoctl` does not link it. AIAC makes this
+     link at onboarding, so a missing
      link is an AIAC fault: the check **fails** (it raises `RuntimeError` that lists the problems), it
      does not skip. So a missing link gives a clear message at once, not only a deny in the step-4
      poll.
@@ -334,8 +369,9 @@ real requests + assert → full teardown.**
       - Verdicts are **computed from** `scenario_uc1.py`, never from the policy. A failing node names the
         exact cell.
    3. **The subject on every leg (D31)** — rung 2.
-      - `test_subject_scope_linked`: `aiac-username-sub` exists, has the `username-to-sub` mapper and
-        no `aiac.managed` marker; both clients (github-agent and github-tool) link it as a default
+      - `test_subject_scope_linked`: `aiac-username-sub` exists, has a mapper with the
+        `username → sub` mapping (type and mapping, not the name) and no `aiac.managed` marker; both
+        clients (github-agent and github-tool) link it as a default
         scope; `rossoctl` does not link it and still has its own `username-to-sub` mapper; a `rossoctl`
         password-grant token for `dev-user` has `sub` = `dev-user`.
       - `test_exchanged_token_subject_is_username`: one node per user. A standard token exchange as
@@ -465,6 +501,11 @@ changed combiner denies a pod that has no client CR, so a deleted CR means deny.
   `initialize`, `tools/list` and `tools/call` are denied for `devops-user` (no grant). Under target
   side, github-tool's inbound decides the session (D26), and the agent's outbound passes it through.
   Under agent side, the agent's outbound decides it (the MCP session rule).
+- **The race hint (handoff 20, D33).** A failed onboarding that does not settle (the failed agent and
+  the failed tool), and a tool that does not converge on the happy path, add the event-before-commit
+  race hint to their message (see *[Per-rung flow](#per-rung-flow)*, step 2). The rung reads the hint
+  while the Controller pod that ran the onboarding still runs, because the restore of the injection
+  restarts the Controller.
 
 ## Controller restart — the resync and the no-CR deny (rung 6)
 
@@ -644,7 +685,9 @@ The suite reads its config from the repo-root `.env` (gitignored); source it bef
 > `svc/aiac-policy-model-store-service` on `7074`), the abstract-policy ConfigMap/mount
 > (`AIAC_POLICY_CONFIGMAP` / `AIAC_POLICY_MOUNT_PATH`), the agent Deployment to restart
 > (`AIAC_AGENT_DEPLOYMENT`), the Kind cluster name (`AIAC_KIND_CLUSTER`), the timeouts (`AIAC_DEPLOY_TIMEOUT`,
-> `AIAC_BUNDLE_TIMEOUT`, `AIAC_BUNDLE_POLL_INTERVAL`), and the rung-5 knobs (`AIAC_ROLLBACK_SETTLE_TIMEOUT`,
+> `AIAC_BUNDLE_TIMEOUT`, `AIAC_ONBOARD_TIMEOUT`, `AIAC_BUNDLE_POLL_INTERVAL`; defaults 180 s, 300 s, 600 s
+> and 10 s; with the handoff-20 fix deployed, do not raise them for the event-before-commit race,
+> see *[Per-rung flow](#per-rung-flow)*, step 2), and the rung-5 knobs (`AIAC_ROLLBACK_SETTLE_TIMEOUT`,
 > `AIAC_ROLLBACK_LIFT_TIMEOUT`, `AIAC_UNUSABLE_LLM_BASE_URL`). Single stack — one Controller, one policy; the two-variant env
 > (`AIAC_EXPLICIT_URL`/`AIAC_ABSTRACT_URL`, per-variant OPA pods) is gone with the two-stack topology.
 
@@ -761,10 +804,16 @@ Rungs 6 and 7 restart the Controller twice each, so each one takes several minut
     before the bootstrap, Provision and the PRB, D30), the bootstrap of a tool before Provision, and the
     read-only route `GET /policy/services/{service_id:path}` (D18). For D31: Provision links the
     subject scope before `set_service_type`, keeps it out of the created-manifest, and the rollback
-    never deletes it; `test_uc1_subject_scope.py` covers the harness helper `subject_scope_problems`.
+    never deletes it; `test_uc1_subject_scope.py` covers the harness helpers `subject_scope_problems`,
+    `subject_scope_link_problems`, `require_subject_scope`, `exchange_token` and `exchanged_subject`.
+    For handoff 20 (D33): `test_uc1_commit_race_hint.py` covers the harness race hint
+    (`commit_race_hint`, `append_hint`, `controller_commit_race_hint` and the bounded `controller_logs`
+    read), with `kubectl` stubbed.
   - `test/unit/idp/` — the subject scope (D31): `POST /services/{service_id}/subject-scope` creates
     `aiac-username-sub` and its mapper with no marker (idempotent, also after a `409` from a
-    concurrent onboarding), removes an optional link, and links the scope as a default scope; the
+    concurrent onboarding), changes a wrong `username-to-sub` mapper back, gives `409` on a scope that
+    has the marker, removes an optional link, and links the scope as a default scope;
+    `GET /services/{service_id}/scopes` gives `200` for a client that links the unmarked scope; the
     library method `link_subject_scope`.
 - **Stack's realm, leave-in-place; per-rung cleanup.** UC-1 resolves/provisions against the deployed
   stack's `KEYCLOAK_REALM` (default `rossoctl`) and **never deletes** the realm/users/roles. Per rung,
