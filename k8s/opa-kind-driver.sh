@@ -31,8 +31,15 @@
 #     B.1    add the github-tool outbound route
 #     B.2    grant github-agent the exchange scope   (expect HTTP 204)
 #     B.3    restart github-agent to load the route
+#            precheck (read only): the github-agent Keycloak client links the
+#            client scope aiac-username-sub as a DEFAULT scope (D31). If not
+#            (missing, or optional only), the driver stops at once with the
+#            cause and the fix, and does not run B.4
 #     B.4    outbound tools/list probe as dev-user to github-tool:9090/mcp
-#            (with the MCP Accept header) -> ALLOWED: github-agent's outbound
+#            (with the MCP Accept header) -> ALLOWED only when github-agent
+#            links aiac-username-sub as a default scope (AIAC onboarded
+#            github-agent with the D31 images; the precheck above makes sure of
+#            this), so the exchanged token has sub=dev-user: github-agent's outbound
 #            pass-through lets it through, github-tool's inbound session rule
 #            allows it, and the reply is a JSON-RPC result frame that lists
 #            the four tools. Any deny (a 403 from github-tool's inbound, an
@@ -195,6 +202,52 @@ admin_token() {
         | python3 -c 'import sys,json;print(json.load(sys.stdin).get("access_token",""))' 2>/dev/null || true)
   [ -n "$tok" ] || die "could not obtain a Keycloak master admin token (admin/admin) at ${KC}"
   printf '%s' "$tok"
+}
+
+# The client scope that sets sub=<username> in an exchanged token (D31).
+SUBJECT_SCOPE="aiac-username-sub"
+
+# scope_linked <admin> <client-uuid> <default|optional>  — read only (GET). Print
+# "yes" when the client links the client scope aiac-username-sub as that kind of
+# scope, "no" when it does not, and "error" when the admin API reply is not a list.
+scope_linked() {
+  local admin="$1" cid="$2" kind="$3" res
+  res=$(curl -s -H "Authorization: Bearer $admin" \
+          "${KC}/admin/realms/${REALM}/clients/${cid}/${kind}-client-scopes" \
+        | python3 -c 'import sys,json
+try: d=json.load(sys.stdin)
+except Exception: d=None
+if not isinstance(d,list): print("error")
+else: print("yes" if any(isinstance(s,dict) and s.get("name")==sys.argv[1] for s in d) else "no")' \
+            "$SUBJECT_SCOPE" 2>/dev/null || true)
+  printf '%s' "${res:-error}"
+}
+
+# check_subject_scope <client-uuid>  — the B.4 precheck (D31), read only. The
+# token that github-agent exchanges for github-tool gets sub=<username> only from
+# the client scope aiac-username-sub, linked as a DEFAULT scope of the
+# github-agent client (AIAC Provision links it at onboarding). Without that link
+# the B.4 probe is denied only after POLL_SECS. So stop here at once with the
+# cause and the fix.
+check_subject_scope() {
+  local cid="$1" admin def opt cause fix
+  admin="$(admin_token)"
+  def="$(scope_linked "$admin" "$cid" default)"
+  [ "$def" != "error" ] \
+    || die "could not read the default client scopes of the github-agent Keycloak client (${cid}) at ${KC}"
+  if [ "$def" = "yes" ]; then
+    pass "github-agent links the client scope ${SUBJECT_SCOPE} as a default scope (D31): the exchanged token gets sub=dev-user"
+    return 0
+  fi
+  opt="$(scope_linked "$admin" "$cid" optional)"
+  cause="the token that github-agent exchanges for github-tool keeps sub = the Keycloak user ID of dev-user, but github-tool's inbound keys users by username. So B.4 would be DENIED by github-tool's inbound OPA (DENIED_TOOL_INBOUND)."
+  fix="Fix: let AIAC onboard github-agent with the D31 images. Or run its onboarding again: POST /apply/service/${cid} on the Controller (svc/aiac-agent-service:7070 in aiac-system), or POST /services/${cid}/subject-scope on the IdP Configuration Service (svc/aiac-pdp-config-service:7071 in aiac-system). See the runbook Prerequisites (D31)."
+  if [ "$opt" = "yes" ]; then
+    die "github-agent links the client scope ${SUBJECT_SCOPE} only as an OPTIONAL scope, not as a default scope (D31). The mapper of an optional scope runs only when the token request names that scope, and the token exchange does not name it. Thus ${cause}
+     ${fix}"
+  fi
+  die "github-agent does not link the client scope ${SUBJECT_SCOPE} as a default scope (D31): AIAC has not onboarded github-agent, or onboarded it with images older than D31. Thus ${cause}
+     ${fix}"
 }
 
 # ── Cluster helpers ──────────────────────────────────────────────────────────
@@ -557,6 +610,12 @@ kubectl wait --for=condition=ready pod -n "$NS" -l "$AGENT_LABEL" --timeout=120s
   || die "github-agent did not become Ready within 120s after restart"
 pass "github-agent restarted and Ready"
 
+step "B.4 precheck — github-agent links the client scope ${SUBJECT_SCOPE} as a default scope (D31)"
+# Read only: GET the default (and, if needed, the optional) client scopes of the
+# github-agent client that B.2 found (CID). check_subject_scope gets a new admin
+# token, because the B.2 token can expire during the B.3 restart.
+check_subject_scope "$CID"
+
 step "B.4 — Outbound probe as dev-user (tools/list to github-tool:9090/mcp) — expect ALLOWED"
 info "the call crosses github-agent's outbound OPA (the github-agent CR's outbound package: a"
 info "pass-through) and github-tool's inbound OPA (the github-tool CR's inbound package: the tool"
@@ -645,7 +704,7 @@ case "$OB_VERDICT" in
   APP_REJECTED*)
     die "the github-tool app answered HTTP ${OB_HTTP:-?} with no AuthBridge rejection: the call passed both OPA checks, but the app refused the request. Check the probe URL (/mcp) and the header Accept: application/json, text/event-stream." ;;
   DENIED_TOOL_INBOUND)
-    die "outbound tools/list DENIED by github-tool's inbound OPA (HTTP 403, plugin=opa) after ${POLL_SECS}s. The github-tool CR's inbound session rule allows tools/list for dev-user through github-agent. Check that A.3 applied the github-tool CR, that its bundle has propagated, and that the exchanged token has sub=dev-user and azp=${EXPECTED_SPIFFE} (sub=dev-user needs the client scope aiac-username-sub, which AIAC links to github-agent at onboarding, D31; see the runbook Prerequisites)." ;;
+    die "outbound tools/list DENIED by github-tool's inbound OPA (HTTP 403, plugin=opa) after ${POLL_SECS}s. The github-tool CR's inbound session rule allows tools/list for dev-user through github-agent. Check that A.3 applied the github-tool CR, that its bundle has propagated, and that the exchanged token has sub=dev-user and azp=${EXPECTED_SPIFFE} (sub=dev-user needs the client scope aiac-username-sub as a default scope of github-agent, which AIAC links at onboarding, D31; the B.4 precheck found that link, so look first at the CR and its bundle; see the runbook Prerequisites)." ;;
   "DENIED_PLUGIN opa")
     die "outbound tools/list DENIED by github-agent's outbound OPA (a JSON-RPC error frame at HTTP 200, plugin=opa) after ${POLL_SECS}s. Under target side the github-agent CR's outbound is a pass-through: check that A.3 applied the example CRs (an agent-side CR may still be in place) and that the bundle has propagated." ;;
   "DENIED_PLUGIN token-exchange")
