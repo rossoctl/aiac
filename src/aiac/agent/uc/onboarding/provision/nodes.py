@@ -11,7 +11,6 @@ as an `HTTPException(502, ...)` whose message names the workload and the specifi
 missing/invalid label — actionable, never silent.
 """
 
-import os
 import time
 from dataclasses import dataclass
 
@@ -49,7 +48,7 @@ class WaitConfig:
 # ``classify_service`` can run BEFORE the operator has patched the label onto the pod. A briefly-absent
 # label is therefore a transient not-ready state, re-polled before we give up with a 502. Defaults
 # ≈ 30s of slack (well under the NATS ACK_WAIT and the system-test convergence poll); tests set fast.
-LABEL_WAIT = WaitConfig("ONBOARD_LABEL_WAIT_ATTEMPTS", "ONBOARD_LABEL_WAIT_BACKOFF", 15, 2.0)
+_LABEL_WAIT = WaitConfig("ONBOARD_LABEL_WAIT_ATTEMPTS", "ONBOARD_LABEL_WAIT_BACKOFF", 15, 2.0)
 
 # Deploy->onboard race tolerance for the AgentCard skill sync — a SECOND, later race than the label one
 # above. The operator syncs the fetched A2A card onto ``status.card.skills`` only AFTER the agent pod is
@@ -107,13 +106,9 @@ _MCP_READY_INTERVAL = 3.0  # seconds between readiness attempts (patched in unit
 
 
 def _mcp_ready_timeout() -> float:
-    """The discovery readiness budget in seconds; an unset, non-numeric or negative value falls
-    back to the default."""
-    try:
-        value = float(os.getenv(_MCP_READY_TIMEOUT_ENV, str(_MCP_READY_TIMEOUT_DEFAULT)))
-    except (TypeError, ValueError):
-        return _MCP_READY_TIMEOUT_DEFAULT
-    return value if value >= 0 else _MCP_READY_TIMEOUT_DEFAULT
+    """The discovery readiness budget in seconds; an unset, non-numeric, non-finite or negative
+    value falls back to the default."""
+    return env_num(_MCP_READY_TIMEOUT_ENV, _MCP_READY_TIMEOUT_DEFAULT, float, minimum=0.0)
 
 
 def _endpoint_not_ready(exc: Exception) -> bool:
@@ -173,7 +168,7 @@ def _owned_by(pod, workload_name: str) -> bool:
     return False
 
 
-def owned_pods(pods, workload_name: str) -> list:
+def _owned_pods(pods, workload_name: str) -> list:
     """Every pod owned by ``workload_name`` (see ``_owned_by``), in list order."""
     return [pod for pod in pods if _owned_by(pod, workload_name)]
 
@@ -191,7 +186,7 @@ def split_client_name(service_id: str, name: str | None) -> tuple[str, str]:
     return namespace, workload_name
 
 
-def pod_service_type(pod, workload_name: str) -> ServiceType | None:
+def _pod_service_type(pod, workload_name: str) -> ServiceType | None:
     """The service type from the operator's ``rossoctl.io/type`` label of ``pod``, or ``None`` while
     the label is absent (a deploy->onboard race). A label that is present with a value other than
     ``agent``/``tool`` is a real misconfiguration that no wait can fix: ``HTTPException(502)`` now."""
@@ -207,7 +202,7 @@ def pod_service_type(pod, workload_name: str) -> ServiceType | None:
         )
 
 
-def label_missing_detail(workload_name: str, pod) -> str:
+def _label_missing_detail(workload_name: str, pod) -> str:
     """The 502 detail of an exhausted wait for the ``rossoctl.io/type`` label of ``pod``."""
     label = (getattr(pod.metadata, "labels", None) or {}).get(_TYPE_LABEL)
     return (
@@ -268,18 +263,18 @@ def await_labelled_pods(namespace: str, workload_name: str, settled=None) -> tup
         except Exception as e:
             raise HTTPException(502, f"Kubernetes pod LIST failed in namespace {namespace!r}: {e}")
 
-        pods = [p for p in owned_pods(items, workload_name) if getattr(p.metadata, "deletion_timestamp", None) is None]
+        pods = [p for p in _owned_pods(items, workload_name) if getattr(p.metadata, "deletion_timestamp", None) is None]
         if not pods:
             return None
         # Present but not agent/tool raises now: a real misconfiguration, never a race.
-        service_type = pod_service_type(pods[0], workload_name)
+        service_type = _pod_service_type(pods[0], workload_name)
         if service_type is None:
-            detail = label_missing_detail(workload_name, pods[0])
+            detail = _label_missing_detail(workload_name, pods[0])
             return None
         last = (service_type, pods)
         return last if settled is None or settled(service_type, pods) else None
 
-    ready = poll_until_ready(_probe, LABEL_WAIT)
+    ready = poll_until_ready(_probe, _LABEL_WAIT)
     if ready is not None:
         return ready
     if last is not None:
