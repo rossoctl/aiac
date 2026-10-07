@@ -60,6 +60,28 @@ try: print(json.load(sys.stdin).get("access_token","") or "")
 except Exception: print("")'
 }
 
+# json_eval <python-expr> — evaluate <python-expr> over the JSON on stdin (bound to `d`; env vars via
+# `os.environ`) and print the result (one line per item when it returns a newline-joined string).
+# Prints "" (exit 0) instead of raising on a Keycloak error body or an unreachable server, so a
+# half-torn-down cluster degrades to "nothing found" rather than a `set -e` abort.
+json_eval() {
+  python3 -c '
+import sys, json, os
+try:
+    d = json.load(sys.stdin)
+    r = eval(sys.argv[1])
+except Exception:
+    r = ""
+print("" if r is None else r)' "$1"
+}
+
+# client_uuid_by_name <name> — the Keycloak client looked up by its "name" DISPLAY field
+# (e.g. "team1/github-agent"), not clientId. Prints "" if not found.
+client_uuid_by_name() {
+  curl -s -H "Authorization: Bearer ${ADMIN}" "${KC}/admin/realms/${REALM}/clients" \
+    | CLIENT_NAME="$1" json_eval 'next((c["id"] for c in d if c.get("name") == os.environ["CLIENT_NAME"]), "")'
+}
+
 echo "==> 1. Reverting authproxy-routes (dropping the github-tool route)"
 kubectl patch configmap authproxy-routes -n "$NS" --type merge -p "$(python3 -c '
 import json
@@ -68,10 +90,9 @@ print(json.dumps({"data":{"routes.yaml": ""}}))')" || true
 echo "==> 2. Removing the optional client-scope from github-agent (if present)"
 ADMIN="$(admin_token)"
 if [ -n "$ADMIN" ]; then
-  AGENT_UUID=$(curl -s -H "Authorization: Bearer ${ADMIN}" "${KC}/admin/realms/${REALM}/clients" \
-    | python3 -c 'import sys,json;print(next((c["id"] for c in json.load(sys.stdin) if c.get("name")=="team1/github-agent"),""))')
+  AGENT_UUID="$(client_uuid_by_name "${NS}/github-agent")"
   SCOPE_ID=$(curl -s -H "Authorization: Bearer ${ADMIN}" "${KC}/admin/realms/${REALM}/client-scopes" \
-    | python3 -c 'import sys,json;print(next((s["id"] for s in json.load(sys.stdin) if s["name"]=="agent-team1-github-tool-aud"),""))')
+    | SCOPE_NAME="agent-${NS}-github-tool-aud" json_eval 'next((s["id"] for s in d if s.get("name") == os.environ["SCOPE_NAME"]), "")')
   if [ -n "$AGENT_UUID" ] && [ -n "$SCOPE_ID" ]; then
     curl -s -o /dev/null -w "    remove scope HTTP %{http_code}\n" -X DELETE \
       -H "Authorization: Bearer ${ADMIN}" \
@@ -80,16 +101,9 @@ if [ -n "$ADMIN" ]; then
     echo "    (client or scope not found — nothing to remove)"
   fi
 
-  echo "==> 3. Deleting the Keycloak clients team1/github-agent, team1/github-tool"
-  for name in "team1/github-agent" "team1/github-tool"; do
-    UUID=$(curl -s -H "Authorization: Bearer ${ADMIN}" "${KC}/admin/realms/${REALM}/clients" \
-      | CLIENT_NAME="$name" python3 -c '
-import sys, json, os
-name = os.environ["CLIENT_NAME"]
-for c in json.load(sys.stdin):
-    if c.get("name") == name:
-        print(c["id"]); break
-')
+  echo "==> 3. Deleting the Keycloak clients ${NS}/github-agent, ${NS}/github-tool"
+  for name in "${NS}/github-agent" "${NS}/github-tool"; do
+    UUID="$(client_uuid_by_name "$name")"
     if [ -n "$UUID" ]; then
       curl -s -o /dev/null -w "    delete ${name} HTTP %{http_code}\n" -X DELETE \
         -H "Authorization: Bearer ${ADMIN}" "${KC}/admin/realms/${REALM}/clients/${UUID}"
@@ -108,29 +122,17 @@ echo "     so a stale scope/role from a prior onboarding cycle causes a 409/502 
 if [ -n "$ADMIN" ]; then
   for component in github-agent github-tool; do
     SCOPE_IDS=$(curl -s -H "Authorization: Bearer ${ADMIN}" "${KC}/admin/realms/${REALM}/client-scopes" \
-      | COMPONENT="$component" AUD_NAME="agent-${NS}-${component}-aud" python3 -c '
-import sys, json, os
-component = os.environ["COMPONENT"]
-aud_name = os.environ["AUD_NAME"]
-for s in json.load(sys.stdin):
-    name = s.get("name", "")
-    if name.startswith(component + ".") or name == aud_name:
-        print(s["id"])
-')
+      | COMPONENT="$component" AUD_NAME="agent-${NS}-${component}-aud" json_eval '"\n".join(
+    s["id"] for s in d
+    if s.get("name", "").startswith(os.environ["COMPONENT"] + ".") or s.get("name") == os.environ["AUD_NAME"])')
     for id in $SCOPE_IDS; do
       curl -s -o /dev/null -w "    delete client-scope (${component}) ${id} HTTP %{http_code}\n" -X DELETE \
         -H "Authorization: Bearer ${ADMIN}" "${KC}/admin/realms/${REALM}/client-scopes/${id}"
     done
 
     ROLE_NAMES=$(curl -s -H "Authorization: Bearer ${ADMIN}" "${KC}/admin/realms/${REALM}/roles" \
-      | COMPONENT="$component" python3 -c '
-import sys, json, os
-component = os.environ["COMPONENT"]
-for r in json.load(sys.stdin):
-    name = r.get("name", "")
-    if name.startswith(component + "."):
-        print(name)
-')
+      | COMPONENT="$component" json_eval '"\n".join(
+    r["name"] for r in d if r.get("name", "").startswith(os.environ["COMPONENT"] + "."))')
     while IFS= read -r role; do
       [ -n "$role" ] || continue
       curl -s -o /dev/null -w "    delete role ${role} HTTP %{http_code}\n" -X DELETE \
@@ -148,10 +150,17 @@ echo "==> 6. Deleting github-agent/github-tool workloads (Deployment/Service/Ser
 kubectl delete -f "$ASSETS_DIR/agents/github_agent/k8s/github-agent-deployment.yaml" -n "$NS" --ignore-not-found
 kubectl delete -f "$ASSETS_DIR/tools/github_tool/k8s/github-tool-deployment.yaml" -n "$NS" --ignore-not-found
 
-echo "==> 7. Deleting leftover client-credentials Secrets in '${NS}'"
-kubectl get secret -n "$NS" -o name 2>/dev/null \
-  | { grep '^secret/rossoctl-keycloak-client-credentials-' || true; } \
-  | xargs -r kubectl delete -n "$NS" --ignore-not-found
+echo "==> 7. Deleting the github-agent/github-tool client-credentials Secrets in '${NS}'"
+# Only the demo's two Secrets, not every rossoctl-keycloak-client-credentials-* in the namespace
+# (other workloads have theirs there too). The operator names them deterministically from
+# (namespace, workload) — mirror of clientreg.KeycloakClientCredentialsSecretName in rossoctl/operator.
+for workload in github-agent github-tool; do
+  secret=$(NS="$NS" WORKLOAD="$workload" python3 -c '
+import hashlib, os
+key = os.environ["NS"] + "\0" + os.environ["WORKLOAD"] + "\0rossoctl-keycloak-client-credentials"
+print("rossoctl-keycloak-client-credentials-" + hashlib.sha256(key.encode()).hexdigest()[:16])')
+  kubectl delete secret "$secret" -n "$NS" --ignore-not-found
+done
 
 # ── --include-infra: reverse enable.sh's Keycloak-side changes ────────────────
 if [ "$DO_INFRA" -eq 1 ]; then

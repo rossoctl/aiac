@@ -107,7 +107,9 @@ fi
 
 TMPFILES=()
 # -rf, not -f: TMPFILES holds both files and the mktemp -d build dir (the derived-image context).
-cleanup() { [ "${#TMPFILES[@]}" -gt 0 ] && rm -rf "${TMPFILES[@]}"; }
+# An if, not `[ ... ] && rm`: as the EXIT trap's last command, a false test would become the
+# script's exit status (rc=1 after a successful --stack-only / --broker-only run).
+cleanup() { if [ "${#TMPFILES[@]}" -gt 0 ]; then rm -rf "${TMPFILES[@]}"; fi; }
 trap cleanup EXIT
 
 load_image_to_kind() {
@@ -328,10 +330,16 @@ DOCKERFILE
     echo "    waiting for Keycloak's token endpoint to come up..."
     sleep 5
   done
-  curl -s -o /dev/null -w "    events/config HTTP %{http_code}\n" -X PUT \
+  local events_http
+  events_http=$(curl -s -o /dev/null -w "%{http_code}" -X PUT \
     -H "Authorization: Bearer ${admin}" -H "Content-Type: application/json" \
     "${KC}/admin/realms/${REALM}/events/config" \
-    -d '{"adminEventsEnabled": true, "eventsListeners": ["jboss-logging", "aiac-event-listener"]}'
+    -d '{"adminEventsEnabled": true, "eventsListeners": ["jboss-logging", "aiac-event-listener"]}')
+  echo "    events/config HTTP ${events_http}"
+  if [ "$events_http" != "204" ]; then
+    echo "ERROR: enabling aiac-event-listener on realm '${REALM}' returned HTTP ${events_http} (expected 204)" >&2
+    exit 1
+  fi
 
   echo "==> [spi] Keycloak SPI installed and enabled."
   echo "    Verify: kubectl logs statefulset/${KEYCLOAK_STATEFULSET} -n ${KEYCLOAK_NAMESPACE} | grep -i aiac-event-listener"

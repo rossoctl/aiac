@@ -246,7 +246,9 @@ fi
 # ── 3. The whole aiac-system namespace ────────────────────────────────────────
 step "Deleting namespace ${AIAC_NS} (AIAC stack, NATS broker, Policy Model Store PVC, secrets)"
 if kubectl get ns "$AIAC_NS" >/dev/null 2>&1; then
-  run kubectl delete namespace "$AIAC_NS" --ignore-not-found --timeout="${NS_WAIT_SECS}s"
+  # `|| true`: a --timeout expiry exits non-zero, which under `set -e` would skip the Keycloak and
+  # OPA cleanup below. The `kubectl get ns` check right after reports the still-terminating case.
+  run kubectl delete namespace "$AIAC_NS" --ignore-not-found --timeout="${NS_WAIT_SECS}s" || true
   if [ "$DRY_RUN" -eq 0 ]; then
     if kubectl get ns "$AIAC_NS" >/dev/null 2>&1; then
       warn "${AIAC_NS} still terminating after ${NS_WAIT_SECS}s — check for a stuck finalizer: kubectl get ns ${AIAC_NS} -o yaml"

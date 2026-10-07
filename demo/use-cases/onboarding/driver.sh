@@ -110,8 +110,19 @@ DO_ENFORCE=1
 DO_REPLAY=0
 DO_COLLECT=0
 COLLECT_DIR=""
-# Args compose: at most one --only-* phase selector, optionally plus --collect-logs.
+# Args compose: at most one --only-* phase selector, optionally plus --collect-logs. Two different
+# selectors would switch every phase off and "pass" having done nothing, so reject them.
+ONLY_FLAG=""
 for arg in "$@"; do
+  case "$arg" in
+    --only-*)
+      if [ -n "$ONLY_FLAG" ] && [ "$ONLY_FLAG" != "$arg" ]; then
+        echo "Error: ${ONLY_FLAG} and ${arg} are mutually exclusive." >&2
+        exit 1
+      fi
+      ONLY_FLAG="$arg"
+      ;;
+  esac
   case "$arg" in
     --only-deploy) DO_WIRE=0; DO_ENFORCE=0 ;;
     --only-wire-outbound) DO_DEPLOY=0; DO_ENFORCE=0 ;;
@@ -174,18 +185,34 @@ try: print(json.load(sys.stdin).get("access_token","") or "")
 except Exception: print("")'
 }
 
+# json_eval <python-expr> — evaluate <python-expr> over the JSON on stdin (bound to `d`; env vars via
+# `os.environ`) and print the result. Prints "" (exit 0) instead of raising when the body is not the
+# expected JSON — a Keycloak error object, an empty list, an unreachable server — so the caller's
+# `[ -n ... ] || die` guard reports it, rather than `set -e` killing the script on a traceback.
+json_eval() {
+  python3 -c '
+import sys, json, os
+try:
+    d = json.load(sys.stdin)
+    r = eval(sys.argv[1])
+except Exception:
+    r = ""
+print("" if r is None else r)' "$1"
+}
+
 # client_uuid_by_name <name> <admin_token> — Keycloak clients are looked up by the "name" DISPLAY
 # field (e.g. "team1/github-agent"), not clientId. Prints "" if not found (caller checks).
 client_uuid_by_name() {
   local name="$1" admin="$2"
   curl -s -H "Authorization: Bearer ${admin}" "${KC}/admin/realms/${REALM}/clients" \
-    | CLIENT_NAME="$name" python3 -c '
-import sys, json, os
-name = os.environ["CLIENT_NAME"]
-for c in json.load(sys.stdin):
-    if c.get("name") == name:
-        print(c["id"]); break
-'
+    | CLIENT_NAME="$name" json_eval 'next((c["id"] for c in d if c.get("name") == os.environ["CLIENT_NAME"]), "")'
+}
+
+# scope_id_by_name <name> <admin_token> — the realm client-scope's id, or "" if absent (caller checks).
+scope_id_by_name() {
+  local name="$1" admin="$2"
+  curl -s -H "Authorization: Bearer ${admin}" "${KC}/admin/realms/${REALM}/client-scopes" \
+    | SCOPE_NAME="$name" json_eval 'next((s["id"] for s in d if s.get("name") == os.environ["SCOPE_NAME"]), "")'
 }
 
 latest_pod() {
@@ -347,14 +374,14 @@ phase_deploy() {
 phase_verify_trigger() {
   printf '\n%s%s====== Phase VERIFY-TRIGGER — Keycloak registered new clients, AIAC consumed them ======%s\n' "$C_BLD" "$C_CYN" "$C_RST"
 
-  step "Waiting for team1/github-agent + team1/github-tool clients to appear [timeout ${POLL_SECS}s]"
+  step "Waiting for ${NS}/github-agent + ${NS}/github-tool clients to appear [timeout ${POLL_SECS}s]"
   local deadline=$((SECONDS + POLL_SECS))
   AGENT_UUID=""
   TOOL_UUID=""
   while :; do
     ADMIN="$(admin_token)"
-    AGENT_UUID="$(client_uuid_by_name "team1/github-agent" "$ADMIN")"
-    TOOL_UUID="$(client_uuid_by_name "team1/github-tool" "$ADMIN")"
+    AGENT_UUID="$(client_uuid_by_name "${NS}/github-agent" "$ADMIN")"
+    TOOL_UUID="$(client_uuid_by_name "${NS}/github-tool" "$ADMIN")"
     [ -n "$AGENT_UUID" ] && [ -n "$TOOL_UUID" ] && break
     if [ "$SECONDS" -ge "$deadline" ]; then
       die "Keycloak never registered both clients within ${POLL_SECS}s (agent=${AGENT_UUID:-<none>}, tool=${TOOL_UUID:-<none>}). Check: kubectl logs deployment/rossoctl-controller-manager -n ${SYS_NS}"
@@ -406,14 +433,20 @@ print("yes" if os.environ["SCOPE"] in names else "")' 2>/dev/null || true)
     info "aiac-agent's verbose onboarding logs have since rotated; the provisioned scopes above are the durable proof of consumption"
   fi
 
-  step "Confirming a fresh AuthorizationPolicy CR for github-agent"
-  local before_rv="${ONBOARDING_BEFORE_RV:-<none>}" cr_deadline=$((SECONDS + POLL_SECS))
+  step "Confirming a fresh AuthorizationPolicy CR for github-agent [polling up to ${POLL_SECS}s]"
+  local before_rv="${ONBOARDING_BEFORE_RV:-<none>}" cr_start=$SECONDS cr_deadline=$((SECONDS + POLL_SECS)) cr_next_info=$((SECONDS + 30))
   AFTER_RV=""
   while :; do
     AFTER_RV=$(kubectl get "$POLICY_CR" github-agent -n "$NS" -o jsonpath='{.metadata.resourceVersion}' 2>/dev/null || echo "")
     if [ -n "$AFTER_RV" ] && [ "$AFTER_RV" != "$before_rv" ]; then break; fi
     if [ "$SECONDS" -ge "$cr_deadline" ]; then
       die "github-agent AuthorizationPolicy CR never appeared (still '${before_rv}') after ${POLL_SECS}s — AIAC may not have finished writing rules yet"
+    fi
+    # Policy generation is a chain of LLM calls and routinely takes minutes — say so, so a long
+    # quiet wait isn't mistaken for a hang.
+    if [ "$SECONDS" -ge "$cr_next_info" ]; then
+      info "still waiting for AIAC to write the CR ($((SECONDS - cr_start))s / ${POLL_SECS}s) — policy generation is LLM-bound; watch: kubectl logs -f deployment/aiac-agent -n ${AIAC_NS} | grep chat/completions"
+      cr_next_info=$((SECONDS + 30))
     fi
     sleep 5
   done
@@ -458,22 +491,24 @@ phase_wire_outbound() {
   printf '\n%s%s====== Phase WIRE — AuthBridge outbound leg (authproxy-routes + optional scope) ======%s\n' "$C_BLD" "$C_CYN" "$C_RST"
 
   step "Adding the github-tool outbound route to authproxy-routes"
-  kubectl patch configmap authproxy-routes -n "$NS" --type merge -p "$(python3 -c '
-import json
+  kubectl patch configmap authproxy-routes -n "$NS" --type merge -p "$(NS="$NS" python3 -c '
+import json, os
+ns = os.environ["NS"]
 print(json.dumps({"data":{"routes.yaml":
-"""- host: \"github-tool\"
-  target_audience: \"spiffe://localtest.me/ns/team1/sa/github-tool\"
-  token_scopes: \"openid agent-team1-github-tool-aud\"
+f"""- host: \"github-tool\"
+  target_audience: \"spiffe://localtest.me/ns/{ns}/sa/github-tool\"
+  token_scopes: \"openid agent-{ns}-github-tool-aud\"
 """}}))')" || die "failed to patch authproxy-routes"
   pass "authproxy-routes carries the github-tool route"
 
   step "Granting github-agent the exchange scope on its Keycloak client (expect HTTP 204)"
   ADMIN="$(admin_token)"
-  AGENT_UUID="$(client_uuid_by_name "team1/github-agent" "$ADMIN")"
-  [ -n "$AGENT_UUID" ] || die "could not resolve the Keycloak client uuid for team1/github-agent"
-  SCOPE_ID=$(curl -s -H "Authorization: Bearer ${ADMIN}" "${KC}/admin/realms/${REALM}/client-scopes" \
-    | python3 -c 'import sys,json;print(next((s["id"] for s in json.load(sys.stdin) if s["name"]=="agent-team1-github-tool-aud"),""))')
-  [ -n "$SCOPE_ID" ] || die "client-scope 'agent-team1-github-tool-aud' not found — has github-tool onboarded yet?"
+  [ -n "$ADMIN" ] || die "could not obtain a Keycloak master admin token"
+  AGENT_UUID="$(client_uuid_by_name "${NS}/github-agent" "$ADMIN")"
+  [ -n "$AGENT_UUID" ] || die "could not resolve the Keycloak client uuid for ${NS}/github-agent"
+  local tool_aud="agent-${NS}-github-tool-aud"
+  SCOPE_ID="$(scope_id_by_name "$tool_aud" "$ADMIN")"
+  [ -n "$SCOPE_ID" ] || die "client-scope '${tool_aud}' not found — has github-tool onboarded yet?"
   SCOPE_HTTP=$(curl -s -o /dev/null -w "%{http_code}" -X PUT -H "Authorization: Bearer ${ADMIN}" \
     "${KC}/admin/realms/${REALM}/clients/${AGENT_UUID}/optional-client-scopes/${SCOPE_ID}")
   case "$SCOPE_HTTP" in
@@ -498,8 +533,8 @@ probe_agent() {
     tok="$(mint_token "$user")"
     [ -n "$tok" ] || die "could not mint a token for '${user}' (client=${ROPC_CLIENT_ID}, password=${USER_PASSWORD})"
     out=$(kubectl run "probe-${user}-$RANDOM" --rm -i --restart=Never --image=curlimages/curl:8.10.1 \
-      -n "$NS" --env="TOK=$tok" -- sh -c \
-      'curl -s -m 15 -w "\nHTTP_CODE:%{http_code}\n" -X POST http://github-agent.team1.svc.cluster.local:8080/ \
+      -n "$NS" --env="TOK=$tok" --env="NS=$NS" -- sh -c \
+      'curl -s -m 15 -w "\nHTTP_CODE:%{http_code}\n" -X POST "http://github-agent.${NS}.svc.cluster.local:8080/" \
          -H "Content-Type: application/json" -H "Authorization: Bearer $TOK" \
          -d "{\"jsonrpc\":\"2.0\",\"id\":\"1\",\"method\":\"ping/nonexistent\",\"params\":{}}"' 2>/dev/null || true)
     code=$(printf '%s' "$out" | grep -o 'HTTP_CODE:[0-9]*' | tail -1 | cut -d: -f2 || true)
@@ -580,19 +615,21 @@ phase_enforce() {
   [ -n "$ADMIN" ] || die "could not obtain a Keycloak master admin token"
   AUD_SCOPE="agent-${NS}-github-agent-aud"
   ROPC_UUID="$(curl -s -H "Authorization: Bearer ${ADMIN}" "${KC}/admin/realms/${REALM}/clients?clientId=${ROPC_CLIENT_ID}" \
-    | python3 -c 'import sys,json;print(json.load(sys.stdin)[0]["id"])')"
+    | json_eval 'd[0]["id"]')"
   [ -n "$ROPC_UUID" ] || die "ROPC client '${ROPC_CLIENT_ID}' not found in realm '${REALM}'"
-  AUD_SCOPE_ID="$(curl -s -H "Authorization: Bearer ${ADMIN}" "${KC}/admin/realms/${REALM}/client-scopes" \
-    | AUD_SCOPE="$AUD_SCOPE" python3 -c 'import sys,json,os;print(next((s["id"] for s in json.load(sys.stdin) if s["name"]==os.environ["AUD_SCOPE"]),""))')"
+  AUD_SCOPE_ID="$(scope_id_by_name "$AUD_SCOPE" "$ADMIN")"
   [ -n "$AUD_SCOPE_ID" ] || die "client-scope '${AUD_SCOPE}' not found — has github-agent onboarded yet?"
   ALREADY="$(curl -s -H "Authorization: Bearer ${ADMIN}" "${KC}/admin/realms/${REALM}/clients/${ROPC_UUID}/default-client-scopes" \
-    | AUD_SCOPE="$AUD_SCOPE" python3 -c 'import sys,json,os;print("yes" if any(s["name"]==os.environ["AUD_SCOPE"] for s in json.load(sys.stdin)) else "no")')"
+    | AUD_SCOPE="$AUD_SCOPE" json_eval '"yes" if any(s.get("name") == os.environ["AUD_SCOPE"] for s in d) else "no"')"
   if [ "$ALREADY" = "yes" ]; then
     pass "'${AUD_SCOPE}' already a default scope on '${ROPC_CLIENT_ID}'"
   else
-    curl -s -o /dev/null -X PUT -H "Authorization: Bearer ${ADMIN}" \
-      "${KC}/admin/realms/${REALM}/clients/${ROPC_UUID}/default-client-scopes/${AUD_SCOPE_ID}"
-    pass "added '${AUD_SCOPE}' as a default scope on '${ROPC_CLIENT_ID}'"
+    DEFAULT_SCOPE_HTTP=$(curl -s -o /dev/null -w "%{http_code}" -X PUT -H "Authorization: Bearer ${ADMIN}" \
+      "${KC}/admin/realms/${REALM}/clients/${ROPC_UUID}/default-client-scopes/${AUD_SCOPE_ID}")
+    case "$DEFAULT_SCOPE_HTTP" in
+      204) pass "added '${AUD_SCOPE}' as a default scope on '${ROPC_CLIENT_ID}': HTTP 204" ;;
+      *) die "adding '${AUD_SCOPE}' as a default scope on '${ROPC_CLIENT_ID}' returned HTTP ${DEFAULT_SCOPE_HTTP} (expected 204)" ;;
+    esac
   fi
 
   step "Ensuring ${ROPC_CLIENT_ID} stamps the username into the token 'sub' claim"
@@ -761,12 +798,16 @@ phase_replay_trigger() {
   pass "aiac-agent consumed both aiac.apply.service.<uuid> events over NATS — no /apply/service/{id} call in this script"
 
   step "Confirming a fresh AuthorizationPolicy CR for github-agent [polling up to ${POLL_SECS}s]"
-  local cr_deadline=$((SECONDS + POLL_SECS)) after_rv=""
+  local cr_start=$SECONDS cr_deadline=$((SECONDS + POLL_SECS)) cr_next_info=$((SECONDS + 30)) after_rv=""
   while :; do
     after_rv=$(kubectl get "$POLICY_CR" github-agent -n "$NS" -o jsonpath='{.metadata.resourceVersion}' 2>/dev/null || echo "")
     if [ -n "$after_rv" ] && [ "$after_rv" != "$before_rv" ]; then break; fi
     if [ "$SECONDS" -ge "$cr_deadline" ]; then
       die "github-agent AuthorizationPolicy CR resourceVersion never changed (still '${before_rv}') after ${POLL_SECS}s — AIAC may not have finished writing rules yet"
+    fi
+    if [ "$SECONDS" -ge "$cr_next_info" ]; then
+      info "still waiting for AIAC to rewrite the CR ($((SECONDS - cr_start))s / ${POLL_SECS}s) — policy generation is LLM-bound; watch: kubectl logs -f deployment/aiac-agent -n ${AIAC_NS} | grep chat/completions"
+      cr_next_info=$((SECONDS + 30))
     fi
     sleep 5
   done

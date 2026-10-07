@@ -35,7 +35,8 @@ gate passes and no DENY gate matches::
                not subject_deny_ok; not target_deny_ok }
     # outbound — the MCP session messages (no tool name)
     allow if { input.mcp.method in session_methods;
-               some tool in target_allow_scopes[input.identity.service_id]; tool_ok(tool) }
+               some tool in object.get(target_allow_scopes, input.identity.service_id, []);
+               tool_ok(tool) }
 
 **Outbound MCP session.** ``initialize``, ``notifications/initialized``, ``ping``
 and ``tools/list`` carry no tool name. They are allowed to a target iff at least
@@ -418,7 +419,7 @@ def generate_outbound_rego(model: AgentPolicyModel) -> str:
     when neither ``subject_deny_ok`` nor ``target_deny_ok`` matches.
 
     ``agent_roles`` / ``agent_role_scopes`` are emitted for debugging but are
-    **not** referenced by ``allow`` — ``target_allow_scopes[input.identity.service_id]``
+    **not** referenced by ``allow`` — ``object.get(target_allow_scopes, input.identity.service_id, [])``
     already *is* the capability gate. This package emits neither ``agent_scopes``
     nor the inbound scope gates.
 

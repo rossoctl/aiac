@@ -19,7 +19,7 @@ from fastapi import HTTPException
 
 from aiac.idp.configuration.api import Configuration
 from aiac.idp.configuration.models import ServiceType
-from aiac.shared.upstream import is_transient, run_upstream
+from aiac.shared.upstream import run_upstream
 
 from .kube import list_agentcards, list_pods, read_service
 from .state import OnboardingProvisionState
@@ -58,15 +58,13 @@ _LABEL_WAIT = _WaitConfig("ONBOARD_LABEL_WAIT_ATTEMPTS", "ONBOARD_LABEL_WAIT_BAC
 # transient not-ready state, re-polled before we fall back to a default access scope. Same ≈30s slack.
 _CARD_WAIT = _WaitConfig("ONBOARD_CARD_WAIT_ATTEMPTS", "ONBOARD_CARD_WAIT_BACKOFF", 15, 2.0)
 
-# Deploy->onboard race tolerance for the tool's MCP endpoint — the THIRD race, and the one with the
-# least slack available to it. Onboarding is triggered by the Keycloak client registration, which the
-# operator performs while the tool's pod is still starting, so ``analyze_tool`` can query
-# ``tools/list`` seconds before anything is listening. A refused/5xx probe is therefore a transient
-# not-ready state, re-polled before we give up with a 502. Budgeted at DOUBLE the attempts of the two
-# waits above (≈60s of backoff, and more in wall-clock since each look also spends
-# ``_mcp_tools_list``'s own bounded transport retries) because a tool pod additionally has to bring up
-# its injected AuthBridge sidecar — which fronts this very endpoint — so it starts serving later than
-# an agent's AgentCard sync does. Still well under the NATS ACK_WAIT, same as the others.
+# Deploy->onboard race tolerance for the tool's MCP manifest — the THIRD race. A tool can answer
+# ``tools/list`` with an EMPTY manifest while it is still starting, so an empty answer is re-polled
+# before we give up with a 502. This wait covers the empty manifest ONLY: an endpoint that is not
+# listening yet (refused / 5xx) is waited for inside ``_mcp_tools_list`` (bounded by
+# ``AIAC_MCP_DISCOVERY_READY_TIMEOUT``), and any failure it raises is final — nesting this poll around
+# that wait multiplied the worst case past the NATS ACK_WAIT. ≈60s of backoff, plus one quick call
+# per look; well under ACK_WAIT.
 _MCP_WAIT = _WaitConfig("ONBOARD_MCP_WAIT_ATTEMPTS", "ONBOARD_MCP_WAIT_BACKOFF", 30, 2.0)
 
 
@@ -392,19 +390,16 @@ def analyze_tool(state: OnboardingProvisionState) -> dict:
     except Exception as e:
         raise HTTPException(502, f"discovery token minting failed for service {state.service_id!r}: {e}")
 
-    # Re-poll the endpoint while it is merely not-listening-yet (see _MCP_WAIT). A TRANSIENT failure
-    # (connection refused / timeout / 5xx) is the deploy race and returns None to retry; anything else
-    # — a 401 from a bad discovery token, a wrong path — is a real fault and propagates on the first
-    # look, so a genuine misconfiguration fails fast instead of stalling for the whole budget.
-    # An EMPTY manifest is also treated as not-ready: a tool contributing zero scopes yields an empty
+    # ``_mcp_tools_list`` already waits for a not-listening-yet endpoint and applies its own transport
+    # retries, so any exception it raises is final and maps straight to a 502 — re-polling it here
+    # would nest a third retry loop and run the worst case far past the NATS ACK_WAIT. The outer poll
+    # (see _MCP_WAIT) is for an EMPTY manifest only: a tool contributing zero scopes yields an empty
     # outbound gate, which is the silent half-policy this wait exists to prevent, so it is better to
     # keep looking and then fail loudly than to accept it.
     def _probe():
         try:
             return _mcp_tools_list(endpoint, token=token) or None
         except Exception as e:
-            if is_transient(e):
-                return None
             raise HTTPException(502, f"MCP tools/list failed at {endpoint}: {e}")
 
     tools = _poll_until_ready(_probe, _MCP_WAIT)

@@ -24,8 +24,10 @@
 #                       the operator image from operator/Dockerfile and renders
 #                       the bundle-service manifests from the clone's
 #                       charts/operator/templates/bundleservice/
-#                                                           (default: ../operator)
-#                       NOTE: this is relative to your CWD, not to this script.
+#                       (default: an operator/ clone next to this repo, i.e.
+#                       <this script>/../../operator — resolved from the script's
+#                       location, so it works from any CWD. A RELATIVE path you
+#                       pass yourself is resolved against your CWD.)
 #   ROSSOCTL_DIR        path to the rossoctl/rossoctl repo clone (the chart)
 #   CORTEX_DIR          path to the rossoctl/cortex repo clone; the authbridge
 #                       source built in Step 2 lives there, not in this repo
@@ -83,8 +85,8 @@ if [ -z "$OPERATOR_DIR" ] || [ ! -f "$OPERATOR_DIR/operator/Dockerfile" ] || [ !
   echo "ERROR: Set OPERATOR_DIR to point to your rossoctl/operator repo clone" >&2
   echo "       (Step 1 needs \$OPERATOR_DIR/operator/Dockerfile and the bundle-service" >&2
   echo "        Helm templates in \$OPERATOR_DIR/charts/operator/templates/bundleservice/)" >&2
-  echo "       OPERATOR_DIR is resolved against your current directory, not this script —" >&2
-  echo "       pass an absolute path if you are not running from the repo root." >&2
+  echo "       (The default is an operator/ clone next to this repo; a relative OPERATOR_DIR" >&2
+  echo "        you pass is resolved against your current directory — prefer an absolute path.)" >&2
   if [ -n "$OPERATOR_DIR" ] \
     && [ -f "$OPERATOR_DIR/operator/cmd/bundle-service/Dockerfile" ]; then
     echo "       (that clone predates bundle-service being folded into the operator" >&2
@@ -146,7 +148,9 @@ fi
 # (set -e) under any step still cleans up. Trailing-X templates only (no suffix
 # after the Xs) for portability across GNU and BSD/macOS mktemp.
 TMPFILES=()
-cleanup() { [ "${#TMPFILES[@]}" -gt 0 ] && rm -f "${TMPFILES[@]}"; }
+# An if, not `[ ... ] && rm`: as the EXIT trap's last command, a false test would become the
+# script's exit status.
+cleanup() { if [ "${#TMPFILES[@]}" -gt 0 ]; then rm -f "${TMPFILES[@]}"; fi; }
 trap cleanup EXIT
 
 load_image_to_kind() {
@@ -229,6 +233,10 @@ helm template "$RELEASE_NAME" "$OPERATOR_DIR/charts/operator" \
   --show-only templates/bundleservice/deployment.yaml \
   --show-only templates/bundleservice/default-policy.yaml \
   | kubectl apply -f -
+# OPERATOR_IMAGE is a fixed tag (localhost/operator:local), so on a re-run after rebuilding the
+# operator the rendered spec is byte-identical and `apply` changes nothing — with pullPolicy=Never
+# the running pod would keep the OLD binary. Force a new rollout so it picks up the image just loaded.
+kubectl rollout restart deployment/bundle-service -n "$RELEASE_NAMESPACE"
 kubectl rollout status deployment/bundle-service -n "$RELEASE_NAMESPACE" --timeout=180s
 kubectl get pods -n "$RELEASE_NAMESPACE" -l app=bundle-service
 

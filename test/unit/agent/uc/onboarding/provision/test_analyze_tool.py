@@ -3,9 +3,9 @@
 Kubernetes Service lookup (`_core_v1` seam) and the MCP `tools/list` call (`_mcp_tools_list`
 seam) are mocked. `namespace` + `workload_name` are pre-set on state by `classify_service`.
 
-`analyze_tool` polls the MCP endpoint through `_poll_until_ready`/`_MCP_WAIT` to absorb the
-deploy->onboard race (the tool's pod is still starting when its Keycloak client registration
-triggers onboarding), so the wait knobs are pinned fast here by an autouse fixture.
+`analyze_tool` re-polls an EMPTY manifest through `_poll_until_ready`/`_MCP_WAIT` (the endpoint
+readiness wait itself lives inside `_mcp_tools_list`), so the wait knobs are pinned fast here by an
+autouse fixture.
 """
 
 from types import SimpleNamespace
@@ -112,30 +112,29 @@ class TestAnalyzeToolEmpty:
 class TestAnalyzeToolRaceTolerance:
     """The deploy->onboard race: the tool's pod is still starting when onboarding fires."""
 
-    def test_transient_failure_is_retried_then_succeeds(self, monkeypatch):
-        monkeypatch.setenv("ONBOARD_MCP_WAIT_ATTEMPTS", "3")
-        result, mcp, _ = _run(
-            svc=_svc({MCP_LABEL: ""}),
-            mcp_exc=[ConnectionError("connection refused"), ONE_TOOL],
-        )
-        provision = result["service_provision"]
-        assert [s.name for s in provision.scopes] == [f"{WORKLOAD}.t1"]
-        assert mcp.call_count == 2
-
     def test_empty_manifest_is_retried_then_succeeds(self, monkeypatch):
         monkeypatch.setenv("ONBOARD_MCP_WAIT_ATTEMPTS", "3")
         result, mcp, _ = _run(svc=_svc({MCP_LABEL: ""}), mcp_exc=[[], ONE_TOOL])
         assert [s.name for s in result["service_provision"].scopes] == [f"{WORKLOAD}.t1"]
         assert mcp.call_count == 2
 
-    def test_non_transient_failure_fails_fast_without_spending_the_budget(self, monkeypatch):
-        # A 401 from a bad discovery token, or a wrong path, is a real fault — not the deploy race.
-        # It must surface on the FIRST look rather than stalling for the whole wait. Patched inline
-        # (not via _run) so the mock is still reachable after analyze_tool raises.
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            RuntimeError("401 Unauthorized"),
+            requests.ConnectionError("connection refused"),
+            requests.ReadTimeout("read timed out"),
+        ],
+    )
+    def test_any_failure_fails_fast_without_spending_the_budget(self, monkeypatch, exc):
+        # ``_mcp_tools_list`` already waits for a not-ready endpoint (and applies its own transport
+        # retries), so whatever it raises is final: re-polling it here would nest a third retry loop
+        # and push the worst case far past the NATS ACK_WAIT. Every failure surfaces on the FIRST
+        # look. Patched inline (not via _run) so the mock is still reachable after analyze_tool raises.
         monkeypatch.setenv("ONBOARD_MCP_WAIT_ATTEMPTS", "5")
         with (
             patch.object(kube, "_core_v1") as core_v1,
-            patch.object(nodes, "_mcp_tools_list", side_effect=RuntimeError("401 Unauthorized")) as mcp,
+            patch.object(nodes, "_mcp_tools_list", side_effect=exc) as mcp,
             patch.object(nodes, "_discovery_token", return_value="disco-tok"),
         ):
             core = MagicMock()
