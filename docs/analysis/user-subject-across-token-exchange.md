@@ -5,7 +5,8 @@
 > 2026-10-06. **Branch:** `target-side-ac`.
 >
 > The analysis below stays as the decision used it. Dated status notes in §8.1 and §9 record the
-> decision and its implementation.
+> decision and its implementation. The `file:line` references are for the code before D31
+> (`50d61a8`); the D31 change (`33b0bef`) moved some of these lines.
 >
 > The AuthBridge and operator facts come from their source code (§1.4). The Keycloak facts come
 > from the Keycloak 26.5.2 source and docs (§1.5). Statements marked **To verify** are not
@@ -621,7 +622,7 @@ Side findings, not part of the decision:
 | Inbound projection | `src/aiac/policy/model/projection.py` |
 | Subject gates | `src/aiac/pdp/service/policy/opa/rego.py` |
 | Harness subject check | `verify_subject_mapper` in `test/system/launcher.py` (called by `onboarded_stack` in `test/system/uc1_onboard.py`); the scope link (D31): `require_subject_scope` in `test/system/uc1_onboard.py` |
-| Decision D31 (B-AIAC) | `docs/specs/PRD.md` §5 *Key architectural decisions*; `docs/handoffs/18-option-b-aiac-username-sub.md` |
+| Decision D31 (B-AIAC) | `docs/specs/PRD.md` §5 *Key architectural decisions*; `docs/handoffs/18-option-b-aiac-username-sub.md` (gitignored; local only) |
 | Captured CRs of the failing runs | `test/system/artifacts/cr-captures/` (gitignored; local only) |
 | AuthBridge identity, OPA input, token exchange | `cortex/core/plugins/{jwtvalidation,opa,tokenexchange}/` (see §1.4) |
 | Operator clients, audience scopes, realm template | `operator/internal/keycloak/{admin,audience}.go`, `operator/internal/bootstrap/keycloak.go` |
