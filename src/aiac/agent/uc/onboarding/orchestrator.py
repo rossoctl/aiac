@@ -90,7 +90,7 @@ class ServiceNotVisibleError(HTTPException):
 # give up with a 502; without the wait, the next try is the NATS redelivery after ACK_WAIT (600 s).
 # The SPI fix (publish after the commit) removes the race; this wait is defense in depth. The wait
 # runs inside ``_service_lock``, and the NATS consumer handles one message at a time, so it blocks
-# the other onboardings: keep the default short (≈30 s, as LABEL_WAIT). Tests set it fast.
+# the other onboardings: keep the default short (≈30 s, as the label wait). Tests set it fast.
 # A 404 cannot tell a not-yet-committed client from one that does not exist, so an unknown or
 # deleted UUID (a manual POST, a phantom event, a redelivery after a teardown) also waits the
 # whole budget before its 502; before this wait it was a 502 at once.

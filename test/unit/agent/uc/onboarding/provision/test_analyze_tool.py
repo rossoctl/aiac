@@ -216,8 +216,9 @@ class TestMcpToolsListWaitsForEndpoint:
                 nodes._mcp_tools_list("http://x/mcp")
         assert post.call_count == 1
 
-    def test_bad_ready_timeout_env_falls_back_to_the_default(self, monkeypatch):
-        monkeypatch.setenv("AIAC_MCP_DISCOVERY_READY_TIMEOUT", "banana")
+    @pytest.mark.parametrize("value", ["banana", "inf", "nan", "-1"])
+    def test_bad_ready_timeout_env_falls_back_to_the_default(self, monkeypatch, value):
+        monkeypatch.setenv("AIAC_MCP_DISCOVERY_READY_TIMEOUT", value)
         assert nodes._mcp_ready_timeout() == nodes._MCP_READY_TIMEOUT_DEFAULT
 
     def test_the_ready_timeout_default_covers_the_opa_bundle_poll(self, monkeypatch):
