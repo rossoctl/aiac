@@ -38,7 +38,9 @@ from aiac.agent.policy_rules_builder.graph import (
 )
 from aiac.agent.uc.onboarding import orchestrator
 from aiac.agent.uc.onboarding.preconditions import EnforcementPreconditionError
-from aiac.agent.uc.onboarding.provision import kube
+from aiac.agent.uc.onboarding.provision import kube, nodes
+from aiac.agent.uc.onboarding.provision.state import OnboardingProvisionState, Trigger
+from aiac.agent.uc.onboarding.provision.types import ScopeDefinition, ServiceProvision
 from aiac.idp.configuration.models import Role, Scope, Service, ServiceType
 from test.unit.agent.uc.onboarding import kube_fakes as kf
 
@@ -413,6 +415,46 @@ class TestRollbackDeletesOnlyCreated:
         deleted_scopes = [c.args[1] for c in config.delete_service_scope.call_args_list]
         assert reused_role not in deleted_roles
         assert reused_scope not in deleted_scopes
+
+    def test_rollback_never_deletes_the_subject_scope(self):
+        # D31: Provision links the shared subject scope aiac-username-sub to the client, but keeps
+        # it out of the created-manifest. The graph runs the real provision_service node, so the
+        # rollback gets the manifest that Provision returns: it deletes the scope this run
+        # created, never the subject scope.
+        service = _service()
+        config = _config_returning(service)
+        config.get_scopes.return_value = []  # weather.x is absent before the run
+        created_scope = Scope(id="s-new", name="weather.x")
+        config.create_service_scope.return_value = created_scope
+        config.link_subject_scope.return_value = Scope(id="s-sub", name="aiac-username-sub")
+        classified = OnboardingProvisionState(
+            trigger=Trigger(entity_id=SERVICE_ID),
+            service_id=SERVICE_ID,
+            namespace=kf.NAMESPACE,
+            workload_name=kf.WORKLOAD,
+            service_type=ServiceType.AGENT,
+            service_provision=ServiceProvision(
+                roles=[], scopes=[ScopeDefinition(name="weather.x", description="X")], reasoning="r"
+            ),
+        )
+        graph = MagicMock()
+        graph.invoke.side_effect = lambda _trigger_state: nodes.provision_service(classified)
+
+        with (
+            patch.object(orchestrator, "build_provision_graph", return_value=graph),
+            patch.object(orchestrator, "ServicePolicyBuilder") as spb,
+            patch.object(orchestrator, "_config", return_value=config),
+            patch.object(nodes, "_config", return_value=config),
+        ):
+            spb.build.side_effect = LLMAccessError("boom")
+            with pytest.raises(LLMAccessError):
+                orchestrator.onboard_service(SERVICE_ID)
+
+        config.link_subject_scope.assert_called_once_with(service)
+        config.delete_service_scope.assert_called_once_with(service, created_scope)
+        deleted_scopes = [c.args[1].name for c in config.delete_service_scope.call_args_list]
+        assert "aiac-username-sub" not in deleted_scopes
+        config.set_service_enabled.assert_called_once_with(service, False)
 
 
 class TestRollbackScopedToFourErrors:

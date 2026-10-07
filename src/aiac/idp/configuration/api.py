@@ -196,6 +196,21 @@ class Configuration:
         )
         return Service.model_validate(resp.json())
 
+    def link_subject_scope(self, service: Service) -> Scope:
+        """Link the shared subject scope ``aiac-username-sub`` to a service's client (D31).
+
+        Issues ``POST /services/{service.id}/subject-scope`` with no body. The config service
+        ensures the client scope ``aiac-username-sub`` and its ``username`` → ``sub`` mapper, with
+        **no** ``aiac.managed`` marker, and links it as a default client scope of this service's
+        client. Exchanged tokens for the service then carry ``sub`` = username. Idempotent — an
+        existing scope, mapper or link is not an error. Raises ``RuntimeError`` on a non-OK status.
+
+        The scope is shared by every managed client, so UC-1 never puts it into the created-manifest
+        (a rollback never deletes it). Returns the ``Scope``; its ``aiac_managed`` is ``False``.
+        """
+        resp = self._request("POST", f"/services/{service.id}/subject-scope", params=self._params())
+        return Scope.model_validate(resp.json())
+
     def set_service_enabled(self, service: Service, enabled: bool) -> Service:
         """The **writer** for ``Service.enabled`` — consumed by the UC1 rollback (disable a failed
         service's client) and the success re-enable path.

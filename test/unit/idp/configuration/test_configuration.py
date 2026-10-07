@@ -327,6 +327,26 @@ class TestGetService:
         assert result.roles[0].name == "viewer"
         assert result.scopes[0].name == "read:data"
 
+    def test_unmarked_subject_scope_kept_with_aiac_managed_false(self, monkeypatch):
+        # D31: the shared aiac-username-sub scope has no aiac.managed marker. The library does not
+        # filter on the marker: the scope stays in Service.scopes, and the consumers (the PCE, the
+        # focal-entity resolver) drop it through Scope.aiac_managed.
+        monkeypatch.setenv("AIAC_PDP_CONFIG_URL", BASE)
+        raw = {"id": self.SERVICE_ID, "clientId": self.SERVICE_ID, "name": "my-svc", "enabled": True}
+        all_scopes = [
+            {"id": "s1", "name": "read:data", "attributes": {"aiac.managed": "true"}},
+            {"id": "s-sub", "name": "aiac-username-sub", "attributes": {"include.in.token.scope": "false"}},
+        ]
+        service_scopes = [{"id": "s1"}, {"id": "s-sub"}]
+        with patch(
+            "aiac.idp.configuration.api.requests.get",
+            side_effect=[_ok(raw), _ok([]), _ok(all_scopes), _ok([]), _ok(service_scopes)],
+        ):
+            result = Configuration.for_realm(REALM).get_service(self.SERVICE_ID)
+        managed = {s.name: s.aiac_managed for s in result.scopes}
+        assert managed == {"read:data": True, "aiac-username-sub": False}
+        assert all(s.serviceId == self.SERVICE_ID for s in result.scopes)
+
     def test_type_resolved_from_client_type_attribute(self, monkeypatch):
         # Typing comes from the client.type attribute (via Service._resolve_keycloak_fields),
         # never from the description — the description-keyword fallback has been removed.
@@ -525,6 +545,74 @@ class TestSetServiceType:
         with patch("aiac.idp.configuration.api.requests.post", return_value=_ok(updated, 200)) as m:
             Configuration.for_realm(REALM).set_service_type(service, ServiceType.AGENT)
         assert m.call_args[1].get("json") == {"type": "Agent"}
+
+
+# ---------------------------------------------------------------------------
+# link_subject_scope — D31: links the shared, unmarked aiac-username-sub scope
+#
+# POST /services/{id}/subject-scope with no body → the service ensures the scope and
+# its username -> sub mapper, and links it as a default scope of the client. Returns
+# the Scope; it has no aiac.managed marker, so aiac_managed is False.
+# ---------------------------------------------------------------------------
+
+
+class TestLinkSubjectScope:
+    SUBJECT_SCOPE = {
+        "id": "subject-scope-id",
+        "name": "aiac-username-sub",
+        "description": "AIAC subject scope (D31): sets the token sub to the username",
+        "protocol": "openid-connect",
+        "attributes": {"include.in.token.scope": "false", "display.on.consent.screen": "false"},
+        "protocolMappers": [{"name": "username-to-sub", "protocolMapper": "oidc-usermodel-property-mapper"}],
+    }
+
+    def _make_service(self, **kwargs):
+        defaults = {"id": "svc-uuid", "clientId": "svc-uuid", "name": "my-svc", "enabled": True}
+        return Service.model_validate({**defaults, **kwargs})
+
+    def test_posts_to_subject_scope_endpoint(self, monkeypatch):
+        monkeypatch.setenv("AIAC_PDP_CONFIG_URL", BASE)
+        with patch("aiac.idp.configuration.api.requests.post", return_value=_ok(self.SUBJECT_SCOPE, 200)) as m:
+            Configuration.for_realm(REALM).link_subject_scope(self._make_service())
+        m.assert_called_once()
+        assert m.call_args[0][0] == f"{BASE}/services/svc-uuid/subject-scope"
+
+    def test_forwards_realm_as_query_param(self, monkeypatch):
+        monkeypatch.setenv("AIAC_PDP_CONFIG_URL", BASE)
+        with patch("aiac.idp.configuration.api.requests.post", return_value=_ok(self.SUBJECT_SCOPE, 200)) as m:
+            Configuration.for_realm(REALM).link_subject_scope(self._make_service())
+        assert m.call_args[1].get("params") == {"realm": REALM}
+
+    def test_sends_no_body(self, monkeypatch):
+        monkeypatch.setenv("AIAC_PDP_CONFIG_URL", BASE)
+        with patch("aiac.idp.configuration.api.requests.post", return_value=_ok(self.SUBJECT_SCOPE, 200)) as m:
+            Configuration.for_realm(REALM).link_subject_scope(self._make_service())
+        assert "json" not in m.call_args[1]
+        assert "data" not in m.call_args[1]
+
+    def test_returns_scope_from_response(self, monkeypatch):
+        monkeypatch.setenv("AIAC_PDP_CONFIG_URL", BASE)
+        with patch("aiac.idp.configuration.api.requests.post", return_value=_ok(self.SUBJECT_SCOPE, 200)):
+            result = Configuration.for_realm(REALM).link_subject_scope(self._make_service())
+        assert isinstance(result, Scope)
+        assert result.id == "subject-scope-id"
+        assert result.name == "aiac-username-sub"
+
+    def test_returned_scope_is_not_aiac_managed(self, monkeypatch):
+        # The subject scope is shared by every managed client, so it never carries the marker:
+        # a marked scope would become an own scope of each linked service (and break Assumption 2).
+        monkeypatch.setenv("AIAC_PDP_CONFIG_URL", BASE)
+        with patch("aiac.idp.configuration.api.requests.post", return_value=_ok(self.SUBJECT_SCOPE, 200)):
+            result = Configuration.for_realm(REALM).link_subject_scope(self._make_service())
+        assert result.aiac_managed is False
+
+    @pytest.mark.parametrize("status", [502, 409])
+    def test_raises_on_non_2xx(self, status, monkeypatch):
+        # 502: a Keycloak error; 409: the scope exists but carries the aiac.managed marker.
+        monkeypatch.setenv("AIAC_PDP_CONFIG_URL", BASE)
+        with patch("aiac.idp.configuration.api.requests.post", return_value=_err(status)):
+            with pytest.raises(RuntimeError):
+                Configuration.for_realm(REALM).link_subject_scope(self._make_service())
 
 
 # ---------------------------------------------------------------------------

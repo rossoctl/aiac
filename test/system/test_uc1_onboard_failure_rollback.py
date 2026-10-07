@@ -18,8 +18,10 @@ One shared stack, four phases in order (``_run_phases``); each records what it o
 assert on the record, so a failed phase reports its own facts and the later phases report "not reached":
 
 1. **Failed agent** — deploy the agent with the LLM seam broken. Assert: the client is disabled and its
-   ``client.type`` is kept; the ``github-agent.*`` roles/scopes Provision created are gone; the agent has
-   **no** CR (the quarantine deleted it; a 404 counts as success); a real inbound ``dev-user`` request
+   ``client.type`` is kept; the ``github-agent.*`` roles/scopes Provision created are gone; the shared
+   subject scope ``aiac-username-sub`` stays — it still exists and is still a default scope of the
+   disabled agent client (Provision linked it, and the link is not in the created-manifest, D31); the
+   agent has **no** CR (the quarantine deleted it; a 404 counts as success); a real inbound ``dev-user`` request
    (allowed on the happy path) is **denied** — the agent never had a CR in this phase, so the deny comes
    from the changed combiner: the live proof that a pod with no CR is denied (D20); no SPM; the failure
    and the dead-letter move are logged.
@@ -233,6 +235,9 @@ def _run_phases(ctx: dict, run: dict) -> None:
             cr=uc1.authpolicy_policies(AGENT),
             spm=uc1.spm_present(agent["clientId"]),
             provisioned=_prefixed(admin, f"{AGENT}."),
+            # The shared subject scope after the rollback (D31): Provision linked it before the build
+            # failed, and the link is not in the created-manifest, so the scope and the link stay.
+            subject_scope=uc1.subject_scope_link_problems(admin, AGENT),
         )
         run["agent_failed"] = failed
     # No CR, so the changed combiner denies the agent pod (D20). Poll to wait out the 503 that the OPA
@@ -364,6 +369,17 @@ def test_failed_agent_inbound_denied(run: dict) -> None:
     allowed (the skip gate makes sure the cluster has the changed one)."""
     decision = _failed(run, "agent_failed")["inbound"]
     assert decision == "deny", f"dev-user inbound to the quarantined agent: {decision!r} (want 'deny')"
+
+
+def test_rollback_keeps_the_subject_scope(run: dict) -> None:
+    """The rollback of the failed agent keeps the shared subject scope (D31): ``aiac-username-sub`` still
+    exists (with its mapper and no marker) and is still a **default** scope of the disabled agent client.
+    Provision linked it before the build failed, and the link is not in the created-manifest, so the
+    rollback (which deletes only the manifest) does not touch it — a shared scope is never deleted."""
+    problems = _failed(run, "agent_failed")["subject_scope"]
+    assert not problems, (
+        f"the subject scope {uc1.SUBJECT_SCOPE!r} is not in place after the rollback of the failed agent: {problems}"
+    )
 
 
 @pytest.mark.parametrize("key", ["agent_failed", "tool_failed"])

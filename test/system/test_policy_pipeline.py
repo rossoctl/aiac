@@ -72,7 +72,10 @@ def pipeline() -> dict:
     """Onboard the **full** stack (agent + tool) via the shared harness, enable the outbound leg, and
     wait for the live pipeline to converge; yield the live probe context (``admin`` handle,
     ``agent_pod``, Keycloak URL/realm, ``tool_onboarded=True``). Keycloak cleanup + CR delete run
-    before and after. Skips cleanly if the pipeline is not wired or the env is unset."""
+    before and after. Right after each workload converges, the harness checks that its client links
+    the subject scope ``aiac-username-sub`` as a default scope (``require_subject_scope``, D31), so the
+    exchanged token that github-tool's inbound reads has ``sub`` = the username; a missing link fails
+    the fixture. Skips cleanly if the pipeline is not wired or the env is unset."""
     with uc1.onboarded_stack([scn.AGENT_WORKLOAD, scn.TOOL_WORKLOAD]) as ctx:
         yield ctx
 

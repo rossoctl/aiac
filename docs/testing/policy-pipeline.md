@@ -90,9 +90,12 @@ over the fully onboarded stack.
    SQLite outlives redeploys). Then `reenable_provisioned_clients`, and poll until both clients are gone
    (a leftover client would stop the deploy from firing `CLIENT_CREATED` again). Then `provision_realm_and_users` idempotently ensures the scenario's three users +
    realm roles (`developer` / `tester` / `devops`) with the descriptions the PRB reads (the fixture
-   provisions these; UC-1 does not), `verify_subject_mapper` confirms the realm's `username → sub`
+   provisions these; UC-1 does not), `verify_subject_mapper` confirms the `username → sub` mapper of the login client `rossoctl`
    mapper + Direct Access Grants are in place (else skip), and `ensure_agent_policy` mounts the single
-   abstract `policy.md` on the Controller pod.
+   abstract `policy.md` on the Controller pod. `verify_subject_mapper` stays the check of the login
+   token (through the `rossoctl` client). The exchanged token gets the same mapping from the client
+   scope `aiac-username-sub`, which AIAC links to each onboarded client (D31). The shared UC-1 harness
+   checks that link (step 3).
 3. **Onboard both workloads through the real in-cluster UC-1 Controller.** `load_workload_images`
    loads the demo images into the Kind node, then `deploy_workload` deploys the `github-agent` and then
    the `github-tool`, one at a time, each converging before the next. Deploying is the event-driven
@@ -109,7 +112,13 @@ over the fully onboarded stack.
    rules-based tool inbound (D26) and a pass-through outbound, and github-agent's CR has the
    agent-level inbound (D26a) and a pass-through outbound (D24). Under agent side, github-agent's CR
    has the agent-level inbound and a rules-based outbound (the per-tool checks and the MCP session
-   rule), and github-tool has a pass-through CR.
+   rule), and github-tool has a pass-through CR. Right after each workload converges, the UC-1
+   harness fixture (`onboarded_stack`) calls `require_subject_scope`: it checks with the admin API
+   that the workload's client has `aiac-username-sub` as a default scope, and that the scope has the
+   `username-to-sub` mapper and no `aiac.managed` marker (D31). AIAC makes this link at onboarding,
+   so a missing link **fails** the run; it does not skip. The UC-1 ladder also decodes an exchanged
+   token and checks `sub` = the username (rung 2, see
+   [uc1-onboarding-pipeline.md](uc1-onboarding-pipeline.md#per-rung-flow)).
 4. **Enable the outbound token-exchange leg (Part B).** `ensure_github_tool_route` adds the
    `github-tool` outbound route to `authproxy-routes`, `grant_exchange_scope` grants the agent's
    Keycloak client the `github-tool` audience scope as optional, and `restart_agent` restarts the

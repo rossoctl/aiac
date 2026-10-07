@@ -23,6 +23,7 @@ A FastAPI web service that proxies Keycloak Admin REST API endpoints. Returns Id
 | POST | `/scopes` | `POST /admin/realms/{realm}/client-scopes` | Create realm-level scope |
 | POST | `/services/{service_id}/scopes` | `admin.create_client_scope(...)` → `admin.add_client_default_client_scope(service_id, scope_id, {})` | Create an `aiac.managed` scope and assign it to the service as a default scope |
 | POST | `/services/{service_id}/scopes/{scope_id}` | `PUT /admin/realms/{realm}/clients/{service_id}/default-client-scopes/{scope_id}` | Assign existing scope as default scope to service |
+| POST | `/services/{service_id}/subject-scope` | `admin.get_client_scopes()` → (only if absent) `admin.create_client_scope(...)` → `admin.get_mappers_from_client_scope(scope_id)` → (only if absent) `admin.add_mapper_to_client_scope(scope_id, ...)` → `admin.get_client_scope(scope_id)` → `admin.get_client_optional_client_scopes(service_id)` → (only if linked as optional) `admin.delete_client_optional_client_scope(service_id, scope_id)` → `admin.add_client_default_client_scope(service_id, scope_id, {})` | Make sure that the shared subject scope `aiac-username-sub` and its `username-to-sub` mapper exist (with **no** `aiac.managed` marker), and link the scope to the service as a default scope (D31) |
 | POST | `/roles` | `POST /admin/realms/{realm}/roles` | Create realm-level role |
 | POST | `/services/{service_id}/roles/{role_id}` | `admin.get_client_service_account_user(service_id)` → `admin.assign_realm_roles(user_id, ...)` | Assign existing realm role to service account |
 | GET | `/services/{service_id}/discovery-token` | `admin.get_client(service_id)` → (idempotent) `add_mapper_to_client` → `KeycloakOpenID(...).token(grant_type="client_credentials")` | Mint a bearer token, minted **as the service's own client**, whose `aud` contains that client's client-id — for authenticating UC-1 tool discovery against the tool's AuthBridge sidecar |
@@ -66,6 +67,21 @@ Accepts JSON body `{"name": ..., "description": ...}`. It:
 3. Returns `409 Conflict` if the scope is already assigned to the service.
 4. Returns `502 Bad Gateway` with `{"error": ...}` on `KeycloakError`.
 
+`POST /services/{service_id}/subject-scope` (the subject is the username on every leg — [D31](../PRD.md#key-architectural-decisions)):
+Accepts no body. UC-1 Provision calls it at each onboarding, for agents and tools. It:
+1. Makes sure that the shared client scope **`aiac-username-sub`** exists in the correct state (`_ensure_subject_scope`, idempotent):
+   - Finds the scope by name in `admin.get_client_scopes()`. If it is absent, calls `admin.create_client_scope({"name": "aiac-username-sub", "description": "AIAC subject scope (D31): sets the token sub to the username", "protocol": "openid-connect", "attributes": {"include.in.token.scope": "false", "display.on.consent.screen": "false"}})`. The scope has **no** `aiac.managed` attribute (see the marker section below). A `KeycloakError` with `response_code == 409` (a concurrent onboarding of another service created the scope first) is not an error: it finds the scope by name again. It does not use `skip_exists=True` (in python-keycloak 7.x, a `409` then fails on the missing `Location` header).
+   - If the existing scope carries the `aiac.managed` marker, it stops with `409` (step 5).
+   - Calls `admin.get_mappers_from_client_scope(scope_id)`. If no mapper has the name **`username-to-sub`**, calls `admin.add_mapper_to_client_scope(scope_id, {...})` with an `oidc-usermodel-property-mapper`: `user.attribute` = `username`, `claim.name` = `sub`, `jsonType.label` = `String`, and `access.token.claim`, `id.token.claim`, `userinfo.token.claim` and `introspection.token.claim` all `true`. A `409` (a concurrent add) is not an error. The check is by name only, as for the discovery-audience mapper.
+   - Reads the full scope representation with `admin.get_client_scope(scope_id)`.
+2. If the scope is in `admin.get_client_optional_client_scopes(service_id)`, calls `admin.delete_client_optional_client_scope(service_id, scope_id)`. Keycloak does not add a default link for a scope that is already linked as optional (and gives no error), and the mapper of an optional scope runs only when the token request names that scope. So an optional link would silently leave `sub` = the user ID.
+3. Calls `admin.add_client_default_client_scope(service_id, scope_id, {})`. Keycloak does not add a default link that already exists (and gives no error), so a second call changes nothing ("already linked" is success).
+4. Returns `200 OK` with the scope JSON.
+5. Returns `409 Conflict` with `{"error": ...}` if the existing `aiac-username-sub` carries the `aiac.managed` marker. The message names the scope, D31 and the fix (remove the attribute).
+6. Returns `502 Bad Gateway` with `{"error": ...}` on `KeycloakError`.
+
+Why the scope: the Keycloak standard token exchange (V2) applies only the scopes of the requester client (the agent). So the `username-to-sub` mapper of the login client (`rossoctl`) never gets into an exchanged token, but the mapper of a scope that is linked to the agent client does. The endpoint links the scope only to the client `service_id`. It never changes another client (the login client `rossoctl` keeps its own mapper and does not get the scope), and it never makes the scope a realm default scope. If the scope or its mapper is deleted, the next onboarding creates it again. See [the analysis](../../analysis/user-subject-across-token-exchange.md) (§1.5, §8.1).
+
 `POST /roles`:
 Accepts JSON body `{"name": ..., "description": ...}`. It:
 1. Calls `admin.create_realm_role({"name": ..., "description": ..., "attributes": {"aiac.managed": ["true"]}})` to create the role at realm level. The `aiac.managed` attribute is the AIAC provisioning marker (realm-role attribute values are lists of strings).
@@ -103,8 +119,8 @@ serviceId]`:
 `GET /services/{service_id}/scopes`:
 1. Calls `admin.get_client_default_client_scopes(service_id)` to return the realm-level client scopes assigned as defaults to the service.
 2. Sets `serviceId` (this service's `clientId`) on each scope.
-3. Returns `200 OK` with a JSON array of client scope objects.
-4. Returns `409 Conflict` if an `aiac.managed` scope has more than one owning client (Assumption 2).
+3. Returns `200 OK` with a JSON array of client scope objects. The array has **every** default scope of the client, also the scopes that have no `aiac.managed` marker: the Keycloak built-ins (for example `profile`) and the shared subject scope `aiac-username-sub` (D31). The consumers keep only the marked scopes (the `Scope.aiac_managed` filter: the PCE `owned_scopes`, and the own and other scopes in the AIAC Agent `focal_entities`), so an unmarked scope never becomes an own scope of the service.
+4. Returns `409 Conflict` if an `aiac.managed` scope has more than one owning client (Assumption 2). An unmarked scope is not checked, so `aiac-username-sub`, which is linked to many clients, does not cause a `409`.
 5. Returns `502 Bad Gateway` with `{"error": ...}` on `KeycloakError`.
 
 `POST /services/{service_id}/roles/{role_id}`:
@@ -160,19 +176,22 @@ Accepts JSON body `{"enabled": true | false}` (rejected with `422` otherwise). I
 2. Idempotent — disabling an already-disabled client (or enabling an already-enabled one) is not an error.
 3. Returns `200 OK` with the updated client JSON (re-fetched via `admin.get_client`); `502 Bad Gateway` with `{"error": ...}` on `KeycloakError`.
 
-The UC1 compensating rollback (see the AIAC Agent UC1 spec) consumes the two deletes and the enable/disable: it deletes the roles and scopes Provision created, and then disables the client as a failed-service marker. The rollback keeps the client type. The empty-type clear on `POST /services/{id}/type` stays in the service, but no library primitive or rollback calls it.
+The UC1 compensating rollback (see the AIAC Agent UC1 spec) consumes the two deletes and the enable/disable: it deletes the roles and scopes Provision created, and then disables the client as a failed-service marker. The rollback keeps the client type. It also keeps the shared subject scope `aiac-username-sub` and its link: the scope is not in the created-manifest (D31). The empty-type clear on `POST /services/{id}/type` stays in the service, but no library primitive or rollback calls it.
 
 All endpoints except `/health` require a `?realm=<realm>` query parameter specifying the Keycloak realm to operate in. Returns `422 Unprocessable Entity` if the parameter is absent. `/health` accepts no realm parameter — it calls `_get_or_create_admin(os.environ["KEYCLOAK_ADMIN_REALM"])` directly.
 
 All GET endpoints return `200 OK` with a JSON array on success, except `/subjects/{subject_id}/assignments` (a JSON object with `realmMappings` and `serviceMappings` fields), `/services/{service_id}`, `/services/{service_id}/discovery-token` and `/health`, which return a JSON object. All endpoints return `502 Bad Gateway` with a JSON error body if the Keycloak Admin API call fails, with these exceptions:
 - `/health` returns `503` with `{"status": "unavailable", "error": ...}`.
 - `GET /roles` and `GET /services/{service_id}/scopes` return `409 Conflict` on an Assumption 1 / Assumption 2 violation.
+- `POST /services/{service_id}/subject-scope` returns `409 Conflict` when the shared subject scope `aiac-username-sub` carries the `aiac.managed` marker (D31).
 - The two `DELETE` endpoints return `200 OK` when Keycloak answers `404` (idempotent teardown).
 - `GET /services/{service_id}/roles` returns `[]` when Keycloak answers `400`.
 
 ### AIAC provisioning marker (`aiac.managed`)
 
-Every role and client scope this service creates is stamped with the Keycloak attribute `aiac.managed` = `true` — the AIAC naming convention that distinguishes AIAC-provisioned entities from Keycloak's own built-ins (default client scopes, the `default-roles-<realm>` composite). Attribute value shape differs by entity: realm-role attribute values are lists (`{"aiac.managed": ["true"]}`), client-scope attribute values are plain strings (`{"aiac.managed": "true"}`). Because Keycloak's brief role representation omits attributes, `GET /roles` requests the full representation so the marker survives the read. Downstream consumers (the Policy Computation Engine's P2 embed) filter on this marker to keep only domain entities.
+Every role and client scope this service creates, except the shared subject scope (below), is stamped with the Keycloak attribute `aiac.managed` = `true` — the AIAC naming convention that distinguishes AIAC-provisioned entities from Keycloak's own built-ins (default client scopes, the `default-roles-<realm>` composite). Attribute value shape differs by entity: realm-role attribute values are lists (`{"aiac.managed": ["true"]}`), client-scope attribute values are plain strings (`{"aiac.managed": "true"}`). Because Keycloak's brief role representation omits attributes, `GET /roles` requests the full representation so the marker survives the read. Downstream consumers (the Policy Computation Engine's P2 embed) filter on this marker to keep only domain entities.
+
+**Exception — the shared subject scope `aiac-username-sub` has no marker ([D31](../PRD.md#key-architectural-decisions)).** `POST /services/{service_id}/subject-scope` creates it with no `aiac.managed` attribute, and gives `409` if a scope of that name has the attribute. The scope is not a domain entity of one service: it is shared by every AIAC-managed client, and it only sets the token `sub` to the username. A marked scope would become an own scope of each linked service: the library's `get_services()` joins the default scopes of each client with the full representations of `GET /scopes`, so the marker would put the scope into the policy model and into the PRB candidates. It would also break Assumption 2 (below), because it has many owners. With no marker, the consumers drop it as they drop a Keycloak built-in. See [the analysis](../../analysis/user-subject-across-token-exchange.md) (§8.1).
 
 ### Agent roles are client roles, field population, and assumption enforcement (SPM/APM)
 
@@ -194,7 +213,7 @@ Under the SPM/APM policy-model redesign the Policy Computation Engine (PCE) perf
 **Fail-loud enforcement at this boundary** (detectable here via membership queries; do not silently pick a side):
 
 - **Assumption 1 — no cross-kind role.** A role held by _both_ human users and agent service accounts cannot be represented by a single `actorIds` list. On violation, **raise/log** rather than choosing one kind.
-- **Assumption 2 — single scope owner.** Keycloak client scopes are realm-level and assignable to many clients. `GET /services/{service_id}/scopes` enforces this: an **AIAC-managed** scope (see the `aiac.managed` marker above) that more than one client exposes as a default scope is an invariant violation → `409 Conflict`. (The library's `get_services_by_scope` is only a client-side filter and does not check this.)
+- **Assumption 2 — single scope owner.** Keycloak client scopes are realm-level and assignable to many clients. `GET /services/{service_id}/scopes` enforces this: an **AIAC-managed** scope (see the `aiac.managed` marker above) that more than one client exposes as a default scope is an invariant violation → `409 Conflict`. (The library's `get_services_by_scope` is only a client-side filter and does not check this.) The shared subject scope `aiac-username-sub` (D31) is outside this rule: it is linked to every AIAC-managed client, but it has no marker, so the owner check skips it.
 
 ## Configuration
 
@@ -263,5 +282,6 @@ docker build -f src/aiac/idp/service/configuration/keycloak/Dockerfile \
 - `DELETE /services/{service_id}/roles/{role_id}`: `get_client_service_account_user(service_id)` → `get_realm_role_by_id(role_id)` → `delete_realm_roles_of_user(user_id, [role])` (unmap first), then — only if `get_realm_role_members(role_name)` is empty (no other subject holds it) — `delete_realm_role(role_name)`.
 - `DELETE /services/{service_id}/scopes/{scope_id}`: `delete_client_default_client_scope(service_id, scope_id)` (unmap first), then — only if no other client has it assigned — `delete_client_scope(scope_id)`.
 - Unset type (`POST /services/{service_id}/type` with an empty type): `get_client(service_id)` → drop the `client.type` attribute → `update_client(service_id, {"attributes": {...}})` (read-merge, same as set).
+- `POST /services/{service_id}/subject-scope`: `_ensure_subject_scope(admin)` — find `aiac-username-sub` (`_SUBJECT_SCOPE`) by name in `get_client_scopes()` → `create_client_scope(...)` if it is absent (a `409` → find it by name again) → raise `_InvariantViolation` if it has the `aiac.managed` marker → `get_mappers_from_client_scope(scope_id)` → `add_mapper_to_client_scope(scope_id, ...)` if no mapper has the name `username-to-sub` (`_SUBJECT_MAPPER`; a `409` is success) → `get_client_scope(scope_id)`. Then `delete_client_optional_client_scope(service_id, scope_id)` if the scope is in `get_client_optional_client_scopes(service_id)` → `add_client_default_client_scope(service_id, scope_id, {})`. `_InvariantViolation` → `409`; `KeycloakError` → `502`.
 - `POST /services/{service_id}/enabled`: `update_client(service_id, {"enabled": <bool>})` → `get_client(service_id)` (re-fetch). This is the writer for `Service.enabled`; all service reads already return the client representation unmodified (see above), so `enabled` is surfaced on read for `get_service` / `get_services`.
 - On `KeycloakError`, return HTTP 502 with `{"error": str(e)}`.

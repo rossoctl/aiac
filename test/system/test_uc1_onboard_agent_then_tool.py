@@ -27,7 +27,19 @@ recomposes the bundles; the verdicts are the same under each side. Two side-awar
 the deny of an ungranted call comes from (``deny_origin``) and the shape of both CRs
 (``cr_matches_side``).
 
-There is **no agent re-onboard** and **no intermediate validation** — only the end state is checked.
+**The subject on every leg (D31).** The tool's inbound keys users by username, and it reads the
+subject from the ``sub`` of the token that the agent exchanged. Keycloak's standard token exchange
+builds that token from the agent client's scopes only, so the login client's own ``username-to-sub``
+mapper (on ``rossoctl``) never reaches it; the client scope ``aiac-username-sub``, which AIAC links to
+each onboarded client, does. ``test_subject_scope_linked`` checks both sources in Keycloak (the scope,
+its mapper, no marker, the two default links, no link on ``rossoctl``, and the ``rossoctl`` mapper with
+its login token), and ``test_exchanged_token_subject_is_username`` decodes a real exchanged token (as the
+agent client, with its client secret — the identity that ``k8s/opa-kind-enable.sh`` gives AuthBridge's
+``token-exchange``; it skips cleanly only when the agent client uses another authenticator). The shared fixture also fails fast when a link is missing
+(``require_subject_scope`` right after each workload converges).
+
+There is **no agent re-onboard** and **no intermediate validation** — only the end state is checked
+(apart from the subject-scope check of the fixture).
 This is order 1 of the order-independence pair; rung 3 (tool then agent) asserts its final live
 outbound matrix is **identical** to this rung's.
 
@@ -182,3 +194,47 @@ def test_crs_match_live_side(onboarded: dict) -> None:
         for workload, kind in uc1.WORKLOAD_KIND.items()
     }
     assert not any(problems.values()), f"CRs do not match {side}: {problems}"
+
+
+# ======================================================================================
+# The subject on every leg (D31) — both sources of sub = username
+# ======================================================================================
+
+
+def test_subject_scope_linked(onboarded: dict) -> None:
+    """Both sources of ``sub`` = username are in place (D31):
+
+    * ``aiac-username-sub`` exists with the ``username → sub`` mapper and no ``aiac.managed`` marker,
+      github-agent and github-tool each link it as a **default** scope, and the login client ``rossoctl``
+      does not link it (``subject_scope_link_problems``);
+    * ``rossoctl`` still has its own ``username → sub`` client mapper (unchanged by AIAC), and a
+      ``rossoctl`` password-grant token for ``dev-user`` has ``sub`` = ``dev-user``."""
+    admin = onboarded["admin"]
+    problems = uc1.subject_scope_link_problems(admin, [scn.AGENT_WORKLOAD, scn.TOOL_WORKLOAD])
+    assert not problems, f"the subject scope {uc1.SUBJECT_SCOPE!r} is not in place: {problems}"
+
+    login = uc1.login_client(admin)
+    assert login is not None, f"no login client {uc1.KEYCLOAK_CLIENT_ID!r} in realm {TEST_REALM!r}"
+    mappers = admin.get_mappers_from_client(login["id"])
+    assert any(uc1.is_login_subject_mapper(m) for m in mappers), (
+        f"the login client {uc1.KEYCLOAK_CLIENT_ID!r} lost its own username->sub mapper: "
+        f"{[(m.get('name'), (m.get('config') or {}).get('claim.name')) for m in mappers]}"
+    )
+    sub = uc1.login_subject(onboarded, "dev-user")
+    assert sub == "dev-user", f"a {uc1.KEYCLOAK_CLIENT_ID!r} login token for dev-user has sub={sub!r}"
+
+
+@pytest.mark.parametrize("subject", list(scn.USERS))
+def test_exchanged_token_subject_is_username(onboarded: dict, subject: str) -> None:
+    """A standard token exchange of ``subject``'s login token, as the agent client to the tool audience
+    (the request AuthBridge's route sends), gives a token with ``sub`` = the username — the subject
+    that the tool's inbound reads. It comes from the agent's default scope ``aiac-username-sub``: the
+    exchange applies only the agent client's scopes. The harness authenticates with the agent's client
+    secret; it skips cleanly only when the agent client uses another authenticator (for example a SPIFFE
+    JWT-SVID through ``federated-jwt``), and a refused secret is a failure. This is the one direct check
+    of the exchanged ``sub``: under agent side no one-hop decision reads it."""
+    sub = uc1.exchanged_subject(onboarded, subject)
+    assert sub == subject, (
+        f"the exchanged token for {subject!r} has sub={sub!r} (want the username) — is {uc1.SUBJECT_SCOPE!r} "
+        "a default scope of the agent client?"
+    )

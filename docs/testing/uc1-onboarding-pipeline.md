@@ -16,7 +16,7 @@
 > | Rung | Issue | Onboards | Proves |
 > |---|---|---|---|
 > | 1 | `testing/5.4.1-uc1-onboard-agent-only.md` | agent only | agent discovery + inbound enforcement stand alone; **inbound gate only** — no tool onboarded, so there is no real outbound call and the outbound leg is not probed live |
-> | 2 | `testing/5.4.2-uc1-onboard-agent-then-tool.md` | agent → tool | onboarding the tool **after** the agent completes the tool check (PCE additive merge): under target side it writes the tool's own CR; under agent side it completes the agent's outbound gate |
+> | 2 | `testing/5.4.2-uc1-onboard-agent-then-tool.md` | agent → tool | onboarding the tool **after** the agent completes the tool check (PCE additive merge): under target side it writes the tool's own CR; under agent side it completes the agent's outbound gate. Also the subject on every leg (D31): each client links `aiac-username-sub`, and the exchanged token has `sub` = the username |
 > | 3 | `testing/5.4.3-uc1-onboard-tool-then-agent.md` | tool → agent | the happy path; **and, vs rung 2, onboarding-order-independence** |
 > | 4 | `testing/5.4.4-uc1-onboard-two-policies.md` | two policies | **deferred / TBD**; two-stack impl discarded |
 > | 5 | `testing/5.4.5-uc1-onboard-failure-rollback.md` | agent / tool (build failure) | UC-1 **compensating rollback + PCE quarantine**: the quarantine deletes the CR, so a failed agent is denied (it has no CR, D20), a failed tool is unreachable, and a successful re-onboarding lifts the quarantine. Also the **MCP session** for a granted user. Test file: `test/system/test_uc1_onboard_failure_rollback.py` |
@@ -76,7 +76,9 @@ restarts. They import three shared modules:
   `app.kubernetes.io/managed-by: aiac-pdp-policy-writer`, name → `spec.policies`),
   `restart_controller` (rollout restart + wait for Ready), and `controller_enforcement_side(side)`
   (patch `AIAC_ENFORCEMENT_SIDE` in `aiac-agent-config`, restart the Controller, and restore the
-  original value with a second restart on every exit path).
+  original value with a second restart on every exit path). The subject-scope check (D31) is
+  `SUBJECT_SCOPE` (`aiac-username-sub`), the pure helper `subject_scope_problems`, and
+  `require_subject_scope` (see *[Per-rung flow](#per-rung-flow)*, step 2).
   Resolution-by-`name` (`"{ns}/github-agent"` / `"{ns}/github-tool"`) is still how the harness
   **reads back** Keycloak state; it no longer resolves an internal UUID to trigger onboarding (except
   rung 5, which re-fires the trigger for an existing client — see below).
@@ -217,7 +219,12 @@ cleanly** when any of it is absent (they never stand it up, and never false-pass
 - **Users + realm roles.** The fixture provisions them (UC-1 does not) — see
   *[Scenario](#scenario)* — via `KeycloakAdmin` into `AIAC_TEST_REALM`, **before** deploying (the PRB
   reads the realm role universe when the event fires `onboard_service`); idempotent; left in place.
-  `verify_subject_mapper` confirms the realm's `username → sub` mapper + Direct Access Grants (else skip).
+  `verify_subject_mapper` confirms the `username → sub` mapper of the login client `rossoctl` + Direct Access Grants (else skip).
+  It checks only the login token (through the `rossoctl` client). The exchanged token gets the same
+  mapping from the client scope `aiac-username-sub`, which AIAC links to each onboarded client (D31).
+  That link is not a precondition: AIAC makes it at onboarding, so `require_subject_scope` checks it
+  as a test step (*[Per-rung flow](#per-rung-flow)*, step 2). Together the two checks cover both
+  sources of the rule.
 
 ## Per-rung flow
 
@@ -271,6 +278,13 @@ real requests + assert → full teardown.**
 
      Sequential deploy-and-wait is what keeps rung order meaningful (rung 2: agent→tool; rung 3:
      tool→agent) and the order-independence proof intact.
+   - **The subject scope (D31), for each workload.** Right after a workload converges,
+     `onboarded_stack` calls `require_subject_scope(admin, workload)`. It checks with the admin API
+     that `aiac-username-sub` exists, has the `username-to-sub` mapper and no `aiac.managed` marker,
+     and is a default scope of the workload's client. AIAC makes this link at onboarding, so a missing
+     link is an AIAC fault: the check **fails** (it raises `RuntimeError` that lists the problems), it
+     does not skip. So a missing link gives a clear message at once, not only a deny in the step-4
+     poll.
 3. **Enable the outbound token-exchange leg (Part B)** — runs **only when a tool is onboarded** (rungs 2
    and 3). The harness gates the whole step on `has_outbound` (a rung has an outbound convergence signal),
    so on rung 1 the route, grant, and restart are **all skipped** — rung 1 then asserts the exact bundle
@@ -291,7 +305,8 @@ real requests + assert → full teardown.**
    post-restart token-exchange window, up to `AIAC_BUNDLE_TIMEOUT`. On rung 1 the convergence set is
    **inbound-only** (`_default_ready_signals` appends the two outbound signals only under
    `tool_onboarded`).
-5. **Validate two outcomes at the end** (no intermediate checks):
+5. **Validate the outcomes at the end** (no intermediate checks, except the step-2 subject-scope
+   check):
    1. **Keycloak provisioning.** The expected realm role(s) + client scopes exist with the expected
       names/descriptions (via `KeycloakAdmin`) — and, for rung 1, that **no** tool scopes were provisioned.
    2. **Enforced decisions.** Drive **real HTTP requests through AuthBridge** and read the **deployed OPA
@@ -318,6 +333,18 @@ real requests + assert → full teardown.**
         live side (see *[CR end state for each side](#cr-end-state-for-each-side)*).
       - Verdicts are **computed from** `scenario_uc1.py`, never from the policy. A failing node names the
         exact cell.
+   3. **The subject on every leg (D31)** — rung 2.
+      - `test_subject_scope_linked`: `aiac-username-sub` exists, has the `username-to-sub` mapper and
+        no `aiac.managed` marker; both clients (github-agent and github-tool) link it as a default
+        scope; `rossoctl` does not link it and still has its own `username-to-sub` mapper; a `rossoctl`
+        password-grant token for `dev-user` has `sub` = `dev-user`.
+      - `test_exchanged_token_subject_is_username`: one node per user. A standard token exchange as
+        the agent client to the tool audience gives `sub` = the username. It skips cleanly when
+        the agent client uses a client authenticator other than `client-secret` (for example a SPIFFE
+        JWT-SVID through `federated-jwt`). The harness exchanges with the agent's client secret, the
+        identity that `k8s/opa-kind-enable.sh` gives AuthBridge's `token-exchange`, so a refused secret
+        is a failure. It is the one direct check of the exchanged `sub`: under agent side no one-hop
+        decision reads it.
 6. **Teardown → pristine.** Restore the cluster to its pre-test (no-workloads) state:
    - **Capture the CRs first** (`capture_aiac_crs`, phase `teardown`), on the success and the failure
      path: every AIAC CR (the managed-by label, all namespaces) and the global combiner, written as YAML
@@ -406,6 +433,9 @@ changed combiner denies a pod that has no client CR, so a deleted CR means deny.
     denied. With the old combiner, the same request would be allowed;
   - the Keycloak client is **disabled** (`enabled=false`), and its `client.type` is **kept**;
   - the `github-agent.*` roles/scopes that Provision created are **removed**;
+  - the shared subject scope `aiac-username-sub` **stays**: it still exists and is still a default
+    scope of the disabled agent client (`test_rollback_keeps_the_subject_scope`). Provision keeps the
+    link out of the created-manifest, so the rollback does not delete it (D31);
   - the agent has **no SPM** in the policy store;
   - the Controller log shows the injected error (`UnparseableLLMResponseError`) and the move of the event
     to the dead-letter subject `aiac.apply.dlq`.
@@ -690,8 +720,8 @@ Rungs 6 and 7 restart the Controller twice each, so each one takes several minut
   CR and policy-store state, the Controller log (the injected error and the dead-letter move), and real
   requests through AuthBridge + OPA: a failed agent has no
   CR and is denied (D20), its client is disabled with `client.type` kept, its provisioned roles/scopes are
-  removed, and it has no SPM; a failed tool loses the CR its onboarding wrote, has
-  no SPM, and is unreachable from the agent; a clean re-onboard writes the agent's CR again and
+  removed (the shared `aiac-username-sub` stays linked, D31), and it has no SPM; a failed tool loses
+  the CR its onboarding wrote, has no SPM, and is unreachable from the agent; a clean re-onboard writes the agent's CR again and
   re-enables the client.
 - **The Controller start is tested live** (rungs 6 and 7). A restart with no change leaves every CR
   unchanged (the resync, D28). A CR deleted by hand denies its service (D20), and the next resync
@@ -725,7 +755,13 @@ Rungs 6 and 7 restart the Controller twice each, so each one takes several minut
     resync stops the Controller before it serves), the onboarding checks #1, #2 and
     #6 (each gives 409, is permanent in the NATS consumer, runs no rollback and no quarantine, and runs
     before the bootstrap, Provision and the PRB, D30), the bootstrap of a tool before Provision, and the
-    read-only route `GET /policy/services/{service_id:path}` (D18).
+    read-only route `GET /policy/services/{service_id:path}` (D18). For D31: Provision links the
+    subject scope before `set_service_type`, keeps it out of the created-manifest, and the rollback
+    never deletes it; `test_uc1_subject_scope.py` covers the harness helper `subject_scope_problems`.
+  - `test/unit/idp/` — the subject scope (D31): `POST /services/{service_id}/subject-scope` creates
+    `aiac-username-sub` and its mapper with no marker (idempotent, also after a `409` from a
+    concurrent onboarding), removes an optional link, and links the scope as a default scope; the
+    library method `link_subject_scope`.
 - **Stack's realm, leave-in-place; per-rung cleanup.** UC-1 resolves/provisions against the deployed
   stack's `KEYCLOAK_REALM` (default `rossoctl`) and **never deletes** the realm/users/roles. Per rung,
   the workloads are undeployed, and their Keycloak registrations, every `AuthorizationPolicy` CR in the

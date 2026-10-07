@@ -126,7 +126,7 @@ Represents a service scope (Keycloak: `client scope`).
 > deserialization automatically (same `model_validate` pass-through as `Role.kind`/`actorIds`). It makes
 > a scope's exposing service an explicit field read rather than something the client must infer.
 
-Scopes also expose an `aiac_managed` property (`bool`): `True` when `attributes` carries the AIAC provisioning marker `aiac.managed` (client-scope attribute values are plain strings, so the marker appears as `"true"`). See the naming convention in the idp-configuration-service spec.
+Scopes also expose an `aiac_managed` property (`bool`): `True` when `attributes` carries the AIAC provisioning marker `aiac.managed` (client-scope attribute values are plain strings, so the marker appears as `"true"`). See the naming convention in the idp-configuration-service spec. The shared subject scope `aiac-username-sub` (D31) has no marker, so its `aiac_managed` is `False`, as for a Keycloak built-in such as `profile`.
 
 ### Usage
 
@@ -207,6 +207,11 @@ class Configuration:
     def create_service_scope(self, service_id: str, scope) -> Scope: ...
 
     def set_service_type(self, service: Service, service_type: ServiceType) -> Service: ...
+
+    # Make sure that the shared subject scope aiac-username-sub (no aiac.managed marker) and its
+    # username -> sub mapper exist, and link the scope as a default scope of the service (D31).
+    # Idempotent. UC1 Provision calls it right before set_service_type.
+    def link_subject_scope(self, service: Service) -> Scope: ...
 
     # Teardown + disable — the two deletes and the enable/disable are consumed by the UC1
     # compensating rollback. The two deletes obey unmap-then-delete order and shared-object safety
@@ -353,6 +358,13 @@ class Configuration:
 2. The service persists the value onto the Keycloak client as the **`client.type`** attribute (a plain string, capitalized). The Keycloak attribute name is an IdP-Service/mapping-layer detail — callers pass the generic `service_type` and never see it.
 3. Raises `RuntimeError` on non-2xx HTTP status.
 4. Returns the updated `Service` instance parsed from the response (`type` now resolved from the new attribute).
+
+`link_subject_scope(service: Service) -> Scope`: link the shared subject scope to the service ([D31](../PRD.md#key-architectural-decisions)).
+1. Issues `POST {AIAC_PDP_CONFIG_URL}/services/{service.id}/subject-scope` with no body, appending `?realm=<self.realm>`.
+2. The service makes sure that the client scope **`aiac-username-sub`** and its `username-to-sub` mapper (`username` → claim `sub`) exist, with **no** `aiac.managed` marker, and links the scope as a **default** client scope of the service's client (an optional link is changed to a default link). Then a token that this client gets as the requester of a token exchange has `sub` = the username. The scope name and the mapper are IdP-Service details — callers pass only the `Service`.
+3. Idempotent: an existing scope, mapper or link is not an error, so a second call changes nothing.
+4. Raises `RuntimeError` on non-2xx HTTP status (via `_request`), including `409` if the existing `aiac-username-sub` carries the `aiac.managed` marker.
+5. Returns the `Scope` instance parsed from the response. Its `aiac_managed` is `False`, so it is never an own scope of a service. The scope is shared by every AIAC-managed client, so UC1 never puts it into the created-manifest, and the rollback never deletes it (see `idp-configuration-service.md` → `POST /services/{service_id}/subject-scope`).
 
 `delete_service_role(service: Service, role: Role) -> None`: teardown of a role this service created.
 1. Issues `DELETE {AIAC_PDP_CONFIG_URL}/services/{service.id}/roles/{role.id}`, appending `?realm=<self.realm>`.

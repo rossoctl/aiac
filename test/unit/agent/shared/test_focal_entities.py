@@ -107,6 +107,24 @@ class TestSplit:
         assert [s.name for s in result.own_scopes] == ["weather.forecast"]
         assert [r.name for r in result.own_roles] == ["weather.agent"]
 
+    def test_unmarked_subject_scope_is_neither_own_nor_other_scope(self):
+        # D31: aiac-username-sub is one shared scope, linked to every managed client and carrying no
+        # aiac.managed marker, so it never becomes an own scope or a candidate other scope.
+        def subject_scope(service_id):
+            return _scope("aiac-username-sub", scope_id="subject-id", service_id=service_id, aiac_managed=False)
+
+        focus = _service(
+            FOCUS_ID,
+            scopes=[_scope("weather.forecast", service_id=FOCUS_ID), subject_scope(FOCUS_ID)],
+            service_type=ServiceType.AGENT,
+        )
+        other = _service(OTHER_ID, scopes=[_scope("github.issue", service_id=OTHER_ID), subject_scope(OTHER_ID)])
+
+        result = _resolve(ServiceType.AGENT, services=[focus, other], subjects=[])
+
+        assert [s.name for s in result.own_scopes] == ["weather.forecast"]
+        assert [s.name for s in result.other_scopes] == ["github.issue"]
+
 
 class TestCandidateRoles:
     def test_composite_other_role_flattened_and_deduped_by_id(self):

@@ -66,8 +66,10 @@
 # Identity note: INBOUND the OPA plugin exposes input.identity.{subject,
 # client_id, scopes} from the validated JWT. On github-tool's inbound the JWT is
 # the exchanged token, so client_id is the calling agent's client. `subject` is
-# the JWT `sub` claim; rossoctl-realm tokens carry the username in `sub` (via a
-# username->sub protocol mapper — see A.1 in k8s/opa-kind-runbook.md).
+# the JWT `sub` claim, the username on every leg (D31): the login token gets it
+# from the rossoctl client's username->sub mapper (A.1 in k8s/opa-kind-runbook.md),
+# and the exchanged token from the client scope aiac-username-sub, which AIAC
+# links to each managed client (github-agent) at onboarding.
 apiVersion: agent.rossoctl.dev/v1alpha1
 kind: AuthorizationPolicy
 metadata:

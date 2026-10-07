@@ -23,6 +23,8 @@ pipeline wired into both legs:
         trigger (operator registers a Keycloak client → Keycloak CLIENT_CREATED → the aiac-event-listener
         SPI publishes on NATS → the agent consumer runs onboard_service, upserting the AuthorizationPolicy
         CR of each affected service on the live API), converging before the next
+      → right after each workload converges, check that its client links the subject scope
+        ``aiac-username-sub`` as a default scope (``require_subject_scope``, D31; a missing link fails)
       → enable the outbound token-exchange leg (Part B: route + optional client scope + agent restart)
       → poll bundle-service + OPA until this run's CR is reflected in real decisions
       → drive REAL HTTP requests through AuthBridge and assert the real plugin's allow/deny
@@ -45,6 +47,13 @@ This module owns:
   ``deploy_workload`` (deploy fires the trigger) / ``wait_for_registration`` / ``undeploy_workload``.
 * **Outbound-leg prep (Part B)** — ``ensure_github_tool_route`` / ``grant_exchange_scope`` /
   ``restart_agent`` so ``token-exchange`` runs and OPA is actually consulted on the outbound leg.
+* **The subject on every leg (D31)** — ``SUBJECT_SCOPE`` (``aiac-username-sub``) and its mapper
+  expectation; the pure ``subject_scope_problems``; the live reader ``subject_scope_link_problems`` and
+  ``require_subject_scope`` (each onboarded client links the scope as a **default** scope, the scope
+  has the ``username → sub`` mapper and no ``aiac.managed`` marker, and the login client ``rossoctl``
+  does not link it; ``onboarded_stack`` fails fast without it); and the ``sub`` probes
+  ``login_subject`` (a password-grant token through ``rossoctl``) and ``exchanged_subject`` (a token
+  exchanged as the agent client to the tool audience).
 * **Live decision oracle + probes** — ``expected_inbound`` / ``expected_outbound_bare`` (verdicts from
   ``scenario_uc1``, keyed on the **bare** runtime tool names AuthBridge sends) and ``inbound_decision``
   / ``outbound_decision`` (mint a user token, send a real request through AuthBridge, classify the
@@ -89,7 +98,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterator, Sequence
+from typing import Collection, Iterator, Mapping, Sequence
 
 import requests
 
@@ -103,10 +112,14 @@ from test.system.launcher import (  # noqa: E402
     BUNDLE_SERVICE_NAMESPACE,
     DENY_ORIGIN_AGENT_OUTBOUND,
     DENY_ORIGIN_TOOL_INBOUND,
+    KEYCLOAK_CLIENT_ID,
+    TokenExchangeError,
     _kubectl_try,
     deny_origin,
+    exchange_token,
     inbound_outcome,
     inbound_probe,
+    jwt_claim,
     kubectl,
     kubectl_apply,
     kubectl_delete,
@@ -834,6 +847,290 @@ def restart_agent(namespace: str) -> None:
 
 
 # ======================================================================================
+# The subject on every leg (D31) — the subject scope ``aiac-username-sub`` and the ``sub`` probes
+# ======================================================================================
+#
+# The policy keys users by **username**, and AuthBridge's ``jwt-validation`` reads the subject from the
+# token ``sub``. Two sources give ``sub`` = username (D31):
+#
+#   * the **login** token — the login client's own ``username-to-sub`` mapper on ``rossoctl`` (a manual
+#     prerequisite, checked by ``verify_subject_mapper``; it never reaches an exchanged token, because
+#     the Keycloak standard token exchange applies only the requester (agent) client's scopes);
+#   * the **exchanged** token — the client scope ``aiac-username-sub`` with the same mapping, which AIAC
+#     links as a default scope to each client it onboards (Provision, before ``client.type``).
+#
+# The second source is AIAC's own step, so a missing link is an AIAC fault: ``require_subject_scope``
+# fails the run (it is not a skip). The scope has no ``aiac.managed`` marker (it is shared by many
+# clients, so a marker would break Assumption 2 and make it an own scope of each linked service), and it
+# is never linked to ``rossoctl`` (two mappers would write the same claim).
+
+# The shared subject scope and the mapping it must carry. The harness never imports ``aiac``, so these
+# repeat ``_SUBJECT_SCOPE`` / ``_SUBJECT_MAPPER`` and the mapper representation of the IdP service.
+SUBJECT_SCOPE = "aiac-username-sub"
+SUBJECT_MAPPER = "username-to-sub"
+SUBJECT_MAPPER_TYPE = "oidc-usermodel-property-mapper"
+SUBJECT_MAPPER_CONFIG: dict[str, str] = {
+    "user.attribute": "username",
+    "claim.name": "sub",
+    "access.token.claim": "true",
+}
+
+# The login client's own mapper comes from a manual step (runbook Prerequisites), not from AIAC, so the
+# harness checks only its mapping on it: the username into ``sub``.
+LOGIN_MAPPER_CONFIG: dict[str, str] = {"user.attribute": "username", "claim.name": "sub"}
+
+# The provisioning marker (PRD §10). The subject scope is the one AIAC-provisioned scope without it.
+AIAC_MANAGED_ATTRIBUTE = "aiac.managed"
+
+# The Keycloak client authenticator of a client that authenticates with its client secret. The harness can
+# exchange a token as the agent client only with that authenticator (``exchanged_subject``).
+CLIENT_SECRET_AUTHENTICATOR = "client-secret"
+
+
+def _carries_aiac_managed(attributes: dict | None) -> bool:
+    """True when ``attributes`` carry the ``aiac.managed`` marker. A client-scope value is a plain
+    string and a realm-role value a list of strings; accept both (as the IdP service does)."""
+    value = (attributes or {}).get(AIAC_MANAGED_ATTRIBUTE)
+    return "true" in value if isinstance(value, list) else value == "true"
+
+
+def _config_has(mapper: dict, config: Mapping[str, str]) -> bool:
+    """True when the mapper's ``config`` holds every ``config`` pair (other keys are free)."""
+    actual = mapper.get("config") or {}
+    return all(actual.get(key) == value for key, value in config.items())
+
+
+def is_subject_mapper(mapper: dict) -> bool:
+    """True when ``mapper`` (a protocol-mapper representation) is the mapper the subject scope must
+    carry: type ``SUBJECT_MAPPER_TYPE`` with every ``SUBJECT_MAPPER_CONFIG`` pair (the username into
+    the access-token ``sub``). The name is not checked: the mapping is what sets ``sub``."""
+    return mapper.get("protocolMapper") == SUBJECT_MAPPER_TYPE and _config_has(mapper, SUBJECT_MAPPER_CONFIG)
+
+
+def is_login_subject_mapper(mapper: dict) -> bool:
+    """True when ``mapper`` maps the username into ``sub`` (``LOGIN_MAPPER_CONFIG``) — the check of the
+    login client's own manual mapper, which needs only that mapping."""
+    return _config_has(mapper, LOGIN_MAPPER_CONFIG)
+
+
+def _mapper_summary(mapper: dict) -> str:
+    """A short form of a mapper for a problem message: its name, type and the two mapping keys."""
+    config = mapper.get("config") or {}
+    return (
+        f"{mapper.get('name')!r} ({mapper.get('protocolMapper')}: user.attribute={config.get('user.attribute')!r}, "
+        f"claim.name={config.get('claim.name')!r}, access.token.claim={config.get('access.token.claim')!r})"
+    )
+
+
+def subject_scope_problems(
+    scope: dict | None,
+    mappers: Sequence[dict],
+    client_default_scope_ids: Mapping[str, Collection[str] | None],
+    login_scope_ids: Collection[str],
+    *,
+    client_optional_scope_ids: Mapping[str, Collection[str]] | None = None,
+) -> list[str]:
+    """Each way the live subject-scope state differs from D31, as one readable sentence that names the
+    object; an empty list means the state is correct. **Pure** — it decides from data already read from
+    the admin API (``subject_scope_link_problems`` reads it), so it is unit-testable offline.
+
+    * ``scope`` — the client-scope representation of ``SUBJECT_SCOPE`` (``None`` when it is missing);
+    * ``mappers`` — the protocol mappers of that scope;
+    * ``client_default_scope_ids`` — for each onboarded client (keyed by its name, ``{ns}/{workload}``),
+      the ids of its **default** client scopes, or ``None`` when the client is not registered;
+    * ``login_scope_ids`` — the ids of every client scope (default and optional) linked to the login
+      client ``rossoctl``;
+    * ``client_optional_scope_ids`` — optional: the ids of each onboarded client's optional scopes, only
+      to say in a problem that a client links the scope as optional.
+
+    The problems: the scope is missing; it carries the ``aiac.managed`` marker; it has no mapper of the
+    expected type and config; an onboarded client is missing or does not link it as a **default** scope
+    (an optional link does not count: the mapper of an optional scope runs only when the token request
+    names the scope, so ``sub`` would stay the user ID); the login client links it."""
+    if scope is None:
+        clients = ", ".join(repr(name) for name in client_default_scope_ids) or "none"
+        return [
+            f"client scope {SUBJECT_SCOPE!r} does not exist in realm {TEST_REALM!r}, so no onboarded client "
+            f"({clients}) can link it"
+        ]
+
+    problems: list[str] = []
+    if _carries_aiac_managed(scope.get("attributes")):
+        problems.append(
+            f"client scope {SUBJECT_SCOPE!r} carries the {AIAC_MANAGED_ATTRIBUTE!r} marker; the shared subject "
+            "scope must not (a marked scope linked to many clients breaks Assumption 2 and becomes an own "
+            "scope of each linked service)"
+        )
+    if not any(is_subject_mapper(mapper) for mapper in mappers):
+        found = ", ".join(_mapper_summary(mapper) for mapper in mappers) or "none"
+        problems.append(
+            f"client scope {SUBJECT_SCOPE!r} has no {SUBJECT_MAPPER_TYPE} mapper with {SUBJECT_MAPPER_CONFIG} "
+            f"(the {SUBJECT_MAPPER!r} mapper); its mappers: {found}"
+        )
+
+    scope_id = scope.get("id")
+    optional = client_optional_scope_ids or {}
+    for client, default_ids in client_default_scope_ids.items():
+        if default_ids is None:
+            problems.append(f"onboarded client {client!r} is not registered, so it cannot link {SUBJECT_SCOPE!r}")
+        elif scope_id not in default_ids:
+            how = "links it only as an optional scope" if scope_id in optional.get(client, ()) else "does not link it"
+            problems.append(
+                f"onboarded client {client!r} does not have {SUBJECT_SCOPE!r} as a default scope ({how}; the "
+                "mapper of an optional scope runs only when the token request names it, so the exchanged "
+                "token keeps sub = the user ID)"
+            )
+    if scope_id in login_scope_ids:
+        problems.append(
+            f"the login client {KEYCLOAK_CLIENT_ID!r} links {SUBJECT_SCOPE!r}; it must not (it has its own "
+            f"{SUBJECT_MAPPER!r} mapper, and two mappers would write the same claim)"
+        )
+    return problems
+
+
+def login_client(admin) -> dict | None:
+    """The Keycloak client representation of the login client ``rossoctl`` (``KEYCLOAK_CLIENT_ID``, the
+    client the harness mints user tokens through), keyed on its ``clientId``; ``None`` if absent."""
+    admin.change_current_realm(TEST_REALM)
+    return next((c for c in admin.get_clients() if c.get("clientId") == KEYCLOAK_CLIENT_ID), None)
+
+
+def _workload_list(workloads: str | Sequence[str]) -> list[str]:
+    """One workload name or a sequence of them, as a list."""
+    return [workloads] if isinstance(workloads, str) else list(workloads)
+
+
+def subject_scope_link_problems(admin, workloads: str | Sequence[str]) -> list[str]:
+    """Read the live subject-scope state of ``workloads`` (one workload name or a list) from the admin
+    API and return ``subject_scope_problems`` over it; an empty list means the state is correct.
+
+    Reads, in realm ``TEST_REALM``: ``SUBJECT_SCOPE`` by name (``get_client_scopes``) and its mappers;
+    each workload's client (``workload_client``) and its default and optional client scopes; and the
+    default and optional client scopes of the login client ``rossoctl``. Read-only. Raises when the
+    admin API cannot be read."""
+    admin.change_current_realm(TEST_REALM)
+    scope = next((s for s in admin.get_client_scopes() if s.get("name") == SUBJECT_SCOPE), None)
+    mappers = admin.get_mappers_from_client_scope(scope["id"]) if scope else []
+
+    default_ids: dict[str, set[str] | None] = {}
+    optional_ids: dict[str, set[str]] = {}
+    for workload in _workload_list(workloads):
+        name = f"{NAMESPACE}/{workload}"
+        client = workload_client(admin, workload)
+        if client is None:
+            default_ids[name] = None
+            continue
+        default_ids[name] = {s.get("id") for s in admin.get_client_default_client_scopes(client["id"])}
+        optional_ids[name] = {s.get("id") for s in admin.get_client_optional_client_scopes(client["id"])}
+
+    login = login_client(admin)
+    login_ids: set[str] = set()
+    if login is not None:
+        login_ids = {s.get("id") for s in admin.get_client_default_client_scopes(login["id"])}
+        login_ids |= {s.get("id") for s in admin.get_client_optional_client_scopes(login["id"])}
+
+    return subject_scope_problems(scope, mappers, default_ids, login_ids, client_optional_scope_ids=optional_ids)
+
+
+def require_subject_scope(admin, workloads: str | Sequence[str]) -> None:
+    """Raise ``RuntimeError`` that lists the problems when the subject scope is not in place for
+    ``workloads`` (one workload name or a list; ``subject_scope_link_problems``). ``onboarded_stack``
+    calls it right after each workload converges.
+
+    A failure, not a skip: AIAC links ``aiac-username-sub`` itself at onboarding (Provision, through the
+    IdP's ``POST /services/{id}/subject-scope``), so a missing link is an AIAC fault, not a missing
+    prerequisite. Without the link the exchanged token keeps ``sub`` = the user ID, and every tool call
+    is denied later with no clear cause; this check gives the cause at once."""
+    problems = subject_scope_link_problems(admin, workloads)
+    if problems:
+        raise RuntimeError(
+            f"the subject scope {SUBJECT_SCOPE!r} (D31) is not in place for {_workload_list(workloads)} in realm "
+            f"{TEST_REALM!r}: " + "; ".join(problems) + ". The workload converged, so its Provision ran; a "
+            "failed link would have failed Provision (502) and stopped the convergence gate before this check. "
+            "So the likely cause is a stale aiac-agent image whose Provision does not call link_subject_scope "
+            "(POST /services/{id}/subject-scope): rebuild and redeploy aiac-agent (and aiac-pdp-config)."
+        )
+
+
+def login_subject(ctx: dict, user: str) -> object:
+    """The ``sub`` of a password-grant token for ``user`` through the login client ``rossoctl`` (the
+    first source of D31: the login client's own ``username-to-sub`` mapper)."""
+    token = mint_token(user, scn.USER_PASSWORD, keycloak_url=ctx["keycloak_url"], realm=ctx["realm"])
+    return jwt_claim(token, "sub")
+
+
+def exchanged_subject(ctx: dict, user: str) -> str:
+    """The ``sub`` of a token that the agent client exchanges for ``user`` to the tool audience (the
+    second source of D31: the agent's default scope ``aiac-username-sub``).
+
+    Mints ``user``'s login token through ``rossoctl``, reads the agent client and its client secret
+    from the admin API, and sends the request that AuthBridge's route sends (``ensure_github_tool_route``):
+    a standard token exchange to ``_tool_audience()`` with ``scope`` = ``openid`` + the tool's audience
+    scope (``exchange_token``). The Keycloak standard token exchange builds the token for the requester
+    (the agent), so its ``sub`` comes from the agent's scopes only.
+
+    The harness can authenticate as the agent only with its client secret. ``k8s/opa-kind-enable.sh``
+    configures AuthBridge's ``token-exchange`` with the ``client-secret`` identity, so on that
+    deployment the agent client uses the ``client-secret`` authenticator and the exchange must succeed:
+    a refused client authentication then raises. ``pytest.skip`` only when the agent client uses
+    another authenticator (``clientAuthenticatorType``, for example ``federated-jwt`` for a SPIFFE
+    JWT-SVID) or has no readable secret. Then no other check reads the exchanged ``sub`` directly: under
+    target side the tool-call verdicts (``test_outbound``) depend on it, but under agent side a one-hop
+    call has no check that reads it (the tool CR is a pass-through), so only ``require_subject_scope``
+    covers it. Any other failure of the exchange raises ``TokenExchangeError`` (the HTTP status and the
+    body)."""
+    import pytest
+    from keycloak.exceptions import KeycloakError
+
+    admin = ctx["admin"]
+    subject_token = mint_token(user, scn.USER_PASSWORD, keycloak_url=ctx["keycloak_url"], realm=ctx["realm"])
+    agent = workload_client(admin, scn.AGENT_WORKLOAD)
+    if agent is None:
+        raise AssertionError(f"no Keycloak client {NAMESPACE}/{scn.AGENT_WORKLOAD} in realm {ctx['realm']!r}")
+
+    authenticator = agent.get("clientAuthenticatorType")
+    skip_note = (
+        "the harness can exchange only with a client secret; require_subject_scope still checks that the "
+        "agent client links the subject scope"
+    )
+    if authenticator != CLIENT_SECRET_AUTHENTICATOR:
+        pytest.skip(
+            f"the agent client {agent.get('clientId')!r} uses the {authenticator!r} client authenticator, "
+            f"not {CLIENT_SECRET_AUTHENTICATOR!r} — {skip_note}"
+        )
+    try:
+        secret = (admin.get_client_secrets(agent["id"]) or {}).get("value")
+    except KeycloakError as exc:
+        pytest.skip(f"cannot read the client secret of {agent.get('clientId')!r} ({exc}) — {skip_note}")
+    if not secret:
+        pytest.skip(f"the agent client {agent.get('clientId')!r} has no client secret — {skip_note}")
+
+    try:
+        token = exchange_token(
+            subject_token,
+            keycloak_url=ctx["keycloak_url"],
+            realm=ctx["realm"],
+            client_id=agent["clientId"],
+            client_secret=secret,
+            audience=_tool_audience(),
+            scope=f"openid {_tool_aud_scope()}",
+        )
+    except TokenExchangeError as exc:
+        if exc.client_auth_refused:
+            # A client-secret client whose own secret is refused is a real fault, not a harness limit.
+            raise AssertionError(
+                f"Keycloak refused the client-secret authentication of the agent client "
+                f"{agent.get('clientId')!r} (HTTP {exc.status}, {exc.error}), although the client uses the "
+                f"{CLIENT_SECRET_AUTHENTICATOR!r} authenticator: {exc}"
+            ) from exc
+        raise
+    sub = jwt_claim(token, "sub")
+    if not isinstance(sub, str):
+        raise AssertionError(f"the exchanged token for {user!r} has no string 'sub' claim: {sub!r}")
+    return sub
+
+
+# ======================================================================================
 # Live decisions — mint a user token, send a real request through AuthBridge, classify the plugin
 # ======================================================================================
 
@@ -1006,7 +1303,10 @@ def onboarded_stack(
     the given ``workloads`` **in order, one at a time** — each ``kubectl apply`` fires the production trigger
     (operator registers a Keycloak client -> Keycloak ``CLIENT_CREATED`` -> the ``aiac-event-listener``
     SPI publishes on NATS -> the agent consumer runs ``onboard_service``, the same handler the retired
-    ``POST /apply`` called) — waiting for each to converge before the next; enable the outbound leg
+    ``POST /apply`` called) — waiting for each to converge before the next, and then checking that its
+    client links the subject scope ``aiac-username-sub`` as a default scope (``require_subject_scope``,
+    D31: AIAC makes this link at onboarding, so a missing link **fails** the run at once, with the
+    problems listed, rather than as a deny in the final poll); enable the outbound leg
     (Part B: route + optional client scope + agent restart); then **poll real decisions** until
     ``bundle-service`` + OPA reflect this run's CR (and token-exchange has settled) before yielding.
     Teardown first captures every AIAC CR and the global combiner to the pytest host
@@ -1068,8 +1368,10 @@ def onboarded_stack(
         )
 
     provision_realm_and_users(admin, TEST_REALM)  # BEFORE deploying (PRB reads the role universe when the event fires)
-    # username->sub mapper + Direct Access Grants are a one-time realm prereq the fixture does NOT
-    # provision; skip (don't fail) if a token can't be minted or its ``sub`` isn't the username.
+    # The login client's username->sub mapper + Direct Access Grants are a one-time realm prereq the
+    # fixture does NOT provision; skip (don't fail) if a token can't be minted or its ``sub`` isn't the
+    # username. This covers the login token only; the exchanged token's ``sub`` comes from
+    # ``aiac-username-sub``, which AIAC links at onboarding (D31) — ``require_subject_scope`` below.
     verify_subject_mapper(keycloak_url=keycloak_url, realm=TEST_REALM, user="dev-user", password=scn.USER_PASSWORD)
 
     tool_onboarded = scn.TOOL_WORKLOAD in workloads
@@ -1138,6 +1440,11 @@ def onboarded_stack(
                         "opa / mcp-parser in the namespace inbound pipeline; an httpGet probe) leaves no CR — "
                         "see the Controller log and k8s/opa-kind-enable.sh."
                     )
+
+            # The workload converged, so its Provision ran and linked the subject scope (D31). Fail fast
+            # (not skip) when it did not: a missing link is AIAC's own fault, and without it the exchanged
+            # token keeps sub = the user ID, so every tool call would be denied later with no clear cause.
+            require_subject_scope(admin, workload)
 
         # Part B — enable the outbound token-exchange leg so the tool check is actually reached (under
         # target side github-tool's inbound OPA, which accepts only a token with its audience; under

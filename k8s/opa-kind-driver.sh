@@ -411,6 +411,9 @@ expect_eq "github-agent SPIFFE ID" "$CLIENT_ID" "$EXPECTED_SPIFFE"
 printf '\n%s%s====== Part A — Inbound authorization ======%s\n' "$C_BLD" "$C_CYN" "$C_RST"
 
 step "A.1 — dev-user token carries sub=dev-user"
+# The rossoctl client's own username->sub mapper sets the sub of this login token.
+# Exchanged tokens (B.4) get the same mapping from the client scope
+# aiac-username-sub, which AIAC links to each managed client at onboarding (D31).
 # Mint first (mint_token dies with Keycloak's real error if the grant fails),
 # then decode — so a mint failure aborts here under set -e rather than feeding
 # an empty token into token_sub.
@@ -642,7 +645,7 @@ case "$OB_VERDICT" in
   APP_REJECTED*)
     die "the github-tool app answered HTTP ${OB_HTTP:-?} with no AuthBridge rejection: the call passed both OPA checks, but the app refused the request. Check the probe URL (/mcp) and the header Accept: application/json, text/event-stream." ;;
   DENIED_TOOL_INBOUND)
-    die "outbound tools/list DENIED by github-tool's inbound OPA (HTTP 403, plugin=opa) after ${POLL_SECS}s. The github-tool CR's inbound session rule allows tools/list for dev-user through github-agent. Check that A.3 applied the github-tool CR, that its bundle has propagated, and that the exchanged token has sub=dev-user and azp=${EXPECTED_SPIFFE}." ;;
+    die "outbound tools/list DENIED by github-tool's inbound OPA (HTTP 403, plugin=opa) after ${POLL_SECS}s. The github-tool CR's inbound session rule allows tools/list for dev-user through github-agent. Check that A.3 applied the github-tool CR, that its bundle has propagated, and that the exchanged token has sub=dev-user and azp=${EXPECTED_SPIFFE} (sub=dev-user needs the client scope aiac-username-sub, which AIAC links to github-agent at onboarding, D31; see the runbook Prerequisites)." ;;
   "DENIED_PLUGIN opa")
     die "outbound tools/list DENIED by github-agent's outbound OPA (a JSON-RPC error frame at HTTP 200, plugin=opa) after ${POLL_SECS}s. Under target side the github-agent CR's outbound is a pass-through: check that A.3 applied the example CRs (an agent-side CR may still be in place) and that the bundle has propagated." ;;
   "DENIED_PLUGIN token-exchange")

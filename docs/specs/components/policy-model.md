@@ -298,7 +298,7 @@ The rule lists split into **8 entity×effect lists** — {inbound subject, inbou
 
 > **No default effect.** The model has no default-effect field, so the PCE sets none at derive time. A pair that no rule mentions is always DENY.
 
-**Inbound rule semantics (deny-overrides):** a subject holding realm role `role` is permitted to invoke this agent for the agent scope `scope` iff an `inbound_subject_allow` edge grants it **and no** `inbound_subject_deny` edge prohibits it; the same allow-and-not-deny logic applies to the source gate. The PDP Policy Writer consumes the allow/deny lists as separate role → agent-scope maps; its inbound gate is keyed on the subject id (mandatory), with the calling source id optional.
+**Inbound rule semantics (deny-overrides):** a subject holding realm role `role` is permitted to invoke this agent for the agent scope `scope` iff an `inbound_subject_allow` edge grants it **and no** `inbound_subject_deny` edge prohibits it; the same allow-and-not-deny logic applies to the source gate. The PDP Policy Writer consumes the allow/deny lists as separate role → agent-scope maps; its inbound gate is keyed on the subject username (`input.identity.subject`, the JWT `sub` on every leg, D31; mandatory), with the calling source id optional.
 
 **Outbound target rule semantics (deny-overrides):** this agent acting as realm role `role` is permitted to request the target scope `scope` iff an `outbound_target_allow` edge grants it **and no** `outbound_target_deny` edge prohibits it. The PDP Policy Writer gates on the target maps `target_allow_scopes` / `target_deny_scopes` (keyed by `input.identity.service_id`). It emits the allow list only as the informational `agent_role_scopes` map (the `allow` rule does not use it), and it does not emit the deny list. Its outbound gate requires both the subject and the agent to be authorized and neither to be denied.
 
@@ -401,7 +401,7 @@ agent_model = AgentPolicyModel(
     agent_roles=[reader],
     agent_scopes=[read],
     source_roles={},
-    subject_roles={"u1": [reader], "u2": [issues_role]},   # keyed by subject id; deny-only role u2 still listed
+    subject_roles={"u1": [reader], "u2": [issues_role]},   # keyed by username; deny-only role u2 still listed
     target_allow_scopes={"github-tool": [read]},           # target service id → allowed scopes
     target_deny_scopes={"github-tool": [issues]},          # target service id → prohibited scopes
     inbound_subject_allow_rules=[allow_rule],

@@ -36,6 +36,44 @@ _SERVICE_TYPE_ATTRIBUTE = "client.type"
 # own clientId as the audience (it defaults ``audience_file`` to ``/shared/client-id.txt``).
 _DISCOVERY_AUDIENCE_MAPPER = "aiac-discovery-audience"
 
+# Name of the shared client scope AIAC links, at onboarding, to each AIAC-managed client so that
+# every token that reaches an agent or tool has ``sub`` = username (D31), also after a token
+# exchange: the standard token exchange (V2) applies only the requester client's scopes, so the
+# login client's own ``username-to-sub`` mapper never reaches an exchanged token. The scope is
+# linked to many clients, so it deliberately has NO ``aiac.managed`` marker: a marked scope would
+# trip Assumption 2 and become an own scope of every linked service. Never a realm default scope.
+_SUBJECT_SCOPE = "aiac-username-sub"
+
+# Name of the one protocol mapper in ``_SUBJECT_SCOPE``. It is the same mapping as the login
+# client's own mapper of the same name (``rossoctl``, a manual platform prerequisite).
+_SUBJECT_MAPPER = "username-to-sub"
+
+# Keycloak representation of ``_SUBJECT_SCOPE``. Not in the token ``scope`` claim and not on the
+# consent screen; no ``aiac.managed`` attribute (see above).
+_SUBJECT_SCOPE_REPRESENTATION = {
+    "name": _SUBJECT_SCOPE,
+    "description": "AIAC subject scope (D31): sets the token sub to the username",
+    "protocol": "openid-connect",
+    "attributes": {"include.in.token.scope": "false", "display.on.consent.screen": "false"},
+}
+
+# Keycloak representation of ``_SUBJECT_MAPPER``: a mapper with claim name ``sub`` overrides the
+# token ``sub`` (the Keycloak user ID) with the username, in every token type.
+_SUBJECT_MAPPER_REPRESENTATION = {
+    "name": _SUBJECT_MAPPER,
+    "protocol": "openid-connect",
+    "protocolMapper": "oidc-usermodel-property-mapper",
+    "config": {
+        "user.attribute": "username",
+        "claim.name": "sub",
+        "jsonType.label": "String",
+        "access.token.claim": "true",
+        "id.token.claim": "true",
+        "userinfo.token.claim": "true",
+        "introspection.token.claim": "true",
+    },
+}
+
 # Optional hard assertion of the public issuer the tool's sidecar validates against. When set, the
 # discovery-token endpoint refuses to emit a token whose ``iss`` differs (frontend-URL pinning is a
 # Keycloak deployment property, not something we can force here); when unset it only records the
@@ -148,6 +186,54 @@ def _ensure_audience_mapper(admin: KeycloakAdmin, service_id: str, client_id: st
             },
         },
     )
+
+
+def _find_client_scope(admin: KeycloakAdmin, name: str) -> dict | None:
+    """Return the realm client scope named ``name``, or ``None`` when there is none."""
+    return next((s for s in admin.get_client_scopes() if s.get("name") == name), None)
+
+
+def _ensure_subject_scope(admin: KeycloakAdmin) -> dict:
+    """Idempotently ensure the shared subject scope ``_SUBJECT_SCOPE`` and its mapper (D31).
+
+    Create the scope (with no ``aiac.managed`` marker) when it is absent, and add the
+    ``oidc-usermodel-property-mapper`` (named ``_SUBJECT_MAPPER``) when the scope does not have it;
+    a second call is a no-op, and a deleted scope or mapper is created again on the next call.
+    Different services onboard concurrently, so a 409 from a concurrent create or mapper add is
+    success. An existing scope that carries the marker violates D31 (it would trip Assumption 2 and
+    become an own scope of every linked service): raise ``_InvariantViolation``. Returns the full
+    scope representation.
+    """
+    scope = _find_client_scope(admin, _SUBJECT_SCOPE)
+    if scope is None:
+        try:
+            scope_id = admin.create_client_scope(_SUBJECT_SCOPE_REPRESENTATION)
+            scope = {**_SUBJECT_SCOPE_REPRESENTATION, "id": scope_id}
+        except KeycloakError as e:
+            # 409: a concurrent onboarding of another service created the scope first, so read it
+            # again by name. Do not use ``skip_exists=True``: in python-keycloak 7.x a 409 then
+            # fails on the missing ``Location`` header.
+            scope = _find_client_scope(admin, _SUBJECT_SCOPE) if e.response_code == 409 else None
+            if scope is None:
+                raise
+    if _is_aiac_managed(scope.get("attributes")):
+        raise _InvariantViolation(
+            f"client scope '{_SUBJECT_SCOPE}' carries the '{_AIAC_MANAGED_ATTRIBUTE}' marker, but the "
+            f"shared subject scope (D31) must not: it is linked to every AIAC-managed client, so a "
+            f"marked scope breaks Assumption 2 and becomes an own scope of each linked service. "
+            f"Remove the '{_AIAC_MANAGED_ATTRIBUTE}' attribute from the scope"
+        )
+    scope_id = scope["id"]
+
+    mappers = admin.get_mappers_from_client_scope(scope_id)
+    if not any(m.get("name") == _SUBJECT_MAPPER for m in mappers):
+        try:
+            admin.add_mapper_to_client_scope(scope_id, _SUBJECT_MAPPER_REPRESENTATION)
+        except KeycloakError as e:
+            # 409: a concurrent onboarding added the mapper first — the mapper is there.
+            if e.response_code != 409:
+                raise
+    return admin.get_client_scope(scope_id)
 
 
 @asynccontextmanager
@@ -489,6 +575,32 @@ def assign_scope_to_service(service_id: str, scope_id: str, admin: KeycloakAdmin
     except KeycloakError as e:
         if e.response_code == 409:
             return JSONResponse(status_code=409, content={"error": str(e)})
+        return JSONResponse(status_code=502, content={"error": str(e)})
+
+
+@app.post("/services/{service_id}/subject-scope", status_code=200)
+def link_subject_scope(service_id: str, admin: KeycloakAdmin = Depends(get_admin)):
+    """Ensure the shared subject scope and link it to a service as a default scope (D31).
+
+    Every token that reaches an AIAC-managed agent or tool must have ``sub`` = username, also after
+    a token exchange (the standard token exchange applies only the requester client's scopes). So
+    ensure ``_SUBJECT_SCOPE`` and its mapper first (``_ensure_subject_scope``), then link the scope
+    to THIS client as a default scope. Keycloak skips a default link of a scope that is already
+    linked as optional (no error), and an optional scope's mapper runs only when the token request
+    names it — an optional link would silently leave ``sub`` = user ID — so remove an optional link
+    first. Keycloak also skips an existing default link with no error, so a second call is a no-op.
+    Never touches another client and never makes the scope a realm default. Returns the scope.
+    """
+    try:
+        scope = _ensure_subject_scope(admin)
+        scope_id = scope["id"]
+        if any(s.get("id") == scope_id for s in admin.get_client_optional_client_scopes(service_id)):
+            admin.delete_client_optional_client_scope(service_id, scope_id)  # optional -> default
+        admin.add_client_default_client_scope(service_id, scope_id, {})
+        return scope
+    except _InvariantViolation as e:
+        return JSONResponse(status_code=409, content={"error": str(e)})
+    except KeycloakError as e:
         return JSONResponse(status_code=502, content={"error": str(e)})
 
 

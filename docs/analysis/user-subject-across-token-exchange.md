@@ -1,6 +1,11 @@
 # User Subject Across Token Exchange: Options
 
-> **Status:** analysis, open for decision. **Date:** 2026-10-06. **Branch:** `target-side-ac`.
+> **Status:** decided: B-AIAC (D31), 2026-10-06. See
+> [PRD D31](../specs/PRD.md#key-architectural-decisions) and the implementation note in §8.1. **Date:**
+> 2026-10-06. **Branch:** `target-side-ac`.
+>
+> The analysis below stays as the decision used it. Dated status notes in §8.1 and §9 record the
+> decision and its implementation.
 >
 > The AuthBridge and operator facts come from their source code (§1.4). The Keycloak facts come
 > from the Keycloak 26.5.2 source and docs (§1.5). Statements marked **To verify** are not
@@ -95,7 +100,7 @@ From the source code. `cortex/` is the AuthBridge repo, `operator/` is the rosso
 | `jwt-validation` parses all claims (`preferred_username` goes to `Claims.Extra`), but `Extra` is private. The public claims carrier gives only `issuer`, `audience` and `exp`, by design | `jwks.go:108-112`; `jwtvalidation/identity.go:22-50`; `cortex/core/capabilities/identity.go:74-98` |
 | The OPA input has only `identity{subject, client_id, scopes}` from `jwt-validation`. No claims, no token. Credential headers are removed. The `include` option covers only MCP, A2A and inference data | `cortex/core/plugins/opa/plugin.go:520-563`, `:758-778`, `:32-67` |
 | A CR can ship only `.rego` files (`data.json` is not possible), so policy data must be Rego constants | `operator/api/v1alpha1/authorizationpolicy_types.go:75` |
-| The token exchange authenticates the agent with a SPIFFE JWT-SVID (`client_assertion`, Keycloak `federated-jwt`). It sends `audience`, and `scope` only when the route has `token_scopes`. It sends no `actor_token`, and nothing forwards the user downstream | `cortex/core/plugins/tokenexchange/exchange/client.go:77-107`, `exchange/auth.go:28-43`; `cortex/core/auth/auth.go:441-443` |
+| The token exchange authenticates the agent with a SPIFFE JWT-SVID (`client_assertion`, Keycloak `federated-jwt`), or with the client secret when the plugin's `identity.type` is `client-secret` (the setting of `k8s/opa-kind-enable.sh`). It sends `audience`, and `scope` only when the route has `token_scopes`. It sends no `actor_token`, and nothing forwards the user downstream | `cortex/core/plugins/tokenexchange/exchange/client.go:77-107`, `exchange/auth.go:28-43`; `cortex/core/auth/auth.go:441-443` |
 | On the agent's outbound leg, `delegation.origin` is the `sub` of the incoming token (parsed without verification). This is why the agent side sees `dev-user` | `cortex/core/plugins/tokenexchange/plugin.go:785-832` |
 | The operator creates workload clients with no protocol mappers and no explicit client scopes. Keycloak gives a new client the realm default scopes | `operator/internal/keycloak/admin.go:181-231` |
 | The operator creates `agent-<ns>-<workload>-aud` with one audience mapper. It attaches that scope to the workload's own client and to each platform client (for example `rossoctl`), and makes it a realm default scope. It already has the code to add a protocol mapper to a scope | `operator/internal/keycloak/audience.go:62-104`, `:205-235` |
@@ -456,6 +461,44 @@ stable as a user ID. The criteria that are left:
 5. Turn off the legacy token exchange (V1). V1 uses the scopes of the *target* client, so a
    request that falls back to V1 would not get the mapper (§1.5, §9 side findings).
 
+> **Status (2026-10-06): decided, D31.** The user chose B-AIAC, with the username precondition and
+> with `rossoctl` unchanged. The steps above are implemented as follows:
+>
+> 1. The scope: an idempotent ensure-step in the IdP Configuration Service, inside the new link call
+>    `POST /services/{service_id}/subject-scope`. It creates `aiac-username-sub` and its
+>    `username-to-sub` mapper with no `aiac.managed` marker, so a deleted scope comes back at the next
+>    onboarding. It runs at each onboarding, not in the Controller start sequence (PRD §7.7 does not
+>    change). `rossoctl` does not change: it keeps its own mapper, and AIAC never links the scope to
+>    it.
+> 2. The link: Provision calls `link_subject_scope` before `set_service_type`, for agents and tools,
+>    so before `compute_and_apply` writes the CR. It uses the new endpoint, not
+>    `POST /services/{id}/scopes/{scope_id}`: the new endpoint also moves an optional link to a
+>    default link. The link is not in the created-manifest, so the rollback, the quarantine and the
+>    offboarding never delete the scope. A service onboarded before D31 gets the link at its next
+>    onboarding (no backfill).
+> 3. Only AIAC-managed clients: the endpoint changes only the client of the onboarded service, and
+>    never makes the scope a realm default.
+> 4. The check is in the system harness, not in the Controller: `require_subject_scope` (each
+>    onboarded client links the scope; a failure, not a skip), `verify_subject_mapper` (the login
+>    token, unchanged), and the rung-2 test `test_exchanged_token_subject_is_username` (it decodes an
+>    exchanged token).
+> 5. A platform follow-up, not done here: `KC_FEATURES` is in the Keycloak deployment of the rossoctl
+>    platform, not in this repo.
+>
+> Two facts found during the implementation:
+>
+> - `GET /services/{id}/scopes` returns **every** default scope of a client, the Keycloak built-ins
+>   (`profile`, `email`, …) too, so it also lists `aiac-username-sub`. The scope does not pollute the
+>   policy model or the PRB candidates because it has no marker: the consumers keep only
+>   `Scope.aiac_managed` scopes (`policy/computation/engine.py`, `agent/shared/focal_entities.py`).
+>   That is how the handoff criterion "`list_service_scopes` does not return it" is met in intent.
+> - The Assumption-2 owner scan does not work on a live system, before and after D31: Keycloak's
+>   `GET /clients/{id}/default-client-scopes` returns only `id` and `name` (live check, 2026-10-06),
+>   so `list_service_scopes` never sees the `aiac.managed` attribute and never builds the owner index.
+>   A marked shared scope would therefore not give a live `409`; it would become an own scope of each
+>   linked service. This is a separate defect (record it as its own issue); the "no marker" rule of
+>   D31 does not depend on it.
+
 Risks that are left with B-AIAC:
 
 - The `sub` override is not documented as supported for usernames. Logout tokens keep the user
@@ -512,8 +555,7 @@ Open:
    unknown.
 5. Whether any AIAC-managed agent or tool receives backchannel logout tokens, which keep
    `sub` = user ID (option B). Expected: no, because they are resource servers behind AuthBridge.
-6. Whether the platform owners accept the username precondition of §8.1 (no rename, no reuse) as
-   a written rule.
+6. *Closed on 2026-10-06; see Closed.*
 7. The agent-side one-hop result of §1.7 (works today) on the live cluster, with the side-switch
    test (rung 7).
 8. The agent-side two-hop result of §1.7 (fails at the second agent) on the live cluster. It is
@@ -532,6 +574,9 @@ Closed:
   default (`editUsernameAllowed: false`) (§1.2).
 - Keycloak rejects a second user with an existing username (§1.2).
 - AIAC's IdP service can link a scope to a client as a default scope (§1.2).
+- Question 6 (closed on 2026-10-06): the username precondition of §8.1 (no rename, no reuse) is a
+  written rule. Decided with the user on 2026-10-06, and recorded as a platform prerequisite in PRD
+  §8 (D31).
 
 Side findings, not part of the decision:
 
@@ -553,10 +598,11 @@ Side findings, not part of the decision:
 |---|---|
 | Mapper reason (rossoctl) | `rossoctl/docs/_internal/authbridge/opa-migration-guide.md:285-289` |
 | Expected tool inbound input (subject = `dev-user`) | `k8s/opa-kind-runbook.md` (B.4, B.5) |
-| User-role `actorIds` | `src/aiac/idp/service/configuration/keycloak/main.py:540-546` |
+| User-role `actorIds` | `src/aiac/idp/service/configuration/keycloak/main.py` (`list_roles`) |
 | Inbound projection | `src/aiac/policy/model/projection.py` |
 | Subject gates | `src/aiac/pdp/service/policy/opa/rego.py` |
-| Harness subject check | `test/system/uc1_onboard.py:1073`, `test/system/launcher.py:925-942` |
+| Harness subject check | `verify_subject_mapper` in `test/system/launcher.py` (called by `onboarded_stack` in `test/system/uc1_onboard.py`); the scope link (D31): `require_subject_scope` in `test/system/uc1_onboard.py` |
+| Decision D31 (B-AIAC) | `docs/specs/PRD.md` §5 *Key architectural decisions*; `docs/handoffs/18-option-b-aiac-username-sub.md` |
 | Captured CRs of the failing runs | `test/system/artifacts/cr-captures/` (gitignored; local only) |
 | AuthBridge identity, OPA input, token exchange | `cortex/core/plugins/{jwtvalidation,opa,tokenexchange}/` (see §1.4) |
 | Operator clients, audience scopes, realm template | `operator/internal/keycloak/{admin,audience}.go`, `operator/internal/bootstrap/keycloak.go` |

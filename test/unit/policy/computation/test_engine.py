@@ -838,6 +838,28 @@ def test_zero_rule_focus_spm_is_stored_and_deployed(kind):
     assert store.policy_pushes == [TargetSidePolicyModel(services=[expected])]
 
 
+# --------------------------------------------------------------------------- #
+# D31 — the shared subject scope aiac-username-sub. Provision links it to every   #
+# managed client, but it has no aiac.managed marker, so it is never an own scope  #
+# of a service: the catalog seed keeps it out of every SPM identity.              #
+# --------------------------------------------------------------------------- #
+def _subject_scope(service_id) -> Scope:
+    # One Keycloak scope linked to many clients: the IdP library sets serviceId per linking client.
+    return _scope("s-subject", "aiac-username-sub", service_id=service_id, aiac_managed=False)
+
+
+def test_subject_scope_is_never_an_owned_scope(side):
+    AR, UR, AS, TS, _ = _repro()
+    catalog = [
+        _agent("github-agent", roles=[AR], scopes=[AS, _subject_scope("github-agent")]),
+        _tool("github-tool", scopes=[TS, _subject_scope("github-tool")]),
+    ]
+    store = run_engine([_rule(UR, AS), _rule(AR, TS)], catalog=catalog)
+
+    assert store.data["github-agent"].owned_scopes == [AS]
+    assert store.data["github-tool"].owned_scopes == [TS]
+
+
 def test_agent_side_zero_rule_focus_tool_gets_its_pass_through(agent_side):
     TS = _scope("s-own", "own", service_id="new-svc")
     store = run_engine([], catalog=[_tool("new-svc", scopes=[TS])], focus_service="new-svc")

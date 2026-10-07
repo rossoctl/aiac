@@ -439,8 +439,13 @@ def analyze_tool(state: OnboardingProvisionState) -> dict:
 
 
 def provision_service(state: OnboardingProvisionState) -> dict:
-    """Write the derived roles + scopes into the IdP (idempotent create-or-get + map) and
-    persist the discovered service type onto the Keycloak client, via the idp-library.
+    """Write the derived roles + scopes into the IdP (idempotent create-or-get + map), link the
+    shared subject scope ``aiac-username-sub`` to the client (D31), and persist the discovered
+    service type onto the Keycloak client, via the idp-library.
+
+    The subject-scope link (``link_subject_scope``, idempotent) runs for agents and tools alike,
+    before ``set_service_type``. It makes an exchanged token have ``sub`` = username. A failure of
+    the link is a ``502`` and the type is then not set.
 
     Returns the `ServiceProvision` + `service_type` to the Orchestrator, plus the
     **created-manifest** (`created_roles` / `created_scopes`): exactly the entities this run
@@ -448,7 +453,8 @@ def provision_service(state: OnboardingProvisionState) -> dict:
     `create_service_scope` return the resolved entity whether they created or reused it, so a
     name is classified as created only when it was **absent** from the realm before this run
     (snapshot taken before the create loop). The Orchestrator's compensating rollback deletes
-    only this manifest, so a role/scope another service already owns is never torn down."""
+    only this manifest, so a role/scope another service already owns is never torn down. The
+    subject scope is shared by all managed clients, so it is never in the manifest."""
     config = _config()
     provision = state.service_provision
     service_id = state.service_id
@@ -467,6 +473,11 @@ def provision_service(state: OnboardingProvisionState) -> dict:
             if scope.name not in existing_scope_names:
                 created_scopes.append(resolved)
         service = config.get_service(service_id)
+        # D31: an exchanged token gets sub = username only from the scopes of the agent client
+        # (the requester), so every managed client links aiac-username-sub. Link it before
+        # set_service_type, so that every client with client.type has the link. The scope is
+        # shared by all managed clients, so it is never in the created-manifest.
+        config.link_subject_scope(service)
         config.set_service_type(service, state.service_type)
     except HTTPException:
         raise

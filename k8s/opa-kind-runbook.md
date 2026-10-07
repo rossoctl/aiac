@@ -134,6 +134,31 @@ read the delegation chain (see [Part B](#part-b--outbound-token-exchange--opa)).
 
   Verify with A.1 below — a good token decodes to `sub = dev-user`.
 
+  This mapper sets `sub` only in the login token (a token for `rossoctl`). The
+  Keycloak standard token exchange (V2) of the tool leg applies only the scopes
+  of the agent client, so this mapper never reaches the exchanged token. For
+  that token, AIAC links the client scope `aiac-username-sub` (the same
+  `username → sub` mapping) as a default scope to each client that it onboards
+  ([D31](../docs/specs/PRD.md#key-architectural-decisions)). AIAC creates the
+  scope and the link; there is no manual step. So the tool leg (B.4, B.5) also
+  has `subject = dev-user`. Keep the `rossoctl` mapper, and do not link
+  `aiac-username-sub` to `rossoctl`: each one covers a different token. If AIAC
+  has not onboarded `github-agent`, the link is not there: the exchanged token
+  then has `sub` = the Keycloak user ID, and `github-tool`'s inbound denies the
+  B.4 probe. To check the link of `github-agent`:
+
+  ```bash
+  KC=http://keycloak.localtest.me:8080
+  ADMIN=$(curl -s -X POST "$KC/realms/master/protocol/openid-connect/token" \
+    -d client_id=admin-cli -d username=admin -d password=admin -d grant_type=password \
+    | python3 -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')
+  CID=$(curl -s -H "Authorization: Bearer $ADMIN" "$KC/admin/realms/rossoctl/clients" \
+    | python3 -c 'import sys,json;print(next(c["id"] for c in json.load(sys.stdin) if c["clientId"].endswith("/sa/github-agent")))')
+  curl -s -H "Authorization: Bearer $ADMIN" "$KC/admin/realms/rossoctl/clients/$CID/default-client-scopes" \
+    | python3 -c 'import sys,json;print("aiac-username-sub linked:",any(s["name"]=="aiac-username-sub" for s in json.load(sys.stdin)))'
+  # aiac-username-sub linked: True
+  ```
+
 ### Event-driven onboarding path (required by the UC-1 system suite)
 
 The manual probes in Parts A/B assume `github-agent` + `github-tool` are already deployed. The UC-1
@@ -455,7 +480,8 @@ JSON; the log prints it in Go `map[...]` form):
 
 - `identity` comes from the **validated inbound JWT** (`jwt-validation` runs
   before OPA). `subject` is the JWT `sub` claim — here `dev-user`, via the
-  realm's `username → sub` mapper. `client_id` is the token's client (`rossoctl`
+  `username → sub` mapper of the `rossoctl` client
+  ([Prerequisites](#prerequisites)). `client_id` is the token's client (`rossoctl`
   in this probe). `scopes` are the token's granted scopes.
 - Credential headers (`authorization`, `cookie`, …) are **redacted** from
   `headers` — use `identity` for auth decisions.
@@ -596,8 +622,10 @@ kubectl exec -i -n team1 "$POD" -c agent -- python3 - < /tmp/probe.py
 > 2. `github-tool`'s inbound OPA: the `github-tool` CR's inbound package. There,
 >    `jwt-validation` builds `input.identity` from the exchanged token
 >    (`subject` = `dev-user`; `client_id` = `github-agent`'s SPIFFE ID, the
->    calling agent). `tools/list` is an MCP session message: it carries no tool
->    name. The session rule allows it when at least one tool of `owned_tools`
+>    calling agent). The `subject` is `dev-user` because AIAC links the client
+>    scope `aiac-username-sub` to `github-agent` at onboarding (D31, see
+>    [Prerequisites](#prerequisites)). `tools/list` is an MCP session message:
+>    it carries no tool name. The session rule allows it when at least one tool of `owned_tools`
 >    passes `tool_ok`. `source-read` passes: `dev-user` has the role
 >    `developer`, and the calling agent has the role
 >    `github-agent.source_operations`. Both roles grant `source-read`.
@@ -706,7 +734,9 @@ of this input, and it allows the call. The per-tool check is in the
 `github-tool` CR's `inbound/request.rego`, on `github-tool`'s inbound leg. There
 the input comes from the validated exchanged JWT, not from a delegation hop:
 
-- `input.identity.subject` = the delegated user (`dev-user`);
+- `input.identity.subject` = the delegated user (`dev-user`): the `sub` of the
+  exchanged token, which the `aiac-username-sub` mapper sets (D31, see
+  [Prerequisites](#prerequisites));
 - `input.identity.client_id` = the calling agent
   (`spiffe://localtest.me/ns/team1/sa/github-agent`);
 - `input.mcp.method` and `input.mcp.params.name` (the invoked tool), from

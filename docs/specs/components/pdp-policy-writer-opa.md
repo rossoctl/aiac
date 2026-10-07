@@ -56,7 +56,7 @@ The derived policy of one agent, under agent side only. The PCE derives it in me
 | `agent_roles` | `list[Role]` | Realm roles assigned to this agent. Effect-agnostic identity. |
 | `agent_scopes` | `list[Scope]` | Scopes this agent exposes. Effect-agnostic identity. |
 | `source_roles` | `dict[str, list[Role]]` | Inbound: source (calling service) **id** → roles held. Keyed by the inbound `input.identity.client_id`. **Optional** gate input — an absent `client_id`, or a platform bypass client, passes. Effect-agnostic; **includes deny-edge roles**. |
-| `subject_roles` | `dict[str, list[Role]]` | Inbound + outbound: subject (end-user) **id** → roles held. Keyed by `input.identity.subject`. Inbound gate: **mandatory**. Effect-agnostic; **includes deny-edge roles**. |
+| `subject_roles` | `dict[str, list[Role]]` | Inbound + outbound: subject (end-user) **username** → roles held. Keyed by `input.identity.subject`, the JWT `sub`, which is the username on every leg (D31); on the agent-side outbound it comes from `delegation.origin`. Inbound gate: **mandatory**. Effect-agnostic; **includes deny-edge roles**. |
 | `target_allow_scopes` | `dict[str, list[Scope]]` | Outbound: target service **id** → scopes this agent **may** request on it. Keys stay the **full** target service id (matching `input.identity.service_id`, a full SPIFFE ID); the scope **values** are de-prefixed to the bare MCP tool names carried in `input.mcp.params.name` (Q9). |
 | `target_deny_scopes` | `dict[str, list[Scope]]` | Outbound: target service **id** → scopes this agent **must not** request on it. Same key/value shape as `target_allow_scopes` (full target service id keys, de-prefixed scope values). |
 | `inbound_subject_allow_rules` / `inbound_subject_deny_rules` | `list[PolicyRule]` | Who may / must-not call this agent: `(subject_role, agent_scope)` tuples |
@@ -205,7 +205,7 @@ The Rego packages evaluate the `input` document the live AuthBridge OPA plugin p
 
 | Input field | Meaning | Package |
 |-------------|---------|---------|
-| `input.identity.subject` | The delegated end-user id (JWT `sub`) | agent inbound, tool inbound, agent outbound |
+| `input.identity.subject` | The delegated end-user **username**: the JWT `sub`, which is the username on every leg (D31). On the agent-side outbound, the plugin takes it from `delegation.origin` (the `sub` of the token that came into the agent) | agent inbound, tool inbound, agent outbound |
 | `input.identity.client_id` | The calling client (the JWT `azp` claim). On an agent inbound: the source. On a tool inbound: the calling agent, or the tool itself for the UC-1 discovery token | agent inbound, tool inbound |
 | `input.identity.service_id` | The downstream target audience the exchanged token was minted for — a **full SPIFFE id**. The inbound input has **no** `service_id` (cortex `core/plugins/opa/plugin.go`) | agent outbound |
 | `input.mcp.method` | The MCP JSON-RPC method (`tools/call`, `tools/list`, `initialize`, …). The plugin always sets it (`buildMCPInput` in the cortex OPA plugin, `core/plugins/opa/plugin.go`) | tool inbound, agent outbound |
@@ -213,7 +213,7 @@ The Rego packages evaluate the `input` document the live AuthBridge OPA plugin p
 
 On the agent outbound leg there is no validated JWT; the plugin synthesizes `input.identity` from the token-exchange delegation hop. An **absent** `input.identity.service_id` matches nothing in the maps and is therefore **denied**. A request with no tool name (for example `tools/list`) is allowed only as an MCP session message (see [Agent outbound package](#agent-outbound-package-agent-side-authbridgeclientoutboundrequest)).
 
-On an inbound leg, `jwt-validation` sets `input.identity` from the validated token. When an agent calls a tool, that token is the one the agent's `token-exchange` minted for the tool's audience. So on the tool inbound, `subject` is the delegated user and `client_id` is the calling agent's clientId. The UC-1 discovery token is different: the IdP Configuration Service mints it as the tool's own client (client credentials), so its `azp`, and thus `client_id`, is the tool's own clientId.
+On an inbound leg, `jwt-validation` sets `input.identity` from the validated token. When an agent calls a tool, that token is the one the agent's `token-exchange` minted for the tool's audience. So on the tool inbound, `subject` is the delegated user's username (D31: the agent client links the client scope `aiac-username-sub`, which sets `sub` to the username in the exchanged token) and `client_id` is the calling agent's clientId. The UC-1 discovery token is different: the IdP Configuration Service mints it as the tool's own client (client credentials), so its `azp`, and thus `client_id`, is the tool's own clientId.
 
 The agent packages embed these symbols. Under agent side they come from the APM. Under target side the agent inbound gets them from the projection of the agent's SPM: `agent_scopes` is `owned_scopes`, and the identity maps and the four inbound role maps come from `project_inbound(spm)`. The tool inbound symbols are in [their own table](#tool-inbound-package-target-side-authbridgeclientinboundrequest).
 
@@ -222,7 +222,7 @@ The agent packages embed these symbols. Under agent side they come from the APM.
 | Rego symbol | Source | Shape | De-prefixed? |
 |-------------|--------|-------|--------------|
 | `agent_scopes` | `model.agent_scopes` | `[scope.name, …]` — **inbound only** (the audience gate) | no — full scope names |
-| `subject_roles` | `model.subject_roles` | subject id → `[role.name, …]` (effect-agnostic; includes deny-edge roles) | n/a (roles) |
+| `subject_roles` | `model.subject_roles` | username → `[role.name, …]` (effect-agnostic; includes deny-edge roles) | n/a (roles) |
 | `source_roles` | `model.source_roles` | source client id → `[role.name, …]` — **inbound only** (effect-agnostic; includes deny-edge roles) | n/a (roles) |
 | `subject_role_allow_scopes` / `subject_role_deny_scopes` | grouped `inbound_subject_{allow,deny}_rules` (inbound) / `outbound_subject_{allow,deny}_rules` (outbound) | role → `[scope name, …]` — inbound: agent scopes; outbound: tool names | inbound no; outbound **yes** |
 | `source_role_allow_scopes` / `source_role_deny_scopes` | grouped `inbound_source_{allow,deny}_rules` | role → `[agent scope name, …]` — **inbound only** | no — full scope names |

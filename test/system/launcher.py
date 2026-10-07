@@ -10,8 +10,9 @@ Two halves, both live here so a single module import serves every launcher:
 
 * **Live-cluster half** — drive a real rossoctl/Kind cluster with the AuthBridge OPA pipeline wired
   in (see ``k8s/opa-kind-runbook.md``). ``kubectl`` wrappers + ``port_forward`` + ``resolve_pod``
-  onboard through the in-cluster Controller; ``mint_token`` / ``jwt_claim`` / ``inbound_probe`` /
-  ``outbound_probe`` / ``outbound_session_probe`` send **real HTTP requests through AuthBridge** and
+  onboard through the in-cluster Controller; ``mint_token`` / ``exchange_token`` / ``jwt_claim`` /
+  ``inbound_probe`` / ``outbound_probe`` / ``outbound_session_probe`` send **real HTTP requests through
+  AuthBridge** (and, for ``exchange_token``, one RFC 8693 token exchange straight to Keycloak) and
   classify the **real OPA plugin's** allow/deny; ``poll_until`` waits for ``bundle-service`` to reflect a CR change; and the
   skip gates (``require_env_or_skip`` / ``require_pipeline`` / ``verify_subject_mapper``) make the
   suite skip cleanly — never false-pass — when the cluster is not wired. ``require_pipeline`` also
@@ -361,6 +362,78 @@ def mint_token(
         timeout=timeout,
     )
     resp.raise_for_status()
+    return resp.json()["access_token"]
+
+
+# RFC 8693 token exchange — the request AuthBridge's ``token-exchange`` plugin sends on the outbound leg.
+TOKEN_EXCHANGE_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:token-exchange"
+ACCESS_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:access_token"
+
+# The answer of Keycloak when it refuses the client authentication of a token request (RFC 6749 §5.2):
+# HTTP 400 or 401 with one of these OAuth ``error`` codes.
+CLIENT_AUTH_REFUSED_STATUSES = frozenset({400, 401})
+CLIENT_AUTH_REFUSED_ERRORS = frozenset({"invalid_client", "unauthorized_client"})
+
+
+class TokenExchangeError(RuntimeError):
+    """Keycloak did not answer a token exchange (``exchange_token``) with a token. Carries the HTTP
+    ``status``, the raw ``body`` and the OAuth ``error`` code (``None`` when the body is not an OAuth
+    error document), so that a caller can tell a refused client authentication
+    (``client_auth_refused``) from every other failure."""
+
+    def __init__(self, status: int, body: str, error: str | None) -> None:
+        self.status = status
+        self.body = body
+        self.error = error
+        super().__init__(f"token exchange failed: HTTP {status}, error={error!r}, body={body[:500]!r}")
+
+    @property
+    def client_auth_refused(self) -> bool:
+        """True when Keycloak refused the client authentication of the request (HTTP 400/401 with
+        ``invalid_client`` / ``unauthorized_client``), not the exchange itself."""
+        return self.status in CLIENT_AUTH_REFUSED_STATUSES and self.error in CLIENT_AUTH_REFUSED_ERRORS
+
+
+def exchange_token(
+    subject_token: str,
+    *,
+    keycloak_url: str,
+    realm: str,
+    client_id: str,
+    client_secret: str,
+    audience: str,
+    scope: str,
+    timeout: float = 30.0,
+) -> str:
+    """Exchange ``subject_token`` for an access token to ``audience`` (RFC 8693, the Keycloak standard
+    token exchange) as the client ``client_id``, and return the new access token.
+
+    The same request that AuthBridge's ``token-exchange`` plugin sends on the agent's outbound leg
+    (``audience`` + ``scope`` from the route, ``subject_token_type`` and ``requested_token_type`` =
+    access token). The client authenticates with ``client_secret`` (form data, like ``mint_token``),
+    as AuthBridge does with the ``client-secret`` identity that ``k8s/opa-kind-enable.sh`` sets. Raises ``TokenExchangeError`` on a non-2xx answer;
+    its ``client_auth_refused`` tells a refused client authentication from every other failure."""
+    resp = requests.post(
+        f"{keycloak_url.rstrip('/')}/realms/{realm}/protocol/openid-connect/token",
+        data={
+            "grant_type": TOKEN_EXCHANGE_GRANT_TYPE,
+            "subject_token": subject_token,
+            "subject_token_type": ACCESS_TOKEN_TYPE,
+            "requested_token_type": ACCESS_TOKEN_TYPE,
+            "audience": audience,
+            "scope": scope,
+            "client_id": client_id,
+            "client_secret": client_secret,
+        },
+        timeout=timeout,
+    )
+    if not (200 <= resp.status_code < 300):
+        try:
+            doc = resp.json()
+        except ValueError:
+            doc = None
+        error = doc.get("error") if isinstance(doc, dict) else None
+        raise TokenExchangeError(resp.status_code, resp.text, error if isinstance(error, str) else None)
     return resp.json()["access_token"]
 
 
@@ -925,7 +998,14 @@ def verify_subject_mapper(
     the username only when the realm carries the ``username -> sub`` mapper and Direct Access Grants
     are enabled on ``client_id`` — a one-time Keycloak prerequisite the fixture does **not** provision
     (runbook Prerequisites). Skipping here (rather than failing every decision) keeps a mis-provisioned
-    realm from masquerading as a policy bug. Returns the minted token on success."""
+    realm from masquerading as a policy bug. Returns the minted token on success.
+
+    This checks only the **login** token: the login client's own ``username-to-sub`` mapper (on
+    ``client_id``, by default ``rossoctl``) sets its ``sub``. A token that an agent exchanges gets the
+    same mapping from the client scope ``aiac-username-sub``, which AIAC links to each managed client
+    at onboarding (D31); ``uc1_onboard.require_subject_scope`` checks that link, and a missing link
+    fails the run (it is an AIAC step, not a prerequisite). Together the two checks cover both
+    sources of the rule."""
     import pytest
 
     try:
@@ -939,7 +1019,8 @@ def verify_subject_mapper(
     sub = jwt_claim(token, "sub")
     if sub != user:
         pytest.skip(
-            f"token 'sub' is {sub!r}, not {user!r} — the realm's username->sub protocol mapper is "
-            "missing (see k8s/opa-kind-runbook.md Prerequisites)."
+            f"login token 'sub' is {sub!r}, not {user!r} — the login client {client_id!r} has no "
+            "username->sub protocol mapper (a manual prerequisite; AIAC's aiac-username-sub scope covers "
+            "only the exchanged tokens, D31 — see k8s/opa-kind-runbook.md Prerequisites)."
         )
     return token
