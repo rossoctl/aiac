@@ -11,7 +11,7 @@
     <packaging>jar</packaging>
 
     <name>AIAC Keycloak Event Listener</name>
-    <description>Keycloak admin-event listener that publishes CLIENT_CREATED and role create/update events to the AIAC NATS JetStream Event Broker.</description>
+    <description>Keycloak admin-event listener that publishes CLIENT_CREATED, role create/update and user realm-role mapping events to the AIAC NATS JetStream Event Broker.</description>
 
     <properties>
         <maven.compiler.source>17</maven.compiler.source>
@@ -24,7 +24,9 @@
              and the later keycloak-services advisories, are provided-scope
              (Keycloak supplies these jars at runtime) — they don't ship in the
              shaded provider jar. keycloak-services is deliberately NOT a
-             dependency of the SPI code: it imports only org.keycloak.Config (core),
+             dependency of the SPI code: it imports only org.keycloak.Config and
+             org.keycloak.util.JsonSerialization (core; the JSON parse of a
+             role-mapping representation, so no JSON library is shaded),
              org.keycloak.models.* (server-spi), and org.keycloak.events.*
              (server-spi-private). It is a test-scope dependency only (see
              below). -->
