@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from eval.conftest import _scale_run_matches_fixed_100, _scenario_name_from_nodeid
+from eval.conftest import _render_field, _scale_run_matches_fixed_100, _scenario_name_from_nodeid
 
 
 @pytest.fixture(autouse=True)
@@ -93,3 +93,34 @@ class TestScenarioNameFromNodeid:
         # practice) falls through to the unchanged-return branch rather than mis-slicing.
         nodeid = "eval/test_policy_pipeline_eval.py::test_prb_correctness[baseline"
         assert _scenario_name_from_nodeid(nodeid) == nodeid
+
+
+class TestRenderFieldFencing:
+    """Confirmed as a real finding in PR review: a multi-line value containing its own backtick
+    run (e.g. an LLM-drafted recommendation body with inline/fenced code) must not be able to
+    prematurely close the outer fence ``_render_field`` wraps it in."""
+
+    def test_plain_multiline_text_uses_a_three_backtick_fence(self) -> None:
+        lines: list[str] = []
+        _render_field(lines, "Recommendation", "line one\nline two")
+        assert lines[1] == "  ```"
+        assert lines[-1] == "  ```"
+
+    def test_body_containing_a_three_backtick_fence_gets_a_longer_outer_fence(self) -> None:
+        lines: list[str] = []
+        body = "Wrap the fix like:\n```python\nraise ValueError\n```"
+        _render_field(lines, "Recommendation", body)
+        opening_fence = lines[1].strip()
+        assert opening_fence == "````"  # one longer than the body's own ``` run
+        assert lines[-1].strip() == "````"
+        # The body's own fence lines must survive untouched, not be mistaken for the outer close.
+        assert "  ```python" in lines
+        assert "  ```" in lines
+
+    def test_body_containing_a_longer_backtick_run_still_gets_a_proper_fence(self) -> None:
+        lines: list[str] = []
+        body = "A run of ```` four backticks\nsecond line"
+        _render_field(lines, "Recommendation", body)
+        opening_fence = lines[1].strip()
+        assert opening_fence == "`````"  # one longer than the body's own run of 4
+        assert lines[-1].strip() == opening_fence

@@ -333,6 +333,11 @@ def _draft_patterns(cases: list[EvidenceCase]) -> list[_Pattern]:
             raise_sanitized(err)
         except LLMError:
             return []
+    # ``with_structured_output`` can return None instead of raising when the model's response
+    # can't be coerced into the schema (e.g. it answered in plain text) -- treat that the same as
+    # any other unusable response, not an AttributeError on `.patterns`.
+    if result is None:
+        return []
     return result.patterns
 
 
@@ -370,9 +375,12 @@ def build_recommendations(
     """Orchestrator: calls all six case-builders to collect ``list[EvidenceCase]`` (pure, instant);
     if empty, returns ``[]`` with no LLM call. Otherwise calls ``_draft_patterns`` once; validates
     each returned pattern's ``case_ids`` against the known set (drops unknown/hallucinated ids,
-    drops a pattern left with none); if that leaves zero usable patterns (call failed, or nothing
-    survived validation), falls back to the deterministic ``(finding_type, fallback_key)`` grouping
-    instead. Returns the final list sorted by heading for stable rendering."""
+    drops a pattern left with none). Any case left uncovered by every surviving pattern -- whether
+    because the call failed outright, nothing survived validation, or the model simply omitted a
+    case or gave it a hallucinated id -- goes through the deterministic ``(finding_type,
+    fallback_key)`` grouping instead, so no case is ever silently dropped from the section (the
+    module docstring's "never silently blank" guarantee extends to every individual case, not just
+    to the section as a whole). Returns the final list sorted by heading for stable rendering."""
     cases: list[EvidenceCase] = [
         *over_grant_cases(over_grant),
         *under_grant_cases(under_grant),
@@ -388,19 +396,22 @@ def build_recommendations(
     patterns = _draft_patterns(cases)
 
     recommendations: list[Recommendation] = []
+    covered_ids: set[str] = set()
     for pattern in patterns:
-        covered_ids = [case_id for case_id in pattern.case_ids if case_id in cases_by_id]
-        if not covered_ids:
+        pattern_covered_ids = [case_id for case_id in pattern.case_ids if case_id in cases_by_id]
+        if not pattern_covered_ids:
             continue
+        covered_ids.update(pattern_covered_ids)
         recommendations.append(
             Recommendation(
                 heading=pattern.heading,
                 body=pattern.recommendation,
-                evidence=[cases_by_id[case_id].evidence for case_id in covered_ids],
+                evidence=[cases_by_id[case_id].evidence for case_id in pattern_covered_ids],
             )
         )
 
-    if not recommendations:
-        recommendations = _fallback_recommendations(cases)
+    uncovered_cases = [case for case in cases if case.case_id not in covered_ids]
+    if uncovered_cases:
+        recommendations.extend(_fallback_recommendations(uncovered_cases))
 
     return sorted(recommendations, key=lambda rec: rec.heading)

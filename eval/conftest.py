@@ -249,13 +249,35 @@ def _detail(report: pytest.TestReport, category: str) -> str | None:
     return None
 
 
+def _longest_backtick_run(text: str) -> int:
+    """Length of the longest run of consecutive backticks anywhere in ``text`` -- used by
+    ``_render_field`` to size its code fence. Every value this module code-fences is free-form
+    (an LLM-drafted recommendation body, in particular) and may itself contain a backtick run (its
+    own inline code or fenced block); per CommonMark, an opening fence shorter than or equal to
+    that run doesn't actually close the block -- the content's own backticks end it early and
+    everything after renders outside the fence."""
+    longest = current = 0
+    for ch in text:
+        if ch == "`":
+            current += 1
+            longest = max(longest, current)
+        else:
+            current = 0
+    return longest
+
+
 def _render_field(lines: list[str], label: str, text: str) -> None:
-    """Append a ``- **label:** text`` bullet, code-fencing ``text`` if it spans multiple lines."""
+    """Append a ``- **label:** text`` bullet, code-fencing ``text`` if it spans multiple lines.
+    The fence is always longer than the longest backtick run inside ``text`` itself (see
+    ``_longest_backtick_run``), so a value containing its own fenced/inline code (e.g. an
+    LLM-drafted recommendation body) can never prematurely close the outer fence and corrupt the
+    rest of the report."""
     if "\n" in text:
+        fence = "`" * max(_longest_backtick_run(text) + 1, 3)
         lines.append(f"- **{label}:**")
-        lines.append("  ```")
+        lines.append(f"  {fence}")
         lines.extend(f"  {line}" for line in text.splitlines())
-        lines.append("  ```")
+        lines.append(f"  {fence}")
     else:
         lines.append(f"- **{label}:** {text}")
 

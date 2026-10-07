@@ -297,6 +297,50 @@ class TestBuildRecommendations:
         assert "correctness_prb" in rec.heading
         assert len(rec.evidence) == 1
 
+    def test_case_the_llm_omits_still_surfaces_via_fallback(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A pattern covering only SOME cases must not silently drop the rest -- confirmed as a
+        real finding in PR review: the module's "never silently blank" guarantee has to hold per
+        case, not just when the whole LLM call fails."""
+        other_entry = (
+            "correctness_e2e",
+            "wildcard_grant",
+            {"over_grants": {"outbound_target": [("role-b", "scope-b")]}},
+        )
+        stub = _Pattern(
+            heading="pattern covering only one case",
+            recommendation="rec",
+            case_ids=["correctness_prb:baseline:over_grant"],  # omits the e2e case entirely
+        )
+        monkeypatch.setattr("eval.recommendations._draft_patterns", lambda cases: [stub])
+        recs = self._call(over_grant=[_OVER_GRANT_ENTRY, other_entry])
+        assert len(recs) == 2
+        drafted = next(r for r in recs if r.heading == "pattern covering only one case")
+        assert len(drafted.evidence) == 1 and "role-a" in drafted.evidence[0]
+        fallback = next(r for r in recs if r is not drafted)
+        assert "LLM pattern analysis unavailable" in fallback.body
+        assert "role-b" in fallback.evidence[0]
+
+    def test_hallucinated_id_in_an_otherwise_valid_pattern_still_surfaces_the_other_case(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """One pattern naming a real case plus a hallucinated one, alongside a second real case the
+        pattern never mentions at all -- both real cases must end up covered (one drafted, one
+        fallback), never just the one the pattern happened to name."""
+        other_entry = (
+            "correctness_e2e",
+            "wildcard_grant",
+            {"over_grants": {"outbound_target": [("role-b", "scope-b")]}},
+        )
+        stub = _Pattern(
+            heading="pattern",
+            recommendation="rec",
+            case_ids=["correctness_prb:baseline:over_grant", "hallucinated:nonexistent:over_grant"],
+        )
+        monkeypatch.setattr("eval.recommendations._draft_patterns", lambda cases: [stub])
+        recs = self._call(over_grant=[_OVER_GRANT_ENTRY, other_entry])
+        assert len(recs) == 2
+        assert any("LLM pattern analysis unavailable" in r.body and "role-b" in r.evidence[0] for r in recs)
+
 
 # =========================================================================== #
 # _draft_patterns itself -- LLM failure returns [] rather than raising        #
@@ -312,6 +356,24 @@ class TestDraftPatternsLLMFailure:
             raise LLMAccessError("LLM endpoint unreachable after exhausting transport retries")
 
         monkeypatch.setattr("eval.recommendations.call_with_retry", _raise)
+        monkeypatch.setattr("eval.recommendations.build_llm", lambda settings: MagicMock())
+        cases = [
+            EvidenceCase(
+                case_id="x:y:over_grant",
+                finding_type="over_grant",
+                evidence="evidence",
+                remedy_menu="menu",
+                fallback_key="x",
+            )
+        ]
+        assert _draft_patterns(cases) == []
+
+    def test_structured_output_none_returns_empty_list_not_raise(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """``with_structured_output`` can return ``None`` instead of raising when the model's
+        response can't be coerced into the schema -- confirmed as a real finding in PR review."""
+        from eval.recommendations import _draft_patterns
+
+        monkeypatch.setattr("eval.recommendations.call_with_retry", lambda *a, **k: None)
         monkeypatch.setattr("eval.recommendations.build_llm", lambda settings: MagicMock())
         cases = [
             EvidenceCase(
