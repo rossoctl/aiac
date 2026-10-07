@@ -444,6 +444,10 @@ changed combiner denies a pod that has no client CR, so a deleted CR means deny.
     so "no CR" is a real transition), and the tool has **no SPM**;
   - the Keycloak client is **disabled** and `client.type=Tool` is **kept**; the failure and the
     dead-letter move are logged;
+  - the shared subject scope `aiac-username-sub` **stays**: it still exists and is still a default
+    scope of the disabled tool client. The phase-3 onboarding linked it, and the link is not in the
+    created-manifest, so the rollback does not delete it (D31). `test_rollback_keeps_the_subject_scope`
+    covers the failed agent and the failed tool;
   - the agent's CR, by side: under target side it does not change (the tool owns no role, so the
     footprint purge changes no other SPM) — its inbound grants stay and its outbound stays a
     pass-through. Under agent side, the agent CR's outbound grant bindings are all empty, and its
