@@ -92,9 +92,7 @@ def test_package_logger_emits_info_after_configure(monkeypatch):
     root.addHandler(logging.Handler())
     root.handlers[-1].emit = records.append  # type: ignore[method-assign]
     consumer_logger.info("aiac-agent-consumer subscribed to %s", ["aiac.apply.service.*"])
-    assert [r.getMessage() for r in records] == [
-        "aiac-agent-consumer subscribed to ['aiac.apply.service.*']"
-    ]
+    assert [r.getMessage() for r in records] == ["aiac-agent-consumer subscribed to ['aiac.apply.service.*']"]
 
 
 def test_level_is_authoritative_when_root_already_has_a_handler(monkeypatch):

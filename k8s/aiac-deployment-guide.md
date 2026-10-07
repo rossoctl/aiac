@@ -323,7 +323,7 @@ in place to the CR-backed implementation, which writes Rego packages to an
 `AuthorizationPolicy` Kubernetes CR instead. The image name, ClusterIP Service name, and
 port are unchanged — no image swap and no Agent reconfiguration required.
 
-See issue [4.18 — K8s: OPA PDP Policy Writer AuthorizationPolicy CR + RBAC upgrade](../docs/issues/deployment/4.18-k8s-opa-authorizationpolicy-rbac.md) for the full procedure (ServiceAccount, ClusterRole, ClusterRoleBinding, CR instance).
+See issue [#70 — K8s: OPA PDP Policy Writer AuthorizationPolicy CR + RBAC upgrade](https://github.com/rossoctl/aiac/issues/70) for the full procedure (ServiceAccount, ClusterRole, ClusterRoleBinding, CR instance).
 
 ```bash
 # Rebuild the OPA PDP Policy Writer image with the Phase 2 (CR-backed) implementation
