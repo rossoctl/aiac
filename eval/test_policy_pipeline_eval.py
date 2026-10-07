@@ -300,7 +300,9 @@ def _read_back(config: Configuration) -> tuple[dict[str, Role], dict[str, Scope]
     scopes: dict[str, Scope] = {}
     for svc in config.get_services():
         for s in svc.scopes:
-            scopes.setdefault(s.name, s)  # first owner wins; each scope has exactly one owner
+            # One entry for each name: no eval scenario shares a scope between tools. (A shared scope is
+            # valid, D32; it then has one copy for each owner, and this map keeps the first one.)
+            scopes.setdefault(s.name, s)
     return roles, scopes
 
 

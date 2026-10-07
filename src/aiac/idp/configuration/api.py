@@ -1,3 +1,4 @@
+import logging
 import os
 from pathlib import Path
 from typing import Protocol
@@ -7,6 +8,8 @@ from dotenv import load_dotenv
 
 from aiac.idp.configuration.models import Role, Scope, Service, ServiceType, Subject
 from aiac.shared.upstream import run_upstream
+
+logger = logging.getLogger(__name__)
 
 
 class IdPHTTPError(RuntimeError):
@@ -36,6 +39,22 @@ class _NamedDefinition(Protocol):
 
     name: str
     description: str
+
+
+def _warn_on_dropped_description(kind: str, existing: Role | Scope, definition: _NamedDefinition) -> None:
+    """Log a ``WARNING`` when a reused (shared, D32) role or scope keeps a description that is not
+    the new definition's description. ``None`` counts as ``""``. The kept description is not
+    updated in Keycloak, so a later owner cannot silently change the policy decision for the
+    earlier owners; the warning makes the dropped text visible."""
+    kept, dropped = existing.description or "", definition.description or ""
+    if kept != dropped:
+        logger.warning(
+            "reused %s %r keeps its description %r; the new description %r is dropped (D32: Keycloak is not updated)",
+            kind,
+            existing.name,
+            kept,
+            dropped,
+        )
 
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
@@ -259,10 +278,15 @@ class Configuration:
         """Idempotent create-or-get of a realm role by name, then map it to ``service_id``.
 
         If a realm role with ``role.name`` already exists it is reused (no duplicate create);
-        otherwise it is created. The role is then mapped to the service's service-account
+        otherwise it is created. Reuse is by design (D32): services with the same workload name
+        share the role. A reused role keeps its description; when ``role.description`` is not the
+        same (``None`` counts as ``""``), a ``WARNING`` names the role and both descriptions, and
+        Keycloak is not updated. The role is then mapped to the service's service-account
         (``map_role_to_service`` is itself idempotent). Returns the resolved ``Role``.
         """
         existing = next((r for r in self.get_roles() if r.name == role.name), None)
+        if existing is not None:
+            _warn_on_dropped_description("role", existing, role)
         resolved = existing or self.create_role(role.name, role.description)
         self.map_role_to_service(self.get_service(service_id), resolved)
         return resolved
@@ -271,10 +295,16 @@ class Configuration:
         """Idempotent create-or-get of a client scope by name, then map it to ``service_id``.
 
         If a client scope with ``scope.name`` already exists it is reused; otherwise it is
-        created. The scope is then mapped to the service as a default client scope
-        (``map_scope_to_service`` is itself idempotent). Returns the resolved ``Scope``.
+        created. Reuse is by design (D32): services with the same workload name share the scope,
+        and each owner gets its own copy in ``get_services()``. A reused scope keeps its
+        description; when ``scope.description`` is not the same (``None`` counts as ``""``), a
+        ``WARNING`` names the scope and both descriptions, and Keycloak is not updated. The scope
+        is then mapped to the service as a default client scope (``map_scope_to_service`` is itself
+        idempotent). Returns the resolved ``Scope``.
         """
         existing = next((s for s in self.get_scopes() if s.name == scope.name), None)
+        if existing is not None:
+            _warn_on_dropped_description("client scope", existing, scope)
         resolved = existing or self.create_scope(scope.name, scope.description)
         self.map_scope_to_service(self.get_service(service_id), resolved)
         return resolved

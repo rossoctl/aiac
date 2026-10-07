@@ -164,8 +164,9 @@ class Scope(BaseModel):
     name: str
     description: str | None = None
     attributes: dict[str, Any] = {}
-    # The single owning service's serviceId — the SPM routing key: a rule ``(role, scope)``
-    # routes to ``SPM(scope.serviceId)`` (Assumption 2: a scope has exactly one owner).
+    # The serviceId of the owner of this copy — the SPM routing key: a rule ``(role, scope)``
+    # routes to ``SPM(scope.serviceId)``. A shared scope (D32) has one copy for each owner (the
+    # same ``id``, another ``serviceId``), and each copy routes to its owner's SPM.
     # Populated at the IdP construction boundary (handoff 02); defaulted here so Wave 1 stays
     # backward-compatible with existing Scope construction sites.
     serviceId: str = ""
