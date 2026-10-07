@@ -43,11 +43,6 @@ make users
 make e2e
 ```
 
-> **Use `make enforce`, not `./driver.sh --only-enforce`.** The enforce phase has a prerequisite
-> (the outbound route) that a separate WIRE phase installs. `make enforce` runs both in order.
-> Running the enforce half alone against an unwired cluster denies **every** outbound probe with no
-> indication why. Same for `make e2e`, which covers both.
-
 ---
 
 ## The policy
@@ -63,7 +58,7 @@ Grant access on a least-privilege basis: allow only what this policy states; den
 
 ## What AIAC generates from it
 
-Two Rego policies per agent — one gating **who may call it**, one gating **what it may do
+Two Rego policies per agent — one gating **who may call it**, one gating **who it may call
 downstream** — derived from the policy text plus the realm-role descriptions already in Keycloak and
 the tool's own discovered capabilities.
 
@@ -109,14 +104,13 @@ that leg.
 ## Before you start
 
 **Cluster.** A Kind cluster named `rossoctl` with the rossoctl platform installed — SPIRE, Keycloak,
-and the rossoctl operator. Namespace `team1` must exist; the installer owns it, nothing here creates
-it.
+and the rossoctl operator. Namespace `team1` must exist; 
 
 **Tools.** `kubectl`, `helm`, `kind`, `curl`, `python3`, and `docker` or `podman` on `PATH`.
 
 **Three sibling repo clones**, needed by step 2. Each is auto-detected from the script's own
-location, so you normally set none of them. Override only if a clone lives elsewhere, and then use
-an **absolute** path — a relative one resolves against your shell's cwd, not the script's.
+location. Override only if a clone lives elsewhere, and then use an **absolute** path
+ — a relative one resolves against your shell's cwd, not the script's.
 
 | Variable | Clone | Used for |
 |---|---|---|
@@ -150,11 +144,10 @@ kubectl create secret generic keycloak-admin-secret -n aiac-system \
   --from-literal=KEYCLOAK_ADMIN_PASSWORD=<admin-password>
 ```
 
-Both key names are exact. Override the location with `KC_SECRET_NS` / `KC_SECRET`.
 
 ### Keycloak credentials are discovered for you
 
-You do **not** need to export `KEYCLOAK_URL` / `KEYCLOAK_ADMIN_USERNAME` /
+**NO** need to export `KEYCLOAK_URL` / `KEYCLOAK_ADMIN_USERNAME` /
 `KEYCLOAK_ADMIN_PASSWORD`. Every Keycloak-touching `make` target self-runs
 `init/00-discover-keycloak.sh` first, which port-forwards the in-cluster Keycloak and reads the
 admin credentials from the Secret above. The forward is set up once and reused. If you already
@@ -195,8 +188,16 @@ Step 5 re-asserts the mapper idempotently, so a `409` there is expected and harm
 
 ## Step 1 — Install AIAC
 
+> **`make enable` defaults to `LLM_BASE_URL=https://api.openai.com/v1` and `LLM_MODEL=gpt-4o-mini`.**
+
 ```bash
 make enable
+```
+
+> If your endpoint is anything else, pass them as follow:
+
+```bash
+LLM_BASE_URL=https://your-endpoint LLM_MODEL=your-model make enable
 ```
 
 ### What happens
@@ -215,20 +216,10 @@ Three independently runnable sub-steps:
 | NATS broker | `--broker-only` | Applies `event-broker-deployment.yaml`, creating `aiac-event-broker-service` |
 | Keycloak SPI | `--spi-only` | Builds the shaded jar in a Maven container (no JDK needed locally), derives a Keycloak image carrying it, `kind load`s it, patches the live `keycloak` StatefulSet, and enables the listener on the realm |
 
-It deliberately does **not** deploy `github-agent`/`github-tool` — they stay undeployed so step 4 is
-a genuine first-time trigger.
+Both `github-agent`/`github-tool` — are **NOT** deployed hence step 4 is a genuine first-time trigger.
 
-### Point it at your LLM
-
-> **`enable.sh` defaults to `LLM_BASE_URL=https://api.openai.com/v1` and `LLM_MODEL=gpt-4o-mini`.**
-> If your endpoint is anything else, pass them, or onboarding fails later with a `401` that looks
-> like a bad API key:
->
-> ```bash
-> LLM_BASE_URL=https://your-endpoint LLM_MODEL=your-model make enable
-> ```
->
-> Already installed with the wrong values? Patch and restart — these are injected via `envFrom`, so
+### Change LLM
+> Want to use different values? Patch and restart — these are injected via `envFrom`, so
 > they are snapshotted at pod start and a ConfigMap edit alone changes nothing:
 >
 > ```bash
@@ -253,7 +244,7 @@ kubectl exec deployment/aiac-agent -n aiac-system -- \
   sh -c 'echo "$LLM_BASE_URL  $LLM_MODEL"'
 ```
 
-### Re-running after a source change
+### Re-running after a source change - (For developers only)
 
 The stack sub-step **skips building an image that already exists locally** — right on a re-run,
 wrong after editing `src/aiac/`. Force the builds:
@@ -270,12 +261,19 @@ of the `rossoctl` release reverts it. Undo it deliberately with `make restore AR
 
 ## Step 2 — Wire OPA into both AuthBridge legs
 
+Confirm OPA is **NOT** configured in any authbridge leg  — expect `0`:
+
 ```bash
-make opa      # wraps ../../../k8s/opa-kind-enable.sh
+kubectl get configmap authbridge-runtime-config -n team1 \
+  -o jsonpath='{.data.config\.yaml}' | grep -c 'name: opa'
 ```
 
-This is a **cluster-level, one-time** change owned by `k8s/`, not by this demo — `make opa` is only
-a thin wrapper over the `k8s/` script.
+Now insert opa in both inbound and outbound legs of AuthBridge
+```bash
+make opa  
+```
+
+This is a **cluster-level, one-time** change owned by `k8s/`.
 
 ### What happens
 
