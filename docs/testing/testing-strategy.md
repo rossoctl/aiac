@@ -55,6 +55,44 @@ A live suite must never false-pass when its environment is absent. System and li
 `require_env_or_skip(...)` or an equivalent direct `pytest.skip` (a clean skip) so an unset variable or an unwired cluster
 **skips** rather than fails or silently passes.
 
+## Writing a new test — where and how
+
+The placement of a test follows what the test **touches**, not what it is about.
+Use this ladder. The first match wins:
+
+1. **One unit, in-process, no external service** → **unit**. Put it under
+   `test/unit/` at the path that **mirrors** the module under test. For example,
+   a test for `src/aiac/pdp/policy/…` goes in `test/unit/pdp/policy/`. Do not tag
+   it (no `pytestmark`). A bare `pytest` then runs it. If the mirror directory
+   does not exist, create it.
+2. **Several AIAC units cooperating in-process, no cluster** → **integration**.
+   Tag the module with `pytestmark = pytest.mark.integration` (or the single test
+   with `@pytest.mark.integration`). When you add the first one, create
+   `test/integration/` as a mirror of `src/aiac/`.
+3. **Needs a live Kind cluster / Rosso / deployed AIAC** → **system**. Put it in
+   `test/system/` and tag it `@pytest.mark.system`. It **must skip cleanly** when
+   the cluster or env is missing. Use `require_env_or_skip`. Do not use
+   `require_env`, because it exits hard.
+4. **Heavy policy-pipeline evaluation** → **eval**. Put it under `eval/` and tag
+   it `@pytest.mark.eval`. The same clean-skip rule applies. Exception: offline
+   tests of the eval harness helpers (scorer, dashboard, trend log, …) also live
+   under `eval/`, but have no tag. A bare `pytest` runs them in the unit lane.
+
+Then, if the test calls a real external LLM but needs no cluster, also add the
+`llm` tag. A unit or integration test can have the `llm` tag. To put more than one
+marker on a test, use `pytestmark = [pytest.mark.system, pytest.mark.llm]`.
+
+Rules of thumb:
+
+- Use the **lowest** level that still tests what you need. Most tests are unit
+  tests.
+- Do not import by a hard-coded path. Get the repo root with
+  `Path(__file__).resolve().parents[N]`. **Count N from the actual location of the
+  file**: a file in `test/unit/pdp/policy/` is 4 levels below the repo root.
+- Each test above the unit level skips cleanly when its infra is not available.
+
+To run each lane, see [`../agents/test.md`](../agents/test.md).
+
 ## Specs in this directory
 
 | Spec | Level | What it documents |
