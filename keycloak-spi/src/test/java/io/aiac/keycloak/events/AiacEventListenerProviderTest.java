@@ -4,6 +4,9 @@ import io.nats.client.Connection;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.NullSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.keycloak.events.Event;
 import org.keycloak.events.admin.AdminEvent;
 import org.keycloak.events.admin.OperationType;
@@ -52,6 +55,19 @@ class AiacEventListenerProviderTest {
 
     @Mock
     private Connection natsConnection;
+
+    /** The resource path of {@code RoleMapperResource} under {@code UserResource}. */
+    static final String ROLE_MAPPING_PATH = "users/user-1/role-mappings/realm";
+
+    /**
+     * The representation of a realm-role mapping event: the JSON array of {@code RoleRepresentation}
+     * that {@code RoleMapperResource} gives to {@code AdminEventBuilder.representation}.
+     */
+    static final String TWO_ROLES = "["
+            + "{\"id\":\"role-1\",\"name\":\"developer\",\"composite\":false,\"clientRole\":false,"
+            + "\"containerId\":\"realm-1\"},"
+            + "{\"id\":\"role-2\",\"name\":\"viewer\",\"composite\":false,\"clientRole\":false,"
+            + "\"containerId\":\"realm-1\"}]";
 
     private AiacEventListenerProvider provider;
 
@@ -137,6 +153,7 @@ class AiacEventListenerProviderTest {
         provider.onEvent(adminEvent(ResourceType.REALM_ROLE, OperationType.CREATE, "roles/editor"), true);
         provider.onEvent(
                 adminEvent(ResourceType.CLIENT_ROLE, OperationType.UPDATE, "clients/abc-123/roles/writer"), false);
+        provider.onEvent(roleMapping(OperationType.CREATE, TWO_ROLES), false);
 
         verify(transactionManager, times(1)).enlistAfterCompletion(any());
         KeycloakTransaction tx = enlistedTransaction();
@@ -148,6 +165,8 @@ class AiacEventListenerProviderTest {
         inOrder.verify(natsConnection).publish(eq("aiac.apply.service.abc-123"), aryEq(payload("abc-123")));
         inOrder.verify(natsConnection).publish(eq("aiac.apply.role.editor"), aryEq(payload("editor")));
         inOrder.verify(natsConnection).publish(eq("aiac.apply.role.writer"), aryEq(payload("writer")));
+        inOrder.verify(natsConnection).publish(eq("aiac.apply.role-members.role-1"), aryEq(payload("role-1")));
+        inOrder.verify(natsConnection).publish(eq("aiac.apply.role-members.role-2"), aryEq(payload("role-2")));
     }
 
     @Test
@@ -157,6 +176,14 @@ class AiacEventListenerProviderTest {
         provider.onEvent(adminEvent(ResourceType.REALM_ROLE, OperationType.DELETE, "roles/editor"), false);
         provider.onEvent(adminEvent(ResourceType.USER, OperationType.CREATE, "users/some-user"), false);
         provider.onEvent(adminEvent(null, null, null), false);
+        // Known limits: a group mapping, a client-role mapping and a group membership. Each one has a
+        // good role list, so the drop comes from the kind or the path, not from the representation.
+        provider.onEvent(adminEvent(ResourceType.REALM_ROLE_MAPPING, OperationType.CREATE,
+                "groups/group-1/role-mappings/realm", TWO_ROLES), false);
+        provider.onEvent(adminEvent(ResourceType.CLIENT_ROLE_MAPPING, OperationType.CREATE,
+                "users/user-1/role-mappings/clients/client-1", TWO_ROLES), false);
+        provider.onEvent(adminEvent(ResourceType.GROUP_MEMBERSHIP, OperationType.CREATE,
+                "users/user-1/groups/group-1", "{\"id\":\"group-1\",\"name\":\"team\"}"), false);
 
         verifyNoInteractions(transactionManager);
         verifyNoInteractions(natsConnection);
@@ -239,6 +266,104 @@ class AiacEventListenerProviderTest {
     }
 
     @Test
+    void userRealmRoleAssignPublishesOneSubjectForEachRoleOnlyAtCommit() {
+        // includeRepresentation is false (the realm has adminEventsDetailsEnabled = false), but
+        // Keycloak sets the representation all the same: the listener does not depend on the flag.
+        provider.onEvent(roleMapping(OperationType.CREATE, TWO_ROLES), false);
+        KeycloakTransaction tx = enlistedTransaction();
+
+        tx.begin();
+        verifyNoInteractions(natsConnection);
+
+        tx.commit();
+        InOrder inOrder = inOrder(natsConnection);
+        inOrder.verify(natsConnection).publish(eq("aiac.apply.role-members.role-1"), aryEq(payload("role-1")));
+        inOrder.verify(natsConnection).publish(eq("aiac.apply.role-members.role-2"), aryEq(payload("role-2")));
+    }
+
+    @Test
+    void userRealmRoleUnassignPublishesOneSubjectForEachRoleOnlyAtCommit() {
+        provider.onEvent(roleMapping(OperationType.DELETE, TWO_ROLES), true);
+        KeycloakTransaction tx = enlistedTransaction();
+
+        tx.begin();
+        verifyNoInteractions(natsConnection);
+
+        tx.commit();
+        verifyPublished("aiac.apply.role-members.role-1", "role-1");
+        verifyPublished("aiac.apply.role-members.role-2", "role-2");
+    }
+
+    @Test
+    void rolledBackRoleMappingPublishesNothing() {
+        provider.onEvent(roleMapping(OperationType.CREATE, TWO_ROLES), false);
+        KeycloakTransaction tx = enlistedTransaction();
+
+        tx.begin();
+        tx.rollback();
+
+        verifyNoInteractions(natsConnection);
+    }
+
+    @ParameterizedTest
+    @NullSource
+    @ValueSource(strings = {"", "not json", "{\"id\":\"role-1\"}", "\"role-1\"", "null", "[]"})
+    void roleMappingWithNoRoleListIsDroppedWithAWarning(String representation) {
+        CapturedLog log = CapturedLog.of(AiacEventListenerProvider.class);
+        try {
+            assertDoesNotThrow(() -> provider.onEvent(roleMapping(OperationType.CREATE, representation), false));
+            assertTrue(log.hasWarning(
+                    "role mapping event on " + ROLE_MAPPING_PATH + " has no role list; dropping it"));
+        } finally {
+            log.detach();
+        }
+        verifyNoInteractions(transactionManager);
+        verifyNoInteractions(natsConnection);
+    }
+
+    @Test
+    void roleWithNoUsableIdIsDroppedWithAWarningAndTheOtherRolesArePublished() {
+        String roles = "[{\"name\":\"no-id\"},{\"id\":\"a.b\",\"name\":\"dotted\"},{\"id\":7},"
+                + "\"role-3\",null,{\"id\":\"role-2\",\"name\":\"viewer\"}]";
+
+        CapturedLog log = CapturedLog.of(AiacEventListenerProvider.class);
+        try {
+            provider.onEvent(roleMapping(OperationType.CREATE, roles), false);
+            assertTrue(log.hasWarning("role mapping event on " + ROLE_MAPPING_PATH
+                    + " has a role with no usable id; dropping that role: {name=no-id}"));
+            assertTrue(log.hasWarning("dropping that role: {id=a.b, name=dotted}"));
+            assertTrue(log.hasWarning("dropping that role: {id=7}"));
+            assertTrue(log.hasWarning("dropping that role: role-3"));
+            assertTrue(log.hasWarning("dropping that role: null"));
+        } finally {
+            log.detach();
+        }
+        KeycloakTransaction tx = enlistedTransaction();
+        tx.begin();
+        tx.commit();
+
+        verifyPublished("aiac.apply.role-members.role-2", "role-2");
+        verify(natsConnection, times(1)).publish(any(String.class), any(byte[].class));
+    }
+
+    @Test
+    void roleMappingOutsideAnActiveTransactionIsPublishedAtOnceWithOneConnectionLookup() {
+        when(transactionManager.isActive()).thenReturn(false);
+        AtomicInteger resolved = new AtomicInteger();
+        provider = new AiacEventListenerProvider(session, () -> {
+            resolved.incrementAndGet();
+            return natsConnection;
+        });
+
+        provider.onEvent(roleMapping(OperationType.CREATE, TWO_ROLES), false);
+
+        verify(transactionManager, never()).enlistAfterCompletion(any());
+        verifyPublished("aiac.apply.role-members.role-1", "role-1");
+        verifyPublished("aiac.apply.role-members.role-2", "role-2");
+        assertEquals(1, resolved.get());
+    }
+
+    @Test
     void userEventIsANoOp() {
         provider.onEvent(new Event());
 
@@ -266,5 +391,17 @@ class AiacEventListenerProviderTest {
         event.setOperationType(operation);
         event.setResourcePath(resourcePath);
         return event;
+    }
+
+    static AdminEvent adminEvent(
+            ResourceType type, OperationType operation, String resourcePath, String representation) {
+        AdminEvent event = adminEvent(type, operation, resourcePath);
+        event.setRepresentation(representation);
+        return event;
+    }
+
+    /** A realm-role mapping of a user (or of an agent's service account), as Keycloak sends it. */
+    static AdminEvent roleMapping(OperationType operation, String representation) {
+        return adminEvent(ResourceType.REALM_ROLE_MAPPING, operation, ROLE_MAPPING_PATH, representation);
     }
 }

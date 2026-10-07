@@ -40,10 +40,24 @@ live), in one ``apply_policy`` call — no call when the policy model is empty:
 
 A stale or missing CR stays until its service is affected again, or until the resync.
 
-Input contract. Each ``PolicyRule`` arrives with ``scope.serviceId``, ``role.kind`` and
-``role.actorIds`` already populated and with roles already flattened to their closure. The PCE
-performs no IdP lookup for routing/classification and no role flattening — the only runtime IdP
-read is ``Configuration.get_services()`` for the identity (P2) seed and the live check.
+Input contract. Each ``PolicyRule`` arrives with ``scope.serviceId`` and ``role.kind`` already
+populated and with roles already flattened to their closure. The PCE performs no IdP lookup for
+routing/classification and no role flattening. The ``role.actorIds`` of a rule is only a snapshot
+(see "Role holders").
+
+Role holders (D32). A stored edge keeps a copy of ``role.actorIds`` from the run that built it, and
+that copy goes stale: a role that two agents share carries only the holder that its build saw, and
+a user role keeps the members that it had when the rule was stored. A membership change does not
+change the policy (role → scope); it changes only who holds the role. So each operation reads the
+IdP one time, under the PCE lock: ``Configuration.get_services()`` (the catalog: the identity (P2)
+seed, the live check, and the holders of each agent role) and ``Configuration.get_roles()`` (the
+current members of each user role). It never reads ``get_subjects()``. From these it builds one
+``RoleHolders`` (``aiac.policy.model.holders``) and applies it, in memory, to every input rule and
+to every SPM that it reads from the store, so the routing guard, the affected set, ``_derive`` and
+the writer's ``project_inbound`` all see the current holders. The store schema does not change:
+the stored ``actorIds`` are a snapshot, refreshed when the PCE writes the SPM.
+``rerender_role(role_id)`` is the entry point for a membership change (the role-members event): it
+re-renders the CRs that use the role, with no PRB call and no store write.
 
 Drift GC. Because Keycloak UUIDs churn on delete/recreate, an append-only merge would let stale
 edges pile up beside their superseded generations. So after routing, ``_reconcile`` prunes each
@@ -58,8 +72,9 @@ falls out of the catalog forever, so its own ``SPM(X)``, its outbound footprint 
 other_scope`` edges on *other* SPMs) and its CR would linger. ``decommission(service_id)`` is the
 authoritative counterpart: it acts on an explicit offboard signal (not the catalog-miss guard),
 tears down X's entire footprint, deletes the CR of X, and redeploys the affected services of the
-side (target side: the services whose SPM changed; agent side: the agents that targeted X and the
-agents whose SPM changed).
+side with the current role holders (target side: the services whose SPM changed, and the services
+that keep an edge of a role X shared with another service; agent side: the agents that targeted X,
+the remaining holders of such a shared role, and the agents among those services).
 
 Service ids. Every service id the PCE takes is the **clientId** (``Service.serviceId``, the SPM key,
 type ``ClientId``) — never the Keycloak internal UUID (``ServiceUuid``). The UUID is only for finding
@@ -83,17 +98,17 @@ ConfigMap patch and a Controller restart, so the resync then writes every CR in 
 entry, or ``None``. ``bootstrap(service_id, service_type)`` (checkpoint B1) writes the focus tool's CR
 before UC-1 Provision, so that the discovery passes D20; it stores no SPM.
 
-Fire-and-forget — ``compute_and_apply``, ``decommission``, ``quarantine``, ``resync`` and
-``bootstrap`` log and re-raise dependency failures.
+Fire-and-forget — ``compute_and_apply``, ``decommission``, ``quarantine``, ``resync``,
+``bootstrap`` and ``rerender_role`` log and re-raise dependency failures.
 
 Serialization (the PCE lock). Every operation that writes reads SPMs, changes them, and writes them
 back. The store has no versions, and its own write lock protects one write, not a
 read-modify-write. So two runs that route rules into one shared SPM (for example two agents
 granted on one tool's scope) would both read the old SPM, and the second write would silently
 remove the first run's rules. One module-level lock, ``_pce_lock``, is held for the whole body of
-``compute_and_apply``, ``decommission``, ``quarantine``, ``resync`` and ``bootstrap``;
-``policy_model_for`` only reads and takes no lock. The PRB (the LLM work) runs before
-``compute_and_apply``, outside the lock, so concurrent onboardings still build their rules in
+``compute_and_apply``, ``decommission``, ``quarantine``, ``resync``, ``bootstrap`` and
+``rerender_role``; ``policy_model_for`` only reads and takes no lock. The PRB (the LLM work) runs
+before ``compute_and_apply``, outside the lock, so concurrent onboardings still build their rules in
 parallel; the part under the lock makes no LLM call. Known limits:
 
 - It serializes one process only (one Controller replica, as for the orchestrator's per-service
@@ -111,6 +126,7 @@ from collections.abc import Iterable
 from aiac.idp.configuration.api import Configuration
 from aiac.idp.configuration.models import ClientId, Role, RoleKind, Scope, Service, ServiceType
 from aiac.pdp.policy.library.api import apply_policy, delete_service_cr, replace_policy
+from aiac.policy.model.holders import RoleHolders
 from aiac.policy.model.models import (
     AgentPolicyModel,
     AgentSidePolicyModel,
@@ -174,9 +190,9 @@ def _reconcile(
 
     Prevents cross-run drift accumulation (Keycloak UUIDs churn on delete/recreate, so an
     append-only merge grows stale edges beside the superseded ones). Uses only the ``get_services()``
-    catalog the PCE already loads — no additional IdP read — so the ``get_services()``-only invariant
-    holds. Order-independent: it removes **only** edges whose entity no longer exists, never a live
-    edge, so onboarding-order convergence is preserved.
+    catalog the PCE already loads — no additional IdP read. Order-independent: it removes **only**
+    edges whose entity no longer exists, never a live edge, so onboarding-order convergence is
+    preserved.
 
     An edge on ``SPM(X)`` is kept iff:
 
@@ -185,9 +201,10 @@ def _reconcile(
     2. for an ``Agent``-kind role, the role id is still in the catalog — drops retired/churned agent
        client roles (e.g. a focus-agent self-reference the current builder can no longer emit);
     3. for a ``User``-kind role, it is not a superseded generation: user realm roles are
-       membership-derived (absent from the catalog, and the PCE must not read ``get_subjects()``), so
-       among the ``User`` edges sharing ``(scope.id, role.name)`` a stale edge is dropped only when
-       this batch carries a *different* id for that same ``(scope, name)`` — the fresh batch's
+       membership-derived (absent from the catalog; the PCE reads ``get_roles()`` only for their
+       current members at render time, D32, and never reads ``get_subjects()``), so among the
+       ``User`` edges sharing ``(scope.id, role.name)`` a stale edge is dropped only when this batch
+       carries a *different* id for that same ``(scope, name)`` — the fresh batch's
        current-generation id supersedes the old one.
 
     Runs over **both** inbound lists (allow and deny) independently: the churn collapse is computed
@@ -243,20 +260,34 @@ def _seed_identity(model: ServicePolicyModel, svc: Service) -> None:
     model.owned_scopes = [s for s in svc.scopes if s.aiac_managed]
 
 
-def _spm_cache(catalog: dict[str, Service]):
+def _read_idp(focus_service: str | None = None) -> tuple[dict[str, Service], RoleHolders]:
+    """Read the IdP one time for an operation (D32): the ``get_services()`` catalog, keyed by
+    clientId, and the current holders of every role, from that catalog and one ``get_roles()`` call
+    (the focus service counts as live). The PCE never reads ``get_subjects()``."""
+    config = Configuration.for_default_realm()
+    catalog = {svc.serviceId: svc for svc in config.get_services()}
+    return catalog, RoleHolders(catalog.values(), config.get_roles(), focus_service=focus_service)
+
+
+def _spm_cache(catalog: dict[str, Service], holders: RoleHolders, stale: set[str] | None = None):
     """Build a store-backed SPM cache seeded from the ``get_services()`` catalog.
 
-    Returns ``(spms, spm)``, shared by ``_run``, ``_decommission`` and ``_quarantine``. ``spm(id)``
-    fetches each SPM from the store at most once (``get_service_policy`` returns a fresh empty SPM on
-    404, so a brand-new — or already-deleted — service is handled), seeds its identity (type + own
-    ``aiac.managed`` roles/scopes) from the catalog when the service is still present, and mutates in
-    place. ``spms`` maps each loaded id to its cached SPM.
+    Returns ``(spms, spm)``, shared by every operation that renders. ``spm(id)`` fetches each SPM
+    from the store at most once (``get_service_policy`` returns a fresh empty SPM on 404, so a
+    brand-new — or already-deleted — service is handled), gives each edge the current holders of its
+    role (``holders``, D32), seeds its identity (type + own ``aiac.managed`` roles/scopes) from the
+    catalog when the service is still present, and mutates in place. ``spms`` maps each loaded id to
+    its cached SPM. When ``stale`` is given, ``spm`` adds to it the id of each SPM whose stored
+    holders were not the current ones.
     """
     spms: dict[str, ServicePolicyModel] = {}
 
     def spm(service_id: str) -> ServicePolicyModel:
         if service_id not in spms:
-            model = get_service_policy(service_id)
+            stored = get_service_policy(service_id)
+            model = holders.refresh_model(stored)
+            if stale is not None and model != stored:
+                stale.add(service_id)
             svc = catalog.get(service_id)
             if svc is not None:
                 if svc.type is not None:
@@ -336,11 +367,17 @@ def compute_and_apply(
       SPM) that is an agent, and each agent that targets a touched SPM (an Agent-kind inbound edge
       on it). Each APM is derived from the store just written.
 
+    Role holders (D32). Each input rule, and each SPM that the run reads, gets the current holders
+    of its role before the routing guard (see "Role holders" in the module docstring). A touched SPM
+    whose stored holders are not the current ones is persisted and deployed too, so a duplicate
+    rule (for example the second holder of a shared role) still updates the callee's CR.
+
     Routing guard. A disabled client is a failed (quarantined) service; a service absent from the
-    catalog is deleted. Under the PCE lock, after the catalog read, the run drops each rule whose
-    scope owner, or the owner of whose agent role (``role.actorIds``), is disabled or absent, so a
-    build that started before a quarantine or an offboard cannot write rules back into the removed
-    footprint. The run also deploys only live services. ``focus_service`` — the
+    catalog is deleted. Under the PCE lock, after the IdP read, the run drops each rule whose scope
+    owner is disabled or absent, or whose ``Agent``-kind role has no live holder now, so a build
+    that started before a quarantine or an offboard cannot write rules back into the removed
+    footprint. A shared role with one disabled holder and one live holder is kept: it is the live
+    holder's grant too. The run also deploys only live services. ``focus_service`` — the
     clientId (``Service.serviceId``, the SPM key) of the service this onboarding builds, not its
     Keycloak UUID — is exempt: a re-onboarding applies while its client is still disabled
     (``reenable_service`` runs after the apply). The onboarding route and the NATS consumer pass the
@@ -373,10 +410,17 @@ def decommission(service_id: ClientId) -> None:
     (``X_role → other_scope`` edges stored on other services' SPMs), deletes the CR of X
     (``delete_service_cr``, D20 — for an agent and for a tool; a 404 counts as success), and
     redeploys the affected live services of the current side in a single partial upsert (the
-    policy-model stage, D23): under target side the services whose SPM the purge changed; under
-    agent side the agents that targeted X (read before ``SPM(X)`` is deleted) and the agents whose
-    SPM the purge changed, re-derived from the store. A never-onboarded / already-removed service
-    (the store has no content for it) is a no-op: no store write, no CR delete.
+    policy-model stage, D23), with the current role holders: under target side the services whose
+    SPM the purge changed; under agent side the agents that targeted X (read before ``SPM(X)`` is
+    deleted) and the agents whose SPM the purge changed, re-derived from the store.
+
+    A role of X that another service also holds (a shared role, D32) is not purged. X is not a
+    holder of it any more, so the services whose SPM has an edge of that role are redeployed too,
+    without X, but not written (their rules did not change); under agent side the remaining holders
+    of the role and the agents among those services are re-derived. A client delete gives no
+    role-mapping event, so without this X stays in those CRs until the resync. A never-onboarded /
+    already-removed service (the store has no content for it) is a no-op: no store write, no CR
+    delete.
 
     Exceptions from any dependency (IdP, Policy Store, PDP) are logged and **re-raised** so the
     Controller surfaces the failure instead of reporting a phantom success.
@@ -403,14 +447,16 @@ def _live_services(catalog: dict[str, Service], focus_service: str | None = None
     return catalog.keys() - _disabled_services(catalog, focus_service)
 
 
-def _routable(rule: PolicyRule, catalog: dict[str, Service], disabled: set[str]) -> bool:
-    """True iff every service ``rule`` touches — its scope owner, and the owner of its agent role —
-    is live: present in ``catalog`` and not in ``disabled``. A service absent from the catalog is
-    gone (its client was deleted, e.g. offboarded while its onboarding was still building)."""
-    owners = {rule.scope.serviceId}
-    if rule.role.kind == RoleKind.AGENT:
-        owners.update(rule.role.actorIds)
-    return all(owner in catalog and owner not in disabled for owner in owners)
+def _routable(rule: PolicyRule, live: set[str]) -> bool:
+    """True iff ``rule`` (with the current holders, D32) can take effect: its scope owner is
+    ``live``, and an ``Agent``-kind role has at least one holder. The holders are live services
+    only, so a role whose every holder is disabled or absent has none. A shared role is also the
+    grant of its other holders, so one disabled holder does not drop it. A service absent from the
+    catalog is gone (its client was deleted, e.g. offboarded while its onboarding was still
+    building)."""
+    if rule.scope.serviceId not in live:
+        return False
+    return rule.role.kind != RoleKind.AGENT or bool(rule.role.actorIds)
 
 
 def quarantine(service_id: ClientId, deleted_roles: Iterable[Role] = ()) -> None:
@@ -426,14 +472,17 @@ def quarantine(service_id: ClientId, deleted_roles: Iterable[Role] = ()) -> None
        has in the catalog, plus ``deleted_roles``: the roles the rollback already deleted from the
        IdP (the run's created-manifest). The catalog no longer lists those, but a concurrent run can
        have stored their grants on another SPM, which would keep allowing X. A role that another
-       service also holds (a realm role reused by name) is kept: its grants are that service's too;
+       service also holds (a shared role, D32) is kept: its grants are that service's too;
     3. delete the CR of X (``delete_service_cr``, D20), for an agent and for a tool. In an AIAC setup
        the global combiner denies a pod that has no client CR, so the delete denies every request to
        and from X. There is no no-rules CR;
     4. redeploy the affected live services of the current side (not X, not a deleted or disabled
-       service) in one ``apply_policy`` call (the policy-model stage, D23): under target side the
-       services whose SPMs lost X's roles; under agent side the agents that targeted X and the
-       agents whose SPMs lost X's roles, re-derived from the store.
+       service) in one ``apply_policy`` call (the policy-model stage, D23), with the current role
+       holders: under target side the services whose SPMs lost X's roles, and the services whose
+       SPMs keep an edge of a shared role of X (X, disabled, is not a holder any more, so it leaves
+       their CRs; these SPMs are not written); under agent side the agents that targeted X, the
+       agents whose SPMs lost X's roles or keep an edge of a shared role of X, and the remaining
+       holders of that shared role, re-derived from the store.
 
     Idempotent: a second call finds no SPM and no edges, and deletes the CR again (a 404 counts as
     success). A ``service_id`` that is not in the catalog is a logged no-op. The quarantine is lifted
@@ -457,13 +506,14 @@ def resync() -> None:
     The Controller calls it at every start, before it serves. Holds the PCE lock for the whole body,
     so onboardings wait. Steps:
 
-    1. read the catalog once and list every stored SPM (``list_service_policies``, the managed set);
+    1. read the IdP once (the catalog and the current role holders, D32) and list every stored SPM
+       (``list_service_policies``, the managed set);
     2. ``replace_policy(<the full policy model of the current side>)`` — ``PUT /policy`` upserts one
        CR per entry and deletes every other AIAC CR. Live = in the catalog and enabled (checkpoint
        O3). Target side: ``TargetSidePolicyModel(services=[every stored SPM of a live service])``,
-       the SPMs as stored. Agent side: ``AgentSidePolicyModel(agents=[the APM of every live stored
-       agent], pass_through=[every live stored tool])``. The call is made also when the model is
-       empty: the PUT then deletes every AIAC CR;
+       the SPMs as stored with the current holders. Agent side: ``AgentSidePolicyModel(agents=[the
+       APM of every live stored agent], pass_through=[every live stored tool])``. The call is made
+       also when the model is empty: the PUT then deletes every AIAC CR;
     3. quarantine (see ``quarantine``) each disabled service that still has a stored SPM (C2), under
        the same lock hold, with no ``deleted_roles``.
 
@@ -471,7 +521,8 @@ def resync() -> None:
     not in the model, so the PUT deletes its CR; its SPM stays (removing it is ``decommission``'s
     job). The resync is also the path for a side change (a ConfigMap patch and a Controller restart:
     the PUT writes every CR in the new side, so no mixed state stays), for a stale or missing CR,
-    and for the upgrade from the per-agent CRs of an older release.
+    for a missed role-members event (the render uses the current holders), and for the upgrade from
+    the per-agent CRs of an older release.
 
     Exceptions from any dependency are logged and **re-raised**: the Controller then stops, the pod
     restarts, and the resync runs again.
@@ -485,29 +536,79 @@ def resync() -> None:
         raise
 
 
+def rerender_role(role_id: str) -> None:
+    """Re-render the CRs that use the role ``role_id`` with its current holders (D32) — the entry
+    point of the role-members event (a user or a service account got or lost the role).
+
+    A membership change does not change the policy (role → scope), only who holds the role. So it
+    makes no PRB call and writes no SPM: the stored rules stay, and only the CRs change. Holds the
+    PCE lock. Reads the IdP once (the catalog and the current role holders), then deploys in one
+    ``apply_policy`` call (D23):
+
+    - target side: the live stored SPMs that have an edge of the role
+      (``get_service_policies_by_role``), each with the current holders; no call when there is none;
+    - agent side (the legacy method): the APM of every live stored agent, re-derived from the store.
+      An agent that lost the role is not a holder any more, so it cannot be found from the holders;
+      no call when there is no live stored agent.
+
+    ``role_id`` is the Keycloak role id. A deleted role still re-renders: its edges get no holder
+    (fail closed). A missed event is repaired by the resync.
+
+    Exceptions from any dependency are logged and **re-raised**.
+    """
+    try:
+        side = enforcement_side()
+        with _pce_lock:
+            _rerender_role(role_id, side)
+    except Exception:
+        logger.exception("rerender_role failed for role %r", _loggable(role_id))
+        raise
+
+
+def _rerender_role(role_id: str, side: EnforcementSide) -> None:
+    catalog, holders = _read_idp()
+    live = _live_services(catalog)
+    if side == EnforcementSide.TARGET_SIDE:
+        # The store finds the SPMs by role id only.
+        role = Role(id=role_id, name=role_id, composite=False)
+        found = sorted(get_service_policies_by_role(role), key=lambda model: model.service_id)
+        services = [holders.refresh_model(model) for model in found if model.service_id in live]
+        if services:
+            apply_policy(TargetSidePolicyModel(services=services))
+        return
+    _, spm = _spm_cache(catalog, holders)
+    agents = {model.service_id for model in list_service_policies() if model.service_id in live}
+    _deploy_agent_side(agents, spm, catalog)
+
+
 def policy_model_for(service_id: ClientId) -> PolicyModel | None:
     """The read model of one service (D18): the policy model of the current side with only the entry
     of ``service_id``, or ``None`` if the store has no SPM for it (the service is not in the managed
     set; the Controller route then gives 404).
 
-    - target side: ``TargetSidePolicyModel(services=[SPM(service_id)])``, the SPM as stored;
+    - target side: ``TargetSidePolicyModel(services=[SPM(service_id)])``, the SPM as stored with the
+      current holders;
     - agent side: ``AgentSidePolicyModel(agents=[APM(service_id)])`` for an agent, derived from the
       store as at a deploy; else ``AgentSidePolicyModel(agents=[], pass_through=[service_id])``. The
       stored SPM's ``service_type`` tells an agent from a tool.
 
     It shows what the PCE deploys for the service from the current store. It does not read the CR in
-    the cluster (which can be stale, D23) and makes no IdP read: the identity of the APM is the one
-    stored on the SPM. Read-only: it takes no lock and writes nothing."""
+    the cluster (which can be stale, D23). When the store has the SPM, it reads the IdP as a deploy
+    does (``get_services()`` and ``get_roles()``, D32), because the render uses the current role
+    holders, not the stored ``actorIds``; the identity of the APM is the one stored on the SPM.
+    Read-only: it takes no lock and writes nothing."""
     side = enforcement_side()
     stored = _stored_spm(service_id)
     if stored is None:
         return None
-    if side == EnforcementSide.TARGET_SIDE:
-        return TargetSidePolicyModel(services=[stored])
-    if stored.service_type != ServiceType.AGENT:
+    if side == EnforcementSide.AGENT_SIDE and stored.service_type != ServiceType.AGENT:
         return AgentSidePolicyModel(agents=[], pass_through=[service_id])
-    spms, spm = _spm_cache({})
-    spms[service_id] = stored
+    catalog, holders = _read_idp()
+    model = holders.refresh_model(stored)
+    if side == EnforcementSide.TARGET_SIDE:
+        return TargetSidePolicyModel(services=[model])
+    spms, spm = _spm_cache(catalog, holders)
+    spms[service_id] = model
     return AgentSidePolicyModel(agents=[_derive(service_id, spm)])
 
 
@@ -528,7 +629,8 @@ def bootstrap(service_id: ClientId, service_type: ServiceType) -> None:
     Under the PCE lock, one ``apply_policy`` call with the CR that the current side gives
     ``SPM(service_id)``:
 
-    - ``SPM(service_id)`` is the stored SPM when the store has one (a re-onboarding), as stored;
+    - ``SPM(service_id)`` is the stored SPM when the store has one (a re-onboarding), as stored with
+      the current role holders (D32);
     - else a zero-rule SPM of ``service_type`` — the type comes from the pod label, because the
       catalog type is not set before Provision — with its identity (the ``aiac.managed`` roles and
       scopes) seeded from the catalog if the service is in it.
@@ -553,10 +655,15 @@ def bootstrap(service_id: ClientId, service_type: ServiceType) -> None:
 
 
 def _bootstrap(service_id: str, service_type: ServiceType, side: EnforcementSide) -> None:
+    # The IdP once (D32): the catalog seeds a new SPM; the holders refresh a stored one. The service
+    # is the focus of its onboarding, so it counts as live.
+    catalog, holders = _read_idp(service_id)
     model = _stored_spm(service_id)
-    if model is None:
+    if model is not None:
+        model = holders.refresh_model(model)
+    else:
         model = ServicePolicyModel(service_id=service_id, service_type=service_type, owned_roles=[], owned_scopes=[])
-        svc = {svc.serviceId: svc for svc in Configuration.for_default_realm().get_services()}.get(service_id)
+        svc = catalog.get(service_id)
         if svc is not None:
             _seed_identity(model, svc)
     if side == EnforcementSide.TARGET_SIDE:
@@ -564,7 +671,7 @@ def _bootstrap(service_id: str, service_type: ServiceType, side: EnforcementSide
     elif model.service_type == ServiceType.AGENT:
         # Never a pass-through for an agent: it would allow every request. Its APM, derived from
         # that SPM, as a deploy derives it.
-        spms, spm = _spm_cache({})
+        spms, spm = _spm_cache(catalog, holders)
         spms[service_id] = model
         apply_policy(AgentSidePolicyModel(agents=[_derive(service_id, spm)]))
     else:
@@ -577,12 +684,14 @@ def _loggable(value: str) -> str:
 
 
 def _run(rules: list[PolicyRule], override: bool, focus_service: str | None, side: EnforcementSide) -> None:
-    config = Configuration.for_default_realm()
+    # (1) The IdP once (D32). The catalog carries each service's type (agent vs tool) and its own
+    # roles/scopes (the SPM identity, P2, filtered to aiac.managed), and tells which services are
+    # live; with get_roles() it gives the current holders of every role.
+    catalog, holders = _read_idp(focus_service)
 
-    # (1) Catalog once — the only runtime IdP read. Carries each service's type (agent vs tool)
-    # and its own roles/scopes (the SPM identity, P2, filtered to aiac.managed), and tells which
-    # services are live.
-    catalog = {svc.serviceId: svc for svc in config.get_services()}
+    # (1.2) The current holders on every input rule: the build's actorIds are a snapshot (a shared
+    # role carries only the holder that the build saw).
+    rules = [holders.refresh_rule(rule) for rule in rules]
 
     # Distinct input roles (dedup by id) — the set purged under override. Built from the input
     # BEFORE the routing guard: under override, a role whose every new rule the guard drops must
@@ -591,20 +700,24 @@ def _run(rules: list[PolicyRule], override: bool, focus_service: str | None, sid
     for rule in rules:
         distinct_roles.setdefault(rule.role.id, rule.role)
 
-    # (1.5) Routing guard — drop every rule that touches a service that is not live: disabled
-    # (quarantined, except the focus service) or absent from the catalog (deleted). See
-    # ``compute_and_apply``.
-    disabled = _disabled_services(catalog, focus_service)
-    kept = [rule for rule in rules if _routable(rule, catalog, disabled)]
+    # (1.5) Routing guard — drop every rule whose scope owner is not live — disabled (quarantined,
+    # except the focus service) or absent from the catalog (deleted) — or whose agent role has no
+    # live holder. See ``compute_and_apply``.
+    live = _live_services(catalog, focus_service)
+    kept = [rule for rule in rules if _routable(rule, live)]
     if len(kept) != len(rules):
         logger.warning(
-            "routing guard dropped %d rule(s) that touch a disabled or deleted service", len(rules) - len(kept)
+            "routing guard dropped %d rule(s) that touch a disabled or deleted service or whose agent role has no "
+            "live holder",
+            len(rules) - len(kept),
         )
     rules = kept
 
-    # SPM cache: fetch each SPM from the store at most once, seed its identity from the catalog,
-    # mutate in place, and persist the changed ones.
-    spms, spm = _spm_cache(catalog)
+    # SPM cache: fetch each SPM from the store at most once, give its edges the current holders,
+    # seed its identity from the catalog, mutate in place, and persist the changed ones. ``stale``
+    # collects each loaded SPM whose stored holders were not the current ones.
+    stale: set[str] = set()
+    spms, spm = _spm_cache(catalog, holders, stale)
 
     changed: set[str] = set()
 
@@ -642,6 +755,12 @@ def _run(rules: list[PolicyRule], override: bool, focus_service: str | None, sid
         if _reconcile(model, catalog, catalog_agent_role_ids, batch_user_role_ids):
             changed.add(service_id)
 
+    # (3.6) A touched SPM whose stored holders are stale (a holder came or went since it was
+    # written) is changed too: persisting it refreshes the snapshot, and deploying it gives its CR
+    # the current holders. Else a duplicate rule — the second holder of a shared role — would leave
+    # the callee's CR without that holder.
+    changed |= stale
+
     # (4) Persist every changed SPM.
     for service_id in changed:
         apply_service_policy(service_id, spms[service_id])
@@ -650,7 +769,6 @@ def _run(rules: list[PolicyRule], override: bool, focus_service: str | None, sid
     # services: one absent from the catalog is deleted, and its stored SPM (or the store's 404
     # placeholder) must not bring its CR back — removing it is ``decommission``'s job; a disabled one
     # stays with no CR.
-    live = _live_services(catalog, focus_service)
     if side == EnforcementSide.TARGET_SIDE:
         # Target side: the changed SPMs — each CR is rendered from the callee's own SPM.
         _deploy(changed & live, spms)
@@ -667,12 +785,11 @@ def _run(rules: list[PolicyRule], override: bool, focus_service: str | None, sid
 
 
 def _decommission(service_id: str, side: EnforcementSide) -> None:
-    config = Configuration.for_default_realm()
-
-    # (1) Catalog once — the only runtime IdP read. X itself is absent (it was offboarded); the
-    # catalog is used to seed and filter the still-live services that the redeploy writes.
-    catalog = {svc.serviceId: svc for svc in config.get_services()}
-    spms, spm = _spm_cache(catalog)
+    # (1) The IdP once (D32). X itself is absent (it was offboarded); the catalog is used to seed
+    # and filter the still-live services that the redeploy writes, and with get_roles() it gives
+    # the current role holders (X is not one).
+    catalog, holders = _read_idp()
+    spms, spm = _spm_cache(catalog, holders)
 
     # (2) Load SPM(X) — X is gone from the catalog, so spm() does not reseed it; the persisted SPM
     # carries the roles/scopes X owned when it was onboarded. Content guard: a 404 fresh-empty SPM
@@ -682,33 +799,33 @@ def _decommission(service_id: str, side: EnforcementSide) -> None:
         return
 
     # (3)-(6) Tear down X's footprint in the store (see ``_remove_footprint``).
-    changed, targeters = _remove_footprint(service_id, catalog, spms, spm)
+    changed, shared, agents = _remove_footprint(service_id, catalog, spms, spm)
 
     # (7) Delete the CR of X (D20), for an agent and for a tool. A 404 counts as success.
     delete_service_cr(service_id)
 
     # (8) Redeploy the affected live services of the side (X excluded) in one call (D23).
-    _redeploy_after_removal(service_id, changed, targeters, catalog, spms, spm, side)
+    _redeploy_after_removal(service_id, changed, shared, agents, catalog, spms, spm, side)
 
 
 def _resync(side: EnforcementSide) -> None:
-    config = Configuration.for_default_realm()
-
-    # (1) Catalog once, and every stored SPM — the managed set (D21).
-    catalog = {svc.serviceId: svc for svc in config.get_services()}
+    # (1) The IdP once (the catalog and the current role holders, D32), and every stored SPM — the
+    # managed set (D21).
+    catalog, holders = _read_idp()
     stored = sorted(list_service_policies(), key=lambda model: model.service_id)
 
     # (2) Replace every AIAC CR with the CRs of the live managed services, in the current side. A
     # disabled service is not in the model: step 3 removes it, and its rules must not come back,
-    # even for a moment.
+    # even for a moment. Each CR names the current role holders, so the resync repairs a missed
+    # role-members event.
     live = _live_services(catalog)
-    live_stored = [model for model in stored if model.service_id in live]
+    live_stored = [holders.refresh_model(model) for model in stored if model.service_id in live]
     if side == EnforcementSide.TARGET_SIDE:
         replace_policy(TargetSidePolicyModel(services=live_stored))
     else:
         # The APM of each live stored agent, derived from the store, and a pass-through CR for each
         # live stored tool (D24).
-        _, spm = _spm_cache(catalog)
+        _, spm = _spm_cache(catalog, holders)
         replace_policy(
             AgentSidePolicyModel(
                 agents=[_derive(m.service_id, spm) for m in live_stored if _is_agent(catalog, m.service_id)],
@@ -719,31 +836,35 @@ def _resync(side: EnforcementSide) -> None:
     # (3) Quarantine each disabled service that still has an SPM (C2). The lock is already held.
     for model in stored:
         if model.service_id in catalog and model.service_id not in live:
-            _quarantine_in(catalog, model.service_id, [], side)
+            _quarantine_in(catalog, holders, model.service_id, [], side)
 
 
 def _quarantine(service_id: str, deleted_roles: list[Role], side: EnforcementSide) -> None:
-    config = Configuration.for_default_realm()
-
-    # (1) Catalog once. X is still in it (the rollback disables the client, it does not delete it).
-    # spm() seeds X's current roles from the catalog, so step 4 removes the roles X still has. The
-    # roles the rollback deleted are not in the catalog any more, so the caller passes them in
-    # ``deleted_roles`` and step 4 removes their edges too — else an edge a concurrent run stored
+    # (1) The IdP once (the catalog and the current role holders, D32). X is still in the catalog
+    # (the rollback disables the client, it does not delete it), but a disabled service is not a
+    # holder. spm() seeds X's current roles from the catalog, so step 4 removes the roles X still
+    # has. The roles the rollback deleted are not in the catalog any more, so the caller passes them
+    # in ``deleted_roles`` and step 4 removes their edges too — else an edge a concurrent run stored
     # (X_role → other_scope) keeps allowing X until a later run reconciles that SPM.
-    _quarantine_in({svc.serviceId: svc for svc in config.get_services()}, service_id, deleted_roles, side)
+    catalog, holders = _read_idp()
+    _quarantine_in(catalog, holders, service_id, deleted_roles, side)
 
 
 def _quarantine_in(
-    catalog: dict[str, Service], service_id: str, deleted_roles: list[Role], side: EnforcementSide
+    catalog: dict[str, Service],
+    holders: RoleHolders,
+    service_id: str,
+    deleted_roles: list[Role],
+    side: EnforcementSide,
 ) -> None:
-    """The body of ``quarantine`` for a catalog already read (``quarantine`` and ``resync``)."""
+    """The body of ``quarantine`` for an IdP read already done (``quarantine`` and ``resync``)."""
     if service_id not in catalog:
         logger.warning("quarantine: service %r is not in the IdP catalog — nothing to do", _loggable(service_id))
         return
-    spms, spm = _spm_cache(catalog)
+    spms, spm = _spm_cache(catalog, holders)
 
     # (3)-(6) Tear down X's footprint in the store (see ``_remove_footprint``).
-    changed, targeters = _remove_footprint(service_id, catalog, spms, spm, deleted_roles)
+    changed, shared, agents = _remove_footprint(service_id, catalog, spms, spm, deleted_roles)
 
     # (7) Delete the CR of X (D20), for an agent and for a tool. In an AIAC setup the global combiner
     # denies a pod that has no client CR, so the delete denies every request to and from X. A 404
@@ -751,26 +872,32 @@ def _quarantine_in(
     delete_service_cr(service_id)
 
     # (8) Redeploy the affected live services of the side (X excluded) in one call (D23).
-    _redeploy_after_removal(service_id, changed, targeters, catalog, spms, spm, side)
+    _redeploy_after_removal(service_id, changed, shared, agents, catalog, spms, spm, side)
 
 
 def _remove_footprint(
     service_id: str, catalog: dict[str, Service], spms, spm, extra_roles: Iterable[Role] = ()
-) -> tuple[set[str], set[str]]:
+) -> tuple[set[str], set[str], set[str]]:
     """Tear down service X's footprint in the store — the steps ``decommission`` and ``quarantine``
     share. ``extra_roles`` are X's roles that ``SPM(X)`` no longer lists (``quarantine``'s
     rollback-deleted roles); their edges are purged as X's own. A role that another service in
-    ``catalog`` also holds (a realm role reused by name) is not purged: its grants are that
-    service's grants too. Returns ``(changed, targeters)``: the services whose SPM the purge changed
-    (X excluded), and the agents that targeted X."""
+    ``catalog`` also holds (a shared role, D32) is not purged: its grants are that service's grants
+    too. X is not a holder of it any more (X is disabled or absent), so the SPMs that have an edge
+    of that role keep their rules but get a new render without X.
+
+    Returns ``(changed, shared, agents)``: the services whose SPM the purge changed, written to the
+    store; the services whose SPM has an edge of a shared role of X, not written (their rules did
+    not change); and the agents whose agent-side policy uses X — the agents that targeted X, and
+    the remaining holders of each shared role of X that has an edge. X is in none of the sets."""
     spm_x = spm(service_id)
 
     # (3) Targeters — the agents whose outbound loses X: they hold an Agent-kind inbound edge (allow
     # or deny) on SPM(X) (their_role → X_scope), which goes when SPM(X) is deleted in step 5. So
     # they are read first.
-    targeters = _targeters(spm_x)
+    agents = _targeters(spm_x)
 
     changed: set[str] = set()
+    shared: set[str] = set()
 
     # (4) Purge X's outbound footprint — X_role → other_scope edges (allow AND deny) stored on OTHER
     # services' SPMs. Dedup by id: an extra role can also still be on SPM(X). Skip a role that
@@ -778,46 +905,60 @@ def _remove_footprint(
     # service's grants. X itself stays denied — its CR is deleted, and the combiner denies a pod
     # that has no client CR (D20).
     held_elsewhere = {r.id for sid, svc in catalog.items() if sid != service_id for r in svc.roles}
-    roles = {role.id: role for role in [*spm_x.owned_roles, *extra_roles] if role.id not in held_elsewhere}
+    roles = {role.id: role for role in [*spm_x.owned_roles, *extra_roles]}
     for role in roles.values():
         for stored in get_service_policies_by_role(role):
             if stored.service_id == service_id:
                 continue
             model = spm(stored.service_id)
-            if _purge_role(model, role.id):
-                changed.add(model.service_id)
+            if role.id not in held_elsewhere:
+                if _purge_role(model, role.id):
+                    changed.add(model.service_id)
+                continue
+            # (4b) A shared role: the edges stay, but the cached SPM already names only the current
+            # holders, so the redeploy takes X out of the callee's CR (a client delete gives no
+            # role-mapping event). The remaining holders carry these edges on their outbound (agent
+            # side).
+            shared.add(model.service_id)
+            edges = model.inbound_allow_rules + model.inbound_deny_rules
+            agents.update(actor for edge in edges if edge.role.id == role.id for actor in edge.role.actorIds)
 
     # (5) Delete SPM(X) — removes every user→X and agent→X inbound edge in one shot, so X leaves the
     # managed set — and evict it from the cache so the redeploy cannot resurrect it.
     delete_service_policy(service_id)
     spms.pop(service_id, None)
 
-    # (6) Persist every changed (footprint-purged) SPM.
+    # (6) Persist every changed (footprint-purged) SPM. A shared SPM is not written: its rules did
+    # not change.
     for changed_id in sorted(changed):
         apply_service_policy(changed_id, spms[changed_id])
 
-    return changed, targeters
+    agents.discard(service_id)
+    return changed, shared, agents
 
 
 def _redeploy_after_removal(
     service_id: str,
     changed: set[str],
-    targeters: set[str],
+    shared: set[str],
+    agents: set[str],
     catalog: dict[str, Service],
     spms: dict[str, ServicePolicyModel],
     spm,
     side: EnforcementSide,
 ) -> None:
     """The policy-model stage of ``quarantine`` and ``decommission`` (D23): redeploy the affected
-    live services of ``side``, X (``service_id``) excluded, in one call. Target side: the services
-    whose SPM the purge changed. Agent side: the agents that targeted X, and the agents whose SPM the
-    purge changed (their inbound ``source_roles[X]`` went); each is re-derived from the store, from
-    which SPM(X) is gone."""
+    live services of ``side``, X (``service_id``) excluded, in one call, with the current role
+    holders. Target side: the services whose SPM the purge changed, and the services whose SPM has
+    an edge of a shared role of X (``shared``, see ``_remove_footprint``). Agent side: ``agents``
+    (the agents that targeted X, and the remaining holders of a shared role of X), and the agents
+    among the changed and the shared services (their inbound ``source_roles[X]`` went); each is
+    re-derived from the store, from which SPM(X) is gone."""
     live = _live_services(catalog) - {service_id}
     if side == EnforcementSide.TARGET_SIDE:
-        _deploy(changed & live, spms)
+        _deploy((changed | shared) & live, spms)
         return
-    affected = targeters | {sid for sid in changed if _is_agent(catalog, sid)}
+    affected = agents | {sid for sid in changed | shared if _is_agent(catalog, sid)}
     _deploy_agent_side(affected & live, spm, catalog)
 
 
@@ -831,7 +972,8 @@ def _deploy(service_ids: set[str], spms: dict[str, ServicePolicyModel]) -> None:
 def _affected_agents(roles: Iterable[Role], touched_owners: set[str], spm, catalog: dict[str, Service]) -> set[str]:
     """The affected agents of a run under agent side (D23) — from the batch, never a full scan:
 
-    - the owners (``actorIds``) of each input or purged ``Agent``-kind role: their outbound changed;
+    - the current holders (``actorIds``) of each input or purged ``Agent``-kind role: their outbound
+      changed;
     - each touched owner that is an agent: its inbound changed;
     - each agent that targets a touched SPM (``_targeters``, a superset of the exact-scope match;
       a re-derive is idempotent, so that is safe): its outbound changed.
@@ -840,7 +982,7 @@ def _affected_agents(roles: Iterable[Role], touched_owners: set[str], spm, catal
     affected: set[str] = set()
     for role in roles:
         if role.kind == RoleKind.AGENT:
-            affected.update(role.actorIds)  # owning agents — their outbound changed
+            affected.update(role.actorIds)  # holding agents — their outbound changed
     for owner in touched_owners:
         if _is_agent(catalog, owner):
             affected.add(owner)  # the touched owner is an agent — its inbound changed
@@ -849,8 +991,8 @@ def _affected_agents(roles: Iterable[Role], touched_owners: set[str], spm, catal
 
 
 def _targeters(model: ServicePolicyModel) -> set[str]:
-    """The agents that target ``model``'s service: the owners (``actorIds``) of every Agent-kind
-    inbound edge on it, allow and deny."""
+    """The agents that target ``model``'s service: the current holders (``actorIds``) of every
+    Agent-kind inbound edge on it, allow and deny."""
     return {
         actor
         for edge in model.inbound_allow_rules + model.inbound_deny_rules
@@ -884,8 +1026,10 @@ def _deploy_agent_side(agent_ids: set[str], spm, catalog: dict[str, Service], pa
 
 
 def _derive(agent_id, spm) -> AgentPolicyModel:
-    """Build ``APM(agent_id)`` entirely from the persisted SPMs (zero IdP) — the agent-side render
-    input (``AgentSidePolicyModel.agents``). The target side does not call it.
+    """Build ``APM(agent_id)`` entirely from the persisted SPMs — the agent-side render input
+    (``AgentSidePolicyModel.agents``). The target side does not call it. Every SPM it reads comes
+    from the ``spm`` cache, so each edge carries the current holders of its role (D32); it makes no
+    IdP read of its own.
 
     Each inbound edge on ``SPM(A)`` is classified by ``role.kind`` (User → subject, Agent → source)
     **and** ``effect`` (allow/deny) into one of four inbound buckets; each outbound edge (one of A's
@@ -912,10 +1056,11 @@ def _derive(agent_id, spm) -> AgentPolicyModel:
 
     # Outbound — for each of A's own roles, the edges on other services' SPMs that reference it,
     # split by effect. Relevance is directional: only A's *agent* roles confer an outbound edge, so
-    # a merely shared user role never creates a false edge to a service A does not target.
+    # a merely shared user role never creates a false edge to a service A does not target. The store
+    # finds the SPMs; the cache gives each one with the current holders.
     for role in sa.owned_roles:
         for stored in get_service_policies_by_role(role):
-            _derive_outbound(apm, role, stored)
+            _derive_outbound(apm, role, spm(stored.service_id))
 
     return apm
 

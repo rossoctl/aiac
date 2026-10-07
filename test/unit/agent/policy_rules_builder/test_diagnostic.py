@@ -155,6 +155,30 @@ def test_clean_approval_records_nothing():
 
 
 # --------------------------------------------------------------------------- #
+# 3b — a shared scope (D32: one copy for each owner, the same id and name) is   #
+#      listed one time to the proposer and the auditor, as in the live graph   #
+#      (the diagnostic reuses ``graph._scope_cands``).                         #
+# --------------------------------------------------------------------------- #
+def test_shared_scope_is_listed_once_in_the_diagnostic_prompts():
+    role = _role("r-dev", "developer")
+    team1 = Scope(id="s-iss", name="issues", description="Issue tracker", serviceId="team1/tool")
+    team2 = team1.model_copy(update={"serviceId": "team2/tool"})
+
+    with ExitStack() as stack:
+        sc = _patch_calls(
+            stack,
+            [
+                RoleSelection(granted_scope_names=["issues"], reasoning="granted"),
+                AuditVerdict(approved=True),
+            ],
+        )
+        run_role_diagnostic("Developers may use issues.", role, [team1, team2])
+
+    for call in sc.call_args_list:
+        assert call.args[1][1].content.count("scope name=issues: Issue tracker") == 1
+
+
+# --------------------------------------------------------------------------- #
 # 4 — retry-budget exhaustion marks the entity UNEVALUATED (nonconvergence)     #
 #     and does NOT raise; no conflicts are produced.                           #
 # --------------------------------------------------------------------------- #

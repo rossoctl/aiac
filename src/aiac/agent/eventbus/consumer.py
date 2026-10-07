@@ -2,7 +2,11 @@
 
 Subscribes to the ``aiac-agent-consumer`` durable queue group and, on each
 message, calls the same use-case handler + ``compute_and_apply`` sequence the
-HTTP routes use, awaiting completion before acking. On a **permanent** failure (see
+HTTP routes use, awaiting completion before acking. A role-membership change
+(``aiac.apply.role-members.{role-id}``, D32) calls the PCE ``rerender_role`` instead, as the
+``POST /apply/role-members/{role_id}`` route does: no use-case handler (no PRB run) and no
+``compute_and_apply``. Before it subscribes, the start updates an existing durable consumer to the
+config of the code (``ensure_consumer``). On a **permanent** failure (see
 ``_PERMANENT_ERRORS``: a policy conflict or contradiction, a PRB fault, an unparseable LLM
 response, or a failed UC1 precondition check) the message is republished to the DLQ subject and
 terminated at the FIRST delivery. On any other failure the message is left unacked (NATS
@@ -28,17 +32,17 @@ from urllib.parse import unquote
 import nats
 from fastapi import FastAPI
 from nats.aio.msg import Msg
-from nats.js.api import AckPolicy, ConsumerConfig
 
 from aiac.agent.controller.start import run_start_sequence
 from aiac.agent.eventbus.stream import (
-    ACK_WAIT_SECONDS,
     CONSUMER_FILTER_SUBJECTS,
     CONSUMER_NAME,
     DEFAULT_NATS_URL,
     DLQ_SUBJECT,
     MAX_DELIVER,
     STREAM_NAME,
+    consumer_config,
+    ensure_consumer,
     ensure_stream,
 )
 from aiac.agent.policy_rules_builder.conflict_detection import PolicyConflictError
@@ -54,7 +58,7 @@ from aiac.agent.uc.onboarding.preconditions import EnforcementPreconditionError
 from aiac.agent.uc.policy_update.build import build_policy
 from aiac.agent.uc.role_update.role import update_role
 from aiac.idp.configuration.models import ClientId, ServiceUuid
-from aiac.policy.computation import compute_and_apply
+from aiac.policy.computation import compute_and_apply, rerender_role
 from aiac.policy.model.models import PolicyRule
 
 logger = logging.getLogger(__name__)
@@ -66,6 +70,8 @@ _START_RETRY_MAX_BACKOFF = 30.0
 
 _SERVICE_PREFIX = "aiac.apply.service."
 _ROLE_PREFIX = "aiac.apply.role."
+# Not a sub-prefix of _ROLE_PREFIX: "aiac.apply.role-members.x" does not start with "aiac.apply.role.".
+_ROLE_MEMBERS_PREFIX = "aiac.apply.role-members."
 _POLICY_BUILD_SUBJECT = "aiac.apply.policy.build"
 
 # PERMANENT failures: redelivery can never make them succeed (a real policy conflict /
@@ -121,9 +127,10 @@ async def _nak_not_visible(msg: Msg) -> None:
 
 
 def _handle(subject: str) -> tuple[list[PolicyRule], bool, ClientId | None]:
-    """Dispatch ``subject`` to its use-case handler — the consumer's only subject switch. Returns
-    ``(rules, override, focus_service)``: ``focus_service`` is the onboarded service's clientId (from
-    ``onboard_service``), and ``None`` for every other subject."""
+    """Dispatch ``subject`` to its use-case handler — the subject switch for every subject that goes
+    through ``compute_and_apply`` (``_process`` sends a role-membership subject to ``rerender_role``
+    first). Returns ``(rules, override, focus_service)``: ``focus_service`` is the onboarded service's
+    clientId (from ``onboard_service``), and ``None`` for every other subject."""
     if subject.startswith(_SERVICE_PREFIX):
         return onboard_service(ServiceUuid(subject[len(_SERVICE_PREFIX) :]))
     if subject.startswith(_ROLE_PREFIX):
@@ -135,6 +142,34 @@ def _handle(subject: str) -> tuple[list[PolicyRule], bool, ClientId | None]:
     if subject == _POLICY_BUILD_SUBJECT:
         return *build_policy(), None
     raise ValueError(f"no handler for subject {subject!r}")
+
+
+async def _process(subject: str) -> None:
+    """Do the work of one message, mirroring its ``/apply/*`` route. Raises on a failure; the ack
+    contract is ``_dispatch``'s."""
+    # ``_handle`` (the LLM-backed policy-rules builder) and ``compute_and_apply`` are SYNCHRONOUS and
+    # slow (tens of seconds); ``rerender_role`` is synchronous too (IdP, store and PDP calls). nats-py
+    # runs the consumer callback ON the event loop, so calling them inline froze the loop for the whole
+    # onboard — starving the FastAPI ``/health`` endpoint until the liveness probe killed the pod
+    # mid-onboard (then NATS redelivered the unacked message and the race repeated). Offload each to
+    # the default threadpool so the loop stays free to answer ``/health`` while onboarding runs.
+    loop = asyncio.get_running_loop()
+    if subject.startswith(_ROLE_MEMBERS_PREFIX):
+        # A role-membership change (D32) changes only who holds the role, not the policy: re-render the
+        # CRs that use the role with its current holders. No use-case handler (so no PRB run), no
+        # compute_and_apply, no re-enable. The role id is a UUID: one token, passed as it is (no decode).
+        await loop.run_in_executor(None, rerender_role, subject.removeprefix(_ROLE_MEMBERS_PREFIX))
+        return
+    # UC1 only: ``focus`` is the onboarded service's clientId, so the PCE routing guard keeps
+    # its rules while its client is still disabled (a re-onboarding of a quarantined service).
+    rules, override, focus = await loop.run_in_executor(None, _handle, subject)
+    await loop.run_in_executor(None, functools.partial(compute_and_apply, rules, override, focus_service=focus))
+    # UC1 only (only an onboarding has a focus service): re-enable the client AFTER a
+    # successful compute_and_apply, mirroring the HTTP route. If compute_and_apply raised
+    # above, this is skipped and the client stays disabled (the failed-service marker), never
+    # enabled-with-no-policy. The re-enable is an IdP call, so it takes the subject's UUID.
+    if focus is not None:
+        reenable_service(ServiceUuid(subject.removeprefix(_SERVICE_PREFIX)))
 
 
 class AiacEventConsumer:
@@ -151,6 +186,9 @@ class AiacEventConsumer:
         self._nc = await nats.connect(self._nats_url, max_reconnect_attempts=-1)
         js = self._nc.jetstream()
         await ensure_stream(js)
+        # subscribe() uses ``config`` only to create a missing durable consumer; it binds to an existing
+        # one with the config that the server has. So update an existing one to the code's config first.
+        await ensure_consumer(js)
         self._sub = await js.subscribe(
             subject="aiac.apply.>",
             queue=CONSUMER_NAME,
@@ -158,12 +196,7 @@ class AiacEventConsumer:
             stream=STREAM_NAME,
             manual_ack=True,
             cb=self._dispatch,
-            config=ConsumerConfig(
-                filter_subjects=CONSUMER_FILTER_SUBJECTS,
-                ack_policy=AckPolicy.EXPLICIT,
-                max_deliver=MAX_DELIVER,
-                ack_wait=ACK_WAIT_SECONDS,
-            ),
+            config=consumer_config(),
         )
         logger.info("aiac-agent-consumer subscribed to %s", CONSUMER_FILTER_SUBJECTS)
 
@@ -192,23 +225,7 @@ class AiacEventConsumer:
 
     async def _dispatch(self, msg: Msg) -> None:
         try:
-            # ``_handle`` (the LLM-backed policy-rules builder) and ``compute_and_apply`` are
-            # SYNCHRONOUS and slow (tens of seconds). nats-py runs this callback ON the event loop,
-            # so calling them inline froze the loop for the whole onboard — starving the FastAPI
-            # ``/health`` endpoint until the liveness probe killed the pod mid-onboard (then NATS
-            # redelivered the unacked message and the race repeated). Offload both to the default
-            # threadpool so the loop stays free to answer ``/health`` while onboarding runs.
-            loop = asyncio.get_running_loop()
-            # UC1 only: ``focus`` is the onboarded service's clientId, so the PCE routing guard keeps
-            # its rules while its client is still disabled (a re-onboarding of a quarantined service).
-            rules, override, focus = await loop.run_in_executor(None, _handle, msg.subject)
-            await loop.run_in_executor(None, functools.partial(compute_and_apply, rules, override, focus_service=focus))
-            # UC1 only (only an onboarding has a focus service): re-enable the client AFTER a
-            # successful compute_and_apply, mirroring the HTTP route. If compute_and_apply raised
-            # above, this is skipped and the client stays disabled (the failed-service marker), never
-            # enabled-with-no-policy. The re-enable is an IdP call, so it takes the subject's UUID.
-            if focus is not None:
-                reenable_service(ServiceUuid(msg.subject.removeprefix(_SERVICE_PREFIX)))
+            await _process(msg.subject)
         except Exception as exc:
             # Log exactly once, routed by exception TYPE to its per-persona named logger.
             # FastAPI's exception handlers never fire on this path (there is no request), so

@@ -50,8 +50,9 @@ def get_service_policy(service_id: str) -> ServicePolicyModel:
 
 
 def get_service_policy_by_scope(scope: Scope) -> ServicePolicyModel | None:
-    # Singular: a scope has exactly one owning service (Assumption 2). Pure sugar over the
-    # by-id read — no dedicated HTTP route. A scope with no resolved owner has no SPM.
+    # Singular: a scope copy names one owner in ``serviceId`` (a shared scope has one copy for
+    # each owner, D32). Pure sugar over the by-id read — no dedicated HTTP route. A scope with no
+    # resolved owner has no SPM.
     if not scope.serviceId:
         return None
     return get_service_policy(scope.serviceId)

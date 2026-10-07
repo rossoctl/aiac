@@ -23,6 +23,7 @@ to put a new test, see `docs/testing/testing-strategy.md`.
 
 ```bash
 .venv/bin/pytest                              # unit lane (the default addopts)
+.venv/bin/pytest -m integration               # only the integration lane (offline)
 .venv/bin/pytest -m system                    # only the system lane
 .venv/bin/pytest -m "system or eval"          # union of two lanes
 .venv/bin/pytest -m system -k uc1_onboard     # system lane, narrowed by name substring
@@ -33,7 +34,7 @@ to put a new test, see `docs/testing/testing-strategy.md`.
 | Lane | Selection | `test` skill profile | Needs |
 |---|---|---|---|
 | unit | bare `pytest` | `unit` | Nothing |
-| integration | `-m integration` | `integration` | Nothing. **Reserved but empty**: no tests and no directory yet. |
+| integration | `-m integration` | `integration` | Nothing (offline: several AIAC units in one process, no cluster, no LLM endpoint). The tests are under `test/integration/`, a mirror of `src/aiac/`. The first one is the D32 test of shared roles and scopes (`test/integration/policy/computation/test_shared_roles.py`). |
 | llm | `-m llm` | `system` | An LLM endpoint only (no cluster, no Keycloak) |
 | system | `-m system` | `system` | A wired Kind cluster, Keycloak admin credentials, an LLM endpoint |
 | eval | `-m eval` | `system` | Keycloak, an LLM endpoint, `opa` on `PATH` for the e2e level |
@@ -49,6 +50,22 @@ The live lanes read the repo-root `.env` (gitignored): `LLM_BASE_URL`,
 
 ```bash
 set -a; . .env; set +a
+```
+
+## `integration` lane
+
+The integration tests make several AIAC units work together in one process, with
+no cluster, no Keycloak and no LLM endpoint. So they need no env and no `.env`,
+and they do not skip. The default `addopts` deselects them, so a bare `pytest`
+does not run them. The first test is the D32 test of shared roles and scopes
+(`test/integration/policy/computation/test_shared_roles.py`): the real focal resolver,
+Service Policy Builder (with the LLM seam stubbed), PCE and PDP Policy Writer
+render, for agents and tools that share a role or a scope. Fakes stand in for
+Keycloak, the Policy Model Store and the Kubernetes API (`fakes.py` next to the
+test).
+
+```bash
+.venv/bin/pytest -m integration
 ```
 
 ## `llm` lane

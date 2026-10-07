@@ -774,6 +774,73 @@ def test_policy_block_labels_baseline_grants_only_and_scenario():
     assert human.index("BASELINE POLICY") < human.index("SCENARIO POLICY") < human.index("SCEN-TEXT")
 
 
+# --------------------------------------------------------------------------- #
+# Shared scope (D32, handoff 19 Bug 2). A scope that two services share has     #
+# one copy for each owner in ``other_scopes``: the same id and name, another    #
+# ``serviceId``. The LLM decides the scope once, so the proposer and the        #
+# auditor see it one time; the build node still emits one rule for each copy,  #
+# so each owner's SPM gets the rule.                                           #
+# --------------------------------------------------------------------------- #
+def _shared_scope_copies() -> tuple[Scope, Scope]:
+    team1 = Scope(id="s-read", name="github-tool.source-read", description="Read source", serviceId="team1/gt")
+    return team1, team1.model_copy(update={"serviceId": "team2/gt"})
+
+
+def test_shared_scope_is_listed_once_to_the_proposer_and_the_auditor():
+    role = _role("r-ops", "github-agent.source_operations")
+    team1, team2 = _shared_scope_copies()
+    issues = _scope("s-iss", "issues")
+    with ExitStack() as stack:
+        stack.enter_context(patch("aiac.agent.policy_rules_builder.graph.get_policy_source", return_value=_Source()))
+        sc = stack.enter_context(
+            patch(
+                "aiac.agent.policy_rules_builder.graph._structured_call",
+                side_effect=[
+                    RoleSelection(granted_scope_names=["github-tool.source-read"], reasoning="r"),
+                    AuditVerdict(approved=True),
+                ],
+            )
+        )
+        build_role_rules(role, [team1, issues, team2])
+
+    proposer_human, auditor_human = (c.args[1][1].content for c in sc.call_args_list)
+    for human in (proposer_human, auditor_human):
+        assert human.count("scope name=github-tool.source-read: Read source") == 1
+        # The first copy keeps its place in candidate order.
+        assert human.index("scope name=github-tool.source-read") < human.index("scope name=issues")
+
+
+@pytest.mark.parametrize(
+    ("selection", "effect"),
+    [
+        (RoleSelection(granted_scope_names=["github-tool.source-read"], reasoning="r"), RuleEffect.ALLOW),
+        (
+            RoleSelection(granted_scope_names=[], denied_scope_names=["github-tool.source-read"], reasoning="r"),
+            RuleEffect.DENY,
+        ),
+    ],
+    ids=["allow", "deny"],
+)
+def test_shared_scope_decision_gives_one_rule_for_each_owner_copy(selection, effect):
+    role = _role("r-ops", "github-agent.source_operations")
+    team1, team2 = _shared_scope_copies()
+    with ExitStack() as stack:
+        stack.enter_context(patch("aiac.agent.policy_rules_builder.graph.get_policy_source", return_value=_Source()))
+        stack.enter_context(
+            patch(
+                "aiac.agent.policy_rules_builder.graph._structured_call",
+                side_effect=[selection, AuditVerdict(approved=True)],
+            )
+        )
+        rules = build_role_rules(role, [team1, team2])
+
+    assert rules == [
+        PolicyRule(role=role, scope=team1, effect=effect),
+        PolicyRule(role=role, scope=team2, effect=effect),
+    ]
+    assert [r.scope.serviceId for r in rules] == ["team1/gt", "team2/gt"]
+
+
 # =========================================================================== #
 # #166 — the PRB LLM seam (_structured_call) gets its OWN retry cadence,        #
 # independent of the shared UPSTREAM_MAX_RETRIES that governs the IdP/MCP/K8s   #

@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Test;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class SubjectMapperTest {
@@ -65,6 +66,76 @@ class SubjectMapperTest {
         Optional<String> subject =
                 SubjectMapper.subjectFor(SubjectMapper.ResourceKind.REALM_ROLE, "CREATE", "roles/a\tb\rc\nd");
         assertEquals(Optional.of("aiac.apply.role.a%09b%0Dc%0Ad"), subject);
+    }
+
+    @Test
+    void realmRoleAssignToAUserIsAUserRealmRoleMapping() {
+        // An agent's service account is a user too, so its role mapping has the same path.
+        assertTrue(SubjectMapper.isUserRealmRoleMapping(
+                SubjectMapper.ResourceKind.REALM_ROLE_MAPPING, "CREATE", "users/user-1/role-mappings/realm"));
+    }
+
+    @Test
+    void realmRoleUnassignFromAUserIsAUserRealmRoleMapping() {
+        assertTrue(SubjectMapper.isUserRealmRoleMapping(
+                SubjectMapper.ResourceKind.REALM_ROLE_MAPPING, "DELETE", "users/user-1/role-mappings/realm"));
+    }
+
+    @Test
+    void groupRealmRoleMappingIsNotAUserRealmRoleMapping() {
+        // Known limit: a role that a user holds through a group is not a holder (R3), so a group
+        // mapping is dropped.
+        assertFalse(SubjectMapper.isUserRealmRoleMapping(
+                SubjectMapper.ResourceKind.REALM_ROLE_MAPPING, "CREATE", "groups/group-1/role-mappings/realm"));
+    }
+
+    @Test
+    void otherRoleMappingPathsAndOperationsAreNotAUserRealmRoleMapping() {
+        SubjectMapper.ResourceKind mapping = SubjectMapper.ResourceKind.REALM_ROLE_MAPPING;
+        assertFalse(SubjectMapper.isUserRealmRoleMapping(mapping, "UPDATE", "users/user-1/role-mappings/realm"));
+        assertFalse(SubjectMapper.isUserRealmRoleMapping(mapping, null, "users/user-1/role-mappings/realm"));
+        assertFalse(SubjectMapper.isUserRealmRoleMapping(mapping, "CREATE", "users//role-mappings/realm"));
+        assertFalse(SubjectMapper.isUserRealmRoleMapping(
+                mapping, "CREATE", "users/user-1/role-mappings/clients/client-1"));
+        assertFalse(SubjectMapper.isUserRealmRoleMapping(mapping, "CREATE", "users/user-1/role-mappings"));
+        assertFalse(SubjectMapper.isUserRealmRoleMapping(mapping, "CREATE", "users/user-1/role-mappings/realm/x"));
+        assertFalse(SubjectMapper.isUserRealmRoleMapping(mapping, "CREATE", null));
+    }
+
+    @Test
+    void otherResourceKindsAreNotAUserRealmRoleMapping() {
+        String path = "users/user-1/role-mappings/realm";
+        assertFalse(SubjectMapper.isUserRealmRoleMapping(SubjectMapper.ResourceKind.OTHER, "CREATE", path));
+        assertFalse(SubjectMapper.isUserRealmRoleMapping(SubjectMapper.ResourceKind.REALM_ROLE, "CREATE", path));
+        assertFalse(SubjectMapper.isUserRealmRoleMapping(null, "CREATE", path));
+    }
+
+    @Test
+    void realmRoleMappingHasNoSingleSubject() {
+        // The roles are in the representation, not in the path: see isUserRealmRoleMapping.
+        Optional<String> subject = SubjectMapper.subjectFor(
+                SubjectMapper.ResourceKind.REALM_ROLE_MAPPING, "CREATE", "users/user-1/role-mappings/realm");
+        assertTrue(subject.isEmpty());
+    }
+
+    @Test
+    void roleIdMapsToRoleMembersSubject() {
+        Optional<String> subject = SubjectMapper.roleMembersSubject("6f1c2a9e-3b4d-4e5f-8a7b-9c0d1e2f3a4b");
+        assertEquals(Optional.of("aiac.apply.role-members.6f1c2a9e-3b4d-4e5f-8a7b-9c0d1e2f3a4b"), subject);
+    }
+
+    @Test
+    void roleIdThatIsNotOneSubjectTokenGivesNoSubject() {
+        // A Keycloak role id is a UUID. An id with '.', '*', '>' or whitespace is not one NATS token:
+        // "aiac.apply.role-members.*" would not match it, and the publish could not read the id back
+        // from the last segment of the subject.
+        assertTrue(SubjectMapper.roleMembersSubject(null).isEmpty());
+        assertTrue(SubjectMapper.roleMembersSubject("").isEmpty());
+        assertTrue(SubjectMapper.roleMembersSubject("a.b").isEmpty());
+        assertTrue(SubjectMapper.roleMembersSubject("a*").isEmpty());
+        assertTrue(SubjectMapper.roleMembersSubject("a>").isEmpty());
+        assertTrue(SubjectMapper.roleMembersSubject("a b").isEmpty());
+        assertTrue(SubjectMapper.roleMembersSubject("a\tb").isEmpty());
     }
 
     @Test

@@ -4,7 +4,9 @@ The Controller is stateless. Each ``/apply/*`` route dispatches to its use-case 
 (orchestrator or sub-agent), receives the ``(list[PolicyRule], override)`` tuple
 the handler returns, and makes the **single** ``compute_and_apply(rules, override)``
 call to the Policy Computation Engine. No per-use-case business logic, retry
-handling, or state assembly lives here.
+handling, or state assembly lives here. Two routes call the PCE directly instead:
+``/apply/offboard/...`` (``decommission``) and ``/apply/role-members/{role_id}``
+(``rerender_role``, a role-membership change, D32).
 
 ``GET /policy/services/{service_id:path}`` is a read-only view (D18): the policy model of the
 current side with only the entry of one service (by its clientId), or 404 if it has no SPM. It
@@ -45,7 +47,7 @@ from aiac.agent.uc.policy_update.build import build_policy
 from aiac.agent.uc.policy_update.rebuild import rebuild_policy
 from aiac.agent.uc.role_update.role import update_role
 from aiac.idp.configuration.models import ClientId, ServiceUuid
-from aiac.policy.computation import compute_and_apply, decommission, policy_model_for
+from aiac.policy.computation import compute_and_apply, decommission, policy_model_for, rerender_role
 
 app = FastAPI(lifespan=lifespan)
 
@@ -172,6 +174,17 @@ def apply_policy_rebuild() -> Response:
 def apply_role(role_id: str) -> Response:
     rules, override = update_role(role_id)
     compute_and_apply(rules, override)
+    return Response(status_code=200)
+
+
+# A role-membership change (D32; the operator route of the ``aiac.apply.role-members.{role-id}`` event): a
+# user or a service account got or lost the role. That changes only who holds the role, not the policy,
+# so the route bypasses the use-case handlers (no PRB run) and compute_and_apply, and calls the PCE's
+# rerender_role directly: it re-renders the CRs that use the role with its current holders. role_id is
+# the Keycloak role id (a UUID).
+@app.post("/apply/role-members/{role_id}")
+def apply_role_members(role_id: str) -> Response:
+    rerender_role(role_id)
     return Response(status_code=200)
 
 
