@@ -90,6 +90,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterator
 
@@ -151,11 +152,13 @@ def _poll_decision(decide: Callable[[], str], want: str, timeout: float = uc1.BU
     return seen["decision"]
 
 
-def _settle_failed(admin, workload: str, settled: Callable[[dict], bool]) -> dict:
+def _settle_failed(admin, workload: str, settled: Callable[[dict], bool], *, since: datetime | None = None) -> dict:
     """Wait for a failed onboarding of ``workload`` to reach its terminal state — the client disabled
     (the rollback's last step) AND ``settled(client)`` (the quarantine's observable end) — then give the
-    consumer a short window to log the dead-letter move. Returns ``{"settled", "client", "logs"}``, read
-    while the injected Controller pod (the one that holds the failure log) is still running."""
+    consumer a short window to log the dead-letter move. Returns ``{"settled", "client", "logs",
+    "race_hint"}``, read while the injected Controller pod (the one that holds the failure log) is still
+    running. ``race_hint`` is ``""``, or, when the state did not settle, the event-before-commit race hint
+    over the Controller log from ``since`` (the trigger; ``uc1.controller_commit_race_hint``, handoff 20)."""
     seen: dict = {"client": None}
 
     def _terminal() -> bool:
@@ -173,7 +176,8 @@ def _settle_failed(admin, workload: str, settled: Callable[[dict], bool]) -> dic
             return _dlq_line(uuid) in logs["text"]
 
         uc1.poll_until(_logged, timeout=60, interval=5)
-    return {"settled": done, "client": seen["client"], "logs": logs["text"]}
+    race_hint = "" if done else uc1.controller_commit_race_hint(since, admin=admin, workload=workload)
+    return {"settled": done, "client": seen["client"], "logs": logs["text"], "race_hint": race_hint}
 
 
 def _prefixed(admin, prefix: str) -> dict[str, list[str]]:
@@ -226,12 +230,13 @@ def _run_phases(ctx: dict, run: dict) -> None:
 
     # --- Phase 1 — a failed first onboarding of the agent ---------------------------------------
     with uc1.controller_llm_unusable():
+        deployed_at = datetime.now(timezone.utc)  # the log window of the race hint (handoff 20)
         uc1.deploy_workload(AGENT)  # fires CLIENT_CREATED -> onboard_service -> build raises
         agent = _registered_client(admin, AGENT)
         # Terminal: disabled (rollback) AND no CR (the quarantine deletes it; an agent gets no bootstrap
         # CR, so it never had one in this phase). ``_settle_failed`` then waits for the dead-letter
         # line, which the consumer logs only after the quarantine returned.
-        failed = _settle_failed(admin, AGENT, lambda _c: uc1.authpolicy_policies(AGENT) is None)
+        failed = _settle_failed(admin, AGENT, lambda _c: uc1.authpolicy_policies(AGENT) is None, since=deployed_at)
         failed.update(
             uuid=agent["id"],
             cr=uc1.authpolicy_policies(AGENT),
@@ -246,7 +251,7 @@ def _run_phases(ctx: dict, run: dict) -> None:
     # sidecar gives before its first bundle loads.
     failed["inbound"] = _poll_decision(lambda: uc1.inbound_decision(ctx, "dev-user"), "deny")
     if not failed["settled"]:
-        run["stopped"] = "the failed agent onboarding did not settle (phase 1)"
+        run["stopped"] = uc1.append_hint("the failed agent onboarding did not settle (phase 1)", failed["race_hint"])
         return
 
     # --- Phase 2 — lift: the seam is restored (context exited); re-fire the agent's trigger ------
@@ -271,6 +276,7 @@ def _run_phases(ctx: dict, run: dict) -> None:
         return
 
     # --- Phase 3 — onboard the tool on the happy path, prepare Part B, then one MCP session -------
+    deployed_at = datetime.now(timezone.utc)
     uc1.deploy_workload(TOOL)
     tool = _registered_client(admin, TOOL)
     uc1.ensure_github_tool_route(uc1.NAMESPACE)
@@ -278,16 +284,20 @@ def _run_phases(ctx: dict, run: dict) -> None:
     uc1.restart_agent(uc1.NAMESPACE)
     outbound = _poll_decision(lambda: uc1.outbound_decision(ctx, "dev-user", PROBE_TOOL), "allow", LIFT_TIMEOUT)
     if outbound != "allow":
-        run["stopped"] = f"the tool did not converge on the happy path: dev-user outbound {PROBE_TOOL}={outbound!r}"
+        run["stopped"] = uc1.append_hint(
+            f"the tool did not converge on the happy path: dev-user outbound {PROBE_TOOL}={outbound!r}",
+            uc1.controller_commit_race_hint(deployed_at, admin=admin, workload=TOOL),
+        )
         return
     run["tool_onboarded"] = {"tool_cr": uc1.authpolicy_policies(TOOL), "agent_cr": uc1.authpolicy_policies(AGENT)}
     run["session"] = {user: uc1.mcp_session_decisions(ctx, user, PROBE_TOOL) for user in ("dev-user", "devops-user")}
 
     # --- Phase 4 — a failed re-onboarding of the (onboarded) tool --------------------------------
     with uc1.controller_llm_unusable():
+        published_at = datetime.now(timezone.utc)
         uc1.publish_service_event(tool["id"])
         # Terminal: disabled (rollback) AND its phase-3 SPM gone (the quarantine's first step).
-        failed = _settle_failed(admin, TOOL, lambda c: not uc1.spm_present(c["clientId"]))
+        failed = _settle_failed(admin, TOOL, lambda c: not uc1.spm_present(c["clientId"]), since=published_at)
         failed.update(
             uuid=tool["id"],
             cr=uc1.authpolicy_policies(TOOL),
@@ -330,10 +340,11 @@ def _failed(run: dict, key: str) -> dict:
     """The record of a failed-onboarding phase, failing first if it never reached its terminal state."""
     obs = _phase(run, key)
     client = obs["client"] or {}
-    assert obs["settled"], (
+    assert obs["settled"], uc1.append_hint(
         f"{key}: no rolled-back + quarantined terminal state within {SETTLE_TIMEOUT:.0f}s — client "
         f"enabled={client.get('enabled')!r}. Did the injection reach the Controller (onboarding may have "
-        "succeeded), or did the build fail with an error outside _ROLLBACK_ERRORS?"
+        "succeeded), or did the build fail with an error outside _ROLLBACK_ERRORS?",
+        obs.get("race_hint", ""),
     )
     return obs
 
