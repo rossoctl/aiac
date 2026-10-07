@@ -1,10 +1,10 @@
 """Static eval results dashboard — scenario drill-down + historical trend charts (issue #2542).
 
-Renders entirely from the artifacts ``eval/trend_log.py``/``eval/conftest.py`` (#2091) already
-produce — the committed, append-only ``eval/trend_log.jsonl`` and the gitignored per-run
-``eval/reports/report_<timestamp>.md`` — no new data source, no CI wiring, no server. A single
-self-contained HTML file (inline SVG, inline CSS, no external requests) a developer regenerates
-locally after an eval run.
+Renders entirely from the artifacts ``eval/dashboard/trend_log.py``/``eval/conftest.py`` (#2091)
+already produce — the committed, append-only ``eval/dashboard/trend_log.jsonl`` and the
+gitignored per-run ``eval/reports/report_<timestamp>.md`` — no new data source, no CI wiring, no
+server. A single self-contained HTML file (inline SVG, inline CSS, no external requests) a
+developer regenerates locally after an eval run.
 
 Two artifacts, two read paths: ``load_trend_log`` reads the committed trend log; ``parse_report``/
 ``parse_reports`` re-derive structured scenario data from the Markdown report(s) ``eval/conftest.py``
@@ -24,9 +24,10 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from eval.trend_log import DEFAULT_PATH as TREND_LOG_DEFAULT_PATH
+from eval.dashboard.trend_log import DEFAULT_PATH as TREND_LOG_DEFAULT_PATH
 
-HERE = Path(__file__).resolve().parent
+HERE = Path(__file__).resolve().parent  # eval/dashboard/
+EVAL_DIR = HERE.parent  # eval/ -- eval/reports/ lives here, a sibling of this package, not under it
 
 
 def load_trend_log(path: Path = TREND_LOG_DEFAULT_PATH) -> list[dict[str, Any]]:
@@ -301,7 +302,7 @@ def _report_anchor(report: ParsedReport) -> str:
     return "run-" + report.run_at.strftime("%Y%m%dT%H%M%SZ")
 
 
-# Bookkeeping keys every trend-log row carries (eval/trend_log.py's `append_row`, plus
+# Bookkeeping keys every trend-log row carries (eval/dashboard/trend_log.py's `append_row`, plus
 # `scenarios_scored` that every pooling function adds) that are never themselves a plottable
 # metric -- everything else on a row *used* to be one, whatever the suite, back when every metric
 # any pooling function produced was naturally 0-1-bounded (a rate or a score). This chart hardcodes
@@ -543,7 +544,7 @@ def render_dashboard(trend_rows: list[dict[str, Any]], reports: list[ParsedRepor
         )
         trends_body = f'<div class="trends-grid">{chart_sections}</div>'
     else:
-        trends_body = "<p>No trend-log rows yet — run an eval suite to populate eval/trend_log.jsonl.</p>"
+        trends_body = "<p>No trend-log rows yet — run an eval suite to populate eval/dashboard/trend_log.jsonl.</p>"
 
     tables = "".join(render_scenario_table(report) for report in reports)
     drilldown_sections = (
@@ -565,7 +566,7 @@ def render_dashboard(trend_rows: list[dict[str, Any]], reports: list[ParsedRepor
 
 def build_dashboard(
     trend_log_path: Path = TREND_LOG_DEFAULT_PATH,
-    reports_dir: Path = HERE / "reports",
+    reports_dir: Path = EVAL_DIR / "reports",
     output_path: Path = HERE / "dashboard.html",
 ) -> Path:
     """Load the trend log + every per-run report, render the dashboard, write it to

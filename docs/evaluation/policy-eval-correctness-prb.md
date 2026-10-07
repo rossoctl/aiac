@@ -284,12 +284,12 @@ This is **one** integration-test spec among several indexed by the master PRD
 
 ## Trend log
 
-`eval/trend_log.py`'s shared `append_row`/`pool_correctness_metrics` (#2091) pools this suite's
+`eval/dashboard/trend_log.py`'s shared `append_row`/`pool_correctness_metrics` (#2091) pools this suite's
 `true_positives`/`denied_total` counts (and `over_grants`/`under_grants`/`incorrectly_denied` pair
 dicts) — `record_property`'d by `test_prb_correctness` alongside the existing
 precision/recall/denial-precision floats — across every scenario that reached `score_scenario` in
 a run, and appends one row (`suite="correctness_prb"`) to the committed, append-only
-`eval/trend_log.jsonl` from `eval/conftest.py`'s `pytest_sessionfinish`. Pooled by summed count,
+`eval/dashboard/trend_log.jsonl` from `eval/conftest.py`'s `pytest_sessionfinish`. Pooled by summed count,
 not averaged per-scenario — same union-not-average philosophy as `score_scenario`'s own
 cross-gate aggregation. See `docs/evaluation/eval-framework.md` §9.
 

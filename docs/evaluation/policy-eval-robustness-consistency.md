@@ -390,14 +390,14 @@ is also read back by `_write_trend_log` (see [Trend log](#trend-log)).
 `record_property("invariant"/"sensitive", bool)` values, via nodeid-substring matching
 (`_ROBUSTNESS_TEST_MARKERS`, since the single flat `eval` marker — shared by every suite under
 `eval/` — spans four test functions across two families × two tiers that must stay unblended per
-spec §4), and appends **four** rows to the committed, append-only `eval/trend_log.jsonl` from
+spec §4), and appends **four** rows to the committed, append-only `eval/dashboard/trend_log.jsonl` from
 `pytest_sessionfinish` — one per family/tier combination, never combined: `suite=
 "robustness_mechanical_invariance"`, `"robustness_semantic_invariance"` (#2467),
 `"robustness_mechanical_sensitivity"`, and `"robustness_semantic_sensitivity"` (#2467). Each row
 carries that row's own pass/fail rate (`invariance_rate`/`sensitivity_rate`, mean of that row's
 booleans) *and* that row's own `precision`/`recall`/`denial_precision`, pooled from the same
 `true_positives`/`denied_total`/`over_grants`/`under_grants`/`incorrectly_denied` shape
-`_record_scoring` records (`eval/trend_log.py`'s `pool_correctness_metrics` — the same pooling
+`_record_scoring` records (`eval/dashboard/trend_log.py`'s `pool_correctness_metrics` — the same pooling
 function the two Correctness suites use, reused as-is here) — so each row's chart is directly
 comparable in shape to a Correctness chart: two measuring the PRB against *original* inputs
 (invariance, mechanical vs. semantic tier), two against *deliberately edited/reworded* inputs
@@ -406,7 +406,7 @@ filter that only exercises one test function) simply gets no row at all, rather 
 mislabeling one row's count against another's. See `docs/evaluation/eval-framework.md` §9.
 
 **Consistency (#2468)** gets its own single row, `suite="consistency"`, pooled by
-`eval/trend_log.py`'s `pool_consistency_metrics` — not `pool_correctness_metrics`, since there's no
+`eval/dashboard/trend_log.py`'s `pool_consistency_metrics` — not `pool_correctness_metrics`, since there's no
 truth table here (Consistency compares PRB runs to each other, not to ground truth), just each
 scenario's own `inconsistent` boolean rolled up into an `agreement_rate` (the fraction of the
 corpus's scenarios that agreed across all of their `PRB_CONSISTENCY_REPEATS` repeats). Framed as

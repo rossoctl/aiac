@@ -197,9 +197,9 @@ render behavior itself.
 
 Same mechanism as
 [policy-eval-correctness-prb.md § Trend log](policy-eval-correctness-prb.md#trend-log) (#2091,
-`eval/trend_log.py`) — `test_e2e_correctness` `record_property`s the same `true_positives`/
+`eval/dashboard/trend_log.py`) — `test_e2e_correctness` `record_property`s the same `true_positives`/
 `denied_total` counts, and `eval/conftest.py` pools them into a `suite="correctness_e2e"` row in
-the same committed `eval/trend_log.jsonl`, distinct from the PRB-level suite's
+the same committed `eval/dashboard/trend_log.jsonl`, distinct from the PRB-level suite's
 `"correctness_prb"` row.
 
 ## Relationship to other integration tests

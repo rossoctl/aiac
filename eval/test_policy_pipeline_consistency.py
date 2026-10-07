@@ -25,7 +25,7 @@ N (repeats per scenario) is overridable via ``PRB_CONSISTENCY_REPEATS`` (default
 
 Feeds the committed trend log (spec §9): ``record_property("inconsistent", bool)`` per scenario is
 read back by ``eval/conftest.py``'s ``_write_trend_log`` (``_CONSISTENCY_TEST_MARKERS``) and pooled
-via ``eval/trend_log.py``'s ``pool_consistency_metrics`` into an ``agreement_rate`` — recorded
+via ``eval/dashboard/trend_log.py``'s ``pool_consistency_metrics`` into an ``agreement_rate`` — recorded
 even on a fully-passing run, per spec §6, so an occasional flake against a live LLM stays visible
 over time instead of only showing up as a one-off failure.
 """
@@ -100,7 +100,7 @@ def test_prb_consistent_across_repeats(scenario_name: str, monkeypatch: pytest.M
     # attribute scalar. Read back by eval/conftest.py's _render_entry to show "Inconsistent: Yes/No"
     # + detail in the Markdown report on every run, pass or fail, not just via the crash message
     # when the assert below fires. "inconsistent" alone is also read back by _write_trend_log
-    # (_CONSISTENCY_TEST_MARKERS) and pooled via eval/trend_log.py's pool_consistency_metrics into
+    # (_CONSISTENCY_TEST_MARKERS) and pooled via eval/dashboard/trend_log.py's pool_consistency_metrics into
     # this run's agreement_rate (spec: docs/evaluation/eval-framework.md §6/§9).
     record_property("mismatches", "\n".join(mismatches))
 
