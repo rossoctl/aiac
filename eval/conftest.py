@@ -141,7 +141,8 @@ import pytest
 from dotenv import load_dotenv
 
 from eval.dashboard.trend_log import append_row, pool_consistency_metrics, pool_correctness_metrics, pool_scale_metrics
-from eval.recommendations import build_recommendations, format_pairs
+from eval.nodeid import scenario_for_nodeid
+from eval.pairs import format_pairs
 
 HERE = Path(__file__).resolve().parent
 REPORTS_DIR = HERE / "reports"
@@ -185,10 +186,16 @@ def _scenario_name_from_nodeid(nodeid: str) -> str:
     ``eval/test_policy_pipeline_eval.py::test_prb_correctness[baseline]`` -> ``"baseline"``) --
     used by ``_collect_recommendation_evidence`` to attribute each recorded property dict to the
     scenario it came from. Returns the nodeid unchanged for a non-parametrized test (e.g. the Scale
-    suite's structural/correctness tests, which run once per dimension/level, not per scenario)."""
-    if nodeid.endswith("]") and "[" in nodeid:
-        return nodeid[nodeid.rindex("[") + 1 : -1]
-    return nodeid
+    suite's structural/correctness tests, which run once per dimension/level, not per scenario).
+
+    Delegates the actual extraction to ``eval.nodeid.scenario_for_nodeid`` -- the same function
+    ``eval.dashboard.dashboard`` uses -- rather than keeping an independent ``rindex("[")``-based
+    parser (confirmed as a real finding in PR review: the two could give different answers for an
+    unusual parametrize id, making the recommendations section and the dashboard drill-down
+    disagree on which scenario a nodeid belongs to). The ``or nodeid`` fallback is this call site's
+    own: unlike the dashboard (which wants ``None`` for "no scenario, skip"), this one wants a
+    non-``None`` grouping key for a non-parametrized nodeid."""
+    return scenario_for_nodeid(nodeid) or nodeid
 
 
 def pytest_collection_modifyitems(session: pytest.Session, config: pytest.Config, items: list) -> None:
@@ -309,14 +316,15 @@ def _render_field(lines: list[str], label: str, text: str) -> None:
 def _format_pairs_dict(pairs_by_gate: dict) -> str:
     """Render a ``{gate: [(role, scope), ...]}`` dict (as produced by ``ScenarioScore.over_grants``
     /``under_grants``/``incorrectly_denied``) as one line per non-empty gate, or ``"none"`` --
-    newline-joined, deliberately UNBOUNDED (``limit=None``), unlike
-    ``eval.recommendations.format_pairs``'s own LLM-prompt-sized default. This is the gitignored,
+    newline-joined, deliberately UNBOUNDED (``limit=None``), unlike ``format_pairs``'s own
+    LLM-prompt-sized default that ``eval.recommendations`` keeps (imported from ``eval.pairs``,
+    the same lightweight module this file imports it from -- see that module's own docstring for
+    why both pull from there rather than one importing from the other). This is the gitignored,
     human-read-only per-run Markdown report (not something fed back into an LLM request), so there
     is no context-window reason to cap it here -- including for the Scale suite's correctness
     tests (``_render_metrics_block`` is their render path too, via the ``"precision" in props``
     branch they share with the two Correctness suites), where a reader may genuinely want to see
-    every one of a 100-entity run's pairs, not a truncated sample. Delegates to the shared function
-    instead of keeping its own duplicate copy."""
+    every one of a 100-entity run's pairs, not a truncated sample."""
     return format_pairs(pairs_by_gate, sep="\n", limit=None)
 
 
@@ -703,7 +711,28 @@ def _render_recommendations_section(lines: list[str], evidence: dict) -> None:
     recommendations" section below the drill-down (spec §9.1, #2472) -- **omits the whole section**
     when the result is empty (no ``_none_`` fallback here, unlike the six pass/fail category
     sections above: the spec is explicit that an empty category must not render as a vacuous pass
-    statement)."""
+    statement).
+
+    Imports ``build_recommendations`` here, not at module top (confirmed as a real finding in PR
+    review): ``eval.recommendations`` needs ``langchain_core``/``pydantic``/``aiac.agent.llm`` for
+    its own LLM seam, and ``eval.conftest`` is loaded for every pytest session that touches
+    ``eval/`` -- including the plain offline unit lane, since ``eval/`` is in ``testpaths``, and
+    for every OTHER suite under ``eval/``, not only the ones this feature cares about. A
+    module-top import here would mean a broken/missing optional LLM dependency breaks collection
+    of hooks every eval suite shares, not just this one feature -- deferring it to call time means
+    that failure instead surfaces only when this function actually runs, with the rest of the
+    report (and every other suite's own tests) unaffected. ``format_pairs`` doesn't have this
+    problem -- it lives in ``eval.pairs``, which has no such heavy imports, and stays a normal
+    module-top import.
+
+    Builds into a local ``section_lines`` list, extending the real ``lines`` only once rendering
+    finishes without raising (also a real finding in PR review): the caller's broad ``except
+    Exception`` already prints a warning and omits this section on failure, but was still
+    appending directly to the shared ``lines`` -- a build that raised partway through (e.g. inside
+    the loop below) left whatever heading/bullets it had already written IN the report, a
+    half-finished section rather than a cleanly omitted one."""
+    from eval.recommendations import build_recommendations
+
     recommendations = build_recommendations(
         correctness=evidence["correctness"],
         sensitivity=evidence["sensitivity"],
@@ -714,14 +743,14 @@ def _render_recommendations_section(lines: list[str], evidence: dict) -> None:
     )
     if not recommendations:
         return
-    lines.append("## Improvement recommendations")
-    lines.append("")
+    section_lines: list[str] = ["## Improvement recommendations", ""]
     for rec in recommendations:
-        lines.append(f"### {_sanitize_recommendation_heading(rec.heading)}")
-        lines.append("")
-        _render_field(lines, "Recommendation", rec.body)
-        _render_field(lines, "Evidence", "\n".join(rec.evidence))
-        lines.append("")
+        section_lines.append(f"### {_sanitize_recommendation_heading(rec.heading)}")
+        section_lines.append("")
+        _render_field(section_lines, "Recommendation", rec.body)
+        _render_field(section_lines, "Evidence", "\n".join(rec.evidence))
+        section_lines.append("")
+    lines.extend(section_lines)
 
 
 def _render_entry(lines: list[str], nodeid: str, report: pytest.TestReport, category: str) -> None:

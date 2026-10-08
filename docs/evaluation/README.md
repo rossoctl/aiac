@@ -39,6 +39,7 @@ directly — real shell/CI exports still take precedence.
 | `SCALE_TOTAL_CORPUS_SIZE` / `SCALE_TOTAL_CORPUS_ROLES` / `SCALE_PER_DECISION_CANDIDATES` / `SCALE_SEED` (optional) | `eval` (`test_policy_pipeline_scale.py`) | Corpus-size overrides; defaults 100/10/100/0. Override to a small size while iterating — see [policy-eval-scale.md](policy-eval-scale.md). |
 | `SCALE_CONCURRENCY` (optional) | `eval` (`test_policy_pipeline_scale.py`) | Max concurrent PRB/Keycloak-admin calls; default 20. |
 | `EVAL_REPORT_TZ` (optional) | none (report only) | Timezone for the Markdown report's timestamp/filename; default UTC. |
+| `EVAL_RECOMMENDATIONS_LLM` (optional) | none (report only) | Set to `0`/`false`/`no` to skip the Improvement-recommendations section's batched LLM call (`eval/recommendations.py`); default enabled. The section still renders via the deterministic fallback grouping — useful for a quick `-k` debug rerun where you don't want to wait on (or pay for) that call. |
 
 Minimal repo-root `.env` for the PRB-level suites only:
 

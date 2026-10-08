@@ -19,10 +19,11 @@ import pytest
 from eval.recommendations import (
     EvidenceCase,
     Recommendation,
+    _grant_diff,
     _Pattern,
+    _truncate,
     build_recommendations,
     consistency_cases,
-    format_pairs,
     invariance_cases,
     over_grant_cases,
     scale_mistake_cases,
@@ -32,39 +33,44 @@ from eval.recommendations import (
 from test.system.launcher import require_env_or_skip
 
 # =========================================================================== #
-# format_pairs -- shared with eval.conftest._format_pairs_dict                #
+# _truncate / _grant_diff                                                     #
 # =========================================================================== #
 
 
-class TestFormatPairs:
-    def test_empty_dict_is_none(self) -> None:
-        assert format_pairs({}) == "none"
+class TestTruncate:
+    def test_short_text_is_unchanged(self) -> None:
+        assert _truncate("short", limit=10) == "short"
 
-    def test_default_sep_is_single_line(self) -> None:
-        pairs = {"inbound": [("role-a", "scope-a")], "outbound": [("role-b", "scope-b")]}
-        rendered = format_pairs(pairs)
-        assert "\n" not in rendered
-        assert "; " in rendered
+    def test_long_text_is_cut_with_a_marker(self) -> None:
+        result = _truncate("x" * 20, limit=10)
+        assert result == "x" * 10 + "... (truncated)"
 
-    def test_custom_sep_for_markdown_rendering(self) -> None:
-        pairs = {"inbound": [("role-a", "scope-a")], "outbound": [("role-b", "scope-b")]}
-        rendered = format_pairs(pairs, sep="\n", limit=None)
-        assert rendered == "inbound: (role-a, scope-a)\noutbound: (role-b, scope-b)"
+    def test_exactly_at_the_limit_is_unchanged(self) -> None:
+        assert _truncate("x" * 10, limit=10) == "x" * 10
 
-    def test_pairs_beyond_the_limit_are_summarized_not_dropped_silently(self) -> None:
-        """Confirmed as a real finding in PR review: a corpus the size of the Scale suite's
-        total-corpus dimension can produce hundreds of pairs for one gate, and the unbounded
-        version used to put every single one into one batched LLM request."""
-        pairs = {"inbound": [(f"role-{i}", f"scope-{i}") for i in range(25)]}
-        rendered = format_pairs(pairs, limit=5)
-        assert rendered.count("role-") == 5  # only the first 5 pairs are spelled out
-        assert "... and 20 more" in rendered
 
-    def test_no_limit_means_unbounded(self) -> None:
-        pairs = {"inbound": [(f"role-{i}", f"scope-{i}") for i in range(25)]}
-        rendered = format_pairs(pairs, limit=None)
-        assert "..." not in rendered
-        assert rendered.count("role-") == 25
+class TestGrantDiff:
+    def test_identical_grants_show_no_difference(self) -> None:
+        grants = {"inbound": [("role-a", "scope-a")]}
+        assert _grant_diff(grants, grants) == "no difference"
+
+    def test_lost_and_gained_are_both_reported(self) -> None:
+        expected = {"inbound": [("role-tester", "scope-x")]}
+        actual = {"inbound": [("role-dev", "scope-x")]}
+        result = _grant_diff(expected, actual)
+        assert "lost -> inbound: (role-tester, scope-x)" in result
+        assert "gained -> inbound: (role-dev, scope-x)" in result
+
+    def test_shared_pair_is_excluded_from_the_diff(self) -> None:
+        expected = {"inbound": [("role-a", "scope-a"), ("role-shared", "scope-y")]}
+        actual = {"inbound": [("role-b", "scope-a"), ("role-shared", "scope-y")]}
+        result = _grant_diff(expected, actual)
+        assert "role-shared" not in result
+
+    def test_only_lost_no_gained(self) -> None:
+        expected = {"inbound": [("role-a", "scope-a")]}
+        result = _grant_diff(expected, {})
+        assert result == "lost -> inbound: (role-a, scope-a)"
 
 
 # =========================================================================== #
@@ -190,7 +196,45 @@ class TestSensitivityCases:
         assert case.case_id == "robustness_mechanical_sensitivity:baseline:sensitivity"
         assert case.finding_type == "sensitivity"
         assert case.fallback_key == "restriction_word"
-        assert "role-tester" in case.evidence and "role-dev" in case.evidence
+        assert "lost -> inbound: (role-tester, scope-x)" in case.evidence
+        assert "gained -> inbound: (role-dev, scope-x)" in case.evidence
+
+    def test_long_perturbation_is_truncated_as_a_well_formed_quoted_string(self) -> None:
+        """Confirmed as a real finding in PR review: truncating an already-repr'd string (quotes
+        and escapes already applied) can cut mid-escape and drops the closing quote. Truncating
+        the raw text FIRST, then repr-ing the (now short) result, always produces a complete,
+        well-formed quoted string with the marker inside it."""
+        entries = [
+            (
+                "robustness_mechanical_sensitivity",
+                "baseline",
+                {"sensitive": False, "perturbation": "x" * 600, "expected_grants": {}, "actual_grants": {}},
+            )
+        ]
+        [case] = sensitivity_cases(entries)
+        assert "... (truncated)'" in case.evidence  # closing quote survives, right after the marker
+        assert case.evidence.count("x") == 500
+
+    def test_evidence_shows_only_the_difference_not_the_full_lists(self) -> None:
+        """Confirmed as a real finding in PR review: independently truncating two full
+        expected/actual lists at the same pair-count limit can leave both showing an identical
+        prefix with no way to tell which pair changed. Diffing first means a pair both lists
+        share (unchanged) never appears in the evidence at all."""
+        entries = [
+            (
+                "robustness_mechanical_sensitivity",
+                "baseline",
+                {
+                    "sensitive": False,
+                    "expected_grants": {"inbound": [("role-tester", "scope-x"), ("role-shared", "scope-y")]},
+                    "actual_grants": {"inbound": [("role-dev", "scope-x"), ("role-shared", "scope-y")]},
+                },
+            )
+        ]
+        [case] = sensitivity_cases(entries)
+        assert "role-shared" not in case.evidence  # unchanged pair -- not part of the diff
+        assert "lost -> inbound: (role-tester, scope-x)" in case.evidence
+        assert "gained -> inbound: (role-dev, scope-x)" in case.evidence
 
 
 class TestInvarianceCases:
@@ -307,6 +351,19 @@ class TestScaleMistakeCases:
             [case] = scale_mistake_cases([("scale_per_decision_prb", props)])
             assert case.case_id == "scale_per_decision_prb:scale_mistake"
 
+    def test_a_pair_in_both_under_grants_and_incorrectly_denied_is_not_restated_twice(self) -> None:
+        """Confirmed as a real finding in PR review: this builder still restated the same pairs
+        under both labels after under_grant_cases was fixed to dedupe them the same way. The
+        "also incorrectly denied" clause must be omitted entirely once nothing's left, not shown
+        as a stray "-> none" (a second finding from the same review round)."""
+        props = {
+            "under_grants": {"inbound": [("role-a", "scope-a")]},
+            "incorrectly_denied": {"inbound": [("role-a", "scope-a")]},
+        }
+        [case] = scale_mistake_cases([("scale_per_decision_prb", props)])
+        assert case.evidence.count("role-a") == 1
+        assert "incorrectly denied" not in case.evidence
+
 
 # =========================================================================== #
 # build_recommendations -- pattern validation + deterministic fallback        #
@@ -402,7 +459,11 @@ class TestBuildRecommendations:
         drafted = next(r for r in recs if r.heading == "pattern covering only one case")
         assert len(drafted.evidence) == 1 and "role-a" in drafted.evidence[0]
         fallback = next(r for r in recs if r is not drafted)
-        assert "LLM pattern analysis unavailable" in fallback.body
+        # Confirmed as a real finding in PR review: "unavailable" is misleading here -- the LLM
+        # call clearly worked (it drafted the OTHER recommendation above), it just didn't cover
+        # this case.
+        assert "Not covered by the LLM pattern analysis" in fallback.body
+        assert "LLM pattern analysis unavailable" not in fallback.body
         assert "role-b" in fallback.evidence[0]
 
     def test_hallucinated_id_in_an_otherwise_valid_pattern_still_surfaces_the_other_case(
@@ -424,7 +485,19 @@ class TestBuildRecommendations:
         monkeypatch.setattr("eval.recommendations._draft_patterns", lambda cases: [stub])
         recs = self._call(correctness=[_OVER_GRANT_ENTRY, other_entry])
         assert len(recs) == 2
-        assert any("LLM pattern analysis unavailable" in r.body and "role-b" in r.evidence[0] for r in recs)
+        assert any("Not covered by the LLM pattern analysis" in r.body and "role-b" in r.evidence[0] for r in recs)
+
+    def test_case_claimed_by_an_earlier_pattern_is_not_claimed_by_a_later_one_too(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Confirmed as a real finding in PR review: deduping only WITHIN one pattern still let
+        the same case_id appear in two different patterns, double-counting that case's failure
+        under two separate recommendations."""
+        first = _Pattern(heading="first", recommendation="rec1", case_ids=["correctness_prb:baseline:over_grant"])
+        second = _Pattern(heading="second", recommendation="rec2", case_ids=["correctness_prb:baseline:over_grant"])
+        monkeypatch.setattr("eval.recommendations._draft_patterns", lambda cases: [first, second])
+        [rec] = self._call(correctness=[_OVER_GRANT_ENTRY])
+        assert rec.heading == "first"
 
 
 # =========================================================================== #
@@ -470,6 +543,42 @@ class TestDraftPatternsLLMFailure:
             )
         ]
         assert _draft_patterns(cases) == []
+
+
+class TestDraftPatternsLLMDisabledFlag:
+    """Confirmed as a real finding in PR review: a developer rerunning one failing scenario with
+    ``-k`` had no way to skip the blocking, retried LLM call pytest_sessionfinish makes whenever
+    at least one case failed."""
+
+    def test_flag_unset_still_calls_the_llm(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from eval.recommendations import _draft_patterns
+
+        monkeypatch.delenv("EVAL_RECOMMENDATIONS_LLM", raising=False)
+        calls = []
+        monkeypatch.setattr("eval.recommendations.call_with_retry", lambda *a, **k: calls.append(1) or None)
+        monkeypatch.setattr("eval.recommendations.build_llm", lambda settings: MagicMock())
+        cases = [
+            EvidenceCase(
+                case_id="x:y:over_grant", finding_type="over_grant", evidence="e", remedy_menu="m", fallback_key="x"
+            )
+        ]
+        _draft_patterns(cases)
+        assert calls == [1]
+
+    @pytest.mark.parametrize("value", ["0", "false", "False", "no", "NO"])
+    def test_falsy_flag_skips_the_call_entirely(self, monkeypatch: pytest.MonkeyPatch, value: str) -> None:
+        from eval.recommendations import _draft_patterns
+
+        monkeypatch.setenv("EVAL_RECOMMENDATIONS_LLM", value)
+        calls = []
+        monkeypatch.setattr("eval.recommendations.load_llm_settings", lambda: calls.append(1))
+        cases = [
+            EvidenceCase(
+                case_id="x:y:over_grant", finding_type="over_grant", evidence="e", remedy_menu="m", fallback_key="x"
+            )
+        ]
+        assert _draft_patterns(cases) == []
+        assert calls == []  # not even settings were loaded -- no attempt made at all
 
 
 # =========================================================================== #

@@ -29,12 +29,24 @@ Three layers, in this file:
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel
 
 from aiac.agent.llm import build_llm, call_with_retry, load_llm_settings
+from eval.pairs import format_pairs, pairs_not_in
+
+# EVAL_RECOMMENDATIONS_LLM env override (default enabled) -- lets a developer skip the blocking,
+# retried LLM call entirely for a quick -k debug run (confirmed as a real finding in PR review:
+# pytest_sessionfinish makes this call whenever at least one case failed, with no way to opt out
+# short of unsetting LLM_BASE_URL/LLM_API_KEY/LLM_MODEL entirely -- which would also break
+# anything else in the session that needs them). Disabling it still produces the section: an
+# empty _draft_patterns result is exactly what build_recommendations' own documented contract
+# already falls back to on any unusable result -- never a missing section, just an unclustered
+# one.
+_RECOMMENDATIONS_LLM_ENV = "EVAL_RECOMMENDATIONS_LLM"
 
 
 @dataclass(frozen=True)
@@ -59,40 +71,44 @@ class Recommendation:
     evidence: list[str]  # one line per case this recommendation covers
 
 
-# Cap on how many (role, scope) pairs one gate contributes to one evidence string -- a large
-# corpus (the Scale suite's total-corpus dimension in particular, ~9M tokens / hundreds of
-# generated entities) can produce hundreds or thousands of under-granted pairs for a single
-# finding, and every evidence string this module builds goes into ONE batched _draft_patterns
-# request. An unbounded pair list there can overflow the model's context window outright, failing
-# the whole batched call (and with it, every case's chance at an LLM-drafted recommendation, not
-# just this one's) rather than just this one case's own detail.
-_MAX_PAIRS_PER_GATE = 20
+# Evidence strings this module builds are capped in two ways, both bounding what goes into ONE
+# batched _draft_patterns request: per-gate pair counts (eval.pairs.format_pairs's own
+# MAX_PAIRS_PER_GATE) and, for free-form text fields that aren't pair lists at all (perturbation,
+# mismatches), a plain character cap -- see _truncate below.
+_MAX_FIELD_CHARS = 500
 
 
-def format_pairs(pairs_by_gate: dict, *, sep: str = "; ", limit: int | None = _MAX_PAIRS_PER_GATE) -> str:
-    """Render a ``{gate: [(role, scope), ...]}`` dict (as produced by ``ScenarioScore.over_grants``
-    /``under_grants``/``incorrectly_denied``) as one line per non-empty gate joined by ``sep``, or
-    ``"none"``. Shared with ``eval.conftest._format_pairs_dict``, which imports this and passes
-    ``sep="\\n"``, ``limit=None`` for its unbounded, newline-per-gate Markdown rendering into the
-    gitignored, human-read-only per-run report -- unbounded there is a deliberate choice (a reader
-    may want every pair of even a 100-entity Scale-suite run, not a truncated sample), not an
-    assumption that the pairs are always few. Every call site in THIS module instead keeps the
-    defaults: ``sep="; "`` so a value stays single-line (both the per-case prompt line sent to the
-    LLM and the fallback recommendation's evidence list would otherwise be corrupted by an embedded
-    newline), and ``limit`` so one gate's pair list is capped at ``_MAX_PAIRS_PER_GATE`` with a
-    trailing ``"... and N more"`` -- bounding what goes into the batched LLM request, which the
-    Markdown report has no such reason to do."""
-    if not pairs_by_gate:
-        return "none"
+def _truncate(text: str, limit: int = _MAX_FIELD_CHARS) -> str:
+    """``text`` cut to ``limit`` characters with a trailing ``"... (truncated)"`` marker --
+    bounds a free-form evidence field (``perturbation``/``mismatches``) that ``format_pairs``'s own
+    per-gate cap doesn't reach, since neither is a pair list. Confirmed as a real finding in PR
+    review: a long policy-text edit or a high ``PRB_CONSISTENCY_REPEATS`` run could otherwise make
+    ONE case's evidence string large enough, on its own, to risk overflowing the model's context
+    window in the single batched request every case shares."""
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "... (truncated)"
+
+
+def _grant_diff(expected: dict, actual: dict) -> str:
+    """One line summarizing exactly what differs between ``expected``/``actual`` grants, per gate
+    -- ``lost`` (in ``expected``, not ``actual``) and ``gained`` (in ``actual``, not ``expected``).
+    Sent instead of the two full lists (confirmed as a real finding in PR review): when both lists
+    are independently capped at the same ``format_pairs`` pair limit, a pair that changed past that
+    cutoff (e.g. expected pair #25 of 30, sorted) could leave BOTH truncated lists showing the same
+    first N pairs plus "... and K more" -- identical on their face, with no way to tell which pair
+    actually changed. Diffing first means the cap only ever has to represent genuine differences,
+    which are typically far fewer than either full list."""
+    lost = pairs_not_in(expected, actual)
+    gained = pairs_not_in(actual, expected)
+    if not lost and not gained:
+        return "no difference"
     parts = []
-    for gate, pairs in sorted(pairs_by_gate.items()):
-        shown = pairs if limit is None else pairs[:limit]
-        pair_str = ", ".join(f"({r}, {s})" for r, s in shown)
-        omitted = len(pairs) - len(shown)
-        if omitted > 0:
-            pair_str = f"{pair_str}, ... and {omitted} more" if pair_str else f"... and {omitted} more"
-        parts.append(f"{gate}: {pair_str}")
-    return sep.join(parts)
+    if lost:
+        parts.append(f"lost -> {format_pairs(lost)}")
+    if gained:
+        parts.append(f"gained -> {format_pairs(gained)}")
+    return "; ".join(parts)
 
 
 # Remedy-menu constants -- the spec's own recommendation-form framing per finding type
@@ -154,20 +170,6 @@ def over_grant_cases(entries: list[tuple[str, str, dict]]) -> list[EvidenceCase]
     return cases
 
 
-def _pairs_not_in(pairs_by_gate: dict, other_by_gate: dict) -> dict:
-    """``pairs_by_gate`` minus every pair already present in ``other_by_gate``, per gate -- drops a
-    gate entirely once nothing is left. Used by ``under_grant_cases`` so ``incorrectly_denied``
-    (normally a SUBSET of ``under_grants``) only ever adds evidence for the genuinely distinct edge
-    case -- a pair that landed in BOTH -- instead of restating the same pairs twice."""
-    result: dict = {}
-    for gate, pairs in pairs_by_gate.items():
-        other = set(other_by_gate.get(gate, []))
-        remaining = [pair for pair in pairs if pair not in other]
-        if remaining:
-            result[gate] = remaining
-    return result
-
-
 def under_grant_cases(entries: list[tuple[str, str, dict]]) -> list[EvidenceCase]:
     """Mirrors ``over_grant_cases`` for ``under_grants`` -- PLUS the part of ``incorrectly_denied``
     not already in ``under_grants``. ``incorrectly_denied`` (an explicit deny for a pair that should
@@ -178,12 +180,12 @@ def under_grant_cases(entries: list[tuple[str, str, dict]]) -> list[EvidenceCase
     scope split by the auditor into one approved sub-decision and one best-effort-rejected
     sub-decision for the same (role, scope) pair -- which lands in ``incorrectly_denied`` without
     ever appearing in ``under_grants`` (it IS in ``granted``, so ``expected - granted`` excludes
-    it). ``_pairs_not_in`` isolates exactly that: whatever's in ``incorrectly_denied`` but not
-    already in ``under_grants``."""
+    it). ``eval.pairs.pairs_not_in`` isolates exactly that: whatever's in ``incorrectly_denied`` but
+    not already in ``under_grants``."""
     cases = []
     for suite, scenario, props in entries:
         under_grants = props.get("under_grants") or {}
-        incorrectly_denied_only = _pairs_not_in(props.get("incorrectly_denied") or {}, under_grants)
+        incorrectly_denied_only = pairs_not_in(props.get("incorrectly_denied") or {}, under_grants)
         if not under_grants and not incorrectly_denied_only:
             continue
         detail_parts = []
@@ -210,17 +212,18 @@ def sensitivity_cases(entries: list[tuple[str, str, dict]]) -> list[EvidenceCase
     ``robustness_semantic_sensitivity``). One ``EvidenceCase`` per entry whose ``"sensitive"``
     flag is ``False`` (the PRB failed to change its decision on a deliberately meaning-changing
     edit). ``fallback_key`` is the edit's own ``edit_type`` -- the policy-text-level pattern the
-    PRB was insensitive to, not just which suite caught it."""
+    PRB was insensitive to, not just which suite caught it. Evidence shows the grant DIFFERENCE
+    (``_grant_diff``), not the two full expected/actual lists -- confirmed as a real finding in PR
+    review: independently capping two full lists at the same pair limit could leave both showing
+    an identical truncated prefix with no way to tell which pair actually changed."""
     cases = []
     for suite, scenario, props in entries:
         if props.get("sensitive", True):
             continue
         edit_type = props.get("edit_type", "unknown")
-        evidence = (
-            f"{suite}/{scenario} (edit_type={edit_type}): perturbation={props.get('perturbation', '')!r}; "
-            f"expected grants -> {format_pairs(props.get('expected_grants') or {})}; "
-            f"actual grants -> {format_pairs(props.get('actual_grants') or {})}"
-        )
+        perturbation = repr(_truncate(str(props.get("perturbation", ""))))
+        diff = _grant_diff(props.get("expected_grants") or {}, props.get("actual_grants") or {})
+        evidence = f"{suite}/{scenario} (edit_type={edit_type}): perturbation={perturbation}; {diff}"
         cases.append(
             EvidenceCase(
                 case_id=f"{suite}:{scenario}:sensitivity",
@@ -239,16 +242,15 @@ def invariance_cases(entries: list[tuple[str, str, dict]]) -> list[EvidenceCase]
     ``robustness_semantic_invariance``). One ``EvidenceCase`` per entry whose ``"invariant"`` flag
     is ``False`` (the PRB's decision changed under a meaning-preserving perturbation).
     ``fallback_key`` is the suite itself (tier) -- there is no edit_type here, every change is
-    unwanted by definition."""
+    unwanted by definition. Evidence shows the grant DIFFERENCE (``_grant_diff``), not the two
+    full expected/actual lists -- see ``sensitivity_cases``'s docstring for why."""
     cases = []
     for suite, scenario, props in entries:
         if props.get("invariant", True):
             continue
-        evidence = (
-            f"{suite}/{scenario}: perturbation={props.get('perturbation', '')!r}; "
-            f"expected grants -> {format_pairs(props.get('expected_grants') or {})}; "
-            f"actual grants -> {format_pairs(props.get('actual_grants') or {})}"
-        )
+        perturbation = repr(_truncate(str(props.get("perturbation", ""))))
+        diff = _grant_diff(props.get("expected_grants") or {}, props.get("actual_grants") or {})
+        evidence = f"{suite}/{scenario}: perturbation={perturbation}; {diff}"
         cases.append(
             EvidenceCase(
                 case_id=f"{suite}:{scenario}:invariance",
@@ -277,7 +279,11 @@ def consistency_cases(entries: list[tuple[str, dict]], classification: str) -> l
         # convention sensitivity_cases/invariance_cases use for `perturbation`) keeps this case's
         # evidence a single line, so _case_prompt_line's per-case indentation and
         # ``"\n".join(rec.evidence)`` in the rendered report both still read as one case each.
-        evidence = f"consistency/{scenario} ({classification}): mismatches -> {(props.get('mismatches') or 'none')!r}"
+        # ``_truncate`` bounds it too: a high PRB_CONSISTENCY_REPEATS run can produce an
+        # arbitrarily long mismatch list that format_pairs's pair-count cap never reaches, since
+        # this isn't a pair list at all.
+        mismatches = repr(_truncate(props.get("mismatches") or "none"))
+        evidence = f"consistency/{scenario} ({classification}): mismatches -> {mismatches}"
         cases.append(
             EvidenceCase(
                 case_id=f"consistency:{scenario}",
@@ -296,18 +302,26 @@ def scale_mistake_cases(entries: list[tuple[str, dict]]) -> list[EvidenceCase]:
     ``_e2e`` counterparts), never parametrized by scenario. One ``EvidenceCase`` per entry whose
     over-grants, under-grants, or incorrectly-denied pairs are non-empty -- any occurrence IS the
     finding (decision 1: the Scale suite's correctness check reuses the same zero-tolerance gate as
-    Correctness, so there is no numeric degradation threshold to diff against)."""
+    Correctness, so there is no numeric degradation threshold to diff against). ``over-grants``/
+    ``under-grants`` are always shown (even as ``none``) since one Scale case spans all three
+    categories at once and a reader benefits from seeing which are and aren't empty -- UNLIKE
+    ``under_grant_cases``' two conditional clauses. The one thing this DOES share with
+    ``under_grant_cases``: only the part of ``incorrectly_denied`` not already covered by
+    ``under_grants`` is included, and that clause is omitted entirely (not shown as ``none``) when
+    nothing's left -- confirmed as a real finding in PR review: this builder still restated the
+    same pairs under both labels after ``under_grant_cases`` was fixed to dedupe them, doubling
+    the same pairs in a 100-entity Scale run's largest evidence strings."""
     cases = []
     for suite, props in entries:
         over_grants = props.get("over_grants") or {}
         under_grants = props.get("under_grants") or {}
-        incorrectly_denied = props.get("incorrectly_denied") or {}
-        if not (over_grants or under_grants or incorrectly_denied):
+        incorrectly_denied_only = pairs_not_in(props.get("incorrectly_denied") or {}, under_grants)
+        if not (over_grants or under_grants or incorrectly_denied_only):
             continue
-        evidence = (
-            f"{suite}: over-grants -> {format_pairs(over_grants)}; under-grants -> "
-            f"{format_pairs(under_grants)}; incorrectly denied -> {format_pairs(incorrectly_denied)}"
-        )
+        detail_parts = [f"over-grants -> {format_pairs(over_grants)}", f"under-grants -> {format_pairs(under_grants)}"]
+        if incorrectly_denied_only:
+            detail_parts.append(f"also incorrectly denied -> {format_pairs(incorrectly_denied_only)}")
+        evidence = f"{suite}: " + "; ".join(detail_parts)
         cases.append(
             EvidenceCase(
                 case_id=f"{suite}:scale_mistake",
@@ -372,7 +386,12 @@ def _draft_patterns(cases: list[EvidenceCase]) -> list[_Pattern]:
     out of ``pytest_sessionfinish`` and abort the per-cell report before it's written. The whole
     body stays inside one ``try`` on purpose (confirmed as a real finding in PR review: an earlier
     version only guarded the call itself, so a result that was present but the wrong shape still
-    raised past this function)."""
+    raised past this function).
+
+    Also returns ``[]`` immediately, with no call attempted at all, when ``EVAL_RECOMMENDATIONS_LLM``
+    is set to a falsy value -- see that env var's own module-level comment."""
+    if os.environ.get(_RECOMMENDATIONS_LLM_ENV, "1").strip().lower() in ("0", "false", "no"):
+        return []
     try:
         settings = load_llm_settings()
         runnable = build_llm(settings).with_structured_output(_PatternBatch)
@@ -388,9 +407,13 @@ def _draft_patterns(cases: list[EvidenceCase]) -> list[_Pattern]:
         return []
 
 
-def _fallback_recommendations(cases: list[EvidenceCase]) -> list[Recommendation]:
+def _fallback_recommendations(cases: list[EvidenceCase], *, reason: str) -> list[Recommendation]:
     """One ``Recommendation`` per ``(finding_type, fallback_key)`` group, body a static,
-    clearly-labeled note -- used when the LLM call failed or produced nothing usable."""
+    clearly-labeled note naming ``reason`` -- used for every case the LLM pattern analysis didn't
+    cover. ``reason`` must say WHY, not always "unavailable": confirmed as a real finding in PR
+    review -- a case can land here even when the LLM call succeeded and produced several good
+    patterns, just not one covering THIS case, and "unavailable" would misleadingly suggest the
+    whole call failed when most of the section is genuinely LLM-drafted."""
     groups: dict[tuple[str, str], list[EvidenceCase]] = {}
     for case in cases:
         groups.setdefault((case.finding_type, case.fallback_key), []).append(case)
@@ -399,10 +422,7 @@ def _fallback_recommendations(cases: list[EvidenceCase]) -> list[Recommendation]
         recommendations.append(
             Recommendation(
                 heading=f"{finding_type}: {fallback_key}",
-                body=(
-                    f"LLM pattern analysis unavailable (no usable drafted pattern) -- raw evidence "
-                    f"grouped by {fallback_key}:"
-                ),
+                body=f"{reason} -- raw evidence grouped by {fallback_key}:",
                 evidence=[case.evidence for case in group_cases],
             )
         )
@@ -433,7 +453,12 @@ def build_recommendations(
     ``under_grants``/``incorrectly_denied``), so there used to be two separate parameters a caller
     could (and once did) accidentally pass different lists to, silently producing an over-grant
     finding and an under-grant finding that don't actually agree on which run they describe. One
-    parameter makes that impossible."""
+    parameter makes that impossible.
+
+    A case id already claimed by an earlier pattern is skipped by every later one too (confirmed
+    as a real finding in PR review: deduping only WITHIN one pattern still let the same case_id
+    appear in two different patterns, so its evidence line -- and the failure it represents --
+    showed up under two separate ``###`` recommendations)."""
     cases: list[EvidenceCase] = [
         *over_grant_cases(correctness),
         *under_grant_cases(correctness),
@@ -451,9 +476,12 @@ def build_recommendations(
     recommendations: list[Recommendation] = []
     covered_ids: set[str] = set()
     for pattern in patterns:
-        # dict.fromkeys dedupes while preserving order -- a pattern naming the same case_id twice
-        # must not duplicate that case's evidence line in the rendered recommendation.
-        pattern_covered_ids = list(dict.fromkeys(cid for cid in pattern.case_ids if cid in cases_by_id))
+        # dict.fromkeys dedupes while preserving order -- a pattern naming the same case_id twice,
+        # or a case_id a PRIOR pattern already claimed, must not duplicate that case's evidence
+        # line under two different recommendations.
+        pattern_covered_ids = list(
+            dict.fromkeys(cid for cid in pattern.case_ids if cid in cases_by_id and cid not in covered_ids)
+        )
         if not pattern_covered_ids:
             continue
         covered_ids.update(pattern_covered_ids)
@@ -467,6 +495,14 @@ def build_recommendations(
 
     uncovered_cases = [case for case in cases if case.case_id not in covered_ids]
     if uncovered_cases:
-        recommendations.extend(_fallback_recommendations(uncovered_cases))
+        # "unavailable" only when NOTHING from the LLM survived at all -- if other cases ARE
+        # covered by a real pattern above, these specific ones were merely omitted/mis-id'd, a
+        # different (and much less alarming) story than "the call failed".
+        reason = (
+            "LLM pattern analysis unavailable (no usable drafted pattern)"
+            if not recommendations
+            else "Not covered by the LLM pattern analysis (other cases in this run were)"
+        )
+        recommendations.extend(_fallback_recommendations(uncovered_cases, reason=reason))
 
     return sorted(recommendations, key=lambda rec: rec.heading)

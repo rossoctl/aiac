@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from eval.dashboard.trend_log import DEFAULT_PATH as TREND_LOG_DEFAULT_PATH
+from eval.nodeid import scenario_for_nodeid
 
 HERE = Path(__file__).resolve().parent  # eval/dashboard/
 EVAL_DIR = HERE.parent  # eval/ -- eval/reports/ lives here, a sibling of this package, not under it
@@ -94,7 +95,6 @@ _FENCE_RE = re.compile(r"^`{3,}$")
 # only by the accident that neither label is in _LABEL_FIELDS today -- parse_report stops here on
 # purpose instead of relying on that accident to hold forever.
 _RECOMMENDATIONS_HEADING = "## Improvement recommendations"
-_SCENARIO_RE = re.compile(r"\[([^\[\]]+)\]$")
 
 # Bullet label -> ScenarioEntry field name, mirroring the labels ``eval/conftest.py``'s
 # ``_render_metrics_block``/``_render_entry`` write. "What it tests"/"Failure"/"Reason" are handled
@@ -143,11 +143,6 @@ def _suite_for_nodeid(nodeid: str) -> str | None:
         if marker in nodeid:
             return suite
     return None
-
-
-def _scenario_for_nodeid(nodeid: str) -> str | None:
-    m = _SCENARIO_RE.search(nodeid)
-    return m.group(1) if m else None
 
 
 def _parse_metric(value: str) -> float | None:
@@ -209,7 +204,7 @@ def parse_report(path: Path) -> ParsedReport:
                 # Only meaningful for a correctness-suite entry -- the bracket for any other
                 # suite's nodeid (e.g. eval_extended's ``test_inbound[scenario-agent-subject]``)
                 # is a different, non-scenario parametrize id.
-                scenario=_scenario_for_nodeid(nodeid) if suite is not None else None,
+                scenario=scenario_for_nodeid(nodeid) if suite is not None else None,
                 category=category,
             )
             entries.append(entry)
