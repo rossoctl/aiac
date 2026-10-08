@@ -136,6 +136,9 @@ load_dotenv(HERE.parent / ".env", override=False)
 
 _docstrings: dict[str, str] = {}
 _reports: dict[str, pytest.TestReport] = {}
+# The crash message of a teardown failure that came after an earlier failed phase of the same test.
+# The earlier report stays in _reports (it holds the test's own result); this is rendered next to it.
+_teardown_failures: dict[str, str] = {}
 
 # Every suite that carries `pytestmark = pytest.mark.eval` lives directly under `eval/` as a
 # `test_policy_pipeline_*.py` module (the scenarios/consistency/robustness/correctness-prb/
@@ -182,7 +185,12 @@ def pytest_runtest_logreport(report: pytest.TestReport) -> None:
     if not _is_eval_suite_nodeid(report.nodeid):
         return
     # A later phase (call) supersedes an earlier one (setup) for the same nodeid; a setup or
-    # teardown failure has no later phase to supersede it.
+    # teardown failure has no later phase to supersede it. A teardown failure after an earlier
+    # failure does not replace it -- the earlier report holds the test's own result.
+    earlier = _reports.get(report.nodeid)
+    if report.when == "teardown" and earlier is not None and earlier.outcome == "failed":
+        _teardown_failures[report.nodeid] = _detail(report, "error") or "teardown failed"
+        return
     _reports[report.nodeid] = report
 
 
@@ -521,7 +529,7 @@ def _unscored_reason(report: pytest.TestReport, detail: str | None) -> str:
     if report.when == "setup":
         reason = "a fixture failed before the test ran"
     elif report.when == "teardown":
-        reason = "a fixture teardown failed (this entry does not show the test's own result)"
+        reason = "a fixture teardown failed"
     else:
         reason = "the test failed before scoring"
     return reason + (" (see Failure)" if detail else "")
@@ -579,6 +587,8 @@ def _render_entry(lines: list[str], nodeid: str, report: pytest.TestReport, cate
         if detail:
             label = "Reason" if category in ("skipped", "xfailed") else "Failure"
             _render_field(lines, label, detail)
+    if nodeid in _teardown_failures:
+        _render_field(lines, "Teardown failure", _teardown_failures[nodeid])
     lines.append("")
 
 

@@ -173,12 +173,22 @@ def _provision_scale_realm_and_services(
     )
 
 
+def _require_empty_store() -> None:
+    """Fail the fixture at once, before any LLM call, if the Policy Model Store already holds an
+    SPM. ``_merged_rules_for`` needs a store that holds only this run's SPMs: each fixture starts a
+    store on a fresh DB, and ``running_services`` refuses a port that a stale process holds. This
+    checks the result directly, for any cause that those two do not cover."""
+    if stale := sorted(spm.service_id for spm in list_service_policies()):
+        url = os.environ.get("AIAC_POLICY_MODEL_STORE_URL")
+        pytest.fail(f"the Policy Model Store at {url} is not empty before the run: {stale}")
+
+
 def _merged_rules_for() -> list[PolicyRule]:
     """Query every real, persisted post-``compute_and_apply`` ``ServicePolicyModel``
     (``aiac.policy.model_store.library.api.list_service_policies``, one request -- the same read
     the PCE's own resync uses) and concatenate every ``inbound_allow_rules``/``inbound_deny_rules``
-    entry. Each fixture starts its own store on a fresh DB (``running_services`` fails if a stale
-    process holds the port), so every SPM here is from this scenario.
+    entry. ``_require_empty_store`` checks at the fixture start that the store holds no SPM, so every
+    SPM here is from this scenario.
 
     This is the actual merge-engine output, queried **before** the Rego renderer gets anywhere
     near it -- unlike checking the rendered Rego data maps, which ``aiac.pdp.service.policy.opa.
@@ -537,6 +547,7 @@ def total_corpus_e2e_result(tmp_path_factory: pytest.TempPathFactory, scale_env:
     policy_path.write_text(corpus.policy_text)
     scale_env.setenv("AIAC_POLICY_FILE", str(policy_path))
     with running_services([idp, store, opa], src=SRC):
+        _require_empty_store()
         config = Configuration.for_realm(scenario.REALM_DEFAULT)
         provision_via_config(config, scenario)
         roles, scopes = read_back_idp(config)
@@ -715,6 +726,7 @@ def per_decision_e2e_result(tmp_path_factory: pytest.TempPathFactory, scale_env:
 
     tmp_dir = tmp_path_factory.mktemp("scale_per_decision_e2e")
     with running_services([idp, store, opa], src=SRC):
+        _require_empty_store()
         config = Configuration.for_realm(scenario.REALM_DEFAULT)
         provision_via_config(config, scenario)
         roles, scopes = read_back_idp(config)
