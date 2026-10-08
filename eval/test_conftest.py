@@ -83,7 +83,8 @@ class TestWriteTrendLogPartialScaleSuites:
     header names exactly these, so the dashboard and the trend log agree."""
 
     @pytest.fixture(autouse=True)
-    def _no_file_writes(self, monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
+    def rows(self, monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
+        """The ``(suite, run_type)`` of each row that ``_write_trend_log`` appends (no file write)."""
         rows: list[tuple[str, str]] = []
         monkeypatch.setattr(eval_conftest, "append_row", lambda suite, _m, run_type: rows.append((suite, run_type)))
         monkeypatch.setattr(eval_conftest, "pool_scale_metrics", lambda entries: {})
@@ -98,21 +99,49 @@ class TestWriteTrendLogPartialScaleSuites:
             reports[nodeid] = SimpleNamespace(nodeid=nodeid, user_properties=props)
         monkeypatch.setattr(eval_conftest, "_reports", reports)
 
-    def test_a_full_fixed_100_run_is_not_partial(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_a_full_fixed_100_run_is_not_partial(
+        self, monkeypatch: pytest.MonkeyPatch, rows: list[tuple[str, str]]
+    ) -> None:
         self._ran(monkeypatch, "test_scale_total_corpus_structural_prb", "test_scale_total_corpus_correctness_prb")
-        assert _write_trend_log() == []
+        partial = _write_trend_log()
+        assert partial == []
+        assert partial == sorted(suite for suite, run_type in rows if run_type == "partial")
 
-    def test_a_reduced_size_run_is_partial(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_a_reduced_size_run_is_partial(self, monkeypatch: pytest.MonkeyPatch, rows: list[tuple[str, str]]) -> None:
         self._ran(monkeypatch, "test_scale_total_corpus_structural_prb", "test_scale_total_corpus_correctness_prb")
         monkeypatch.setenv("SCALE_TOTAL_CORPUS_SIZE", "10")
-        assert _write_trend_log() == ["scale_total_corpus_prb"]
+        partial = _write_trend_log()
+        assert partial == ["scale_total_corpus_prb"]
+        assert partial == sorted(suite for suite, run_type in rows if run_type == "partial")
 
-    def test_a_run_of_only_one_half_is_partial(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_a_run_of_only_one_half_is_partial(
+        self, monkeypatch: pytest.MonkeyPatch, rows: list[tuple[str, str]]
+    ) -> None:
         self._ran(monkeypatch, "test_scale_per_decision_correctness_e2e")
-        assert _write_trend_log() == ["scale_per_decision_e2e"]
+        partial = _write_trend_log()
+        assert partial == ["scale_per_decision_e2e"]
+        assert partial == sorted(suite for suite, run_type in rows if run_type == "partial")
 
-    def test_a_skipped_suite_records_nothing_so_is_not_named(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_a_skipped_suite_records_nothing_so_is_not_named(
+        self, monkeypatch: pytest.MonkeyPatch, rows: list[tuple[str, str]]
+    ) -> None:
         nodeid = "eval/test_policy_pipeline_scale.py::test_scale_total_corpus_correctness_prb"
         monkeypatch.setattr(eval_conftest, "_reports", {nodeid: SimpleNamespace(nodeid=nodeid, user_properties=[])})
         monkeypatch.setenv("SCALE_TOTAL_CORPUS_SIZE", "10")
-        assert _write_trend_log() == []
+        partial = _write_trend_log()
+        assert partial == []
+        assert partial == sorted(suite for suite, run_type in rows if run_type == "partial")
+
+    def test_a_count_mismatch_between_the_halves_is_partial(
+        self, monkeypatch: pytest.MonkeyPatch, rows: list[tuple[str, str]]
+    ) -> None:
+        # Two structural entries (as if the test were parametrized) against one correctness entry.
+        self._ran(
+            monkeypatch,
+            "test_scale_total_corpus_structural_prb[a]",
+            "test_scale_total_corpus_structural_prb[b]",
+            "test_scale_total_corpus_correctness_prb",
+        )
+        partial = _write_trend_log()
+        assert partial == ["scale_total_corpus_prb"]
+        assert partial == sorted(suite for suite, run_type in rows if run_type == "partial")

@@ -54,7 +54,6 @@ from __future__ import annotations
 
 import os
 import sys
-import tempfile
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -150,7 +149,7 @@ def scale_env() -> Iterator[pytest.MonkeyPatch]:
 
 
 def _provision_scale_realm_and_services(
-    mp: pytest.MonkeyPatch, scenario, *, rego_dir: Path, db_prefix: str, ports: dict[str, int]
+    mp: pytest.MonkeyPatch, scenario, *, rego_dir: Path, db_path: Path, ports: dict[str, int]
 ) -> tuple[Service, Service, Service]:
     """Shared prefix of both e2e fixtures below: connect to Keycloak and provision the realm, then
     ``eval.test_policy_pipeline_eval.prepare_pipeline`` -- the same env + idp/store/opa setup that
@@ -167,18 +166,20 @@ def _provision_scale_realm_and_services(
         mp.setenv,
         realm=scenario.REALM_DEFAULT,
         rego_dir=rego_dir,
-        db_path=Path(tempfile.mkdtemp(prefix=db_prefix)) / "policy_model.db",
+        db_path=db_path,
         idp=(host, ports["idp"]),
         store=(host, ports["store"]),
         opa=(host, ports["opa"]),
     )
 
 
-def _merged_rules_for() -> list[PolicyRule]:
+def _merged_rules_for(service_ids: set[str]) -> list[PolicyRule]:
     """Query every real, persisted post-``compute_and_apply`` ``ServicePolicyModel``
     (``aiac.policy.model_store.library.api.list_service_policies``, one request -- the same read
     the PCE's own resync uses) and concatenate every ``inbound_allow_rules``/``inbound_deny_rules``
-    entry. Each fixture has a fresh store DB, so the store holds only this scenario's services.
+    entry. Each fixture has a fresh store DB, so the store must hold only this scenario's services
+    (``service_ids``): an SPM of any other service fails loudly here, because its rules would give
+    false duplicates or hide real ones.
 
     This is the actual merge-engine output, queried **before** the Rego renderer gets anywhere
     near it -- unlike checking the rendered Rego data maps, which ``aiac.pdp.service.policy.opa.
@@ -192,7 +193,10 @@ def _merged_rules_for() -> list[PolicyRule]:
     ``with running_services(...)`` block, before it tears the store down. The caller's returned
     dict carries the result forward so the structural test (which runs after the fixture has
     already returned) can check it with no live service of its own."""
-    return [rule for spm in list_service_policies() for rule in spm.inbound_allow_rules + spm.inbound_deny_rules]
+    spms = list_service_policies()
+    foreign = sorted(spm.service_id for spm in spms if spm.service_id not in service_ids)
+    assert not foreign, f"the store holds SPMs of services outside this scenario: {foreign}"
+    return [rule for spm in spms for rule in spm.inbound_allow_rules + spm.inbound_deny_rules]
 
 
 # ======================================================================================
@@ -529,7 +533,7 @@ def total_corpus_e2e_result(tmp_path_factory: pytest.TempPathFactory, scale_env:
         scale_env,
         scenario,
         rego_dir=rego_dir,
-        db_prefix="aiac-store-scale-total-corpus-",
+        db_path=tmp_path_factory.mktemp("scale_total_corpus_store") / "policy_model.db",
         ports=_TOTAL_CORPUS_E2E_PORTS,
     )
 
@@ -550,7 +554,7 @@ def total_corpus_e2e_result(tmp_path_factory: pytest.TempPathFactory, scale_env:
         # Must happen in here, before running_services tears the store down -- see
         # _merged_rules_for's own docstring for why this, not the rendered Rego, is where a real
         # merge-engine duplicate would actually show up.
-        merged_rules = _merged_rules_for()
+        merged_rules = _merged_rules_for(set(scenario.AGENTS) | set(scenario.TOOLS))
 
     return {
         "corpus": corpus,
@@ -709,7 +713,7 @@ def per_decision_e2e_result(tmp_path_factory: pytest.TempPathFactory, scale_env:
         scale_env,
         scenario,
         rego_dir=rego_dir,
-        db_prefix="aiac-store-scale-per-decision-",
+        db_path=tmp_path_factory.mktemp("scale_per_decision_store") / "policy_model.db",
         ports=_PER_DECISION_E2E_PORTS,
     )
 
@@ -747,7 +751,7 @@ def per_decision_e2e_result(tmp_path_factory: pytest.TempPathFactory, scale_env:
         elapsed = time.perf_counter() - start
         # Must happen in here, before running_services tears the store down -- see
         # _merged_rules_for's own docstring.
-        merged_rules = _merged_rules_for()
+        merged_rules = _merged_rules_for(set(scenario.AGENTS) | set(scenario.TOOLS))
 
     return {
         "corpus": corpus,

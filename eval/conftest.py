@@ -423,8 +423,9 @@ def _render_metrics_block(lines: list[str], props: dict, *, unavailable_reason: 
     ``test_prb_correctness``/``test_e2e_correctness`` record, and (the robustness suite only)
     ``_record_scoring``'s ``perturbation``/``expected_grants``/``actual_grants`` fields first, when
     present, so a reader sees what changed and what was expected/returned before the numbers.
-    When ``unavailable_reason`` is given (the scenario's own setup failed before scoring could run,
-    so ``props`` has none of this), render the same six metrics fields with a uniform placeholder
+    When ``unavailable_reason`` is given (the test failed before scoring could run -- a scenario
+    setup failure, a fixture error, or an error in the test body -- so ``props`` has none of this),
+    render the same six metrics fields with a uniform placeholder
     instead — so a reader always sees the same shape, pass or fail, setup-failed or scored."""
     if unavailable_reason is not None:
         for label in ("Precision", "Recall", "Denial precision", "Over-grants", "Under-grants", "Incorrectly denied"):
@@ -518,10 +519,10 @@ def _render_entry(lines: list[str], nodeid: str, report: pytest.TestReport, cate
     ``record_property``s precision/recall/denial-precision + the over-/under-grant/incorrect-denial
     pair breakdown; ``test_prb_consistent_across_repeats`` (consistency) ``record_property``s an
     ``inconsistent`` flag + ``mismatches`` detail; render each instead of the generic docstring +
-    crash/skip-reason fallback every other test in this suite gets. A correctness-suite scenario
-    whose *setup* failed (a pipeline error before ``score_scenario`` ever ran) gets the crash detail
-    *and* the same six-field metrics block, marked unavailable with why — not silently dropped to
-    the generic fallback."""
+    crash/skip-reason fallback every other test in this suite gets. A correctness-suite test that
+    failed before ``score_scenario`` ever ran (a scenario setup failure, a fixture error, or an
+    error in the test body) gets the crash detail *and* the same six-field metrics block, marked
+    unavailable — not silently dropped to the generic fallback."""
     lines.append(f"### `{nodeid}`")
     props = dict(report.user_properties)
     if "expected" in props and "output" in props:
@@ -555,16 +556,11 @@ def _render_entry(lines: list[str], nodeid: str, report: pytest.TestReport, cate
         detail = _detail(report, category)
         if detail:
             _render_field(lines, "Failure", detail)
-        # The 8-scenario suites report a scenario setup failure in the call phase (pytest.fail in
-        # _require_scenario); a Scale fixture's setup failure is a real setup-phase error, so a
-        # Scale call-phase failure happened in the test body, after setup.
-        is_scale = any(marker in nodeid for marker in _SCALE_CORRECTNESS_TEST_MARKERS)
-        reason = (
-            "the test failed before scoring could run"
-            if is_scale and report.when == "call"
-            else "scenario setup failed before scoring could run"
-        )
-        _render_metrics_block(lines, props, unavailable_reason=reason)
+        # One neutral reason for every suite: the Failure field above gives the cause (a scenario
+        # setup failure, a fixture error, or an error in the test body). The pytest phase cannot
+        # tell these apart -- the 8-scenario suites report a scenario setup failure in the call
+        # phase (pytest.fail in _require_scenario).
+        _render_metrics_block(lines, props, unavailable_reason="the test failed before scoring could run (see Failure)")
     else:
         doc = _docstrings.get(nodeid)
         if doc:

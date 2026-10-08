@@ -671,8 +671,10 @@ def prepare_pipeline(
     ``AIAC_*_URL`` vars at the ``(host, port)`` pairs, and the enforcement side. Each caller that
     runs the pipeline uses this one helper, so a new pipeline setting reaches all of them. The
     caller sets ``AIAC_POLICY_FILE`` itself (a run can use more than one policy file). ``setenv``
-    is ``os.environ.__setitem__`` in a worker process of its own, else a ``MonkeyPatch.setenv``
-    that restores the env when the caller is done."""
+    is ``os.environ.__setitem__`` in a ``ProcessPoolExecutor`` worker (never the pytest process),
+    else a ``MonkeyPatch.setenv`` that restores the env when the caller is done. Set every var on
+    each call, never conditionally: a worker can run more than one scenario, and a later scenario
+    must not keep the realm or URLs of an earlier one."""
     if rego_dir.exists():
         shutil.rmtree(rego_dir)
     rego_dir.mkdir(parents=True)
