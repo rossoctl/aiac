@@ -7,8 +7,9 @@ byte-for-byte the same split the builder performed inline; no live behavior chan
 
 The focus service is resolved from ``get_services()`` by ``id`` (the Keycloak internal client
 UUID the ``/apply/service/{id}`` route and ``Trigger.entity_id`` carry — **not**
-``serviceId``/clientId, which may be a slash-bearing SPIFFE URI). Candidates are
-excluded/included by **ownership** (role id / ``scope.serviceId``), never by name:
+``serviceId``/clientId, which may be a slash-bearing SPIFFE URI). The candidates come from the
+**other** services, selected by **owner service** (the service that holds the role / the
+``scope.serviceId`` of the copy), never by name:
 
 - ``own_roles`` / ``own_scopes`` — the focus service's own ``aiac.managed`` roles/scopes.
 - ``candidate_roles`` — the flattened, de-duplicated union of (a) other services'
@@ -18,6 +19,22 @@ excluded/included by **ownership** (role id / ``scope.serviceId``), never by nam
   D32): a role that two services hold (a shared role) is one candidate with both holders.
 - ``other_scopes`` — other services' ``aiac.managed`` scopes, sourced from ``get_services()``
   so each scope carries its owning ``serviceId`` (the SPM routing key the PCE needs).
+
+A role or a scope that only the focus service has is not a candidate. A **shared** role or scope
+(D32: one realm-wide policy) is on both sides, because the selection is by owner service, not by
+entity:
+
+- a realm role that the focus and another enabled service hold is in ``own_roles`` (the focus's
+  copy) and also in ``candidate_roles`` (through the other holder), with every current holder, the
+  focus included;
+- a client scope that the focus and another enabled service own is in ``own_scopes`` (the focus's
+  copy), and the other owner's copy is in ``other_scopes``.
+
+So a build can give the PRB a (role, scope) pair where a holder of the role owns the scope (a
+self-mapping): the scope-focal pass of an own scope can get a shared role that the focus holds, and
+the role-focal pass of a shared own role gets the scopes of its other holders. This is allowed under
+D32. No filter removes such a pair, at build time or at render time. The PCE renders the current
+holders of the role, so a grant on such a pair also lets that holder call its own scope.
 
 A **disabled** service (``Service.enabled`` is false — the UC1 failed-service marker set by the
 rollback) contributes no candidate role and no other-scope, so no build grants anything to or from
@@ -109,7 +126,9 @@ def resolve_focal_entities(
     own_scopes = [s for s in focus.scopes if s.aiac_managed]
 
     # The other services that can take part in a rule: every enabled service except the focus. A
-    # disabled one is a failed (quarantined) service — see the module docstring.
+    # disabled one is a failed (quarantined) service — see the module docstring. The selection is by
+    # owner service, not by entity: a role or a scope that the focus shares with one of these services
+    # (D32) comes in through that service, and that is allowed (see the module docstring).
     others = [s for s in services if s.serviceId != focus.serviceId and s.enabled]
 
     # kind=Agent rides through unchanged from get_services() → routes to source_roles in the PCE.
@@ -132,13 +151,15 @@ def resolve_focal_entities(
     # Other services' aiac.managed scopes, sourced from get_services() (mirroring
     # other_agent_roles) so each scope carries its owning serviceId — the SPM routing key the
     # PCE needs. The global get_scopes() endpoint returns scopes with an empty serviceId, which
-    # would both (a) fail to exclude the focus's own scopes (``"" != focus.serviceId`` is always
-    # true) and (b) route any resulting rule to ``SPM("")``, a 422 dead-end.
+    # would both (a) fail to exclude the focus's own copies (``"" != focus.serviceId`` is always
+    # true) and (b) route any resulting rule to ``SPM("")``, a 422 dead-end. The other owner's copy
+    # of a shared scope (D32: the same scope id, another serviceId) is in this list.
     other_scopes = [s for other in others for s in other.scopes if s.aiac_managed]
 
     # The holders of each candidate role, by the rule that the PCE uses at render time (D32): the
-    # live services that hold an agent role (the focus counts as live), and the members of a user
-    # role. The subjects' roles come from GET /roles, so they carry those members.
+    # live services that hold an agent role (the focus counts as live, so a shared role that the focus
+    # holds lists the focus too), and the members of a user role. The subjects' roles come from
+    # GET /roles, so they carry those members.
     holders = RoleHolders(services, user_roles, focus_service=focus.serviceId)
     candidate_roles = _flatten_dedup(user_roles + other_agent_roles, holders)
 

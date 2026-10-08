@@ -14,7 +14,8 @@ Coverage: clean policy over >=1 evaluated entity -> ``no_conflict``; ALL conflic
 focal entities in one report with the first conflict NOT aborting; a non-converging entity ->
 ``unevaluated`` with status != ``no_conflict``; the ``unevaluated`` disjunct load-bearing even with
 an evaluated entity; zero focal entities -> ``incomplete`` (never ``no_conflict``, no LLM call); the
-AGENT role-focal fan-out; and the resolver's ``HTTPException(502/404)`` pre-survey boundary.
+AGENT role-focal fan-out; the same (role, scope) pairs as the builder, a self-mapping pair of a shared
+role and scope (D32) included; and the resolver's ``HTTPException(502/404)`` pre-survey boundary.
 """
 
 from unittest.mock import MagicMock, patch
@@ -22,7 +23,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 from fastapi import HTTPException
 
-from aiac.agent.policy_rules_builder.diagnostic import ExplainResult
+from aiac.agent.policy_rules_builder import diagnostic_survey
+from aiac.agent.policy_rules_builder.diagnostic import DiagnosticResult, ExplainResult
 from aiac.agent.policy_rules_builder.diagnostic_models import ConflictKind, ConflictStatus
 from aiac.agent.policy_rules_builder.diagnostic_survey import check_policy_conflicts
 from aiac.agent.policy_rules_builder.graph import (
@@ -32,6 +34,7 @@ from aiac.agent.policy_rules_builder.graph import (
     ScopeSelection,
 )
 from aiac.agent.shared import focal_entities
+from aiac.agent.uc.onboarding.policy_builder import builder
 from aiac.idp.configuration.models import Role as RoleModel
 from aiac.idp.configuration.models import RoleKind, Scope, Service, ServiceType, Subject
 
@@ -262,6 +265,65 @@ def test_agent_service_runs_scope_and_role_focal_entities():
     # Both the scope-focal (ScopeSelection) and role-focal (RoleSelection) fan-outs were exercised.
     assert ScopeSelection in seen_schemas
     assert RoleSelection in seen_schemas
+
+
+# --------------------------------------------------------------------------- #
+# 5b — the survey hands each entity the same pairs as the builder, the          #
+#      self-mapping pair of a shared role and scope (D32) included.             #
+# --------------------------------------------------------------------------- #
+def test_survey_and_builder_hand_the_same_pairs_including_the_shared_self_pair():
+    # team1/github-agent and team2/github-agent (the focus) hold the shared role and each owns a copy
+    # of the shared scope (the same scope id, with the owner as serviceId). D32 allows a self-mapping:
+    # the candidates come from the other services by owner service, so each pass gets a pair where a
+    # holder of the role owns the scope.
+    team1_id = "spiffe://localtest.me/ns/team1/sa/github-agent"
+    team2_id = "spiffe://localtest.me/ns/team2/sa/github-agent"
+    shared_role = _role("github-agent.source_operations", role_id="role-id", kind=RoleKind.AGENT)
+    shared_scope = _scope("github-agent.source_operations", scope_id="scope-id")
+
+    def agent(client_id):
+        return _service(
+            f"uuid-{client_id}",
+            ref=client_id,
+            roles=[shared_role.model_copy(update={"actorIds": [client_id]})],
+            scopes=[shared_scope.model_copy(update={"serviceId": client_id})],
+            service_type=ServiceType.AGENT,
+        )
+
+    team1, team2 = agent(team1_id), agent(team2_id)
+    conf = MagicMock()
+    conf.get_services.return_value = [team1, team2]
+    conf.get_subjects.return_value = []
+
+    def pairs(scope_calls, role_calls):
+        """The (role id, scope id, scope owner) pairs that the calls hand to the PRB."""
+        out = {(r.id, scope.id, scope.serviceId) for roles, scope in scope_calls for r in roles}
+        return out | {(role.id, s.id, s.serviceId) for role, scopes in role_calls for s in scopes}
+
+    clean = DiagnosticResult(conflicts=[], unevaluated=[])
+    with (
+        patch.object(focal_entities, "_config", return_value=conf),
+        patch(_SEAM, side_effect=AssertionError("no LLM turn: the diagnostic runs are patched")),
+        patch.object(diagnostic_survey, "run_scope_diagnostic", return_value=clean) as rsd,
+        patch.object(diagnostic_survey, "run_role_diagnostic", return_value=clean) as rrd,
+    ):
+        check_policy_conflicts("policy", team2.id)
+    with (
+        patch.object(builder, "_config", return_value=conf),
+        patch.object(builder, "build_scope_rules", return_value=[]) as bsr,
+        patch.object(builder, "build_role_rules", return_value=[]) as brr,
+        patch.object(builder, "applied_rules_for_scopes", return_value=[]),
+    ):
+        builder.ServicePolicyBuilder.build(team2.id, ServiceType.AGENT)
+
+    survey_pairs = pairs([c.args[1:3] for c in rsd.call_args_list], [c.args[1:3] for c in rrd.call_args_list])
+    builder_pairs = pairs([c.args for c in bsr.call_args_list], [c.args for c in brr.call_args_list])
+    expected = {
+        ("role-id", "scope-id", team2_id),  # scope-focal: the focus's own copy, with the shared role
+        ("role-id", "scope-id", team1_id),  # role-focal: the shared role, with team1's copy
+    }
+    assert builder_pairs == expected
+    assert survey_pairs == builder_pairs
 
 
 # --------------------------------------------------------------------------- #

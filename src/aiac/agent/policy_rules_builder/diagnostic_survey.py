@@ -14,8 +14,10 @@ lists ALL of that service's conflicts at once.
 This is the diagnostic counterpart of ``ServicePolicyBuilder.build()`` (the live fan-out loop in
 ``uc/onboarding/policy_builder/builder.py``): it resolves the SAME typed entity set via the shared
 ``resolve_focal_entities`` (#155) and mirrors that loop's fan-out EXACTLY (scope-focal over every
-own scope; role-focal over every flattened own role, AGENT services only). It differs in three
-deliberate ways:
+own scope; role-focal over every flattened own role, AGENT services only). So it surveys the same
+(role, scope) pairs as the builder, including a pair where a holder of a shared role owns the scope
+(a self-mapping, which a shared role or scope brings in and D32 allows; no filter removes it). It
+differs in three deliberate ways:
 
   * it is READ-ONLY — it never runs Provision (which MUTATES the IdP) and never calls the PCE /
     orchestrator. The target service is a PRE-EXISTING catalog entry, so its ``service_type`` is

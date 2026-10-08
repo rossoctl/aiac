@@ -252,7 +252,9 @@ class TestFlattening:
 class TestSelfExclusion:
     """Exclusion is by ownership (role id / scope.serviceId), never by name — the other
     service's role/scope below intentionally shares a name with the focus's own, to prove
-    that name is not what drives exclusion."""
+    that name is not what drives exclusion. The ids differ, so these are not a shared role or
+    scope: a shared one (the same id) is a candidate through the other service, see
+    ``TestSelfMappingAllowed``."""
 
     def test_own_role_and_scope_excluded_from_other_universe_even_when_name_matches(self):
         own_role = _role("shared.name", role_id="own-role-id")
@@ -269,15 +271,20 @@ class TestSelfExclusion:
             subjects=[],
         )
 
-        # own role never in the roles list handed to build_scope_rules — only the other
-        # service's same-named-but-differently-owned role is present
+        # the own role (an id that no other service holds) is not in the roles list handed to
+        # build_scope_rules — only the other service's same-named-but-differently-owned role is present
         assert [r.id for r in bsr.call_args.args[0]] == ["other-role-id"]
-        # own scope never in the scopes list handed to build_role_rules
+        # the own scope (an id that no other service owns) is not in the scopes list handed to
+        # build_role_rules
         assert [s.id for s in brr.call_args.args[1]] == ["other-scope-id"]
 
 
-class TestSelfMappingInvariant:
-    def test_no_own_role_in_any_scope_call_and_no_own_scope_in_any_role_call(self):
+class TestNonSharedOwnEntities:
+    """Owner-service sourcing: a role or a scope that only the focus has is in no candidate list.
+    This is not a ban on self-mapping: a role or a scope that the focus shares with another service
+    (D32) is a candidate through that service, see ``TestSelfMappingAllowed``."""
+
+    def test_an_own_role_or_scope_that_no_other_service_has_is_in_no_call(self):
         own_roles = [_role("weather.agent"), _role("weather.admin")]
         own_scopes = [
             _scope("weather.forecast", service_id=FOCUS_ID),
@@ -301,12 +308,68 @@ class TestSelfMappingInvariant:
             subjects=[],
         )
 
-        # across ALL build_scope_rules calls, no roles list contains an own role
+        # across ALL build_scope_rules calls, no roles list contains a non-shared own role
         for c in bsr.call_args_list:
             assert own_role_ids.isdisjoint({r.id for r in c.args[0]})
-        # across ALL build_role_rules calls, no scopes list contains an own scope
+        # across ALL build_role_rules calls, no scopes list contains a non-shared own scope
         for c in brr.call_args_list:
             assert own_scope_ids.isdisjoint({s.id for s in c.args[1]})
+
+
+class TestSelfMappingAllowed:
+    """D32 allows a self-mapping. team1/github-agent and team2/github-agent (the focus) hold the
+    shared role and each owns a copy of the shared scope (the same scope id, with the owner as
+    ``serviceId``). The candidates come from the other services by owner service, so each pass is
+    handed a pair where a holder of the role owns the scope, and the builder keeps the PRB's rule on
+    it (no build-time filter)."""
+
+    TEAM1 = "spiffe://localtest.me/ns/team1/sa/github-agent"
+    TEAM2 = "spiffe://localtest.me/ns/team2/sa/github-agent"
+    NAME = "github-agent.source_operations"  # the role and the scope of a github-agent skill
+
+    def _agent(self, client_id, role, scope):
+        """The catalog entry of one holder: its copy of the role and its copy of the scope."""
+        return _service(
+            f"uuid-{client_id}",
+            ref=client_id,
+            roles=[role.model_copy(update={"actorIds": [client_id]})],
+            scopes=[scope.model_copy(update={"serviceId": client_id})],
+            service_type=ServiceType.AGENT,
+        )
+
+    def test_each_pass_is_handed_the_shared_pair_and_the_rule_on_it_is_kept(self):
+        shared_role = _role(self.NAME, role_id="role-id", kind=RoleKind.AGENT)
+        shared_scope = _scope(self.NAME, scope_id="scope-id")
+        team1 = self._agent(self.TEAM1, shared_role, shared_scope)
+        team2 = self._agent(self.TEAM2, shared_role, shared_scope)
+
+        result, bsr, brr, _ = _invoke(
+            ServiceType.AGENT,
+            services=[team1, team2],
+            all_scopes=[],
+            subjects=[],
+            service_id=team2.id,
+            # the PRB grants every candidate it is handed
+            scope_rules=lambda roles, scope: [_rule(r, scope) for r in roles],
+            role_rules=lambda role, scopes: [_rule(role, s) for s in scopes],
+        )
+
+        # the scope-focal pass of the focus's own copy is handed the shared role (through team1),
+        # with every current holder, the focus included
+        assert bsr.call_count == 1
+        s_roles, s_scope = bsr.call_args.args
+        assert (s_scope.id, s_scope.serviceId) == ("scope-id", self.TEAM2)
+        assert [(r.id, r.actorIds) for r in s_roles] == [("role-id", [self.TEAM1, self.TEAM2])]
+        # the role-focal pass of the shared role is handed team1's copy of the shared scope
+        assert brr.call_count == 1
+        r_role, r_scopes = brr.call_args.args
+        assert r_role.id == "role-id"
+        assert [(s.id, s.serviceId) for s in r_scopes] == [("scope-id", self.TEAM1)]
+        # no filter: the rule on each pair is in the result, one for each copy of the scope
+        assert [(r.role.id, r.scope.id, r.scope.serviceId) for r in result] == [
+            ("role-id", "scope-id", self.TEAM2),
+            ("role-id", "scope-id", self.TEAM1),
+        ]
 
 
 class TestOwnershipBeatsMembership:
