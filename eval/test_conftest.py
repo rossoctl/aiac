@@ -151,7 +151,6 @@ class TestUnscoredReason:
         [
             ("setup", "a fixture failed before the test ran"),
             ("call", "the test failed before scoring"),
-            ("teardown", "a fixture teardown failed"),
         ],
     )
     def test_names_only_what_the_phase_makes_sure(self, when: str, expected: str) -> None:
@@ -163,11 +162,12 @@ class TestUnscoredReason:
 
 
 class TestTeardownAfterAFailure:
-    def test_a_teardown_failure_keeps_the_call_failure(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    @pytest.mark.parametrize("call_outcome", ["failed", "passed", "skipped"])
+    def test_a_teardown_failure_keeps_the_call_result(self, monkeypatch: pytest.MonkeyPatch, call_outcome: str) -> None:
         monkeypatch.setattr(eval_conftest, "_reports", {})
         monkeypatch.setattr(eval_conftest, "_teardown_failures", {})
         nodeid = "eval/test_policy_pipeline_scale.py::test_scale_total_corpus_correctness_prb"
-        call = SimpleNamespace(nodeid=nodeid, when="call", outcome="failed", longrepr=None)
+        call = SimpleNamespace(nodeid=nodeid, when="call", outcome=call_outcome, longrepr=None)
         crash = SimpleNamespace(reprcrash=SimpleNamespace(message="teardown boom"))
         teardown = SimpleNamespace(nodeid=nodeid, when="teardown", outcome="failed", longrepr=crash)
 
