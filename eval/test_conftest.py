@@ -13,7 +13,7 @@ from types import SimpleNamespace
 import pytest
 
 import eval.conftest as eval_conftest
-from eval.conftest import _scale_run_matches_fixed_100, _unscored_reason, _write_trend_log
+from eval.conftest import _scale_run_matches_fixed_100, _unscored_reason, _write_trend_log, pytest_runtest_logreport
 
 
 @pytest.fixture(autouse=True)
@@ -151,7 +151,7 @@ class TestUnscoredReason:
         [
             ("setup", "a fixture failed before the test ran"),
             ("call", "the test failed before scoring"),
-            ("teardown", "a fixture teardown failed (this entry does not show the test's own result)"),
+            ("teardown", "a fixture teardown failed"),
         ],
     )
     def test_names_only_what_the_phase_makes_sure(self, when: str, expected: str) -> None:
@@ -160,3 +160,19 @@ class TestUnscoredReason:
     def test_points_at_failure_only_when_the_entry_has_one(self) -> None:
         assert _unscored_reason(SimpleNamespace(when="call"), detail="boom").endswith(" (see Failure)")
         assert not _unscored_reason(SimpleNamespace(when="call"), detail=None).endswith(" (see Failure)")
+
+
+class TestTeardownAfterAFailure:
+    def test_a_teardown_failure_keeps_the_call_failure(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(eval_conftest, "_reports", {})
+        monkeypatch.setattr(eval_conftest, "_teardown_failures", {})
+        nodeid = "eval/test_policy_pipeline_scale.py::test_scale_total_corpus_correctness_prb"
+        call = SimpleNamespace(nodeid=nodeid, when="call", outcome="failed", longrepr=None)
+        crash = SimpleNamespace(reprcrash=SimpleNamespace(message="teardown boom"))
+        teardown = SimpleNamespace(nodeid=nodeid, when="teardown", outcome="failed", longrepr=crash)
+
+        pytest_runtest_logreport(call)
+        pytest_runtest_logreport(teardown)
+
+        assert eval_conftest._reports[nodeid] is call
+        assert eval_conftest._teardown_failures[nodeid] == "teardown boom"
