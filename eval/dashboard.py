@@ -142,7 +142,7 @@ def _scenario_for_nodeid(nodeid: str) -> str | None:
 
 def _parse_metric(value: str) -> float | None:
     """``value`` is a float string (``"1.000"``) or the ``"unavailable — ..."`` placeholder
-    ``_render_metrics_block`` writes for a scenario whose setup failed before scoring ran."""
+    ``_render_metrics_block`` writes for a test that failed before scoring ran."""
     if value.startswith("unavailable"):
         return None
     return float(value)
