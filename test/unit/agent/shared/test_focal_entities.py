@@ -8,7 +8,10 @@ mocked ``Configuration`` (passed via the ``config`` seam — no live IdP, no LLM
 - the own-scope / candidate-role / other-scope ownership split (by role id / ``scope.serviceId``,
   never by name),
 - composite-role flatten + de-dup of the candidate universe,
-- membership-derived user roles vs ``aiac.managed`` agent roles, with self-owned exclusion,
+- membership-derived user roles vs ``aiac.managed`` agent roles, with service-owned exclusion (a
+  role that a service owns is not a user-kind candidate),
+- a shared role or scope (D32) on both sides: the candidates come from the other services by owner
+  service, so a pair where a holder of the role owns the scope (a self-mapping) is allowed,
 - ``service_type`` echoed from the parameter (not ``focus.type``),
 - the ``HTTPException(502/404)`` pre-survey boundary.
 
@@ -213,6 +216,43 @@ class TestSharedRoles:
         )
 
         assert [(r.id, r.actorIds) for r in result.candidate_roles] == [("dev-id", ["alice", "bob"])]
+
+
+class TestSelfMapping:
+    """D32 allows a self-mapping. The candidates come from the other services by owner service, not by
+    entity, so a role or a scope that the focus shares with another service is on both sides.
+    team1/github-agent and team2/github-agent (the focus) hold the shared role and each owns a copy of
+    the shared scope (the same scope id, with the owner as ``serviceId``)."""
+
+    TEAM1 = "spiffe://localtest.me/ns/team1/sa/github-agent"
+    TEAM2 = "spiffe://localtest.me/ns/team2/sa/github-agent"
+    NAME = "github-agent.source_operations"  # the role and the scope of a github-agent skill
+
+    def _agent(self, client_id, role, scope):
+        """The catalog entry of one holder: its copy of the role and its copy of the scope."""
+        return _service(
+            f"uuid-{client_id}",
+            ref=client_id,
+            roles=[role.model_copy(update={"actorIds": [client_id]})],
+            scopes=[scope.model_copy(update={"serviceId": client_id})],
+            service_type=ServiceType.AGENT,
+        )
+
+    def test_the_shared_role_and_the_other_copy_of_the_shared_scope_are_candidates(self):
+        shared_role = _role(self.NAME, role_id="role-id", kind=RoleKind.AGENT)
+        shared_scope = _scope(self.NAME, scope_id="scope-id")
+        team1 = self._agent(self.TEAM1, shared_role, shared_scope)
+        team2 = self._agent(self.TEAM2, shared_role, shared_scope)
+
+        result = _resolve(ServiceType.AGENT, services=[team1, team2], subjects=[], service_id=team2.id)
+
+        # The own side: the focus's copies.
+        assert [(r.id, r.actorIds) for r in result.own_roles] == [("role-id", [self.TEAM2])]
+        assert [(s.id, s.serviceId) for s in result.own_scopes] == [("scope-id", self.TEAM2)]
+        # The candidate side: the shared role through its other holder, with every current holder (the
+        # focus included), and the other owner's copy of the shared scope.
+        assert [(r.id, r.actorIds) for r in result.candidate_roles] == [("role-id", [self.TEAM1, self.TEAM2])]
+        assert [(s.id, s.serviceId) for s in result.other_scopes] == [("scope-id", self.TEAM1)]
 
 
 class TestServiceType:

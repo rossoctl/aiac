@@ -3,7 +3,8 @@
 D32: one policy for the whole realm, so services in different namespaces (or an admin, in one
 namespace) share a realm role or a client scope by name. Every holder of a shared role must get the
 grants of that role, a shared scope is decided one time, and the holders of a role (agents and users)
-in a CR are the current holders, not a copy from the onboarding that stored the rule.
+in a CR are the current holders, not a copy from the onboarding that stored the rule. A shared role can
+be mapped onto a scope that one of its holders owns (a self-mapping): D32 allows it (cases 5 and 6).
 
 The real code runs between the seams: the focal-entity resolver, the Service Policy Builder with the
 real PRB graphs, the PCE (``compute_and_apply``, ``rerender_role``, ``resync``) and the PDP Policy
@@ -245,9 +246,9 @@ def _rego_map(rego: str, var: str) -> dict[str, list[str]]:
     raise AssertionError(f"map {var} is not closed in the package:\n{rego}")
 
 
-def _holders(stack: Stack, tool: Workload, role: str = AGENT_ROLE) -> set[str]:
-    """The callers (clientIds) that the tool CR's ``source_roles`` gives ``role``."""
-    source_roles = _rego_map(stack.inbound(tool.client_id), "source_roles")
+def _holders(stack: Stack, workload: Workload, role: str = AGENT_ROLE) -> set[str]:
+    """The callers (clientIds) that the inbound CR's ``source_roles`` gives ``role``."""
+    source_roles = _rego_map(stack.inbound(workload.client_id), "source_roles")
     return {caller for caller, roles in source_roles.items() if role in roles}
 
 
@@ -431,3 +432,174 @@ class TestLaterAndRemovedHolder:
         assert stack.llm.prompts[prompts_before:] == [], "a PRB call happened"
         if repair == "event":
             assert stack.store.writes[writes_before:] == [], "the event path wrote an SPM"
+
+
+# --------------------------------------------------------------------------- #
+# case 5 — a shared role on a scope that one of its holders owns (self-mapping) #
+# --------------------------------------------------------------------------- #
+# The decisions of a policy that also lets the agents that operate on source repositories call one
+# another (the fake LLM decides from this table, not from the policy text): both passes grant the
+# shared role on the agents' shared scope, which has the same name.
+PEER_DECISIONS = {
+    **DECISIONS,
+    ("role", AGENT_ROLE): ({SOURCE_READ, AGENT_ROLE}, {SOURCE_WRITE}),
+    ("scope", AGENT_ROLE): ({DEVELOPER, AGENT_ROLE}, set()),
+}
+AGENT_ORDERS = {"team1-first": (AGENT1, AGENT2), "team2-first": (AGENT2, AGENT1)}
+
+
+class TestSelfMapping:
+    """team1/github-agent and team2/github-agent hold the shared role ``github-agent.source_operations``
+    and each owns a copy of the shared scope of the same name. D32 allows a self-mapping. The candidates
+    come from the other services by owner service, so at the second agent's onboarding the shared role
+    is a candidate of the scope-focal pass of the focus's own copy (through the other holder), and the
+    other agent's copy is a candidate of the role-focal pass of the shared role. No filter removes the
+    pair, and the PCE renders the current holders, so a grant on it lets each holder call each copy,
+    its own copy included."""
+
+    @pytest.mark.parametrize("order", list(AGENT_ORDERS))
+    def test_the_shared_pair_reaches_the_prb_prompt_of_both_passes(self, stack: Stack, order: str) -> None:
+        first, second = AGENT_ORDERS[order]
+        stack.llm.decisions = PEER_DECISIONS
+        stack.bring_up(first)
+        # One holder and one owner: no other service brings the role or a copy of the scope in. The
+        # focal line of a pass has the other prefix, so these strings match only a candidate line.
+        assert all(f"role name={AGENT_ROLE}:" not in p for p in stack.llm.prompts_for("scope", AGENT_ROLE))
+        assert all(f"scope name={AGENT_ROLE}:" not in p for p in stack.llm.prompts_for("role", AGENT_ROLE))
+        seen = {kind: len(stack.llm.prompts_for(kind, AGENT_ROLE)) for kind in ("scope", "role")}
+
+        stack.bring_up(second)
+
+        scope_pass = stack.llm.prompts_for("scope", AGENT_ROLE)[seen["scope"] :]
+        role_pass = stack.llm.prompts_for("role", AGENT_ROLE)[seen["role"] :]
+        assert scope_pass, f"no scope-focal prompt of {AGENT_ROLE} at the second onboarding"
+        assert all(f"role name={AGENT_ROLE}:" in p for p in scope_pass), "the shared role is not a candidate"
+        assert role_pass, f"no role-focal prompt of {AGENT_ROLE} at the second onboarding"
+        assert all(f"scope name={AGENT_ROLE}:" in p for p in role_pass), "the other copy is not a candidate"
+
+    @pytest.mark.parametrize("order", list(AGENT_ORDERS))
+    def test_target_side_the_cr_of_each_copy_gives_every_holder_the_grant(self, stack: Stack, order: str) -> None:
+        stack.llm.decisions = PEER_DECISIONS
+        for workload in AGENT_ORDERS[order]:
+            stack.bring_up(workload)
+
+        holders = {AGENT1.client_id, AGENT2.client_id}
+        for owner in (AGENT1, AGENT2):
+            spm = stack.store.spm(owner.client_id)
+            assert spm is not None
+            assert _edges(spm.inbound_allow_rules) == {
+                (AGENT_ROLE, AGENT_ROLE, owner.client_id),
+                (DEVELOPER, AGENT_ROLE, owner.client_id),
+            }
+            assert _holders(stack, owner) == holders, f"{owner.client_id}: the owner is a holder too"
+            rego = stack.inbound(owner.client_id)
+            assert _rego_map(rego, "source_role_allow_scopes") == {AGENT_ROLE: [AGENT_ROLE]}
+            assert _rego_map(rego, "source_role_deny_scopes") == {}
+
+    @pytest.mark.parametrize("order", list(AGENT_ORDERS))
+    def test_agent_side_each_holder_outbound_allows_every_copy(
+        self, stack: Stack, order: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("AIAC_ENFORCEMENT_SIDE", EnforcementSide.AGENT_SIDE.value)
+        stack.llm.decisions = PEER_DECISIONS
+        for workload in AGENT_ORDERS[order]:
+            stack.bring_up(workload)
+
+        owners = {AGENT1.client_id: ["source_operations"], AGENT2.client_id: ["source_operations"]}
+        for holder in (AGENT1, AGENT2):
+            rego = stack.outbound(holder.client_id)
+            assert _rego_map(rego, "target_allow_scopes") == owners, f"{holder.client_id}: its own copy too"
+            assert _rego_map(rego, "target_deny_scopes") == {}
+            # The inbound gates are the same on both sides (D18b).
+            assert _holders(stack, holder) == set(owners), f"{holder.client_id}: the inbound source_roles"
+
+
+# --------------------------------------------------------------------------- #
+# case 6 — an admin-assigned shared role on a re-onboarding (self-mapping)     #
+# --------------------------------------------------------------------------- #
+# The decisions of the re-onboarding. They grant the shared role on review-agent's skill (a scope
+# with a different name, which the holder by the admin's assignment owns) and on github-agent's skill
+# (the scope with the same name as the role, which the holder by Provision owns).
+ADMIN_DECISIONS = {
+    **PEER_DECISIONS,
+    ("scope", REVIEW_SKILL): ({DEVELOPER, AGENT_ROLE}, set()),
+}
+
+
+class TestAdminAssignedSelfMapping:
+    """An admin assigns github-agent's role to team1/review-agent, then review-agent is onboarded
+    again. The role now has two holders in one namespace, so each pass of the re-onboarding gets a
+    self-mapping pair: the scope-focal pass of review-agent's own skill gets the shared role (through
+    github-agent, its other holder), and the role-focal pass of the shared role gets github-agent's
+    skill (a scope that the other holder owns). D32 allows both pairs. No filter removes them, and the
+    PCE renders the current holders, so each holder can call both skills, its own skill included."""
+
+    @staticmethod
+    def _reonboard(stack: Stack) -> tuple[list[str], list[str]]:
+        """Bring up github-agent and review-agent with ``DECISIONS``, assign the shared role to
+        review-agent (and deliver its event), then onboard review-agent again with
+        ``ADMIN_DECISIONS``. Returns the scope-focal prompts of review-agent's skill and the
+        role-focal prompts of the shared role, of the re-onboarding only."""
+        stack.bring_up(AGENT1)
+        stack.bring_up(REVIEWER)
+        # Before the assignment, review-agent does not hold the shared role: no role-focal pass of the
+        # role gets github-agent's skill, and no rule grants the role on a skill.
+        assert all(f"scope name={AGENT_ROLE}:" not in p for p in stack.llm.prompts_for("role", AGENT_ROLE))
+        for owner in (AGENT1, REVIEWER):
+            spm = stack.store.spm(owner.client_id)
+            assert spm is not None
+            assert all(rule.role.name != AGENT_ROLE for rule in spm.inbound_allow_rules), owner.client_id
+        stack.realm.grant(REVIEWER.client_id, AGENT_ROLE)  # the admin's role mapping
+        stack.deliver_role_events()
+        scope_seen = len(stack.llm.prompts_for("scope", REVIEW_SKILL))
+        role_seen = len(stack.llm.prompts_for("role", AGENT_ROLE))
+        stack.llm.decisions = ADMIN_DECISIONS
+
+        stack.onboard(REVIEWER.client_id)
+
+        return (
+            stack.llm.prompts_for("scope", REVIEW_SKILL)[scope_seen:],
+            stack.llm.prompts_for("role", AGENT_ROLE)[role_seen:],
+        )
+
+    def test_both_self_pairs_reach_the_prb_prompt(self, stack: Stack) -> None:
+        scope_pass, role_pass = self._reonboard(stack)
+
+        assert scope_pass, f"no scope-focal prompt of {REVIEW_SKILL} at the re-onboarding"
+        assert all(f"role name={AGENT_ROLE}:" in p for p in scope_pass), (
+            f"the shared role is not a candidate of {REVIEW_SKILL} (a self-mapping of review-agent)"
+        )
+        assert role_pass, f"no role-focal prompt of {AGENT_ROLE} at the re-onboarding"
+        assert all(f"scope name={AGENT_ROLE}:" in p for p in role_pass), (
+            f"github-agent's {AGENT_ROLE} is not a candidate of the shared role (a self-mapping of github-agent)"
+        )
+
+    def test_target_side_both_spms_keep_the_grant_and_each_cr_gives_every_holder(self, stack: Stack) -> None:
+        self._reonboard(stack)
+
+        holders = {AGENT1.client_id, REVIEWER.client_id}
+        for owner, skill in ((AGENT1, AGENT_ROLE), (REVIEWER, REVIEW_SKILL)):
+            spm = stack.store.spm(owner.client_id)
+            assert spm is not None
+            assert _edges(spm.inbound_allow_rules) == {
+                (AGENT_ROLE, skill, owner.client_id),
+                (DEVELOPER, skill, owner.client_id),
+            }, f"{owner.client_id}: the allow edges"
+            assert _holders(stack, owner) == holders, f"{owner.client_id}: the owner is a holder too"
+            rego = stack.inbound(owner.client_id)
+            assert _rego_map(rego, "source_role_allow_scopes") == {AGENT_ROLE: [skill]}
+            assert _rego_map(rego, "source_role_deny_scopes") == {}
+
+    def test_agent_side_each_holder_outbound_allows_both_skills(
+        self, stack: Stack, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("AIAC_ENFORCEMENT_SIDE", EnforcementSide.AGENT_SIDE.value)
+        self._reonboard(stack)
+
+        targets = {AGENT1.client_id: ["source_operations"], REVIEWER.client_id: ["code_review"]}
+        for holder in (AGENT1, REVIEWER):
+            rego = stack.outbound(holder.client_id)
+            assert _rego_map(rego, "target_allow_scopes") == targets, f"{holder.client_id}: its own skill too"
+            assert _rego_map(rego, "target_deny_scopes") == {}
+            # The inbound gates are the same on both sides (D18b).
+            assert _holders(stack, holder) == set(targets), f"{holder.client_id}: the inbound source_roles"
