@@ -73,6 +73,7 @@ from aiac.idp.configuration.api import Configuration  # noqa: E402
 from aiac.idp.configuration.models import Role, RoleKind, Scope  # noqa: E402
 from aiac.policy.computation.engine import compute_and_apply  # noqa: E402
 from aiac.policy.model.models import PolicyRule, RuleEffect  # noqa: E402
+from aiac.policy.model_store.library.api import _base_url as store_url  # noqa: E402
 from aiac.policy.model_store.library.api import list_service_policies  # noqa: E402
 from eval.correctness_scorer import score_scenario  # noqa: E402
 from eval.prb_direct import build_roles_and_scopes  # noqa: E402
@@ -179,8 +180,7 @@ def _require_empty_store() -> None:
     store on a fresh DB, and ``running_services`` refuses a port that a stale process holds. This
     checks the result directly, for any cause that those two do not cover."""
     if stale := sorted(spm.service_id for spm in list_service_policies()):
-        url = os.environ.get("AIAC_POLICY_MODEL_STORE_URL")
-        pytest.fail(f"the Policy Model Store at {url} is not empty before the run: {stale}")
+        pytest.fail(f"the Policy Model Store at {store_url()} is not empty before the run: {stale}")
 
 
 def _merged_rules_for() -> list[PolicyRule]:

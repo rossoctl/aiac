@@ -136,8 +136,9 @@ load_dotenv(HERE.parent / ".env", override=False)
 
 _docstrings: dict[str, str] = {}
 _reports: dict[str, pytest.TestReport] = {}
-# The crash message of a teardown failure that came after an earlier failed phase of the same test.
-# The earlier report stays in _reports (it holds the test's own result); this is rendered next to it.
+# The crash message of a teardown failure of a test. The earlier report (setup or call) stays in
+# _reports, as it holds the test's own result; the entry goes in the "error" bucket (pytest counts
+# a teardown failure as an error too) and shows this next to that result.
 _teardown_failures: dict[str, str] = {}
 
 # Every suite that carries `pytestmark = pytest.mark.eval` lives directly under `eval/` as a
@@ -184,11 +185,10 @@ def pytest_runtest_logreport(report: pytest.TestReport) -> None:
         return
     if not _is_eval_suite_nodeid(report.nodeid):
         return
-    # A later phase (call) supersedes an earlier one (setup) for the same nodeid; a setup or
-    # teardown failure has no later phase to supersede it. A teardown failure after an earlier
-    # failure does not replace it -- the earlier report holds the test's own result.
-    earlier = _reports.get(report.nodeid)
-    if report.when == "teardown" and earlier is not None and earlier.outcome == "failed":
+    # A later phase (call) supersedes an earlier one (setup) for the same nodeid. A teardown
+    # failure never replaces the earlier report -- that holds the test's own result (passed,
+    # failed or skipped); see _teardown_failures.
+    if report.when == "teardown" and report.nodeid in _reports:
         _teardown_failures[report.nodeid] = _detail(report, "error") or "teardown failed"
         return
     _reports[report.nodeid] = report
@@ -523,15 +523,11 @@ def _render_scale_block(lines: list[str], props: dict) -> None:
 
 def _unscored_reason(report: pytest.TestReport, detail: str | None) -> str:
     """Why a scored-suite entry has no scores, from the pytest phase of its report. Only the setup
-    and teardown phases are sure signs of a fixture error. A call-phase failure can be a test-body
+    phase is a sure sign of a fixture error (a teardown report never replaces an earlier one, see
+    pytest_runtest_logreport). A call-phase failure can be a test-body
     error or a scenario setup failure (the 8-scenario suites report that in the call phase,
     pytest.fail in _require_scenario), so say only what is sure; the Failure field gives the cause."""
-    if report.when == "setup":
-        reason = "a fixture failed before the test ran"
-    elif report.when == "teardown":
-        reason = "a fixture teardown failed"
-    else:
-        reason = "the test failed before scoring"
+    reason = "a fixture failed before the test ran" if report.when == "setup" else "the test failed before scoring"
     return reason + (" (see Failure)" if detail else "")
 
 
@@ -733,7 +729,7 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     order = ["failed", "passed", "error", "xpassed", "xfailed", "skipped"]
     buckets: dict[str, list[tuple[str, pytest.TestReport]]] = {cat: [] for cat in order}
     for nodeid, report in _reports.items():
-        buckets[_categorize(report)].append((nodeid, report))
+        buckets["error" if nodeid in _teardown_failures else _categorize(report)].append((nodeid, report))
     for cat in buckets:
         buckets[cat].sort(key=lambda pair: pair[0])
 

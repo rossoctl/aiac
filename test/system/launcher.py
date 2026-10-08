@@ -118,19 +118,27 @@ def start_service(service: Service, *, src: Path) -> subprocess.Popen:
 def wait_until_ready(base_url: str, *, timeout: float = 30.0, proc: subprocess.Popen | None = None) -> None:
     """Poll ``GET {base_url}/health`` until it returns 200, or raise after ``timeout`` seconds.
 
-    With ``proc`` (the spawned service), raise at once with its exit code if it exits while this
-    waits -- a crash at startup, or a failed bind because another process holds the port."""
+    With ``proc`` (the spawned service), raise with its exit code if it has exited: before each
+    poll, after the 200, and at the deadline -- a crash at startup, or a failed bind. This does not
+    prove that the 200 came from ``proc``: a process that took the port can answer before ``proc``
+    tries to bind (``running_services`` checks the port before the spawn for that case)."""
+
+    def _require_alive() -> None:
+        if proc is not None and (code := proc.poll()) is not None:
+            raise RuntimeError(f"service for {base_url} exited (code {code}) before it was ready")
+
     deadline = time.time() + timeout
     last_err: Exception | None = None
     while time.time() < deadline:
-        if proc is not None and (code := proc.poll()) is not None:
-            raise RuntimeError(f"service for {base_url} exited (code {code}) before it was ready")
+        _require_alive()
         try:
             if requests.get(f"{base_url}/health", timeout=1).status_code == 200:
+                _require_alive()
                 return
         except requests.RequestException as exc:
             last_err = exc
         time.sleep(0.3)
+    _require_alive()
     raise RuntimeError(f"service not ready at {base_url} within {timeout}s ({last_err})")
 
 
@@ -141,7 +149,11 @@ def terminate(proc: subprocess.Popen) -> None:
         proc.wait(timeout=5)
     except subprocess.TimeoutExpired:
         proc.kill()
-        proc.wait()  # the port is free only when the process is gone (require_port_free)
+        try:
+            proc.wait(timeout=5)  # the port is free only when the process is gone (require_port_free)
+        except subprocess.TimeoutExpired:
+            # Do not raise: running_services calls this in ``finally`` for each proc in turn.
+            log.warning("pid %d did not exit after SIGKILL; its port can stay in use", proc.pid)
 
 
 def require_port_free(service: Service) -> None:
@@ -152,8 +164,10 @@ def require_port_free(service: Service) -> None:
     one, which cannot bind and exits: its old state (a store DB, a Rego dir) mixes into this run."""
     try:
         socket.create_connection((service.host, service.port), timeout=0.5).close()  # any address family
-    except OSError:
+    except ConnectionRefusedError:
         return  # nothing listens
+    except OSError as exc:  # a host that does not resolve, a filtered port: not known to be free
+        raise RuntimeError(f"cannot check {service.host}:{service.port} for {service.module_app}: {exc}") from exc
     raise RuntimeError(
         f"{service.host}:{service.port} is already in use (a stale {service.module_app} from an "
         f"earlier run?) -- stop that process, then run again"
