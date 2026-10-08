@@ -107,7 +107,6 @@ import os
 import shutil
 import subprocess
 import sys
-import tempfile
 from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
@@ -667,9 +666,10 @@ def prepare_pipeline(
     """The env and the idp/store/opa ``Service`` triple that one in-process PRB+PCE run needs.
 
     Wipes and recreates ``rego_dir``, points the store at ``db_path`` (the caller gives a fresh
-    path and owns its directory), and sets (through ``setenv``) every env var that the in-process PCE reads: the realm, the four
-    ``AIAC_*_URL`` vars at the ``(host, port)`` pairs, and the enforcement side. Each caller that
-    runs the pipeline uses this one helper, so a new pipeline setting reaches all of them. The
+    path and owns its directory), and sets (through ``setenv``) every env var that the in-process
+    PCE reads: the realm, the four ``AIAC_*_URL`` vars at the ``(host, port)`` pairs, and the
+    enforcement side. Each caller that runs the pipeline uses this one helper, so a new pipeline
+    setting reaches all of them. The
     caller sets ``AIAC_POLICY_FILE`` itself (a run can use more than one policy file). ``setenv``
     is ``os.environ.__setitem__`` in a ``ProcessPoolExecutor`` worker (never the pytest process),
     else a ``MonkeyPatch.setenv`` that restores the env when the caller is done. Set every var on
@@ -709,7 +709,7 @@ def prepare_pipeline(
     )
 
 
-def _provision_scenario(name: str, idp_port: int, store_port: int, opa_port: int) -> dict:
+def _provision_scenario(name: str, idp_port: int, store_port: int, opa_port: int, store_root: str) -> dict:
     """Provision one scenario's realm and run the real PRB+PCE pipeline, leaving ``.rego`` on disk
     under ``rego_out/policy_pipeline_eval/<scenario>/``. Returns ``{"rego_dir": Path, "rules":
     list[PolicyRule], "reasoning_by_scope": dict[str, str], "reasoning_by_agent_role": dict[str,
@@ -754,7 +754,7 @@ def _provision_scenario(name: str, idp_port: int, store_port: int, opa_port: int
             os.environ.__setitem__,
             realm=scenario.REALM_DEFAULT,
             rego_dir=rego_dir,
-            db_path=Path(tempfile.mkdtemp(prefix=f"aiac-store-eval-{name}-")) / "policy_model.db",
+            db_path=Path(store_root) / f"{name}.db",
             idp=(idp_host, idp_port),
             store=(store_host, store_port),
             opa=(opa_host, opa_port),
@@ -815,7 +815,7 @@ def _provision_scenario(name: str, idp_port: int, store_port: int, opa_port: int
 
 
 @pytest.fixture(scope="session")
-def pipeline() -> dict[str, dict]:
+def pipeline(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
     """Provision Keycloak and run the real PRB+PCE pipeline once per scenario — in parallel, one
     ``ProcessPoolExecutor`` worker per scenario (see the module docstring) — leaving ``.rego`` on
     disk under ``rego_out/policy_pipeline_eval/<scenario>/``. Returns ``{scenario_name:
@@ -840,6 +840,9 @@ def pipeline() -> dict[str, dict]:
     # escape-hatch env var surface as an opaque crash deep inside the executor.
     max_workers = max(1, int(os.environ.get("EVAL_PIPELINE_PARALLELISM", str(len(SCENARIOS)))))
     realm_lock = multiprocessing.Lock()  # serializes admin.create_realm — see _provision_scenario
+    # One store DB for each scenario, under a pytest-managed dir (cleaned up by pytest). A str: each
+    # argument must pickle across to the worker, which cannot use tmp_path_factory itself.
+    store_root = str(tmp_path_factory.mktemp("pipeline_store"))
     results: dict[str, dict] = {}
     with ProcessPoolExecutor(max_workers=max_workers, initializer=_init_worker, initargs=(realm_lock,)) as executor:
         futures = {
@@ -849,6 +852,7 @@ def pipeline() -> dict[str, dict]:
                 DEFAULT_IDP_PORT + i * 10,
                 DEFAULT_STORE_PORT + i * 10,
                 DEFAULT_OPA_PORT + i * 10,
+                store_root,
             ): name
             for i, name in enumerate(SCENARIOS)
         }

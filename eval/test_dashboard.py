@@ -153,12 +153,12 @@ def test_parse_report_setup_failure_leaves_metrics_none(tmp_path: Path) -> None:
         "### `eval/test_policy_pipeline_correctness_prb.py::test_prb_correctness[wildcard_grant]`\n"
         "- **What it tests:** Some docstring.\n"
         "- **Failure:** setup crashed\n"
-        "- **Precision:** unavailable — scenario setup failed before scoring could run\n"
-        "- **Recall:** unavailable — scenario setup failed before scoring could run\n"
-        "- **Denial precision:** unavailable — scenario setup failed before scoring could run\n"
-        "- **Over-grants:** unavailable — scenario setup failed before scoring could run\n"
-        "- **Under-grants:** unavailable — scenario setup failed before scoring could run\n"
-        "- **Incorrectly denied:** unavailable — scenario setup failed before scoring could run\n\n"
+        "- **Precision:** unavailable — a fixture failed before the test ran (see Failure)\n"
+        "- **Recall:** unavailable — a fixture failed before the test ran (see Failure)\n"
+        "- **Denial precision:** unavailable — a fixture failed before the test ran (see Failure)\n"
+        "- **Over-grants:** unavailable — a fixture failed before the test ran (see Failure)\n"
+        "- **Under-grants:** unavailable — a fixture failed before the test ran (see Failure)\n"
+        "- **Incorrectly denied:** unavailable — a fixture failed before the test ran (see Failure)\n\n"
     )
     path = _write_report(tmp_path, body)
 
