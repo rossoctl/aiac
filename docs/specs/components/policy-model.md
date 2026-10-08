@@ -31,7 +31,7 @@ The former model could express only **grants**. A `PolicyRule(role, scope)` was 
 
 ## Solution
 
-A canonical, dependency-free model module at `aiac.policy.model` defines `ServicePolicyModel`, `PolicyRule`, `AgentPolicyModel`, and the policy-model hierarchy (`EnforcementSide`, `PolicyModel`, `TargetSidePolicyModel`, `AgentSidePolicyModel`, `AnyPolicyModel`) with typed fields. The same package has the shared projection `project_inbound` (`aiac.policy.model.projection`). No HTTP client, no service code — importable by any consumer without side effects. `PolicyRule.role` and `PolicyRule.scope` are typed `Role` and `Scope` objects from `aiac.idp.configuration.models`.
+A canonical, dependency-free model module at `aiac.policy.model` defines `ServicePolicyModel`, `PolicyRule`, `AgentPolicyModel`, and the policy-model hierarchy (`EnforcementSide`, `PolicyModel`, `TargetSidePolicyModel`, `AgentSidePolicyModel`, `AnyPolicyModel`) with typed fields. The same package has the shared projection `project_inbound` (`aiac.policy.model.projection`) and the render-time role holders `RoleHolders` (`aiac.policy.model.holders`, D32). No HTTP client, no service code — importable by any consumer without side effects. `PolicyRule.role` and `PolicyRule.scope` are typed `Role` and `Scope` objects from `aiac.idp.configuration.models`.
 
 **Two-layer model.** `ServicePolicyModel` (SPM) is the **persistent source of truth**, one per **service** (agent *and* tool). It holds the service's **inbound** rules plus its own identity (owned roles and scopes). `AgentPolicyModel` (APM) becomes a **pure derived projection** built from the relevant SPMs by the PCE — it is **no longer persisted**. Its shape is unchanged so existing consumers (PDP Policy Library, PDP Policy Writer) keep working.
 
@@ -91,8 +91,10 @@ src/aiac/policy/
 └── model/
     ├── __init__.py    # empty
     ├── models.py      # ServicePolicyModel, PolicyRule, AgentPolicyModel, EnforcementSide,
-    │                  # PolicyModel, TargetSidePolicyModel, AgentSidePolicyModel, AnyPolicyModel
-    └── projection.py  # project_inbound, InboundProjection (D18b)
+    │                  # PolicyModel, TargetSidePolicyModel, AgentSidePolicyModel, AnyPolicyModel,
+    │                  # parse_policy_model
+    ├── projection.py  # project_inbound, InboundProjection (D18b)
+    └── holders.py     # RoleHolders: render-time role holders (D32), pure, no I/O
 ```
 
 ### Dependencies
@@ -100,7 +102,7 @@ src/aiac/policy/
 | Dependency | Purpose |
 |------------|---------|
 | `pydantic` | `BaseModel`, `ConfigDict`, `Field` (the discriminator of `AnyPolicyModel`) |
-| `aiac.idp.configuration.models` | Typed `Role`, `Scope`, `ServiceType` (as map values, in `PolicyRule`, and in `ServicePolicyModel`) |
+| `aiac.idp.configuration.models` | Typed `Role`, `RoleKind`, `Scope`, `Service`, `ServiceType`: `Role`, `Scope` and `ServiceType` as map values, in `PolicyRule`, and in `ServicePolicyModel`; `RoleKind` for the split of `project_inbound` and for `RoleHolders`; `Service` as the catalog that `RoleHolders` reads |
 
 No HTTP client dependency. No `requests`, no `python-dotenv`.
 
@@ -224,7 +226,7 @@ The two-layer model requires ownership and a user/agent distinction on the IdP t
 - **`Role.actorIds: list[str]`** — context-dependent on `kind`:
   - `kind == AGENT` ⇔ a Keycloak **client role** on the agent's client, or an `aiac.managed` **realm role** on the agent's service account; `actorIds` = the owning **agent `serviceId`(s)** (usually one).
   - `kind == USER` ⇔ a Keycloak **realm role**; `actorIds` = the **holder usernames**.
-  - **On a stored edge, `actorIds` is a snapshot** of the holders at build time. It is not the authority ([D32](../PRD.md#key-architectural-decisions)). At each operation the PCE replaces it with the **current holders** (`RoleHolders`, `aiac.policy.model.holders`): for an `Agent`-kind role, the live services whose roles contain the role; for a `User`-kind role, the direct members that `get_roles()` gives now. So a holder that comes later is added, and a holder that goes is removed, with no new rule. The store schema does not change; the PCE refreshes the stored snapshot when it writes an SPM for another reason. See [`policy-computation-engine.md`](policy-computation-engine.md).
+  - **On a stored edge, `actorIds` is a snapshot** of the holders at build time. It is not the authority ([D32](../PRD.md#key-architectural-decisions)). At each operation the PCE replaces it with the **current holders** (`RoleHolders`, `aiac.policy.model.holders`): for an `Agent`-kind role, the live services whose roles contain the role; for a `User`-kind role, the direct members that `get_roles()` gives now. So a holder that comes later is added, and a holder that goes is removed, with no new rule. The store schema does not change. The PCE refreshes the stored snapshot each time it writes an SPM. A `compute_and_apply` run also writes and deploys each touched SPM whose stored holders are not the current ones, also when no rule changed. The run that lifts a quarantine also deploys each SPM that has an edge of a role of the lifted service, and writes those of them whose stored holders are stale. Other SPMs keep their snapshot until a later write (for example an SPM that no run touches, an SPM that `rerender_role` or the resync renders, or a shared SPM that a quarantine or a decommission redeploys but does not write), and their CRs get the current holders at the next deploy, role re-render or resync. Until that write, the CR can name other holders than the snapshot, and a later stale-holders check compares only the snapshot (a known limit). See [`policy-computation-engine.md` → Role holders at render time (D32)](policy-computation-engine.md#role-holders-at-render-time-d32).
 
 A `model_validator` on `Role` enforces what it can locally (`kind` present/valid; `actorIds` is a `list[str]`). The **cross-kind** invariant (Assumption 1) and the **client/realm ⇔ agent/user** invariant (Assumption 3) are enforced **upstream at construction** (the Keycloak IdP boundary), because the raw Keycloak facts are only visible there — see handoff 02 for that enforcement and field population.
 
@@ -245,7 +247,7 @@ The persistent source of truth — one per service (agent *and* tool), keyed by 
 | Field | Type | Description |
 |-------|------|-------------|
 | `service_id` | `str` | The owning service's id. |
-| `service_type` | `ServiceType` | `Agent` or `Tool`. Under target side, it selects the inbound render of the service's CR (a tool inbound or an agent inbound). Under agent side, it drives derivation: only `Agent` services get an APM, and a managed `Tool` gets a pass-through CR (its clientId in `AgentSidePolicyModel.pass_through`). |
+| `service_type` | `ServiceType` | `Agent` or `Tool`. Under target side, it selects the inbound render of the service's CR (a tool inbound or an agent inbound). Under agent side, a deploy does not read this field: it takes the type from the catalog (`Service.type`), so only an `Agent` gets an APM, and a managed `Tool` gets a pass-through CR (its clientId in `AgentSidePolicyModel.pass_through`). Under agent side, only the read model and the bootstrap use the stored `service_type`. See [`policy-computation-engine.md` → P2 / P5b reconciliation, and the agent-side rule](policy-computation-engine.md#p2--p5b-reconciliation-and-the-agent-side-rule). |
 | `owned_roles` | `list[Role]` | This service's own roles (`Service.roles`; `aiac.managed` marker only). |
 | `owned_scopes` | `list[Scope]` | This service's exposed scopes (`aiac.managed` marker only). |
 | `inbound_allow_rules` | `list[PolicyRule]` | Canonical positive edges: every `Allow` rule granting access to `owned_scopes`. |
@@ -378,7 +380,7 @@ So, for one SPM, both sides give the same inbound gates.
 - JSON object keys must be strings. A dict keyed by a pydantic model does not round-trip through `model_dump(mode="json")` / JSON without a custom key serializer; a `str` key serializes natively.
 - The IdP models are plain pydantic models (default field-based equality, not hashable). The PCE builds these maps from `role.actorIds` and `scope.serviceId`.
 
-As a result, no field in `aiac.policy.model` uses a typed object as a dict key, and this module imports only `Role`, `Scope`, and `ServiceType` from `aiac.idp.configuration.models` (as map *values*, in `PolicyRule`, and in `ServicePolicyModel`). `Service` and `Subject` are no longer referenced here.
+As a result, no field in `aiac.policy.model` uses a typed object as a dict key. From `aiac.idp.configuration.models`, `models.py` imports only `Role`, `Scope`, and `ServiceType` (as map *values*, in `PolicyRule`, and in `ServicePolicyModel`); `projection.py` also imports `RoleKind`; `holders.py` imports `Role`, `RoleKind`, and `Service` (the catalog that `RoleHolders` reads, never a dict key). `Subject` is not referenced.
 
 ### Usage
 
@@ -462,6 +464,7 @@ Key behaviors to assert:
 - **The policy-model tag (D18a).** `TargetSidePolicyModel(services=[...])` and `AgentSidePolicyModel(agents=[...])` get their tag with no argument (`target-side` / `agent-side`), and `pass_through` defaults to `[]`. Each round-trips through `model_dump(mode="json")` with its tag.
 - **The discriminated union.** A target-side body parses through `AnyPolicyModel` to `TargetSidePolicyModel`, and an agent-side body to `AgentSidePolicyModel`. A body with a wrong tag, a missing tag, or the old tag-less `{"agents": [...]}` shape fails validation.
 - **The shared projection (D18b).** `project_inbound` splits the edges of one SPM by `role.kind` and effect into the four rule lists. A role that appears only in a DENY edge is in `subject_roles` / `source_roles`. An SPM with zero rules gives empty lists and empty maps. For the same SPM, the projection gives the same inbound buckets and identity maps as the APM inbound that `_derive` builds (the `_derive` tests that exist stay green).
+- **The role holders (D32).** `RoleHolders` gives an `Agent`-kind role every live service in the catalog that has the role. A disabled service is not a holder, but the focus service is a holder also while it is disabled. It gives a `User`-kind role the current members that `get_roles()` lists, and no holder when `get_roles()` does not list the role. Each source is used only for its kind, and the catalog order does not change the holders. `refresh_role`, `refresh_rule` and `refresh_model` return copies: the scope and the effect of a rule do not change, and `refresh_model` refreshes every edge in both lists and keeps their order. See `test/unit/policy/model/test_holders.py`.
 
 ---
 
