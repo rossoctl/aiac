@@ -513,6 +513,20 @@ def _render_scale_block(lines: list[str], props: dict) -> None:
         )
 
 
+def _unscored_reason(report: pytest.TestReport, detail: str | None) -> str:
+    """Why a scored-suite entry has no scores, from the pytest phase of its report. Only the setup
+    and teardown phases are sure signs of a fixture error. A call-phase failure can be a test-body
+    error or a scenario setup failure (the 8-scenario suites report that in the call phase,
+    pytest.fail in _require_scenario), so say only what is sure; the Failure field gives the cause."""
+    if report.when == "setup":
+        reason = "a fixture failed before the test ran"
+    elif report.when == "teardown":
+        reason = "a fixture teardown failed (this entry does not show the test's own result)"
+    else:
+        reason = "the test failed before scoring"
+    return reason + (" (see Failure)" if detail else "")
+
+
 def _render_entry(lines: list[str], nodeid: str, report: pytest.TestReport, category: str) -> None:
     """Per-cell tests (``test_inbound``/``test_outbound``) ``record_property`` a concrete
     description + expected/actual boolean + explanation; ``test_prb_correctness`` (correctness-prb)
@@ -556,11 +570,7 @@ def _render_entry(lines: list[str], nodeid: str, report: pytest.TestReport, cate
         detail = _detail(report, category)
         if detail:
             _render_field(lines, "Failure", detail)
-        # Only the setup phase is a sure sign of a fixture error. A call-phase failure can be a test-
-        # body error or a scenario setup failure (the 8-scenario suites report that in the call
-        # phase, pytest.fail in _require_scenario), so say only what is sure; Failure gives the cause.
-        reason = "a fixture failed before the test ran" if report.when == "setup" else "the test failed before scoring"
-        _render_metrics_block(lines, props, unavailable_reason=reason + (" (see Failure)" if detail else ""))
+        _render_metrics_block(lines, props, unavailable_reason=_unscored_reason(report, detail))
     else:
         doc = _docstrings.get(nodeid)
         if doc:

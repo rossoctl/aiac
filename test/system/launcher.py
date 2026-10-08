@@ -36,6 +36,7 @@ import logging
 import os
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -137,18 +138,43 @@ def terminate(proc: subprocess.Popen) -> None:
         proc.kill()
 
 
+def require_port_free(service: Service) -> None:
+    """Raise if a process already listens on ``service``'s host and port.
+
+    ``wait_until_ready`` accepts any process that answers ``/health`` on the port, so without this
+    check a stale service (e.g. from an interrupted run) would serve this run in place of the new
+    one, which cannot bind and exits: its old state (a store DB, a Rego dir) mixes into this run."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(0.5)
+        if sock.connect_ex((service.host, service.port)) == 0:
+            raise RuntimeError(
+                f"{service.host}:{service.port} is already in use (a stale {service.module_app} from an "
+                f"earlier run?) -- stop that process, then run again"
+            )
+
+
 @contextmanager
 def running_services(services: list[Service], *, src: Path, timeout: float = 30.0) -> Iterator[None]:
     """Spawn every service, poll each ``/health``, yield, then terminate them all in ``finally``.
 
-    Every spawned subprocess is torn down even if a later spawn or health poll fails.
+    Every port must be free before the spawn (``require_port_free``), and each spawned process
+    must still be alive after its health poll -- so the process that answers is the new one, not
+    one that took the port in between. Every spawned subprocess is torn down even if a later
+    spawn or health poll fails.
     """
+    for service in services:
+        require_port_free(service)
     procs: list[subprocess.Popen] = []
     try:
         for service in services:
             procs.append(start_service(service, src=src))
-        for service in services:
+        for service, proc in zip(services, procs):
             wait_until_ready(service.base_url, timeout=timeout)
+            if (code := proc.poll()) is not None:
+                raise RuntimeError(
+                    f"{service.module_app} exited (code {code}), but {service.base_url}/health answered: "
+                    f"another process holds the port"
+                )
         yield
     finally:
         for proc in procs:
