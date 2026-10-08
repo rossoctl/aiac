@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -166,18 +167,18 @@ def _provision_scale_realm_and_services(
         mp.setenv,
         realm=scenario.REALM_DEFAULT,
         rego_dir=rego_dir,
-        db_prefix=db_prefix,
+        db_path=Path(tempfile.mkdtemp(prefix=db_prefix)) / "policy_model.db",
         idp=(host, ports["idp"]),
         store=(host, ports["store"]),
         opa=(host, ports["opa"]),
     )
 
 
-def _merged_rules_for(service_ids: set[str]) -> list[PolicyRule]:
-    """Query the real, persisted post-``compute_and_apply`` ``ServicePolicyModel`` for every
-    service in ``service_ids`` (``aiac.policy.model_store.library.api.list_service_policies``, one
-    request for every stored SPM -- the same read the PCE's own resync uses) and concatenate every
-    ``inbound_allow_rules``/``inbound_deny_rules`` entry.
+def _merged_rules_for() -> list[PolicyRule]:
+    """Query every real, persisted post-``compute_and_apply`` ``ServicePolicyModel``
+    (``aiac.policy.model_store.library.api.list_service_policies``, one request -- the same read
+    the PCE's own resync uses) and concatenate every ``inbound_allow_rules``/``inbound_deny_rules``
+    entry. Each fixture has a fresh store DB, so the store holds only this scenario's services.
 
     This is the actual merge-engine output, queried **before** the Rego renderer gets anywhere
     near it -- unlike checking the rendered Rego data maps, which ``aiac.pdp.service.policy.opa.
@@ -191,11 +192,7 @@ def _merged_rules_for(service_ids: set[str]) -> list[PolicyRule]:
     ``with running_services(...)`` block, before it tears the store down. The caller's returned
     dict carries the result forward so the structural test (which runs after the fixture has
     already returned) can check it with no live service of its own."""
-    rules: list[PolicyRule] = []
-    for spm in sorted(list_service_policies(), key=lambda spm: spm.service_id):
-        if spm.service_id in service_ids:
-            rules += spm.inbound_allow_rules + spm.inbound_deny_rules
-    return rules
+    return [rule for spm in list_service_policies() for rule in spm.inbound_allow_rules + spm.inbound_deny_rules]
 
 
 # ======================================================================================
@@ -553,7 +550,7 @@ def total_corpus_e2e_result(tmp_path_factory: pytest.TempPathFactory, scale_env:
         # Must happen in here, before running_services tears the store down -- see
         # _merged_rules_for's own docstring for why this, not the rendered Rego, is where a real
         # merge-engine duplicate would actually show up.
-        merged_rules = _merged_rules_for(set(scenario.AGENTS) | set(scenario.TOOLS))
+        merged_rules = _merged_rules_for()
 
     return {
         "corpus": corpus,
@@ -750,7 +747,7 @@ def per_decision_e2e_result(tmp_path_factory: pytest.TempPathFactory, scale_env:
         elapsed = time.perf_counter() - start
         # Must happen in here, before running_services tears the store down -- see
         # _merged_rules_for's own docstring.
-        merged_rules = _merged_rules_for(set(scenario.AGENTS) | set(scenario.TOOLS))
+        merged_rules = _merged_rules_for()
 
     return {
         "corpus": corpus,

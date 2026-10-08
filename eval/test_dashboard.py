@@ -676,17 +676,17 @@ def test_find_matching_report_links_a_scale_suite_row_with_only_one_entry() -> N
     assert _find_matching_report(row, [near]) is near
 
 
-def test_a_reduced_size_scale_suite_is_never_full(tmp_path: Path) -> None:
-    """A Scale run at a reduced ``SCALE_*`` size (the report header names it, see
-    ``eval/conftest.py``'s ``_reduced_size_scale_suites``) is "partial" in the trend log, so it is
-    not a full suite here either: no scenario-table row, no link from a fixed-100 trend row."""
+def test_a_partial_scale_suite_is_never_full(tmp_path: Path) -> None:
+    """A Scale suite that the trend log tagged "partial" (the report header names it, from
+    ``eval/conftest.py``'s ``_write_trend_log``) is not a full suite here either, whatever its
+    entry count: no scenario-table row, no link from a fixed-100 trend row."""
     path = tmp_path / "report_10_09_07_00_36.md"
     path.write_text(
         "# policy-eval-scenarios test report\n\n"
         "Run: 2026-09-10T07:00:36+00:00\n"
         "Exit status: 0\n"
         "Total: 2 — passed=2\n"
-        "Reduced-size Scale suites: scale_total_corpus_prb, scale_total_corpus_e2e\n\n"
+        "Partial Scale suites: scale_total_corpus_e2e, scale_total_corpus_prb\n\n"
         "## passed (2)\n\n"
         "### `eval/test_policy_pipeline_scale.py::test_scale_total_corpus_correctness_prb`\n"
         "- **Precision:** 1.000\n"
@@ -700,14 +700,14 @@ def test_a_reduced_size_scale_suite_is_never_full(tmp_path: Path) -> None:
 
     report = parse_report(path)
 
-    assert report.reduced_suites == {"scale_total_corpus_prb", "scale_total_corpus_e2e"}
+    assert report.partial_suites == {"scale_total_corpus_prb", "scale_total_corpus_e2e"}
     assert _full_suites(report) == {"scale_per_decision_prb"}
     row = {"suite": "scale_total_corpus_prb", "timestamp": "2026-09-10T07:00:36+00:00"}
     assert _find_matching_report(row, [report]) is None
 
 
-def test_a_report_with_no_reduced_size_line_has_no_reduced_suites(tmp_path: Path) -> None:
-    assert parse_report(_write_report(tmp_path, "## passed (0)\n\n_none_\n")).reduced_suites == set()
+def test_a_report_with_no_partial_scale_line_has_no_partial_suites(tmp_path: Path) -> None:
+    assert parse_report(_write_report(tmp_path, "## passed (0)\n\n_none_\n")).partial_suites == set()
 
 
 def test_render_scenario_table_drops_a_setup_failure_scale_run() -> None:

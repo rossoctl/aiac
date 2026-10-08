@@ -8,10 +8,12 @@ per-suite branching worth protecting on its own. Unmarked, runs in the default f
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 import eval.conftest as eval_conftest
-from eval.conftest import _reduced_size_scale_suites, _scale_run_matches_fixed_100
+from eval.conftest import _scale_run_matches_fixed_100, _write_trend_log
 
 
 @pytest.fixture(autouse=True)
@@ -76,21 +78,41 @@ class TestScaleRunMatchesFixed100:
         assert _scale_run_matches_fixed_100("scale_per_decision_e2e")
 
 
-class TestReducedSizeScaleSuites:
+class TestWriteTrendLogPartialScaleSuites:
+    """``_write_trend_log`` returns the Scale suites whose row it tagged "partial"; the report
+    header names exactly these, so the dashboard and the trend log agree."""
+
+    @pytest.fixture(autouse=True)
+    def _no_file_writes(self, monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
+        rows: list[tuple[str, str]] = []
+        monkeypatch.setattr(eval_conftest, "append_row", lambda suite, _m, run_type: rows.append((suite, run_type)))
+        monkeypatch.setattr(eval_conftest, "pool_scale_metrics", lambda entries: {})
+        monkeypatch.setattr(eval_conftest, "pool_correctness_metrics", lambda entries: {})
+        return rows
+
     def _ran(self, monkeypatch: pytest.MonkeyPatch, *names: str) -> None:
-        nodeids = [f"eval/test_policy_pipeline_scale.py::{name}" for name in names]
-        monkeypatch.setattr(eval_conftest, "_reports", dict.fromkeys(nodeids))
+        reports = {}
+        for name in names:
+            nodeid = f"eval/test_policy_pipeline_scale.py::{name}"
+            props = [("structural_pass", True)] if "structural" in name else [("true_positives", 1)]
+            reports[nodeid] = SimpleNamespace(nodeid=nodeid, user_properties=props)
+        monkeypatch.setattr(eval_conftest, "_reports", reports)
 
-    def test_names_only_the_suites_that_ran_at_a_reduced_size(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        self._ran(monkeypatch, "test_scale_total_corpus_correctness_prb", "test_scale_per_decision_structural_prb")
+    def test_a_full_fixed_100_run_is_not_partial(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._ran(monkeypatch, "test_scale_total_corpus_structural_prb", "test_scale_total_corpus_correctness_prb")
+        assert _write_trend_log() == []
+
+    def test_a_reduced_size_run_is_partial(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._ran(monkeypatch, "test_scale_total_corpus_structural_prb", "test_scale_total_corpus_correctness_prb")
         monkeypatch.setenv("SCALE_TOTAL_CORPUS_SIZE", "10")
-        assert _reduced_size_scale_suites() == ["scale_total_corpus_prb"]
+        assert _write_trend_log() == ["scale_total_corpus_prb"]
 
-    def test_ignores_a_reduced_suite_that_did_not_run(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        self._ran(monkeypatch, "test_scale_per_decision_correctness_prb")
+    def test_a_run_of_only_one_half_is_partial(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._ran(monkeypatch, "test_scale_per_decision_correctness_e2e")
+        assert _write_trend_log() == ["scale_per_decision_e2e"]
+
+    def test_a_skipped_suite_records_nothing_so_is_not_named(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        nodeid = "eval/test_policy_pipeline_scale.py::test_scale_total_corpus_correctness_prb"
+        monkeypatch.setattr(eval_conftest, "_reports", {nodeid: SimpleNamespace(nodeid=nodeid, user_properties=[])})
         monkeypatch.setenv("SCALE_TOTAL_CORPUS_SIZE", "10")
-        assert _reduced_size_scale_suites() == []
-
-    def test_empty_at_fixed_100(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        self._ran(monkeypatch, "test_scale_total_corpus_correctness_e2e")
-        assert _reduced_size_scale_suites() == []
+        assert _write_trend_log() == []
