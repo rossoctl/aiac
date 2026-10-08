@@ -669,12 +669,11 @@ def prepare_pipeline(
     path and owns its directory), and sets (through ``setenv``) every env var that the in-process
     PCE reads: the realm, the four ``AIAC_*_URL`` vars at the ``(host, port)`` pairs, and the
     enforcement side. Each caller that runs the pipeline uses this one helper, so a new pipeline
-    setting reaches all of them. The
-    caller sets ``AIAC_POLICY_FILE`` itself (a run can use more than one policy file). ``setenv``
-    is ``os.environ.__setitem__`` in a ``ProcessPoolExecutor`` worker (never the pytest process),
-    else a ``MonkeyPatch.setenv`` that restores the env when the caller is done. Set every var on
-    each call, never conditionally: a worker can run more than one scenario, and a later scenario
-    must not keep the realm or URLs of an earlier one."""
+    setting reaches all of them. The caller sets ``AIAC_POLICY_FILE`` itself (a run can use more
+    than one policy file). ``setenv`` is ``os.environ.__setitem__`` in a ``ProcessPoolExecutor``
+    worker (never the pytest process), else a ``MonkeyPatch.setenv`` that restores the env when
+    the caller is done. Set every var on each call, never conditionally: a worker can run more
+    than one scenario, and a later scenario must not keep the realm or URLs of an earlier one."""
     if rego_dir.exists():
         shutil.rmtree(rego_dir)
     rego_dir.mkdir(parents=True)
@@ -840,8 +839,9 @@ def pipeline(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
     # escape-hatch env var surface as an opaque crash deep inside the executor.
     max_workers = max(1, int(os.environ.get("EVAL_PIPELINE_PARALLELISM", str(len(SCENARIOS)))))
     realm_lock = multiprocessing.Lock()  # serializes admin.create_realm — see _provision_scenario
-    # One store DB for each scenario, under a pytest-managed dir (cleaned up by pytest). A str: each
-    # argument must pickle across to the worker, which cannot use tmp_path_factory itself.
+    # One store DB for each scenario, under the pytest basetemp (pytest keeps only the dirs of its
+    # last few sessions). A str: each argument must pickle across to the worker, which cannot use
+    # tmp_path_factory itself.
     store_root = str(tmp_path_factory.mktemp("pipeline_store"))
     results: dict[str, dict] = {}
     with ProcessPoolExecutor(max_workers=max_workers, initializer=_init_worker, initargs=(realm_lock,)) as executor:

@@ -13,7 +13,7 @@ from types import SimpleNamespace
 import pytest
 
 import eval.conftest as eval_conftest
-from eval.conftest import _scale_run_matches_fixed_100, _write_trend_log
+from eval.conftest import _scale_run_matches_fixed_100, _unscored_reason, _write_trend_log
 
 
 @pytest.fixture(autouse=True)
@@ -143,3 +143,20 @@ class TestWriteTrendLogPartialScaleSuites:
         partial = _write_trend_log()
         assert partial == ["scale_total_corpus_prb"]
         assert partial == sorted(suite for suite, run_type in rows if run_type == "partial")
+
+
+class TestUnscoredReason:
+    @pytest.mark.parametrize(
+        ("when", "expected"),
+        [
+            ("setup", "a fixture failed before the test ran"),
+            ("call", "the test failed before scoring"),
+            ("teardown", "a fixture teardown failed (this entry does not show the test's own result)"),
+        ],
+    )
+    def test_names_only_what_the_phase_makes_sure(self, when: str, expected: str) -> None:
+        assert _unscored_reason(SimpleNamespace(when=when), detail=None) == expected
+
+    def test_points_at_failure_only_when_the_entry_has_one(self) -> None:
+        assert _unscored_reason(SimpleNamespace(when="call"), detail="boom").endswith(" (see Failure)")
+        assert not _unscored_reason(SimpleNamespace(when="call"), detail=None).endswith(" (see Failure)")
