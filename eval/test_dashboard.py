@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from eval.dashboard import (
+from eval.dashboard.dashboard import (
     ParsedReport,
     ScenarioEntry,
     _expected_count,
@@ -41,7 +41,7 @@ def _report(run_at_iso: str, suite: str | None) -> ParsedReport:
 
 
 def test_find_matching_report_picks_nearest_same_suite_within_tolerance(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("eval.dashboard._EXPECTED_SCENARIO_COUNT", 1)  # one-entry fixtures below
+    monkeypatch.setattr("eval.dashboard.dashboard._EXPECTED_SCENARIO_COUNT", 1)  # one-entry fixtures below
     row = {"suite": "correctness_prb", "timestamp": "2026-09-10T07:00:05+00:00"}
     far = _report("2026-09-10T01:00:00+00:00", "correctness_prb")
     near = _report("2026-09-10T07:00:00+00:00", "correctness_prb")
@@ -53,7 +53,7 @@ def test_find_matching_report_picks_nearest_same_suite_within_tolerance(monkeypa
 
 
 def test_find_matching_report_returns_none_outside_tolerance(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("eval.dashboard._EXPECTED_SCENARIO_COUNT", 1)  # one-entry fixture below
+    monkeypatch.setattr("eval.dashboard.dashboard._EXPECTED_SCENARIO_COUNT", 1)  # one-entry fixture below
     row = {"suite": "correctness_prb", "timestamp": "2026-09-10T07:00:00+00:00"}
     stale = _report("2026-09-09T00:00:00+00:00", "correctness_prb")
 
@@ -61,7 +61,7 @@ def test_find_matching_report_returns_none_outside_tolerance(monkeypatch: pytest
 
 
 def test_find_matching_report_returns_none_when_no_same_suite_report(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("eval.dashboard._EXPECTED_SCENARIO_COUNT", 1)  # one-entry fixture below
+    monkeypatch.setattr("eval.dashboard.dashboard._EXPECTED_SCENARIO_COUNT", 1)  # one-entry fixture below
     row = {"suite": "correctness_prb", "timestamp": "2026-09-10T07:00:00+00:00"}
     other = _report("2026-09-10T07:00:00+00:00", "correctness_e2e")
 
@@ -145,6 +145,68 @@ def test_parse_report_handles_multiline_fenced_under_grants(tmp_path: Path) -> N
     assert entry.suite == "correctness_e2e"
     assert entry.scenario == "agent_delegation"
     assert entry.under_grants == "outbound_subject: (a, b), (c, d)\noutbound_target: (e, f)"
+
+
+def test_parse_report_handles_a_longer_fence_around_a_body_with_its_own_triple_backtick(tmp_path: Path) -> None:
+    """Confirmed as a real finding in PR review: ``eval/conftest.py``'s ``_render_field`` sizes its
+    fence longer than the longest backtick run already inside the value (e.g. an LLM-drafted
+    recommendation body quoting its own fenced code) -- the parser must accept any 3-or-more
+    backtick fence and close only on a line matching that SAME length, not hardcode exactly 3
+    (which would both miss the real close and mistake the inner ``` for it)."""
+    body = (
+        "## passed (1)\n\n"
+        "### `eval/test_policy_pipeline_correctness_e2e.py::test_e2e_correctness[agent_delegation]`\n"
+        "- **Precision:** 1.000\n"
+        "- **Recall:** 1.000\n"
+        "- **Denial precision:** 1.000\n"
+        "- **Over-grants:** none\n"
+        "- **Under-grants:** none\n"
+        "- **Incorrectly denied:** none\n"
+        "- **Reason:**\n"
+        "  ````\n"
+        "  Wrap the fix like:\n"
+        "  ```python\n"
+        "  raise ValueError\n"
+        "  ```\n"
+        "  ````\n\n"
+    )
+    path = _write_report(tmp_path, body)
+
+    report = parse_report(path)
+
+    entry = report.entries[0]
+    assert entry.failure == "Wrap the fix like:\n```python\nraise ValueError\n```"
+
+
+def test_parse_report_stops_before_the_recommendations_section(tmp_path: Path) -> None:
+    """Confirmed as a real finding in PR review: the "## Improvement recommendations" section
+    eval/conftest.py appends after the per-category drill-down is recommendation prose, not
+    per-scenario data -- its own "- **Recommendation:**"/"- **Evidence:**" bullets must not get
+    attributed to the preceding section's last ScenarioEntry (harmless today only because neither
+    label happens to be one _assign_field recognizes -- parse_report stops here on purpose instead
+    of relying on that accident)."""
+    body = (
+        "## passed (1)\n\n"
+        "### `eval/test_policy_pipeline_correctness_prb.py::test_prb_correctness[baseline]`\n"
+        "- **Precision:** 1.000\n"
+        "- **Recall:** 1.000\n"
+        "- **Denial precision:** 1.000\n"
+        "- **Over-grants:** none\n"
+        "- **Under-grants:** none\n"
+        "- **Incorrectly denied:** none\n\n"
+        "## Improvement recommendations\n\n"
+        "### Over-interpreting 'only'\n\n"
+        "- **Recommendation:** Add a prompt constraint for restriction words.\n"
+        "- **Evidence:** correctness_prb/baseline: over-granted pairs -> inbound: (role-a, scope-a)\n"
+    )
+    path = _write_report(tmp_path, body)
+
+    report = parse_report(path)
+
+    assert len(report.entries) == 1
+    entry = report.entries[0]
+    assert entry.failure is None
+    assert entry.over_grants == "none"
 
 
 def test_parse_report_setup_failure_leaves_metrics_none(tmp_path: Path) -> None:
@@ -374,7 +436,7 @@ def test_render_svg_chart_tooltip_is_structured_multiline() -> None:
 
 
 def test_render_svg_chart_links_point_to_matching_report_anchor(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("eval.dashboard._EXPECTED_SCENARIO_COUNT", 1)  # one-entry fixture below
+    monkeypatch.setattr("eval.dashboard.dashboard._EXPECTED_SCENARIO_COUNT", 1)  # one-entry fixture below
     rows = [
         {
             "suite": "correctness_prb",
@@ -427,7 +489,7 @@ def test_render_dashboard_uses_dark_theme_colors() -> None:
 def test_render_scenario_table_lists_correctness_entries_anchored_for_chart_links(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("eval.dashboard._EXPECTED_SCENARIO_COUNT", 1)  # one-entry fixture below
+    monkeypatch.setattr("eval.dashboard.dashboard._EXPECTED_SCENARIO_COUNT", 1)  # one-entry fixture below
     entry = ScenarioEntry(
         nodeid="eval/test_policy_pipeline_correctness_prb.py::test_prb_correctness[baseline]",
         suite="correctness_prb",
@@ -454,7 +516,7 @@ def test_render_scenario_table_summary_names_file_and_suite_not_raw_timestamp(
     """The summary line leads with the report filename and names which suite ran, in parentheses
     -- e.g. ``report_x.md (correctness_prb suite)`` -- rather than the raw ``run_at`` ISO
     timestamp, which was redundant with the report's own filename/sort order."""
-    monkeypatch.setattr("eval.dashboard._EXPECTED_SCENARIO_COUNT", 1)  # one-entry fixture below
+    monkeypatch.setattr("eval.dashboard.dashboard._EXPECTED_SCENARIO_COUNT", 1)  # one-entry fixture below
     entry = ScenarioEntry(
         nodeid="eval/test_policy_pipeline_correctness_prb.py::test_prb_correctness[baseline]",
         suite="correctness_prb",
@@ -478,7 +540,7 @@ def test_render_scenario_table_summary_names_file_and_suite_not_raw_timestamp(
 
 def test_render_scenario_table_summary_lists_multiple_suites(monkeypatch: pytest.MonkeyPatch) -> None:
     """A report with entries from more than one suite names all of them, pluralized."""
-    monkeypatch.setattr("eval.dashboard._EXPECTED_SCENARIO_COUNT", 1)  # one entry per suite below
+    monkeypatch.setattr("eval.dashboard.dashboard._EXPECTED_SCENARIO_COUNT", 1)  # one entry per suite below
     entries = [
         ScenarioEntry(
             nodeid="eval/test_policy_pipeline_robustness.py::test_prb_invariant_to_mechanical_perturbation[baseline]",
@@ -515,7 +577,7 @@ def test_render_scenario_table_includes_robustness_entries(monkeypatch: pytest.M
     """Regression test for the bug where a report with *only* robustness entries rendered as an
     empty string and vanished from the drill-down entirely, because `_suite_for_nodeid` recognized
     no robustness nodeid pattern and every entry's `suite` stayed `None`."""
-    monkeypatch.setattr("eval.dashboard._EXPECTED_SCENARIO_COUNT", 1)  # one-entry fixture below
+    monkeypatch.setattr("eval.dashboard.dashboard._EXPECTED_SCENARIO_COUNT", 1)  # one-entry fixture below
     entry = ScenarioEntry(
         nodeid="eval/test_policy_pipeline_robustness.py::test_prb_sensitive_to_mechanical_edit[baseline]",
         suite="robustness_mechanical_sensitivity",
@@ -543,7 +605,7 @@ def test_render_scenario_table_distinguishes_mechanical_invariant_and_sensitive(
     (`robustness_mechanical_invariance`/`robustness_mechanical_sensitivity`), so the drill-down
     table's Suite column tells the two families apart from `entry.suite` alone -- no separate
     display-name override needed."""
-    monkeypatch.setattr("eval.dashboard._EXPECTED_SCENARIO_COUNT", 1)  # one entry per suite below
+    monkeypatch.setattr("eval.dashboard.dashboard._EXPECTED_SCENARIO_COUNT", 1)  # one entry per suite below
     body = (
         "## passed (2)\n\n"
         "### `eval/test_policy_pipeline_robustness.py::test_prb_invariant_to_mechanical_perturbation[baseline]`\n"
@@ -576,7 +638,7 @@ def test_render_scenario_table_distinguishes_mechanical_invariant_and_sensitive(
 
 
 def test_render_scenario_table_escapes_html_and_preserves_multiline_breaks(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("eval.dashboard._EXPECTED_SCENARIO_COUNT", 1)  # one-entry fixture below
+    monkeypatch.setattr("eval.dashboard.dashboard._EXPECTED_SCENARIO_COUNT", 1)  # one-entry fixture below
     entry = ScenarioEntry(
         nodeid="eval/test_policy_pipeline_correctness_prb.py::test_prb_correctness[baseline]",
         suite="correctness_prb",
@@ -603,7 +665,8 @@ def test_expected_scenario_count_matches_conftests_copy() -> None:
     rather than importing `eval.conftest` (see the module docstring), so nothing else catches the
     two drifting apart if the corpus grows and only one copy gets bumped -- this test is that
     catch."""
-    from eval import conftest, dashboard
+    from eval import conftest
+    from eval.dashboard import dashboard
 
     assert dashboard._EXPECTED_SCENARIO_COUNT == conftest._EXPECTED_SCENARIO_COUNT
 
@@ -743,7 +806,7 @@ def test_render_scenario_table_keeps_a_suite_with_more_than_the_full_corpus(monk
     module's copy of the constant hasn't caught up yet) is still a genuinely complete run and must
     render -- the partial-run filter is "at least the full count", not "exactly", so it never
     punishes a suite for having grown."""
-    monkeypatch.setattr("eval.dashboard._EXPECTED_SCENARIO_COUNT", 1)
+    monkeypatch.setattr("eval.dashboard.dashboard._EXPECTED_SCENARIO_COUNT", 1)
     entries = [
         ScenarioEntry(
             nodeid=f"eval/test_policy_pipeline_correctness_prb.py::test_prb_correctness[{name}]",

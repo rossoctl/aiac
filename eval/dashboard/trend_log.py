@@ -1,6 +1,6 @@
 """Shared, reusable trend-log writer (spec: ``docs/evaluation/eval-framework.md`` §9).
 
-A small, **committed-to-git**, append-only file — ``eval/trend_log.jsonl`` by default — holding
+A small, **committed-to-git**, append-only file — ``eval/dashboard/trend_log.jsonl`` by default — holding
 one JSON line per eval run: model version, timestamp, and a handful of small aggregate metrics
 (never verbose per-cell reasoning text or raw pair listings, which stay in the gitignored per-run
 Markdown report, ``eval/conftest.py``).
@@ -45,8 +45,9 @@ from pathlib import Path
 from typing import Any
 
 HERE = Path(__file__).resolve().parent
-# Beside conftest.py, not under eval/reports/ or eval/rego_out/ (the only two paths .gitignore
-# excludes) — so this file is tracked by git with no .gitignore change needed.
+# Beside this writer and eval/dashboard/dashboard.py, not under eval/reports/ or eval/rego_out/
+# (the only two paths .gitignore excludes) — so this file is tracked by git with no .gitignore
+# change needed.
 DEFAULT_PATH = HERE / "trend_log.jsonl"
 
 
@@ -109,7 +110,7 @@ def pool_scale_metrics(entries: list[dict[str, Any]]) -> dict[str, Any]:
     coverage_values = [e["token_coverage"] for e in entries if e.get("token_coverage") is not None]
     return {
         # "scenarios_scored", not "runs_scored": every pooling function in this module uses this
-        # exact key for its row count, and eval/dashboard.py's _ROW_BOOKKEEPING_KEYS excludes it
+        # exact key for its row count, and eval/dashboard/dashboard.py's _ROW_BOOKKEEPING_KEYS excludes it
         # from the trend chart by that exact name -- a different name here would have silently
         # slipped through as a plottable "metric" instead (confirmed: it did, until this was
         # caught in review).

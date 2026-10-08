@@ -274,7 +274,7 @@ def test_scale_total_corpus_structural_prb(total_corpus_prb_result: dict, record
     # second time.
     record_property("failed_decisions", failed_decisions)
     # Common fields every Scale structural test records, regardless of dimension -- lets
-    # eval.trend_log.pool_scale_metrics pool both dimensions' rows with one shared shape rather
+    # eval.dashboard.trend_log.pool_scale_metrics pool both dimensions' rows with one shared shape rather
     # than needing to know each dimension's own field taxonomy. See that function's docstring.
     record_property("structural_pass", not missing and not duplicates)
     record_property("structural_issue_count", len(missing) + len(duplicates))
@@ -432,7 +432,7 @@ def test_scale_per_decision_structural_prb(per_decision_prb_result: dict, record
     record_property("token_coverage", cost.coverage)
     record_property("best_effort_notes", best_effort_notes)
     # Common fields every Scale structural test records -- see the total-corpus test's own
-    # comment on why, and eval.trend_log.pool_scale_metrics's docstring.
+    # comment on why, and eval.dashboard.trend_log.pool_scale_metrics's docstring.
     no_issues = not scope_invalid and not role_invalid and not scope_duplicates and not role_duplicates
     record_property("structural_pass", no_issues)
     record_property(

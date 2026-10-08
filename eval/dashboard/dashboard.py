@@ -1,10 +1,10 @@
 """Static eval results dashboard — scenario drill-down + historical trend charts (issue #2542).
 
-Renders entirely from the artifacts ``eval/trend_log.py``/``eval/conftest.py`` (#2091) already
-produce — the committed, append-only ``eval/trend_log.jsonl`` and the gitignored per-run
-``eval/reports/report_<timestamp>.md`` — no new data source, no CI wiring, no server. A single
-self-contained HTML file (inline SVG, inline CSS, no external requests) a developer regenerates
-locally after an eval run.
+Renders entirely from the artifacts ``eval/dashboard/trend_log.py``/``eval/conftest.py`` (#2091)
+already produce — the committed, append-only ``eval/dashboard/trend_log.jsonl`` and the
+gitignored per-run ``eval/reports/report_<timestamp>.md`` — no new data source, no CI wiring, no
+server. A single self-contained HTML file (inline SVG, inline CSS, no external requests) a
+developer regenerates locally after an eval run.
 
 Two artifacts, two read paths: ``load_trend_log`` reads the committed trend log; ``parse_report``/
 ``parse_reports`` re-derive structured scenario data from the Markdown report(s) ``eval/conftest.py``
@@ -24,9 +24,11 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from eval.trend_log import DEFAULT_PATH as TREND_LOG_DEFAULT_PATH
+from eval.dashboard.trend_log import DEFAULT_PATH as TREND_LOG_DEFAULT_PATH
+from eval.nodeid import scenario_for_nodeid
 
-HERE = Path(__file__).resolve().parent
+HERE = Path(__file__).resolve().parent  # eval/dashboard/
+EVAL_DIR = HERE.parent  # eval/ -- eval/reports/ lives here, a sibling of this package, not under it
 
 
 def load_trend_log(path: Path = TREND_LOG_DEFAULT_PATH) -> list[dict[str, Any]]:
@@ -80,7 +82,19 @@ _RUN_RE = re.compile(r"^Run: (.+)$")
 _HEADING_RE = re.compile(r"^## (\w+) \(\d+\)$")
 _ENTRY_RE = re.compile(r"^### `(.+)`$")
 _BULLET_RE = re.compile(r"^- \*\*(.+?):\*\*\s?(.*)$")
-_SCENARIO_RE = re.compile(r"\[([^\[\]]+)\]$")
+# A code fence line is 3-OR-MORE backticks (``eval/conftest.py``'s ``_render_field`` sizes the
+# fence longer than the longest backtick run already inside the value it wraps, per CommonMark) --
+# never hardcoded to exactly 3, and the closing fence must match the opening fence's exact length
+# (see ``parse_report``), not just satisfy this pattern on its own.
+_FENCE_RE = re.compile(r"^`{3,}$")
+# The literal heading eval/conftest.py's _render_recommendations_section writes (never matches
+# _HEADING_RE's own "## Word (N)" pattern, since this section has no per-category count suffix) --
+# everything from here to end of file is recommendation prose, not per-scenario data, and must
+# never be mistaken for one: a "- **Recommendation:**"/"- **Evidence:**" bullet attaching to the
+# PRECEDING section's last ScenarioEntry (confirmed as a real finding in PR review) is harmless
+# only by the accident that neither label is in _LABEL_FIELDS today -- parse_report stops here on
+# purpose instead of relying on that accident to hold forever.
+_RECOMMENDATIONS_HEADING = "## Improvement recommendations"
 
 # Bullet label -> ScenarioEntry field name, mirroring the labels ``eval/conftest.py``'s
 # ``_render_metrics_block``/``_render_entry`` write. "What it tests"/"Failure"/"Reason" are handled
@@ -131,11 +145,6 @@ def _suite_for_nodeid(nodeid: str) -> str | None:
     return None
 
 
-def _scenario_for_nodeid(nodeid: str) -> str | None:
-    m = _SCENARIO_RE.search(nodeid)
-    return m.group(1) if m else None
-
-
 def _parse_metric(value: str) -> float | None:
     """``value`` is a float string (``"1.000"``) or the ``"unavailable — ..."`` placeholder
     ``_render_metrics_block`` writes for a scenario whose setup failed before scoring ran."""
@@ -164,21 +173,24 @@ def parse_report(path: Path) -> ParsedReport:
     entry: ScenarioEntry | None = None
     pending_label: str | None = None
     fenced_lines: list[str] = []
+    fence = ""
 
     i, n = 0, len(lines)
     while i < n:
         line = lines[i]
 
         if pending_label is not None:
-            if line.strip() == "```":
+            if line.strip() == fence:
                 if entry is not None:
                     _assign_field(entry, pending_label, "\n".join(fenced_lines))
-                pending_label, fenced_lines = None, []
+                pending_label, fenced_lines, fence = None, [], ""
             else:
                 fenced_lines.append(line[2:] if line.startswith("  ") else line)
             i += 1
             continue
 
+        if line == _RECOMMENDATIONS_HEADING:
+            break
         if run_m := _RUN_RE.match(line):
             run_at = datetime.fromisoformat(run_m.group(1))
         elif heading_m := _HEADING_RE.match(line):
@@ -192,15 +204,16 @@ def parse_report(path: Path) -> ParsedReport:
                 # Only meaningful for a correctness-suite entry -- the bracket for any other
                 # suite's nodeid (e.g. eval_extended's ``test_inbound[scenario-agent-subject]``)
                 # is a different, non-scenario parametrize id.
-                scenario=_scenario_for_nodeid(nodeid) if suite is not None else None,
+                scenario=scenario_for_nodeid(nodeid) if suite is not None else None,
                 category=category,
             )
             entries.append(entry)
         elif bullet_m := _BULLET_RE.match(line):
             label, value = bullet_m.group(1), bullet_m.group(2)
-            if value == "" and i + 1 < n and lines[i + 1].strip() == "```":
-                pending_label, fenced_lines = label, []
-                i += 1  # skip the opening ``` fence too
+            next_stripped = lines[i + 1].strip() if i + 1 < n else ""
+            if value == "" and _FENCE_RE.match(next_stripped):
+                pending_label, fenced_lines, fence = label, [], next_stripped
+                i += 1  # skip the opening fence line too
             elif entry is not None:
                 _assign_field(entry, label, value)
         i += 1
@@ -301,7 +314,7 @@ def _report_anchor(report: ParsedReport) -> str:
     return "run-" + report.run_at.strftime("%Y%m%dT%H%M%SZ")
 
 
-# Bookkeeping keys every trend-log row carries (eval/trend_log.py's `append_row`, plus
+# Bookkeeping keys every trend-log row carries (eval/dashboard/trend_log.py's `append_row`, plus
 # `scenarios_scored` that every pooling function adds) that are never themselves a plottable
 # metric -- everything else on a row *used* to be one, whatever the suite, back when every metric
 # any pooling function produced was naturally 0-1-bounded (a rate or a score). This chart hardcodes
@@ -543,7 +556,7 @@ def render_dashboard(trend_rows: list[dict[str, Any]], reports: list[ParsedRepor
         )
         trends_body = f'<div class="trends-grid">{chart_sections}</div>'
     else:
-        trends_body = "<p>No trend-log rows yet — run an eval suite to populate eval/trend_log.jsonl.</p>"
+        trends_body = "<p>No trend-log rows yet — run an eval suite to populate eval/dashboard/trend_log.jsonl.</p>"
 
     tables = "".join(render_scenario_table(report) for report in reports)
     drilldown_sections = (
@@ -565,7 +578,7 @@ def render_dashboard(trend_rows: list[dict[str, Any]], reports: list[ParsedRepor
 
 def build_dashboard(
     trend_log_path: Path = TREND_LOG_DEFAULT_PATH,
-    reports_dir: Path = HERE / "reports",
+    reports_dir: Path = EVAL_DIR / "reports",
     output_path: Path = HERE / "dashboard.html",
 ) -> Path:
     """Load the trend log + every per-run report, render the dashboard, write it to

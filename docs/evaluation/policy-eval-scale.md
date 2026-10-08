@@ -173,7 +173,7 @@ Reuses `eval.correctness_scorer.score_scenario`/`score_gate` (the same scorer
   "gates" the way a real scenario's three gates are — each candidate becomes a `(role_name,
   scope_name)` pair against the fixed focal entity (subject-side pairs for the scope direction,
   resource-side pairs for the role direction), so `score_scenario`'s existing per-gate aggregation,
-  `eval/conftest.py`'s report rendering, and `eval/trend_log.py`'s pooling all apply with **zero**
+  `eval/conftest.py`'s report rendering, and `eval/dashboard/trend_log.py`'s pooling all apply with **zero**
   special-casing.
 
 Same zero-tolerance-on-over-grants gate every sibling suite uses; under-grants and incorrect
@@ -188,7 +188,7 @@ dimension/level are checked by separate test functions but land on one row
 (`scale_total_corpus_prb`/`scale_total_corpus_e2e`/`scale_per_decision_prb`/`scale_per_decision_e2e`
 — total-corpus and per-decision, and PRB and e2e, always kept on **separate** rows, per spec §5's
 explicit warning that a system can pass one dimension/level while silently failing the other).
-`eval.trend_log.pool_scale_metrics` pools the structural half (`structural_pass`/
+`eval.dashboard.trend_log.pool_scale_metrics` pools the structural half (`structural_pass`/
 `structural_issue_count`/`wall_clock_seconds`/`total_tokens`/`token_coverage`, common fields both
 dimensions record regardless of their own concrete-check taxonomy) into `structural_pass_rate`/
 `structural_issue_count`/`total_tokens`/`mean_wall_clock_seconds`/`mean_token_coverage`; the
@@ -262,6 +262,6 @@ placement (Nightly, not per-PR).
 
 ## Blocked-by
 
-\#2091 (the committed trend log — already shipped; `eval.trend_log.append_row`/
+\#2091 (the committed trend log — already shipped; `eval.dashboard.trend_log.append_row`/
 `pool_correctness_metrics` reused here unmodified, `pool_scale_metrics` added alongside them). Same
 PRB/e2e prerequisites as every other suite in this family — no new production dependency introduced.

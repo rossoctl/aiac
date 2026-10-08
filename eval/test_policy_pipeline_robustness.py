@@ -59,7 +59,7 @@ shared ``_record_scoring`` helper, ``"true_positives"``/``"denied_total"`` — t
 across the run into its *own* committed trend-log row — ``suite="robustness_mechanical_invariance"``
 for (1), ``robustness_semantic_invariance`` for (2), ``robustness_mechanical_sensitivity`` for (3),
 ``robustness_semantic_sensitivity`` for (4) — carrying that row's own precision/recall/
-denial_precision (``eval.trend_log.pool_correctness_metrics``, the same pooling the two
+denial_precision (``eval.dashboard.trend_log.pool_correctness_metrics``, the same pooling the two
 Correctness suites use, so the resulting charts are directly comparable to them: one measuring
 performance against the *original* inputs, the others against *deliberately edited/reworded*
 inputs) plus that row's own pass/fail rate (``invariance_rate``/``sensitivity_rate`` — spec §9),
@@ -228,7 +228,7 @@ def _record_scoring(
     Also records ``true_positives``/``denied_total`` (the same two raw counts
     ``test_prb_correctness`` records), purely so ``eval/conftest.py``'s ``_write_trend_log`` can
     pool this scenario into an aggregate precision/recall/denial_precision the same way it pools
-    the two Correctness suites (``eval.trend_log.pool_correctness_metrics``) -- giving each
+    the two Correctness suites (``eval.dashboard.trend_log.pool_correctness_metrics``) -- giving each
     robustness family its own precision/recall/denial_precision trend, directly comparable in
     shape to the Correctness charts: one measuring the PRB against the *original* inputs
     (invariance), the other against *deliberately edited* inputs (sensitivity).

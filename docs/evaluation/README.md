@@ -37,8 +37,9 @@ directly — real shell/CI exports still take precedence.
 | `EVAL_PIPELINE_PARALLELISM` (optional) | `eval`, `eval` | Max concurrent workers provisioning scenarios in the shared `pipeline` fixture; defaults to the scenario count (8). |
 | `PRB_CONSISTENCY_REPEATS` (optional) | `eval` | Repeats per scenario; default 5, must be ≥ 2. |
 | `SCALE_TOTAL_CORPUS_SIZE` / `SCALE_TOTAL_CORPUS_ROLES` / `SCALE_PER_DECISION_CANDIDATES` / `SCALE_SEED` (optional) | `eval` (`test_policy_pipeline_scale.py`) | Corpus-size overrides; defaults 100/10/100/0. Override to a small size while iterating — see [policy-eval-scale.md](policy-eval-scale.md). |
-| `SCALE_CONCURRENCY` (optional) | `eval` (`test_policy_pipeline_scale.py`) | Max concurrent PRB decision calls, total-corpus only -- the e2e fixtures' Keycloak-admin calls run one at a time regardless; default 20. |
+| `SCALE_CONCURRENCY` (optional) | `eval` (`test_policy_pipeline_scale.py`) | Max concurrent PRB/Keycloak-admin calls; default 20. |
 | `EVAL_REPORT_TZ` (optional) | none (report only) | Timezone for the Markdown report's timestamp/filename; default UTC. |
+| `EVAL_RECOMMENDATIONS_LLM` (optional) | none (report only) | Set to `0`/`false`/`no` to skip the Improvement-recommendations section's batched LLM call (`eval/recommendations.py`); default enabled. The section still renders via the deterministic fallback grouping — useful for a quick `-k` debug rerun where you don't want to wait on (or pay for) that call. |
 
 Minimal repo-root `.env` for the PRB-level suites only:
 
@@ -105,7 +106,7 @@ run.
 Every run of the six suites above writes a Markdown report to the gitignored `eval/reports/`
 (`report_<DD_MM_HH_MM_SS>.md`) — see `eval/conftest.py`. The two Correctness suites, the
 Robustness suite's mechanical tier, and the Scale suite (one row per dimension/level) additionally
-append one row each to the **committed** `eval/trend_log.jsonl` (spec:
+append one row each to the **committed** `eval/dashboard/trend_log.jsonl` (spec:
 [eval-framework.md §9](eval-framework.md#9-reporting-and-trend-persistence)) — see
 [policy-eval-correctness-prb.md § Trend log](policy-eval-correctness-prb.md#trend-log),
 [policy-eval-robustness-consistency.md § Trend log](policy-eval-robustness-consistency.md#trend-log),
@@ -114,16 +115,16 @@ log](policy-eval-scale.md#test-report-and-trend-log).
 
 ## Dashboard
 
-`eval/dashboard.py` renders a static, self-contained HTML view (inline SVG, no external
+`eval/dashboard/dashboard.py` renders a static, self-contained HTML view (inline SVG, no external
 dependency, no CI wiring) from the two artifacts above — no new data source. Regenerate it after a
 run:
 
 ```bash
-.venv/bin/python -m eval.dashboard
+.venv/bin/python -m eval.dashboard.dashboard
 ```
 
-Writes `eval/dashboard.html` (gitignored, regenerated each time) with one historical trend chart
-per suite present in `eval/trend_log.jsonl`, plus a collapsible scenario drill-down section per
+Writes `eval/dashboard/dashboard.html` (gitignored, regenerated each time) with one historical
+trend chart per suite present in `eval/dashboard/trend_log.jsonl`, plus a collapsible scenario drill-down section per
 report found under `eval/reports/`. A chart point links to its matching report's section when one
 is found on disk within a few hours of that trend-log row's timestamp; otherwise it still shows its
 exact values via a hover tooltip, just without a link.

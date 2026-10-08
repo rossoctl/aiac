@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from eval.trend_log import append_row, pool_consistency_metrics, pool_correctness_metrics, pool_scale_metrics
+from eval.dashboard.trend_log import append_row, pool_consistency_metrics, pool_correctness_metrics, pool_scale_metrics
 
 
 def test_pool_empty_entries_is_vacuously_perfect() -> None:
