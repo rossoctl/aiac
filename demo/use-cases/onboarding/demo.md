@@ -690,8 +690,23 @@ overlapping surface to `restore.sh --include-infra`, then additionally removes:
 ```bash
 make teardown ARGS=--dry-run       # list everything; change nothing
 make teardown                      # tear down (prompts; ARGS=--yes skips)
-make teardown ARGS=--include-opa   # also revert step 2's overlay (needs the chart clone)
+make teardown ARGS=--include-opa   # also undo step 2 (needs the chart clone + helm), see below
+make teardown ARGS=--include-images  # also delete the locally built images
+make teardown ARGS=--all           # both: the full reset
 ```
+
+`--include-opa` undoes everything `k8s/opa-kind-enable.sh` installed:
+
+- the OPA legs in the AuthBridge pipeline (via `k8s/opa-kind-restore.sh`)
+- `bundle-service` in `rossoctl-system`, with its ServiceAccount, ClusterRole/Binding and the
+  `default` global `AuthorizationPolicy`. `opa-kind-restore.sh` alone leaves these running.
+- the `localhost/authbridge:local` image pin on the `rossoctl` release, so sidecars go back to the
+  operator subchart's default image. The operator is restarted to pick that up.
+
+`--include-images` deletes the `localhost/*` images from the Kind node and the host runtime: the
+four AIAC stack images, `github-agent`/`github-tool` and `keycloak-aiac`, plus `operator` and
+`authbridge` when `--include-opa` is also given. Any image a pod still runs is kept and reported.
+After it, re-run `k8s/opa-kind-enable.sh` (if you used `--include-opa`) and `./enable.sh --rebuild`.
 
 **What it deliberately leaves**, because the demo does not own it:
 
@@ -701,8 +716,10 @@ make teardown ARGS=--include-opa   # also revert step 2's overlay (needs the cha
 - **the realm fix-up** (Direct Access Grants, the `username → sub` mapper) — one-time cluster state
   that this demo and the `-m system` suite both depend on.
 - **the operator's `*-aud` audience client scopes**, which it owns and recreates.
-- **step 2's OPA overlay**, unless you pass `--include-opa`.
-- **container images already in the Kind node.** Inert; the script prints the `docker image rm` line.
+- **step 2's OPA overlay, `bundle-service` and the authbridge image pin**, unless you pass `--include-opa`.
+- **the `AuthorizationPolicy` CRD**, even with `--include-opa`. Deleting a CRD deletes every CR of
+  that kind cluster-wide.
+- **container images already in the Kind node**, unless you pass `--include-images`.
 
 > **One caveat on `authproxy-routes`.** The demo declares that ConfigMap in `team1`, so `teardown`
 > deletes it as the symmetric inverse of `deploy.sh`. If your platform also seeds one there, the

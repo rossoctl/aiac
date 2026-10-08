@@ -17,7 +17,10 @@
 #   the AuthorizationPolicy CR  |  the demo's Keycloak users (dev-user/test-user/devops-user)
 #   credentials Secrets         |  the demo's Keycloak realm roles (developer/tester/devops)
 #   the outbound-leg wiring     |  the demo's ROPC client (aiac-demo-cli)
-#   the Keycloak SPI + image    |  optionally the OPA pipeline overlay (--include-opa)
+#   the Keycloak SPI + image    |  optionally everything k8s/opa-kind-enable.sh installed
+#                               |    (--include-opa): the OPA pipeline overlay, bundle-service,
+#                               |    and the local authbridge image pin on the rossoctl release
+#                               |  optionally the locally built container images (--include-images)
 #
 # DELIBERATELY LEFT IN PLACE (platform state this demo does not own — see demo.md "Cleanup"):
 #   - the team1 namespace itself. The Rossoctl installer creates and owns it
@@ -27,16 +30,24 @@
 #     Prerequisites. One-time cluster-wide state that this demo and the system test suite
 #     both depend on, and which is harmless to leave.
 #   - the operator's `*-aud` audience client scopes, which it owns and recreates.
-#   - container images already loaded into the Kind node (inert; `docker image rm` them by hand).
-#     Consequence worth knowing: because these survive, a later `./enable.sh` finds the stack images
-#     present and SKIPS rebuilding them, so a source change made since would not reach the cluster.
-#     Re-install with `./enable.sh --rebuild` to force those builds.
+#   - container images already loaded into the Kind node, unless --include-images. Inert, but
+#     because they survive, a later `./enable.sh` finds the stack images present and SKIPS
+#     rebuilding them, so a source change made since would not reach the cluster. Re-install with
+#     `./enable.sh --rebuild` to force those builds.
+#   - the AuthorizationPolicy CRD, even with --include-opa. Deleting a CRD deletes every CR of that
+#     kind cluster-wide, and the operator chart may own it.
 #
 # Usage:
 #   ./teardown.sh --dry-run        # list everything that WOULD be removed; change nothing
 #   ./teardown.sh                  # tear down (prompts for confirmation)
 #   ./teardown.sh --yes            # tear down without prompting
-#   ./teardown.sh --include-opa    # also revert the OPA pipeline overlay (needs ROSSOCTL_DIR)
+#   ./teardown.sh --include-opa    # also undo k8s/opa-kind-enable.sh: the OPA pipeline overlay,
+#                                  # bundle-service, and the localhost/authbridge image pin
+#                                  # (needs ROSSOCTL_DIR and helm)
+#   ./teardown.sh --include-images # also delete the locally built images from the Kind node and
+#                                  # the host runtime (operator + authbridge only with --include-opa,
+#                                  # since otherwise the cluster still runs them)
+#   ./teardown.sh --all            # --include-opa --include-images: the full reset
 #   ./teardown.sh --aiac-only      # uninstall ONLY AIAC: delete the aiac-system namespace and
 #                                  # nothing else (the inverse of ./enable.sh)
 #
@@ -56,6 +67,9 @@
 #   KC, REALM             Keycloak base URL + realm
 #   KIND_CLUSTER          Kind cluster name, for the kubeconfig refresh (default: rossoctl)
 #   ROSSOCTL_DIR          Helm chart clone, only for --include-opa      (default: ../../../../rossoctl)
+#   RELEASE_NAME          rossoctl helm release, only for --include-opa (default: rossoctl)
+#   RELEASE_NAMESPACE     its namespace, where bundle-service runs      (default: rossoctl-system)
+#   CONTAINER_RUNTIME     docker | podman, only for --include-images    (default: as opa-kind-enable.sh)
 #   NS_WAIT_SECS          how long to wait for aiac-system to finalize  (default: 180)
 
 set -euo pipefail
@@ -70,19 +84,25 @@ KC="${KC:-http://keycloak.localtest.me:8080}"
 REALM="${REALM:-rossoctl}"
 KIND_CLUSTER="${KIND_CLUSTER:-rossoctl}"
 NS_WAIT_SECS="${NS_WAIT_SECS:-180}"
+ROSSOCTL_DIR="${ROSSOCTL_DIR:-$AIAC_DIR/../rossoctl}"
+RELEASE_NAME="${RELEASE_NAME:-rossoctl}"
+RELEASE_NAMESPACE="${RELEASE_NAMESPACE:-rossoctl-system}"
 
 DRY_RUN=0
 ASSUME_YES=0
 DO_OPA=0
+DO_IMAGES=0
 AIAC_ONLY=0
 for arg in "$@"; do
   case "$arg" in
     --dry-run) DRY_RUN=1 ;;
     --yes|-y) ASSUME_YES=1 ;;
     --include-opa) DO_OPA=1 ;;
+    --include-images) DO_IMAGES=1 ;;
+    --all) DO_OPA=1; DO_IMAGES=1 ;;
     --aiac-only) AIAC_ONLY=1 ;;
     "") ;;
-    *) echo "Usage: $0 [--dry-run] [--yes] [--include-opa | --aiac-only]" >&2; exit 1 ;;
+    *) echo "Usage: $0 [--dry-run] [--yes] [--include-opa] [--include-images] [--all] [--aiac-only]" >&2; exit 1 ;;
   esac
 done
 # Contradictory: --aiac-only touches nothing outside aiac-system, and the OPA overlay lives in the
@@ -156,6 +176,11 @@ step "Preflight"
 for c in kubectl curl python3; do
   command -v "$c" >/dev/null 2>&1 || die "missing required command on PATH: $c"
 done
+if [ "$DO_OPA" -eq 1 ]; then
+  command -v helm >/dev/null 2>&1 || die "--include-opa needs helm on PATH"
+  [ -f "$ROSSOCTL_DIR/charts/rossoctl/Chart.yaml" ] \
+    || die "--include-opa needs the rossoctl chart clone — set ROSSOCTL_DIR (tried ${ROSSOCTL_DIR})"
+fi
 if ! kubectl cluster-info >/dev/null 2>&1; then
   if command -v kind >/dev/null 2>&1 && kind get clusters 2>/dev/null | grep -qx "$KIND_CLUSTER"; then
     info "cluster unreachable — re-exporting kubeconfig for Kind cluster '${KIND_CLUSTER}'"
@@ -194,6 +219,13 @@ info "configmap ${NS}/authproxy-routes: $(present configmap authproxy-routes "$N
 OPA_COUNT=$(kubectl get configmap authbridge-runtime-config -n "$NS" \
               -o jsonpath='{.data.config\.yaml}' 2>/dev/null | grep -c 'name: opa' || true)
 info "OPA legs wired in ${NS}:         ${OPA_COUNT:-0} (2 = both; teardown leaves this unless --include-opa)"
+info "deployment ${RELEASE_NAMESPACE}/bundle-service: $(present deployment bundle-service "$RELEASE_NAMESPACE" | sed 's/yes/present/;s/no/absent/')"
+# The image pin as the operator actually renders it, not as helm reports the user values — see
+# drop_authbridge_pin() for why those two can disagree.
+AUTHBRIDGE_IMAGE=$(kubectl get configmap "${RELEASE_NAME}-platform-config" -n "$RELEASE_NAMESPACE" \
+                     -o jsonpath='{.data.config\.yaml}' 2>/dev/null \
+                   | sed -n 's/^  authbridge: *//p' | head -1 || true)
+info "authbridge sidecar image:        ${AUTHBRIDGE_IMAGE:-unknown}"
 
 if [ "$DRY_RUN" -eq 0 ] && [ "$ASSUME_YES" -eq 0 ]; then
   if [ "$AIAC_ONLY" -eq 1 ]; then
@@ -310,24 +342,163 @@ except Exception: print("")')
   fi
 fi
 
-# ── 5. Optional: the OPA pipeline overlay ─────────────────────────────────────
+# ── 5. Optional: everything k8s/opa-kind-enable.sh installed ─────────────────
+# drop_authbridge_pin — re-render the rossoctl release without
+# operator-chart.defaults.images.authbridge, so sidecars go back to the operator subchart's own
+# default image. opa-kind-restore.sh re-applies that pin on purpose (it only reverts the pipeline),
+# so this runs after it.
+#
+# Takes the release's stored user values and passes them back explicitly with -f, rather than
+# `--reuse-values --set ...authbridge=null`: on this chart that removes the key from the stored
+# values but still renders the old pin into ${RELEASE_NAME}-platform-config, and a second
+# --reuse-values upgrade keeps rendering it. Only an explicit -f of the clean values clears it.
+drop_authbridge_pin() {
+  local vals had
+  vals="$(mktemp "${TMPDIR:-/tmp}/teardown-values.XXXXXX")"
+  # JSON is valid YAML, so helm reads this file as-is — no PyYAML needed.
+  had=$(helm get values "$RELEASE_NAME" -n "$RELEASE_NAMESPACE" -o json \
+        | python3 -c '
+import sys, json
+v = json.load(sys.stdin) or {}
+had = v.get("operator-chart", {}).get("defaults", {}).get("images", {}).pop("authbridge", "")
+json.dump(v, open(sys.argv[1], "w"))
+print(had)' "$vals") || { rm -f "$vals"; warn "could not read the ${RELEASE_NAME} release values"; return 1; }
+  if [ -z "$had" ] && ! printf '%s' "$AUTHBRIDGE_IMAGE" | grep -q '^localhost/'; then
+    rm -f "$vals"
+    info "no authbridge image pin on release ${RELEASE_NAME} — already on the chart default"
+    return 0
+  fi
+  if [ "$DRY_RUN" -eq 1 ]; then
+    rm -f "$vals"
+    info "[dry-run] would helm upgrade ${RELEASE_NAME} with its current values minus" \
+         "operator-chart.defaults.images.authbridge (${had:-$AUTHBRIDGE_IMAGE}), then restart the operator"
+    return 0
+  fi
+  ( cd "$ROSSOCTL_DIR/charts/rossoctl" && helm dependency build >/dev/null ) \
+    && helm upgrade "$RELEASE_NAME" "$ROSSOCTL_DIR/charts/rossoctl" -n "$RELEASE_NAMESPACE" \
+         -f "$vals" >/dev/null \
+    || { rm -f "$vals"; warn "helm upgrade to drop the authbridge pin failed"; return 1; }
+  rm -f "$vals"
+  # The operator reads its platform config at startup, so a re-rendered ConfigMap alone does not
+  # change which image the next injected sidecar gets.
+  kubectl rollout restart "deployment/${RELEASE_NAME}-controller-manager" -n "$RELEASE_NAMESPACE" >/dev/null
+  kubectl rollout status "deployment/${RELEASE_NAME}-controller-manager" -n "$RELEASE_NAMESPACE" \
+    --timeout=180s >/dev/null || warn "operator restart did not finish within 180s"
+  AUTHBRIDGE_IMAGE=$(kubectl get configmap "${RELEASE_NAME}-platform-config" -n "$RELEASE_NAMESPACE" \
+                       -o jsonpath='{.data.config\.yaml}' | sed -n 's/^  authbridge: *//p' | head -1)
+  if printf '%s' "$AUTHBRIDGE_IMAGE" | grep -q '^localhost/'; then
+    warn "release re-rendered but the authbridge image is still ${AUTHBRIDGE_IMAGE}"
+    return 1
+  fi
+  pass "authbridge sidecar image back to the chart default (${AUTHBRIDGE_IMAGE})"
+}
+
 if [ "$DO_OPA" -eq 1 ]; then
   step "Reverting the OPA pipeline overlay (k8s/opa-kind-restore.sh)"
   if [ -x "$AIAC_DIR/k8s/opa-kind-restore.sh" ]; then
     if [ "$DRY_RUN" -eq 1 ]; then
       info "[dry-run] would run: ${AIAC_DIR}/k8s/opa-kind-restore.sh"
     else
-      ROSSOCTL_DIR="${ROSSOCTL_DIR:-$AIAC_DIR/../rossoctl}" bash "$AIAC_DIR/k8s/opa-kind-restore.sh" \
+      ROSSOCTL_DIR="$ROSSOCTL_DIR" RELEASE_NAME="$RELEASE_NAME" RELEASE_NAMESPACE="$RELEASE_NAMESPACE" \
+        AGENT_NAMESPACE="$NS" bash "$AIAC_DIR/k8s/opa-kind-restore.sh" \
         || warn "opa-kind-restore.sh failed — it needs a ROSSOCTL_DIR chart clone and helm on PATH"
     fi
   else
     warn "k8s/opa-kind-restore.sh not found or not executable — skipping"
   fi
+
+  step "Deleting bundle-service from ${RELEASE_NAMESPACE} (opa-kind-enable.sh Step 1)"
+  # opa-kind-restore.sh leaves this running. It was rendered with `helm template | kubectl apply`,
+  # outside any release, so nothing else will ever remove it. Names mirror the five templates
+  # opa-kind-enable.sh renders from the operator chart's templates/bundleservice/.
+  run kubectl delete -n "$RELEASE_NAMESPACE" --ignore-not-found \
+    deployment/bundle-service service/bundle-service serviceaccount/bundle-service
+  # default-policy.yaml's global AuthorizationPolicy. Only meaningful as bundle-service's input.
+  run kubectl delete authorizationpolicies.agent.rossoctl.dev default -n "$RELEASE_NAMESPACE" --ignore-not-found
+  run kubectl delete --ignore-not-found \
+    "clusterrole/${RELEASE_NAME}-bundle-service" "clusterrolebinding/${RELEASE_NAME}-bundle-service"
+  info "the AuthorizationPolicy CRD is left in place (deleting it would delete every policy CR)"
+
+  step "Dropping the local authbridge image pin from release ${RELEASE_NAME} (opa-kind-enable.sh Step 2)"
+  drop_authbridge_pin || warn "authbridge pin NOT dropped — its image will be kept below too"
 elif [ "$AIAC_ONLY" -eq 1 ]; then
   step "OPA pipeline overlay left wired (--aiac-only)"
 else
-  step "OPA pipeline overlay left wired (pass --include-opa to revert it)"
-  info "it is a cluster-level change owned by k8s/, and reverting it needs the ROSSOCTL_DIR chart clone"
+  step "OPA pipeline overlay, bundle-service and authbridge pin left in place (pass --include-opa)"
+  info "they are cluster-level changes owned by k8s/, and reverting them needs the ROSSOCTL_DIR chart clone"
+fi
+
+# ── 6. Optional: the locally built container images ───────────────────────────
+# Image names mirror where each is built: init/01-prereqs.py AIAC_IMAGES (the four stack images),
+# demo/assets/kind-load.sh (github-*), enable.sh (keycloak-aiac), k8s/opa-kind-enable.sh
+# (operator, authbridge).
+DEMO_IMAGES=(
+  localhost/aiac-pdp-config:local
+  localhost/aiac-pdp-policy-opa:local
+  localhost/aiac-policy-model-store:local
+  localhost/aiac-agent:local
+)
+if [ "$AIAC_ONLY" -eq 0 ]; then
+  # restore.sh --include-infra (step 1) put Keycloak back on its stock image.
+  DEMO_IMAGES+=(localhost/github-agent:latest localhost/github-tool:latest localhost/keycloak-aiac:local)
+fi
+if [ "$DO_OPA" -eq 1 ]; then
+  DEMO_IMAGES+=(localhost/operator:local localhost/authbridge:local)
+fi
+
+# remove_image <image> — from every Kind node's containerd and from the host runtime. Skips an
+# image a pod still runs, which is how a failed step above keeps its image instead of leaving a
+# workload that cannot restart.
+remove_image() {
+  local img="$1" node
+  if printf '%s\n' "$IMAGES_IN_USE" | grep -qxF "$img"; then
+    warn "${img} is still used by a running pod — kept"
+    return 0
+  fi
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "[dry-run] would remove ${img} from the Kind node(s) and ${CONTAINER_RUNTIME}"
+    return 0
+  fi
+  for node in $KIND_NODES; do
+    if "$CONTAINER_RUNTIME" exec "$node" crictl rmi "$img" >/dev/null 2>&1; then
+      info "removed ${img} from node ${node}"
+    fi
+  done
+  if "$CONTAINER_RUNTIME" image rm "$img" >/dev/null 2>&1; then
+    info "removed ${img} from ${CONTAINER_RUNTIME}"
+  fi
+}
+
+if [ "$DO_IMAGES" -eq 1 ]; then
+  step "Deleting the locally built images from the Kind node(s) and the host runtime"
+  KIND_NODES="$(kind get nodes --name "$KIND_CLUSTER" 2>/dev/null || true)"
+  # Whichever runtime can actually see the Kind node: a `docker` on PATH may be a podman shim, or
+  # a real Docker that knows nothing of a podman-provider cluster. Falls back to the same choice
+  # as k8s/opa-kind-enable.sh, which loaded some of these.
+  if [ -z "${CONTAINER_RUNTIME:-}" ]; then
+    first_node="$(printf '%s\n' "$KIND_NODES" | head -1)"
+    for rt in docker podman; do
+      if [ -n "$first_node" ] && command -v "$rt" >/dev/null 2>&1 \
+         && "$rt" inspect "$first_node" >/dev/null 2>&1; then
+        CONTAINER_RUNTIME="$rt"; break
+      fi
+    done
+  fi
+  if [ -z "${CONTAINER_RUNTIME:-}" ]; then
+    if [ "${KIND_EXPERIMENTAL_PROVIDER:-}" = "podman" ] || ! command -v docker >/dev/null 2>&1; then
+      CONTAINER_RUNTIME=podman
+    else
+      CONTAINER_RUNTIME=docker
+    fi
+  fi
+  [ -n "$KIND_NODES" ] || warn "no nodes found for Kind cluster '${KIND_CLUSTER}' — removing host copies only"
+  IMAGES_IN_USE="$(kubectl get pods -A \
+    -o jsonpath='{range .items[*]}{range .spec.containers[*]}{.image}{"\n"}{end}{range .spec.initContainers[*]}{.image}{"\n"}{end}{end}' \
+    2>/dev/null | sort -u || true)"
+  for img in "${DEMO_IMAGES[@]}"; do remove_image "$img"; done
+  [ "$DRY_RUN" -eq 1 ] || pass "local images removed (anything still in use was kept and reported above)"
+else
+  step "Container images left in place (pass --include-images to delete them)"
 fi
 
 # ── Report ────────────────────────────────────────────────────────────────────
@@ -367,6 +538,10 @@ Verify the demo is gone:
   kubectl get deployment,svc,sa -n ${NS} | grep github         # expect: no matches
   kubectl get authorizationpolicies.agent.rossoctl.dev -n ${NS}  # expect: no github-agent
   kubectl get ns ${NS}                                         # expect: still Active (installer-owned)
+$([ "$DO_OPA" -eq 1 ] && printf '%s\n' \
+"  kubectl get deploy bundle-service -n ${RELEASE_NAMESPACE}        # expect: NotFound" \
+"  kubectl get cm authbridge-runtime-config -n ${NS} -o jsonpath='{.data.config\\.yaml}' | grep -c 'name: opa'  # expect: 0")
+$([ "$DO_IMAGES" -eq 1 ] && printf '%s' "  docker exec ${KIND_CLUSTER}-control-plane crictl images | grep localhost/   # expect: no matches (podman exec on podman)")
 
   # realm should hold none of the demo's users/roles/client:
   ADMIN=\$(curl -s -X POST "${KC}/realms/master/protocol/openid-connect/token" \\
@@ -384,14 +559,15 @@ Still in place, by design (platform state this demo does not own):
   - the 'rossoctl' client's Direct Access Grants + username->sub mapper (demo.md Prerequisites).
     This demo and the system test suite both rely on these.
   - the operator's '*-aud' audience client scopes, which it owns and recreates.
-  - container images in the Kind node (inert). Remove by hand if you want the disk back:
-      docker image rm localhost/aiac-{pdp-config,pdp-policy-opa,policy-model-store,agent}:local \\
-                      localhost/github-{agent,tool}:latest
-    Because they survive, a plain './enable.sh' will SKIP rebuilding the stack images and re-load
-    these — so any source change you made since would not reach the cluster. Use --rebuild below.
-$([ "$DO_OPA" -eq 0 ] && printf '%s' "  - the OPA pipeline overlay in ${NS} — re-run with --include-opa to revert it.")
+$([ "$DO_IMAGES" -eq 0 ] && printf '%s\n' \
+"  - container images in the Kind node (inert) — re-run with --include-images to delete them." \
+"    Because they survive, a plain './enable.sh' will SKIP rebuilding the stack images and re-load" \
+"    these — so any source change you made since would not reach the cluster. Use --rebuild below.")
+$([ "$DO_OPA" -eq 0 ] && printf '%s' "  - the OPA pipeline overlay, bundle-service and the authbridge image pin — re-run with --include-opa.")
+$([ "$DO_OPA" -eq 1 ] && printf '%s' "  - the AuthorizationPolicy CRD (deleting it would delete every policy CR cluster-wide).")
 
-To stand the demo back up: see demo.md, Part 1.
+To stand the demo back up: see demo.md, Part 1.$([ "$DO_OPA" -eq 1 ] && printf '\n%s' \
+"  ../../../k8s/opa-kind-enable.sh   # first: OPA overlay, bundle-service, local authbridge + operator images")
   ./enable.sh --rebuild     # rebuild the four stack images from current source, then install
   ./enable.sh               # reuse the images already built (faster; no source change since)
 EOF
