@@ -62,7 +62,7 @@ Represents a role. Per Assumption 3 (policy-model spec), **user** roles are Keyc
 |-------|------|----------------|---------|
 | `id` | `str` | `id` | |
 | `name` | `str` | `name` | |
-| `description` | `str \| None` | `description` | |
+| `description` | `str \| None` | `description` | `None` |
 | `composite` | `bool` | `composite` | |
 | `childRoles` | `list[Role]` | `composites.realm` | `[]` |
 | `attributes` | `dict[str, Any]` | `attributes` | `{}` |
@@ -216,9 +216,12 @@ retried write then makes no duplicate, as follows:
 
 > **Known gap — a retried create.** The two create routes are not idempotent: a retried
 > `create_role` / `create_scope` whose first attempt was committed fails with `409`. UC1 Provision
-> then fails with `502`. The new role or scope is not in the created-manifest (the call failed), so
-> the rollback does not delete it; the next run reuses it by name and does not record it as created.
-> This gap existed before the retry (the first `5xx` failed the run the same way).
+> then fails with `502`. A Provision failure is not a rollback error, so no rollback runs (the
+> Orchestrator calls Provision before the `try` block of the rollback). This role or scope stays in
+> Keycloak, not mapped to the service. Each role or scope that the same run created and mapped
+> before the failure also stays. The next run finds them all by name, reuses and maps them, and does
+> not record them as created, so a later rollback does not delete them either. This gap existed
+> before the retry (the first `5xx` failed the run the same way).
 
 ### Dependencies
 ```
@@ -352,7 +355,7 @@ The PCE calls `get_roles()` one time for each operation, next to `get_services()
 2. Returns an empty list when no service exposes the scope.
 3. Raises `IdPHTTPError` on any underlying non-2xx (propagated from `get_services()` / `_build_service()`).
 
-> **Performance note:** because both methods delegate to `get_services()`, each call inherits its full fan-out cost (see the `get_services()` performance note above — `2N + 1 + roles` HTTP requests for N services). Acceptable for the low-frequency PCE resolution path. If it becomes a bottleneck, the right fix is a real server-side `role_id` / `scope_id` filter on `GET /services`.
+> **Performance note:** because both methods delegate to `get_services()`, each call inherits its full fan-out cost (see the `get_services()` performance note above — `2N + 1 + roles` HTTP requests for N services). Acceptable for ad-hoc callers: no runtime path of AIAC calls these methods (only tests do). If it becomes a bottleneck, the right fix is a real server-side `role_id` / `scope_id` filter on `GET /services`.
 
 > **P1 client-side filter — handoff 03 audit (no change required).** With ownership now explicit on
 > the entities (`Role.kind`/`actorIds`, `Scope.serviceId`), the P1 client-side filter was audited for
@@ -364,9 +367,11 @@ The PCE calls `get_roles()` one time for each operation, next to `get_services()
 > from the service-side truth. The filter still returns **only** genuine owners/exposers and returns
 > `[]` for realm-level roles that no service owns. No client-side re-derivation of role kind is
 > introduced by these methods; `get_services_by_role` is **retained as a method** for API completeness
-> and ad-hoc callers, but the current SPM-based PCE no longer calls it: its **only** runtime IdP read is
-> `Configuration.get_services()` (see `aiac.policy.computation`), and owner/role lookups against stored
-> policy go through the Policy Model Store's `get_service_policies_by_role`, not this IdP filter.
+> and ad-hoc callers, but the PCE does not call it. Its runtime IdP reads are
+> `Configuration.get_services()` and `Configuration.get_roles()`, one time for each operation under the
+> PCE lock ([D32](../PRD.md#key-architectural-decisions); it never reads `get_subjects()`). Owner and
+> role lookups against stored policy go through the Policy Model Store's `get_service_policies_by_role`,
+> not this IdP filter.
 
 `get_subjects_by_role(role: Role) -> list[Subject]`:
 1. `GET {AIAC_PDP_CONFIG_URL}/subjects?role_id={role.id}&realm=<self.realm>`

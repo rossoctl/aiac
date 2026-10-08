@@ -589,6 +589,15 @@ and is **not yet enforced** here.
 > failed onboarding), except the focus service. So the PRB never judges a pair with a quarantined
 > service. See [`uc1-service-onboarding.md` → Service Policy Builder](uc1-service-onboarding.md#sub-agent-service-policy-builder).
 
+> **A shared role or scope can be on both sides (D32).** The resolver takes the candidates from the
+> other services by owner service, not by role id or scope id. So a role that the focus service
+> shares with another service can be a candidate role, and the other owner's copy of a shared scope
+> can be a candidate scope. A call can then get a *(role, scope)* pair where a holder of the role
+> owns the scope (a self-mapping): a shared role of the focus service on an own scope, or a shared
+> own role on a scope of its other holder. D32 allows this: the PRB judges such a pair as it judges
+> any other pair, and no filter removes it. See
+> [`uc1-service-onboarding.md` → Shared roles and scopes: self-mapping (D32)](uc1-service-onboarding.md#shared-roles-and-scopes-self-mapping-d32).
+
 > **Door B removed (#2540).** UC1 previously also ran a user-role-focal **deny-only** pass
 > (`build_role_denies` over each `RoleKind.USER` candidate role, alongside the scope-focal pass) to
 > derive user-role exclusivity denies. Under digested input that pass is redundant and has been

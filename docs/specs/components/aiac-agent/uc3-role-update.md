@@ -11,6 +11,8 @@
 | Event Broker (NATS) | `aiac.apply.role.{name}` (percent-encoded role name; originated by Keycloak SPI role created/updated) |
 | HTTP (debug) | `POST /apply/role/{role_id}` |
 
+> **Key contract: open.** The two triggers do not give the same key now. The NATS subject carries the role **name**: the SPI percent-encodes it into one NATS token, and the consumer (`eventbus/consumer.py`) decodes it with `unquote` before it calls `update_role`. The debug route gives its `{role_id}` path segment to `update_role` unchanged. Until UC3 is built, the stub reads no key, so give the role name on the route too. A name alone is ambiguous for a client role: the subject carries only the last segment of the role path, not the client. So the final contract must use the name and the owning client, or the SPI must publish the role id (see [`keycloak-spi/README.md` → Known gaps / open questions](../../../../keycloak-spi/README.md#known-gaps--open-questions)).
+
 ## Architecture
 
 Single path, no create/update branch. The sub-agent is **deterministic** (non-LLM).
@@ -47,7 +49,7 @@ flowchart TD
 **Nature:** deterministic, non-LLM. Pure IdP reader.
 
 **Steps:**
-1. Read the triggering role (`role_id`) from `aiac.idp.configuration.api`.
+1. Read the triggering role from `aiac.idp.configuration.api`, with the key that the trigger gives (see the key contract in [Triggers](#triggers)).
 2. **Flatten the triggering role to its closure** via the shared `flatten_role` helper (see [Composite role flattening](#composite-role-flattening)): the role itself plus all descendant roles from `role.childRoles`, de-duplicated by `role.id`. A non-composite role yields just itself.
 3. Read **all scopes** from `aiac.idp.configuration.api`.
 4. Call `build_role_rules(r, all_scopes)` on the PRB **once per role `r` in the closure**, and merge the results into a single `list[PolicyRule]`.

@@ -72,9 +72,12 @@ selects where a `tools/call` is checked
 - **Target side (the default).** The tool's own inbound OPA decides each tool call, from its own CR. The
   inbound package allows a `tools/call` only when the delegated user and the calling agent
   (`github-agent`) both hold a role granted that tool, and no deny vetoes it (D26). The MCP session
-  messages (`initialize`, `notifications/initialized`, `ping`, `tools/list`) pass only when at least one
-  of the four tools passes that check. The outbound packages of `github-agent` and of this tool are
-  pass-throughs (D24).
+  messages (`initialize`, `notifications/initialized`, `ping`, `tools/list`) pass when at least one
+  of the four tools passes that check. They also pass for the tool's own client (the self-discovery
+  rule: `input.identity.client_id` is the tool's clientId,
+  `spiffe://localtest.me/ns/team1/sa/github-tool` on Kind), so that UC-1 discovery can list the
+  tools. A `tools/call` never passes this way. The outbound packages of `github-agent` and of this
+  tool are pass-throughs (D24).
 - **Agent side.** This tool gets a **pass-through CR**: both of its request packages allow every
   request. The outbound OPA package of the calling agent (`github-agent`) allows a `tools/call` only for
   a granted tool.
@@ -159,8 +162,9 @@ answers `tools/list` with the four tools of §3.
 - **Tool-CALL handlers:** trivial **no-op / echo stubs**. A `tools/call` for any of the four returns a
   stub result (e.g. a text content block echoing the tool name + received arguments, or a fixed
   `"stub: not implemented in phase-1 demo"` message). They perform **no** GitHub work. This is
-  acceptable because phase 1 drives no live traffic — but the endpoint must still be a **real,
-  deployable MCP server** that answers `tools/list`.
+  acceptable because the system tests call the tool only to check the OPA decision (a JSON-RPC
+  result or an OPA `403`), and they do not examine the stub result (see §2). The endpoint must
+  still be a **real, deployable MCP server** that answers `tools/list`.
 - **Location:** self-contained under `demo/assets/tools/github_tool/`, mirroring the agent's
   `demo/assets/agents/github_agent/` layout. Ships its own `Dockerfile`, dependency manifest, and the
   `k8s/` manifests of §7.

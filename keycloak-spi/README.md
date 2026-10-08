@@ -44,7 +44,8 @@ publishes `aiac.apply.role-members.{role-id}` for each role, with the payload `{
 ### Keycloak facts
 
 We read these facts in the bytecode of `keycloak-services` `26.5.2` (the live version) with
-`javap -c -p`. The pom version, `26.7.3`, has the same code.
+`javap -c -p`. The pom version, `26.7.3`, has the same code. The custom image uses `26.6.3` (see
+[Build the custom Keycloak image](#build-the-custom-keycloak-image)).
 
 - `RoleMapperResource` sets the resource type `REALM_ROLE_MAPPING` in its constructor.
   `UserResource.getRoleMappings()` (`@Path("role-mappings")`) and `GroupResource.getRoleMappings()`
@@ -88,12 +89,20 @@ commit of its after-completion transaction, in event order. A rollback publishes
 
 ### Provision gives this event too
 
-UC1 Provision maps each role to the service account of the service
-(`POST /services/{id}/roles/{role_id}` on the IdP Configuration Service, which calls
+UC1 Provision maps each role to the service account of the service, also a role that it reuses
+by name (`POST /services/{id}/roles/{role_id}` on the IdP Configuration Service, which calls
 `assign_realm_roles` on `users/{service-account-user-id}/role-mappings/realm`). A UC1 rollback
-unmaps it (`delete_realm_roles_of_user`). Each of these gives a `role-members` event. This is
-correct: the AIAC Agent renders again the CRs that use the role, so a new holder of a shared role
-gets the grants of the role at once. A new role has no SPM edge, so its event changes nothing.
+unmaps only the roles that this run created (the created-manifest), with
+`delete_realm_roles_of_user`, and deletes each of these roles that then has no member. Each
+mapping and each unmap gives a `role-members` event. This is correct: the AIAC Agent renders again
+the CRs that use the role, so a new holder of a shared role gets the grants of the role at once
+(when the platform Keycloak runs an image with this listener; see
+[PRD → Role members · a new render](../docs/specs/PRD.md#role-members--a-new-render-aiacapplyrole-membersrole-id)).
+A new role has no SPM edge, so its event changes nothing.
+
+A reused (shared) role stays mapped to the disabled client, so the rollback gives no event for it.
+The quarantine renders the CRs that use that role again without the client, because a disabled
+service is not a holder (D32).
 
 ### Known limits
 
@@ -109,6 +118,12 @@ These changes give no `role-members` event:
 - **A user delete.** Keycloak removes the role mappings of a deleted user (also of the service
   account of a deleted client) with no `REALM_ROLE_MAPPING` event. The resync at the next
   Controller start renders the CRs with the current holders.
+- **A role delete.** Keycloak sends only `REALM_ROLE` (or `CLIENT_ROLE`) + `DELETE`, and the
+  listener drops it. In `keycloak-services` `26.5.2`, `RoleContainerResource.deleteRole` and
+  `RoleByIdResource.deleteRole` remove the role and its mappings with no `REALM_ROLE_MAPPING` event.
+  The CRs keep the old holders until the resync at the next Controller start, or until
+  `POST /apply/role-members/{role_id}` with the id of the deleted role. That render gives the role
+  no holder (fail closed).
 
 ## Publish after the commit
 
@@ -174,6 +189,11 @@ The Dockerfile is a 3-stage build: compile the shaded jar, drop it into
 `/opt/keycloak/providers/` and run `kc.sh build` (bakes the augmented server into the image, no
 per-pod build at startup), then copy the built distribution into the final runtime image.
 
+The base image is `quay.io/keycloak/keycloak:26.6.3`: `KEYCLOAK_VERSION` in the `Makefile` (it is
+also in the image tag) and the default of the `KEYCLOAK_IMAGE` build argument in the `Dockerfile`.
+Change the two values together. Keep them at `26.6.3` or higher: `26.6.3` is the first version
+that clears the advisories against `26.5.2` (see the comment on `keycloak.version` in `pom.xml`).
+
 ## Install
 
 **Jar-only** (existing Keycloak/RHBK deployment):
@@ -221,9 +241,11 @@ reachable, or the client closed it after its reconnect budget), the next commit 
 to publish tries again.
 
 Setting either on the live Keycloak pod is the separate Helm chart's responsibility, not this
-repo's — this code is ready for it either way. Verify the exact SPI env var naming against a
-running Keycloak 26.6.3 instance before relying on it in a deploy runbook; it's inferred from
-Keycloak's documented CLI-flag-to-env-var convention, not confirmed here.
+repo's — this code is ready for it either way. Verify the exact SPI env var naming against the
+Keycloak that runs it before relying on it in a deploy runbook: `26.6.3` with the custom image, or
+the version of your Keycloak with the jar-only install (the live version is `26.5.2`, see
+[Keycloak facts](#keycloak-facts)). It's inferred from Keycloak's documented
+CLI-flag-to-env-var convention, not confirmed here.
 
 ## Testing
 
@@ -272,13 +294,14 @@ podman run --rm -v "$PWD/keycloak-spi:/build" -v "$HOME/.m2:/root/.m2" -w /build
   docker.io/library/maven:3.9-eclipse-temurin-17 mvn -B test      # or: mvn -B package
 ```
 
-The pom compiles against Keycloak `26.7.3`. To check the code against the Keycloak version that
-runs live (for example `26.5.2`), add `-Dkeycloak.version=26.5.2`. The Keycloak classes that the
-provider uses (`AbstractKeycloakTransaction`, `KeycloakTransactionManager.enlistAfterCompletion`,
+The pom compiles against Keycloak `26.7.3`. To check the code against another Keycloak version,
+for example the live version `26.5.2` or the base of the custom image `26.6.3`, add
+`-Dkeycloak.version=<version>` (for example `-Dkeycloak.version=26.5.2`). The Keycloak classes that
+the provider uses (`AbstractKeycloakTransaction`, `KeycloakTransactionManager.enlistAfterCompletion`,
 `KeycloakSession.getTransactionManager`, `JsonSerialization.readValue(String, Class)`,
-`ResourceType.REALM_ROLE_MAPPING`) have the same API in `26.5.2` and `26.7.3`. With
+`ResourceType.REALM_ROLE_MAPPING`) have the same API in `26.5.2`, `26.6.3` and `26.7.3`. With
 `-Dkeycloak.version`, `AiacEventListenerProviderKeycloakManagerTest` uses the transaction manager of
-that version; it passes with `26.5.2` and with `26.7.3`.
+that version; all the tests pass with `26.5.2`, `26.6.3` and `26.7.3`.
 
 To verify manually, against a live Keycloak:
 
@@ -312,4 +335,4 @@ To verify manually, against a live Keycloak:
   event: the resync at the next Controller start, or `POST /apply/role-members/{role_id}` on the
   Controller.
 - **Role mappings** have known limits (groups, composite roles, client-role mappings, a user
-  delete). See [Role mappings](#known-limits).
+  delete, a role delete). See [Role mappings](#known-limits).
