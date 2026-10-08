@@ -26,6 +26,7 @@ from aiac.agent.policy_rules_builder.graph import (
 )
 from aiac.agent.uc.onboarding.orchestrator import ServiceNotVisibleError
 from aiac.agent.uc.onboarding.preconditions import EnforcementPreconditionError
+from aiac.idp.configuration.api import IdPHTTPError
 from aiac.idp.configuration.models import Role, Scope, ServiceType
 from aiac.policy.model.models import PolicyRule, RuleEffect, ServicePolicyModel, TargetSidePolicyModel
 
@@ -146,12 +147,20 @@ def test_apply_role_members_rerenders_the_role_with_no_prb_run():
     pce.assert_not_called()
 
 
-def test_apply_role_members_surfaces_a_dependency_error_status():
-    # rerender_role re-raises a dependency error (IdP, store or PDP); the route surfaces its status.
-    with patch("aiac.agent.controller.routes.rerender_role", side_effect=HTTPException(status_code=502)):
-        resp = client.post("/apply/role-members/role-1")
+def test_apply_role_members_answers_500_on_a_dependency_error():
+    # rerender_role re-raises a dependency error as it is: the library error of the IdP (IdPHTTPError), the
+    # store or the PDP writer (a RuntimeError). No Controller handler maps it, so the route answers 500, as
+    # every PCE path does (aiac-agent.md → Upstream → HTTP status). The client returns the server's 500
+    # response instead of raising the error in the test.
+    unhandled = TestClient(app, raise_server_exceptions=False)
+    with patch(
+        "aiac.agent.controller.routes.rerender_role",
+        side_effect=IdPHTTPError(502, '{"error": "Keycloak unavailable"}'),
+    ):
+        resp = unhandled.post("/apply/role-members/role-1")
 
-    assert resp.status_code == 502
+    assert resp.status_code == 500
+    assert resp.text == "Internal Server Error"
 
 
 def test_apply_role_does_not_rerender():
