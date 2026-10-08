@@ -659,15 +659,15 @@ def prepare_pipeline(
     *,
     realm: str,
     rego_dir: Path,
-    db_prefix: str,
+    db_path: Path,
     idp: tuple[str, int],
     store: tuple[str, int],
     opa: tuple[str, int],
 ) -> tuple[Service, Service, Service]:
     """The env and the idp/store/opa ``Service`` triple that one in-process PRB+PCE run needs.
 
-    Wipes and recreates ``rego_dir``, makes a fresh store DB under a ``db_prefix`` temp dir, and
-    sets (through ``setenv``) every env var that the in-process PCE reads: the realm, the four
+    Wipes and recreates ``rego_dir``, points the store at ``db_path`` (the caller gives a fresh
+    path and owns its directory), and sets (through ``setenv``) every env var that the in-process PCE reads: the realm, the four
     ``AIAC_*_URL`` vars at the ``(host, port)`` pairs, and the enforcement side. Each caller that
     runs the pipeline uses this one helper, so a new pipeline setting reaches all of them. The
     caller sets ``AIAC_POLICY_FILE`` itself (a run can use more than one policy file). ``setenv``
@@ -676,7 +676,6 @@ def prepare_pipeline(
     if rego_dir.exists():
         shutil.rmtree(rego_dir)
     rego_dir.mkdir(parents=True)
-    db_path = Path(tempfile.mkdtemp(prefix=db_prefix)) / "policy_model.db"
 
     setenv("KEYCLOAK_REALM", realm)  # PCE reads this back
     setenv("AIAC_PDP_CONFIG_URL", f"http://{idp[0]}:{idp[1]}")
@@ -746,12 +745,14 @@ def _provision_scenario(name: str, idp_port: int, store_port: int, opa_port: int
 
         rego_dir = HERE / "rego_out" / "policy_pipeline_eval" / name
         os.environ["AIAC_POLICY_FILE"] = str(digested_policy_path(scenario))
-        # A worker process of its own, so a direct os.environ write cannot leak into another test.
+        # A worker process, never the pytest process, so a direct os.environ write cannot leak into a
+        # test. A worker can run more than one scenario (EVAL_PIPELINE_PARALLELISM < 8); that is safe
+        # only because prepare_pipeline sets every var on each call -- keep it so (no conditional set).
         idp, store, opa = prepare_pipeline(
             os.environ.__setitem__,
             realm=scenario.REALM_DEFAULT,
             rego_dir=rego_dir,
-            db_prefix=f"aiac-store-eval-{name}-",
+            db_path=Path(tempfile.mkdtemp(prefix=f"aiac-store-eval-{name}-")) / "policy_model.db",
             idp=(idp_host, idp_port),
             store=(store_host, store_port),
             opa=(opa_host, opa_port),

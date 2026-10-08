@@ -345,8 +345,8 @@ _SCALE_TEST_MARKERS: dict[str, tuple[str, str]] = {
     "::test_scale_per_decision_correctness_e2e": ("scale_per_decision_e2e", "correctness"),
 }
 
-# The Scale correctness test functions (from _SCALE_TEST_MARKERS above). When a Scale fixture's
-# setup fails, these get the same "unavailable, here's why" metrics block as
+# The Scale correctness test functions (from _SCALE_TEST_MARKERS above). When one fails before it
+# records its scores, it gets the same "unavailable, here's why" metrics block as
 # _CORRECTNESS_TEST_MARKERS/_ROBUSTNESS_SCORED_TEST_MARKERS, not only a crash message.
 _SCALE_CORRECTNESS_TEST_MARKERS = tuple(
     marker for marker, (_suite, check_type) in _SCALE_TEST_MARKERS.items() if check_type == "correctness"
@@ -408,19 +408,6 @@ def _scale_run_matches_fixed_100(scale_suite: str) -> bool:
     dimension = "total_corpus" if "total_corpus" in scale_suite else "per_decision"
     defaults = {**_SCALE_SHARED_DEFAULTS, **_SCALE_DIMENSION_DEFAULTS[dimension]}
     return all(os.environ.get(var, default) == default for var, default in defaults.items())
-
-
-def _reduced_size_scale_suites() -> list[str]:
-    """The Scale suites that ran in this session at a size other than fixed-100 (see
-    ``_scale_run_matches_fixed_100``). The report names them in its header, so ``eval/dashboard.py``
-    does not count such a run as a full one (a report has no ``run_type`` of its own)."""
-    ran = {
-        scale_suite
-        for nodeid in _reports
-        for marker, (scale_suite, _check_type) in _SCALE_TEST_MARKERS.items()
-        if marker in nodeid
-    }
-    return sorted(suite for suite in ran if not _scale_run_matches_fixed_100(suite))
 
 
 def _format_best_effort_notes(notes: dict[str, str]) -> str:
@@ -568,7 +555,16 @@ def _render_entry(lines: list[str], nodeid: str, report: pytest.TestReport, cate
         detail = _detail(report, category)
         if detail:
             _render_field(lines, "Failure", detail)
-        _render_metrics_block(lines, props, unavailable_reason="scenario setup failed before scoring could run")
+        # The 8-scenario suites report a scenario setup failure in the call phase (pytest.fail in
+        # _require_scenario); a Scale fixture's setup failure is a real setup-phase error, so a
+        # Scale call-phase failure happened in the test body, after setup.
+        is_scale = any(marker in nodeid for marker in _SCALE_CORRECTNESS_TEST_MARKERS)
+        reason = (
+            "the test failed before scoring could run"
+            if is_scale and report.when == "call"
+            else "scenario setup failed before scoring could run"
+        )
+        _render_metrics_block(lines, props, unavailable_reason=reason)
     else:
         doc = _docstrings.get(nodeid)
         if doc:
@@ -580,7 +576,7 @@ def _render_entry(lines: list[str], nodeid: str, report: pytest.TestReport, cate
     lines.append("")
 
 
-def _write_trend_log() -> None:
+def _write_trend_log() -> list[str]:
     """One committed trend-log row per Correctness suite present in this session (PRB-level
     and/or end-to-end), plus one per Robustness family x tier combination (invariance/sensitivity,
     mechanical/semantic) — spec: docs/evaluation/eval-framework.md §9. Pools every scenario's
@@ -608,7 +604,12 @@ def _write_trend_log() -> None:
 
     Always stamped in UTC, independent of ``EVAL_REPORT_TZ`` (that variable only controls the
     gitignored per-run Markdown report's timestamp/filename) — a committed file read by every
-    contributor and by downstream trend analysis must not carry a per-contributor UTC offset."""
+    contributor and by downstream trend analysis must not carry a per-contributor UTC offset.
+
+    Returns the Scale suites whose row this call tagged "partial" (sorted). The report header
+    names them, so ``eval/dashboard.py`` does not count them as full (a report has no ``run_type``
+    of its own) -- one decision, made here, for both the trend log and the dashboard."""
+    partial_scale_suites: list[str] = []
     by_suite: dict[str, list[dict]] = {}
     robustness_flags: dict[str, list[bool]] = {}
     robustness_entries: dict[str, list[dict]] = {}
@@ -699,7 +700,10 @@ def _write_trend_log() -> None:
                 f"correctness scored {len(correctness)} -- scenarios_scored is ambiguous, row tagged partial"
             )
             run_type = "partial"
+        if run_type == "partial":
+            partial_scale_suites.append(scale_suite)
         append_row(scale_suite, scale_metrics, run_type=run_type)
+    return partial_scale_suites
 
 
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
@@ -718,7 +722,7 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
         buckets[cat].sort(key=lambda pair: pair[0])
 
     now = datetime.now(REPORT_TZ)
-    _write_trend_log()
+    partial_scale_suites = _write_trend_log()
     total = len(_reports)
     lines = [
         "# policy-eval-scenarios test report",
@@ -727,8 +731,8 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
         f"Exit status: {exitstatus}",
         f"Total: {total} — " + ", ".join(f"{cat}={len(buckets[cat])}" for cat in order),
     ]
-    if reduced := _reduced_size_scale_suites():
-        lines.append(f"Reduced-size Scale suites: {', '.join(reduced)}")
+    if partial_scale_suites:
+        lines.append(f"Partial Scale suites: {', '.join(partial_scale_suites)}")
     lines.append("")
     for cat in order:
         entries = buckets[cat]

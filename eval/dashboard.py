@@ -77,7 +77,7 @@ _SUITE_BY_NODEID_MARKER = {
 }
 
 _RUN_RE = re.compile(r"^Run: (.+)$")
-_REDUCED_RE = re.compile(r"^Reduced-size Scale suites: (.+)$")
+_PARTIAL_SCALE_RE = re.compile(r"^Partial Scale suites: (.+)$")
 _HEADING_RE = re.compile(r"^## (\w+) \(\d+\)$")
 _ENTRY_RE = re.compile(r"^### `(.+)`$")
 _BULLET_RE = re.compile(r"^- \*\*(.+?):\*\*\s?(.*)$")
@@ -123,9 +123,9 @@ class ParsedReport:
     path: Path
     run_at: datetime
     entries: list[ScenarioEntry] = field(default_factory=list)
-    # Scale suites that ran at a size other than fixed-100 (the report header's
-    # "Reduced-size Scale suites:" line, eval/conftest.py's _reduced_size_scale_suites). Never full.
-    reduced_suites: set[str] = field(default_factory=set)
+    # Scale suites whose trend-log row this run tagged "partial" (the report header's
+    # "Partial Scale suites:" line, from eval/conftest.py's _write_trend_log). Never full.
+    partial_suites: set[str] = field(default_factory=set)
 
 
 def _suite_for_nodeid(nodeid: str) -> str | None:
@@ -163,7 +163,7 @@ def parse_report(path: Path) -> ParsedReport:
     mirroring ``eval/conftest.py``'s render logic in reverse (see module docstring)."""
     lines = path.read_text(encoding="utf-8").splitlines()
     run_at: datetime | None = None
-    reduced_suites: set[str] = set()
+    partial_suites: set[str] = set()
     category = ""
     entries: list[ScenarioEntry] = []
     entry: ScenarioEntry | None = None
@@ -186,8 +186,8 @@ def parse_report(path: Path) -> ParsedReport:
 
         if run_m := _RUN_RE.match(line):
             run_at = datetime.fromisoformat(run_m.group(1))
-        elif reduced_m := _REDUCED_RE.match(line):
-            reduced_suites = {suite.strip() for suite in reduced_m.group(1).split(",")}
+        elif partial_m := _PARTIAL_SCALE_RE.match(line):
+            partial_suites = {suite.strip() for suite in partial_m.group(1).split(",")}
         elif heading_m := _HEADING_RE.match(line):
             category = heading_m.group(1)
         elif entry_m := _ENTRY_RE.match(line):
@@ -214,7 +214,7 @@ def parse_report(path: Path) -> ParsedReport:
 
     if run_at is None:
         raise ValueError(f"{path}: no 'Run:' line found")
-    return ParsedReport(path=path, run_at=run_at, entries=entries, reduced_suites=reduced_suites)
+    return ParsedReport(path=path, run_at=run_at, entries=entries, partial_suites=partial_suites)
 
 
 def parse_reports(reports_dir: Path) -> list[ParsedReport]:
@@ -240,8 +240,8 @@ def parse_reports(reports_dir: Path) -> list[ParsedReport]:
 _EXPECTED_SCENARIO_COUNT = 8
 
 # Suites whose "full" scored-entry count isn't the shared 8-scenario corpus -- explicit overrides,
-# checked before the default above. A Scale run at a reduced size is not full either -- see
-# _full_suites. The Scale suite's four correctness test functions (#2469) are
+# checked before the default above. A Scale run that the trend log tagged "partial" is not full
+# either -- see _full_suites. The Scale suite's four correctness test functions (#2469) are
 # each exactly one fixture-backed test case (one generated total-corpus/per-decision scenario per
 # dimension/level), never a sweep over multiple named scenarios, so "full" for them is 1, not 8 --
 # without this override _full_suites (and therefore render_scenario_table/_find_matching_report)
@@ -270,14 +270,15 @@ def _full_suites(report: ParsedReport) -> set[str]:
     full-corpus chart point to a `-k`-filtered debug report that happens to fall within the match
     tolerance, landing the link on a section listing none of that suite's scenarios, or on no
     section at all if every suite in that report is partial. A Scale suite that the report names
-    as reduced-size (``ParsedReport.reduced_suites``) is never full, whatever its entry count -- the
-    trend log tags the same run "partial"."""
+    as partial (``ParsedReport.partial_suites`` -- a reduced size, another seed, only one of its
+    two halves run, ...) is never full, whatever its entry count: the trend log tagged the same run
+    "partial"."""
     scored = [e for e in report.entries if e.suite is not None and e.precision is not None]
     counts = Counter(e.suite for e in scored)
     return {
         suite
         for suite, count in counts.items()
-        if count >= _expected_count(suite) and suite not in report.reduced_suites
+        if count >= _expected_count(suite) and suite not in report.partial_suites
     }
 
 

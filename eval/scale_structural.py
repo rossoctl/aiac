@@ -82,8 +82,8 @@ def duplicate_rule_triples(rules: list[PolicyRule]) -> list[tuple[str, str, str]
       ``agent_roles`` lists, or the per-decision fixtures' candidate lists) accidentally listing the
       same scope/role twice, which ``_assemble_rules`` would then faithfully restate twice.
     - **e2e level**, over the real persisted post-``compute_and_apply`` ``ServicePolicyModel``
-      rules (``eval.test_policy_pipeline_scale._merged_rules_for``, queried via
-      ``aiac.policy.model_store.library.api.get_service_policy`` while the Policy Model Store is
+      rules (``eval.test_policy_pipeline_scale._merged_rules_for``, read in one request via
+      ``aiac.policy.model_store.library.api.list_service_policies`` while the Policy Model Store is
       still running) -- the one place a real merge-engine dedup-by-``role.id``+``scope.id``+
       ``effect`` bug could actually show up. **Not** the rendered Rego: ``aiac.pdp.service.policy.
       opa.rego``'s own grouping functions (``_group_rules``/``_group_rules_deprefixed``) always

@@ -29,7 +29,7 @@ class TestPreparePipeline:
             monkeypatch.setenv,
             realm="r1",
             rego_dir=tmp_path / "rego",
-            db_prefix="aiac-test-",
+            db_path=tmp_path / "policy_model.db",
             idp=("127.0.0.1", 7600),
             store=("127.0.0.1", 7602),
             opa=("127.0.0.1", 7601),
@@ -41,6 +41,7 @@ class TestPreparePipeline:
         assert os.environ["AIAC_PDP_POLICY_URL"] == "http://127.0.0.1:7601"
         assert (idp.port, store.port, opa.port) == (7600, 7602, 7601)
         assert opa.env["REGO_OUTPUT_DIR"] == str(tmp_path / "rego")
+        assert store.env["SERVICEPOLICY_DB_PATH"] == str(tmp_path / "policy_model.db")
         assert (tmp_path / "rego").is_dir()
 
     def test_wipes_an_old_rego_dir(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -51,7 +52,7 @@ class TestPreparePipeline:
             monkeypatch.setenv,
             realm="r1",
             rego_dir=rego_dir,
-            db_prefix="aiac-test-",
+            db_path=tmp_path / "policy_model.db",
             idp=("127.0.0.1", 7600),
             store=("127.0.0.1", 7602),
             opa=("127.0.0.1", 7601),
