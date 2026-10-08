@@ -556,11 +556,11 @@ def _render_entry(lines: list[str], nodeid: str, report: pytest.TestReport, cate
         detail = _detail(report, category)
         if detail:
             _render_field(lines, "Failure", detail)
-        # One neutral reason for every suite: the Failure field above gives the cause (a scenario
-        # setup failure, a fixture error, or an error in the test body). The pytest phase cannot
-        # tell these apart -- the 8-scenario suites report a scenario setup failure in the call
-        # phase (pytest.fail in _require_scenario).
-        _render_metrics_block(lines, props, unavailable_reason="the test failed before scoring could run (see Failure)")
+        # Only the setup phase is a sure sign of a fixture error. A call-phase failure can be a test-
+        # body error or a scenario setup failure (the 8-scenario suites report that in the call
+        # phase, pytest.fail in _require_scenario), so say only what is sure; Failure gives the cause.
+        reason = "a fixture failed before the test ran" if report.when == "setup" else "the test failed before scoring"
+        _render_metrics_block(lines, props, unavailable_reason=reason + (" (see Failure)" if detail else ""))
     else:
         doc = _docstrings.get(nodeid)
         if doc:

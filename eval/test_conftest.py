@@ -103,9 +103,8 @@ class TestWriteTrendLogPartialScaleSuites:
         self, monkeypatch: pytest.MonkeyPatch, rows: list[tuple[str, str]]
     ) -> None:
         self._ran(monkeypatch, "test_scale_total_corpus_structural_prb", "test_scale_total_corpus_correctness_prb")
-        partial = _write_trend_log()
-        assert partial == []
-        assert partial == sorted(suite for suite, run_type in rows if run_type == "partial")
+        assert _write_trend_log() == []
+        assert rows == [("scale_total_corpus_prb", "regression")]
 
     def test_a_reduced_size_run_is_partial(self, monkeypatch: pytest.MonkeyPatch, rows: list[tuple[str, str]]) -> None:
         self._ran(monkeypatch, "test_scale_total_corpus_structural_prb", "test_scale_total_corpus_correctness_prb")
@@ -128,9 +127,8 @@ class TestWriteTrendLogPartialScaleSuites:
         nodeid = "eval/test_policy_pipeline_scale.py::test_scale_total_corpus_correctness_prb"
         monkeypatch.setattr(eval_conftest, "_reports", {nodeid: SimpleNamespace(nodeid=nodeid, user_properties=[])})
         monkeypatch.setenv("SCALE_TOTAL_CORPUS_SIZE", "10")
-        partial = _write_trend_log()
-        assert partial == []
-        assert partial == sorted(suite for suite, run_type in rows if run_type == "partial")
+        assert _write_trend_log() == []
+        assert rows == []
 
     def test_a_count_mismatch_between_the_halves_is_partial(
         self, monkeypatch: pytest.MonkeyPatch, rows: list[tuple[str, str]]

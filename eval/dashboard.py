@@ -101,8 +101,9 @@ _FLOAT_FIELDS = {"precision", "recall", "denial_precision"}
 class ScenarioEntry:
     """One ``### \\`nodeid\\``` entry from a per-run Markdown report (``eval/conftest.py``'s
     ``_render_entry``). ``suite``/``scenario`` are ``None`` for a non-correctness-suite entry.
-    ``precision``/``recall``/``denial_precision`` are ``None`` when the scenario's own setup failed
-    before scoring ever ran (``_render_metrics_block``'s ``unavailable_reason`` branch)."""
+    ``precision``/``recall``/``denial_precision`` are ``None`` when the test failed before scoring
+    ever ran -- a fixture error, a scenario setup failure or a test-body error
+    (``_render_metrics_block``'s ``unavailable_reason`` branch)."""
 
     nodeid: str
     suite: str | None = None
