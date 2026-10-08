@@ -33,10 +33,11 @@ the side, filtered to live services (in the catalog and not disabled; the focus 
 live), in one ``apply_policy`` call — no call when the policy model is empty:
 
 - target side: the services whose SPM changed in this run (the ``changed`` set: routed,
-  override-purged, reconciled, and the focus SPM);
+  override-purged, reconciled, stale holders, and the focus SPM), and, when the run lifts a
+  quarantine, the services whose SPM has an edge of a role of the focus service (see "Quarantine");
 - agent side: the affected agents (the owners of the batch's agent roles, each touched owner that
-  is an agent, and each agent that targets a touched SPM), plus the pass-through of the focus
-  service when it is a tool.
+  is an agent, each agent that targets a touched SPM, and, at a lift, the agents among those
+  services), plus the pass-through of the focus service when it is a tool.
 
 A stale or missing CR stays until its service is affected again, or until the resync.
 
@@ -88,7 +89,13 @@ Quarantine. ``quarantine(service_id, deleted_roles)`` is the UC1 failure-path co
 the same store footprint and deletes the CR of the service (D20: in an AIAC setup the global
 combiner denies a pod that has no client CR). ``compute_and_apply``'s routing guard then drops every
 later rule that touches a disabled service, so a build that started before the quarantine cannot
-write its rules back.
+write its rules back. Only a successful re-onboarding lifts the quarantine: its ``compute_and_apply``
+runs with the service as the focus while its client is still disabled. The quarantine rendered the
+CRs of a shared role of the service without it but did not write those SPMs, so the stale-holders
+check cannot find them. The lift therefore also deploys every live SPM that has an edge of a role of
+the focus service, with the focus as a holder again. It writes only those whose stored holders are
+stale (a run wrote them while the service was quarantined), so each snapshot names the holders that
+its CR names.
 
 Resync, read model, bootstrap. ``resync()`` (D28) runs at every Controller start: one
 ``replace_policy`` (``PUT /policy``) with the full policy model of the side for the live managed
@@ -200,7 +207,7 @@ def _reconcile(
     1. its scope is still one of ``X``'s current ``aiac.managed`` scopes (``model.owned_scopes``,
        seeded from the catalog) — drops retired/churned scopes (e.g. ``*-aud``);
     2. for an ``Agent``-kind role, the role id is still in the catalog — drops retired/churned agent
-       client roles (e.g. a focus-agent self-reference the current builder can no longer emit);
+       client roles (e.g. a role of the focus agent that the catalog no longer has);
     3. for a ``User``-kind role, it is not a superseded generation: user realm roles are
        membership-derived (absent from the catalog; the PCE reads ``get_roles()`` only for their
        current members at render time, D32, and never reads ``get_subjects()``), so among the
@@ -361,17 +368,28 @@ def compute_and_apply(
     of the current side (``enforcement_side()``, read once) with one ``apply_policy`` call — no call
     when it is empty. Live = in the catalog and not disabled; the focus service counts as live.
 
-    - target side: ``TargetSidePolicyModel(services=[SPM(x) for x in changed if x is live])``;
+    - target side: ``TargetSidePolicyModel(services=[SPM(x) for x in changed | lifted if x is
+      live])``;
     - agent side: ``AgentSidePolicyModel(agents=[APM(a) for each live affected agent],
       pass_through=[focus_service] if it is a live tool)``. The affected agents are the owners of
       the batch's agent roles, each touched owner (a routed rule's scope owner, or a ``changed``
-      SPM) that is an agent, and each agent that targets a touched SPM (an Agent-kind inbound edge
-      on it). Each APM is derived from the store just written.
+      SPM) that is an agent, each agent that targets a touched SPM (an Agent-kind inbound edge on
+      it), and each agent in ``lifted``. Each APM is derived from the store just written.
 
     Role holders (D32). Each input rule, and each SPM that the run reads, gets the current holders
     of its role before the routing guard (see "Role holders" in the module docstring). A touched SPM
     whose stored holders are not the current ones is persisted and deployed too, so a duplicate
     rule (for example the second holder of a shared role) still updates the callee's CR.
+
+    The lift (D32). A run whose ``focus_service`` is in the catalog but disabled lifts the
+    quarantine of that service. ``lifted`` is then every live service whose SPM has an edge of a role
+    of the focus service (its ``aiac.managed`` roles), with the focus as a holder again: the
+    quarantine rendered those CRs without it but did not write the SPMs, so their stored holders can
+    still name it and the stale-holders check does not find them, and the run's rules need not touch
+    them. They are deployed. Their rules did not change, so the run writes only those whose stored
+    holders are stale (for example a callee that a run wrote while the focus was quarantined): the
+    snapshot then names the holders that the CR names, so a later stale-holders check sees a later
+    change of the holders. In every other run ``lifted`` is empty.
 
     Routing guard. A disabled client is a failed (quarantined) service; a service absent from the
     catalog is deleted. Under the PCE lock, after the IdP read, the run drops each rule whose scope
@@ -496,8 +514,11 @@ def quarantine(service_id: ClientId, deleted_roles: Iterable[Role] = ()) -> None
 
     Idempotent: a second call finds no SPM and no edges, and deletes the CR again (a 404 counts as
     success). A ``service_id`` that is not in the catalog is a logged no-op. The quarantine is lifted
-    only by a successful re-onboarding: its ``compute_and_apply`` stores ``SPM(X)`` again (also with
-    zero rules, D21) and writes a new CR, then ``reenable_service`` re-enables the client.
+    only by a successful re-onboarding: its ``compute_and_apply`` (X is the focus service, still
+    disabled) stores ``SPM(X)`` again (also with zero rules, D21), writes a new CR, and deploys the
+    SPMs of step 4 that keep an edge of a shared role of X, with X as a holder again (the quarantine
+    did not write them, so the stale-holders check cannot find them; the lift writes only those whose
+    stored holders are stale); then ``reenable_service`` re-enables the client.
 
     Exceptions from any dependency are logged and **re-raised**.
     """
@@ -699,7 +720,7 @@ def _run(rules: list[PolicyRule], override: bool, focus_service: str | None, sid
     # live; with get_roles() it gives the current holders of every role.
     catalog, holders = _read_idp(focus_service)
 
-    # (1.2) The current holders on every input rule: the build's actorIds are a snapshot (a shared
+    # (1a) The current holders on every input rule: the build's actorIds are a snapshot (a shared
     # role carries only the holder that the build saw).
     rules = [holders.refresh_rule(rule) for rule in rules]
 
@@ -710,7 +731,7 @@ def _run(rules: list[PolicyRule], override: bool, focus_service: str | None, sid
     for rule in rules:
         distinct_roles.setdefault(rule.role.id, rule.role)
 
-    # (1.5) Routing guard — drop every rule whose scope owner is not live — disabled (quarantined,
+    # (1b) Routing guard — drop every rule whose scope owner is not live — disabled (quarantined,
     # except the focus service) or absent from the catalog (deleted) — or whose agent role has no
     # live holder. See ``compute_and_apply``.
     live = _live_services(catalog, focus_service)
@@ -755,7 +776,7 @@ def _run(rules: list[PolicyRule], override: bool, focus_service: str | None, sid
     if focus_service is not None and focus_service in catalog:
         changed.add(spm(focus_service).service_id)
 
-    # (3.5) Reconcile touched SPMs against current IdP truth (get_services()-only — no extra IdP
+    # (3b) Reconcile touched SPMs against current IdP truth (get_services()-only — no extra IdP
     # read) so drift cannot accumulate across re-onboarding. At this point ``spms`` holds exactly
     # the touched SPMs (routed + override-purged + the focus SPM). Runs under both merge modes;
     # order-independent (drops only edges whose entity no longer exists).
@@ -765,14 +786,21 @@ def _run(rules: list[PolicyRule], override: bool, focus_service: str | None, sid
         if _reconcile(model, catalog, catalog_agent_role_ids, batch_user_role_ids):
             changed.add(service_id)
 
-    # (3.6) A touched SPM whose stored holders are stale (a holder came or went since it was
+    # (3c) A touched SPM whose stored holders are stale (a holder came or went since it was
     # written) is changed too: persisting it refreshes the snapshot, and deploying it gives its CR
     # the current holders. Else a duplicate rule — the second holder of a shared role — would leave
     # the callee's CR without that holder.
     changed |= stale
 
-    # (4) Persist every changed SPM.
-    for service_id in changed:
+    # (3d) The lift (D32): when this run lifts a quarantine (the focus service is disabled), the
+    # live services whose SPM has an edge of a role of the focus service. Each is deployed. It does
+    # not join ``changed`` (its rules did not change), but loading it adds it to ``stale`` when its
+    # stored holders are not the current ones (a run wrote it while the focus was quarantined), and
+    # step 4 writes that one: its snapshot then names the holders that its CR names.
+    lifted = _lift_callees(focus_service, catalog, live, spm)
+
+    # (4) Persist every changed SPM, and each lifted SPM whose stored holders are stale.
+    for service_id in changed | (lifted & stale):
         apply_service_policy(service_id, spms[service_id])
 
     # (5) The policy-model stage (D23): deploy the affected live services of the side. Only live
@@ -780,18 +808,55 @@ def _run(rules: list[PolicyRule], override: bool, focus_service: str | None, sid
     # placeholder) must not bring its CR back — removing it is ``decommission``'s job; a disabled one
     # stays with no CR.
     if side == EnforcementSide.TARGET_SIDE:
-        # Target side: the changed SPMs — each CR is rendered from the callee's own SPM.
-        _deploy(changed & live, spms)
+        # Target side: the changed SPMs, and the lifted ones — each CR is rendered from the callee's
+        # own SPM.
+        _deploy((changed | lifted) & live, spms)
         return
 
     # Agent side: the affected agents, derived from the store just written (an agent's outbound
     # depends on the SPMs of the services it calls), plus the pass-through CR of a focus tool (D24).
     # Folding ``changed`` into the touched owners is what makes a revocation propagate: under
-    # override an owner that only *lost* edges is in ``changed`` but carries no fresh rule.
+    # override an owner that only *lost* edges is in ``changed`` but carries no fresh rule. A lifted
+    # agent gets the focus back in its inbound ``source_roles``; a lifted tool keeps its
+    # pass-through, and an outbound does not name the holders of its own role, so nothing else.
     touched_owners = {rule.scope.serviceId for rule in rules} | changed
     affected = _affected_agents(distinct_roles.values(), touched_owners, spm, catalog)
+    affected |= {sid for sid in lifted if _is_agent(catalog, sid)}
     pass_through = [focus_service] if focus_service in live and _is_tool(catalog, focus_service) else []
     _deploy_agent_side(affected & live, spm, catalog, pass_through)
+
+
+def _lift_callees(focus_service: str | None, catalog: dict[str, Service], live: set[str], spm) -> set[str]:
+    """The services that the lift of a quarantine re-renders (D32), the focus service excluded.
+
+    A run whose focus service X is in the catalog but disabled is the successful re-onboarding that
+    lifts the quarantine of X (``reenable_service`` runs after the apply). The quarantine rendered the
+    CRs of the SPMs that have an edge of a shared role of X without X, and did not write those SPMs
+    (``_remove_footprint`` step 4b). So their stored holders can still name X: the stale-holders
+    check (step 3c) does not find them, and the run's rules need not touch them. Now X counts as
+    live, so it is a holder again. This returns every live service whose SPM has an edge of a role of
+    X (``SPM(X).owned_roles``, its ``aiac.managed`` roles from the catalog), loaded through the SPM
+    cache with the current holders, so the cache adds to ``stale`` each one whose stored holders are
+    not the current ones. The caller deploys them. Their rules did not change, so it writes only the
+    stale ones: a callee that a run wrote while X was quarantined has a snapshot without X, and if
+    its CR named X but the snapshot did not, a later stale-holders check could not see that X lost
+    the role (the CR would keep X until the resync). After a quarantine, an edge of a role that only
+    X holds is new in this run (the quarantine purged the old ones, and the routing guard dropped
+    every later rule of the role, which had no live holder), so its SPM is already in the ``changed``
+    set: the lift of a service that holds no shared role gets no extra deploy.
+
+    Any other run returns an empty set: no focus service, or an enabled one, which is already a
+    holder in those CRs.
+    """
+    svc = catalog.get(focus_service) if focus_service is not None else None
+    if svc is None or svc.enabled:
+        return set()
+    callees: set[str] = set()
+    for role in spm(svc.serviceId).owned_roles:
+        for stored in get_service_policies_by_role(role):
+            if stored.service_id != svc.serviceId and stored.service_id in live:
+                callees.add(spm(stored.service_id).service_id)
+    return callees
 
 
 def _decommission(service_id: str, side: EnforcementSide) -> None:
@@ -890,7 +955,9 @@ class _Footprint:
     """What ``_remove_footprint`` found for service X; X is in none of the sets.
 
     ``changed``: the services whose SPM the purge changed, written to the store. ``shared``: the
-    services whose SPM has an edge of a shared role of X, not written (their rules did not change).
+    services whose SPM has an edge of a shared role of X, not written (their rules did not change),
+    so their stored holders still name X; the lift of a quarantine deploys them again with X
+    (``_lift_callees``).
     ``agents``: the agents whose agent-side policy uses X — the agents that targeted X, and the
     remaining holders of each shared role of X that has an edge."""
 
@@ -1050,7 +1117,8 @@ def _derive(agent_id, spm) -> AgentPolicyModel:
 
     Each inbound edge on ``SPM(A)`` is classified by ``role.kind`` (User → subject, Agent → source)
     **and** ``effect`` (allow/deny) into one of four inbound buckets; each outbound edge (one of A's
-    own roles referenced on another SPM) is classified by ``effect`` into the target allow/deny
+    own roles referenced on an SPM, also on ``SPM(A)`` itself for a self-mapping of a shared role,
+    which D32 allows) is classified by ``effect`` into the target allow/deny
     bucket and grows ``target_allow_scopes`` / ``target_deny_scopes``. Identity/aggregate maps stay
     effect-agnostic — a deny-only role or subject still registers into them."""
     sa = spm(agent_id)
@@ -1071,10 +1139,11 @@ def _derive(agent_id, spm) -> AgentPolicyModel:
     apm.subject_roles = inbound.subject_roles
     apm.source_roles = inbound.source_roles
 
-    # Outbound — for each of A's own roles, the edges on other services' SPMs that reference it,
-    # split by effect. Relevance is directional: only A's *agent* roles confer an outbound edge, so
-    # a merely shared user role never creates a false edge to a service A does not target. The store
-    # finds the SPMs; the cache gives each one with the current holders.
+    # Outbound — for each of A's own roles, the edges on the SPMs that reference it (also on SPM(A)
+    # itself for a self-mapping of a shared role, which D32 allows), split by effect. Relevance is
+    # directional: only A's *agent* roles confer an outbound edge, so a merely shared user role never
+    # creates a false edge to a service A does not target. The store finds the SPMs; the cache gives
+    # each one with the current holders.
     for role in sa.owned_roles:
         for stored in get_service_policies_by_role(role):
             _derive_outbound(apm, role, spm(stored.service_id))

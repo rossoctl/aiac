@@ -2825,3 +2825,147 @@ def test_agent_side_removing_one_holder_of_a_shared_role_rederives_the_agents_th
     assert [rule.role.actorIds for rule in apm_a1.outbound_target_allow_rules] == [[_A1], [_A1]]
     assert push.pass_through == []
     assert store.service_writes == []
+
+
+# ---- the lift of a quarantine (D32) ----------------------------------------- #
+# The quarantine of team2 re-rendered the callees of the shared role without it, #
+# but did not write them: their stored snapshot still names team2. The lift (a   #
+# successful re-onboarding, team2 is the focus and still disabled) must give     #
+# team2 back to those CRs, also when its batch routes no rule to a callee (an    #
+# edge that the callee's own onboarding stored) or only a duplicate rule (the    #
+# refreshed SPM is equal to the stored one, so it is not stale).                 #
+def _lift_fixture(*, a1_enabled=True, a2_enabled=False, a2_stored=False, snapshot=(_A1, _A2)):
+    """The store after the quarantine of team2: the live tool and agent-b keep the edges of the
+    shared role, with the snapshot of both holders; a disabled tool and a deleted (absent) tool have
+    an edge of it too. ``a2_enabled`` / ``a2_stored`` give the same store for a plain re-onboarding
+    of an enabled team2 instead (not a lift). ``snapshot`` is the stored holders on those edges: a
+    run that wrote the callees while team2 was quarantined left ``(_A1,)``."""
+    TS = _source_read()
+    BS = _scope("s-b-inbound", "agent-b.inbound", service_id="agent-b")
+    DS = _scope("s-disabled-read", service_id="disabled-tool")
+    GS = _scope("s-ghost-read", service_id="ghost-tool")
+    both = _shared(*snapshot)
+    initial = {
+        _T1: _stored_tool(_rule(both, TS)),
+        "agent-b": _spm("agent-b", owned_scopes=[BS], inbound=[_rule(both, BS)]),
+        "disabled-tool": _spm("disabled-tool", type=ServiceType.TOOL, owned_scopes=[DS], inbound=[_rule(both, DS)]),
+        "ghost-tool": _spm("ghost-tool", type=ServiceType.TOOL, owned_scopes=[GS], inbound=[_rule(both, GS)]),
+        _A1: _spm(_A1, owned_roles=[_shared(_A1)]),
+    }
+    if a2_stored:
+        initial[_A2] = _spm(_A2, owned_roles=[_shared(_A2)])
+    catalog = [
+        _agent(_A1, roles=[_shared(_A1)], enabled=a1_enabled),
+        _agent(_A2, roles=[_shared(_A2)], enabled=a2_enabled),
+        _agent("agent-b", scopes=[BS]),
+        _tool(_T1, scopes=[TS]),
+        _tool("disabled-tool", scopes=[DS], enabled=False),
+    ]
+    return catalog, initial
+
+
+def _lift_store(rules, *, catalog, initial) -> FakeStore:
+    return run_engine(rules, catalog=catalog, store_initial=initial, focus_service=_A2)
+
+
+@pytest.mark.parametrize("rules", [[], [_rule(_shared(_A2), _source_read())]], ids=["no-rule", "duplicate-rule"])
+def test_a_lift_redeploys_the_live_callees_of_the_focus_roles_with_the_focus(rules):
+    catalog, initial = _lift_fixture()
+    store = _lift_store(rules, catalog=catalog, initial=initial)
+
+    (push,) = store.policy_pushes  # one call: the focus, and the live callees of its shared role
+    assert [spm.service_id for spm in push.services] == ["agent-b", _T1, _A2]
+    assert [_source_roles(spm) for spm in push.services[:2]] == [{_A1: ["r-src-op"], _A2: ["r-src-op"]}] * 2
+    # The callees' rules did not change and their snapshot is current: only SPM(focus) is written.
+    assert [sid for sid, _ in store.service_writes] == [_A2]
+    assert {sid: m for sid, m in store.data.items() if sid != _A2} == initial
+
+
+def test_a_lift_writes_each_lifted_callee_whose_stored_holders_are_stale(side):
+    # team1's re-onboarding wrote the callees while team2 was quarantined (stale holders, step 3.6),
+    # so their snapshot names team1 only. The lift deploys them with team2, and must write them too:
+    # else the store says team1 only while the CR names team2, and a later run that touches them
+    # cannot see that team2 lost the role (fail open). The disabled and the deleted callees are not
+    # lifted, so they are not written. The write does not make them changed: the deploy is the same.
+    catalog, initial = _lift_fixture(snapshot=(_A1,))
+    store = _lift_store([], catalog=catalog, initial=initial)
+
+    assert sorted(sid for sid, _ in store.service_writes) == sorted(["agent-b", _T1, _A2])
+    for sid in ("agent-b", _T1):
+        assert [rule.role.actorIds for rule in store.data[sid].inbound_allow_rules] == [[_A1, _A2]], sid
+    for sid in ("disabled-tool", "ghost-tool"):
+        assert store.data[sid] == initial[sid], sid
+    (push,) = store.policy_pushes
+    if side == EnforcementSide.TARGET_SIDE:
+        assert [spm.service_id for spm in push.services] == ["agent-b", _T1, _A2]
+        assert [_source_roles(spm) for spm in push.services[:2]] == [{_A1: ["r-src-op"], _A2: ["r-src-op"]}] * 2
+    else:
+        assert [apm.agent_id for apm in push.agents] == ["agent-b", _A2]
+        assert push.pass_through == []
+
+
+def test_agent_side_a_lift_rederives_the_agent_callees_of_the_focus_roles(agent_side):
+    # agent-b's inbound names the holders of the shared role. The tools keep their pass-through, and
+    # team1's outbound does not depend on team2, so neither is deployed.
+    catalog, initial = _lift_fixture()
+    store = _lift_store([], catalog=catalog, initial=initial)
+
+    (push,) = store.policy_pushes
+    assert [apm.agent_id for apm in push.agents] == ["agent-b", _A2]
+    sources = {caller: [r.id for r in roles] for caller, roles in push.agents[0].source_roles.items()}
+    assert sources == {_A1: ["r-src-op"], _A2: ["r-src-op"]}
+    assert push.pass_through == []
+    assert [sid for sid, _ in store.service_writes] == [_A2]
+
+
+def test_a_lift_whose_other_holders_are_all_quarantined_gives_the_role_to_the_focus_only():
+    catalog, initial = _lift_fixture(a1_enabled=False)
+    store = _lift_store([], catalog=catalog, initial=initial)
+
+    (push,) = store.policy_pushes
+    assert [spm.service_id for spm in push.services] == ["agent-b", _T1, _A2]
+    assert [_source_roles(spm) for spm in push.services[:2]] == [{_A2: ["r-src-op"]}] * 2
+
+
+@pytest.mark.parametrize("snapshot", [(_A1, _A2), (_A1,)], ids=["current-snapshot", "stale-snapshot"])
+def test_a_lift_given_again_gives_the_same_deploy(snapshot):
+    # A NATS redelivery before reenable_service: the second run finds SPM(team2) and deploys the same.
+    # The first run wrote the stale callees, so the second run writes only SPM(focus).
+    catalog, initial = _lift_fixture(snapshot=snapshot)
+    store = FakeStore(initial)
+    writes = []
+    for _ in range(2):
+        before = len(store.service_writes)
+        with engine_env(catalog, store) as compute:
+            compute([_rule(_shared(_A2), _source_read())], focus_service=_A2)
+        writes.append(sorted(sid for sid, _ in store.service_writes[before:]))
+
+    first, second = store.policy_pushes
+    assert first == second
+    assert writes[1] == [_A2]
+
+
+def test_an_onboarding_of_an_enabled_service_does_not_redeploy_the_callees_of_its_roles(side):
+    # Not a lift: the callees' CRs already name team2, so only what the run changed is deployed.
+    catalog, initial = _lift_fixture(a2_enabled=True, a2_stored=True)
+    store = _lift_store([_rule(_shared(_A2), _source_read())], catalog=catalog, initial=initial)
+
+    (push,) = store.policy_pushes
+    if side == EnforcementSide.TARGET_SIDE:
+        assert [spm.service_id for spm in push.services] == [_A2]
+    else:
+        assert [apm.agent_id for apm in push.agents] == [_A1, _A2]  # the holders of the batch's role
+
+
+@pytest.mark.parametrize("enabled", [False, True], ids=["lift", "onboarding"])
+def test_a_lift_of_a_service_that_holds_no_shared_role_deploys_what_an_onboarding_deploys(enabled):
+    # The quarantine purged the edges of a role that only X holds, so the lift finds none to redeploy:
+    # it deploys what its run changed, as an onboarding of an enabled X does.
+    XR = _agent_role("r-x", "x.skill", owner="x-agent")
+    TS = _source_read()
+    catalog = [_agent("x-agent", roles=[XR], enabled=enabled), _tool(_T1, scopes=[TS])]
+    store = run_engine([_rule(XR, TS)], catalog=catalog, store_initial={_T1: _stored_tool()}, focus_service="x-agent")
+
+    (push,) = store.policy_pushes
+    assert [spm.service_id for spm in push.services] == [_T1, "x-agent"]
+    assert sorted(sid for sid, _ in store.service_writes) == [_T1, "x-agent"]
