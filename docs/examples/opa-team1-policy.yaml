@@ -39,7 +39,8 @@
 # client_id, scopes}. OUTBOUND there is no validated JWT, so the plugin
 # synthesizes input.identity from the token-exchange delegation hop. `subject` is
 # the JWT `sub` claim; rossoctl-realm tokens carry the username in `sub` (via a
-# username->sub protocol mapper — see A.1 in k8s/opa-kind-runbook.md).
+# username->sub protocol mapper — see "One-time Keycloak realm fix-up" in
+# demo/use-cases/onboarding/demo.md).
 apiVersion: agent.rossoctl.dev/v1alpha1
 kind: AuthorizationPolicy
 metadata:

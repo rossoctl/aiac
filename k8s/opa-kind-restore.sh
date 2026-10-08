@@ -3,8 +3,8 @@
 #
 # Re-applies the rossoctl chart's real, untouched charts/rossoctl/values.yaml
 # (no OPA/parser overlay) and restarts the authbridge sidecars so they pick
-# up the reverted pipeline. Mirrors the "Rollback" section of
-# authbridge/docs/opa-kind-runbook.md verbatim — since opa-kind-enable.sh
+# up the reverted pipeline. This is the "Restore" section of
+# k8s/opa-kind-runbook.md — since opa-kind-enable.sh
 # never wrote to values.yaml, "restoring" it is just re-running helm upgrade
 # against that same file with no overlay on top.
 #
@@ -14,6 +14,9 @@
 # cluster/local-image setup, not the OPA overlay, and the chart's own
 # defaults assume OpenShift (openshift: true), so dropping them breaks
 # the upgrade on Kind (see mcp-gateway.yaml's openshiftDomain check).
+#
+# Leaves bundle-service, the AuthorizationPolicy CRD and any policy CRs in
+# place — without opa in the pipeline nothing consults them.
 #
 # Env vars:
 #   ROSSOCTL_DIR        path to the rossoctl/rossoctl repo clone (the chart)
@@ -54,7 +57,8 @@ helm upgrade "$RELEASE_NAME" "$CHART_DIR" -n "$RELEASE_NAMESPACE" \
   --set operator-chart.defaults.images.authbridge="$IMAGE_TAG"
 
 echo "==> Restarting authbridge pods in ${AGENT_NAMESPACE}"
-kubectl delete pods -n "$AGENT_NAMESPACE" -l rossoctl.io/type=agent
+# --ignore-not-found so this no-ops cleanly when the namespace has no agent pods.
+kubectl delete pods -n "$AGENT_NAMESPACE" -l rossoctl.io/type=agent --ignore-not-found
 
 cat <<EOF
 ==> Done.

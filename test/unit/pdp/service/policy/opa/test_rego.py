@@ -14,6 +14,7 @@ maps (``subject_roles`` / ``source_roles`` / ``agent_roles``) keep their names.
 """
 
 import json
+import re
 import shutil
 import subprocess
 import tempfile
@@ -231,9 +232,9 @@ def test_inbound_split_scope_maps_from_split_rule_lists():
 
 def test_inbound_subject_gates_use_identity_fields():
     rego = generate_inbound_rego(_github_agent())
-    assert "some role in subject_roles[input.identity.subject]" in rego
-    assert "some scope in subject_role_allow_scopes[role]" in rego
-    assert "some scope in subject_role_deny_scopes[role]" in rego
+    assert "some role in object.get(subject_roles, input.identity.subject, [])" in rego
+    assert "some scope in object.get(subject_role_allow_scopes, role, [])" in rego
+    assert "some scope in object.get(subject_role_deny_scopes, role, [])" in rego
     assert "scope in agent_scopes" in rego
 
 
@@ -241,8 +242,8 @@ def test_inbound_platform_bypass_default_rossoctl():
     rego = generate_inbound_rego(_github_agent())
     assert "source_allow_ok if { not input.identity.client_id }" in rego
     assert 'source_allow_ok if { input.identity.client_id == "rossoctl" }' in rego
-    assert "some role in source_roles[input.identity.client_id]" in rego
-    assert "some scope in source_role_allow_scopes[role]" in rego
+    assert "some role in object.get(source_roles, input.identity.client_id, [])" in rego
+    assert "some scope in object.get(source_role_allow_scopes, role, [])" in rego
 
 
 def test_inbound_platform_bypass_multiple_clients():
@@ -254,7 +255,7 @@ def test_inbound_platform_bypass_multiple_clients():
 def test_inbound_source_deny_gate_present():
     rego = generate_inbound_rego(_github_agent())
     assert "source_deny_ok if {" in rego
-    assert "some scope in source_role_deny_scopes[role]" in rego
+    assert "some scope in object.get(source_role_deny_scopes, role, [])" in rego
 
 
 def test_inbound_has_default_deny_and_deny_overrides_allow():
@@ -351,15 +352,15 @@ def test_outbound_no_prefixed_scope_leaks():
 
 def test_outbound_gates_use_nested_identity_and_mcp_input():
     rego = generate_outbound_rego(_github_agent())
-    assert "some role in subject_roles[input.identity.subject]" in rego
-    assert "tool in subject_role_allow_scopes[role]" in rego
-    assert "tool in subject_role_deny_scopes[role]" in rego
+    assert "some role in object.get(subject_roles, input.identity.subject, [])" in rego
+    assert "tool in object.get(subject_role_allow_scopes, role, [])" in rego
+    assert "tool in object.get(subject_role_deny_scopes, role, [])" in rego
     assert "subject_allow_ok if { subject_allows(input.mcp.params.name) }" in rego
     assert "subject_deny_ok if { subject_denies(input.mcp.params.name) }" in rego
     assert "target_allow_ok if { target_allows(input.mcp.params.name) }" in rego
-    assert "tool in target_allow_scopes[input.identity.service_id]" in rego
+    assert "tool in object.get(target_allow_scopes, input.identity.service_id, [])" in rego
     assert "target_deny_ok if { target_denies(input.mcp.params.name) }" in rego
-    assert "tool in target_deny_scopes[input.identity.service_id]" in rego
+    assert "tool in object.get(target_deny_scopes, input.identity.service_id, [])" in rego
     assert "default allow := false" in rego
     assert (
         'allow if { input.mcp.method == "tools/call"; subject_allow_ok; target_allow_ok; not subject_deny_ok; not target_deny_ok }'
@@ -920,3 +921,92 @@ def test_tools_call_stays_a_per_tool_check(subject, tool, allowed):
 def test_every_other_mcp_method_is_denied(mcp):
     rego = generate_outbound_rego(_session_model())
     _assert_opa_allow(rego, _OUTBOUND, _outbound_input("dev-user", mcp), False)
+
+
+# --- Regression: empty maps must never be indexed directly -------------------
+#
+# A map rendered empty (``var := {}``) is typed by OPA as an object with a
+# CLOSED, empty key set, so a direct ``var[key]`` is a static
+# ``rego_type_error: undefined ref ... want (one of): []``. That error fails the
+# WHOLE bundle at activation: the OPA plugin never initializes and AuthBridge
+# rejects every request on that leg with
+# ``503 upstream.unreachable "opa policy engine not initialized"``.
+#
+# Seen in the live github-agent sidecar: 7 such errors from the six maps that
+# rendered empty. The fix is rego._lookup — every map read goes through
+# ``object.get(map, key, [])``, which is well-typed whether or not the map has
+# keys and iterates zero times on a miss (identical semantics).
+#
+# NOTE the version trap: OPA 1.17 ACCEPTS the direct index and 1.21 (what the
+# proxy embeds) rejects it, so the opa-based check below only bites on a
+# new-enough binary. The textual test above it is version-independent and is the
+# one that actually guards this on any machine.
+
+# Every map emitted by rego._render_map, in either package.
+_GENERATED_MAPS = (
+    "subject_roles",
+    "source_roles",
+    "subject_role_allow_scopes",
+    "subject_role_deny_scopes",
+    "source_role_allow_scopes",
+    "source_role_deny_scopes",
+    "target_allow_scopes",
+    "target_deny_scopes",
+    "agent_role_scopes",
+)
+
+
+def _direct_index_sites(rego: str) -> list[str]:
+    """Return the source lines that index a generated map as ``map[...]``.
+
+    A declaration reads ``var := {`` and a total read reads
+    ``object.get(var, ...)`` — neither contains ``var[``, so any hit here is a
+    direct index.
+    """
+    sites = []
+    for line in rego.splitlines():
+        for name in _GENERATED_MAPS:
+            if re.search(rf"(?<![\w.]){re.escape(name)}\[", line):
+                sites.append(line.strip())
+    return sites
+
+
+@pytest.mark.parametrize(
+    "model_factory",
+    [
+        # Every map empty — the minimal repro of the live failure.
+        lambda: _model(),
+        # Fully populated, so the fix is not only exercised on the empty path.
+        _session_model,
+    ],
+    ids=["all-maps-empty", "populated"],
+)
+def test_generated_maps_are_never_indexed_directly(model_factory):
+    model = model_factory()
+    for rego in (generate_inbound_rego(model), generate_outbound_rego(model)):
+        assert _direct_index_sites(rego) == []
+
+
+@pytest.mark.skipif(shutil.which("opa") is None, reason="opa not on PATH")
+@pytest.mark.parametrize(
+    "model_factory",
+    [lambda: _model(), _session_model],
+    ids=["all-maps-empty", "populated"],
+)
+def test_generated_rego_type_checks(model_factory):
+    """``opa check`` both packages together, as bundle activation does.
+
+    Only meaningful on opa >= ~1.18; older binaries accept the bad index.
+    """
+    model = model_factory()
+    with tempfile.TemporaryDirectory() as tmp:
+        inbound = Path(tmp) / "inbound.rego"
+        outbound = Path(tmp) / "outbound.rego"
+        inbound.write_text(generate_inbound_rego(model))
+        outbound.write_text(generate_outbound_rego(model))
+        out = subprocess.run(
+            [shutil.which("opa"), "check", str(inbound), str(outbound)],
+            capture_output=True,
+            text=True,
+        )
+    assert out.returncode == 0, f"opa check failed:\n{out.stdout}\n{out.stderr}"

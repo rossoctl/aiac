@@ -11,6 +11,11 @@ from fastapi.responses import JSONResponse, Response
 
 from aiac.policy.model.models import ServicePolicyModel
 from aiac.policy.model_store.keying import decode_service_id
+from aiac.shared.logging_config import configure_logging
+
+# Without this the root logger has no handler and defaults to WARNING, so the SQLite-failure
+# logging below never reaches the pod log — see ``aiac.shared.logging_config``.
+configure_logging()
 
 logger = logging.getLogger(__name__)
 

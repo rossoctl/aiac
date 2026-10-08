@@ -2,6 +2,10 @@
 
 Kubernetes Service lookup (`_core_v1` seam) and the MCP `tools/list` call (`_mcp_tools_list`
 seam) are mocked. `namespace` + `workload_name` are pre-set on state by `classify_service`.
+
+`analyze_tool` re-polls an EMPTY manifest through `_poll_until_ready`/`_MCP_WAIT` (the endpoint
+readiness wait itself lives inside `_mcp_tools_list`), so the wait knobs are pinned fast here by an
+autouse fixture.
 """
 
 from types import SimpleNamespace
@@ -17,6 +21,18 @@ from aiac.agent.uc.onboarding.provision.state import OnboardingProvisionState, T
 NS = "team-a"
 WORKLOAD = "github-tool"
 MCP_LABEL = "protocol.rossoctl.io/mcp"
+
+# A minimal non-empty manifest. Tests asserting the SUCCESS path must use one: an empty manifest is
+# now a not-ready state for the readiness poll, not a valid zero-scope answer (see TestAnalyzeToolEmpty).
+ONE_TOOL = [{"name": "t1", "description": "d"}]
+
+
+@pytest.fixture(autouse=True)
+def _fast_mcp_wait(monkeypatch):
+    # One look, no backoff: keeps the MCP readiness poll from adding real sleeps to every test.
+    # Tests that exercise the RETRY path override ONBOARD_MCP_WAIT_ATTEMPTS themselves.
+    monkeypatch.setenv("ONBOARD_MCP_WAIT_ATTEMPTS", "1")
+    monkeypatch.setenv("ONBOARD_MCP_WAIT_BACKOFF", "0")
 
 
 def _state():
@@ -69,23 +85,66 @@ class TestAnalyzeToolFound:
         mcp.assert_called_once_with(f"http://{WORKLOAD}.{NS}.svc.cluster.local:8080/mcp", token="disco-tok")
 
     def test_endpoint_uses_services_first_port(self):
-        _run(svc=_svc({MCP_LABEL: ""}, port=9000), tools=[])[1].assert_called_once_with(
+        _run(svc=_svc({MCP_LABEL: ""}, port=9000), tools=ONE_TOOL)[1].assert_called_once_with(
             f"http://{WORKLOAD}.{NS}.svc.cluster.local:9000/mcp", token="disco-tok"
         )
 
     def test_authenticated_discovery_uses_minted_token(self):
         # The token comes from the _discovery_token seam (config service mints it) and is threaded
         # through to the MCP probe as the Bearer credential.
-        _, mcp, disco = _run(svc=_svc({MCP_LABEL: ""}), tools=[])
+        _, mcp, disco = _run(svc=_svc({MCP_LABEL: ""}), tools=ONE_TOOL)
         disco.assert_called_once()
         assert mcp.call_args.kwargs["token"] == "disco-tok"
 
 
 class TestAnalyzeToolEmpty:
-    def test_empty_tools_list_yields_no_roles_no_scopes(self):
-        provision = _run(svc=_svc({MCP_LABEL: ""}), tools=[])[0]["service_provision"]
-        assert provision.roles == []
-        assert provision.scopes == []
+    def test_empty_manifest_is_not_ready_and_exhausts_the_wait_into_a_502(self, monkeypatch):
+        # A tool contributing zero scopes produces an EMPTY outbound gate downstream — the silent
+        # half-policy the readiness poll exists to prevent. So an empty manifest is re-polled and,
+        # once the budget is spent, fails loudly rather than provisioning nothing.
+        monkeypatch.setenv("ONBOARD_MCP_WAIT_ATTEMPTS", "3")
+        with pytest.raises(HTTPException) as ei:
+            _run(svc=_svc({MCP_LABEL: ""}), tools=[])
+        assert ei.value.status_code == 502
+        assert "never returned a non-empty tool manifest" in ei.value.detail
+
+
+class TestAnalyzeToolRaceTolerance:
+    """The deploy->onboard race: the tool's pod is still starting when onboarding fires."""
+
+    def test_empty_manifest_is_retried_then_succeeds(self, monkeypatch):
+        monkeypatch.setenv("ONBOARD_MCP_WAIT_ATTEMPTS", "3")
+        result, mcp, _ = _run(svc=_svc({MCP_LABEL: ""}), mcp_exc=[[], ONE_TOOL])
+        assert [s.name for s in result["service_provision"].scopes] == [f"{WORKLOAD}.t1"]
+        assert mcp.call_count == 2
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            RuntimeError("401 Unauthorized"),
+            requests.ConnectionError("connection refused"),
+            requests.ReadTimeout("read timed out"),
+        ],
+    )
+    def test_any_failure_fails_fast_without_spending_the_budget(self, monkeypatch, exc):
+        # ``_mcp_tools_list`` already waits for a not-ready endpoint (and applies its own transport
+        # retries), so whatever it raises is final: re-polling it here would nest a third retry loop
+        # and push the worst case far past the NATS ACK_WAIT. Every failure surfaces on the FIRST
+        # look. Patched inline (not via _run) so the mock is still reachable after analyze_tool raises.
+        monkeypatch.setenv("ONBOARD_MCP_WAIT_ATTEMPTS", "5")
+        with (
+            patch.object(kube, "_core_v1") as core_v1,
+            patch.object(nodes, "_mcp_tools_list", side_effect=exc) as mcp,
+            patch.object(nodes, "_discovery_token", return_value="disco-tok"),
+        ):
+            core = MagicMock()
+            core.read_namespaced_service.return_value = _svc({MCP_LABEL: ""})
+            core_v1.return_value = core
+            with pytest.raises(HTTPException) as ei:
+                nodes.analyze_tool(_state())
+        assert ei.value.status_code == 502
+        assert "MCP tools/list failed" in ei.value.detail
+        assert mcp.call_count == 1
 
 
 class TestAnalyzeTool502:

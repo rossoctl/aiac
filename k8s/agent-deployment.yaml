@@ -30,6 +30,19 @@ data:
   LLM_MAX_RETRIES: "3"
   LLM_RETRY_BACKOFF_MIN: "1"
   LLM_RETRY_BACKOFF_MAX: "30"
+  # Root-logger level for the Agent's own logs (aiac.shared.logging_config), applied by
+  # BOTH the aiac-init container and the Controller. INFO is what makes the onboarding
+  # trace — "aiac-agent-consumer subscribed to ...", the per-service apply lines — visible
+  # in `kubectl logs deployment/aiac-agent`. Note this is NOT uvicorn's --log-level, which
+  # only governs uvicorn's own access/error loggers and leaves application logs silent.
+  # Accepts DEBUG | INFO | WARNING | ERROR | CRITICAL (case-insensitive) or a number; an
+  # unrecognized value falls back to INFO. This overrides the LOG_LEVEL in aiac-pdp-config
+  # (listed earlier in both containers' envFrom).
+  # Raise to DEBUG when diagnosing an onboarding that never lands:
+  #   kubectl patch configmap aiac-agent-config -n aiac-system --type merge \
+  #     -p '{"data":{"LOG_LEVEL":"DEBUG"}}' \
+  #     && kubectl rollout restart deployment/aiac-agent -n aiac-system
+  LOG_LEVEL: "INFO"
 
 ---
 # Prerequisites: create this Secret before applying this manifest:
@@ -106,9 +119,13 @@ spec:
           image: localhost/aiac-agent:local
           imagePullPolicy: Never
           command: ["python", "-m", "aiac.agent.init.wait_and_provision"]
+          # aiac-agent-config comes AFTER aiac-pdp-config so its LOG_LEVEL wins (envFrom: last
+          # source takes precedence) — the init container and the Controller share one level.
           envFrom:
             - configMapRef:
                 name: aiac-pdp-config
+            - configMapRef:
+                name: aiac-agent-config
           # Same hardening baseline as the app container; temp writes go to /tmp.
           securityContext:
             allowPrivilegeEscalation: false

@@ -26,6 +26,14 @@ metadata:
 data:
   KEYCLOAK_URL: "http://keycloak-service.keycloak.svc:8080"
   KEYCLOAK_ADMIN_REALM: "master"
+  # Root-logger level (DEBUG | INFO | WARNING | ERROR | CRITICAL, or a number); an unrecognized
+  # value falls back to INFO. A bare Pod cannot be rollout-restarted — patch, then recreate it:
+  #   kubectl patch configmap aiac-pdp-config-standalone -n aiac-system --type merge \
+  #     -p '{"data":{"LOG_LEVEL":"DEBUG"}}'
+  #   kubectl delete pod idp-configuration-keycloak-pod -n aiac-system \
+  #     && kubectl apply -f k8s/idp-configuration-keycloak-pod.yaml
+  # (re-applying resets LOG_LEVEL to the value in this file — edit it here instead to keep DEBUG.)
+  LOG_LEVEL: "INFO"
 
 ---
 # keycloak-admin-secret is NOT defined here — it must be pre-provisioned

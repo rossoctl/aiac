@@ -210,8 +210,8 @@ The suite reads its config from the repo-root `.env` (gitignored); source it bef
 
 Runnable against a live rossoctl/Kind cluster (operator + Keycloak + SPIRE) with the AuthBridge OPA
 pipeline wired into **both** legs, `github-agent` + `github-tool` **deployed and registered** into
-`AIAC_TEST_REALM`, and a real LLM in-pod. Stand the pipeline up with `k8s/opa-kind-enable.sh`; the full
-prerequisites, wiring, and manual probe commands are in `k8s/opa-kind-runbook.md`.
+`AIAC_TEST_REALM`, and a real LLM in-pod. Stand the pipeline up with `k8s/opa-kind-enable.sh`; its
+prerequisites, wiring and verification are in `k8s/opa-kind-runbook.md`.
 
 ```bash
 k8s/opa-kind-enable.sh          # one-time: wire the OPA plugin into both legs of the Kind cluster
@@ -223,8 +223,8 @@ set -a; . .env; set +a
 ```
 
 Without `-m system` the suite is not collected; when the cluster is not wired or the env is unset
-it **skips cleanly** (it never false-passes). To eyeball the pipeline manually, follow
-`k8s/opa-kind-runbook.md` (Part A inbound, Part B outbound) and inspect the upserted
+it **skips cleanly** (it never false-passes). To eyeball the pipeline manually, read the sidecar's
+decision logs (`k8s/opa-kind-runbook.md` "What OPA sees on each leg") and inspect the upserted
 `AuthorizationPolicy` CR and the provisioned Keycloak realm.
 
 ## Testing Decisions

@@ -35,7 +35,8 @@ gate passes and no DENY gate matches::
                not subject_deny_ok; not target_deny_ok }
     # outbound — the MCP session messages (no tool name)
     allow if { input.mcp.method in session_methods;
-               some tool in target_allow_scopes[input.identity.service_id]; tool_ok(tool) }
+               some tool in object.get(target_allow_scopes, input.identity.service_id, []);
+               tool_ok(tool) }
 
 **Outbound MCP session.** ``initialize``, ``notifications/initialized``, ``ping``
 and ``tools/list`` carry no tool name. They are allowed to a target iff at least
@@ -110,10 +111,14 @@ def _render_list(var: str, values: list[str]) -> str:
 
 
 def _render_map(var: str, mapping: dict[str, list[str]]) -> str:
-    """Render ``{var} := { "key": ["a", "b"], ... }`` as Rego (empty-safe: ``{}``).
+    """Render ``{var} := { "key": ["a", "b"], ... }`` as Rego (empty case: ``{}``).
 
     Keys and values are emitted via ``json.dumps`` so quotes/newlines/backslashes are escaped
-    (JSON-compatible Rego string syntax) — this prevents Rego injection / broken output."""
+    (JSON-compatible Rego string syntax) — this prevents Rego injection / broken output.
+
+    An empty mapping renders as a bare ``{}``, which is NOT safe to index
+    directly — every read of a map rendered here must go through :func:`_lookup`.
+    See that function for why."""
     if not mapping:
         return f"{var} := {{}}"
     lines = [f"{var} := {{"]
@@ -122,6 +127,39 @@ def _render_map(var: str, mapping: dict[str, list[str]]) -> str:
         lines.append(f"    {json.dumps(key)}: [{inner}],")
     lines.append("}")
     return "\n".join(lines)
+
+
+def _lookup(mapping_var: str, key: str) -> str:
+    """Render a TOTAL map read: ``object.get(<mapping_var>, <key>, [])``.
+
+    Every read of a :func:`_render_map` map must go through here rather than
+    indexing directly as ``mapping_var[key]``.
+
+    A direct index does not type-check once the map renders empty. OPA infers a
+    bare ``{}`` as an object with a CLOSED, empty key set, so any dynamic index
+    into it is a static error::
+
+        rego_type_error: undefined ref: data.…source_roles[input.identity.client_id][_]
+            have: input.identity.client_id
+            want (one of): []
+
+    That error is fatal to the WHOLE bundle, not just the offending rule: the
+    bundle fails activation, the OPA plugin never initializes, and AuthBridge
+    then rejects every request on that leg with
+    ``503 upstream.unreachable "opa policy engine not initialized"`` — a
+    fail-closed outage from a map that merely happened to have no entries.
+
+    ``object.get`` returns ``any``, so the read stays well-typed whether or not
+    the map has keys, and returns ``[]`` for a missing key — which iterates zero
+    times, exactly as the direct index did. Semantics are unchanged; only the
+    static type changes.
+
+    Reproduce with the OPA the proxy actually embeds (v1.21.0). OPA 1.17 accepts
+    the direct index, so a locally-installed older ``opa`` will NOT catch this:
+
+        opa check <bundle-dir>   # 1.21 → 7 rego_type_errors; 1.17 → clean
+    """
+    return f"object.get({mapping_var}, {key}, [])"
 
 
 def _deprefix(scope) -> str:
@@ -207,8 +245,8 @@ def _name_map_deprefixed(mapping) -> dict[str, list[str]]:
 def _inbound_subject_gate(gate: str, scope_map: str) -> str:
     return (
         f"{gate} if {{\n"
-        "    some role in subject_roles[input.identity.subject]\n"
-        f"    some scope in {scope_map}[role]\n"
+        f"    some role in {_lookup('subject_roles', 'input.identity.subject')}\n"
+        f"    some scope in {_lookup(scope_map, 'role')}\n"
         "    scope in agent_scopes\n"
         "}"
     )
@@ -227,8 +265,8 @@ def _inbound_source_allow_gate(platform_clients: tuple[str, ...]) -> str:
         rules.append(f"source_allow_ok if {{ input.identity.client_id == {json.dumps(client)} }}")
     rules.append(
         "source_allow_ok if {\n"
-        "    some role in source_roles[input.identity.client_id]\n"
-        "    some scope in source_role_allow_scopes[role]\n"
+        f"    some role in {_lookup('source_roles', 'input.identity.client_id')}\n"
+        f"    some scope in {_lookup('source_role_allow_scopes', 'role')}\n"
         "    scope in agent_scopes\n"
         "}"
     )
@@ -243,8 +281,8 @@ def _inbound_source_deny_gate() -> str:
     """
     return (
         "source_deny_ok if {\n"
-        "    some role in source_roles[input.identity.client_id]\n"
-        "    some scope in source_role_deny_scopes[role]\n"
+        f"    some role in {_lookup('source_roles', 'input.identity.client_id')}\n"
+        f"    some scope in {_lookup('source_role_deny_scopes', 'role')}\n"
         "    scope in agent_scopes\n"
         "}"
     )
@@ -269,8 +307,8 @@ _SESSION_METHODS = ("initialize", "notifications/initialized", "ping", "tools/li
 def _outbound_subject_gate(fn: str, gate: str, scope_map: str) -> str:
     return (
         f"{fn}(tool) if {{\n"
-        "    some role in subject_roles[input.identity.subject]\n"
-        f"    tool in {scope_map}[role]\n"
+        f"    some role in {_lookup('subject_roles', 'input.identity.subject')}\n"
+        f"    tool in {_lookup(scope_map, 'role')}\n"
         "}\n"
         f"{gate} if {{ {fn}(input.mcp.params.name) }}"
     )
@@ -278,7 +316,9 @@ def _outbound_subject_gate(fn: str, gate: str, scope_map: str) -> str:
 
 def _outbound_target_gate(fn: str, gate: str, scope_map: str) -> str:
     return (
-        f"{fn}(tool) if {{\n    tool in {scope_map}[input.identity.service_id]\n}}\n"
+        f"{fn}(tool) if {{\n"
+        f"    tool in {_lookup(scope_map, 'input.identity.service_id')}\n"
+        "}\n"
         f"{gate} if {{ {fn}(input.mcp.params.name) }}"
     )
 
@@ -379,7 +419,7 @@ def generate_outbound_rego(model: AgentPolicyModel) -> str:
     when neither ``subject_deny_ok`` nor ``target_deny_ok`` matches.
 
     ``agent_roles`` / ``agent_role_scopes`` are emitted for debugging but are
-    **not** referenced by ``allow`` — ``target_allow_scopes[input.identity.service_id]``
+    **not** referenced by ``allow`` — ``object.get(target_allow_scopes, input.identity.service_id, [])``
     already *is* the capability gate. This package emits neither ``agent_scopes``
     nor the inbound scope gates.
 
@@ -424,7 +464,8 @@ def generate_outbound_rego(model: AgentPolicyModel) -> str:
                 'input.mcp.method == "tools/call"; '
                 "subject_allow_ok; target_allow_ok; not subject_deny_ok; not target_deny_ok",
                 "input.mcp.method in session_methods; "
-                "some tool in target_allow_scopes[input.identity.service_id]; tool_ok(tool)",
+                f"some tool in {_lookup('target_allow_scopes', 'input.identity.service_id')}; "
+                "tool_ok(tool)",
             ),
         ]
     )
