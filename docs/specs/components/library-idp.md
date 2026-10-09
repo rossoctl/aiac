@@ -205,23 +205,32 @@ retried write then makes no duplicate, as follows:
 
 | Primitive | Route | A repeat after a committed first attempt |
 |---|---|---|
-| `create_role` | `POST /roles` | Keycloak refuses a second realm role with the same name: the service answers `409`, so the call raises `IdPHTTPError(409)` (not retried). The role exists, but this call fails. |
-| `create_scope` | `POST /scopes` | The same as `create_role`, for the client-scope name. |
-| `map_role_to_service` | `POST /services/{id}/roles/{role_id}` | No second mapping and no error: Keycloak skips the grant of a role that the service account already has. |
+| `create_role` | `POST /roles` | Keycloak refuses a second realm role with the same name: the service answers `409`, so the call raises `IdPHTTPError(409)` (not retried). The role exists, and this primitive call fails. `create_service_role` takes this `409` as reuse, with `created` = `False` (see below). |
+| `create_scope` | `POST /scopes` | The same as `create_role`, for the client-scope name; `create_service_scope` takes the `409` as reuse. |
+| `map_role_to_service` | `POST /services/{id}/roles/{role_id}` | No second mapping and no error: Keycloak skips the grant of a role that the service account already has. Keycloak still sends the `REALM_ROLE_MAPPING` event, so the SPI publishes `aiac.apply.role-members.{role-id}` again (a new render with the same holders). |
 | `map_scope_to_service` | `POST /services/{id}/scopes/{scope_id}` | No second link and no error: Keycloak skips a scope that is already linked to the client. |
 | `set_service_type`, `set_service_enabled` | `POST /services/{id}/type`, `POST /services/{id}/enabled` | Writes the same value again. |
 | `link_subject_scope` | `POST /services/{id}/subject-scope` | Idempotent (see the method below). |
 | `delete_service_role`, `delete_service_scope` | `DELETE /services/{id}/roles/{role_id}`, `DELETE /services/{id}/scopes/{scope_id}` | Idempotent: an already-gone object is success. |
 | `mint_discovery_token` | `GET /services/{id}/discovery-token` | Mints a new token; no state change. |
 
-> **Known gap — a retried create.** The two create routes are not idempotent: a retried
-> `create_role` / `create_scope` whose first attempt was committed fails with `409`. UC1 Provision
-> then fails with `502`. A Provision failure is not a rollback error, so no rollback runs (the
-> Orchestrator calls Provision before the `try` block of the rollback). This role or scope stays in
-> Keycloak, not mapped to the service. Each role or scope that the same run created and mapped
-> before the failure also stays. The next run finds them all by name, reuses and maps them, and does
-> not record them as created, so a later rollback does not delete them either. This gap existed
-> before the retry (the first `5xx` failed the run the same way).
+> **A retried or concurrent create (REJ-02).** The two create primitives are not idempotent. A
+> `create_role` / `create_scope` fails with `409` in two cases. (i) Its first attempt was committed
+> and the call is repeated. (ii) Another service with the same workload name created the object
+> after this run checked for it: two Provisions at the same time, because the check and the create
+> are two requests. `create_service_role` / `create_service_scope` take a `409` from the create as
+> reuse. They read the roles (or the scopes) again by name and reuse the object of that name, with
+> the same description rule (a `WARNING` when the description is not the same, and no Keycloak
+> update). Then they map the object and return it with `created` = `False`. So the object is not in
+> the created-manifest of this run, and the rollback of this run does not delete the object of the
+> other run. A `409` that the second read does not explain (no object of that name) is raised, and
+> any other error of the create is raised with no second read. In both cases UC1 Provision fails
+> with `502`.
+>
+> **Known limit (a retried create).** A `409` does not tell case (i) from case (ii). So an object
+> that the committed first attempt of this run created is also returned with `created` = `False`. If
+> the build of this run then fails, the rollback keeps that object, mapped to the disabled client.
+> This is fail-closed: a new object has no SPM edge, and the next onboarding reuses it by name.
 
 ### Dependencies
 ```
@@ -265,8 +274,8 @@ class Configuration:
     # Idempotent create-or-get (by name) + map to the service. Accept any object exposing
     # .name / .description (e.g. the aiac-agent RoleDefinition / ScopeDefinition), so the
     # library never imports the agent layer.
-    def create_service_role(self, service_id: str, role) -> Role: ...
-    def create_service_scope(self, service_id: str, scope) -> Scope: ...
+    def create_service_role(self, service_id: str, role) -> tuple[Role, bool]: ...
+    def create_service_scope(self, service_id: str, scope) -> tuple[Scope, bool]: ...
 
     def set_service_type(self, service: Service, service_type: ServiceType) -> Service: ...
 
@@ -318,6 +327,8 @@ class Configuration:
      `scopes` of each owner, each time as its own copy with that owner's `serviceId`.
 4. Raise `IdPHTTPError` on any non-2xx response.
 5. Return `list[Service]` with fully-enriched `roles` (including `childRoles`) and `scopes` (including `description`).
+
+> **Known limit (D-05) — two reads of `GET /roles`.** The PCE calls `get_services()` and then `get_roles()` for each operation (D32). `get_services()` calls `get_roles()` inside it, so each PCE operation sends `GET /roles` two times, and the two answers are two separate snapshots. A role mapping between them can give the agent holders and the user holders of two different times; the next render repairs it. A fix can let `get_services()` take the roles from its caller.
 
 > **Performance note:** `get_services()` issues 2N + 1 + (roles overhead) HTTP requests where N is the number of services. `get_roles()` is called once and its fully-enriched objects are shared across all services. If this becomes a bottleneck, enrichment should be moved server-side.
 
@@ -408,18 +419,18 @@ The PCE calls `get_roles()` one time for each operation, next to `get_services()
 3. Re-fetches the service via `GET {AIAC_PDP_CONFIG_URL}/services/{service.id}`, appending `?realm=<self.realm>`.
 4. Returns the updated `Service` instance parsed from the response.
 
-`create_service_role(service_id: str, role) -> Role`: idempotent create-or-get + map.
-1. `get_roles()` and reuse an existing realm role whose `name == role.name`; otherwise `create_role(role.name, role.description)`.
-2. When it reuses a role whose description is not the same as `role.description`, it logs a `WARNING` (the role name and the two descriptions). It does not update Keycloak: the first description stays, so a policy decision does not change silently ([D32](../PRD.md#key-architectural-decisions)).
+`create_service_role(service_id: str, role) -> tuple[Role, bool]`: idempotent create-or-get + map.
+1. `get_roles()` and reuse an existing realm role whose `name == role.name`; otherwise `create_role(role.name, role.description)`. A `409` from the create is reuse: `get_roles()` again and reuse the role of that name; when there is none, raise the `409` (REJ-02).
+2. When it reuses a role whose description is not the same as `role.description`, it logs a `WARNING` (the role name and the two descriptions). It does not update Keycloak: the first description stays, so a policy decision does not change silently ([D32](../PRD.md#key-architectural-decisions)). The same rule applies to a role that the second read finds.
 3. `map_role_to_service(get_service(service_id), resolved_role)` (itself idempotent). The mapping is a Keycloak realm role-mapping event, so the SPI publishes `aiac.apply.role-members.{role-id}` (D32).
-4. Raises `IdPHTTPError` on any underlying non-2xx HTTP status. Returns the resolved `Role`.
+4. Raises `IdPHTTPError` on any other underlying non-2xx HTTP status. Returns `(role, created)`: the resolved `Role`, and `created` = `True` only when this call created the role. `created` is `False` for a reuse, also for a reuse after a `409`. UC1 Provision puts the role into its created-manifest only when `created` is `True`.
 5. `role` is any object exposing `.name` / `.description` (e.g. the aiac-agent `RoleDefinition`); the library does not import the agent layer.
 
-`create_service_scope(service_id: str, scope) -> Scope`: idempotent create-or-get + map.
-1. `get_scopes()` and reuse an existing client scope whose `name == scope.name`; otherwise `create_scope(scope.name, scope.description)`.
-2. When it reuses a scope whose description is not the same as `scope.description`, it logs a `WARNING` (the scope name and the two descriptions). It does not update Keycloak: the first description stays (D32).
+`create_service_scope(service_id: str, scope) -> tuple[Scope, bool]`: idempotent create-or-get + map.
+1. `get_scopes()` and reuse an existing client scope whose `name == scope.name`; otherwise `create_scope(scope.name, scope.description)`. A `409` from the create is reuse: `get_scopes()` again and reuse the scope of that name; when there is none, raise the `409` (REJ-02).
+2. When it reuses a scope whose description is not the same as `scope.description`, it logs a `WARNING` (the scope name and the two descriptions). It does not update Keycloak: the first description stays (D32). The same rule applies to a scope that the second read finds.
 3. `map_scope_to_service(get_service(service_id), resolved_scope)` (itself idempotent).
-4. Raises `IdPHTTPError` on any underlying non-2xx HTTP status. Returns the resolved `Scope`.
+4. Raises `IdPHTTPError` on any other underlying non-2xx HTTP status. Returns `(scope, created)`, with `created` as for `create_service_role`.
 5. `scope` is any object exposing `.name` / `.description` (e.g. the aiac-agent `ScopeDefinition`).
 
 **The reuse by name is by design ([D32](../PRD.md#key-architectural-decisions)).** UC-1 Provision names each role and scope `<workload>.<tool|skill>`, with no namespace, so two services with the same workload name in different namespaces share their roles and scopes (for example `team1/github-tool` and `team2/github-tool` share `github-tool.source-read`). A realm is a tenant, and one policy covers all AIAC-managed services in the realm. So the reuse does not fail and does not make a namespace-qualified name.
@@ -460,7 +471,9 @@ The PCE calls `get_roles()` one time for each operation, next to `get_services()
 > **Shared-object safety.** Provisioning uses **create-or-reuse-by-name** (`create_service_role` /
 > `create_service_scope` reuse an existing realm role / client scope of the same name), so one role
 > or scope can be shared by several services (by design, D32). Teardown therefore deletes **only** an object **this**
-> service created — identified through the created-manifest that UC1 Service Provision returns — **and**
+> service created — identified through the created-manifest that UC1 Service Provision returns (the
+> `created` flag that `create_service_role` / `create_service_scope` return: a reuse, also after a
+> `409`, is not in it) — **and**
 > that no other service still references. As defense in depth, the delete path (enforced in the IdP
 > Configuration Service — see `idp-configuration-service.md`) refuses to delete a role or scope that is
 > still mapped to another client: such an object is at most unmapped from the caller, never deleted.

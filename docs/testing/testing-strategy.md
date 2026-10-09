@@ -33,7 +33,7 @@ covers:
 | Level | Marker | Location | Needs |
 |---|---|---|---|
 | **unit** | *(untagged)* | `test/unit/` (mirrors `src/aiac/`) | Nothing external — in-process, a single unit under test — **except a live LLM endpoint when the test also carries the orthogonal `llm` tag** (see below); those are deselected by the default `pytest`. Runs in the default `pytest`. |
-| **integration** | `integration` | `test/integration/` (mirrors `src/aiac/`) | Several AIAC units cooperating in-process on a laptop, **no cluster**, no LLM endpoint. Deselected by the default `pytest`; run with `-m integration`. The first test is the D32 test of shared roles and scopes (`test/integration/policy/computation/test_shared_roles.py`). |
+| **integration** | `integration` | `test/integration/` (mirrors `src/aiac/`) | Several AIAC units cooperating in-process on a laptop, **no cluster**, no LLM endpoint. Deselected by the default `pytest`; run with `-m integration`. The first test is the D32 test of shared roles and scopes (`test/integration/policy/computation/test_shared_roles.py`). Three more files use its harness: `test_quarantine_lift.py`, `test_decommission_shared.py` and `test_snapshot_repair.py` (same directory). |
 | **system** | `system` | `test/system/` | A live Kind cluster / Rosso / deployed AIAC — see [`k8s/opa-kind-runbook.md`](../../k8s/opa-kind-runbook.md). Closes the real OPA evaluation loop through AuthBridge. |
 
 ## The `llm` tag (orthogonal)
@@ -103,4 +103,4 @@ To run each lane, see [`../agents/test.md`](../agents/test.md).
 | [pdp-policy-writer.md](pdp-policy-writer.md) | write-only launcher | Standalone `generate_rego.py` launcher — applies a `PolicyModel` and writes Rego for manual inspection. Not a `@pytest.mark`-tagged test. |
 | [policy-pipeline.md](policy-pipeline.md) | system | `test/system/test_policy_pipeline.py` — `@pytest.mark.system`, the full inbound/outbound matrix + negative controls over the fully onboarded stack, asserted through the deployed OPA plugin. |
 | [uc1-onboarding-pipeline.md](uc1-onboarding-pipeline.md) | system | The UC-1 onboarding ladder — `@pytest.mark.system`, real in-cluster onboarding asserted through the deployed OPA plugin. |
-| [shared-roles-integration.md](shared-roles-integration.md) | integration | `test/integration/policy/computation/test_shared_roles.py` — `@pytest.mark.integration`, shared roles and scopes (D32) from the onboarding to the rendered CR, offline, with fakes behind the library seams. |
+| [shared-roles-integration.md](shared-roles-integration.md) | integration | `test/integration/policy/computation/test_shared_roles.py` — `@pytest.mark.integration`, shared roles and scopes (D32) from the onboarding to the rendered CR, offline, with fakes behind the library seams; also the files that use its harness (`test_quarantine_lift.py`, `test_decommission_shared.py`, `test_snapshot_repair.py`). |

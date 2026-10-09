@@ -89,7 +89,7 @@ The two sides encode the same rules in different entries:
   `source_role_allow_scopes`.
 - **Agent side** — `AgentSidePolicyModel(agents=[APM(github-agent)], pass_through=[github-tool])`.
   This user→tool access is encoded in the APM's `outbound_subject_allow_rules` (`(user_role, tool_scope)`
-  pairs — this fixture is allow-only), which the outbound package renders as `subject_role_allow_scopes`. The APM's
+  pairs — this fixture is allow-only), which the outbound package renders as `subject_role_allow_scopes` (keyed by role and then by the target, LIM-02). The APM's
   `inbound_subject_allow_rules` (user→agent-scope) and `outbound_target_allow_rules` (agent-role→tool-scope) are unchanged.
   github-tool is only an ID in `pass_through`.
 
@@ -124,8 +124,9 @@ package is only `allow := true` (D24).
 - **Agent side — the agent's outbound:** the outbound
   `tools/call` gate requires both subject and target capability to pass on the same
   `input.mcp.params.name`. Its **subject** gate is user→**tool** — the tool name must be in
-  `subject_role_allow_scopes[role]` (grouped from `outbound_subject_allow_rules`) for a role of the
-  subject — distinct from the inbound user→agent gate. `target_allow_ok` (the capability gate) is
+  `subject_role_allow_scopes[role][input.identity.service_id]` (grouped from
+  `outbound_subject_allow_rules` by role and then by the owner of the scope copy of each rule, LIM-02)
+  for a role of the subject — distinct from the inbound user→agent gate. `target_allow_ok` (the capability gate) is
   `input.mcp.params.name in target_allow_scopes[input.identity.service_id]`, and `target_allow_scopes`
   keeps its target-id keys with the scope values de-prefixed to the bare tool names. The MCP session
   messages (`initialize`, `notifications/initialized`, `ping`, `tools/list`) are allowed to a target when
@@ -213,7 +214,26 @@ AIAC_ENFORCEMENT_SIDE=agent-side REGO_OUTPUT_DIR=/tmp/aiac-rego-agent-side \
     granted caller or for the tool's own client (the self-discovery rule; never `tools/call`), the
     other MCP methods are denied, a request with no identity is denied — D26,
     D27); the agent inbound (agent-level, and a request with no identity is denied — D26a, D27); and
-    the pass-through outbound allows (D24).
+    the pass-through outbound allows (D24);
+  - LIM-02, the per-target outbound subject maps (in `test/unit/pdp/service/policy/opa/test_rego.py`):
+    `test_outbound_subject_grant_on_one_target_gives_nothing_on_another` and
+    `test_outbound_subject_deny_on_one_target_blocks_nothing_on_another` (two different scopes with
+    the same bare name on two tools: each rule decides on its own target, for `tools/call` and
+    `tools/list`); `test_outbound_shared_scope_grant_and_deny_are_per_copy` (a D32 shared scope, with
+    the grant and the deny rules placed on one copy or on both copies: a grant or a deny decides only
+    on the copy that it names, as under target side);
+    `test_outbound_session_on_a_shared_scope_copy_with_no_rule_is_denied` and
+    `test_outbound_subject_map_has_no_entry_for_a_copy_with_no_rule`;
+    `test_outbound_deny_on_both_copies_blocks_the_user_on_both_copies` and
+    `test_outbound_subject_deny_map_has_the_deny_of_each_copy_on_that_copy` (the APM that the PCE
+    gives when both copies deny a role: one deny rule for each copy, and a grant of another role on
+    one copy; the deny blocks the user on both copies);
+    `test_outbound_subject_deny_map_keys_a_deny_only_on_its_own_copy` and
+    `test_outbound_subject_deny_on_a_copy_that_the_agent_is_denied_stays_on_that_copy`;
+    `test_outbound_subject_map_takes_each_target_tool_from_its_own_copy` and
+    `test_outbound_subject_deny_map_takes_each_target_tool_from_its_own_copy`;
+    `test_outbound_subject_maps_are_keyed_by_role_then_target`; and
+    `test_outbound_subject_map_escapes_its_keys_and_values`.
 
   The shared projection (D18b) has its own unit tests under `test/unit/policy/model/`: for one SPM,
   `project_inbound` gives the same inbound gates as the APM inbound that `_derive` builds.
