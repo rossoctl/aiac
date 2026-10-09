@@ -459,9 +459,14 @@ def _tool_inbound_rego(spm: ServicePolicyModel) -> str:
     tool's own client (``self_client_id`` = the SPM ``service_id``; the UC-1 discovery token is
     minted as that client — checkpoint B1). Both gates are mandatory: no platform-client bypass,
     and a request with no identity is denied (D27).
+
+    A service that owns no tool (the bootstrap CR before discovery) gets no session rule over
+    ``owned_tools``: that rule can never match, and OPA 1.21 rejects a loop over an empty array
+    literal (``some tool in []``) as a type error that stops the whole bundle from activating.
     """
     projection = project_inbound(spm)
     owned_tools = _render_list("owned_tools", [_deprefix(scope) for scope in spm.owned_scopes])
+    owned_session = "input.mcp.method in session_methods; some tool in owned_tools; tool_ok(tool)"
     declarations = "\n".join(
         [
             _render_map("subject_roles", _name_map(projection.subject_roles)),
@@ -488,7 +493,7 @@ def _tool_inbound_rego(spm: ServicePolicyModel) -> str:
             "}",
             _decision_block(
                 'input.mcp.method == "tools/call"; tool_ok(input.mcp.params.name)',
-                "input.mcp.method in session_methods; some tool in owned_tools; tool_ok(tool)",
+                *([owned_session] if spm.owned_scopes else []),
                 "input.mcp.method in session_methods; input.identity.client_id == self_client_id",
             ),
         ]
