@@ -350,9 +350,29 @@ def provision_realm_and_users(admin, realm: str) -> None:
         admin.update_realm_role(name, payload)  # ensure the marker on a pre-existing role too
 
     for username, role_name in scn.USERS.items():
-        user_id = admin.create_user({"username": username, "enabled": True}, exist_ok=True)
+        profile = _user_profile(username)
+        user_id = admin.create_user({"username": username, "enabled": True, **profile}, exist_ok=True)
+        _complete_user_profile(admin, user_id, profile)
         admin.set_user_password(user_id, scn.USER_PASSWORD, temporary=False)
         admin.assign_realm_roles(user_id, [admin.get_realm_role(role_name)])
+
+
+def _user_profile(username: str) -> dict:
+    """The profile fields that a fresh ``rossoctl`` realm requires (``email``, ``firstName``,
+    ``lastName``). Keycloak 26 refuses a password grant for a user without them (``invalid_grant``:
+    "Account is not fully set up"), so ``mint_token`` would fail for that user."""
+    return {"email": f"{username}@rossoctl.local", "emailVerified": True, "firstName": username, "lastName": "AIAC"}
+
+
+def _complete_user_profile(admin, user_id: str, profile: dict) -> None:
+    """Write only the ``profile`` fields that the stored user does not have; an existing value (for
+    example the names of the platform's own ``dev-user``) is kept. The update sends the full root
+    fields, so no stored field is lost."""
+    user = admin.get_user(user_id)
+    missing = {key: value for key, value in profile.items() if not user.get(key)}
+    if missing:
+        root = ("username", "enabled", "email", "emailVerified", "firstName", "lastName")
+        admin.update_user(user_id, {**{key: user.get(key) for key in root if key in user}, **missing})
 
 
 def cleanup_provisioned(admin, realm: str) -> None:
