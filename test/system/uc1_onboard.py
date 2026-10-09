@@ -1598,10 +1598,11 @@ CR_OUTBOUND_PATH = "outbound/request.rego"
 CR_REQUEST_PATHS = frozenset({CR_INBOUND_PATH, CR_OUTBOUND_PATH})
 
 # The Rego bindings that carry the grants of each rules-based package. An empty one renders as ``[]`` /
-# ``{}`` (``rego._render_list`` / ``_render_map``).
+# ``{}`` (``rego._render_list`` / ``_render_map`` / ``_render_nested_map``).
 #   * agent inbound (both sides, agent-level, D26a): the agent's own scopes + the user gate;
 #   * tool inbound (target side, D26): the user gate + the calling-agent gate, keyed by the bare tool;
-#   * agent outbound (agent side only): the user→tool gate + the per-target capability gate.
+#   * agent outbound (agent side only): the user→tool gate (keyed by role and then by target, LIM-02)
+#     + the per-target capability gate.
 AGENT_INBOUND_GRANT_BINDINGS = ("agent_scopes", "subject_role_allow_scopes")
 TOOL_INBOUND_GRANT_BINDINGS = ("subject_role_allow_scopes", "source_role_allow_scopes")
 AGENT_SIDE_OUTBOUND_GRANT_BINDINGS = ("subject_role_allow_scopes", "target_allow_scopes")
@@ -1686,8 +1687,9 @@ def cr_key(workload: str) -> str:
 
 def rego_binding_empty(rego: str, var: str) -> bool | None:
     """Whether the top-level Rego binding ``var := …`` is an empty list/map (``[]`` / ``{}``) — the
-    form ``rego._render_list`` / ``_render_map`` emit for no entries. ``None`` when ``var`` is not
-    bound at all (a CR format change, surfaced by the caller rather than read as empty)."""
+    form ``rego._render_list`` / ``_render_map`` / ``_render_nested_map`` emit for no entries.
+    ``None`` when ``var`` is not bound at all (a CR format change, surfaced by the caller rather
+    than read as empty)."""
     if not re.search(rf"^{re.escape(var)}\s*:=", rego, re.M):
         return None
     return re.search(rf"^{re.escape(var)}\s*:=\s*(\[\s*\]|\{{\s*\}})", rego, re.M) is not None
