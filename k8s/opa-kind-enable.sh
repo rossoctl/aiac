@@ -75,11 +75,20 @@ if [ -z "$ROSSOCTL_DIR" ] || [ ! -d "$ROSSOCTL_DIR" ]; then
   echo "ERROR: Set ROSSOCTL_DIR to point to your rossoctl/rossoctl repo clone" >&2
   exit 1
 fi
-if [ -z "$CORTEX_DIR" ] || [ ! -f "$CORTEX_DIR/cmd/authbridge-proxy/Dockerfile" ]; then
+# The authbridge-proxy Dockerfile: cmd/cortex/ since cortex a86e6708 (a pure
+# move), cmd/authbridge-proxy/ in an older clone.
+AUTHBRIDGE_DOCKERFILE=""
+for candidate in cmd/cortex/Dockerfile cmd/authbridge-proxy/Dockerfile; do
+  if [ -n "$CORTEX_DIR" ] && [ -f "$CORTEX_DIR/$candidate" ]; then
+    AUTHBRIDGE_DOCKERFILE="$candidate"
+    break
+  fi
+done
+if [ -z "$AUTHBRIDGE_DOCKERFILE" ]; then
   echo "ERROR: Set CORTEX_DIR to point to your rossoctl/cortex repo clone" >&2
   echo "       (Step 2 builds the authbridge-proxy image from" >&2
-  echo "        \$CORTEX_DIR/cmd/authbridge-proxy/Dockerfile, which lives in the cortex" >&2
-  echo "        monorepo, not in this repo)" >&2
+  echo "        \$CORTEX_DIR/cmd/cortex/Dockerfile, or cmd/authbridge-proxy/Dockerfile" >&2
+  echo "        in an older clone, which lives in the cortex monorepo, not in this repo)" >&2
   exit 1
 fi
 OPERATOR_IMAGE="${OPERATOR_IMAGE:-localhost/rossoctl-operator:$(git -C "$OPERATOR_DIR" rev-parse --short HEAD)}"
@@ -207,7 +216,7 @@ if [ -z "${GO_BUILD_TAGS:-}" ]; then
   fi
 fi
 echo "    GO_BUILD_TAGS=${GO_BUILD_TAGS}"
-( cd "$CORTEX_DIR" && "$CONTAINER_RUNTIME" build -t "$IMAGE_TAG" -f cmd/authbridge-proxy/Dockerfile \
+( cd "$CORTEX_DIR" && "$CONTAINER_RUNTIME" build -t "$IMAGE_TAG" -f "$AUTHBRIDGE_DOCKERFILE" \
     --build-arg GO_BUILD_TAGS="$GO_BUILD_TAGS" . )
 load_image_to_kind "$IMAGE_TAG"
 

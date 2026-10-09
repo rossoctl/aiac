@@ -82,7 +82,8 @@ read the delegation chain (see [Part B](#part-b--outbound-token-exchange--opa)).
     (default: `../rossoctl`)
   - `CORTEX_DIR` → `rossoctl/cortex` clone (default: `../cortex`). The enable
     script builds the `authbridge-proxy` image from
-    `cmd/authbridge-proxy/Dockerfile` at the cortex repo root. This clone is
+    `cmd/cortex/Dockerfile` (`cmd/authbridge-proxy/Dockerfile` in a clone before
+    cortex `a86e6708`) at the cortex repo root. This clone is
     required: the enable script stops if it is missing. The restore script does
     not need it.
 - `kubectl`, `helm`, `kind`, and `docker` (or `podman`) on `PATH`.
@@ -225,7 +226,8 @@ The script does these 4 steps:
      combiner, also on a re-run. See
      [The changed combiner (D20)](#the-changed-combiner-d20).
 2. **AuthBridge image.** It builds `localhost/authbridge:local` from
-   `$CORTEX_DIR/cmd/authbridge-proxy/Dockerfile` (build context: the cortex repo
+   `$CORTEX_DIR/cmd/cortex/Dockerfile` (`cmd/authbridge-proxy/` in an older clone;
+   build context: the cortex repo
    root) and loads it into the `rossoctl` Kind cluster. AuthBridge plugins are
    opt-in build tags, so the build passes `GO_BUILD_TAGS` with the cortex `full`
    profile (`scripts/profile-tags`, as the cortex CI does). The script derives it
