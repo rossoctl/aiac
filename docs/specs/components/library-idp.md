@@ -280,7 +280,8 @@ class Configuration:
     def set_service_type(self, service: Service, service_type: ServiceType) -> Service: ...
 
     # Make sure that the shared subject scope aiac-username-sub (no aiac.managed marker) and its
-    # username -> sub mapper exist, and link the scope as a default scope of the service (D31).
+    # username -> sub mapper exist, and link the scope as a default scope of the service and of
+    # each platform login client (D31).
     # Idempotent. UC1 Provision calls it right before set_service_type.
     def link_subject_scope(self, service: Service) -> Scope: ...
 
@@ -443,7 +444,7 @@ The PCE calls `get_roles()` one time for each operation, next to `get_services()
 
 `link_subject_scope(service: Service) -> Scope`: link the shared subject scope to the service ([D31](../PRD.md#key-architectural-decisions)).
 1. Issues `POST {AIAC_PDP_CONFIG_URL}/services/{service.id}/subject-scope` with no body, appending `?realm=<self.realm>`.
-2. The service makes sure that the client scope **`aiac-username-sub`** and its `username-to-sub` mapper (`username` → claim `sub`) exist, with **no** `aiac.managed` marker, and links the scope as a **default** client scope of the service's client (an optional link is changed to a default link). Then a token that this client gets as the requester of a token exchange has `sub` = the username. The scope name and the mapper are IdP-Service details — callers pass only the `Service`.
+2. The service makes sure that the client scope **`aiac-username-sub`** and its `username-to-sub` mapper (`username` → claim `sub`) exist, with **no** `aiac.managed` marker, and links the scope as a **default** client scope of the service's client (an optional link is changed to a default link). Then a token that this client gets as the requester of a token exchange has `sub` = the username. The same call also links the scope as a default scope to each platform login client (`PLATFORM_SOURCE_CLIENTS` of the service, default `rossoctl`), so the login token has `sub` = the username too. The scope name, the mapper and the login clients are IdP-Service details — callers pass only the `Service`.
 3. Idempotent: an existing scope, mapper or link is not an error, so a second call changes nothing. An existing `username-to-sub` mapper with a wrong type or config is changed back to the expected mapper.
 4. Raises `IdPHTTPError` on non-2xx HTTP status (via `_request`), including `409` if the existing `aiac-username-sub` carries the `aiac.managed` marker.
 5. Returns the `Scope` instance parsed from the response. Its `aiac_managed` is `False`, so it is never an own scope of a service. The scope is shared by every AIAC-managed client, so UC1 never puts it into the created-manifest, and the rollback never deletes it (see `idp-configuration-service.md` → `POST /services/{service_id}/subject-scope`).

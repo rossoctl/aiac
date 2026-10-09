@@ -91,7 +91,7 @@ restarts. They import three shared modules:
   `TokenExchangeError`), `jwt_claim`, `inbound_probe` / `outbound_probe`, `inbound_outcome` / `outbound_outcome`
   (classified by body, not status: an OPA denial → `deny`, a token-exchange refusal → `error`),
   `poll_until`, and the skip gates (`require_pipeline`,
-  `require_env_or_skip`, `require_event_path`, `verify_subject_mapper`). There is **no** `opa_eval`, no `kubectl_cp` of
+  `require_env_or_skip`, `require_event_path`, `verify_login_subject`). There is **no** `opa_eval`, no `kubectl_cp` of
   `/rego`, and no standalone probe module: the evaluator is the deployed AuthBridge OPA plugin, and the
   input documents are built by AuthBridge's own parsers.
 
@@ -224,12 +224,15 @@ cleanly** when any of it is absent (they never stand it up, and never false-pass
 - **Users + realm roles.** The fixture provisions them (UC-1 does not) — see
   *[Scenario](#scenario)* — via `KeycloakAdmin` into `AIAC_TEST_REALM`, **before** deploying (the PRB
   reads the realm role universe when the event fires `onboard_service`); idempotent; left in place.
-  `verify_subject_mapper` confirms the `username → sub` mapper of the login client `rossoctl` + Direct Access Grants (else skip).
-  It checks only the login token (through the `rossoctl` client). The exchanged token gets the same
-  mapping from the client scope `aiac-username-sub`, which AIAC links to each onboarded client (D31).
-  That link is not a precondition: AIAC makes it at onboarding, so `require_subject_scope` checks it
-  as a test step (*[Per-rung flow](#per-rung-flow)*, step 2). Together the two checks cover both
-  sources of the rule.
+  `verify_login_subject` mints a login token through the login client `rossoctl` and checks that its
+  `sub` is the username. It skips when it cannot mint the token (Direct Access Grants is a
+  prerequisite), and fails when `sub` is not the username. The `sub` comes from the client scope
+  `aiac-username-sub`, the one source of the rule (D31). The IdP Configuration Service links it to
+  `rossoctl` at its startup and at each onboarding, so the link is an AIAC step, not a
+  prerequisite. There is no `sub` client mapper on `rossoctl`. The exchanged token gets the same
+  mapping from the same scope, which AIAC links to each onboarded client. These links are not
+  preconditions: AIAC makes them, so `require_subject_scope` checks them as a test step
+  (*[Per-rung flow](#per-rung-flow)*, step 2).
 
 ## Per-rung flow
 
@@ -320,8 +323,8 @@ real requests + assert → full teardown.**
      `onboarded_stack` calls `require_subject_scope(admin, workload)`. It checks with the admin API
      that `aiac-username-sub` exists, has a mapper with the `username → sub` mapping (it checks the
      mapper type and mapping, not the mapper name) and no `aiac.managed` marker, and is a default scope
-     of the workload's client, and that the login client `rossoctl` does not link it. AIAC makes this
-     link at onboarding, so a missing
+     of the workload's client and of the login client `rossoctl` (a missing login client, a missing
+     link or an optional link only is a problem). AIAC makes these links at onboarding, so a missing
      link is an AIAC fault: the check **fails** (it raises `RuntimeError` that lists the problems), it
      does not skip. So a missing link gives a clear message at once, not only a deny in the step-4
      poll.
@@ -375,9 +378,9 @@ real requests + assert → full teardown.**
         exact cell.
    3. **The subject on every leg (D31)** — rung 2.
       - `test_subject_scope_linked`: `aiac-username-sub` exists, has a mapper with the
-        `username → sub` mapping (type and mapping, not the name) and no `aiac.managed` marker; both
-        clients (github-agent and github-tool) link it as a default
-        scope; `rossoctl` does not link it and still has its own `username-to-sub` mapper; a `rossoctl`
+        `username → sub` mapping (type and mapping, not the name) and no `aiac.managed` marker; the
+        login client `rossoctl` and both clients (github-agent and github-tool) link it as a default
+        scope; `rossoctl` has no client mapper of its own that writes `sub`; a `rossoctl`
         password-grant token for `dev-user` has `sub` = `dev-user`.
       - `test_exchanged_token_subject_is_username`: one node per user. A standard token exchange as
         the agent client to the tool audience gives `sub` = the username. It skips cleanly when
@@ -810,14 +813,18 @@ Rungs 6 and 7 restart the Controller twice each, so each one takes several minut
     read-only route `GET /policy/services/{service_id:path}` (D18). For D31: Provision links the
     subject scope before `set_service_type`, keeps it out of the created-manifest, and the rollback
     never deletes it; `test_uc1_subject_scope.py` covers the harness helpers `subject_scope_problems`,
-    `subject_scope_link_problems`, `require_subject_scope`, `exchange_token` and `exchanged_subject`.
+    `subject_scope_link_problems`, `require_subject_scope`, `exchange_token` and `exchanged_subject`
+    (the login client `rossoctl` must link the scope as a default scope).
     For handoff 20 (D33): `test_uc1_commit_race_hint.py` covers the harness race hint
     (`commit_race_hint`, `append_hint`, `controller_commit_race_hint` and the bounded `controller_logs`
     read), with `kubectl` stubbed.
   - `test/unit/idp/` — the subject scope (D31): `POST /services/{service_id}/subject-scope` creates
     `aiac-username-sub` and its mapper with no marker (idempotent, also after a `409` from a
     concurrent onboarding), changes a wrong `username-to-sub` mapper back, gives `409` on a scope that
-    has the marker, removes an optional link, and links the scope as a default scope;
+    has the marker, removes an optional link, and links the scope as a default scope; it also links
+    the scope as a default scope to each login client of `PLATFORM_SOURCE_CLIENTS` (default
+    `rossoctl`), at each call and at the service startup (idempotent; a missing login client is not
+    an error; no client mapper and no realm default; a startup failure does not stop the service);
     `GET /services/{service_id}/scopes` gives `200` for a client that links the unmarked scope; the
     library method `link_subject_scope`.
 - **Stack's realm, leave-in-place; per-rung cleanup.** UC-1 resolves/provisions against the deployed

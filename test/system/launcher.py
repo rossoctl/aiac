@@ -14,7 +14,7 @@ Two halves, both live here so a single module import serves every launcher:
   ``inbound_probe`` / ``outbound_probe`` / ``outbound_session_probe`` send **real HTTP requests through
   AuthBridge** (and, for ``exchange_token``, one RFC 8693 token exchange straight to Keycloak) and
   classify the **real OPA plugin's** allow/deny; ``poll_until`` waits for ``bundle-service`` to reflect a CR change; and the
-  skip gates (``require_env_or_skip`` / ``require_pipeline`` / ``verify_subject_mapper``) make the
+  skip gates (``require_env_or_skip`` / ``require_pipeline`` / ``verify_login_subject``) make the
   suite skip cleanly — never false-pass — when the cluster is not wired. ``require_pipeline`` also
   skips when the global combiner (the ``default`` ``AuthorizationPolicy`` in the bundle-service
   namespace) still allows a pod that has no client CR (D20, ``combiner_reason``).
@@ -390,8 +390,8 @@ def mint_token(
     """Mint a user access token via the OIDC password grant (runbook A.1 / B.4).
 
     Requires Direct Access Grants enabled on ``client_id`` and the user's password set; a token whose
-    ``sub`` is the username further needs the realm's ``username -> sub`` mapper (see
-    ``verify_subject_mapper``). Raises ``requests.HTTPError`` on a non-2xx token response so the caller
+    ``sub`` is the username further needs the client scope ``aiac-username-sub`` linked to
+    ``client_id`` (see ``verify_login_subject``). Raises ``requests.HTTPError`` on a non-2xx token response so the caller
     can turn a mint failure into a skip."""
     resp = requests.post(
         f"{keycloak_url.rstrip('/')}/realms/{realm}/protocol/openid-connect/token",
@@ -1032,23 +1032,20 @@ def require_event_path(*, admin, realm: str) -> None:
         )
 
 
-def verify_subject_mapper(
+def verify_login_subject(
     *, keycloak_url: str, realm: str, user: str, password: str, client_id: str = KEYCLOAK_CLIENT_ID
 ) -> str:
-    """Mint a token for ``user`` and ``pytest.skip`` unless its ``sub`` equals ``user``.
+    """Mint a login token for ``user`` through ``client_id``; ``pytest.skip`` when it cannot be minted,
+    and ``pytest.fail`` unless its ``sub`` equals ``user``.
 
-    The live loop keys OPA decisions on ``input.identity.subject`` (the token ``sub``), which equals
-    the username only when the realm carries the ``username -> sub`` mapper and Direct Access Grants
-    are enabled on ``client_id`` — a one-time Keycloak prerequisite the fixture does **not** provision
-    (runbook Prerequisites). Skipping here (rather than failing every decision) keeps a mis-provisioned
-    realm from masquerading as a policy bug. Returns the minted token on success.
-
-    This checks only the **login** token: the login client's own ``username-to-sub`` mapper (on
-    ``client_id``, by default ``rossoctl``) sets its ``sub``. A token that an agent exchanges gets the
-    same mapping from the client scope ``aiac-username-sub``, which AIAC links to each managed client
-    at onboarding (D31); ``uc1_onboard.require_subject_scope`` checks that link, and a missing link
-    fails the run (it is an AIAC step, not a prerequisite). Together the two checks cover both
-    sources of the rule."""
+    The live loop keys OPA decisions on ``input.identity.subject`` (the token ``sub``). To mint the
+    token, Direct Access Grants must be enabled on ``client_id`` — a one-time Keycloak prerequisite the
+    fixture does **not** provision (runbook Prerequisites), so a mint failure is a skip. The ``sub`` =
+    username comes from the client scope ``aiac-username-sub``, which the IdP Configuration Service
+    links as a default scope to the login client (``client_id``, by default ``rossoctl``) at its startup
+    and at each onboarding (D31). That is an AIAC step, not a prerequisite, so a wrong ``sub`` fails.
+    ``uc1_onboard.require_subject_scope`` checks the links again after each onboarding. Returns the
+    minted token on success."""
     import pytest
 
     try:
@@ -1061,9 +1058,9 @@ def verify_subject_mapper(
         )
     sub = jwt_claim(token, "sub")
     if sub != user:
-        pytest.skip(
-            f"login token 'sub' is {sub!r}, not {user!r} — the login client {client_id!r} has no "
-            "username->sub protocol mapper (a manual prerequisite; AIAC's aiac-username-sub scope covers "
-            "only the exchanged tokens, D31 — see k8s/opa-kind-runbook.md Prerequisites)."
+        pytest.fail(
+            f"login token 'sub' is {sub!r}, not {user!r} — the login client {client_id!r} does not link the "
+            "client scope 'aiac-username-sub' as a default scope (D31). The IdP Configuration Service "
+            "(aiac-pdp-config) makes this link at startup: check its log, or restart it once Keycloak is ready."
         )
     return token

@@ -991,15 +991,20 @@ class _FakeSubjectScopeAdmin:
     relies on: a duplicate scope or mapper name is a 409, a client-scope link is skipped
     with no error when the scope is already linked to that client as default OR optional, and a
     mapper update (PUT) of an unknown mapper id is a 404 and replaces the type and the full config.
-    Each mapper write is recorded in ``mapper_writes``."""
+    Each mapper write is recorded in ``mapper_writes``. ``clients`` maps the clientId of each
+    login client in the realm to its internal UUID (no login client by default)."""
 
-    def __init__(self):
+    def __init__(self, clients: dict[str, str] | None = None):
+        self.clients: dict[str, str] = dict(clients or {})  # clientId -> internal client UUID
         self.scopes: dict[str, dict] = {}
         self.mappers: dict[str, list[dict]] = {}
         self.default_links: dict[str, list[str]] = {}
         self.optional_links: dict[str, list[str]] = {}
         self.mapper_writes: list[str] = []
         self._next_mapper = 0
+
+    def get_client_id(self, client_id):
+        return self.clients.get(client_id)
 
     def get_client_scopes(self):
         return [dict(s) for s in self.scopes.values()]
@@ -1058,7 +1063,7 @@ class _FakeSubjectScopeAdmin:
 class TestLinkSubjectScope:
     _URL = f"/services/svc-uuid/subject-scope?realm={REALM}"
 
-    def _wire(self, admin, *, existing=None, mappers=(), optional=()):
+    def _wire(self, admin, *, existing=None, mappers=(), optional=(), login_clients=None):
         # Realm scopes: a built-in plus (optionally) an existing subject scope.
         realm_scopes = [{"id": "sc-profile", "name": "profile"}]
         if existing is not None:
@@ -1068,6 +1073,8 @@ class TestLinkSubjectScope:
         admin.get_client_scope.return_value = {**_SUBJECT_SCOPE_PAYLOAD, "id": _SUBJECT_SCOPE_ID}
         admin.get_mappers_from_client_scope.return_value = list(mappers)
         admin.get_client_optional_client_scopes.return_value = list(optional)
+        # No login client by default: these tests are about the service link.
+        admin.get_client_id.side_effect = (login_clients or {}).get
 
     @staticmethod
     def _existing(attributes=None):
@@ -1159,18 +1166,21 @@ class TestLinkSubjectScope:
         assert admin.default_links == {"svc-uuid": [scope_id], "svc-b": [scope_id]}
 
     def test_links_as_client_default_scope_only(self):
-        # The link is a default scope of THIS client: never a realm default, never an optional
-        # scope, and no call touches any other client (rossoctl included).
+        # The link is a default scope of THIS client and of the login client: never a realm
+        # default, never an optional scope, and no call touches any other client.
         admin = MagicMock()
-        self._wire(admin)
+        self._wire(admin, login_clients={"rossoctl": "rossoctl-uuid"})
         _make_client(admin).post(self._URL)
-        admin.add_client_default_client_scope.assert_called_once_with("svc-uuid", _SUBJECT_SCOPE_ID, {})
+        assert admin.add_client_default_client_scope.call_args_list == [
+            (("svc-uuid", _SUBJECT_SCOPE_ID, {}),),
+            (("rossoctl-uuid", _SUBJECT_SCOPE_ID, {}),),
+        ]
         admin.add_default_default_client_scope.assert_not_called()
         admin.add_default_optional_client_scope.assert_not_called()
         admin.add_client_optional_client_scope.assert_not_called()
         admin.update_client.assert_not_called()
         client_ids = {c.args[0] for c in admin.mock_calls if c[0] in _CLIENT_SCOPED_CALLS}
-        assert client_ids == {"svc-uuid"}
+        assert client_ids == {"svc-uuid", "rossoctl-uuid"}
 
     def test_not_optional_link_is_not_deleted(self):
         admin = MagicMock()
@@ -1431,6 +1441,171 @@ class TestLinkSubjectScope:
         app.dependency_overrides.clear()
         resp = TestClient(app).post("/services/svc-uuid/subject-scope")
         assert resp.status_code == 422
+
+    def teardown_method(self):
+        app.dependency_overrides.clear()
+
+
+class TestLinkSubjectScopeToLoginClients:
+    """The subject scope is the one source of ``sub`` = username, also in the login token (D31):
+    AIAC links it as a default scope to each platform login client (``PLATFORM_SOURCE_CLIENTS``,
+    default ``rossoctl``), at startup and at each ``POST /services/{id}/subject-scope``."""
+
+    _URL = f"/services/svc-uuid/subject-scope?realm={REALM}"
+
+    @staticmethod
+    def _fake(**clients):
+        return _FakeSubjectScopeAdmin(clients={"rossoctl": "rossoctl-uuid", **clients})
+
+    def test_endpoint_links_the_scope_to_the_login_client_as_default(self, monkeypatch):
+        monkeypatch.delenv("PLATFORM_SOURCE_CLIENTS", raising=False)
+        admin = self._fake()
+        resp = _make_client(admin).post(self._URL)
+        assert resp.status_code == 200
+        (scope_id,) = admin.scopes
+        assert admin.default_links == {"svc-uuid": [scope_id], "rossoctl-uuid": [scope_id]}
+
+    def test_endpoint_second_call_is_a_noop(self, monkeypatch):
+        monkeypatch.delenv("PLATFORM_SOURCE_CLIENTS", raising=False)
+        admin = self._fake()
+        client = _make_client(admin)
+        assert client.post(self._URL).status_code == 200
+        assert client.post(self._URL).status_code == 200
+        (scope_id,) = admin.scopes
+        assert admin.default_links == {"svc-uuid": [scope_id], "rossoctl-uuid": [scope_id]}
+        assert admin.mapper_writes == ["add"]
+
+    def test_endpoint_moves_an_optional_login_link_to_default(self, monkeypatch):
+        # An optional link would leave sub = the user ID in the login token.
+        monkeypatch.delenv("PLATFORM_SOURCE_CLIENTS", raising=False)
+        admin = self._fake()
+        scope_id = admin.create_client_scope(_SUBJECT_SCOPE_PAYLOAD)
+        admin.optional_links["rossoctl-uuid"] = [scope_id]
+        resp = _make_client(admin).post(self._URL)
+        assert resp.status_code == 200
+        assert admin.default_links["rossoctl-uuid"] == [scope_id]
+        assert admin.optional_links["rossoctl-uuid"] == []
+
+    def test_endpoint_with_a_missing_login_client_is_not_an_error(self, monkeypatch, caplog):
+        monkeypatch.delenv("PLATFORM_SOURCE_CLIENTS", raising=False)
+        admin = _FakeSubjectScopeAdmin()  # no rossoctl client in the realm
+        with caplog.at_level("WARNING"):
+            resp = _make_client(admin).post(self._URL)
+        assert resp.status_code == 200
+        (scope_id,) = admin.scopes
+        assert admin.default_links == {"svc-uuid": [scope_id]}
+        assert "rossoctl" in caplog.text
+
+    def test_endpoint_links_every_configured_login_client(self, monkeypatch):
+        monkeypatch.setenv("PLATFORM_SOURCE_CLIENTS", " rossoctl , ,other-ui ")
+        admin = self._fake(**{"other-ui": "other-uuid"})
+        resp = _make_client(admin).post(self._URL)
+        assert resp.status_code == 200
+        (scope_id,) = admin.scopes
+        assert admin.default_links == {
+            "svc-uuid": [scope_id],
+            "rossoctl-uuid": [scope_id],
+            "other-uuid": [scope_id],
+        }
+
+    def test_blank_setting_falls_back_to_rossoctl(self, monkeypatch):
+        monkeypatch.setenv("PLATFORM_SOURCE_CLIENTS", " , ")
+        admin = self._fake()
+        assert _make_client(admin).post(self._URL).status_code == 200
+        assert "rossoctl-uuid" in admin.default_links
+
+    def test_login_client_is_found_by_client_id(self, monkeypatch):
+        monkeypatch.delenv("PLATFORM_SOURCE_CLIENTS", raising=False)
+        admin = MagicMock()
+        TestLinkSubjectScope()._wire(admin, login_clients={"rossoctl": "rossoctl-uuid"})
+        _make_client(admin).post(self._URL)
+        admin.get_client_id.assert_called_once_with("rossoctl")
+
+    def test_no_client_mapper_and_no_realm_default(self, monkeypatch):
+        # The login client gets a scope link only: no client mapper, no client update, and the
+        # scope never becomes a realm default.
+        monkeypatch.delenv("PLATFORM_SOURCE_CLIENTS", raising=False)
+        admin = MagicMock()
+        TestLinkSubjectScope()._wire(admin, login_clients={"rossoctl": "rossoctl-uuid"})
+        _make_client(admin).post(self._URL)
+        admin.add_mapper_to_client.assert_not_called()
+        admin.update_client.assert_not_called()
+        admin.add_default_default_client_scope.assert_not_called()
+        admin.add_default_optional_client_scope.assert_not_called()
+
+    def test_login_link_error_returns_502(self, monkeypatch):
+        monkeypatch.delenv("PLATFORM_SOURCE_CLIENTS", raising=False)
+        admin = MagicMock()
+        TestLinkSubjectScope()._wire(admin, login_clients={"rossoctl": "rossoctl-uuid"})
+        admin.add_client_default_client_scope.side_effect = [
+            None,
+            KeycloakError(error_message="backend failure", response_code=500),
+        ]
+        resp = _make_client(admin).post(self._URL)
+        assert resp.status_code == 502
+
+    # -- at startup ------------------------------------------------------------------------------
+
+    def test_startup_links_the_scope_to_the_login_client(self, monkeypatch):
+        monkeypatch.setenv("KEYCLOAK_REALM", REALM)
+        monkeypatch.delenv("PLATFORM_SOURCE_CLIENTS", raising=False)
+        admin = self._fake()
+        with patch("aiac.idp.service.configuration.keycloak.main._get_or_create_admin", return_value=admin) as get:
+            with TestClient(app):
+                pass
+        get.assert_called_once_with(REALM)
+        (scope_id,) = admin.scopes
+        assert admin.default_links == {"rossoctl-uuid": [scope_id]}
+        assert [m["name"] for m in admin.mappers[scope_id]] == ["username-to-sub"]
+
+    def test_startup_is_idempotent(self, monkeypatch):
+        monkeypatch.setenv("KEYCLOAK_REALM", REALM)
+        monkeypatch.delenv("PLATFORM_SOURCE_CLIENTS", raising=False)
+        admin = self._fake()
+        with patch("aiac.idp.service.configuration.keycloak.main._get_or_create_admin", return_value=admin):
+            with TestClient(app):
+                pass
+            with TestClient(app):
+                pass
+        (scope_id,) = admin.scopes
+        assert admin.default_links == {"rossoctl-uuid": [scope_id]}
+        assert admin.mapper_writes == ["add"]
+
+    def test_startup_with_keycloak_not_ready_does_not_crash(self, monkeypatch, caplog):
+        monkeypatch.setenv("KEYCLOAK_REALM", REALM)
+        admin = MagicMock()
+        admin.get_client_scopes.side_effect = ConnectionError("connection refused")
+        with patch("aiac.idp.service.configuration.keycloak.main._get_or_create_admin", return_value=admin):
+            with caplog.at_level("WARNING"), TestClient(app) as client:
+                assert client.get("/docs").status_code == 200
+        assert "aiac-username-sub" in caplog.text
+
+    def test_startup_with_a_keycloak_error_does_not_crash(self, monkeypatch):
+        monkeypatch.setenv("KEYCLOAK_REALM", REALM)
+        with patch(
+            "aiac.idp.service.configuration.keycloak.main._get_or_create_admin",
+            side_effect=KeycloakError(error_message="unauthorized", response_code=401),
+        ):
+            with TestClient(app):
+                pass
+
+    def test_startup_with_a_missing_login_client_is_not_an_error(self, monkeypatch, caplog):
+        monkeypatch.setenv("KEYCLOAK_REALM", REALM)
+        monkeypatch.delenv("PLATFORM_SOURCE_CLIENTS", raising=False)
+        admin = _FakeSubjectScopeAdmin()
+        with patch("aiac.idp.service.configuration.keycloak.main._get_or_create_admin", return_value=admin):
+            with caplog.at_level("WARNING"), TestClient(app):
+                pass
+        assert admin.default_links == {}
+        assert "rossoctl" in caplog.text
+
+    def test_startup_without_a_realm_skips_the_link(self, monkeypatch, caplog):
+        monkeypatch.delenv("KEYCLOAK_REALM", raising=False)
+        with patch("aiac.idp.service.configuration.keycloak.main._get_or_create_admin") as get:
+            with caplog.at_level("WARNING"), TestClient(app):
+                pass
+        get.assert_not_called()
+        assert "KEYCLOAK_REALM" in caplog.text
 
     def teardown_method(self):
         app.dependency_overrides.clear()

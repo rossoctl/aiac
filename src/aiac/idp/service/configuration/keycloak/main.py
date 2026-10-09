@@ -1,5 +1,6 @@
 import base64
 import json
+import logging
 import os
 import threading
 from contextlib import asynccontextmanager
@@ -15,6 +16,7 @@ from starlette.responses import JSONResponse
 
 _cache: dict[str, KeycloakAdmin] = {}
 _lock = threading.Lock()
+_log = logging.getLogger(__name__)
 
 # AIAC naming convention: stamp every role/scope this service provisions with the
 # ``aiac.managed=true`` Keycloak attribute so downstream consumers (the Policy Computation
@@ -36,17 +38,25 @@ _SERVICE_TYPE_ATTRIBUTE = "client.type"
 # own clientId as the audience (it defaults ``audience_file`` to ``/shared/client-id.txt``).
 _DISCOVERY_AUDIENCE_MAPPER = "aiac-discovery-audience"
 
-# Name of the shared client scope AIAC links, at onboarding, to each AIAC-managed client so that
-# every token that reaches an agent or tool has ``sub`` = username (D31), also after a token
-# exchange: the standard token exchange (V2) applies only the requester client's scopes, so the
-# login client's own ``username-to-sub`` mapper never reaches an exchanged token. The scope is
+# Name of the shared client scope that is the one source of ``sub`` = username (D31). AIAC links
+# it as a default scope to each platform login client (``_LOGIN_CLIENTS_ENV``), so the login token
+# has ``sub`` = username, and, at onboarding, to each AIAC-managed client, so an exchanged token has
+# it too: the standard token exchange (V2) applies only the requester client's scopes. The scope is
 # linked to many clients, so it deliberately has NO ``aiac.managed`` marker: a marked scope would
 # become an own scope of every linked service. Never a realm default scope.
 _SUBJECT_SCOPE = "aiac-username-sub"
 
-# Name of the one protocol mapper in ``_SUBJECT_SCOPE``. It is the same mapping as the login
-# client's own mapper of the same name (``rossoctl``, a manual platform prerequisite).
+# Name of the one protocol mapper in ``_SUBJECT_SCOPE``.
 _SUBJECT_MAPPER = "username-to-sub"
+
+# Comma-separated clientIds of the platform login clients that get ``_SUBJECT_SCOPE`` (D31). The
+# same setting, with the same meaning, as the PDP policy writer's platform source clients; unset
+# or all-blank falls back to ``_DEFAULT_LOGIN_CLIENTS``.
+_LOGIN_CLIENTS_ENV = "PLATFORM_SOURCE_CLIENTS"
+_DEFAULT_LOGIN_CLIENTS = ("rossoctl",)
+
+# The realm whose login clients get ``_SUBJECT_SCOPE`` at startup.
+_REALM_ENV = "KEYCLOAK_REALM"
 
 # Keycloak representation of ``_SUBJECT_SCOPE``. Not in the token ``scope`` claim and not on the
 # consent screen; no ``aiac.managed`` attribute (see above).
@@ -278,9 +288,63 @@ def _converge_subject_mapper(admin: KeycloakAdmin, scope_id: str, existing: dict
     _add_subject_mapper(admin, scope_id)
 
 
+def _login_clients() -> tuple[str, ...]:
+    """The clientIds in ``_LOGIN_CLIENTS_ENV``, comma-split, blanks dropped (default ``rossoctl``)."""
+    raw = os.environ.get(_LOGIN_CLIENTS_ENV)
+    if raw is None:
+        return _DEFAULT_LOGIN_CLIENTS
+    clients = tuple(c.strip() for c in raw.split(",") if c.strip())
+    return clients or _DEFAULT_LOGIN_CLIENTS
+
+
+def _link_default_scope(admin: KeycloakAdmin, client_uuid: str, scope_id: str) -> None:
+    """Link a scope to a client as a default scope; an optional link is moved to default.
+
+    Keycloak skips a default link of a scope that is already linked as optional (no error), and an
+    optional scope's mapper runs only when the token request names it, so remove an optional link
+    first. Keycloak also skips an existing default link with no error, so a second call is a no-op.
+    """
+    if any(s.get("id") == scope_id for s in admin.get_client_optional_client_scopes(client_uuid)):
+        admin.delete_client_optional_client_scope(client_uuid, scope_id)  # optional -> default
+    admin.add_client_default_client_scope(client_uuid, scope_id, {})
+
+
+def _link_login_clients(admin: KeycloakAdmin, scope_id: str) -> None:
+    """Link the subject scope as a default scope to each platform login client (D31).
+
+    A login client is found by its clientId. A login client that is not in the realm is not an
+    error: log it and continue. Adds no client mapper and never makes the scope a realm default.
+    """
+    for client_id in _login_clients():
+        client_uuid = admin.get_client_id(client_id)
+        if client_uuid is None:
+            _log.warning("login client '%s' not found: '%s' is not linked to it", client_id, _SUBJECT_SCOPE)
+            continue
+        _link_default_scope(admin, client_uuid, scope_id)
+
+
+def _link_login_clients_at_startup() -> None:
+    """Ensure the subject scope and link it to the login clients of ``$KEYCLOAK_REALM`` (D31).
+
+    A failure (for example, Keycloak is not ready) must not stop the service: log it. The call at
+    each onboarding (``POST /services/{id}/subject-scope``) repairs the link.
+    """
+    realm = os.environ.get(_REALM_ENV)
+    if not realm:
+        _log.warning("%s is not set: '%s' is not linked to the login clients at startup", _REALM_ENV, _SUBJECT_SCOPE)
+        return
+    try:
+        admin = _get_or_create_admin(realm)
+        scope = _ensure_subject_scope(admin)
+        _link_login_clients(admin, scope["id"])
+    except Exception as e:  # noqa: BLE001 — any failure here must not crash the service
+        _log.warning("cannot link '%s' to the login clients at startup: %s", _SUBJECT_SCOPE, e)
+
+
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
     load_dotenv(Path(__file__).parent / ".env")
+    _link_login_clients_at_startup()
     yield
 
 
@@ -612,23 +676,21 @@ def assign_scope_to_service(service_id: str, scope_id: str, admin: KeycloakAdmin
 
 @app.post("/services/{service_id}/subject-scope", status_code=200)
 def link_subject_scope(service_id: str, admin: KeycloakAdmin = Depends(get_admin)):
-    """Ensure the shared subject scope and link it to a service as a default scope (D31).
+    """Ensure the shared subject scope and link it to a service and the login clients (D31).
 
     Every token that reaches an AIAC-managed agent or tool must have ``sub`` = username, also after
     a token exchange (the standard token exchange applies only the requester client's scopes). So
     ensure ``_SUBJECT_SCOPE`` and its mapper first (``_ensure_subject_scope``), then link the scope
-    to THIS client as a default scope. Keycloak skips a default link of a scope that is already
-    linked as optional (no error), and an optional scope's mapper runs only when the token request
-    names it — an optional link would silently leave ``sub`` = user ID — so remove an optional link
-    first. Keycloak also skips an existing default link with no error, so a second call is a no-op.
-    Never touches another client and never makes the scope a realm default. Returns the scope.
+    as a default scope to THIS client and again to each platform login client
+    (``_link_login_clients``), which repairs a link that the startup call could not make. An
+    optional link is moved to default (``_link_default_scope``); a second call is a no-op. Touches
+    no other client and never makes the scope a realm default. Returns the scope.
     """
     try:
         scope = _ensure_subject_scope(admin)
         scope_id = scope["id"]
-        if any(s.get("id") == scope_id for s in admin.get_client_optional_client_scopes(service_id)):
-            admin.delete_client_optional_client_scope(service_id, scope_id)  # optional -> default
-        admin.add_client_default_client_scope(service_id, scope_id, {})
+        _link_default_scope(admin, service_id, scope_id)
+        _link_login_clients(admin, scope_id)
         return scope
     except _InvariantViolation as e:
         return JSONResponse(status_code=409, content={"error": str(e)})

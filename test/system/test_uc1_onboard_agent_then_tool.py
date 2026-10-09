@@ -29,11 +29,10 @@ the deny of an ungranted call comes from (``deny_origin``) and the shape of both
 
 **The subject on every leg (D31).** The tool's inbound keys users by username, and it reads the
 subject from the ``sub`` of the token that the agent exchanged. Keycloak's standard token exchange
-builds that token from the agent client's scopes only, so the login client's own ``username-to-sub``
-mapper (on ``rossoctl``) never reaches it; the client scope ``aiac-username-sub``, which AIAC links to
-each onboarded client, does. ``test_subject_scope_linked`` checks both sources in Keycloak (the scope,
-its mapper, no marker, the two default links, no link on ``rossoctl``, and the ``rossoctl`` mapper with
-its login token), and ``test_exchanged_token_subject_is_username`` decodes a real exchanged token (as the
+builds that token from the agent client's scopes only, so AIAC links the client scope
+``aiac-username-sub`` to each onboarded client, and also to the login client ``rossoctl`` for the login
+token. ``test_subject_scope_linked`` checks this in Keycloak (the scope, its mapper, no marker, the three
+default links, no ``sub`` client mapper on ``rossoctl``, and the ``rossoctl`` login token), and ``test_exchanged_token_subject_is_username`` decodes a real exchanged token (as the
 agent client, with its client secret — the identity that ``k8s/opa-kind-enable.sh`` gives AuthBridge's
 ``token-exchange``; it skips cleanly only when the agent client uses another authenticator). The shared fixture also fails fast when a link is missing
 (``require_subject_scope`` right after each workload converges).
@@ -202,12 +201,12 @@ def test_crs_match_live_side(onboarded: dict) -> None:
 
 
 def test_subject_scope_linked(onboarded: dict) -> None:
-    """Both sources of ``sub`` = username are in place (D31):
+    """The one source of ``sub`` = username is in place (D31):
 
     * ``aiac-username-sub`` exists with the ``username → sub`` mapper and no ``aiac.managed`` marker,
-      github-agent and github-tool each link it as a **default** scope, and the login client ``rossoctl``
-      does not link it (``subject_scope_link_problems``);
-    * ``rossoctl`` still has its own ``username → sub`` client mapper (unchanged by AIAC), and a
+      and the login client ``rossoctl``, github-agent and github-tool each link it as a **default**
+      scope (``subject_scope_link_problems``);
+    * ``rossoctl`` has no client mapper of its own that writes ``sub`` (no AIAC step adds one), and a
       ``rossoctl`` password-grant token for ``dev-user`` has ``sub`` = ``dev-user``."""
     admin = onboarded["admin"]
     problems = uc1.subject_scope_link_problems(admin, [scn.AGENT_WORKLOAD, scn.TOOL_WORKLOAD])
@@ -216,8 +215,9 @@ def test_subject_scope_linked(onboarded: dict) -> None:
     login = uc1.login_client(admin)
     assert login is not None, f"no login client {uc1.KEYCLOAK_CLIENT_ID!r} in realm {TEST_REALM!r}"
     mappers = admin.get_mappers_from_client(login["id"])
-    assert any(uc1.is_login_subject_mapper(m) for m in mappers), (
-        f"the login client {uc1.KEYCLOAK_CLIENT_ID!r} lost its own username->sub mapper: "
+    assert not any(uc1.is_login_subject_mapper(m) for m in mappers), (
+        f"the login client {uc1.KEYCLOAK_CLIENT_ID!r} has a client mapper that writes sub (the scope "
+        f"{uc1.SUBJECT_SCOPE!r} must be the one source): "
         f"{[(m.get('name'), (m.get('config') or {}).get('claim.name')) for m in mappers]}"
     )
     sub = uc1.login_subject(onboarded, "dev-user")

@@ -15,7 +15,7 @@ metadata:
 ---
 # NOTE: standalone-specific ConfigMap name. It deliberately does NOT reuse
 # `aiac-pdp-config` (the name used by pdp-interface-deployment.yaml), which
-# carries additional keys (KEYCLOAK_REALM, AIAC_PDP_*_URL). Sharing the name in
+# carries additional keys (AIAC_PDP_*_URL, NATS_URL). Sharing the name in
 # the same namespace would let `kubectl apply` of this isolated manifest clobber
 # the interface ConfigMap and break a running interface Pod on its next restart.
 apiVersion: v1
@@ -26,6 +26,12 @@ metadata:
 data:
   KEYCLOAK_URL: "http://keycloak-service.keycloak.svc:8080"
   KEYCLOAK_ADMIN_REALM: "master"
+  # At startup the service links the client scope aiac-username-sub (D31) to the
+  # login clients PLATFORM_SOURCE_CLIENTS (comma-separated, default rossoctl) of
+  # the realm KEYCLOAK_REALM. Without KEYCLOAK_REALM it skips the startup link;
+  # each onboarding makes the link too.
+  KEYCLOAK_REALM: "rossoctl"
+  PLATFORM_SOURCE_CLIENTS: "rossoctl"
 
 ---
 # keycloak-admin-secret is NOT defined here — it must be pre-provisioned

@@ -19,8 +19,10 @@ data:
   AIAC_PDP_CONFIG_URL: "http://aiac-pdp-config-service:7071"
   AIAC_PDP_POLICY_URL: "http://aiac-pdp-policy-service:7072"
   AIAC_POLICY_MODEL_STORE_URL: "http://aiac-policy-model-store-service:7074"
-  # PLATFORM_SOURCE_CLIENTS is the comma-separated list of platform bypass
-  # clients the inbound Rego admits without a user role.
+  # PLATFORM_SOURCE_CLIENTS is the comma-separated list of the platform login
+  # clients. The PDP policy writer: the bypass clients the inbound Rego admits
+  # without a user role. The IdP Configuration Service: the clients it links the
+  # client scope aiac-username-sub to, at startup and at each onboarding (D31).
   PLATFORM_SOURCE_CLIENTS: "rossoctl"
   # NATS_URL points the PDP services at the Event Broker (Phase 2, issue 4.19).
   NATS_URL: "nats://aiac-event-broker-service:4222"
