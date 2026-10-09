@@ -2,6 +2,7 @@
 
 import pytest
 
+from aiac.policy.computation import engine
 from aiac.policy.model.models import EnforcementSide
 
 
@@ -11,6 +12,15 @@ def _default_side(monkeypatch):
     the developer's shell cannot change a test. A test that needs a side sets it (see ``agent_side``,
     ``side``)."""
     monkeypatch.delenv("AIAC_ENFORCEMENT_SIDE", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_service_waits_for_its_re_enable():
+    """Every test starts and ends with no service that waits for its re-enable: a lift that a test
+    runs adds its focus service to the PCE's in-process set, and only ``lift_done`` removes it."""
+    engine._awaiting_reenable.clear()
+    yield
+    engine._awaiting_reenable.clear()
 
 
 @pytest.fixture

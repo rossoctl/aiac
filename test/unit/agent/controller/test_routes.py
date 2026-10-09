@@ -4,7 +4,7 @@ The orchestrator/sub-agent handlers and the Policy Computation Engine are
 mocked at the routes module boundary — no live services, no real graphs.
 """
 
-from unittest.mock import patch
+from unittest.mock import MagicMock, call, patch
 
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
@@ -315,6 +315,56 @@ def test_apply_service_does_not_reenable_when_pce_apply_raises():
 
     assert resp.status_code == 500
     reenable.assert_not_called()
+
+
+def _onboarding_calls(reenable_error=None) -> tuple[int, list]:
+    """POST /apply/service with the handler, the PCE, the re-enable and the PCE ``lift_done`` mocked;
+    returns the status and the order of the calls."""
+    order = MagicMock()
+    order.reenable.side_effect = reenable_error
+    with (
+        patch("aiac.agent.controller.routes.onboard_service", return_value=([], False, CLIENT_ID)),
+        patch("aiac.agent.controller.routes.compute_and_apply", order.compute_and_apply),
+        patch("aiac.agent.controller.routes.reenable_service", order.reenable),
+        patch("aiac.agent.controller.routes.lift_done", order.lift_done),
+    ):
+        resp = client.post("/apply/service/svc-123")
+    return resp.status_code, order.mock_calls
+
+
+def test_apply_service_ends_the_wait_of_a_lift_after_the_re_enable():
+    # A lift counts the service as live until lift_done (LIM-09): a render between the apply and the
+    # re-enable must not take it out of the CRs of its roles. So lift_done comes after the re-enable.
+    status, calls = _onboarding_calls()
+
+    assert status == 200
+    assert calls == [
+        call.compute_and_apply([], False, focus_service=CLIENT_ID),
+        call.reenable("svc-123"),
+        call.lift_done(CLIENT_ID),
+    ]
+
+
+def test_apply_service_ends_the_wait_of_a_lift_when_the_re_enable_fails():
+    # The client stays disabled, so the service must not count as live any more.
+    status, calls = _onboarding_calls(reenable_error=HTTPException(status_code=502))
+
+    assert status == 502
+    assert calls[-2:] == [call.reenable("svc-123"), call.lift_done(CLIENT_ID)]
+
+
+def test_apply_service_does_not_end_a_wait_when_the_pce_apply_raises():
+    # A failed compute_and_apply lifts nothing: there is no wait to end.
+    with (
+        patch("aiac.agent.controller.routes.onboard_service", return_value=([], False, CLIENT_ID)),
+        patch("aiac.agent.controller.routes.compute_and_apply", side_effect=HTTPException(status_code=500)),
+        patch("aiac.agent.controller.routes.reenable_service"),
+        patch("aiac.agent.controller.routes.lift_done") as lift_done,
+    ):
+        resp = client.post("/apply/service/svc-pce-boom")
+
+    assert resp.status_code == 500
+    lift_done.assert_not_called()
 
 
 def test_policy_rules_builder_error_surfaces_422_and_skips_pce():

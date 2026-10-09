@@ -58,7 +58,7 @@ from aiac.agent.uc.onboarding.preconditions import EnforcementPreconditionError
 from aiac.agent.uc.policy_update.build import build_policy
 from aiac.agent.uc.role_update.role import update_role
 from aiac.idp.configuration.models import ClientId, ServiceUuid
-from aiac.policy.computation import compute_and_apply, rerender_role
+from aiac.policy.computation import compute_and_apply, lift_done, rerender_role
 from aiac.policy.model.models import PolicyRule
 
 logger = logging.getLogger(__name__)
@@ -167,9 +167,15 @@ async def _process(subject: str) -> None:
     # UC1 only (only an onboarding has a focus service): re-enable the client AFTER a
     # successful compute_and_apply, mirroring the HTTP route. If compute_and_apply raised
     # above, this is skipped and the client stays disabled (the failed-service marker), never
-    # enabled-with-no-policy. The re-enable is an IdP call, so it takes the subject's UUID.
+    # enabled-with-no-policy. The re-enable is an IdP call, so it takes the subject's UUID. A lift
+    # of a quarantine counts the service as live until lift_done (LIM-09): end that wait only after
+    # the re-enable, also when the re-enable fails (the client then stays disabled). lift_done takes
+    # no PCE lock, so it does not block the event loop.
     if focus is not None:
-        reenable_service(ServiceUuid(subject.removeprefix(_SERVICE_PREFIX)))
+        try:
+            reenable_service(ServiceUuid(subject.removeprefix(_SERVICE_PREFIX)))
+        finally:
+            lift_done(focus)
 
 
 class AiacEventConsumer:

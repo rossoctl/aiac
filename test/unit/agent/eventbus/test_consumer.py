@@ -10,7 +10,7 @@ use-case handler and no ``compute_and_apply``.
 
 import asyncio
 import threading
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 from fastapi import HTTPException
@@ -287,6 +287,75 @@ def test_dispatch_does_not_reenable_when_pce_apply_raises():
 
     reenable.assert_not_called()
     msg.ack.assert_not_called()
+
+
+def _dispatch_onboarding(reenable_error=None) -> tuple[MagicMock, list]:
+    """_dispatch of a service subject with the handler, the PCE, the re-enable and the PCE
+    ``lift_done`` mocked; returns the message and the order of the calls."""
+    consumer = AiacEventConsumer()
+    consumer._nc = _fake_nc()
+    msg = _fake_msg("aiac.apply.service.svc-1", num_delivered=1)
+    order = MagicMock()
+    order.reenable.side_effect = reenable_error
+    with (
+        patch("aiac.agent.eventbus.consumer.onboard_service", return_value=([], False, CLIENT_ID)),
+        patch("aiac.agent.eventbus.consumer.compute_and_apply", order.compute_and_apply),
+        patch("aiac.agent.eventbus.consumer.reenable_service", order.reenable),
+        patch("aiac.agent.eventbus.consumer.lift_done", order.lift_done),
+    ):
+        asyncio.run(consumer._dispatch(msg))
+    return msg, order.mock_calls
+
+
+def test_dispatch_ends_the_wait_of_a_lift_after_the_re_enable():
+    # A lift counts the service as live until lift_done (LIM-09): a render between the apply and the
+    # re-enable must not take it out of the CRs of its roles. So lift_done comes after the re-enable.
+    msg, calls = _dispatch_onboarding()
+
+    assert calls == [
+        call.compute_and_apply([], False, focus_service=CLIENT_ID),
+        call.reenable("svc-1"),
+        call.lift_done(CLIENT_ID),
+    ]
+    msg.ack.assert_called_once()
+
+
+def test_dispatch_ends_the_wait_of_a_lift_when_the_re_enable_fails():
+    # The client stays disabled, so the service must not count as live any more. The failure takes
+    # the normal retry path (here: left unacked below MAX_DELIVER).
+    msg, calls = _dispatch_onboarding(reenable_error=RuntimeError("idp down"))
+
+    assert calls[-2:] == [call.reenable("svc-1"), call.lift_done(CLIENT_ID)]
+    msg.ack.assert_not_called()
+
+
+def test_dispatch_does_not_end_a_wait_when_the_pce_apply_raises():
+    consumer = AiacEventConsumer()
+    consumer._nc = _fake_nc()
+    msg = _fake_msg("aiac.apply.service.svc-1", num_delivered=1)
+    with (
+        patch("aiac.agent.eventbus.consumer.onboard_service", return_value=([], False, CLIENT_ID)),
+        patch("aiac.agent.eventbus.consumer.compute_and_apply", side_effect=RuntimeError("pce boom")),
+        patch("aiac.agent.eventbus.consumer.reenable_service"),
+        patch("aiac.agent.eventbus.consumer.lift_done") as lift_done,
+    ):
+        asyncio.run(consumer._dispatch(msg))
+
+    lift_done.assert_not_called()
+
+
+def test_dispatch_ends_no_wait_for_a_non_service_subject():
+    consumer = AiacEventConsumer()
+    consumer._nc = AsyncMock()
+    msg = _fake_msg("aiac.apply.role.role-1")
+    with (
+        patch("aiac.agent.eventbus.consumer.update_role", return_value=([], True)),
+        patch("aiac.agent.eventbus.consumer.compute_and_apply"),
+        patch("aiac.agent.eventbus.consumer.lift_done") as lift_done,
+    ):
+        asyncio.run(consumer._dispatch(msg))
+
+    lift_done.assert_not_called()
 
 
 def test_dispatch_does_not_reenable_for_non_service_subject():

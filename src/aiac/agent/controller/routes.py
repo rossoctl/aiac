@@ -3,7 +3,9 @@
 The Controller is stateless. Each ``/apply/*`` route dispatches to its use-case handler
 (orchestrator or sub-agent), receives the ``(list[PolicyRule], override)`` tuple
 the handler returns, and makes the **single** ``compute_and_apply(rules, override)``
-call to the Policy Computation Engine. No per-use-case business logic, retry
+call to the Policy Computation Engine. The onboarding route then re-enables the client
+(``reenable_service``) and calls the PCE ``lift_done`` (also when the re-enable fails): a lift of a
+quarantine counts the service as live until then. No per-use-case business logic, retry
 handling, or state assembly lives here. Two routes call the PCE directly instead:
 ``/apply/offboard/...`` (``decommission``) and ``/apply/role-members/{role_id}``
 (``rerender_role``, a role-membership change, D32).
@@ -47,7 +49,7 @@ from aiac.agent.uc.policy_update.build import build_policy
 from aiac.agent.uc.policy_update.rebuild import rebuild_policy
 from aiac.agent.uc.role_update.role import update_role
 from aiac.idp.configuration.models import ClientId, ServiceUuid
-from aiac.policy.computation import compute_and_apply, decommission, policy_model_for, rerender_role
+from aiac.policy.computation import compute_and_apply, decommission, lift_done, policy_model_for, rerender_role
 
 app = FastAPI(lifespan=lifespan)
 
@@ -152,7 +154,13 @@ def apply_service(service_id: str) -> Response:
     compute_and_apply(rules, override, focus_service=client_id)
     # Re-enable the client only AFTER the PCE apply succeeds — a compute_and_apply failure above
     # propagates and leaves the client disabled (the failed-service marker), never enabled-with-no-policy.
-    reenable_service(uuid)
+    # A lift of a quarantine counts the service as live until lift_done, so a render before the re-enable
+    # keeps it in the CRs of its roles (LIM-09). End that wait only after the re-enable, also when the
+    # re-enable fails: the client then stays disabled, and the service must not count as live.
+    try:
+        reenable_service(uuid)
+    finally:
+        lift_done(client_id)
     return Response(status_code=200)
 
 
