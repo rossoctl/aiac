@@ -2,8 +2,9 @@
 
 Extracted from ``ServicePolicyBuilder.build()`` (D13) so both the live Service Policy
 Builder and the read-only Policy Conflict Check diagnostic resolve the **same** typed entity
-set from the live IdP catalog. This is a **pure extraction** — the resolution logic is
-byte-for-byte the same split the builder performed inline; no live behavior changes.
+set from the live IdP catalog. The extraction itself was **pure** (byte-for-byte the same split
+the builder performed inline). Later changes to the resolution (the D32 holders, the kind of a
+composite child) are made here, so both callers get them.
 
 The focus service is resolved from ``get_services()`` by ``id`` (the Keycloak internal client
 UUID the ``/apply/service/{id}`` route and ``Trigger.entity_id`` carry — **not**
@@ -11,12 +12,22 @@ UUID the ``/apply/service/{id}`` route and ``Trigger.entity_id`` carry — **not
 **other** services, selected by **owner service** (the service that holds the role / the
 ``scope.serviceId`` of the copy), never by name:
 
-- ``own_roles`` / ``own_scopes`` — the focus service's own ``aiac.managed`` roles/scopes.
+- ``own_roles`` / ``own_scopes`` — the focus service's own ``aiac.managed`` roles/scopes (the
+  focus's copies). The role-focal pass flattens each own role (``flatten_role``), so each child of a
+  composite own role is the full copy of its role, with its kind from the catalog ownership (the same
+  rule as for a candidate, below). The tree keeps its shape, so the flatten gives the same role ids.
 - ``candidate_roles`` — the flattened, de-duplicated union of (a) other services'
   ``aiac.managed`` roles (``kind=Agent``) and (b) realm roles held by at least one user
   (composite-expanded, and not owned by any service; ``kind=User``). There is one entry for each
   role id, with its current holders (``RoleHolders``, the rule that the PCE uses at render time,
   D32): a role that two services hold (a shared role) is one candidate with both holders.
+  The kind of a candidate comes from the catalog ownership, not from the copy that the flatten
+  gives: a role id that a service holds (in ``get_services()``, also a disabled service or the
+  focus) is an ``Agent`` role, and any other role is a ``User`` role. Each candidate is the full
+  copy of its role (see ``_catalog_copies``), so a child of a composite role (the
+  ``GET /roles/{name}/composites`` copy, with no kind and no members) does not decide the kind,
+  the holders or the fields of a candidate, and the order of the catalog and of the subjects does
+  not change them.
 - ``other_scopes`` — other services' ``aiac.managed`` scopes, sourced from ``get_services()``
   so each scope carries its owning ``serviceId`` (the SPM routing key the PCE needs).
 
@@ -54,7 +65,7 @@ from pydantic import BaseModel, ConfigDict
 
 from aiac.agent.shared.roles import flatten_role
 from aiac.idp.configuration.api import Configuration
-from aiac.idp.configuration.models import Role, Scope, ServiceType
+from aiac.idp.configuration.models import Role, RoleKind, Scope, Service, ServiceType, Subject
 from aiac.policy.model.holders import RoleHolders
 
 
@@ -76,17 +87,61 @@ def _config() -> Configuration:
     return Configuration.for_default_realm()
 
 
-def _flatten_dedup(roles: list[Role], holders: RoleHolders) -> list[Role]:
-    """Union of every role's closure, de-duplicated by ``role.id``. Each role carries its current
-    holders (``holders``, D32): the copies of a shared role (one per holding service, each with only
-    that service in ``actorIds``) merge into one role with every holder."""
+def _with_kind(role: Role, kind: RoleKind) -> Role:
+    """``role`` with the kind ``kind`` (a copy only when the kind is not already ``kind``)."""
+    return role if role.kind == kind else role.model_copy(update={"kind": kind})
+
+
+def _catalog_copies(services: list[Service], subjects: list[Subject]) -> dict[str, Role]:
+    """The full copy of each role id that the catalog gives, with its kind from the catalog ownership.
+
+    A role id that a service holds (any service in ``services``: a disabled service and the focus
+    too, because they still own their roles) is an ``Agent`` role, and its copy is the copy of the
+    first service that holds it (the copies of a shared role differ only in ``actorIds``, which the
+    holders replace). A role id that a subject holds directly, and that no service holds, is a
+    ``User`` role, and its copy is the ``GET /roles`` copy in ``subject.roles`` (it has the members
+    in ``actorIds`` and the ``aiac.managed`` marker). A role id that only a composite parent gives
+    is not in the result (see ``_canonical``)."""
+    copies: dict[str, Role] = {}
+    for service in services:
+        for role in service.roles:
+            copies.setdefault(role.id, _with_kind(role, RoleKind.AGENT))
+    for subject in subjects:
+        for role in subject.roles:
+            copies.setdefault(role.id, _with_kind(role, RoleKind.USER))
+    return copies
+
+
+def _canonical(role: Role, copies: dict[str, Role]) -> Role:
+    """The full copy of ``role`` (``copies``, from ``_catalog_copies``). A role id that only a
+    composite parent gives keeps the child copy, as a ``User`` role: no service holds it."""
+    return copies.get(role.id) or _with_kind(role, RoleKind.USER)
+
+
+def _with_canonical_children(role: Role, copies: dict[str, Role]) -> Role:
+    """``role`` (this copy) in which each descendant is the full copy of its role (``_canonical``).
+    Each node keeps the children that ``role`` gives it, not the children of its full copy, so
+    ``flatten_role`` of the result gives the same role ids in the same order as ``flatten_role(role)``."""
+
+    def subtree(node: Role, copy: Role) -> Role:
+        children = [subtree(child, _canonical(child, copies)) for child in node.childRoles]
+        return copy.model_copy(update={"childRoles": children})
+
+    return subtree(role, role)
+
+
+def _flatten_dedup(roles: list[Role], holders: RoleHolders, copies: dict[str, Role]) -> list[Role]:
+    """Union of every role's closure, de-duplicated by ``role.id``. Each member is its full copy
+    (``_canonical``), so a child of a composite role does not decide the kind of a candidate. Each
+    role carries its current holders (``holders``, D32): the copies of a shared role (one per holding
+    service, each with only that service in ``actorIds``) merge into one role with every holder."""
     out: list[Role] = []
     seen: set[str] = set()
     for role in roles:
         for member in flatten_role(role):
             if member.id not in seen:
                 seen.add(member.id)
-                out.append(holders.refresh_role(member))
+                out.append(holders.refresh_role(_canonical(member, copies)))
     return out
 
 
@@ -122,7 +177,15 @@ def resolve_focal_entities(
     if focus is None:
         raise HTTPException(404, f"service {service_id!r} not found in IdP catalog")
 
-    own_roles = [r for r in focus.roles if r.aiac_managed]
+    # The full copy of each role, with its kind from the catalog ownership (a role id that a service
+    # holds is an Agent role). The flatten gives a child of a composite role as the composites
+    # endpoint copy, with no per-service kind (User by default) and no members, so each member is
+    # replaced by its full copy and the order of the catalog and of the subjects does not matter.
+    copies = _catalog_copies(services, subjects)
+
+    # The role-focal pass flattens each own role (flatten_role), so a child of a composite own role is
+    # its full copy too. The own role itself stays the focus's copy.
+    own_roles = [_with_canonical_children(r, copies) for r in focus.roles if r.aiac_managed]
     own_scopes = [s for s in focus.scopes if s.aiac_managed]
 
     # The other services that can take part in a rule: every enabled service except the focus. A
@@ -136,16 +199,13 @@ def resolve_focal_entities(
 
     # User roles are membership-derived, not aiac.managed: a realm role qualifies iff a user
     # holds it directly or via a composite parent they hold, and no service owns it.
-    service_owned_ids = {r.id for s in services for r in s.roles}
     user_roles_by_id: dict[str, Role] = {}
     for subject in subjects:
         for role in subject.roles:
-            # NB: flatten_role on an agent composite role would yield children whose kind
-            # defaults to User (composites endpoint doesn't carry per-service kind) — a latent
-            # edge case if a user is ever assigned a composite agent role. Not hit here.
             for member in flatten_role(role):
-                if member.id not in service_owned_ids:
-                    user_roles_by_id[member.id] = member
+                full = _canonical(member, copies)
+                if full.kind == RoleKind.USER:
+                    user_roles_by_id.setdefault(member.id, full)
     user_roles = list(user_roles_by_id.values())
 
     # Other services' aiac.managed scopes, sourced from get_services() (mirroring
@@ -158,10 +218,10 @@ def resolve_focal_entities(
 
     # The holders of each candidate role, by the rule that the PCE uses at render time (D32): the
     # live services that hold an agent role (the focus counts as live, so a shared role that the focus
-    # holds lists the focus too), and the members of a user role. The subjects' roles come from
-    # GET /roles, so they carry those members.
+    # holds lists the focus too), and the members of a user role. The user roles are the full copies
+    # from GET /roles (through the subjects' roles), so they carry those members.
     holders = RoleHolders(services, user_roles, focus_service=focus.serviceId)
-    candidate_roles = _flatten_dedup(user_roles + other_agent_roles, holders)
+    candidate_roles = _flatten_dedup(user_roles + other_agent_roles, holders, copies)
 
     return FocalEntitySet(
         own_scopes=own_scopes,
