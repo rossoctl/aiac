@@ -5,15 +5,24 @@ the client, and ``quarantine`` deletes ``SPM(X)`` and the CR of X. A role that X
 service (Provision reuses it by name, so it is not in the created-manifest) stays mapped to X, and its
 edges stay on the SPMs of its callees. X is disabled, so it is not a holder: the quarantine renders
 those CRs again without X. It does not write those SPMs (their rules did not change), so their stored
-``actorIds`` still name X.
+``actorIds`` still name X. The edges stay also when the other holder is quarantined (disabled) too:
+a disabled client keeps its role mappings, so it still holds the role, and its lift gives the edges
+back to it.
 
 Only a successful re-onboarding lifts the quarantine. Its ``compute_and_apply`` runs with X as the
 focus service (X counts as live, its client is still disabled), so the callees get X as a holder
 again. Before the fix, their refreshed SPM was equal to the stored one (not stale), and a callee that
 the lift's batch does not route a new rule to was not touched at all: no CR got X back until a
-role-members event or the resync. The lift gives no role-members event (the mapping already exists),
-so each test drops the events of the lift. The lift also writes each lifted SPM whose stored holders
-are stale, so its snapshot names the holders that its CR names.
+role-members event or the resync. Provision's re-map of the kept shared role sends a role-members
+event too: Keycloak (26.5.2) sends ``REALM_ROLE_MAPPING`` CREATE also for a mapping that is already
+there. That event would repair the CRs, so each test drops it, to show that the lift alone repairs
+them. The lift also writes each lifted SPM whose stored holders are stale, so its snapshot names the
+holders that its CR names.
+
+The caller re-enables the client after ``compute_and_apply`` returns, outside the PCE lock. So the
+lift counts X as waiting for its re-enable, and the PCE counts a waiting service as live until the
+caller calls ``lift_done`` (after ``reenable_service``, also when it fails). A render in that window
+(for example the role-members event of the re-map) then keeps X in the CRs of its roles.
 
 The harness is the one of ``test_shared_roles.py`` (the real resolver, PRB graphs, PCE and writer
 between the fakes).
@@ -76,11 +85,22 @@ def _fail_onboarding(stack: Stack, workload: Workload) -> None:
 def _lift(stack: Stack, workload: Workload) -> None:
     """A successful re-onboarding of the quarantined ``workload``: Provision again (create-or-get),
     the build and ``compute_and_apply`` with the client still disabled (the focus service), then
-    ``reenable_service``. No role mapping is new, so no role-members event comes."""
+    ``reenable_service`` and ``lift_done``, as the Controller does. Provision maps the kept shared role
+    again, and Keycloak sends a role-members event also for a mapping that is already there; the test
+    drops it, so only the lift can repair the CRs."""
     stack.realm.provision(workload.namespace, workload.name, workload.type, workload.entries)
     stack.drop_role_events()
     stack.onboard(workload.client_id)
     _set_enabled(stack, workload, True)
+    computation.lift_done(workload.client_id)
+
+
+@pytest.fixture(autouse=True)
+def _no_service_waits_for_its_re_enable():
+    """No test leaves a service in the PCE's in-process set of services that wait for their re-enable
+    (a test that fails before its ``lift_done`` would leave it for the next test)."""
+    yield
+    engine._awaiting_reenable.clear()
 
 
 class TestTheLiftPutsTheHolderBack:
@@ -151,6 +171,27 @@ class TestTheLiftPutsTheHolderBack:
             )
 
     @pytest.mark.parametrize("side", list(EnforcementSide), ids=lambda side: side.value)
+    def test_a_callee_that_no_lift_routes_a_rule_to_keeps_the_role_while_every_holder_is_quarantined(
+        self, stack: Stack, side: EnforcementSide, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # review-agent's edge of the shared role comes from its own onboarding, so no lift routes a rule
+        # to it: only the stored edge can give a lifted holder the grant back. team1 fails first, then
+        # team2. team1 is disabled, but its client keeps the mapping of the role, so it still holds it:
+        # the quarantine of team2 does not purge the edge, which is the grant of team1 too.
+        monkeypatch.setenv("AIAC_ENFORCEMENT_SIDE", side.value)
+        stack.llm.decisions = REVIEWER_CALLED
+        for workload in (AGENT1, AGENT2, TOOL1, REVIEWER):
+            stack.bring_up(workload)
+        _fail_onboarding(stack, AGENT1)
+        _fail_onboarding(stack, AGENT2)
+        assert _holders(stack, REVIEWER) == set(), "after both quarantines"
+        assert _stored_holders(stack, REVIEWER), "the quarantine of team2 purged the edge of the shared role"
+
+        _lift(stack, AGENT1)
+
+        assert _holders(stack, REVIEWER) == {AGENT1.client_id}, f"{REVIEWER.client_id}: after the lift of team1"
+
+    @pytest.mark.parametrize("side", list(EnforcementSide), ids=lambda side: side.value)
     def test_the_resync_after_a_lift_gives_the_same_crs(
         self, stack: Stack, side: EnforcementSide, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -165,6 +206,55 @@ class TestTheLiftPutsTheHolderBack:
         computation.resync()
 
         assert stack.cluster.crs == after_lift
+
+
+class TestTheWindowBeforeTheReEnable:
+    """A render between the lift (``compute_and_apply``) and ``reenable_service`` reads the client of
+    team2 as disabled. Here it is the role-members event of Provision's re-map of the shared role. The
+    NATS consumer can run it in that window when the onboarding came on the HTTP route
+    ``POST /apply/service/{service_id}`` (the consumer is then free), and so can the route
+    ``POST /apply/role-members/{role_id}``."""
+
+    @pytest.mark.parametrize("side", list(EnforcementSide), ids=lambda side: side.value)
+    def test_a_role_members_event_before_the_re_enable_keeps_the_lifted_holder(
+        self, stack: Stack, side: EnforcementSide, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("AIAC_ENFORCEMENT_SIDE", side.value)
+        stack.llm.decisions = REVIEWER_CALLED
+        for workload in (AGENT1, AGENT2, TOOL1, REVIEWER):
+            stack.bring_up(workload)
+        _fail_onboarding(stack, AGENT2)
+        # Under agent side the tool CR is a pass-through: review-agent's inbound names the holders.
+        callees = (TOOL1, REVIEWER) if side == EnforcementSide.TARGET_SIDE else (REVIEWER,)
+        stack.realm.provision(AGENT2.namespace, AGENT2.name, AGENT2.type, AGENT2.entries)
+        assert stack.realm.events, "Provision's re-map of the shared role sends a role-members event"
+        stack.onboard(AGENT2.client_id)  # the lift
+
+        stack.deliver_role_events()  # before reenable_service
+        for callee in callees:
+            assert _holders(stack, callee) == {AGENT1.client_id, AGENT2.client_id}, f"{callee.client_id}: in the window"
+
+        _set_enabled(stack, AGENT2, True)  # reenable_service
+        computation.lift_done(AGENT2.client_id)
+        stack.onboard(AGENT1.client_id)  # a later run that touches the callees
+        for callee in callees:
+            assert _holders(stack, callee) == {AGENT1.client_id, AGENT2.client_id}, f"{callee.client_id}: after it"
+
+    def test_after_a_failed_re_enable_the_next_render_takes_the_holder_out(self, stack: Stack) -> None:
+        # reenable_service failed: the client of team2 stays disabled, and lift_done ends the wait.
+        for workload in ORDERS["agents-first"]:
+            stack.bring_up(workload)
+        _fail_onboarding(stack, AGENT2)
+        stack.realm.provision(AGENT2.namespace, AGENT2.name, AGENT2.type, AGENT2.entries)
+        stack.onboard(AGENT2.client_id)  # the lift
+        for tool in TOOLS:
+            assert _holders(stack, tool) == {AGENT1.client_id, AGENT2.client_id}, f"{tool.client_id}: the lift"
+
+        computation.lift_done(AGENT2.client_id)
+        stack.deliver_role_events()
+
+        for tool in TOOLS:
+            assert _holders(stack, tool) == {AGENT1.client_id}, f"{tool.client_id}: team2 is still disabled"
 
 
 class TestTheStoreAfterALift:

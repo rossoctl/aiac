@@ -70,6 +70,26 @@ def test_the_focus_service_is_a_holder_while_it_is_disabled():
     assert holders.of(SHARED) == [_AGENT_1]
 
 
+def test_a_service_that_waits_for_its_re_enable_is_a_holder_while_it_is_disabled():
+    # The lift of a quarantine is done, and its caller has not re-enabled the client yet: the PCE
+    # counts the service as live, so a render in that window keeps it in the CRs of its roles.
+    holders = RoleHolders([_agent(_AGENT_1, SHARED, enabled=False)], [], awaiting_reenable=[_AGENT_1])
+
+    assert holders.of(SHARED) == [_AGENT_1]
+
+
+def test_live_is_the_enabled_services_the_focus_and_the_services_that_wait_for_their_re_enable():
+    services = [
+        _agent(_AGENT_1),
+        _agent(_AGENT_2, enabled=False),
+        _agent("focus", enabled=False),
+        _agent("waiting", enabled=False),
+    ]
+    holders = RoleHolders(services, [], focus_service="focus", awaiting_reenable=["waiting", "not-in-the-catalog"])
+
+    assert holders.live == {_AGENT_1, "focus", "waiting"}
+
+
 def test_an_agent_role_that_no_live_service_has_has_no_holder():
     holders = RoleHolders([_agent(_AGENT_1)], [])
 
@@ -100,11 +120,39 @@ def test_a_user_role_that_get_roles_does_not_list_has_no_holder():
     assert holders.of(DEV) == []
 
 
-def test_a_user_role_is_not_resolved_from_the_catalog():
-    # The kind of the role in the edge selects the source of truth.
-    holders = RoleHolders([_agent(_AGENT_1, _agent_role("developer"))], [])
+# --------------------------------------------------------------------------- #
+# The kind of a role comes from the catalog: a role that a service holds is an  #
+# agent role (Assumption 1: no role is held by services and by users).          #
+# --------------------------------------------------------------------------- #
+def test_a_role_that_a_service_holds_is_an_agent_role_whatever_kind_the_edge_carries():
+    # A child of a composite role keeps kind=User (the composites endpoint has no per-service kind),
+    # also when it is an agent role that a service holds directly. GET /roles lists its service
+    # account as a member; that is not a user.
+    child = _user_role(SHARED.id)
+    holders = RoleHolders([_agent(_AGENT_1, SHARED)], [_user_role(SHARED.id, "service-account-github-agent")])
 
-    assert holders.of(DEV) == []
+    assert holders.of(child) == [_AGENT_1]
+    assert holders.refresh_role(child) == child.model_copy(update={"kind": RoleKind.AGENT, "actorIds": [_AGENT_1]})
+
+
+def test_a_role_that_only_a_disabled_service_holds_is_an_agent_role_with_no_holder():
+    child = _user_role(SHARED.id)
+    holders = RoleHolders([_agent(_AGENT_1, SHARED, enabled=False)], [_user_role(SHARED.id, "service-account-x")])
+
+    assert holders.refresh_role(child) == child.model_copy(update={"kind": RoleKind.AGENT, "actorIds": []})
+
+
+def test_an_agent_role_that_no_service_in_the_catalog_holds_stays_an_agent_role():
+    # A deleted service's role keeps the kind of the edge: it does not become a user role.
+    holders = RoleHolders([], [_user_role(SHARED.id, "service-account-gone")])
+
+    assert holders.refresh_role(SHARED) == SHARED.model_copy(update={"actorIds": []})
+
+
+def test_a_user_role_that_no_service_holds_stays_a_user_role():
+    holders = RoleHolders([_agent(_AGENT_1, SHARED)], [_user_role("developer", "dev-user")])
+
+    assert holders.refresh_role(_user_role("developer")) == DEV
 
 
 # --------------------------------------------------------------------------- #
