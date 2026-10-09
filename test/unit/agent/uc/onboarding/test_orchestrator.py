@@ -727,7 +727,8 @@ class TestRollbackDeletesOnlyCreated:
         config = _config_returning(service)
         config.get_scopes.return_value = []  # weather.x is absent before the run
         created_scope = Scope(id="s-new", name="weather.x")
-        config.create_service_scope.return_value = created_scope
+        # (scope, created): this run created weather.x, so it goes into the created-manifest (REJ-02).
+        config.create_service_scope.return_value = (created_scope, True)
         config.link_subject_scope.return_value = Scope(id="s-sub", name="aiac-username-sub")
         classified = OnboardingProvisionState(
             trigger=Trigger(entity_id=SERVICE_ID),

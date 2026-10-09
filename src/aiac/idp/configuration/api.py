@@ -1,7 +1,8 @@
 import logging
 import os
+from collections.abc import Callable
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, TypeVar
 
 import requests
 from dotenv import load_dotenv
@@ -55,6 +56,51 @@ def _warn_on_dropped_description(kind: str, existing: Role | Scope, definition: 
             kept,
             dropped,
         )
+
+
+_Named = TypeVar("_Named", Role, Scope)
+
+
+def _get_or_create(
+    kind: str,
+    definition: _NamedDefinition,
+    read: Callable[[], list[_Named]],
+    create: Callable[[str, str], _Named],
+) -> tuple[_Named, bool]:
+    """Reuse the ``kind`` named ``definition.name`` that ``read()`` lists, or ``create`` it.
+
+    Returns ``(object, created)``. ``created`` is ``True`` only when this call's ``create``
+    returned the object, and ``False`` for each reuse, also a reuse after a ``409``. So a caller
+    puts an object into its created-manifest only when this call made it.
+
+    Reuse is by design (D32), and a reused object keeps its description
+    (``_warn_on_dropped_description``). The check and the create are two requests, so two services
+    with the same workload name that provision at the same time can both find no object; Keycloak
+    then answers ``409`` to the second create (REJ-02). A ``409`` from the create is reuse too:
+    ``read()`` again and reuse the object of that name that is there now, with the same description
+    rule. That object is the other run's, so ``created`` is ``False``. A create that ``_request``
+    repeats after Keycloak committed the first attempt also gets this ``409``, and reuses the object
+    that the first attempt made. A ``409`` does not tell the two cases apart, so that object is not
+    ``created`` either: a rollback keeps it (fail closed), and the next run reuses it by name. A
+    ``409`` that the second read does not explain (no object of that name) and any other error are
+    raised."""
+
+    def by_name() -> _Named | None:
+        return next((entity for entity in read() if entity.name == definition.name), None)
+
+    existing = by_name()
+    if existing is None:
+        try:
+            return create(definition.name, definition.description), True
+        except IdPHTTPError as error:
+            if error.status != 409:
+                raise
+            existing = by_name()
+            if existing is None:
+                raise
+            logger.info("the create of %s %r answered 409: the name is taken now, so reuse it", kind, definition.name)
+    _warn_on_dropped_description(kind, existing, definition)
+    return existing, False
 
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
@@ -111,7 +157,8 @@ class Configuration:
         (``create_service_role`` / ``create_service_scope``) retry each sub-request without
         compounding. Writes are retried too: a repeated write makes no duplicate, but a repeated
         ``create_role`` / ``create_scope`` whose first attempt was committed answers ``409`` (see
-        ``library-idp.md``).
+        ``library-idp.md``); ``create_service_role`` / ``create_service_scope`` take that ``409`` as
+        reuse (``_get_or_create``).
         """
         caller = getattr(requests, method.lower())
 
@@ -274,40 +321,42 @@ class Configuration:
         )
         return Service.model_validate(resp.json())
 
-    def create_service_role(self, service_id: str, role: _NamedDefinition) -> Role:
+    def create_service_role(self, service_id: str, role: _NamedDefinition) -> tuple[Role, bool]:
         """Idempotent create-or-get of a realm role by name, then map it to ``service_id``.
 
         If a realm role with ``role.name`` already exists it is reused (no duplicate create);
         otherwise it is created. Reuse is by design (D32): services with the same workload name
-        share the role. A reused role keeps its description; when ``role.description`` is not the
-        same (``None`` counts as ``""``), a ``WARNING`` names the role and both descriptions, and
-        Keycloak is not updated. The role is then mapped to the service's service-account
-        (``map_role_to_service`` is itself idempotent). Returns the resolved ``Role``.
+        share the role. A ``409`` from the create (another service created the role after the
+        check) is reuse too: the role is read again by name (``_get_or_create``). A reused role keeps
+        its description; when ``role.description`` is not the same (``None`` counts as ``""``), a
+        ``WARNING`` names the role and both descriptions, and Keycloak is not updated. The role is
+        then mapped to the service's service-account (``map_role_to_service`` is itself idempotent).
+        Returns ``(role, created)``: the resolved ``Role``, and ``True`` only when this call created
+        it (``False`` for a reuse, also after a ``409``). UC1 Provision puts the role into its
+        created-manifest only when ``created`` is ``True``, so its rollback never deletes a role
+        that another service created.
         """
-        existing = next((r for r in self.get_roles() if r.name == role.name), None)
-        if existing is not None:
-            _warn_on_dropped_description("role", existing, role)
-        resolved = existing or self.create_role(role.name, role.description)
+        resolved, created = _get_or_create("role", role, self.get_roles, self.create_role)
         self.map_role_to_service(self.get_service(service_id), resolved)
-        return resolved
+        return resolved, created
 
-    def create_service_scope(self, service_id: str, scope: _NamedDefinition) -> Scope:
+    def create_service_scope(self, service_id: str, scope: _NamedDefinition) -> tuple[Scope, bool]:
         """Idempotent create-or-get of a client scope by name, then map it to ``service_id``.
 
         If a client scope with ``scope.name`` already exists it is reused; otherwise it is
         created. Reuse is by design (D32): services with the same workload name share the scope,
-        and each owner gets its own copy in ``get_services()``. A reused scope keeps its
-        description; when ``scope.description`` is not the same (``None`` counts as ``""``), a
-        ``WARNING`` names the scope and both descriptions, and Keycloak is not updated. The scope
-        is then mapped to the service as a default client scope (``map_scope_to_service`` is itself
-        idempotent). Returns the resolved ``Scope``.
+        and each owner gets its own copy in ``get_services()``. A ``409`` from the create (another
+        service created the scope after the check) is reuse too: the scope is read again by name
+        (``_get_or_create``). A reused scope keeps its description; when ``scope.description`` is
+        not the same (``None`` counts as ``""``), a ``WARNING`` names the scope and both
+        descriptions, and Keycloak is not updated. The scope is then mapped to the service as a
+        default client scope (``map_scope_to_service`` is itself idempotent). Returns
+        ``(scope, created)``: the resolved ``Scope``, and ``True`` only when this call created it
+        (``False`` for a reuse, also after a ``409``), as for ``create_service_role``.
         """
-        existing = next((s for s in self.get_scopes() if s.name == scope.name), None)
-        if existing is not None:
-            _warn_on_dropped_description("client scope", existing, scope)
-        resolved = existing or self.create_scope(scope.name, scope.description)
+        resolved, created = _get_or_create("client scope", scope, self.get_scopes, self.create_scope)
         self.map_scope_to_service(self.get_service(service_id), resolved)
-        return resolved
+        return resolved, created
 
     def create_role(self, role_name: str, role_description: str) -> Role:
         resp = self._request(

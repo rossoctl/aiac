@@ -226,6 +226,41 @@ class TestListServiceRoles:
         assert resp.status_code == 200
         assert resp.json() == []
 
+    # The realm roles of the service account (the provisioning path of the Configuration library).
+    # ``get_realm_roles_of_user`` gives stubs with no attributes, so the endpoint reads each full role
+    # to find the aiac.managed marker.
+    _MANAGED = {"id": "r-managed", "name": "github-agent.source_operations", "attributes": {"aiac.managed": ["true"]}}
+    _BUILTIN = {"id": "r-builtin", "name": "offline_access", "attributes": {}}
+
+    def _realm_admin(self, *, client_roles=(), stubs=()):
+        admin = MagicMock()
+        admin.get_client.return_value = {"id": "svc-uuid", "clientId": "team1/github-agent"}
+        admin.get_client_roles.return_value = [dict(r) for r in client_roles]
+        admin.get_client_service_account_user.return_value = {"id": "sa-uid"}
+        admin.get_realm_roles_of_user.return_value = [dict(s) for s in stubs]
+        full = {r["id"]: r for r in (self._MANAGED, self._BUILTIN)}
+        admin.get_realm_role_by_id.side_effect = lambda role_id: dict(full[role_id])
+        return admin
+
+    def test_aiac_managed_realm_role_of_the_service_account_is_an_agent_role_of_the_service(self):
+        stubs = [{"id": r["id"], "name": r["name"]} for r in (self._MANAGED, self._BUILTIN)]
+        admin = self._realm_admin(stubs=stubs)
+
+        resp = _make_client(admin).get(f"/services/svc-uuid/roles?realm={REALM}")
+
+        assert resp.status_code == 200
+        # The full role, as an agent role of this service (its clientId); the unmarked built-in is not listed.
+        assert resp.json() == [{**self._MANAGED, "kind": "Agent", "actorIds": ["team1/github-agent"]}]
+
+    def test_a_realm_role_that_is_also_a_client_role_of_the_service_is_listed_once(self):
+        client_role = {"id": "r-managed", "name": "github-agent.source_operations", "containerId": "svc-uuid"}
+        admin = self._realm_admin(client_roles=[client_role], stubs=[{"id": "r-managed", "name": "x"}])
+
+        resp = _make_client(admin).get(f"/services/svc-uuid/roles?realm={REALM}")
+
+        assert [r["id"] for r in resp.json()] == ["r-managed"]
+        admin.get_realm_role_by_id.assert_not_called()
+
     def teardown_method(self):
         app.dependency_overrides.clear()
 
