@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import re
 import sys
 from pathlib import Path
 
@@ -81,12 +82,29 @@ def grant_sets(cfg, rego_dir: Path) -> tuple[set[tuple[str, str]], set[tuple[str
         tool_inbound_rego = rego_dir / cfg.tool_inbound_rego
         if not tool_inbound_rego.is_file():
             return inbound, set()
-        gate_rego, query = tool_inbound_rego, "data.authbridge.client.inbound.request.subject_role_allow_scopes"
-    else:
-        gate_rego, query = outbound_rego, "data.authbridge.client.outbound.request.subject_role_allow_scopes"
-    subj_scopes = opa_eval([gate_rego], query, {}) or {}
-    tool_calls = {(role, scope) for role, scopes in subj_scopes.items() for scope in scopes}
+        query = "data.authbridge.client.inbound.request.subject_role_allow_scopes"
+        subj_scopes = opa_eval([tool_inbound_rego], query, {}) or {}
+        return inbound, {(role, tool) for role, tools in subj_scopes.items() for tool in tools}
+    # Agent side: the agent's outbound map is keyed by role and then by the full target service id
+    # (LIM-02), so only the tool's own target gives its grants, as the tool's inbound does above.
+    query = "data.authbridge.client.outbound.request.subject_role_allow_scopes"
+    by_role = opa_eval([outbound_rego], query, {}) or {}
+    tool_calls = {
+        (role, tool)
+        for role, by_target in by_role.items()
+        for target, tools in by_target.items()
+        if _is_tool_target(cfg, target)
+        for tool in tools
+    }
     return inbound, tool_calls
+
+
+def _is_tool_target(cfg, service_id: str) -> bool:
+    """True when ``service_id`` (a target key of the agent's outbound) is the demo tool's clientId:
+    the CR that it names (the SPIFFE ``ns``/``sa`` segments, or a plain ``<ns>/<name>``) is
+    ``cfg.namespace``/``cfg.tool_cr_name``."""
+    match = re.fullmatch(r"spiffe://[^/]+/ns/([^/]+)/sa/([^/]+)", service_id)
+    return (match.groups() if match else tuple(service_id.split("/"))) == (cfg.namespace, cfg.tool_cr_name)
 
 
 def show_snapshot(cfg, rego_dir: Path) -> None:

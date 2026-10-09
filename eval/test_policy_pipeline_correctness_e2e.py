@@ -67,8 +67,12 @@ from eval.correctness_e2e_helpers import _accumulate_agent_gates, _user_role_row
 from eval.correctness_scorer import score_scenario  # noqa: E402
 from eval.test_policy_pipeline_eval import (  # noqa: E402
     SCENARIOS,
+    _agent_delegation_scope_names,
+    _agent_inbound_scope_names,
     _rego_path,
     _require_scenario,
+    _scope_owner,
+    _tool_scope_names,
     _user_role_names,
     opa_bin,
     opa_eval,
@@ -86,14 +90,26 @@ Pair = tuple[str, str]
 # ======================================================================================
 
 
-def _rego_map(rego: Path, doc: str) -> dict[str, list[str]]:
+def _rego_map(rego: Path, doc: str) -> dict:
     """Query one rendered Rego data document under ``data.authbridge.client.<doc>`` (e.g.
     ``inbound.request.subject_role_allow_scopes``) with no input — these are plain declarations,
     not decision rules, so they need none. ``{}`` when ``rego`` has no file on disk (an agent with
-    no rendered rego for this direction — see ``_e2e_grant_sets``)."""
+    no rendered rego for this direction — see ``_e2e_grant_sets``).
+
+    The value is the rendered shape: ``{role: [scope, ...]}`` for the inbound maps and
+    ``agent_role_scopes``, ``{role: {target: [tool, ...]}}`` for the two outbound subject maps
+    (LIM-02). ``_accumulate_agent_gates`` reads each map in its own shape."""
     if not rego.is_file():
         return {}
     return opa_eval([rego], f"data.authbridge.client.{doc}", {})
+
+
+def _scope_owners(scenario: ModuleType) -> dict[str, str]:
+    """The owner (serviceId) of each scope of ``scenario``, as ``_scope_owner`` gives it. The
+    outbound subject maps key each rule by this id (the eval provisions each client with its
+    scenario id as clientId, so the serviceId is the scenario id)."""
+    names = _agent_inbound_scope_names(scenario) | _agent_delegation_scope_names(scenario) | _tool_scope_names(scenario)
+    return {name: _scope_owner(scenario, name) for name in names}
 
 
 def _e2e_grant_sets(pipeline_result: dict, scenario: ModuleType) -> tuple[dict[str, set[Pair]], dict[str, set[Pair]]]:
@@ -101,9 +117,13 @@ def _e2e_grant_sets(pipeline_result: dict, scenario: ModuleType) -> tuple[dict[s
     rendered Rego of every agent in ``scenario`` (real Keycloak+PCE+OPA output, not the PRB's raw
     rules) — see the module docstring for the per-gate map table and the ``outbound_target``
     denial gap. Agents with no rego on disk (declared/emergent ``EXPECT_NO_REGO``) contribute
-    nothing, same as ``test_inbound``/``test_outbound`` already handle it."""
+    nothing, same as ``test_inbound``/``test_outbound`` already handle it.
+
+    An outbound subject rule that is keyed by a target that does not own its scope is scored as
+    ``(role, "<scope>@<target>")``, an over-grant for a grant (``_pairs_from_target_map``)."""
     rego_dir = pipeline_result["rego_dir"]
     user_roles = _user_role_names(scenario)
+    scope_owners = _scope_owners(scenario)
     granted: dict[str, set[Pair]] = {}
     denied: dict[str, set[Pair]] = {}
 
@@ -119,6 +139,8 @@ def _e2e_grant_sets(pipeline_result: dict, scenario: ModuleType) -> tuple[dict[s
             inbound_deny=_user_role_rows(
                 _rego_map(inbound_rego, "inbound.request.subject_role_deny_scopes"), user_roles
             ),
+            # The two outbound subject maps are keyed by role and then by target (LIM-02); each
+            # target is checked against the owner of the tool (``scope_owners``).
             outbound_subject_allow=_user_role_rows(
                 _rego_map(outbound_rego, "outbound.request.subject_role_allow_scopes"), user_roles
             ),
@@ -126,6 +148,7 @@ def _e2e_grant_sets(pipeline_result: dict, scenario: ModuleType) -> tuple[dict[s
                 _rego_map(outbound_rego, "outbound.request.subject_role_deny_scopes"), user_roles
             ),
             outbound_target_allow=_rego_map(outbound_rego, "outbound.request.agent_role_scopes"),
+            scope_owners=scope_owners,
         )
     return granted, denied
 
