@@ -140,7 +140,7 @@ The items of `admin.get_client_default_client_scopes(service_id)` have only `id`
 1. Calls `admin.get_client_service_account_user(service_id)` to get the service account user.
 2. Extracts `user["id"]` from the result.
 3. Resolves the role via `admin.get_realm_role_by_id(role_id)`, then calls `admin.assign_realm_roles(user_id, [role])` to assign the realm role to the service account.
-4. Returns `201 Created` on success. A repeat is also a success, with no second mapping: Keycloak skips the grant of a role that the service account already has, and gives no error (Keycloak 26.5.2, `UserAdapter.grantRole`).
+4. Returns `201 Created` on success. A repeat is also a success, with no second mapping: Keycloak skips the grant of a role that the service account already has, and gives no error (Keycloak 26.5.2, `UserAdapter.grantRole`). Keycloak still sends the `REALM_ROLE_MAPPING` admin event for the repeat (`addRealmRoleMappings` sends it for each request that is not empty), so the SPI publishes `aiac.apply.role-members.{role-id}` again (D32).
 5. Returns `409 Conflict` with `{"error": ...}` only when Keycloak itself answers `409`. A role that is already assigned does not give a `409`.
 6. Returns `502 Bad Gateway` with `{"error": ...}` on other `KeycloakError`.
 

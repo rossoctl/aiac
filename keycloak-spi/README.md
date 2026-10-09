@@ -44,7 +44,8 @@ publishes `aiac.apply.role-members.{role-id}` for each role, with the payload `{
 ### Keycloak facts
 
 We read these facts in the bytecode of `keycloak-services` `26.5.2` (the live version) with
-`javap -c -p`. The pom version, `26.7.3`, has the same code. The custom image uses `26.6.3` (see
+`javap -c -p`. The pom version, `26.7.3`, has the same code. The custom image uses `26.6.3` by
+default; the live image is built on `26.5.2` (see
 [Build the custom Keycloak image](#build-the-custom-keycloak-image)).
 
 - `RoleMapperResource` sets the resource type `REALM_ROLE_MAPPING` in its constructor.
@@ -56,7 +57,10 @@ We read these facts in the bytecode of `keycloak-services` `26.5.2` (the live ve
   `groups/{group-id}/role-mappings/realm` for a group.
 - `addRealmRoleMappings(roles)` sends the event only when the list is not empty. It gives the
   request list as the representation. Each role in the request must have the `id` and the `name` of
-  a realm role, or Keycloak answers `404`.
+  a realm role, or Keycloak answers `404`. It also sends the event for a role that the user already
+  has: `UserAdapter.grantRole` skips that grant with no error, but the event does not depend on it.
+  So a repeat mapping (for example the UC1 re-map of a reused role) gives a `role-members` event
+  too.
 - `deleteRealmRoleMappings(roles)` always sends the event. It gives the request list as the
   representation. With no request body, it removes all the realm roles of the user and gives the
   removed roles (`id`, `name` and the brief fields) as the representation.
@@ -96,9 +100,10 @@ unmaps only the roles that this run created (the created-manifest), with
 `delete_realm_roles_of_user`, and deletes each of these roles that then has no member. Each
 mapping and each unmap gives a `role-members` event. This is correct: the AIAC Agent renders again
 the CRs that use the role, so a new holder of a shared role gets the grants of the role at once
-(when the platform Keycloak runs an image with this listener; see
+(the platform Keycloak runs this listener since 2026-10-08; see
 [PRD → Role members · a new render](../docs/specs/PRD.md#role-members--a-new-render-aiacapplyrole-membersrole-id)).
-A new role has no SPM edge, so its event changes nothing.
+A new role has no SPM edge, so its event changes no decision (under agent side, the AIAC Agent
+writes the CR of every live agent again).
 
 A reused (shared) role stays mapped to the disabled client, so the rollback gives no event for it.
 The quarantine renders the CRs that use that role again without the client, because a disabled
@@ -193,6 +198,9 @@ The base image is `quay.io/keycloak/keycloak:26.6.3`: `KEYCLOAK_VERSION` in the 
 also in the image tag) and the default of the `KEYCLOAK_IMAGE` build argument in the `Dockerfile`.
 Change the two values together. Keep them at `26.6.3` or higher: `26.6.3` is the first version
 that clears the advisories against `26.5.2` (see the comment on `keycloak.version` in `pom.xml`).
+The live platform image is different: it is built with
+`KEYCLOAK_IMAGE=quay.io/keycloak/keycloak:26.5.2`, the version of the platform Keycloak (see
+[Install](#install)).
 
 ## Install
 
@@ -208,6 +216,18 @@ separate Helm chart outside this repo):
 1. `make push` to publish the image.
 2. Override the Keycloak image reference in that chart's values (or Operator CR) to point at
    the pushed image.
+
+**Live state.** Since 2026-10-08 the platform Keycloak (`StatefulSet/keycloak` in the namespace
+`keycloak`, from the Helm release `rossoctl-deps`) runs the image
+`localhost/aiac-keycloak-event-listener:26.5.2-spi-d32`, built from this `Dockerfile` with
+`KEYCLOAK_IMAGE=quay.io/keycloak/keycloak:26.5.2`. The image and `NATS_URL` were set with
+`kubectl`, not in the chart values. So a `helm upgrade` of `rossoctl-deps` puts back the stock
+`quay.io/keycloak/keycloak:26.5.2` (no AIAC jar) and removes `NATS_URL`. Then nothing publishes
+the AIAC subjects, and each lost `role-members` event keeps the old holders in the CRs until the
+resync at the next Controller start (a removed user keeps access until then). To keep the listener,
+set `keycloak.image.repository` and `keycloak.image.tag` in the values of that chart (or in an
+override file), and add `NATS_URL` to `keycloak.extraEnvVars`. A fresh install also needs the realm
+setup of [Enable in a realm](#enable-in-a-realm).
 
 ## Enable in a realm
 
@@ -336,3 +356,7 @@ To verify manually, against a live Keycloak:
   Controller.
 - **Role mappings** have known limits (groups, composite roles, client-role mappings, a user
   delete, a role delete). See [Role mappings](#known-limits).
+- **One AIAC-managed realm for each Keycloak server and NATS** (LIM-01). The subjects have no realm
+  in them, and the listener sends the events of every realm that has it to the one `NATS_URL` of
+  the Keycloak server, with no realm filter. One AIAC stack serves one realm (`KEYCLOAK_REALM`). So
+  two AIAC-managed realms on one Keycloak server mix their events.

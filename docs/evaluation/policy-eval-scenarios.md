@@ -433,8 +433,12 @@ scenarios; the heavy scenarios additionally need Keycloak + `opa`, same discover
   `input.function_name`; it is loaded beside each agent's own outbound Rego, so one probe file
   serves every agent across all eight heavy scenarios rather than needing one probe per agent. It
   uses a token soft-match (split on `[._-]+`, lowercase, set equality). `allow` needs both
-  `subject_ok` (a role of the subject, via `subject_roles` and `subject_role_allow_scopes`, matches
-  the function name) and `target_ok` (`target_allow_scopes[input.target]` matches it). A target
+  `subject_ok` (a role of the subject, via `subject_roles` and
+  `subject_role_allow_scopes[role][input.target]`, matches the function name; the outbound subject
+  maps are keyed by role and then by target, LIM-02) and `target_ok`
+  (`target_allow_scopes[input.target]` matches it), and no deny gate may match the same name
+  (`subject_role_deny_scopes[role][input.target]`, `target_deny_scopes[input.target]`), as in the
+  real gate. A target
   scope owned by another agent is in `target_allow_scopes` exactly like a tool's scope (see the next
   point), so a single probe covers both mechanisms uniformly.
 - **`delegation_scopes` and `inbound_scopes` are indistinguishable at the real system's data-model

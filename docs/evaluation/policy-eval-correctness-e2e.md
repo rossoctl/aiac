@@ -49,8 +49,13 @@ over-grants, under-grants/incorrect denials reported only.
 declares — `subject_role_allow_scopes`/`subject_role_deny_scopes` (inbound and outbound-subject)
 and `agent_role_scopes` (outbound-target, ALLOW only) — rather than exhaustively probing every
 `(role, scope)` pair's `allow`/`deny_ok` decision. Two `opa eval` calls per agent for inbound, and
-three for outbound, return the entire role→scopes table in one shot; `_pairs_from_map` flattens
-each into `(role, scope)` pairs, and `_accumulate_agent_gates` unions every agent's pairs into the three top-level
+three for outbound, return the entire role→scopes table in one shot. `_pairs_from_map` flattens
+each flat `{role: [scope, ...]}` map (the inbound maps and `agent_role_scopes`) into `(role, scope)` pairs.
+The two outbound subject maps are keyed by role and then by the full target service id (LIM-02):
+`{role: {target: [tool, ...]}}`. `_pairs_from_target_map` flattens them: a tool keyed by its owner gives
+`(role, tool)`, and a tool keyed by another target gives `(role, "<tool>@<target>")`, which no truth
+table has, so it is scored as an over-grant. Both readers raise `TypeError` on the other shape, so a
+reader on the wrong shape cannot score pairs with no error. `_accumulate_agent_gates` unions every agent's pairs into the three top-level
 gate buckets `score_scenario` expects. The outbound maps are de-prefixed; the inbound maps keep the
 full scope names. The scenario scope names have no `<owner>.` prefix, so both match the names the
 truth tables use — no re-prefixing logic is needed.
