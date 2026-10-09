@@ -4,7 +4,7 @@ import copy
 import logging
 import pickle
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 import requests
@@ -668,10 +668,11 @@ class TestCreateServiceRole:
             patch.object(cfg, "get_service", return_value=svc),
             patch.object(cfg, "map_role_to_service", return_value=svc) as mapper,
         ):
-            result = cfg.create_service_role("svc-1", role_def)
+            result, was_created = cfg.create_service_role("svc-1", role_def)
         create.assert_called_once_with("app.agent", "Agent role")
         mapper.assert_called_once_with(svc, created)
         assert result is created
+        assert was_created is True  # this call created the role: it goes into the created-manifest
 
     def test_reuses_existing_role_without_creating(self):
         cfg = Configuration.for_realm(REALM)
@@ -684,10 +685,11 @@ class TestCreateServiceRole:
             patch.object(cfg, "get_service", return_value=svc),
             patch.object(cfg, "map_role_to_service", return_value=svc) as mapper,
         ):
-            result = cfg.create_service_role("svc-1", role_def)
+            result, was_created = cfg.create_service_role("svc-1", role_def)
         create.assert_not_called()
         mapper.assert_called_once_with(svc, existing)
         assert result is existing
+        assert was_created is False  # a reuse is not in the created-manifest
 
     # A reused role is shared (D32): it keeps its first description, Keycloak is not updated, and a
     # different new description is logged as a WARNING (handoff 19 Bug 3).
@@ -700,9 +702,12 @@ class TestCreateServiceRole:
             patch.object(cfg, "map_role_to_service", return_value=svc),
             patch("aiac.idp.configuration.api.requests") as http,
         ):
-            result = cfg.create_service_role("svc-1", role_def)
+            result, was_created = cfg.create_service_role("svc-1", role_def)
         create.assert_not_called()
-        http.assert_not_called()  # no update of the kept description
+        assert was_created is False
+        # No update of the kept description: no request at all (``assert_not_called`` would see only a
+        # call of the module mock itself, not ``http.put(...)`` or ``http.post(...)``).
+        assert http.mock_calls == []
         return result
 
     def test_reuse_with_a_different_description_warns_and_keeps_the_first(self, caplog):
@@ -737,6 +742,94 @@ class TestCreateServiceRole:
             cfg.create_service_role("svc-1", SimpleNamespace(name="app.agent", description="Agent role"))
         assert caplog.records == []
 
+    # REJ-02: the check and the create are two requests. Two services with the same workload name
+    # that provision at the same time both find no role, and Keycloak answers 409 to the second
+    # create. A 409 from the create is reuse: read again by name, as the subject scope does (D31).
+    def _race(self, cfg, reads, create_error):
+        svc = self._svc()
+        with (
+            patch.object(cfg, "get_roles", side_effect=reads) as read,
+            patch.object(cfg, "create_role", side_effect=create_error) as create,
+            patch.object(cfg, "get_service", return_value=svc),
+            patch.object(cfg, "map_role_to_service", return_value=svc) as mapper,
+        ):
+            try:
+                result, self.created = cfg.create_service_role(
+                    "svc-1", SimpleNamespace(name="app.agent", description="Second")
+                )
+                return result
+            finally:
+                self.reads, self.creates, self.maps = read.call_count, create.call_count, mapper.call_args_list
+
+    def test_a_409_from_the_create_reuses_the_role_that_is_there_now(self, caplog):
+        cfg = Configuration.for_realm(REALM)
+        winner = Role(id="r-1", name="app.agent", description="First", composite=False)
+        with caplog.at_level(logging.WARNING, logger="aiac.idp.configuration.api"):
+            result = self._race(cfg, [[], [winner]], IdPHTTPError(409, "Conflict"))
+        assert result is winner
+        # The other run created the object, so it is not in this run's created-manifest (REJ-02).
+        assert self.created is False
+        assert (self.reads, self.creates) == (2, 1)
+        assert self.maps == [call(self._svc(), winner)]
+        # The same description rule as a reuse that the first read finds.
+        [record] = caplog.records
+        assert all(text in record.getMessage() for text in ("app.agent", "First", "Second"))
+
+    def test_a_409_with_the_same_description_does_not_warn(self, caplog):
+        # Also the case of a create that _request repeats after Keycloak committed the first attempt.
+        cfg = Configuration.for_realm(REALM)
+        mine = Role(id="r-1", name="app.agent", description="Second", composite=False)
+        with caplog.at_level(logging.WARNING, logger="aiac.idp.configuration.api"):
+            assert self._race(cfg, [[], [mine]], IdPHTTPError(409, "Conflict")) is mine
+        # A 409 does not tell this run's committed first attempt from another run's create, so it
+        # is reuse: the object is not in the created-manifest, and the rollback does not delete it.
+        assert self.created is False
+        assert caplog.records == []
+
+    def test_a_409_that_the_read_again_does_not_explain_is_raised(self):
+        cfg = Configuration.for_realm(REALM)
+        with pytest.raises(IdPHTTPError) as ei:
+            self._race(cfg, [[], []], IdPHTTPError(409, "Conflict"))
+        assert ei.value.status == 409
+        assert self.maps == []
+
+    def test_an_error_other_than_409_from_the_create_is_raised_with_no_read_again(self):
+        cfg = Configuration.for_realm(REALM)
+        with pytest.raises(IdPHTTPError) as ei:
+            self._race(cfg, [[], []], IdPHTTPError(502, "Bad gateway"))
+        assert ei.value.status == 502
+        assert (self.reads, self.maps) == (1, [])
+
+    def test_a_concurrent_create_on_the_wire_is_reuse(self):
+        # The wire of rej02_race.py: GET /roles misses the role, POST /roles answers 409, GET /roles
+        # again finds it, and the role is mapped to the service.
+        cfg = Configuration.for_realm(REALM)
+        winner = {"id": "r-1", "name": "app.agent", "description": "Second", "composite": False}
+        roles_reads = iter([[]])  # the check misses the role; each later read finds it
+        posts = []
+
+        def get(url, **_kwargs):
+            path = url.removeprefix(BASE)
+            if path == "/roles":
+                return _ok(next(roles_reads, [winner]))
+            if path == "/services/svc-1":
+                return _ok({"id": "svc-1", "clientId": "svc-1", "enabled": True})
+            return _ok([])  # /scopes and the service's own roles and scopes
+
+        def post(url, **_kwargs):
+            posts.append(url.removeprefix(BASE))
+            if url == f"{BASE}/roles":
+                return _err(409)
+            return _ok({}, status=201)
+
+        with (
+            patch("aiac.idp.configuration.api.requests.get", side_effect=get),
+            patch("aiac.idp.configuration.api.requests.post", side_effect=post),
+        ):
+            result, created = cfg.create_service_role("svc-1", SimpleNamespace(name="app.agent", description="Second"))
+        assert (result.id, created) == ("r-1", False)
+        assert posts == ["/roles", "/services/svc-1/roles/r-1"]
+
 
 class TestCreateServiceScope:
     def _svc(self):
@@ -753,10 +846,11 @@ class TestCreateServiceScope:
             patch.object(cfg, "get_service", return_value=svc),
             patch.object(cfg, "map_scope_to_service", return_value=svc) as mapper,
         ):
-            result = cfg.create_service_scope("svc-1", scope_def)
+            result, was_created = cfg.create_service_scope("svc-1", scope_def)
         create.assert_called_once_with("app.read", "Read tool")
         mapper.assert_called_once_with(svc, created)
         assert result is created
+        assert was_created is True  # this call created the scope: it goes into the created-manifest
 
     def test_reuses_existing_scope_without_creating(self):
         cfg = Configuration.for_realm(REALM)
@@ -769,10 +863,11 @@ class TestCreateServiceScope:
             patch.object(cfg, "get_service", return_value=svc),
             patch.object(cfg, "map_scope_to_service", return_value=svc) as mapper,
         ):
-            result = cfg.create_service_scope("svc-1", scope_def)
+            result, was_created = cfg.create_service_scope("svc-1", scope_def)
         create.assert_not_called()
         mapper.assert_called_once_with(svc, existing)
         assert result is existing
+        assert was_created is False  # a reuse is not in the created-manifest
 
     # A reused scope is shared (D32): it keeps its first description, Keycloak is not updated, and a
     # different new description is logged as a WARNING (handoff 19 Bug 3).
@@ -785,9 +880,12 @@ class TestCreateServiceScope:
             patch.object(cfg, "map_scope_to_service", return_value=svc),
             patch("aiac.idp.configuration.api.requests") as http,
         ):
-            result = cfg.create_service_scope("svc-1", scope_def)
+            result, was_created = cfg.create_service_scope("svc-1", scope_def)
         create.assert_not_called()
-        http.assert_not_called()  # no update of the kept description
+        assert was_created is False
+        # No update of the kept description: no request at all (``assert_not_called`` would see only a
+        # call of the module mock itself, not ``http.put(...)`` or ``http.post(...)``).
+        assert http.mock_calls == []
         return result
 
     def test_reuse_with_a_different_description_warns_and_keeps_the_first(self, caplog):
@@ -824,6 +922,88 @@ class TestCreateServiceScope:
         ):
             cfg.create_service_scope("svc-1", SimpleNamespace(name="app.read", description="Read tool"))
         assert caplog.records == []
+
+    # REJ-02: the same race as for a role (see TestCreateServiceRole._race).
+    def _race(self, cfg, reads, create_error):
+        svc = self._svc()
+        with (
+            patch.object(cfg, "get_scopes", side_effect=reads) as read,
+            patch.object(cfg, "create_scope", side_effect=create_error) as create,
+            patch.object(cfg, "get_service", return_value=svc),
+            patch.object(cfg, "map_scope_to_service", return_value=svc) as mapper,
+        ):
+            try:
+                result, self.created = cfg.create_service_scope(
+                    "svc-1", SimpleNamespace(name="app.read", description="Second")
+                )
+                return result
+            finally:
+                self.reads, self.creates, self.maps = read.call_count, create.call_count, mapper.call_args_list
+
+    def test_a_409_from_the_create_reuses_the_scope_that_is_there_now(self, caplog):
+        cfg = Configuration.for_realm(REALM)
+        winner = Scope(id="s-1", name="app.read", description="First")
+        with caplog.at_level(logging.WARNING, logger="aiac.idp.configuration.api"):
+            result = self._race(cfg, [[], [winner]], IdPHTTPError(409, "Conflict"))
+        assert result is winner
+        # The other run created the object, so it is not in this run's created-manifest (REJ-02).
+        assert self.created is False
+        assert (self.reads, self.creates) == (2, 1)
+        assert self.maps == [call(self._svc(), winner)]
+        [record] = caplog.records
+        assert all(text in record.getMessage() for text in ("app.read", "First", "Second"))
+
+    def test_a_409_with_the_same_description_does_not_warn(self, caplog):
+        cfg = Configuration.for_realm(REALM)
+        mine = Scope(id="s-1", name="app.read", description="Second")
+        with caplog.at_level(logging.WARNING, logger="aiac.idp.configuration.api"):
+            assert self._race(cfg, [[], [mine]], IdPHTTPError(409, "Conflict")) is mine
+        # A 409 does not tell this run's committed first attempt from another run's create, so it
+        # is reuse: the object is not in the created-manifest, and the rollback does not delete it.
+        assert self.created is False
+        assert caplog.records == []
+
+    def test_a_409_that_the_read_again_does_not_explain_is_raised(self):
+        cfg = Configuration.for_realm(REALM)
+        with pytest.raises(IdPHTTPError) as ei:
+            self._race(cfg, [[], []], IdPHTTPError(409, "Conflict"))
+        assert ei.value.status == 409
+        assert self.maps == []
+
+    def test_an_error_other_than_409_from_the_create_is_raised_with_no_read_again(self):
+        cfg = Configuration.for_realm(REALM)
+        with pytest.raises(IdPHTTPError) as ei:
+            self._race(cfg, [[], []], IdPHTTPError(502, "Bad gateway"))
+        assert ei.value.status == 502
+        assert (self.reads, self.maps) == (1, [])
+
+    def test_a_concurrent_create_on_the_wire_is_reuse(self):
+        cfg = Configuration.for_realm(REALM)
+        winner = {"id": "s-1", "name": "app.read", "description": "Second", "attributes": {"aiac.managed": "true"}}
+        scopes_reads = iter([[]])  # the check misses the scope; each later read finds it
+        posts = []
+
+        def get(url, **_kwargs):
+            path = url.removeprefix(BASE)
+            if path == "/scopes":
+                return _ok(next(scopes_reads, [winner]))
+            if path == "/services/svc-1":
+                return _ok({"id": "svc-1", "clientId": "svc-1", "enabled": True})
+            return _ok([])  # /roles and the service's own roles and scopes
+
+        def post(url, **_kwargs):
+            posts.append(url.removeprefix(BASE))
+            if url == f"{BASE}/scopes":
+                return _err(409)
+            return _ok({}, status=201)
+
+        with (
+            patch("aiac.idp.configuration.api.requests.get", side_effect=get),
+            patch("aiac.idp.configuration.api.requests.post", side_effect=post),
+        ):
+            result, created = cfg.create_service_scope("svc-1", SimpleNamespace(name="app.read", description="Second"))
+        assert (result.id, created) == ("s-1", False)
+        assert posts == ["/scopes", "/services/svc-1/scopes/s-1"]
 
 
 # ---------------------------------------------------------------------------

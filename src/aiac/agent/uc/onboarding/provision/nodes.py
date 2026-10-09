@@ -445,11 +445,13 @@ def provision_service(state: OnboardingProvisionState) -> dict:
     Returns the `ServiceProvision` + `service_type` to the Orchestrator, plus the
     **created-manifest** (`created_roles` / `created_scopes`): exactly the entities this run
     *created*, not the ones it *reused by name*. The idempotent `create_service_role` /
-    `create_service_scope` return the resolved entity whether they created or reused it, so a
-    name is classified as created only when it was **absent** from the realm before this run
-    (snapshot taken before the create loop). The Orchestrator's compensating rollback deletes
-    only this manifest, so a role/scope another service already owns is never torn down. The
-    subject scope is shared by all managed clients, so it is never in the manifest."""
+    `create_service_scope` return `(entity, created)`, and an entity goes into the manifest only
+    when `created` is true. A reuse is not created: an entity that was there before this run, and
+    also one that a concurrent Provision of another service with the same workload name created
+    after this run's check (its create then answers `409`, and the library reuses the entity,
+    REJ-02). The Orchestrator's compensating rollback deletes only this manifest, so a role/scope
+    that another service created is never torn down. The subject scope is shared by all managed
+    clients, so it is never in the manifest."""
     config = _config()
     provision = state.service_provision
     service_id = state.service_id
@@ -457,16 +459,14 @@ def provision_service(state: OnboardingProvisionState) -> dict:
     created_roles = []
     created_scopes = []
     try:
-        existing_role_names = {r.name for r in config.get_roles()} if provision.roles else set()
         for role in provision.roles:
-            resolved = config.create_service_role(service_id, role)
-            if role.name not in existing_role_names:
-                created_roles.append(resolved)
-        existing_scope_names = {s.name for s in config.get_scopes()} if provision.scopes else set()
+            resolved_role, created = config.create_service_role(service_id, role)
+            if created:
+                created_roles.append(resolved_role)
         for scope in provision.scopes:
-            resolved = config.create_service_scope(service_id, scope)
-            if scope.name not in existing_scope_names:
-                created_scopes.append(resolved)
+            resolved_scope, created = config.create_service_scope(service_id, scope)
+            if created:
+                created_scopes.append(resolved_scope)
         service = config.get_service(service_id)
         # D31: an exchanged token gets sub = username only from the scopes of the agent client
         # (the requester), so every managed client links aiac-username-sub. Link it before
