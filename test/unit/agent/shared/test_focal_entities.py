@@ -7,7 +7,9 @@ mocked ``Configuration`` (passed via the ``config`` seam — no live IdP, no LLM
 
 - the own-scope / candidate-role / other-scope ownership split (by role id / ``scope.serviceId``,
   never by name),
-- composite-role flatten + de-dup of the candidate universe,
+- composite-role flatten + de-dup of the candidate universe, with the kind of a composite child from
+  the catalog ownership and its fields and holders from the full copy (not from the child copy); the
+  children of a composite own role (the role-focal pass) get the same kind and fields,
 - membership-derived user roles vs ``aiac.managed`` agent roles, with service-owned exclusion (a
   role that a service owns is not a user-kind candidate),
 - a shared role or scope (D32) on both sides: the candidates come from the other services by owner
@@ -25,6 +27,7 @@ import pytest
 from fastapi import HTTPException
 
 from aiac.agent.shared.focal_entities import FocalEntitySet, resolve_focal_entities
+from aiac.agent.shared.roles import flatten_role
 from aiac.idp.configuration.models import Role as RoleModel
 from aiac.idp.configuration.models import RoleKind, Scope, Service, ServiceType, Subject
 
@@ -216,6 +219,152 @@ class TestSharedRoles:
         )
 
         assert [(r.id, r.actorIds) for r in result.candidate_roles] == [("dev-id", ["alice", "bob"])]
+
+
+class TestCompositeChildKind:
+    """A child of a composite role comes from ``GET /roles/{name}/composites``, which gives no
+    per-service kind (``User`` by default) and no members. The kind of a candidate comes from the
+    catalog ownership (a role id that a service holds is an ``Agent`` role) and its holders from the
+    full copy, so the order of the catalog and of the subjects does not change them."""
+
+    @staticmethod
+    def _child(role):
+        """The copy of ``role`` that the composites endpoint gives: no kind, no members."""
+        return RoleModel(id=role.id, name=role.name, description=role.description, composite=False)
+
+    @pytest.mark.parametrize("composite_first", [True, False], ids=["composite-first", "direct-first"])
+    def test_an_agent_role_that_is_also_a_composite_child_keeps_its_kind_and_holder(self, composite_first):
+        # x holds the composite agent role A, which contains B; y holds B directly.
+        b = _role("b.agent", role_id="b-id", kind=RoleKind.AGENT)
+        a = _role("a.agent", role_id="a-id", composite=True, children=[self._child(b)], kind=RoleKind.AGENT)
+        focus = _service(FOCUS_ID, scopes=[_scope("focus.read", service_id=FOCUS_ID)])
+        x = _service("uuid-x", ref="x", roles=[a.model_copy(update={"actorIds": ["x"]})])
+        y = _service("uuid-y", ref="y", roles=[b.model_copy(update={"actorIds": ["y"]})])
+        others = [x, y] if composite_first else [y, x]
+
+        result = _resolve(ServiceType.TOOL, services=[focus, *others], subjects=[])
+
+        by_id = {r.id: (r.kind, r.actorIds) for r in result.candidate_roles}
+        assert by_id == {"a-id": (RoleKind.AGENT, ["x"]), "b-id": (RoleKind.AGENT, ["y"])}
+
+    def test_an_agent_role_that_is_a_child_of_a_user_composite_is_an_agent_candidate(self):
+        # alice holds the realm role R (no service holds it); R contains B, which y holds directly.
+        b = _role("b.agent", role_id="b-id", kind=RoleKind.AGENT)
+        r = _role("r.user", role_id="r-id", composite=True, children=[self._child(b)], aiac_managed=False)
+        focus = _service(FOCUS_ID, scopes=[_scope("focus.read", service_id=FOCUS_ID)])
+        y = _service("uuid-y", ref="y", roles=[b.model_copy(update={"actorIds": ["y"]})])
+
+        result = _resolve(ServiceType.TOOL, services=[focus, y], subjects=[_subject("alice", roles=[r])])
+
+        by_id = {role.id: (role.kind, role.actorIds) for role in result.candidate_roles}
+        assert by_id["b-id"] == (RoleKind.AGENT, ["y"])
+        assert by_id["r-id"][0] == RoleKind.USER
+
+    def test_a_child_of_an_agent_composite_that_a_disabled_service_holds_has_no_holder(self):
+        # The disabled service still owns B, so B is an agent role; it is not live, so it is no holder.
+        b = _role("b.agent", role_id="b-id", kind=RoleKind.AGENT)
+        a = _role("a.agent", role_id="a-id", composite=True, children=[self._child(b)], kind=RoleKind.AGENT)
+        focus = _service(FOCUS_ID)
+        x = _service("uuid-x", ref="x", roles=[a])
+        failed = _service("uuid-y", ref="y", roles=[b], enabled=False)
+
+        result = _resolve(ServiceType.TOOL, services=[focus, x, failed], subjects=[])
+
+        by_id = {r.id: (r.kind, r.actorIds) for r in result.candidate_roles}
+        assert by_id["b-id"] == (RoleKind.AGENT, [])
+
+    @pytest.mark.parametrize("direct_first", [True, False], ids=["direct-first", "composite-first"])
+    def test_a_user_role_that_is_also_a_composite_child_keeps_its_members(self, direct_first):
+        # alice holds C directly (GET /roles gives its member alice); bob holds C through the
+        # composite parent P (a holder through a composite parent is not resolved: a known limit).
+        c = _role("child", role_id="c-id").model_copy(update={"actorIds": ["alice"]})
+        p = _role("parent", role_id="p-id", composite=True, children=[self._child(c)]).model_copy(
+            update={"actorIds": ["bob"]}
+        )
+        subjects = [_subject("alice", roles=[c]), _subject("bob", roles=[p])]
+        focus = _service(FOCUS_ID)
+
+        result = _resolve(ServiceType.TOOL, services=[focus], subjects=subjects if direct_first else subjects[::-1])
+
+        by_id = {r.id: (r.kind, r.actorIds) for r in result.candidate_roles}
+        assert by_id == {"c-id": (RoleKind.USER, ["alice"]), "p-id": (RoleKind.USER, ["bob"])}
+
+    def test_a_user_candidate_is_the_full_copy_not_the_composite_child(self):
+        # The full copy carries the marker and the description that the PRB prompt shows.
+        c = _role("child", role_id="c-id").model_copy(update={"actorIds": ["alice"]})
+        bare = RoleModel(id="c-id", name="child", composite=False)
+        p = _role("parent", role_id="p-id", composite=True, children=[bare])
+        focus = _service(FOCUS_ID)
+
+        result = _resolve(
+            ServiceType.TOOL, services=[focus], subjects=[_subject("bob", roles=[p]), _subject("alice", roles=[c])]
+        )
+
+        [child] = [r for r in result.candidate_roles if r.id == "c-id"]
+        assert (child.description, child.aiac_managed) == ("child", True)
+
+
+class TestOwnCompositeRoleChildren:
+    """The role-focal pass (``builder.py``, ``diagnostic_survey.py``) flattens each own role with
+    ``flatten_role``. A child of a composite own role is the full copy of its role, with its kind from
+    the catalog ownership: the same rule as for a candidate. The own role itself stays the focus's
+    copy, and the flatten gives the same role ids in the same order."""
+
+    @staticmethod
+    def _flatten_own(result):
+        """The roles that the role-focal pass builds rules for, in its order."""
+        return [role for own in result.own_roles for role in flatten_role(own)]
+
+    @pytest.mark.parametrize("holder", ["other", "focus"])
+    def test_an_agent_role_that_is_a_child_of_an_own_composite_is_an_agent_role(self, holder):
+        # The focus holds the composite own role A, which contains B; another service (or the focus)
+        # holds B directly.
+        b = _role("b.agent", role_id="b-id", kind=RoleKind.AGENT)
+        a = _role("a.agent", role_id="a-id", composite=True, children=[TestCompositeChildKind._child(b)])
+        a = a.model_copy(update={"kind": RoleKind.AGENT, "actorIds": [FOCUS_ID]})
+        focus_roles = [a, b] if holder == "focus" else [a]
+        focus = _service(FOCUS_ID, roles=focus_roles, service_type=ServiceType.AGENT)
+        y = _service("uuid-y", ref="y", roles=[b.model_copy(update={"actorIds": ["y"]})])
+
+        result = _resolve(ServiceType.AGENT, services=[focus, y], subjects=[])
+
+        flattened = [(r.id, r.kind) for r in self._flatten_own(result)]
+        assert flattened[:2] == [("a-id", RoleKind.AGENT), ("b-id", RoleKind.AGENT)]
+
+    def test_a_user_role_that_is_a_child_of_an_own_composite_is_the_full_copy(self):
+        # alice holds C directly: GET /roles gives the marker and the member; the child copy has neither.
+        c = _role("child", role_id="c-id").model_copy(update={"actorIds": ["alice"]})
+        bare = RoleModel(id="c-id", name="child", composite=False)
+        a = _role("a.agent", role_id="a-id", composite=True, children=[bare], kind=RoleKind.AGENT)
+        focus = _service(FOCUS_ID, roles=[a], service_type=ServiceType.AGENT)
+
+        result = _resolve(ServiceType.AGENT, services=[focus], subjects=[_subject("alice", roles=[c])])
+
+        [_, child] = self._flatten_own(result)
+        assert (child.id, child.kind, child.description, child.aiac_managed) == ("c-id", RoleKind.USER, "child", True)
+
+    def test_the_own_role_stays_the_focus_copy_and_the_closure_does_not_change(self):
+        # A is shared: y comes first in the catalog, so the first service copy of A is y's. B is held
+        # by y; its full copy has a child D, which the composite A does not give, so D is not added. N
+        # is a child that no service and no subject holds: it keeps the child copy, as a User role.
+        d = _role("d.agent", role_id="d-id", kind=RoleKind.AGENT)
+        b = _role("b.agent", role_id="b-id", composite=True, children=[d], kind=RoleKind.AGENT)
+        n = RoleModel(id="n-id", name="nobody", composite=False)
+        children = [TestCompositeChildKind._child(b), n]
+        a = _role("a.agent", role_id="a-id", composite=True, children=children, kind=RoleKind.AGENT)
+        own_a = a.model_copy(update={"actorIds": [FOCUS_ID]})
+        focus = _service(FOCUS_ID, roles=[own_a], service_type=ServiceType.AGENT)
+        y = _service("uuid-y", ref="y", roles=[a.model_copy(update={"actorIds": ["y"]}), b])
+
+        result = _resolve(ServiceType.AGENT, services=[y, focus], subjects=[])
+
+        [own] = result.own_roles
+        assert (own.id, own.actorIds) == ("a-id", [FOCUS_ID])
+        assert [(r.id, r.kind) for r in self._flatten_own(result)] == [
+            ("a-id", RoleKind.AGENT),
+            ("b-id", RoleKind.AGENT),
+            ("n-id", RoleKind.USER),
+        ]
 
 
 class TestSelfMapping:
