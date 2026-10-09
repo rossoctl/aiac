@@ -30,7 +30,9 @@ The Provision of a workload is the realm change that ``provision_service`` makes
 ``aiac.apply.role-members.{role-id}`` for a ``REALM_ROLE_MAPPING`` create or delete (R5, R9), and the
 Controller calls ``rerender_role(role_id)`` for it (R7). ``Stack.deliver_role_events`` does that call
 for each event that the realm recorded. ``Stack.drop_role_events`` loses the events, so that the
-resync must repair the CRs.
+resync must repair the CRs. Case 7 needs the event of a Provision role mapping: the onboarding of a
+new holder of the shared role routes no rule to a callee that has an edge of the role, so only the
+event puts the new holder into that callee's CR.
 
 Before D32 (on HEAD ``2069752``), ``rerender_role`` did not exist, so every test stopped with an
 ``AttributeError``. With a no-op ``rerender_role`` stub, 12 of the 17 tests failed: cases 1 and 2 by
@@ -39,8 +41,12 @@ and cases 3 and 4 too. See ``docs/testing/shared-roles-integration.md`` for the 
 """
 
 import json
+import shutil
+import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
+from pathlib import Path
 
 import pytest
 
@@ -603,3 +609,329 @@ class TestAdminAssignedSelfMapping:
             assert _rego_map(rego, "target_deny_scopes") == {}
             # The inbound gates are the same on both sides (D18b).
             assert _holders(stack, holder) == set(targets), f"{holder.client_id}: the inbound source_roles"
+
+
+# --------------------------------------------------------------------------- #
+# case 7 — a new holder's Provision event re-renders a callee with no new rule  #
+# --------------------------------------------------------------------------- #
+# The decisions of a policy that also lets the agents that operate on source repositories call
+# review-agent. The scope-focal pass of review-agent's skill grants the shared role; the role-focal
+# pass of the shared role decides only the tool scopes (``DECISIONS``), not review-agent's skill.
+REVIEWER_CALLED = {**DECISIONS, ("scope", REVIEW_SKILL): ({DEVELOPER, AGENT_ROLE}, set())}
+
+
+class TestProvisionEventOfANewHolder:
+    """team1/review-agent's SPM has an edge of the shared role (its skill allows it). Then
+    team2/github-agent is provisioned and gets the shared role. Its onboarding routes no rule to
+    review-agent (the role-focal pass does not grant the skill), so no ``compute_and_apply`` deploys
+    review-agent again: only the role-members event of the Provision role mapping (R5, R7) puts the
+    new holder into review-agent's CR. The event can come before or after the onboarding."""
+
+    @pytest.mark.parametrize("event_first", [True, False], ids=["event-first", "onboarding-first"])
+    def test_the_provision_event_adds_the_new_holder_to_the_callee_cr(self, stack: Stack, event_first: bool) -> None:
+        stack.llm.decisions = REVIEWER_CALLED
+        for workload in (AGENT1, TOOL1, REVIEWER):
+            stack.bring_up(workload)
+        assert _holders(stack, REVIEWER) == {AGENT1.client_id}, "before the new holder"
+        writes_before = len(stack.store.writes)
+
+        if event_first:
+            stack.bring_up(AGENT2)  # Provision, the events of its role mappings, then the onboarding
+        else:
+            stack.realm.provision(AGENT2.namespace, AGENT2.name, AGENT2.type, AGENT2.entries)
+            events, stack.realm.events = stack.realm.events, []
+            assert events, "the Provision role mapping gave no role-members event"
+            stack.onboard(AGENT2.client_id)
+            assert _holders(stack, REVIEWER) == {AGENT1.client_id}, "the onboarding deployed review-agent again"
+            stack.realm.events = events
+            stack.deliver_role_events()
+
+        assert ("apply", REVIEWER.client_id) not in stack.store.writes[writes_before:], "a rule was routed to it"
+        assert _holders(stack, REVIEWER) == {AGENT1.client_id, AGENT2.client_id}, (
+            f"{REVIEWER.client_id}: the holders of {AGENT_ROLE} in source_roles"
+        )
+        rego = stack.inbound(REVIEWER.client_id)
+        assert _rego_map(rego, "source_role_allow_scopes") == {AGENT_ROLE: [REVIEW_SKILL]}
+
+
+# --------------------------------------------------------------------------- #
+# case 8 — the copies of a shared scope get different user rules              #
+# --------------------------------------------------------------------------- #
+# Each owner's onboarding is its own scope-focal PRB pass on its own copy of a shared scope, so the
+# copies can get different user rules. Here one tool's pass grants ``developer`` on its copy of
+# ``github-tool.source-read`` (``DECISIONS``), and the other tool's pass gives ``developer`` no rule on
+# its copy (``OTHER_COPY_DECISIONS``). The agent role is granted on both copies, so the agent may call
+# both. Each copy must decide from the user rules of its own SPM, under both sides. (A deny on the other
+# copy does not get this far: the PRB of the second onboarding finds the grant of the first copy and
+# raises a policy conflict for the pair.)
+OTHER_COPY_DECISIONS = {**DECISIONS, ("scope", SOURCE_READ): ({AGENT_ROLE}, set())}
+_CALL_SOURCE_READ = {"method": "tools/call", "params": {"name": "source-read"}}
+
+
+def _rego_nested_map(rego: str, var: str) -> dict[str, dict[str, list[str]]]:
+    """The two-level Rego map ``var`` of a rendered package (``var := { "key": { "inner": ["a", ...],
+    ... }, ... }``), as a dict."""
+    lines = rego.splitlines()
+    if f"{var} := {{}}" in lines:
+        return {}
+    assert f"{var} := {{" in lines, f"no map {var} in the package:\n{rego}"
+    out: dict[str, dict[str, list[str]]] = {}
+    inner: dict[str, list[str]] = {}
+    for line in lines[lines.index(f"{var} := {{") + 1 :]:
+        if line == "}":
+            return out
+        entry = line.strip()
+        if entry == "},":
+            continue
+        if entry.endswith(": {"):
+            inner = out.setdefault(json.loads(entry.removesuffix(": {")), {})
+            continue
+        key, values = entry.removesuffix(",").split(": [", 1)
+        inner[json.loads(key)] = json.loads(f"[{values}")
+    raise AssertionError(f"map {var} is not closed in the package:\n{rego}")
+
+
+def _opa_allow(rego: str, tier: str, input_doc: dict) -> bool:
+    """The ``allow`` of the rendered package of ``tier`` for ``input_doc``, from ``opa eval``. Skips the
+    test cleanly when the ``opa`` binary is not on the PATH."""
+    opa = shutil.which("opa")
+    if opa is None:
+        pytest.skip("opa binary not on PATH")
+    query = f"data.authbridge.client.{tier}.request.allow"
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "policy.rego"
+        path.write_text(rego, encoding="utf-8")
+        out = subprocess.run(
+            [opa, "eval", "-f", "json", "-d", str(path), "--stdin-input", query],
+            input=json.dumps(input_doc),
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+    return json.loads(out)["result"][0]["expressions"][0]["value"]
+
+
+class TestDivergentCopiesOfASharedScope:
+    """team1/github-tool and team2/github-tool share ``github-tool.source-read``. ``granted`` is the tool
+    whose copy grants ``developer`` (alice and bob); the other tool's copy has no user rule. team1/
+    github-agent may call both copies. A user rule decides only on the copy whose SPM has it: under
+    agent side, a grant on one copy must not admit alice on the other copy (that is fail-open)."""
+
+    @staticmethod
+    def _bring_up(stack: Stack, granted: Workload) -> Workload:
+        """Bring up the two tools (team1 first), each with the decisions of its own copy, then the
+        agent. Returns the other tool."""
+        for tool in TOOLS:
+            stack.llm.decisions = DECISIONS if tool is granted else OTHER_COPY_DECISIONS
+            stack.bring_up(tool)
+        stack.llm.decisions = DECISIONS
+        stack.bring_up(AGENT1)
+        return TOOL2 if granted is TOOL1 else TOOL1
+
+    @pytest.mark.parametrize("granted", TOOLS, ids=["team1-copy", "team2-copy"])
+    def test_target_side_each_copy_cr_has_only_its_own_user_rules(self, stack: Stack, granted: Workload) -> None:
+        other = self._bring_up(stack, granted)
+
+        granted_spm, other_spm = stack.store.spm(granted.client_id), stack.store.spm(other.client_id)
+        assert granted_spm is not None and other_spm is not None
+        assert (DEVELOPER, SOURCE_READ, granted.client_id) in _edges(granted_spm.inbound_allow_rules)
+        assert all(rule.role.name != DEVELOPER for rule in other_spm.inbound_allow_rules), other.client_id
+        assert all(rule.role.name != DEVELOPER for rule in other_spm.inbound_deny_rules), other.client_id
+
+        assert _rego_map(stack.inbound(granted.client_id), "subject_role_allow_scopes") == {DEVELOPER: ["source-read"]}
+        assert _rego_map(stack.inbound(other.client_id), "subject_role_allow_scopes") == {}
+
+    @pytest.mark.parametrize("granted", TOOLS, ids=["team1-copy", "team2-copy"])
+    def test_agent_side_a_copy_with_no_grant_has_no_subject_entry(
+        self, stack: Stack, granted: Workload, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("AIAC_ENFORCEMENT_SIDE", EnforcementSide.AGENT_SIDE.value)
+        other = self._bring_up(stack, granted)
+
+        rego = stack.outbound(AGENT1.client_id)
+        assert _rego_map(rego, "target_allow_scopes") == {tool.client_id: ["source-read"] for tool in TOOLS}, (
+            "the agent may call both copies"
+        )
+        assert _rego_nested_map(rego, "subject_role_allow_scopes") == {
+            DEVELOPER: {granted.client_id: ["source-read"]}
+        }, f"{other.client_id}: a copy with no grant has no subject entry"
+        assert _rego_nested_map(rego, "subject_role_deny_scopes") == {}
+
+    @pytest.mark.parametrize("side", [EnforcementSide.TARGET_SIDE, EnforcementSide.AGENT_SIDE], ids=lambda s: s.value)
+    @pytest.mark.parametrize("granted", TOOLS, ids=["team1-copy", "team2-copy"])
+    def test_alice_reaches_only_the_copy_that_grants_her(
+        self, stack: Stack, granted: Workload, side: EnforcementSide, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The decision of the rendered CRs for alice (through team1/github-agent) on each copy: both
+        sides allow her on the copy that grants her and deny her on the other copy."""
+        monkeypatch.setenv("AIAC_ENFORCEMENT_SIDE", side.value)
+        other = self._bring_up(stack, granted)
+
+        for tool, expected in ((granted, True), (other, False)):
+            if side is EnforcementSide.AGENT_SIDE:
+                rego, tier = stack.outbound(AGENT1.client_id), "outbound"
+                identity = {"subject": "alice", "service_id": tool.client_id}
+            else:
+                rego, tier = stack.inbound(tool.client_id), "inbound"
+                identity = {"subject": "alice", "client_id": AGENT1.client_id}
+            allowed = _opa_allow(rego, tier, {"identity": identity, "mcp": _CALL_SOURCE_READ})
+            assert allowed is expected, f"{side.value}: alice -> {tool.client_id} source-read"
+
+    def test_agent_side_copies_that_agree_each_get_their_own_rule(
+        self, stack: Stack, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The control case: both copies grant ``developer`` (case 1), so the APM keeps the grant of
+        each copy (the PCE keeps one outbound subject rule for each copy), each copy gets its own
+        subject entry, and alice reaches both copies through the agent."""
+        monkeypatch.setenv("AIAC_ENFORCEMENT_SIDE", EnforcementSide.AGENT_SIDE.value)
+        for workload in (TOOL1, TOOL2, AGENT1):
+            stack.bring_up(workload)
+
+        rego = stack.outbound(AGENT1.client_id)
+        assert _rego_nested_map(rego, "subject_role_allow_scopes") == {
+            DEVELOPER: {tool.client_id: ["source-read"] for tool in TOOLS}
+        }
+        for tool in TOOLS:
+            identity = {"subject": "alice", "service_id": tool.client_id}
+            allowed = _opa_allow(rego, "outbound", {"identity": identity, "mcp": _CALL_SOURCE_READ})
+            assert allowed is True, f"alice -> {tool.client_id} source-read"
+
+
+# --------------------------------------------------------------------------- #
+# case 9 — a deny on the copies of a shared scope                             #
+# --------------------------------------------------------------------------- #
+# The PCE keeps one outbound subject rule for each copy (role, scope id, copy owner, effect), and the
+# writer keys each rule only by the copy that it names, as under target side. So when the SPMs of both
+# copies deny ``developer``, the APM has the deny of each copy, and the agent side denies alice on both
+# copies (with the deny of one copy only, she would reach the other copy through her ``tester`` grant
+# there: fail-open). When one copy denies ``developer`` and the other copy has no rule for it, the agent
+# side denies alice on the first copy only, and allows her on the other copy, as the target side does.
+TESTER = "tester"
+DENY_COPY1 = {**DECISIONS, ("scope", SOURCE_READ): ({AGENT_ROLE}, {DEVELOPER})}
+DENY_COPY2_GRANT_TESTER = {**DECISIONS, ("scope", SOURCE_READ): ({AGENT_ROLE, TESTER}, {DEVELOPER})}
+NO_DENY_COPY2_GRANT_TESTER = {**DECISIONS, ("scope", SOURCE_READ): ({AGENT_ROLE, TESTER}, set())}
+# The scenario -> the decisions of the copy of TOOL1 and of TOOL2.
+DENY_SCENARIOS = {
+    "deny-on-both-copies": (DENY_COPY1, DENY_COPY2_GRANT_TESTER),
+    "deny-on-team1-copy-only": (DENY_COPY1, NO_DENY_COPY2_GRANT_TESTER),
+}
+# The onboarding order of the tools is the order in which the PCE reads their SPMs.
+TOOL_ORDERS = {"team1-first": (TOOL1, TOOL2), "team2-first": (TOOL2, TOOL1)}
+SIDES = [EnforcementSide.TARGET_SIDE, EnforcementSide.AGENT_SIDE]
+
+
+class TestDenyOnCopiesOfASharedScope:
+    """team1/github-tool and team2/github-tool share ``github-tool.source-read``, and team1/github-agent
+    may call both copies. The copy of team1 denies ``developer``. The copy of team2 grants ``tester``,
+    and denies ``developer`` too or has no rule for it. alice holds ``developer`` and ``tester``; carol
+    holds ``tester`` only."""
+
+    @staticmethod
+    def _bring_up(stack: Stack, scenario: str, order: str, side: EnforcementSide, monkeypatch) -> None:
+        monkeypatch.setenv("AIAC_ENFORCEMENT_SIDE", side.value)
+        stack.realm.ensure_role(TESTER, "Testers of the team.")
+        for user in ("alice", "carol"):
+            stack.realm.grant(user, TESTER)
+        stack.realm.events.clear()
+        decisions = {tool.client_id: copy for tool, copy in zip(TOOLS, DENY_SCENARIOS[scenario], strict=True)}
+        for tool in TOOL_ORDERS[order]:
+            stack.llm.decisions = decisions[tool.client_id]
+            stack.bring_up(tool)
+        stack.llm.decisions = DECISIONS
+        stack.bring_up(AGENT1)
+
+    @staticmethod
+    def _verdicts(stack: Stack, side: EnforcementSide) -> dict[tuple[str, str], bool]:
+        """The ``allow`` of the rendered CRs for (user, copy owner) through team1/github-agent."""
+        verdicts = {}
+        for user in ("alice", "carol"):
+            for tool in TOOLS:
+                if side is EnforcementSide.AGENT_SIDE:
+                    rego, tier = stack.outbound(AGENT1.client_id), "outbound"
+                    identity = {"subject": user, "service_id": tool.client_id}
+                else:
+                    rego, tier = stack.inbound(tool.client_id), "inbound"
+                    identity = {"subject": user, "client_id": AGENT1.client_id}
+                verdicts[user, tool.client_id] = _opa_allow(
+                    rego, tier, {"identity": identity, "mcp": _CALL_SOURCE_READ}
+                )
+        return verdicts
+
+    @pytest.mark.parametrize("order", list(TOOL_ORDERS))
+    @pytest.mark.parametrize("side", SIDES, ids=lambda s: s.value)
+    def test_a_deny_on_both_copies_blocks_the_user_on_both_copies(
+        self, stack: Stack, side: EnforcementSide, order: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._bring_up(stack, "deny-on-both-copies", order, side, monkeypatch)
+
+        for tool in TOOLS:
+            spm = stack.store.spm(tool.client_id)
+            assert spm is not None
+            assert (DEVELOPER, SOURCE_READ, tool.client_id) in _edges(spm.inbound_deny_rules), tool.client_id
+        assert self._verdicts(stack, side) == {
+            ("alice", TOOL1.client_id): False,
+            ("alice", TOOL2.client_id): False,  # the team2 SPM denies developer (alice holds it)
+            ("carol", TOOL1.client_id): False,
+            ("carol", TOOL2.client_id): True,  # tester, granted on the team2 copy
+        }
+
+    @pytest.mark.parametrize("order", list(TOOL_ORDERS))
+    def test_agent_side_the_deny_map_has_the_deny_on_both_copies(
+        self, stack: Stack, order: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The deny-agree control: the APM keeps the deny of each copy, and the writer keys each deny on
+        its own copy, so both copies have it (with the deny of one copy only, the other copy would admit
+        alice through her tester grant: fail-open)."""
+        self._bring_up(stack, "deny-on-both-copies", order, EnforcementSide.AGENT_SIDE, monkeypatch)
+
+        rego = stack.outbound(AGENT1.client_id)
+        assert _rego_nested_map(rego, "subject_role_deny_scopes") == {
+            DEVELOPER: {tool.client_id: ["source-read"] for tool in TOOLS}
+        }
+        assert _rego_nested_map(rego, "subject_role_allow_scopes") == {TESTER: {TOOL2.client_id: ["source-read"]}}
+
+    @pytest.mark.parametrize("order", list(TOOL_ORDERS))
+    def test_agent_side_the_deny_map_has_a_deny_of_one_copy_on_that_copy_only(
+        self, stack: Stack, order: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Only the team1 copy denies ``developer``: the deny is keyed only on that copy, and the team2
+        copy, whose SPM has no deny, gets no deny entry (no over-deny)."""
+        self._bring_up(stack, "deny-on-team1-copy-only", order, EnforcementSide.AGENT_SIDE, monkeypatch)
+
+        rego = stack.outbound(AGENT1.client_id)
+        assert _rego_nested_map(rego, "subject_role_deny_scopes") == {DEVELOPER: {TOOL1.client_id: ["source-read"]}}
+        assert _rego_nested_map(rego, "subject_role_allow_scopes") == {TESTER: {TOOL2.client_id: ["source-read"]}}
+
+    def _verdicts_on_both_sides(self, stack: Stack, scenario: str, order: str, monkeypatch) -> dict:
+        """Bring up under target side, then change to agent side as an operator does (the side in the
+        ConfigMap, then the resync at the Controller start). The verdicts of each side, by side."""
+        self._bring_up(stack, scenario, order, EnforcementSide.TARGET_SIDE, monkeypatch)
+        verdicts = {EnforcementSide.TARGET_SIDE: self._verdicts(stack, EnforcementSide.TARGET_SIDE)}
+        monkeypatch.setenv("AIAC_ENFORCEMENT_SIDE", EnforcementSide.AGENT_SIDE.value)
+        computation.resync()
+        verdicts[EnforcementSide.AGENT_SIDE] = self._verdicts(stack, EnforcementSide.AGENT_SIDE)
+        return verdicts
+
+    @pytest.mark.parametrize("order", list(TOOL_ORDERS))
+    @pytest.mark.parametrize("scenario", list(DENY_SCENARIOS))
+    def test_agent_side_is_never_more_permissive_than_target_side(
+        self, stack: Stack, scenario: str, order: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """For each user and copy, the agent outbound allows only what the CR of that copy allows."""
+        verdicts = self._verdicts_on_both_sides(stack, scenario, order, monkeypatch)
+        opened = sorted(
+            key
+            for key, allowed in verdicts[EnforcementSide.AGENT_SIDE].items()
+            if allowed and not verdicts[EnforcementSide.TARGET_SIDE][key]
+        )
+        assert opened == [], f"agent side allows where target side denies: {opened}"
+
+    @pytest.mark.parametrize("order", list(TOOL_ORDERS))
+    def test_a_deny_on_one_copy_gives_the_same_verdicts_on_both_sides(
+        self, stack: Stack, order: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """alice is denied on the team1 copy only: both sides allow her on the team2 copy (her tester
+        grant there), and every other verdict is the same too."""
+        verdicts = self._verdicts_on_both_sides(stack, "deny-on-team1-copy-only", order, monkeypatch)
+        assert verdicts[EnforcementSide.TARGET_SIDE][("alice", TOOL2.client_id)] is True, "the precondition"
+        assert verdicts[EnforcementSide.AGENT_SIDE] == verdicts[EnforcementSide.TARGET_SIDE]
