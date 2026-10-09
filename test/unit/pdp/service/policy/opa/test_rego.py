@@ -8,8 +8,9 @@ live plugin sends).
 
 - **Agent side** (an APM, ``render_agent_side``; a managed tool,
   ``render_pass_through``): the agent inbound (the ``rossoctl`` platform bypass)
-  and the agent outbound (per-tool checks and the MCP session rule; the known limit
-  that A2A and LLM calls are denied), with the deny-overrides ALLOW/DENY split; the
+  and the agent outbound (per-tool checks and the MCP session rule, each per target —
+  LIM-02; the known limit that A2A and LLM calls are denied), with the
+  deny-overrides ALLOW/DENY split; the
   pass-through CR of a managed tool (D24), which allows every request on both tiers. Scope maps are split symmetrically
   (``subject_role_allow_scopes`` / ``_deny_scopes``, ``source_role_allow_scopes`` /
   ``_deny_scopes``, ``target_allow_scopes`` / ``target_deny_scopes``); the identity
@@ -327,9 +328,9 @@ def test_outbound_embeds_agent_roles_list():
 def test_outbound_subject_role_allow_scopes_are_deprefixed():
     rego = generate_outbound_rego(_github_agent())
     assert "subject_role_allow_scopes := {" in rego
-    # bare tool names, owner prefix stripped
-    assert '"developer": ["source-read", "source-write", "issues-read"]' in rego
-    assert '"tester": ["issues-read", "issues-write"]' in rego
+    # role -> the FULL target service id -> bare tool names, owner prefix stripped (LIM-02)
+    assert f'"developer": {{\n        "{GH_TOOL}": ["source-read", "source-write", "issues-read"],\n    }},' in rego
+    assert f'"tester": {{\n        "{GH_TOOL}": ["issues-read", "issues-write"],\n    }},' in rego
 
 
 def test_outbound_agent_role_scopes_are_deprefixed():
@@ -367,8 +368,8 @@ def test_outbound_no_prefixed_scope_leaks():
 def test_outbound_gates_use_nested_identity_and_mcp_input():
     rego = generate_outbound_rego(_github_agent())
     assert "some role in subject_roles[input.identity.subject]" in rego
-    assert "tool in subject_role_allow_scopes[role]" in rego
-    assert "tool in subject_role_deny_scopes[role]" in rego
+    assert "tool in subject_role_allow_scopes[role][input.identity.service_id]\n" in rego
+    assert "tool in subject_role_deny_scopes[role][input.identity.service_id]\n" in rego
     assert "subject_allow_ok if { subject_allows(input.mcp.params.name) }" in rego
     assert "subject_deny_ok if { subject_denies(input.mcp.params.name) }" in rego
     assert "target_allow_ok if { target_allows(input.mcp.params.name) }" in rego
@@ -467,7 +468,7 @@ def test_outbound_per_scope_and_structural():
     maps — subject allow grants {A, C, D}, capability allow grants {B, C, D} on T,
     subject deny bars {D} — so allow is their per-scope intersection minus deny."""
     rego = generate_outbound_rego(_outbound_and_model())
-    assert '"u-role": ["scope-a", "scope-c", "scope-d"]' in rego  # subject allow gate
+    assert f'"u-role": {{\n        "{GH_TOOL}": ["scope-a", "scope-c", "scope-d"],' in rego  # subject allow gate
     assert (
         '"spiffe://localtest.me/ns/team1/sa/github-tool": ["scope-b", "scope-c", "scope-d"]' in rego
     )  # capability allow gate
@@ -935,6 +936,293 @@ def test_tools_call_stays_a_per_tool_check(subject, tool, allowed):
 def test_every_other_mcp_method_is_denied(mcp):
     rego = generate_outbound_rego(_session_model())
     _assert_opa_allow(rego, _OUTBOUND, _outbound_input("dev-user", mcp), False)
+
+
+# --- LIM-02: the outbound subject maps are per target ------------------------
+#
+# Two tools expose a tool with the same bare name: ``tool-a.source-read`` and ``tool-b.source-read``
+# are two different scopes (two ids) that both de-prefix to ``source-read``. The agent may call both
+# (the target gate admits ``source-read`` on each tool). A user rule names one scope, so it decides
+# only on the owner of that scope: a grant on tool-b gives nothing on tool-a, and a deny on tool-a
+# blocks nothing on tool-b.
+#
+# A shared scope (D32) is one scope (one id) with a copy on each owner. Each copy has the user rules of
+# its own SPM: each owner's onboarding is its own scope-focal PRB pass, so two copies can get different
+# rules, and under target side each copy decides from its own SPM. So a user rule, a GRANT or a DENY,
+# decides only on the copy that it names (``scope.serviceId``), as under target side. A copy with no
+# grant gets no allow entry, also when the agent may call that copy: a grant given to every copy is
+# fail-open (it admits the user on a copy whose SPM has no such grant). A copy with no deny gets no deny
+# entry: a deny given to every copy over-denies (it blocks the user on a copy whose SPM has no deny).
+#
+# The PCE keeps one outbound subject rule for each copy (role, scope id, copy owner, effect). So when
+# the SPMs of both copies deny a role, the APM has the deny of each copy, and each copy gets its deny
+# entry: a deny of one copy only would admit the user on the other copy through a grant of another role
+# there (fail-open).
+
+TOOL_A = "spiffe://localtest.me/ns/team1/sa/tool-a"
+TOOL_B = "spiffe://localtest.me/ns/team1/sa/tool-b"
+GH_TOOL_TEAM2 = "spiffe://localtest.me/ns/team2/sa/github-tool"
+MIRROR_TOOL = "spiffe://localtest.me/ns/team1/sa/mirror-tool"
+
+
+def _two_tools_model(deny_on_tool_a: bool) -> AgentPolicyModel:
+    """alice (role dev) is granted ``tool-b.source-read`` only; with ``deny_on_tool_a``, dev is also
+    denied ``tool-a.source-read``. The agent may call ``source-read`` on both tools."""
+    dev = _user_role("dev", "alice")
+    on_a = _scope("tool-a.source-read", TOOL_A)
+    on_b = _scope("tool-b.source-read", TOOL_B)
+    return _model(
+        agent_id=GH_AGENT,
+        subject_roles={"alice": [dev]},
+        target_allow_scopes={TOOL_A: [on_a], TOOL_B: [on_b]},
+        outbound_subject_allow_rules=[_rule(dev, on_b)],
+        outbound_subject_deny_rules=[_rule(dev, on_a, RuleEffect.DENY)] if deny_on_tool_a else [],
+    )
+
+
+_CALL_SOURCE_READ = {"method": "tools/call", "params": {"name": "source-read"}}
+
+
+@pytest.mark.skipif(not shutil.which("opa"), reason="opa binary not on PATH")
+@pytest.mark.parametrize("mcp", [_CALL_SOURCE_READ, {"method": "tools/list"}], ids=["tools-call", "tools-list"])
+@pytest.mark.parametrize("target, allowed", [(TOOL_B, True), (TOOL_A, False)], ids=["granted-tool", "other-tool"])
+def test_outbound_subject_grant_on_one_target_gives_nothing_on_another(mcp, target, allowed):
+    """The grant on tool-b does not let alice call ``source-read`` on tool-a (LIM-02, fail-open)."""
+    rego = generate_outbound_rego(_two_tools_model(deny_on_tool_a=False))
+    _assert_opa_allow(rego, _OUTBOUND, _outbound_input("alice", mcp, target), allowed)
+
+
+@pytest.mark.skipif(not shutil.which("opa"), reason="opa binary not on PATH")
+@pytest.mark.parametrize("mcp", [_CALL_SOURCE_READ, {"method": "tools/list"}], ids=["tools-call", "tools-list"])
+@pytest.mark.parametrize("target, allowed", [(TOOL_B, True), (TOOL_A, False)], ids=["granted-tool", "denied-tool"])
+def test_outbound_subject_deny_on_one_target_blocks_nothing_on_another(mcp, target, allowed):
+    """The deny on tool-a does not block alice's grant on tool-b (LIM-02, fail-closed)."""
+    rego = generate_outbound_rego(_two_tools_model(deny_on_tool_a=True))
+    _assert_opa_allow(rego, _OUTBOUND, _outbound_input("alice", mcp, target), allowed)
+
+
+def test_outbound_subject_maps_are_keyed_by_role_then_target():
+    rego = generate_outbound_rego(_two_tools_model(deny_on_tool_a=True))
+    assert f'subject_role_allow_scopes := {{\n    "dev": {{\n        "{TOOL_B}": ["source-read"],\n    }},\n}}' in rego
+    assert f'subject_role_deny_scopes := {{\n    "dev": {{\n        "{TOOL_A}": ["source-read"],\n    }},\n}}' in rego
+    assert "tool in subject_role_allow_scopes[role][input.identity.service_id]" in rego
+    assert "tool in subject_role_deny_scopes[role][input.identity.service_id]" in rego
+
+
+_COPIES = (GH_TOOL, GH_TOOL_TEAM2)
+
+
+def _shared_scope_model(allow_on: tuple[str, ...], deny_on: tuple[str, ...]) -> AgentPolicyModel:
+    """``github-tool.source-read`` is one shared scope with a copy on team1/github-tool and on
+    team2/github-tool (D32), and the agent may call both copies. alice holds dev; olga holds reader and
+    ops. On each copy in ``allow_on``, dev and reader are granted the scope; on each copy in ``deny_on``,
+    ops is denied it. Each rule names its own copy, as the SPM of that copy's owner has it (one rule for
+    each copy)."""
+    dev = _user_role("dev", "alice")
+    reader = _user_role("reader", "olga")
+    ops = _user_role("ops", "olga")
+    copies = {owner: _scope("github-tool.source-read", owner) for owner in _COPIES}
+    return _model(
+        agent_id=GH_AGENT,
+        subject_roles={"alice": [dev], "olga": [reader, ops]},
+        target_allow_scopes={owner: [copy] for owner, copy in copies.items()},
+        outbound_subject_allow_rules=[_rule(role, copies[owner]) for owner in allow_on for role in (dev, reader)],
+        outbound_subject_deny_rules=[_rule(ops, copies[owner], RuleEffect.DENY) for owner in deny_on],
+    )
+
+
+# The rules of each copy: (the copies with the dev and reader grants, the copies with the ops deny).
+# Through UC-1, a placement where one copy grants a role and the other copy denies the same role is a
+# PRB policy conflict; here dev/reader and ops are different roles, so each placement can occur.
+_SHARED_PLACEMENTS = {
+    "both-copies": (_COPIES, _COPIES),
+    "grant-on-first-copy-only": ((GH_TOOL,), ()),
+    "grant-on-other-copy-only": ((GH_TOOL_TEAM2,), ()),
+    "deny-on-first-copy-only": (_COPIES, (GH_TOOL,)),
+    "deny-on-other-copy-only": (_COPIES, (GH_TOOL_TEAM2,)),
+}
+
+
+@pytest.mark.skipif(not shutil.which("opa"), reason="opa binary not on PATH")
+@pytest.mark.parametrize("placement", list(_SHARED_PLACEMENTS))
+@pytest.mark.parametrize("target", _COPIES, ids=["first-copy", "other-copy"])
+@pytest.mark.parametrize("subject", ["alice", "olga"])
+def test_outbound_shared_scope_grant_and_deny_are_per_copy(placement, target, subject):
+    """alice is allowed on a copy iff that copy grants dev: a grant on one copy does not admit her on
+    a copy with no grant (fail-open). olga is allowed on a copy iff that copy grants reader and does
+    not deny ops: a deny on one copy blocks her on that copy only, as under target side."""
+    allow_on, deny_on = _SHARED_PLACEMENTS[placement]
+    allowed = target in allow_on and not (subject == "olga" and target in deny_on)
+    rego = generate_outbound_rego(_shared_scope_model(allow_on, deny_on))
+    _assert_opa_allow(rego, _OUTBOUND, _outbound_input(subject, _CALL_SOURCE_READ, target), allowed)
+
+
+@pytest.mark.skipif(not shutil.which("opa"), reason="opa binary not on PATH")
+@pytest.mark.parametrize("target, allowed", [(GH_TOOL, True), (GH_TOOL_TEAM2, False)], ids=["granted-copy", "no-rule"])
+def test_outbound_session_on_a_shared_scope_copy_with_no_rule_is_denied(target, allowed):
+    """``tools/list`` follows the per-copy decision: the copy with no rule for alice has no tool that
+    passes ``tool_ok`` for her."""
+    rego = generate_outbound_rego(_shared_scope_model(allow_on=(GH_TOOL,), deny_on=()))
+    _assert_opa_allow(rego, _OUTBOUND, _outbound_input("alice", {"method": "tools/list"}, target), allowed)
+
+
+def test_outbound_subject_map_has_no_entry_for_a_copy_with_no_rule():
+    """A grant on one copy of a shared scope gives no allow entry to the other copy, although the
+    agent may call the other copy (it is in ``target_allow_scopes``)."""
+    rego = generate_outbound_rego(_shared_scope_model(allow_on=(GH_TOOL,), deny_on=()))
+    assert (
+        f'subject_role_allow_scopes := {{\n    "dev": {{\n        "{GH_TOOL}": ["source-read"],\n    }},\n'
+        f'    "reader": {{\n        "{GH_TOOL}": ["source-read"],\n    }},\n}}'
+    ) in rego
+    assert "subject_role_deny_scopes := {}" in rego
+
+
+# The APM that the PCE gives when the SPMs of both copies deny ``dev`` and the SPM of ``tester_on`` also
+# grants ``tester``: the PCE keeps the deny of each copy (one rule for each copy), in the order in which
+# it reads the SPMs. alice holds dev and tester; tina holds tester only.
+_READ_ORDERS = {"first-copy-read-first": _COPIES, "other-copy-read-first": tuple(reversed(_COPIES))}
+
+
+def _deny_on_both_copies_model(read_order: tuple[str, ...], tester_on: str) -> AgentPolicyModel:
+    dev = _user_role("dev", "alice")
+    tester = _user_role("tester", "alice", "tina")
+    copies = {owner: _scope("github-tool.source-read", owner) for owner in _COPIES}
+    return _model(
+        agent_id=GH_AGENT,
+        subject_roles={"alice": [dev, tester], "tina": [tester]},
+        target_allow_scopes={owner: [copy] for owner, copy in copies.items()},
+        outbound_subject_allow_rules=[_rule(tester, copies[tester_on])],
+        outbound_subject_deny_rules=[_rule(dev, copies[owner], RuleEffect.DENY) for owner in read_order],
+    )
+
+
+@pytest.mark.skipif(not shutil.which("opa"), reason="opa binary not on PATH")
+@pytest.mark.parametrize("mcp", [_CALL_SOURCE_READ, {"method": "tools/list"}], ids=["tools-call", "tools-list"])
+@pytest.mark.parametrize("read_order", list(_READ_ORDERS))
+@pytest.mark.parametrize("tester_on", _COPIES, ids=["tester-on-first-copy", "tester-on-other-copy"])
+@pytest.mark.parametrize("target", _COPIES, ids=["first-copy", "other-copy"])
+@pytest.mark.parametrize("subject", ["alice", "tina"])
+def test_outbound_deny_on_both_copies_blocks_the_user_on_both_copies(read_order, tester_on, target, subject, mcp):
+    """Each copy's deny of dev blocks alice on that copy, also on the copy where she has the tester
+    grant (both SPMs deny dev). tina does not hold dev, so no deny blocks her on the tester copy."""
+    allowed = subject == "tina" and target == tester_on
+    rego = generate_outbound_rego(_deny_on_both_copies_model(_READ_ORDERS[read_order], tester_on))
+    _assert_opa_allow(rego, _OUTBOUND, _outbound_input(subject, mcp, target), allowed)
+
+
+@pytest.mark.parametrize("read_order", list(_READ_ORDERS))
+def test_outbound_subject_deny_map_has_the_deny_of_each_copy_on_that_copy(read_order):
+    """The deny of each copy is keyed by that copy, in the order of the deny rules."""
+    order = _READ_ORDERS[read_order]
+    rego = generate_outbound_rego(_deny_on_both_copies_model(order, GH_TOOL_TEAM2))
+    assert (
+        f'subject_role_deny_scopes := {{\n    "dev": {{\n        "{order[0]}": ["source-read"],\n'
+        f'        "{order[1]}": ["source-read"],\n    }},\n}}'
+    ) in rego
+
+
+@pytest.mark.parametrize("deny_named", [GH_TOOL, GH_TOOL_TEAM2], ids=["first-copy", "other-copy"])
+def test_outbound_subject_deny_map_keys_a_deny_only_on_its_own_copy(deny_named):
+    """A deny rule is keyed only by the copy that it names, although the agent may call the other copy
+    of its scope (same scope id) too: the other copy, whose SPM has no deny, gets no deny entry. The
+    grant stays on its own copy."""
+    ops = _user_role("ops", "olga")
+    reader = _user_role("reader", "olga")
+    copies = {owner: _scope("github-tool.source-read", owner) for owner in _COPIES}
+    rego = generate_outbound_rego(
+        _model(
+            agent_id=GH_AGENT,
+            subject_roles={"olga": [reader, ops]},
+            target_allow_scopes={owner: [copy] for owner, copy in copies.items()},
+            outbound_subject_allow_rules=[_rule(reader, copies[GH_TOOL_TEAM2])],
+            outbound_subject_deny_rules=[_rule(ops, copies[deny_named], RuleEffect.DENY)],
+        )
+    )
+    assert (
+        f'subject_role_deny_scopes := {{\n    "ops": {{\n        "{deny_named}": ["source-read"],\n    }},\n}}' in rego
+    )
+    assert (
+        f'subject_role_allow_scopes := {{\n    "reader": {{\n        "{GH_TOOL_TEAM2}": ["source-read"],\n    }},\n}}'
+    ) in rego
+
+
+@pytest.mark.parametrize("deny_named", _COPIES, ids=["allowed-copy", "denied-copy"])
+def test_outbound_subject_deny_on_a_copy_that_the_agent_is_denied_stays_on_that_copy(deny_named):
+    """The agent may call the first copy, and ``target_deny_scopes`` denies it the other copy. A deny
+    rule is keyed only by the copy that it names, also when the agent is denied that copy (the target
+    gate denies the agent there anyway), and never by the other copy."""
+    ops = _user_role("ops", "olga")
+    first, other = (_scope("github-tool.source-read", owner) for owner in _COPIES)
+    rego = generate_outbound_rego(
+        _model(
+            agent_id=GH_AGENT,
+            subject_roles={"olga": [ops]},
+            target_allow_scopes={GH_TOOL: [first]},
+            target_deny_scopes={GH_TOOL_TEAM2: [other]},
+            outbound_subject_deny_rules=[_rule(ops, first if deny_named == GH_TOOL else other, RuleEffect.DENY)],
+        )
+    )
+    assert (
+        f'subject_role_deny_scopes := {{\n    "ops": {{\n        "{deny_named}": ["source-read"],\n    }},\n}}' in rego
+    )
+
+
+def test_outbound_subject_map_takes_each_target_tool_from_its_own_copy():
+    """Each rule de-prefixes by the owner of the copy that it names, so the subject value of each
+    target is the value that the target gate of that target has."""
+    dev = _user_role("dev", "alice")
+    copy1 = _scope("github-tool.source-read", GH_TOOL)
+    mirror = _scope("github-tool.source-read", MIRROR_TOOL)  # the owner name is not the prefix
+    rego = generate_outbound_rego(
+        _model(
+            agent_id=GH_AGENT,
+            subject_roles={"alice": [dev]},
+            target_allow_scopes={GH_TOOL: [copy1], MIRROR_TOOL: [mirror]},
+            outbound_subject_allow_rules=[_rule(dev, copy1), _rule(dev, mirror)],
+        )
+    )
+    assert (
+        f'subject_role_allow_scopes := {{\n    "dev": {{\n        "{GH_TOOL}": ["source-read"],\n'
+        f'        "{MIRROR_TOOL}": ["github-tool.source-read"],\n    }},\n}}'
+    ) in rego
+
+
+def test_outbound_subject_deny_map_takes_each_target_tool_from_its_own_copy():
+    """Each deny rule (one for each copy) de-prefixes by the owner of the copy that it names, so the
+    subject value of each target is the value that the target gate of that target has (the owner name
+    of the mirror copy is not the prefix)."""
+    ops = _user_role("ops", "olga")
+    copy1 = _scope("github-tool.source-read", GH_TOOL)
+    mirror = _scope("github-tool.source-read", MIRROR_TOOL)
+    rego = generate_outbound_rego(
+        _model(
+            agent_id=GH_AGENT,
+            subject_roles={"olga": [ops]},
+            target_allow_scopes={GH_TOOL: [copy1], MIRROR_TOOL: [mirror]},
+            outbound_subject_deny_rules=[_rule(ops, copy1, RuleEffect.DENY), _rule(ops, mirror, RuleEffect.DENY)],
+        )
+    )
+    assert (
+        f'subject_role_deny_scopes := {{\n    "ops": {{\n        "{GH_TOOL}": ["source-read"],\n'
+        f'        "{MIRROR_TOOL}": ["github-tool.source-read"],\n    }},\n}}'
+    ) in rego
+
+
+@pytest.mark.skipif(not shutil.which("opa"), reason="opa binary not on PATH")
+def test_outbound_subject_map_escapes_its_keys_and_values():
+    """The two-level map escapes each key and value like the flat maps (no broken Rego)."""
+    odd = _user_role('dev "x"\n', "alice")
+    tool = _scope('github-tool.say-"hi"', GH_TOOL)
+    rego = generate_outbound_rego(
+        _model(
+            agent_id=GH_AGENT,
+            subject_roles={"alice": [odd]},
+            target_allow_scopes={GH_TOOL: [tool]},
+            outbound_subject_allow_rules=[_rule(odd, tool)],
+        )
+    )
+    mcp = {"method": "tools/call", "params": {"name": 'say-"hi"'}}
+    _assert_opa_allow(rego, _OUTBOUND, _outbound_input("alice", mcp), True)
 
 
 # =========================================================================== #

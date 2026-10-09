@@ -170,6 +170,24 @@ def _render_map(var: str, mapping: dict[str, list[str]]) -> str:
     return "\n".join(lines)
 
 
+def _render_nested_map(var: str, mapping: dict[str, dict[str, list[str]]]) -> str:
+    """Render ``{var} := { "key": { "inner": ["a", "b"], ... }, ... }`` as Rego (empty-safe: ``{}``).
+
+    The two-level counterpart of ``_render_map``, with the same ``json.dumps`` escaping of every
+    key and value."""
+    if not mapping:
+        return f"{var} := {{}}"
+    lines = [f"{var} := {{"]
+    for key, inner_map in mapping.items():
+        lines.append(f"    {json.dumps(key)}: {{")
+        for inner_key, values in inner_map.items():
+            inner = ", ".join(json.dumps(v) for v in values)
+            lines.append(f"        {json.dumps(inner_key)}: [{inner}],")
+        lines.append("    },")
+    lines.append("}")
+    return "\n".join(lines)
+
+
 def _deprefix(scope) -> str:
     """De-prefix a scope value to the bare MCP tool name (agent outbound, tool inbound).
 
@@ -208,8 +226,7 @@ def _group_rules_deprefixed(rules: list[PolicyRule]) -> dict[str, list[str]]:
     """Like ``_group_rules`` but de-prefixes each scope value.
 
     Groups ``{role.name: [_deprefix(scope), ...]}`` — used for the agent outbound
-    ``subject_role_allow_scopes`` / ``subject_role_deny_scopes`` /
-    ``agent_role_scopes`` maps and for the four role maps of the tool inbound,
+    ``agent_role_scopes`` map and for the four role maps of the tool inbound,
     whose values must match the bare ``input.mcp.params.name``."""
     grouped: dict[str, list[str]] = {}
     for rule in rules:
@@ -217,6 +234,35 @@ def _group_rules_deprefixed(rules: list[PolicyRule]) -> dict[str, list[str]]:
         value = _deprefix(rule.scope)
         if value not in scopes:
             scopes.append(value)
+    return grouped
+
+
+def _group_rules_by_target(rules: list[PolicyRule]) -> dict[str, dict[str, list[str]]]:
+    """Group the outbound subject rules into ``{role.name: {target: [tool, ...]}}`` (LIM-02).
+
+    A bare tool name alone does not name a tool: two targets can each have a ``source-read``. So
+    each rule decides only on the copy of the scope that it names (``scope.serviceId``): the key is
+    the **full** service id of the copy's owner (it matches ``input.identity.service_id``), and the
+    tool is the de-prefixed name of that copy, so it is the value that the target gate of that
+    target has. A rule of another scope (another scope id) with the same bare name never decides
+    there. A scope with no ``serviceId`` names no target.
+
+    A shared scope (D32) has one copy for each owner, and each copy has the user rules of its own
+    SPM. So a grant or a deny decides only on its own copy, as under target side: a grant on one copy
+    must not admit the user on a copy whose SPM has no grant (fail-open), and a deny on one copy must
+    not block the user on a copy whose SPM has no deny. A copy with no rule gets no entry, also when
+    the agent may call that copy. The PCE keeps one outbound subject rule for each copy (role, scope
+    id, copy owner, effect), so a rule that two copies have is in the APM for each copy, and each
+    copy gets its entry. First-seen order is kept.
+    """
+    grouped: dict[str, dict[str, list[str]]] = {}
+    for rule in rules:
+        if not rule.scope.serviceId:
+            continue
+        tools = grouped.setdefault(rule.role.name, {}).setdefault(rule.scope.serviceId, [])
+        value = _deprefix(rule.scope)
+        if value not in tools:
+            tools.append(value)
     return grouped
 
 
@@ -300,8 +346,11 @@ def _inbound_source_deny_gate() -> str:
 #
 # The outbound decision is a per-tool two-gate AND (the delegated user reaching a
 # downstream target):
-#   subject gate    — the delegated user's role admits the tool
+#   subject gate    — the delegated user's role admits the tool on this target
 #   capability gate — the target service admits the tool
+# Both gates are keyed by the target (``input.identity.service_id``): a bare tool
+# name alone does not name a tool, because two targets can each have one with
+# that name (LIM-02).
 # Each gate is emitted twice (allow/deny) as a Rego FUNCTION over a bare tool
 # name, so ``tools/call`` (the invoked ``input.mcp.params.name``) and the MCP
 # session (any tool of the target) use one definition of the per-tool check.
@@ -321,7 +370,7 @@ def _outbound_subject_gate(fn: str, gate: str, scope_map: str) -> str:
     return (
         f"{fn}(tool) if {{\n"
         "    some role in subject_roles[input.identity.subject]\n"
-        f"    tool in {scope_map}[role]\n"
+        f"    tool in {scope_map}[role][input.identity.service_id]\n"
         "}\n"
         f"{gate} if {{ {fn}(input.mcp.params.name) }}"
     )
@@ -550,10 +599,15 @@ def generate_outbound_rego(model: AgentPolicyModel) -> str:
     Gates the agent's token-exchanged call to a downstream target, per invoked
     tool. A matching DENY gate blocks the request, on the **same** ``input.mcp.params.name``:
     ``allow`` requires ``subject_allow_ok`` (the delegated user's role admits the
-    tool, via de-prefixed ``subject_role_allow_scopes``) AND ``target_allow_ok``
-    (the target service — keyed by the full ``input.identity.service_id`` SPIFFE
-    id — admits the tool, via de-prefixed ``target_allow_scopes``), and fires only
-    when neither ``subject_deny_ok`` nor ``target_deny_ok`` matches.
+    tool on this target, via de-prefixed ``subject_role_allow_scopes[role][target]``)
+    AND ``target_allow_ok`` (the target service admits the tool, via de-prefixed
+    ``target_allow_scopes[target]``), and fires only when neither ``subject_deny_ok``
+    nor ``target_deny_ok`` matches. ``target`` is the full ``input.identity.service_id``
+    SPIFFE id in all four gates, so a grant or a deny for one target never decides on
+    another target that has a tool with the same bare name (LIM-02). A grant or a
+    deny of a shared scope (D32) decides only on the copy that it names, as under
+    target side; the APM has one outbound subject rule for each copy (see
+    ``_group_rules_by_target``).
 
     ``agent_roles`` / ``agent_role_scopes`` are emitted for debugging but are
     **not** referenced by ``allow`` — ``target_allow_scopes[input.identity.service_id]``
@@ -569,13 +623,13 @@ def generate_outbound_rego(model: AgentPolicyModel) -> str:
         [
             _render_list("agent_roles", _names(model.agent_roles)),
             _render_map("subject_roles", _name_map(model.subject_roles)),
-            _render_map(
+            _render_nested_map(
                 "subject_role_allow_scopes",
-                _group_rules_deprefixed(model.outbound_subject_allow_rules),
+                _group_rules_by_target(model.outbound_subject_allow_rules),
             ),
-            _render_map(
+            _render_nested_map(
                 "subject_role_deny_scopes",
-                _group_rules_deprefixed(model.outbound_subject_deny_rules),
+                _group_rules_by_target(model.outbound_subject_deny_rules),
             ),
             # agent_role_scopes is emitted for debugging/observability only; the
             # allow decision never references it (target_allow_scopes is the
