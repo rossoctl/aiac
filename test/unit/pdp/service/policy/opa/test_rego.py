@@ -1672,9 +1672,14 @@ def _empty_map_policies() -> dict[str, ClientPolicies]:
         owned_roles=[],
         owned_scopes=[_scope("github-tool.source-read", GH_TOOL)],
     )
+    # The bootstrap CR of a tool before discovery: it owns no tool yet (owned_tools := []).
+    bootstrap_tool_spm = ServicePolicyModel(
+        service_id=GH_TOOL, service_type=ServiceType.TOOL, owned_roles=[], owned_scopes=[]
+    )
     return {
         "target-side-agent": render_target_side(agent_spm),
         "target-side-tool": render_target_side(tool_spm),
+        "target-side-bootstrap-tool": render_target_side(bootstrap_tool_spm),
         "agent-side-agent": render_agent_side(_model(agent_id=GH_AGENT)),
     }
 
@@ -1693,6 +1698,30 @@ def test_no_rule_indexes_a_declared_map(policies):
     for rego in policies:
         for name in _declared_maps(rego):
             assert not re.search(rf"\b{name}\[", rego), f"{name} is indexed directly:\n{rego}"
+
+
+def test_no_rule_loops_over_an_empty_list():
+    # OPA 1.21 also rejects a loop over an empty array literal (some x in []); membership is fine.
+    rego = _empty_map_policies()["target-side-bootstrap-tool"].inbound
+    assert "owned_tools := []" in rego
+    assert "some tool in owned_tools" not in rego
+    # The self-discovery rule stays: the bootstrap CR exists for the discovery call.
+    assert "input.identity.client_id == self_client_id" in rego
+
+
+@pytest.mark.skipif(not shutil.which("opa"), reason="opa binary not on PATH")
+@pytest.mark.parametrize(
+    ("subject", "client_id", "mcp", "allowed"),
+    [
+        (None, GH_TOOL, {"method": "tools/list"}, True),  # self-discovery
+        (None, GH_TOOL, _call("source-read"), False),  # never tools/call
+        ("dev-user", GH_AGENT, {"method": "tools/list"}, False),  # no tool: no session for a caller
+    ],
+    ids=["self-tools-list", "self-tools-call", "caller-tools-list"],
+)
+def test_bootstrap_tool_with_no_tools_passes_only_self_discovery(subject, client_id, mcp, allowed):
+    rego = _empty_map_policies()["target-side-bootstrap-tool"].inbound
+    _assert_opa_allow(rego, _INBOUND, _inbound_input(subject, client_id, mcp), allowed)
 
 
 @pytest.mark.skipif(not shutil.which("opa"), reason="opa binary not on PATH")
