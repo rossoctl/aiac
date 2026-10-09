@@ -61,7 +61,7 @@ matches::
     allow if { input.mcp.method == "tools/call"; subject_allow_ok; target_allow_ok;
                not subject_deny_ok; not target_deny_ok }
     allow if { input.mcp.method in session_methods;
-               some tool in target_allow_scopes[input.identity.service_id]; tool_ok(tool) }
+               some tool in object.get(target_allow_scopes, input.identity.service_id, []); tool_ok(tool) }
 
 **The MCP session.** ``initialize``, ``notifications/initialized``, ``ping`` and
 ``tools/list`` carry no tool name. On a tool inbound they are allowed iff at least
@@ -144,6 +144,18 @@ def identity_ref(service_id: str) -> tuple[str, str]:
             f"service id {service_id!r} yields invalid DNS-1123 label(s): namespace={namespace!r}, name={name!r}"
         )
     return namespace, name
+
+
+def _lookup(var: str, *keys: str) -> str:
+    """Render a read of the map ``var`` at ``keys`` as ``object.get`` with an empty default.
+
+    An empty map renders as ``{}`` (``_render_map``), and OPA 1.21 types ``{}`` as an object with
+    no keys: a direct index ``var[key]`` into it is a type error (``undefined ref``) that stops the
+    whole bundle from activating, so the sidecar denies every request. ``object.get`` takes any
+    object, and a missing key gives the default ``[]``, which matches nothing — the same result as
+    the undefined index. Two keys use the path form ``object.get(var, [k1, k2], [])``."""
+    key = keys[0] if len(keys) == 1 else "[" + ", ".join(keys) + "]"
+    return f"object.get({var}, {key}, [])"
 
 
 def _render_list(var: str, values: list[str]) -> str:
@@ -299,8 +311,8 @@ def _name_map_deprefixed(mapping) -> dict[str, list[str]]:
 def _inbound_subject_gate(gate: str, scope_map: str) -> str:
     return (
         f"{gate} if {{\n"
-        "    some role in subject_roles[input.identity.subject]\n"
-        f"    some scope in {scope_map}[role]\n"
+        f"    some role in {_lookup('subject_roles', 'input.identity.subject')}\n"
+        f"    some scope in {_lookup(scope_map, 'role')}\n"
         "    scope in agent_scopes\n"
         "}"
     )
@@ -319,8 +331,8 @@ def _inbound_source_allow_gate(platform_clients: tuple[str, ...]) -> str:
         rules.append(f"source_allow_ok if {{ input.identity.client_id == {json.dumps(client)} }}")
     rules.append(
         "source_allow_ok if {\n"
-        "    some role in source_roles[input.identity.client_id]\n"
-        "    some scope in source_role_allow_scopes[role]\n"
+        f"    some role in {_lookup('source_roles', 'input.identity.client_id')}\n"
+        f"    some scope in {_lookup('source_role_allow_scopes', 'role')}\n"
         "    scope in agent_scopes\n"
         "}"
     )
@@ -335,8 +347,8 @@ def _inbound_source_deny_gate() -> str:
     """
     return (
         "source_deny_ok if {\n"
-        "    some role in source_roles[input.identity.client_id]\n"
-        "    some scope in source_role_deny_scopes[role]\n"
+        f"    some role in {_lookup('source_roles', 'input.identity.client_id')}\n"
+        f"    some scope in {_lookup('source_role_deny_scopes', 'role')}\n"
         "    scope in agent_scopes\n"
         "}"
     )
@@ -369,8 +381,8 @@ def _render_session_methods() -> str:
 def _outbound_subject_gate(fn: str, gate: str, scope_map: str) -> str:
     return (
         f"{fn}(tool) if {{\n"
-        "    some role in subject_roles[input.identity.subject]\n"
-        f"    tool in {scope_map}[role][input.identity.service_id]\n"
+        f"    some role in {_lookup('subject_roles', 'input.identity.subject')}\n"
+        f"    tool in {_lookup(scope_map, 'role', 'input.identity.service_id')}\n"
         "}\n"
         f"{gate} if {{ {fn}(input.mcp.params.name) }}"
     )
@@ -378,7 +390,7 @@ def _outbound_subject_gate(fn: str, gate: str, scope_map: str) -> str:
 
 def _outbound_target_gate(fn: str, gate: str, scope_map: str) -> str:
     return (
-        f"{fn}(tool) if {{\n    tool in {scope_map}[input.identity.service_id]\n}}\n"
+        f"{fn}(tool) if {{\n    tool in {_lookup(scope_map, 'input.identity.service_id')}\n}}\n"
         f"{gate} if {{ {fn}(input.mcp.params.name) }}"
     )
 
@@ -432,8 +444,8 @@ class ClientPolicies(NamedTuple):
 def _tool_gate(fn: str, identity_map: str, identity_field: str, scope_map: str) -> str:
     return (
         f"{fn}(tool) if {{\n"
-        f"    some role in {identity_map}[input.identity.{identity_field}]\n"
-        f"    tool in {scope_map}[role]\n"
+        f"    some role in {_lookup(identity_map, f'input.identity.{identity_field}')}\n"
+        f"    tool in {_lookup(scope_map, 'role')}\n"
         "}"
     )
 
@@ -655,7 +667,7 @@ def generate_outbound_rego(model: AgentPolicyModel) -> str:
                 'input.mcp.method == "tools/call"; '
                 "subject_allow_ok; target_allow_ok; not subject_deny_ok; not target_deny_ok",
                 "input.mcp.method in session_methods; "
-                "some tool in target_allow_scopes[input.identity.service_id]; tool_ok(tool)",
+                f"some tool in {_lookup('target_allow_scopes', 'input.identity.service_id')}; tool_ok(tool)",
             ),
         ]
     )

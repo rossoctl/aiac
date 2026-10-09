@@ -13,20 +13,21 @@ soft_match(tools) if {
 }
 
 # The two subject maps are keyed by role and then by the full target service id (LIM-02):
-# a role's grant or deny decides only on the target that it is keyed by.
+# a role's grant or deny decides only on the target that it is keyed by. Each map is read with
+# object.get, as the real gate does: OPA 1.21 rejects a direct index into an empty map ({}).
 subject_ok if {
-	some role in gen.subject_roles[input.subject]
-	soft_match(gen.subject_role_allow_scopes[role][input.target])
+	some role in object.get(gen.subject_roles, input.subject, [])
+	soft_match(object.get(gen.subject_role_allow_scopes, [role, input.target], []))
 }
 
 subject_denied if {
-	some role in gen.subject_roles[input.subject]
-	soft_match(gen.subject_role_deny_scopes[role][input.target])
+	some role in object.get(gen.subject_roles, input.subject, [])
+	soft_match(object.get(gen.subject_role_deny_scopes, [role, input.target], []))
 }
 
-target_ok if soft_match(gen.target_allow_scopes[input.target])
+target_ok if soft_match(object.get(gen.target_allow_scopes, input.target, []))
 
-target_denied if soft_match(gen.target_deny_scopes[input.target])
+target_denied if soft_match(object.get(gen.target_deny_scopes, input.target, []))
 
 default allow := false
 
