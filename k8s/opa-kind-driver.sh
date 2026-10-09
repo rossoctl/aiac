@@ -170,8 +170,8 @@ except Exception:
     print("no/invalid JSON from the token endpoint (is Keycloak reachable at the URL above?)")' 2>/dev/null || true)
     die "could not mint a token for user '${user}' at ${KC} — Keycloak said: ${err}
      Keycloak Prerequisites (k8s/opa-kind-runbook.md): in realm '${REALM}' the
-     'rossoctl' client needs Direct Access Grants enabled + a username->sub protocol
-     mapper, and users must exist with password == username."
+     'rossoctl' client needs Direct Access Grants enabled, and users must exist with
+     password == username."
   fi
   printf '%s' "$tok"
 }
@@ -204,7 +204,7 @@ admin_token() {
   printf '%s' "$tok"
 }
 
-# The client scope that sets sub=<username> in an exchanged token (D31).
+# The client scope that sets sub=<username> in the login and the exchanged token (D31).
 SUBJECT_SCOPE="aiac-username-sub"
 
 # scope_linked <admin> <client-uuid> <default|optional>  — read only (GET). Print
@@ -464,9 +464,10 @@ expect_eq "github-agent SPIFFE ID" "$CLIENT_ID" "$EXPECTED_SPIFFE"
 printf '\n%s%s====== Part A — Inbound authorization ======%s\n' "$C_BLD" "$C_CYN" "$C_RST"
 
 step "A.1 — dev-user token carries sub=dev-user"
-# The rossoctl client's own username->sub mapper sets the sub of this login token.
-# Exchanged tokens (B.4) get the same mapping from the client scope
-# aiac-username-sub, which AIAC links to each managed client at onboarding (D31).
+# The client scope aiac-username-sub sets the sub of this login token: the IdP
+# Configuration Service links it to the rossoctl client at startup and at each
+# onboarding (D31). Exchanged tokens (B.4) get it from the link that AIAC makes to
+# each managed client at onboarding.
 # Mint first (mint_token dies with Keycloak's real error if the grant fails),
 # then decode — so a mint failure aborts here under set -e rather than feeding
 # an empty token into token_sub.

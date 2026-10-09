@@ -94,11 +94,11 @@ read the delegation chain (see [Part B](#part-b--outbound-token-exchange--opa)).
     this automatically in preflight.)
 - The `rossoctl` Keycloak realm has `dev-user` and `alice` users with
   **password == username**, and the `rossoctl` client has Direct Access Grants
-  enabled plus a `username → sub` protocol mapper. This is a one-time Keycloak
-  change, not per-agent — but a freshly (re)provisioned realm may not have it,
-  in which case token minting fails with `unauthorized_client` (grants disabled),
-  `invalid_grant` (wrong/unset password), or a token whose `sub` is absent
-  (mapper missing). To establish it:
+  enabled (only the password grant of the probes and the test harness needs
+  it). This is a one-time Keycloak change, not per-agent — but a freshly
+  (re)provisioned realm may not have it, in which case token minting fails with
+  `unauthorized_client` (grants disabled) or `invalid_grant` (wrong/unset
+  password). To establish it:
 
   ```bash
   KC=http://keycloak.localtest.me:8080
@@ -106,20 +106,13 @@ read the delegation chain (see [Part B](#part-b--outbound-token-exchange--opa)).
     -d client_id=admin-cli -d username=admin -d password=admin -d grant_type=password \
     | python3 -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')
 
-  # 1. rossoctl client: enable Direct Access Grants + add username->sub mapper
+  # 1. rossoctl client: enable Direct Access Grants
   CID=$(curl -s -H "Authorization: Bearer $ADMIN" "$KC/admin/realms/rossoctl/clients?clientId=rossoctl" \
     | python3 -c 'import sys,json;print(json.load(sys.stdin)[0]["id"])')
   curl -s -H "Authorization: Bearer $ADMIN" "$KC/admin/realms/rossoctl/clients/$CID" \
     | python3 -c 'import sys,json;d=json.load(sys.stdin);d["directAccessGrantsEnabled"]=True;print(json.dumps(d))' \
     | curl -s -o /dev/null -w "enable DAG HTTP %{http_code}\n" -X PUT -H "Authorization: Bearer $ADMIN" \
       -H "Content-Type: application/json" "$KC/admin/realms/rossoctl/clients/$CID" --data-binary @-
-  curl -s -o /dev/null -w "add sub mapper HTTP %{http_code}\n" -X POST -H "Authorization: Bearer $ADMIN" \
-    -H "Content-Type: application/json" \
-    "$KC/admin/realms/rossoctl/clients/$CID/protocol-mappers/models" \
-    -d '{"name":"username-to-sub","protocol":"openid-connect",
-         "protocolMapper":"oidc-usermodel-property-mapper",
-         "config":{"user.attribute":"username","claim.name":"sub","jsonType.label":"String",
-                   "id.token.claim":"true","access.token.claim":"true","userinfo.token.claim":"true"}}'
 
   # 2. set each user's password == username (non-temporary)
   for u in dev-user alice; do
@@ -134,18 +127,23 @@ read the delegation chain (see [Part B](#part-b--outbound-token-exchange--opa)).
 
   Verify with A.1 below — a good token decodes to `sub = dev-user`.
 
-  This mapper sets `sub` only in the login token (a token for `rossoctl`). The
-  Keycloak standard token exchange (V2) of the tool leg applies only the scopes
-  of the agent client, so this mapper never reaches the exchanged token. For
-  that token, AIAC links the client scope `aiac-username-sub` (the same
-  `username → sub` mapping) as a default scope to each client that it onboards
+  There is no manual `sub` mapper step. The client scope `aiac-username-sub`
+  (the `username → sub` mapping) is the one source of `sub` = username
   ([D31](../docs/specs/PRD.md#key-architectural-decisions)). AIAC creates the
-  scope and the link; there is no manual step. So the tool leg (B.4, B.5) also
-  has `subject = dev-user`. Keep the `rossoctl` mapper, and do not link
-  `aiac-username-sub` to `rossoctl`: each one covers a different token. If AIAC
-  has not onboarded `github-agent`, the link is not there: the exchanged token
-  then has `sub` = the Keycloak user ID, and `github-tool`'s inbound denies the
-  B.4 probe. The driver (`k8s/opa-kind-driver.sh`) checks this default link
+  scope and links it as a default scope:
+
+  - to each platform login client (`PLATFORM_SOURCE_CLIENTS`, default
+    `rossoctl`), at the startup of the IdP Configuration Service
+    (`aiac-pdp-config`) and again at each onboarding. So the login token
+    (A.1) has `sub = dev-user`. If Keycloak was not ready when the service
+    started, the first onboarding makes the link; or restart the service.
+  - to each client that it onboards. The Keycloak standard token exchange (V2)
+    of the tool leg applies only the scopes of the agent client, so the tool
+    leg (B.4, B.5) gets `subject = dev-user` from this link.
+
+  Do not add a `sub` client mapper to `rossoctl`. If AIAC has not onboarded
+  `github-agent`, its link is not there: the exchanged token then has `sub` =
+  the Keycloak user ID, and `github-tool`'s inbound denies the B.4 probe. The driver (`k8s/opa-kind-driver.sh`) checks this default link
   before B.4, and stops at once with the cause and the fix when the link is
   missing or optional only. To check the link of `github-agent`:
 
@@ -482,7 +480,7 @@ JSON; the log prints it in Go `map[...]` form):
 
 - `identity` comes from the **validated inbound JWT** (`jwt-validation` runs
   before OPA). `subject` is the JWT `sub` claim — here `dev-user`, via the
-  `username → sub` mapper of the `rossoctl` client
+  client scope `aiac-username-sub` that AIAC links to the `rossoctl` client
   ([Prerequisites](#prerequisites)). `client_id` is the token's client (`rossoctl`
   in this probe). `scopes` are the token's granted scopes.
 - Credential headers (`authorization`, `cookie`, …) are **redacted** from

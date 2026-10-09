@@ -655,7 +655,7 @@ delete_service_cr("spiffe://localtest.me/ns/team1/sa/github-tool")   # the quara
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `PLATFORM_SOURCE_CLIENTS` | No | `rossoctl` | Comma-separated platform bypass clients, sourced from the `aiac-pdp-config` ConfigMap. Drives the agent inbound package's `source_allow_ok if { input.identity.client_id == "<c>" }` bypass rules (Q5). The tool inbound package has no bypass (D26). Blanks are dropped; an unset or all-blank value falls back to `rossoctl` (dropping the bypass would deny end-user traffic, which carries the platform client). |
+| `PLATFORM_SOURCE_CLIENTS` | No | `rossoctl` | Comma-separated platform bypass clients, sourced from the `aiac-pdp-config` ConfigMap. Drives the agent inbound package's `source_allow_ok if { input.identity.client_id == "<c>" }` bypass rules (Q5). The tool inbound package has no bypass (D26). Blanks are dropped; an unset or all-blank value falls back to `rossoctl` (dropping the bypass would deny end-user traffic, which carries the platform client). The IdP Configuration Service reads the same setting, with the same meaning: it links the subject scope `aiac-username-sub` to these login clients (D31). |
 | `POLICY_WRITER_DUMP_REGO` | No | off | When truthy (`1`/`true`/`yes`/`on`) enables the **additive** local rego dump (see below). Never gates the CR write. |
 | `REGO_OUTPUT_DIR` | No | `/rego` | Destination for the additive dump — only consulted when `POLICY_WRITER_DUMP_REGO` is on. |
 

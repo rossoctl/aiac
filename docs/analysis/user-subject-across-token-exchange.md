@@ -1,6 +1,7 @@
 # User Subject Across Token Exchange: Options
 
-> **Status:** decided: B-AIAC (D31), 2026-10-06. See
+> **Status:** decided: B-AIAC (D31), 2026-10-06; changed on 2026-10-09 (the scope is the one
+> source, also for the login clients; see the status note in §8.1). See
 > [PRD D31](../specs/PRD.md#key-architectural-decisions) and the implementation note in §8.1. **Date:**
 > 2026-10-06. **Branch:** `target-side-ac`.
 >
@@ -449,7 +450,9 @@ stable as a user ID. The criteria that are left:
    which has the same mapping. That mapper runs only for tokens issued for `rossoctl` (the login
    token), and the scope covers the tokens issued for the AIAC-managed agents (the exchanged
    tokens). So the rossoctl guide, its examples, the runbook prerequisite and the other users of
-   `rossoctl` keep working, and AIAC never modifies a shared client.
+   `rossoctl` keep working, and AIAC never modifies a shared client. *Changed on 2026-10-09: AIAC
+   now links the scope to `rossoctl` too, and the manual mapper step is gone; see the status note
+   below.*
 2. At onboarding, AIAC links `aiac-username-sub` as a default scope to the onboarded service's
    client. Do it in the provisioning step that tags the client with `client.type`
    (`provision/nodes.py:470`), so it happens before `compute_and_apply` writes the CR. The scope
@@ -472,7 +475,8 @@ stable as a user ID. The criteria that are left:
 >    `username-to-sub` mapper with no `aiac.managed` marker, so a deleted scope comes back at the next
 >    onboarding. It runs at each onboarding, not in the Controller start sequence (PRD §7.7 does not
 >    change). `rossoctl` does not change: it keeps its own mapper, and AIAC never links the scope to
->    it.
+>    it. *Changed on 2026-10-09: AIAC now links the scope to `rossoctl`; see the status note below
+>    the risks.*
 > 2. The link: Provision calls `link_subject_scope` before `set_service_type`, for agents and tools,
 >    so before `compute_and_apply` writes the CR. It uses the new endpoint, not
 >    `POST /services/{id}/scopes/{scope_id}`: the new endpoint also moves an optional link to a
@@ -529,6 +533,27 @@ Risks that are left with B-AIAC:
   token (`verify_subject_mapper`) and the scope link (step 4).
 - The `rossoctl` mapper stays a manual prerequisite (the runbook), as today. Any other login
   client that calls AIAC agents directly needs the same mapper.
+
+> **Status (2026-10-09): the decision changed.** The client scope `aiac-username-sub` is now the
+> one source of `sub` = the username, also for the login token. The two risks above about the two
+> sources and the manual `rossoctl` mapper are closed. The changes:
+>
+> - AIAC links `aiac-username-sub` as a default scope to the platform login clients
+>   (`PLATFORM_SOURCE_CLIENTS`, default `rossoctl`; the same setting as the platform bypass
+>   clients of the PDP Policy Writer, from the ConfigMap `aiac-pdp-config`). The IdP Configuration
+>   Service makes this link at its startup (when `KEYCLOAK_REALM` is set; a failure does not stop
+>   the service) and again at each `POST /services/{service_id}/subject-scope`. A login client that
+>   is not in the realm is not an error.
+> - The manual `username-to-sub` client mapper step on `rossoctl` is removed from the runbook. AIAC
+>   adds no client mapper to a login client. The scope is still not a realm default, still has no
+>   `aiac.managed` marker, and is still not in the created-manifest.
+> - Fresh installs only: AIAC does not remove an old manual mapper on `rossoctl`.
+> - The harness: `verify_subject_mapper` is now `verify_login_subject`. It skips when it cannot
+>   mint the login token (Direct Access Grants), and fails when `sub` is not the username, because
+>   the link is an AIAC step. `require_subject_scope` and the rung-2 test `test_subject_scope_linked`
+>   now require the default link on `rossoctl`, and no `rossoctl` client mapper that writes `sub`.
+> - Open: AIAC now writes to a client that the rossoctl chart owns, so the rossoctl team must agree.
+>   Option C (§4, AuthBridge `subject_claim`) is still the end state, and it removes the scope too.
 
 **Both enforcement sides (§1.7).** B-AIAC fixes both sides with one setup. Each exchanged token for
 a managed agent then has `sub` = username, so the inbound of a second agent sees the username, and
@@ -634,7 +659,7 @@ Side findings, not part of the decision:
 | User-role `actorIds` | `src/aiac/idp/service/configuration/keycloak/main.py` (`list_roles`) |
 | Inbound projection | `src/aiac/policy/model/projection.py` |
 | Subject gates | `src/aiac/pdp/service/policy/opa/rego.py` |
-| Harness subject check | `verify_subject_mapper` in `test/system/launcher.py` (called by `onboarded_stack` in `test/system/uc1_onboard.py`); the scope link (D31): `require_subject_scope` in `test/system/uc1_onboard.py` |
+| Harness subject check | `verify_login_subject` in `test/system/launcher.py` (called by `onboarded_stack` in `test/system/uc1_onboard.py`); the scope link (D31): `require_subject_scope` in `test/system/uc1_onboard.py` |
 | Decision D31 (B-AIAC) | `docs/specs/PRD.md` §5 *Key architectural decisions*; `docs/handoffs/18-option-b-aiac-username-sub.md` (gitignored; local only) |
 | Captured CRs of the failing runs | `test/system/artifacts/cr-captures/` (gitignored; local only) |
 | AuthBridge identity, OPA input, token exchange | `cortex/core/plugins/{jwtvalidation,opa,tokenexchange}/` (see §1.4) |

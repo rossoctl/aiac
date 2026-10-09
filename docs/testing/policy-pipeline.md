@@ -90,12 +90,15 @@ over the fully onboarded stack.
    SQLite outlives redeploys). Then `reenable_provisioned_clients`, and poll until both clients are gone
    (a leftover client would stop the deploy from firing `CLIENT_CREATED` again). Then `provision_realm_and_users` idempotently ensures the scenario's three users +
    realm roles (`developer` / `tester` / `devops`) with the descriptions the PRB reads (the fixture
-   provisions these; UC-1 does not), `verify_subject_mapper` confirms that the `username → sub` mapper of the login client `rossoctl`
-   and Direct Access Grants are in place (else skip), and `ensure_agent_policy` mounts the single
-   abstract `policy.md` on the Controller pod. `verify_subject_mapper` stays the check of the login
-   token (through the `rossoctl` client). The exchanged token gets the same mapping from the client
-   scope `aiac-username-sub`, which AIAC links to each onboarded client (D31). The shared UC-1 harness
-   checks that link (step 3).
+   provisions these; UC-1 does not), `verify_login_subject` mints a login token through the login client `rossoctl`
+   and checks that its `sub` is the username, and `ensure_agent_policy` mounts the single
+   abstract `policy.md` on the Controller pod. `verify_login_subject` skips when it cannot mint the
+   token (Direct Access Grants is not on), and fails when `sub` is not the username. The `sub` comes
+   from the client scope `aiac-username-sub`, which the IdP Configuration Service links to
+   `rossoctl` at its startup and at each onboarding. That link is an AIAC step, not a prerequisite,
+   so a wrong `sub` is a failure. The exchanged token gets the same mapping from the same scope,
+   which AIAC links to each onboarded client (D31). There is no `sub` client mapper on `rossoctl`.
+   The shared UC-1 harness checks these links (step 3).
 3. **Onboard both workloads through the real in-cluster UC-1 Controller.** `load_workload_images`
    loads the demo images into the Kind node, then `deploy_workload` deploys the `github-agent` and then
    the `github-tool`, one at a time, each converging before the next. Deploying is the event-driven
@@ -116,7 +119,7 @@ over the fully onboarded stack.
    harness fixture (`onboarded_stack`) calls `require_subject_scope`: it checks with the admin API
    that the workload's client has `aiac-username-sub` as a default scope, that the scope has a mapper
    with the `username → sub` mapping (the `username-to-sub` mapper; the check reads its type and
-   mapping, not its name) and no `aiac.managed` marker, and that `rossoctl` does not link it (D31). AIAC makes this link at onboarding,
+   mapping, not its name) and no `aiac.managed` marker, and that the login client `rossoctl` also has it as a default scope (D31). AIAC makes these links at onboarding,
    so a missing link **fails** the run; it does not skip. The UC-1 ladder also decodes an exchanged
    token and checks `sub` = the username (rung 2, see
    [uc1-onboarding-pipeline.md](uc1-onboarding-pipeline.md#per-rung-flow)).

@@ -1,9 +1,9 @@
 """The subject-scope check of the UC-1 system-test harness (D31) — pure unit tests.
 
 Every token that reaches an AIAC-managed agent or tool must have ``sub`` = the username (D31). The
-login token gets it from the login client's own ``username-to-sub`` mapper; the token that an agent
-exchanges gets it from the client scope ``aiac-username-sub``, which AIAC links as a default scope to
-each client it onboards. The harness checks that link (``uc1_onboard.require_subject_scope``) right
+one source is the client scope ``aiac-username-sub``: AIAC links it as a default scope to the login
+client ``rossoctl`` (so the login token has it) and to each client it onboards (so the token that an
+agent exchanges has it). The harness checks these links (``uc1_onboard.require_subject_scope``) right
 after each workload converges, and rung 2 decodes a real exchanged token
 (``uc1_onboard.exchanged_subject`` over ``launcher.exchange_token``).
 
@@ -78,21 +78,27 @@ def _mapper(**config: str) -> dict:
     return {**SUBJECT_MAPPER, "config": {**SUBJECT_MAPPER["config"], **config}}
 
 
+_DEFAULT = object()  # "use the correct state" for a ``_problems`` part that can also be ``None``
+
+
 def _problems(
     *,
     scope: dict | None = None,
     mappers: list[dict] | None = None,
     defaults: dict[str, set[str] | None] | None = None,
-    login: set[str] | None = None,
+    login: set[str] | None | object = _DEFAULT,
     optional: dict[str, set[str]] | None = None,
+    login_optional: set[str] | None = None,
 ) -> list[str]:
-    """``subject_scope_problems`` over the correct state, with the given parts changed."""
+    """``subject_scope_problems`` over the correct state, with the given parts changed. ``login=None``
+    is a missing login client."""
     return uc1.subject_scope_problems(
         _scope() if scope is None else scope,
         [SUBJECT_MAPPER] if mappers is None else mappers,
         {AGENT_NAME: {SCOPE_ID, PROFILE_ID}, TOOL_NAME: {SCOPE_ID}} if defaults is None else defaults,
-        {PROFILE_ID} if login is None else login,
+        {PROFILE_ID, SCOPE_ID} if login is _DEFAULT else login,
         client_optional_scope_ids=optional,
+        login_optional_scope_ids=login_optional,
     )
 
 
@@ -201,12 +207,29 @@ def test_unregistered_client_is_a_problem_that_names_the_client() -> None:
 
 
 @pytest.mark.parametrize("login", [{SCOPE_ID}, {PROFILE_ID, SCOPE_ID}], ids=["only", "with-others"])
-def test_login_client_linking_the_scope_is_a_problem(login: set[str]) -> None:
-    """``rossoctl`` keeps its own ``username-to-sub`` mapper; the scope too would be two mappers that
-    write the same claim."""
-    problems = _problems(login=login)
+def test_login_client_linking_the_scope_as_default_is_correct(login: set[str]) -> None:
+    """The scope is the one source of the login token's ``sub`` too: ``rossoctl`` must link it."""
+    assert _problems(login=login) == []
+
+
+def test_login_client_without_the_link_is_a_problem() -> None:
+    problems = _problems(login={PROFILE_ID})
     assert len(problems) == 1
     assert uc1.KEYCLOAK_CLIENT_ID in problems[0] and uc1.SUBJECT_SCOPE in problems[0]
+    assert "default scope" in problems[0] and "does not link it" in problems[0]
+
+
+def test_login_client_with_only_an_optional_link_is_a_problem() -> None:
+    """An optional link leaves the login token's ``sub`` = the user ID."""
+    problems = _problems(login={PROFILE_ID}, login_optional={SCOPE_ID})
+    assert len(problems) == 1
+    assert uc1.KEYCLOAK_CLIENT_ID in problems[0] and "optional" in problems[0]
+
+
+def test_missing_login_client_is_a_problem() -> None:
+    problems = _problems(login=None)
+    assert len(problems) == 1
+    assert uc1.KEYCLOAK_CLIENT_ID in problems[0] and "does not exist" in problems[0]
 
 
 def test_every_problem_is_listed() -> None:
@@ -214,13 +237,14 @@ def test_every_problem_is_listed() -> None:
         scope=_scope(**{"aiac.managed": "true"}),
         mappers=[],
         defaults={AGENT_NAME: set(), TOOL_NAME: None},
-        login={SCOPE_ID},
+        login={PROFILE_ID},
     )
     assert len(problems) == 5
 
 
 def test_login_subject_mapper_needs_only_the_mapping() -> None:
-    """The login client's manual mapper (runbook Prerequisites) is checked only for its mapping."""
+    """A client mapper on the login client that writes ``sub`` (the old manual runbook step, now
+    replaced by the scope link) is found by its mapping only."""
     runbook = {
         "name": "username-to-sub",
         "protocolMapper": "oidc-usermodel-property-mapper",
@@ -264,7 +288,7 @@ def _admin(
         [{"id": PROFILE_ID, "name": "profile"}, _scope()] if scopes is None else scopes
     )
     admin.get_mappers_from_client_scope.return_value = [SUBJECT_MAPPER]
-    default_map = {AGENT_UUID: [SCOPE_ID, PROFILE_ID], TOOL_UUID: [SCOPE_ID], LOGIN_UUID: [PROFILE_ID]}
+    default_map = {AGENT_UUID: [SCOPE_ID, PROFILE_ID], TOOL_UUID: [SCOPE_ID], LOGIN_UUID: [PROFILE_ID, SCOPE_ID]}
     default_map.update(defaults or {})
     optional_map = {AGENT_UUID: [], TOOL_UUID: [], LOGIN_UUID: []}
     optional_map.update(optionals or {})
@@ -293,18 +317,22 @@ def test_live_reader_sees_an_optional_only_link() -> None:
     assert len(problems) == 1 and TOOL_NAME in problems[0] and "optional" in problems[0]
 
 
-def test_live_reader_sees_the_login_client_link() -> None:
-    admin = _admin(optionals={LOGIN_UUID: [SCOPE_ID]})
+def test_live_reader_sees_a_missing_login_link() -> None:
+    admin = _admin(defaults={LOGIN_UUID: [PROFILE_ID]})
     problems = uc1.subject_scope_link_problems(admin, scn.AGENT_WORKLOAD)
-    assert len(problems) == 1 and uc1.KEYCLOAK_CLIENT_ID in problems[0]
+    assert len(problems) == 1 and uc1.KEYCLOAK_CLIENT_ID in problems[0] and "does not link it" in problems[0]
 
 
-def test_live_reader_sees_a_login_client_default_link() -> None:
-    """A default link on ``rossoctl`` is the likeliest form of the forbidden link (two mappers that
-    write ``sub``): the reader reads the login client's default scopes too, not only its optional ones."""
-    admin = _admin(defaults={LOGIN_UUID: [PROFILE_ID, SCOPE_ID]})
+def test_live_reader_sees_an_optional_only_login_link() -> None:
+    admin = _admin(defaults={LOGIN_UUID: [PROFILE_ID]}, optionals={LOGIN_UUID: [SCOPE_ID]})
     problems = uc1.subject_scope_link_problems(admin, scn.AGENT_WORKLOAD)
-    assert len(problems) == 1 and uc1.KEYCLOAK_CLIENT_ID in problems[0]
+    assert len(problems) == 1 and uc1.KEYCLOAK_CLIENT_ID in problems[0] and "optional" in problems[0]
+
+
+def test_live_reader_sees_a_missing_login_client() -> None:
+    admin = _admin(clients=[c for c in _admin().get_clients.return_value if c["id"] != LOGIN_UUID])
+    problems = uc1.subject_scope_link_problems(admin, scn.AGENT_WORKLOAD)
+    assert len(problems) == 1 and uc1.KEYCLOAK_CLIENT_ID in problems[0] and "does not exist" in problems[0]
 
 
 def test_live_reader_sees_a_missing_scope() -> None:
@@ -330,6 +358,14 @@ def test_require_subject_scope_raises_naming_the_workload_and_the_fix() -> None:
     assert TOOL_NAME in message and uc1.SUBJECT_SCOPE in message
     assert "D31" in message and "aiac-agent" in message and "link_subject_scope" in message
     assert "/subject-scope" in message
+
+
+def test_require_subject_scope_names_aiac_pdp_config_for_a_login_link() -> None:
+    """The IdP Configuration Service (aiac-pdp-config) makes the login-client link."""
+    admin = _admin(defaults={LOGIN_UUID: [PROFILE_ID]})
+    with pytest.raises(RuntimeError) as info:
+        uc1.require_subject_scope(admin, scn.AGENT_WORKLOAD)
+    assert uc1.KEYCLOAK_CLIENT_ID in str(info.value) and "aiac-pdp-config" in str(info.value)
 
 
 def test_require_subject_scope_raises_for_an_unregistered_client() -> None:
