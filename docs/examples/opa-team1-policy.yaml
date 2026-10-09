@@ -101,25 +101,25 @@ spec:
         source_role_deny_scopes := {}
 
         subject_allow_ok if {
-            some role in subject_roles[input.identity.subject]
-            some scope in subject_role_allow_scopes[role]
+            some role in object.get(subject_roles, input.identity.subject, [])
+            some scope in object.get(subject_role_allow_scopes, role, [])
             scope in agent_scopes
         }
         subject_deny_ok if {
-            some role in subject_roles[input.identity.subject]
-            some scope in subject_role_deny_scopes[role]
+            some role in object.get(subject_roles, input.identity.subject, [])
+            some scope in object.get(subject_role_deny_scopes, role, [])
             scope in agent_scopes
         }
         source_allow_ok if { not input.identity.client_id }
         source_allow_ok if { input.identity.client_id == "rossoctl" }
         source_allow_ok if {
-            some role in source_roles[input.identity.client_id]
-            some scope in source_role_allow_scopes[role]
+            some role in object.get(source_roles, input.identity.client_id, [])
+            some scope in object.get(source_role_allow_scopes, role, [])
             scope in agent_scopes
         }
         source_deny_ok if {
-            some role in source_roles[input.identity.client_id]
-            some scope in source_role_deny_scopes[role]
+            some role in object.get(source_roles, input.identity.client_id, [])
+            some scope in object.get(source_role_deny_scopes, role, [])
             scope in agent_scopes
         }
         default allow := false
@@ -168,20 +168,20 @@ spec:
         self_client_id := "spiffe://localtest.me/ns/team1/sa/github-tool"
 
         subject_allows(tool) if {
-            some role in subject_roles[input.identity.subject]
-            tool in subject_role_allow_scopes[role]
+            some role in object.get(subject_roles, input.identity.subject, [])
+            tool in object.get(subject_role_allow_scopes, role, [])
         }
         subject_denies(tool) if {
-            some role in subject_roles[input.identity.subject]
-            tool in subject_role_deny_scopes[role]
+            some role in object.get(subject_roles, input.identity.subject, [])
+            tool in object.get(subject_role_deny_scopes, role, [])
         }
         source_allows(tool) if {
-            some role in source_roles[input.identity.client_id]
-            tool in source_role_allow_scopes[role]
+            some role in object.get(source_roles, input.identity.client_id, [])
+            tool in object.get(source_role_allow_scopes, role, [])
         }
         source_denies(tool) if {
-            some role in source_roles[input.identity.client_id]
-            tool in source_role_deny_scopes[role]
+            some role in object.get(source_roles, input.identity.client_id, [])
+            tool in object.get(source_role_deny_scopes, role, [])
         }
         tool_ok(tool) if {
             subject_allows(tool)

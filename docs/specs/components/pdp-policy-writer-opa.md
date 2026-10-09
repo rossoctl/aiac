@@ -242,6 +242,10 @@ Each rules-based package ends with `default allow := false` and one or more `all
 
 **The generator assumes disjoint allow/deny per `(role, scope)` and never reconciles an overlap.** A genuine grant/deny overlap on the same pair is a real policy conflict surfaced **upstream** as HTTP 422 (the PRB raises `PolicyContradictionError`); the PCE assumes a conflict-free model. The generator therefore adds **no** logic that silently reconciles an allow-vs-deny overlap — doing so would mask a conflict that is *supposed* to surface as a 422. The inline `not …_deny_ok` guards are **not** conflict reconciliation: they let a deny on **one** of a subject's several roles — or on **one** of the two gates of a per-tool check — beat an allow arriving from a *different* role / the *other* gate. Each individual `(role, scope)` stays allow-XOR-deny; the denies merely co-occur within a single request.
 
+### Every map is read with `object.get`
+
+A map with no entries renders as `{}`, for example `source_roles := {}` when no agent calls the service. The rules read each map with `object.get(map, key, [])`, or `object.get(map, [key1, key2], [])` for a two-level map. They never index the map directly (`map[key]`). OPA 1.21 types `{}` as an object with no keys, so a direct index into it is a type error (`rego_type_error: undefined ref`). That error stops the whole bundle from activating, and the sidecar then denies every request. The AuthBridge image from the current cortex uses OPA 1.21.1. OPA 1.18 accepted the direct index. A missing key gives the default `[]`, which matches nothing: the result is the same as an undefined index. The unit tests check that no rendered package indexes a map that it declares, and that `opa check` accepts the zero-rule packages (`test_rego.py`, with OPA 1.21 or later on the `PATH`).
+
 ### Tool inbound package (target side): `authbridge.client.inbound.request`
 
 Evaluated by the AuthBridge OPA plugin in the **inbound pipeline of a tool**, under target side — "who may call which tool of this service" (D26). The render input is the tool's stored SPM, through the shared projection (D18b). The package has two gates. Each gate is a pair of Rego functions over a bare tool name:
@@ -305,21 +309,21 @@ session_methods := {"initialize", "notifications/initialized", "ping", "tools/li
 
 # user gate: the delegated user holds a role granted the tool
 subject_allows(tool) if {
-    some role in subject_roles[input.identity.subject]
-    tool in subject_role_allow_scopes[role]
+    some role in object.get(subject_roles, input.identity.subject, [])
+    tool in object.get(subject_role_allow_scopes, role, [])
 }
 subject_denies(tool) if {
-    some role in subject_roles[input.identity.subject]
-    tool in subject_role_deny_scopes[role]
+    some role in object.get(subject_roles, input.identity.subject, [])
+    tool in object.get(subject_role_deny_scopes, role, [])
 }
 # calling-agent gate: the calling agent holds a role granted the tool
 source_allows(tool) if {
-    some role in source_roles[input.identity.client_id]
-    tool in source_role_allow_scopes[role]
+    some role in object.get(source_roles, input.identity.client_id, [])
+    tool in object.get(source_role_allow_scopes, role, [])
 }
 source_denies(tool) if {
-    some role in source_roles[input.identity.client_id]
-    tool in source_role_deny_scopes[role]
+    some role in object.get(source_roles, input.identity.client_id, [])
+    tool in object.get(source_role_deny_scopes, role, [])
 }
 # the full per-tool check (both gates allow, no deny)
 tool_ok(tool) if {
@@ -367,26 +371,26 @@ source_role_allow_scopes := {}
 source_role_deny_scopes := {}
 
 subject_allow_ok if {
-    some role in subject_roles[input.identity.subject]
-    some scope in subject_role_allow_scopes[role]
+    some role in object.get(subject_roles, input.identity.subject, [])
+    some scope in object.get(subject_role_allow_scopes, role, [])
     scope in agent_scopes
 }
 subject_deny_ok if {
-    some role in subject_roles[input.identity.subject]
-    some scope in subject_role_deny_scopes[role]
+    some role in object.get(subject_roles, input.identity.subject, [])
+    some scope in object.get(subject_role_deny_scopes, role, [])
     scope in agent_scopes
 }
 
 source_allow_ok if { not input.identity.client_id }
 source_allow_ok if { input.identity.client_id == "rossoctl" }
 source_allow_ok if {
-    some role in source_roles[input.identity.client_id]
-    some scope in source_role_allow_scopes[role]
+    some role in object.get(source_roles, input.identity.client_id, [])
+    some scope in object.get(source_role_allow_scopes, role, [])
     scope in agent_scopes
 }
 source_deny_ok if {
-    some role in source_roles[input.identity.client_id]
-    some scope in source_role_deny_scopes[role]
+    some role in object.get(source_roles, input.identity.client_id, [])
+    some scope in object.get(source_role_deny_scopes, role, [])
     scope in agent_scopes
 }
 
@@ -475,22 +479,22 @@ session_methods := {"initialize", "notifications/initialized", "ping", "tools/li
 
 # user may reach the tool on this target: holds a role granted the tool there
 subject_allows(tool) if {
-    some role in subject_roles[input.identity.subject]
-    tool in subject_role_allow_scopes[role][input.identity.service_id]
+    some role in object.get(subject_roles, input.identity.subject, [])
+    tool in object.get(subject_role_allow_scopes, [role, input.identity.service_id], [])
 }
 subject_allow_ok if { subject_allows(input.mcp.params.name) }
 subject_denies(tool) if {
-    some role in subject_roles[input.identity.subject]
-    tool in subject_role_deny_scopes[role][input.identity.service_id]
+    some role in object.get(subject_roles, input.identity.subject, [])
+    tool in object.get(subject_role_deny_scopes, [role, input.identity.service_id], [])
 }
 subject_deny_ok if { subject_denies(input.mcp.params.name) }
 # agent may reach the tool: the tool is one the target accepts (direct, per-scope)
 target_allows(tool) if {
-    tool in target_allow_scopes[input.identity.service_id]
+    tool in object.get(target_allow_scopes, input.identity.service_id, [])
 }
 target_allow_ok if { target_allows(input.mcp.params.name) }
 target_denies(tool) if {
-    tool in target_deny_scopes[input.identity.service_id]
+    tool in object.get(target_deny_scopes, input.identity.service_id, [])
 }
 target_deny_ok if { target_denies(input.mcp.params.name) }
 # the full per-tool check (both allow gates, no deny)
@@ -504,7 +508,7 @@ default allow := false
 # tools/call: checked per invoked tool
 allow if { input.mcp.method == "tools/call"; subject_allow_ok; target_allow_ok; not subject_deny_ok; not target_deny_ok }
 # session messages: allowed iff at least one tool of the target passes tool_ok
-allow if { input.mcp.method in session_methods; some tool in target_allow_scopes[input.identity.service_id]; tool_ok(tool) }
+allow if { input.mcp.method in session_methods; some tool in object.get(target_allow_scopes, input.identity.service_id, []); tool_ok(tool) }
 ```
 
 **Known limit (agent side) — A2A and LLM calls through the outbound proxy are denied.** The agent outbound package allows only a granted `tools/call` and the MCP session messages. Every other request falls to `default allow := false`. An A2A call (`input.a2a`, for example `message/send`) and an LLM call (an OpenAI-shaped chat request) carry no MCP method, so the agent's outbound OPA denies them with HTTP `403` (`policy.forbidden`, `plugin: opa`). This applies to every call that crosses the agent's outbound proxy. The demo `github-agent` sends its LLM traffic through it (`HTTP_PROXY=http://127.0.0.1:8081`, plain-HTTP `LLM_API_BASE`). Checked on the Kind cluster (handoff 11, 2026-10-01): an A2A `message/send` and an LLM `/v1/chat/completions` request from the agent container both got `403` from OPA. Under agent side, until the agent outbound package has rules for A2A and inference traffic, wire the outbound OPA only where the agent's LLM endpoint does not cross the proxy (for example HTTPS passthrough, or `NO_PROXY`). Target side does not have this limit: the agent's outbound is a pass-through (but it has no egress check; see [Known limits](#known-limits)).

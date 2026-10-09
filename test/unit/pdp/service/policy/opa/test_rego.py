@@ -26,6 +26,7 @@ back from the Rego under test.
 """
 
 import json
+import re
 import shutil
 import subprocess
 import tempfile
@@ -247,9 +248,9 @@ def test_inbound_split_scope_maps_from_split_rule_lists():
 
 def test_inbound_subject_gates_use_identity_fields():
     rego = generate_inbound_rego(_github_agent())
-    assert "some role in subject_roles[input.identity.subject]" in rego
-    assert "some scope in subject_role_allow_scopes[role]" in rego
-    assert "some scope in subject_role_deny_scopes[role]" in rego
+    assert "some role in object.get(subject_roles, input.identity.subject, [])" in rego
+    assert "some scope in object.get(subject_role_allow_scopes, role, [])" in rego
+    assert "some scope in object.get(subject_role_deny_scopes, role, [])" in rego
     assert "scope in agent_scopes" in rego
 
 
@@ -257,8 +258,8 @@ def test_inbound_platform_bypass_default_rossoctl():
     rego = generate_inbound_rego(_github_agent())
     assert "source_allow_ok if { not input.identity.client_id }" in rego
     assert 'source_allow_ok if { input.identity.client_id == "rossoctl" }' in rego
-    assert "some role in source_roles[input.identity.client_id]" in rego
-    assert "some scope in source_role_allow_scopes[role]" in rego
+    assert "some role in object.get(source_roles, input.identity.client_id, [])" in rego
+    assert "some scope in object.get(source_role_allow_scopes, role, [])" in rego
 
 
 def test_inbound_platform_bypass_multiple_clients():
@@ -270,7 +271,7 @@ def test_inbound_platform_bypass_multiple_clients():
 def test_inbound_source_deny_gate_present():
     rego = generate_inbound_rego(_github_agent())
     assert "source_deny_ok if {" in rego
-    assert "some scope in source_role_deny_scopes[role]" in rego
+    assert "some scope in object.get(source_role_deny_scopes, role, [])" in rego
 
 
 def test_inbound_has_default_deny_and_deny_overrides_allow():
@@ -367,15 +368,15 @@ def test_outbound_no_prefixed_scope_leaks():
 
 def test_outbound_gates_use_nested_identity_and_mcp_input():
     rego = generate_outbound_rego(_github_agent())
-    assert "some role in subject_roles[input.identity.subject]" in rego
-    assert "tool in subject_role_allow_scopes[role][input.identity.service_id]\n" in rego
-    assert "tool in subject_role_deny_scopes[role][input.identity.service_id]\n" in rego
+    assert "some role in object.get(subject_roles, input.identity.subject, [])" in rego
+    assert "tool in object.get(subject_role_allow_scopes, [role, input.identity.service_id], [])\n" in rego
+    assert "tool in object.get(subject_role_deny_scopes, [role, input.identity.service_id], [])\n" in rego
     assert "subject_allow_ok if { subject_allows(input.mcp.params.name) }" in rego
     assert "subject_deny_ok if { subject_denies(input.mcp.params.name) }" in rego
     assert "target_allow_ok if { target_allows(input.mcp.params.name) }" in rego
-    assert "tool in target_allow_scopes[input.identity.service_id]" in rego
+    assert "tool in object.get(target_allow_scopes, input.identity.service_id, [])" in rego
     assert "target_deny_ok if { target_denies(input.mcp.params.name) }" in rego
-    assert "tool in target_deny_scopes[input.identity.service_id]" in rego
+    assert "tool in object.get(target_deny_scopes, input.identity.service_id, [])" in rego
     assert "default allow := false" in rego
     assert (
         'allow if { input.mcp.method == "tools/call"; subject_allow_ok; target_allow_ok; not subject_deny_ok; not target_deny_ok }'
@@ -1005,8 +1006,8 @@ def test_outbound_subject_maps_are_keyed_by_role_then_target():
     rego = generate_outbound_rego(_two_tools_model(deny_on_tool_a=True))
     assert f'subject_role_allow_scopes := {{\n    "dev": {{\n        "{TOOL_B}": ["source-read"],\n    }},\n}}' in rego
     assert f'subject_role_deny_scopes := {{\n    "dev": {{\n        "{TOOL_A}": ["source-read"],\n    }},\n}}' in rego
-    assert "tool in subject_role_allow_scopes[role][input.identity.service_id]" in rego
-    assert "tool in subject_role_deny_scopes[role][input.identity.service_id]" in rego
+    assert "tool in object.get(subject_role_allow_scopes, [role, input.identity.service_id], [])" in rego
+    assert "tool in object.get(subject_role_deny_scopes, [role, input.identity.service_id], [])" in rego
 
 
 _COPIES = (GH_TOOL, GH_TOOL_TEAM2)
@@ -1629,7 +1630,7 @@ def test_agent_side_agent_cr_has_the_agent_inbound_and_the_agent_outbound():
     assert policies.outbound == generate_outbound_rego(apm)
     assert (
         "allow if { input.mcp.method in session_methods; "
-        "some tool in target_allow_scopes[input.identity.service_id]; tool_ok(tool) }"
+        "some tool in object.get(target_allow_scopes, input.identity.service_id, []); tool_ok(tool) }"
     ) in policies.outbound
     assert policies.outbound != _PASS_THROUGH_OUTBOUND
 
@@ -1646,3 +1647,60 @@ def test_agent_side_agent_cr_has_the_agent_inbound_and_the_agent_outbound():
 def test_agent_side_agent_outbound_denies_a2a_and_llm_calls(input_doc):
     # The known limit of the agent side (b435aa1): only a granted tools/call and the MCP session pass.
     _assert_opa_allow(render_agent_side(_github_agent()).outbound, _OUTBOUND, input_doc, False)
+
+
+# =========================================================================== #
+# Empty maps: every map is read with object.get (OPA 1.21)                    #
+# =========================================================================== #
+#
+# An empty map renders as ``{}``. OPA 1.21 types ``{}`` as an object with no keys, so a direct
+# index ``m[key]`` into it is a type error that stops the whole bundle from activating (the
+# sidecar then denies every request). The writer reads every map with ``object.get``.
+
+
+def _empty_map_policies() -> dict[str, ClientPolicies]:
+    """The CRs whose maps are all empty: a zero-rule agent and tool under each side."""
+    agent_spm = ServicePolicyModel(
+        service_id=GH_AGENT,
+        service_type=ServiceType.AGENT,
+        owned_roles=[],
+        owned_scopes=[_scope("github-agent.source_operations", GH_AGENT)],
+    )
+    tool_spm = ServicePolicyModel(
+        service_id=GH_TOOL,
+        service_type=ServiceType.TOOL,
+        owned_roles=[],
+        owned_scopes=[_scope("github-tool.source-read", GH_TOOL)],
+    )
+    return {
+        "target-side-agent": render_target_side(agent_spm),
+        "target-side-tool": render_target_side(tool_spm),
+        "agent-side-agent": render_agent_side(_model(agent_id=GH_AGENT)),
+    }
+
+
+def _declared_maps(rego: str) -> list[str]:
+    return re.findall(r"^(\w+) := \{", rego, flags=re.MULTILINE)
+
+
+@pytest.mark.parametrize(
+    "policies",
+    [*_empty_map_policies().values(), render_agent_side(_github_agent())],
+    ids=[*_empty_map_policies(), "agent-side-github-agent"],
+)
+def test_no_rule_indexes_a_declared_map(policies):
+    # A direct index works only while the map has a key; object.get works on an empty map too.
+    for rego in policies:
+        for name in _declared_maps(rego):
+            assert not re.search(rf"\b{name}\[", rego), f"{name} is indexed directly:\n{rego}"
+
+
+@pytest.mark.skipif(not shutil.which("opa"), reason="opa binary not on PATH")
+@pytest.mark.parametrize("name", list(_empty_map_policies()))
+def test_empty_map_packages_pass_opa_check(name):
+    # With OPA 1.21 or later on the PATH, a direct index into {} fails here (rego_type_error).
+    with tempfile.TemporaryDirectory() as tmp:
+        for i, rego in enumerate(_empty_map_policies()[name]):
+            (Path(tmp) / f"p{i}.rego").write_text(rego)
+        result = subprocess.run([shutil.which("opa"), "check", tmp], capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
