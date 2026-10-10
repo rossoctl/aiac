@@ -315,6 +315,8 @@ def _seed_from_catalog(model: ServicePolicyModel, catalog: dict[str, Service]) -
 def _read_idp(focus_service: str | None = None) -> tuple[dict[str, Service], RoleHolders]:
     """Read the IdP one time for an operation (D32): the ``get_services()`` catalog, keyed by
     clientId, and the current holders of every role, from that catalog and one ``get_roles()`` call.
+    The catalog is built from the same ``get_roles()`` result, so ``GET /roles`` is sent one time
+    and the agent holders and the user holders come from one snapshot.
     The focus service counts as live, and so does each service that waits for its re-enable
     (``holders.live``). The PCE never reads ``get_subjects()``.
 
@@ -324,8 +326,9 @@ def _read_idp(focus_service: str | None = None) -> tuple[dict[str, Service], Rol
     with _awaiting_lock:
         awaiting = frozenset(_awaiting_reenable)
     config = Configuration.for_default_realm()
-    catalog = {svc.serviceId: svc for svc in config.get_services()}
-    holders = RoleHolders(catalog.values(), config.get_roles(), focus_service=focus_service, awaiting_reenable=awaiting)
+    roles = config.get_roles()
+    catalog = {svc.serviceId: svc for svc in config.get_services(roles)}
+    holders = RoleHolders(catalog.values(), roles, focus_service=focus_service, awaiting_reenable=awaiting)
     return catalog, holders
 
 

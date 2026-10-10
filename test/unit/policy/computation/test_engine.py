@@ -968,6 +968,7 @@ def test_dependency_exception_propagates(caplog):
     store = FakeStore()
     with ExitStack() as stack:
         stack.enter_context(patch.dict(os.environ, {"KEYCLOAK_REALM": "test-realm"}))
+        stack.enter_context(patch.object(Configuration, "get_roles", return_value=[]))
         stack.enter_context(patch.object(Configuration, "get_services", side_effect=RuntimeError("boom")))
         stack.enter_context(
             patch("aiac.policy.computation.engine.get_service_policy", side_effect=store.get_service_policy)
@@ -2494,16 +2495,18 @@ def test_every_writing_entry_point_reads_the_idp_once_under_the_pce_lock(side, e
     catalog, initial = _resync_fixture()
     store = FakeStore(initial)
     reads = []  # (the IdP read, the PCE lock is held) — one thread, so a held lock is the operation's
+    given = []  # what get_roles returned: the catalog read takes it, so GET /roles is sent one time
     with engine_env(catalog, store):
         members = Configuration.get_roles.side_effect
 
-        def get_services():
-            reads.append(("get_services", engine._pce_lock.locked()))
+        def get_services(roles=None):
+            reads.append(("get_services", engine._pce_lock.locked(), roles))
             return list(catalog)
 
         def get_roles():
             reads.append(("get_roles", engine._pce_lock.locked()))
-            return members()
+            given.append(members())
+            return given[-1]
 
         with (
             patch.object(Configuration, "get_services", side_effect=get_services),
@@ -2511,7 +2514,7 @@ def test_every_writing_entry_point_reads_the_idp_once_under_the_pce_lock(side, e
         ):
             _ENTRY_POINTS[entry_point](policy.computation)
 
-    assert reads == [("get_services", True), ("get_roles", True)]
+    assert reads == [("get_roles", True), ("get_services", True, given[0])]
 
 
 def test_a_run_that_waits_for_the_pce_lock_reads_the_idp_after_it_takes_the_lock():
@@ -2527,7 +2530,7 @@ def test_a_run_that_waits_for_the_pce_lock_reads_the_idp_after_it_takes_the_lock
     store = FakeStore()
     with (
         engine_env(catalog, store) as compute,
-        patch.object(Configuration, "get_services", side_effect=lambda: list(idp["catalog"])),
+        patch.object(Configuration, "get_services", side_effect=lambda roles=None: list(idp["catalog"])),
     ):
         with engine._pce_lock:  # another operation holds the lock
             threads, errors = _run_in_threads(lambda: compute([_rule(UR, TS)]))
@@ -3699,7 +3702,7 @@ def test_the_wait_is_read_before_the_catalog():
     store = FakeStore(initial)
     _lift_then(catalog, store)
 
-    def get_services():
+    def get_services(roles=None):
         from aiac.policy.computation import lift_done
 
         lift_done(_A2)  # the re-enable commits after this read; then the caller ends the wait

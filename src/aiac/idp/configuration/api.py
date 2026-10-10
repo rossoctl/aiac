@@ -222,9 +222,11 @@ class Configuration:
     def _all_scopes_map(self) -> dict[str, Scope]:
         return {s.id: s for s in self.get_scopes()}
 
-    def get_services(self) -> list[Service]:
+    def get_services(self, roles: list[Role] | None = None) -> list[Service]:
+        """The services of the realm. A caller that has already read ``get_roles()`` gives them as
+        ``roles``, so the realm roles are not read again (one snapshot for both)."""
         resp = self._request("GET", "/services", params=self._params())
-        all_roles = self._all_roles_map()
+        all_roles = self._all_roles_map() if roles is None else {r.id: r for r in roles}
         all_scopes = self._all_scopes_map()
         return [self._build_service(raw, all_roles, all_scopes) for raw in resp.json()]
 

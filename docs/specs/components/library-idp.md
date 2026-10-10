@@ -257,7 +257,7 @@ class Configuration:
 
     def get_subjects(self) -> list[Subject]: ...
     def get_roles(self) -> list[Role]: ...
-    def get_services(self) -> list[Service]: ...
+    def get_services(self, roles: list[Role] | None = None) -> list[Service]: ...
     def get_service(self, service_id: str) -> Service: ...
     def get_scopes(self) -> list[Scope]: ...
 
@@ -312,7 +312,7 @@ class Configuration:
 
 `get_services()` — fully-enriched read:
 1. `GET {AIAC_PDP_CONFIG_URL}/services?realm=<self.realm>` — fetch the base service list.
-2. Call `get_roles()` and `get_scopes()` once upfront to build `{id: Role}` and `{id: Scope}` lookup maps.
+2. Call `get_roles()` (unless the caller gives `roles`) and `get_scopes()` once upfront to build `{id: Role}` and `{id: Scope}` lookup maps.
 3. For each service, delegate to `_build_service(raw, all_roles, all_scopes)` which issues:
    - `GET /services/{id}/roles?realm=<self.realm>` → for each returned role, **copy the matching
      `all_roles` object and merge its authoritative `kind`/`actorIds` onto the copy** — the merge is a
@@ -329,7 +329,7 @@ class Configuration:
 4. Raise `IdPHTTPError` on any non-2xx response.
 5. Return `list[Service]` with fully-enriched `roles` (including `childRoles`) and `scopes` (including `description`).
 
-> **Known limit (D-05) — two reads of `GET /roles`.** The PCE calls `get_services()` and then `get_roles()` for each operation (D32). `get_services()` calls `get_roles()` inside it, so each PCE operation sends `GET /roles` two times, and the two answers are two separate snapshots. A role mapping between them can give the agent holders and the user holders of two different times; the next render repairs it. A fix can let `get_services()` take the roles from its caller.
+> **One `GET /roles` for each PCE operation (D-05, fixed).** The PCE calls `get_roles()` and then `get_services(roles)` for each operation (D32). `get_services(roles)` builds the roles of each service from the roles that it gets, so it does not send `GET /roles` again, and the agent holders and the user holders come from one snapshot. A call with no `roles` reads `get_roles()` itself.
 
 > **Performance note:** `get_services()` issues 2N + 1 + (roles overhead) HTTP requests where N is the number of services. `get_roles()` is called once and its fully-enriched objects are shared across all services. If this becomes a bottleneck, enrichment should be moved server-side.
 

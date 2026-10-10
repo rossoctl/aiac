@@ -1300,6 +1300,15 @@ class TestRealmParameter:
             Configuration.for_realm(REALM).get_services()
         assert call(f"{BASE}/services", params={"realm": REALM}) in m.call_args_list
 
+    def test_get_services_with_the_roles_given_does_not_read_the_roles_again(self, monkeypatch):
+        # The PCE reads the roles one time and gives them to get_services (D32): one GET /roles
+        # for each operation, so the agent holders and the user holders come from one snapshot.
+        monkeypatch.setenv("AIAC_PDP_CONFIG_URL", BASE)
+        with patch("aiac.idp.configuration.api.requests.get", return_value=_ok([])) as m:
+            Configuration.for_realm(REALM).get_services(roles=[])
+        assert call(f"{BASE}/services", params={"realm": REALM}) in m.call_args_list
+        assert call(f"{BASE}/roles", params={"realm": REALM}) not in m.call_args_list
+
 
 # ---------------------------------------------------------------------------
 # Default URL fallback

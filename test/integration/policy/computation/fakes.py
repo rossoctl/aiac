@@ -199,7 +199,7 @@ class FakeRealm:
             s.model_copy(update={"roles": []}) for s in self.get_subjects() if any(r.id == role.id for r in s.roles)
         ]
 
-    def get_services(self) -> list[Service]:
+    def get_services(self, roles: list[Role] | None = None) -> list[Service]:
         return [self._service(raw) for raw in self._clients.values()]
 
     def get_service(self, service_id: str) -> Service:
