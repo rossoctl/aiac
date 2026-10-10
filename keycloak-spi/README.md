@@ -14,7 +14,7 @@ below.
 
 | Keycloak admin event | AIAC subject | Notes |
 |---|---|---|
-| `CLIENT` + `CREATE` (`CLIENT_CREATED`) | `aiac.apply.service.{internal-uuid}` | id parsed from `resourcePath` (`clients/{uuid}`) — this is the Keycloak *internal* client UUID, which is what `onboard_service()` expects, not the human-readable `clientId`. |
+| `CLIENT` + `CREATE` (`CLIENT_CREATED`) | `aiac.apply.service.{internal-uuid}` | id parsed from `resourcePath` (`clients/{uuid}`) — this is the Keycloak *internal* client UUID, which is what `onboard_and_apply()` expects, not the human-readable `clientId`. |
 | `REALM_ROLE` / `CLIENT_ROLE` + `CREATE` or `UPDATE` | `aiac.apply.role.{role-name}` | id is the trailing path segment (a role **name**, not a UUID). `update_role()` is currently a stub with no finalized ID contract (UC3 not yet implemented) — revisit this mapping once UC3 lands. |
 | `REALM_ROLE_MAPPING` + `CREATE` (assign) or `DELETE` (unassign), on `users/{user-id}/role-mappings/realm` | `aiac.apply.role-members.{role-id}`, one subject for each role | A user or the service account of an agent gets or loses realm roles (D32). The role ids come from the event representation, not from the path. A role id is a Keycloak UUID: it is one NATS token and has no encoding. See [Role mappings](#role-mappings). |
 | everything else (user events, `DELETE` of a client or a role, a group role mapping `groups/{group-id}/role-mappings/realm`, `CLIENT_ROLE_MAPPING`, `GROUP_MEMBERSHIP`, etc.) | — | dropped. The role-mapping events in this row are known limits (see [Role mappings](#role-mappings)). |

@@ -2149,6 +2149,37 @@ def test_resync_quarantines_each_disabled_service_that_has_an_spm():
     ]
 
 
+@pytest.mark.parametrize("operation", ["resync", "rerender_role"])
+def test_a_render_that_writes_no_spm_seeds_the_identity_from_the_catalog(operation):
+    # An admin removed a scope from the tool in Keycloak. compute_and_apply renders the tool with the
+    # identity of the catalog, so a render that writes no SPM must too: else the CR changes back and
+    # forth with the path that rendered it.
+    catalog, initial = _resync_fixture()
+    removed = _scope("s-tool-removed", "tool-removed", service_id="github-tool")
+    initial["github-tool"].owned_scopes.append(removed)
+    store = FakeStore(initial)
+    if operation == "resync":
+        run_resync(catalog=catalog, store=store)
+        (push,) = store.policy_replaces
+    else:
+        run_rerender("r-agent-src", catalog=catalog, store=store)
+        push = store.last_push
+
+    tool = next(spm for spm in push.services if spm.service_id == "github-tool")
+    assert [scope.id for scope in tool.owned_scopes] == ["s-tool-read"]
+
+
+def test_agent_side_rerender_role_derives_from_the_listed_spms_with_no_by_role_query(agent_side):
+    # The listed SPMs are every stored SPM: the derive finds the SPMs of each role in the cache, so
+    # it makes no store round trip under the PCE lock.
+    catalog, initial = _resync_fixture()
+    store = run_rerender("r-user-dev", catalog=catalog, store=FakeStore(initial))
+
+    assert store.by_role_calls == []
+    assert store.pushed_agent_ids == {"github-agent"}
+    assert store.pushed_apm("github-agent").target_allow_scopes == {"github-tool": initial["github-tool"].owned_scopes}
+
+
 def test_agent_side_resync_replaces_every_cr_with_the_apms_and_the_pass_throughs(agent_side):
     # The PUT carries the APM of each live stored agent and the pass-through of each live stored
     # tool. The disabled agent and the absent one are not in it.

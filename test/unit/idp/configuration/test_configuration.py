@@ -226,6 +226,14 @@ class TestGetRoles:
             result = Configuration.for_realm(REALM).get_roles()
         assert not hasattr(result[0], "mappedScopes")
 
+    def test_a_role_name_is_encoded_as_one_path_segment(self, monkeypatch):
+        # A name with "?", "#" or "/" must not end the path or open a query.
+        monkeypatch.setenv("AIAC_PDP_CONFIG_URL", BASE)
+        roles = [{"id": "r1", "name": "team/a?b#c", "composite": True}]
+        with patch("aiac.idp.configuration.api.requests.get", side_effect=[_ok(roles), _ok([])]) as m:
+            Configuration.for_realm(REALM).get_roles()
+        assert m.call_args_list[1].args[0] == f"{BASE}/roles/team%2Fa%3Fb%23c/composites"
+
     def test_raises_if_composites_call_fails(self, monkeypatch):
         monkeypatch.setenv("AIAC_PDP_CONFIG_URL", BASE)
         roles = [{"id": "r1", "name": "admin", "composite": True}]

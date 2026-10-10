@@ -24,11 +24,15 @@ Routes:
 - ``POST /policy`` — upsert one CR per entry (no rollback on a partial failure).
 - ``PUT /policy`` — replace: upsert every entry, then delete every other CR that has the
   managed-by label. The delete step runs only after every upsert succeeded. Both sides; a side
-  change rewrites both packages of a kept CR in one write (``spec.policies`` is atomic). An entry
-  whose service id gives no CR identity (``identity_ref`` raises) is logged and skipped, not a 400:
-  it cannot have a CR, and one bad stored SPM must not block the resync at every Controller start.
+  change rewrites both packages of a kept CR in one write (``spec.policies`` is atomic).
 - ``DELETE /policy/services/{service_id:path}`` — delete the CR of one service (the quarantine and
   the decommission); a k8s 404 is success.
+
+A service id that gives no CR identity (``identity_ref`` raises) cannot have a CR. So each write
+logs it and skips it, never a 400: ``POST`` and ``PUT`` skip its entry, and ``DELETE`` has nothing
+to delete. With D20 such a service is denied (it has no CR). A 400 would make one bad stored SPM
+fail every later write that has it: the resync at every Controller start, each quarantine and
+decommission of the service, and each batch that deploys it.
 - ``DELETE /policy`` — delete every CR that has the managed-by label.
 - ``GET /health`` — a bounded CR list.
 
@@ -216,6 +220,16 @@ def _dump_cr(namespace: str, name: str, body: dict) -> None:
         dest.write_text(policy["content"])
 
 
+def _cr_identity(service_id: str) -> tuple[str, str] | None:
+    """The ``(namespace, name)`` of the CR of ``service_id``, or ``None`` (logged) when the id gives
+    no CR identity: the service cannot have a CR, so the write skips it (see the module docstring)."""
+    try:
+        return identity_ref(service_id)
+    except ValueError as e:
+        logger.warning("skipped a service that cannot have a CR: %s", e)
+        return None
+
+
 def _upsert(service_id: str, policies: ClientPolicies) -> tuple[str, str]:
     """Server-side-apply the CR of one entry (idempotent), then dump if enabled (Q6b).
 
@@ -242,9 +256,10 @@ def _apply(model: PolicyModel) -> None:
     """``POST /policy``: upsert one CR per entry of ``model``.
 
     No rollback: a failure stops the batch, and the entries already written stay written (SSA is
-    idempotent, so a retry re-applies the whole set)."""
+    idempotent, so a retry re-applies the whole set). An entry that cannot have a CR is skipped."""
     for service_id, policies in _entries(model):
-        _upsert(service_id, policies)
+        if _cr_identity(service_id) is not None:
+            _upsert(service_id, policies)
 
 
 def _delete_cr(namespace: str, name: str) -> None:
@@ -276,17 +291,13 @@ def _replace(model: PolicyModel) -> None:
     """``PUT /policy``: upsert every entry, then delete every other managed CR.
 
     The delete step runs only after every upsert succeeded: an upsert failure propagates before
-    the list, so nothing is deleted. A per-item 404 (a concurrent delete) is success. An entry whose
-    service id gives no CR identity is logged and skipped: it cannot have a CR, and the PCE resync
-    sends every stored SPM, so a 400 would stop every Controller start."""
-    keep: set[tuple[str, str]] = set()
-    for service_id, policies in _entries(model):
-        try:
-            identity_ref(service_id)
-        except ValueError as e:
-            logger.warning("PUT /policy skipped an entry that cannot have a CR: %s", e)
-            continue
-        keep.add(_upsert(service_id, policies))
+    the list, so nothing is deleted. A per-item 404 (a concurrent delete) is success. An entry that
+    cannot have a CR is skipped."""
+    keep = {
+        _upsert(service_id, policies)
+        for service_id, policies in _entries(model)
+        if _cr_identity(service_id) is not None
+    }
     for namespace, name in _managed_crs():
         if (namespace, name) not in keep:
             _delete_cr(namespace, name)
@@ -313,7 +324,8 @@ def _run_write(op) -> Response:
     """Run a write op, mapping failures to HTTP responses.
 
     - ``ValueError`` — a malformed / namespace-less service id from
-      ``identity_ref`` — maps to **400** (its message names the bad id).
+      ``identity_ref`` — maps to **400** (its message names the bad id). Each route skips such an
+      id first (``_cr_identity``), so this is a guard only.
     - ``ApiException`` — a Kubernetes API failure — maps to **502**.
     - ``OSError`` — the additive rego dump's filesystem write — maps to **502**.
 
@@ -399,7 +411,12 @@ def replace_policy(policy: _PolicyBody):
 # matches it — HTTP 404).
 @app.delete("/policy/services/{service_id:path}", status_code=204)
 def delete_service(service_id: str):
-    return _run_write(lambda: _delete_cr(*identity_ref(service_id)))
+    def _delete() -> None:
+        identity = _cr_identity(service_id)
+        if identity is not None:
+            _delete_cr(*identity)
+
+    return _run_write(_delete)
 
 
 @app.delete("/policy", status_code=204)

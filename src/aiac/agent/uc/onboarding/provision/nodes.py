@@ -170,10 +170,12 @@ def _mcp_tools_list(endpoint: str, token: str | None = None) -> list[dict]:
 
 
 def _owned_by(pod, workload_name: str) -> bool:
-    """True if ``workload_name`` owns ``pod``: a Deployment's ReplicaSet (name prefix
-    ``{workload}-``), or a StatefulSet / Sandbox whose name equals ``workload``."""
+    """True if ``workload_name`` owns ``pod``: a Deployment's ReplicaSet (``{workload}-{hash}``: the
+    name before its last ``-`` equals ``workload``, so ``github-tool-5d8f9`` is not a ReplicaSet of
+    ``github``; the pod-template hash has no ``-``), or a StatefulSet / Sandbox whose name equals
+    ``workload``."""
     for owner in getattr(pod.metadata, "owner_references", None) or []:
-        if owner.kind == "ReplicaSet" and owner.name.startswith(f"{workload_name}-"):
+        if owner.kind == "ReplicaSet" and owner.name.rsplit("-", 1)[0] == workload_name:
             return True
         if owner.kind in ("StatefulSet", "Sandbox") and owner.name == workload_name:
             return True

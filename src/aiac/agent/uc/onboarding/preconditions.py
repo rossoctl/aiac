@@ -1,6 +1,6 @@
 """UC1 enforcement precondition checks (D30).
 
-The Orchestrator runs these checks first in ``onboard_service``: after the one IdP read that
+The Orchestrator runs these checks first in ``onboard_and_apply``: after the one IdP read that
 resolves the clientId, and before Provision and the PRB. Each check tells whether the pod of the
 focus service can enforce its CR:
 

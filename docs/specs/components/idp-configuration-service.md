@@ -19,7 +19,7 @@ A FastAPI web service that proxies Keycloak Admin REST API endpoints. Returns Id
 | GET | `/scopes` | `GET /admin/realms/{realm}/client-scopes` | All scopes |
 | GET | `/services/{service_id}/roles` | `admin.get_client_roles(service_id)` **+** `aiac.managed` realm roles on the service account | **An agent's own roles (`R_A`)** from **two** sources: this service's client roles, **plus** the `aiac.managed` realm roles assigned to its service account (the `Configuration` library's provisioning path). Both surfaced as `kind = Agent`. See "Agent roles are client roles" below. |
 | GET | `/services/{service_id}/scopes` | `admin.get_client_default_client_scopes(service_id)` | Default client scopes assigned to a service, each with `serviceId` = this service. A scope that several services share is listed for each of them ([D32](../PRD.md#key-architectural-decisions)) |
-| GET | `/roles/{role_name}/composites` | `GET /admin/realms/{realm}/roles/{role-name}/composites` | Current composite permissions assigned to a role; `404` when Keycloak does not find the role |
+| GET | `/roles/{role_name:path}/composites` | `GET /admin/realms/{realm}/roles/{role-name}/composites` | Current composite permissions assigned to a role; `404` when Keycloak does not find the role. `{role_name:path}`: the IdP library encodes a `/` in a role name as `%2F`, and the server decodes it before routing, so a single-segment `{role_name}` does not match it |
 | POST | `/scopes` | `POST /admin/realms/{realm}/client-scopes` | Create realm-level scope |
 | POST | `/services/{service_id}/scopes` | `admin.create_client_scope(...)` → `admin.add_client_default_client_scope(service_id, scope_id, {})` | Create an `aiac.managed` scope and assign it to the service as a default scope |
 | POST | `/services/{service_id}/scopes/{scope_id}` | `PUT /admin/realms/{realm}/clients/{service_id}/default-client-scopes/{scope_id}` | Assign existing scope as default scope to service |
@@ -321,7 +321,7 @@ docker build -f src/aiac/idp/service/configuration/keycloak/Dockerfile \
 - `GET /roles`: call `admin.get_realm_roles(brief_representation=False)`, then drop the role named `default-roles-{realm}` (the Keycloak-generated default composite for the realm) before enrichment.
 - `GET /services/{service_id}/roles`: see the detailed contract above.
 - `GET /services/{service_id}/scopes`: call `admin.get_client_default_client_scopes(service_id)`, then set `serviceId` = `admin.get_client(service_id)["clientId"]` on each scope. No owner check (D32).
-- `GET /roles/{role_name}/composites`: call `admin.get_composite_realm_roles_of_role(role_name=role_name)`.
+- `GET /roles/{role_name:path}/composites`: call `admin.get_composite_realm_roles_of_role(role_name=role_name)`.
 - `POST /services/{service_id}/roles/{role_id}`: call `admin.get_client_service_account_user(service_id)` → extract `user["id"]` → resolve the role via `admin.get_realm_role_by_id(role_id)` → call `admin.assign_realm_roles(user_id, [role])`.
 - `DELETE /services/{service_id}/roles/{role_id}`: `get_client_service_account_user(service_id)` → `get_realm_role_by_id(role_id)` → `delete_realm_roles_of_user(user_id, [role])` (unmap first), then — only if `get_realm_role_members(role_name)` is empty (no other subject holds it) — `delete_realm_role(role_name)`.
 - `DELETE /services/{service_id}/scopes/{scope_id}`: `delete_client_default_client_scope(service_id, scope_id)` (unmap first), then — only if `_build_scope_owner_index(admin)` shows no other client that has it assigned — `delete_client_scope(scope_id)`.

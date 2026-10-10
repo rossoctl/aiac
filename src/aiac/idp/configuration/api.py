@@ -3,6 +3,7 @@ import os
 from collections.abc import Callable
 from pathlib import Path
 from typing import Protocol, TypeVar
+from urllib.parse import quote
 
 import requests
 from dotenv import load_dotenv
@@ -187,7 +188,10 @@ class Configuration:
         for raw in resp.json():
             role_data = dict(raw)
             if raw.get("composite"):
-                composites_resp = self._request("GET", f"/roles/{raw['name']}/composites", params=self._params())
+                # A role name can carry "?", "#" or "/": encode it as one path segment. The server
+                # decodes "%2F" before routing, so its route takes ``{role_name:path}``.
+                name = quote(raw["name"], safe="")
+                composites_resp = self._request("GET", f"/roles/{name}/composites", params=self._params())
                 role_data["childRoles"] = composites_resp.json()
             roles.append(Role.model_validate(role_data))
         return roles

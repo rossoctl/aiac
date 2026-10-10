@@ -4,11 +4,10 @@ The Orchestrator is a plain function that sequences exactly two stages:
 Service Provision (a compiled StateGraph) -> Service Policy Builder. Both are mocked
 here via the module-level `build_provision_graph` / `ServicePolicyBuilder` seams, and the
 idp-library `Configuration` is mocked via the `_config` seam -- no live graph, IdP,
-Kubernetes, or LLM. `onboard_service` applies nothing (no PCE call); it returns
-`(list[PolicyRule], override=False, client_id)`. `onboard_and_apply` (the entry point of the
-Controller route and the NATS consumer) then makes the single `compute_and_apply` call, inside the
-per-service lock, with the re-enable as its `on_applied`; `compute_and_apply` is patched at its import
-site.
+Kubernetes, or LLM. `onboard_and_apply` (the entry point of the Controller route and the NATS
+consumer) builds `(list[PolicyRule], override=False, client_id)` and then makes the single
+`compute_and_apply` call, inside the per-service lock, with the re-enable as its `on_applied`;
+`compute_and_apply` is patched at its import site, and most tests check what it was given.
 
 Issue 171 adds a compensating rollback (UC1-only): on any of the four typed build
 failures the Orchestrator tears down exactly what Provision *created this run* (the
@@ -61,6 +60,22 @@ def quarantine():
     live PCE. Tests that check it request this fixture by name."""
     with patch.object(orchestrator, "quarantine") as mock:
         yield mock
+
+
+@pytest.fixture(autouse=True)
+def pce():
+    """The PCE ``compute_and_apply`` seam of ``onboard_and_apply`` — patched for every test, so the
+    apply never reaches a live PCE (and the ``on_applied`` re-enable does not run)."""
+    with patch.object(orchestrator, "compute_and_apply") as mock:
+        yield mock
+
+
+def _run_onboarding(service_id):
+    """Run ``onboard_and_apply`` and return ``(rules, override, focus_service)``: what it gave the
+    PCE (the patched ``compute_and_apply``)."""
+    orchestrator.onboard_and_apply(service_id)
+    args, kwargs = orchestrator.compute_and_apply.call_args
+    return (*args, kwargs["focus_service"])
 
 
 @pytest.fixture(autouse=True)
@@ -137,7 +152,7 @@ class TestBothStagesSucceed:
             patch.object(orchestrator, "_config", return_value=_config_returning(_service())),
         ):
             spb.build.return_value = rules
-            result = orchestrator.onboard_service(SERVICE_ID)
+            result = _run_onboarding(SERVICE_ID)
 
         # service_type produced by Provision is fed into the Service Policy Builder
         spb.build.assert_called_once_with(SERVICE_ID, ServiceType.AGENT)
@@ -146,10 +161,10 @@ class TestBothStagesSucceed:
         # an unmentioned pair.
         assert result == (rules, False, CLIENT_ID)
 
-    def test_onboard_service_takes_no_default_effect(self):
+    def test_onboard_and_apply_takes_no_default_effect(self):
         import inspect
 
-        assert "default_effect" not in inspect.signature(orchestrator.onboard_service).parameters
+        assert "default_effect" not in inspect.signature(orchestrator.onboard_and_apply).parameters
 
     def test_provision_graph_invoked_with_service_id_in_trigger(self):
         # The service_id must reach Provision as the trigger's entity_id (Keycloak
@@ -163,7 +178,7 @@ class TestBothStagesSucceed:
             patch.object(orchestrator, "_config", return_value=_config_returning(_service())),
         ):
             spb.build.return_value = [object()]
-            orchestrator.onboard_service(SERVICE_ID)
+            _run_onboarding(SERVICE_ID)
 
         (state,), _ = graph.invoke.call_args
         assert state.trigger.entity_id == SERVICE_ID
@@ -180,7 +195,7 @@ class TestProvisionFails:
             patch.object(orchestrator, "_config", return_value=_config_returning(_service())),
         ):
             with pytest.raises(HTTPException) as exc:
-                orchestrator.onboard_service(SERVICE_ID)
+                _run_onboarding(SERVICE_ID)
 
         assert exc.value.status_code == 502
         spb.build.assert_not_called()
@@ -202,7 +217,7 @@ class TestServiceReadFails:
             patch.object(orchestrator, "_config", return_value=config),
         ):
             with pytest.raises(HTTPException) as exc:
-                orchestrator.onboard_service(SERVICE_ID)
+                _run_onboarding(SERVICE_ID)
 
         assert exc.value.status_code == 502
         graph.invoke.assert_not_called()
@@ -242,7 +257,7 @@ class TestFirstReadWaitsForANewClient:
             patch.object(orchestrator, "_config", return_value=config),
         ):
             spb.build.return_value = rules
-            result = orchestrator.onboard_service(SERVICE_ID)
+            result = _run_onboarding(SERVICE_ID)
 
         assert result == (rules, False, CLIENT_ID)
         assert config.get_service.call_count == misses + 1
@@ -265,7 +280,7 @@ class TestFirstReadWaitsForANewClient:
             patch.object(orchestrator, "_config", return_value=config),
         ):
             with pytest.raises(orchestrator.ServiceNotVisibleError) as ei:
-                orchestrator.onboard_service(SERVICE_ID)
+                _run_onboarding(SERVICE_ID)
 
         assert isinstance(ei.value, HTTPException)
         assert ei.value.status_code == 502
@@ -300,7 +315,7 @@ class TestFirstReadWaitsForANewClient:
             patch.object(orchestrator, "_config", return_value=config),
         ):
             with pytest.raises(HTTPException) as ei:
-                orchestrator.onboard_service(SERVICE_ID)
+                _run_onboarding(SERVICE_ID)
 
         assert not isinstance(ei.value, orchestrator.ServiceNotVisibleError)
         assert ei.value.status_code == 502
@@ -321,7 +336,7 @@ class TestFirstReadWaitsForANewClient:
             patch.object(nodes.time, "sleep") as sleep,
         ):
             with pytest.raises(orchestrator.ServiceNotVisibleError):
-                orchestrator.onboard_service(SERVICE_ID)
+                _run_onboarding(SERVICE_ID)
 
         assert [c.args for c in sleep.call_args_list] == [(0.5,), (0.5,)]
 
@@ -338,7 +353,7 @@ class TestFirstReadWaitsForANewClient:
             patch.object(nodes.time, "sleep") as sleep,
         ):
             with pytest.raises(orchestrator.ServiceNotVisibleError):
-                orchestrator.onboard_service(SERVICE_ID)
+                _run_onboarding(SERVICE_ID)
 
         assert config.get_service.call_count == 15
         assert sum(c.args[0] for c in sleep.call_args_list) == pytest.approx(28.0)
@@ -358,7 +373,7 @@ class TestFirstReadWaitsForANewClient:
             patch.object(nodes.time, "sleep") as sleep,
         ):
             with pytest.raises(orchestrator.ServiceNotVisibleError):
-                orchestrator.onboard_service(SERVICE_ID)
+                _run_onboarding(SERVICE_ID)
 
         assert [c.args for c in sleep.call_args_list] == [(2.0,), (2.0,)]
 
@@ -513,9 +528,9 @@ class TestFirstReadAgainstTheRealLibrary:
 
 class TestSuccessDoesNotReEnableClient:
     def test_success_does_not_touch_enabled_and_does_not_tear_down(self):
-        # onboard_service does not re-enable the client itself — onboard_and_apply does that via
-        # reenable_service(), but only AFTER compute_and_apply succeeds (so a PCE failure leaves the
-        # client disabled). onboard_service tears nothing down and never sets enabled here.
+        # The build does not re-enable the client itself — onboard_and_apply gives reenable_service()
+        # to compute_and_apply as on_applied, so it runs only AFTER a successful apply (a PCE failure
+        # leaves the client disabled). With the PCE mocked, nothing is torn down or enabled.
         service = _service()
         config = _config_returning(service)
         graph = _graph(
@@ -529,7 +544,7 @@ class TestSuccessDoesNotReEnableClient:
             patch.object(orchestrator, "_config", return_value=config),
         ):
             spb.build.return_value = [object()]
-            orchestrator.onboard_service(SERVICE_ID)
+            _run_onboarding(SERVICE_ID)
 
         config.set_service_enabled.assert_not_called()
         config.delete_service_role.assert_not_called()
@@ -573,7 +588,7 @@ class TestRollbackOnBuildFailure:
         ):
             spb.build.side_effect = error
             with pytest.raises(type(error)) as ei:
-                orchestrator.onboard_service(SERVICE_ID)
+                _run_onboarding(SERVICE_ID)
 
         # The ORIGINAL error instance is re-raised, not swallowed or re-wrapped.
         assert ei.value is error
@@ -613,7 +628,7 @@ class TestRollbackOnBuildFailure:
         ):
             spb.build.side_effect = LLMAccessError("boom")
             with pytest.raises(LLMAccessError):
-                orchestrator.onboard_service(SERVICE_ID)
+                _run_onboarding(SERVICE_ID)
 
         names = [c[0] for c in config.method_calls]
         assert names.index("set_service_enabled") > names.index("delete_service_role")
@@ -636,7 +651,7 @@ class TestRollbackOnBuildFailure:
         ):
             spb.build.side_effect = build_error
             with pytest.raises(RuntimeError, match="PDP unreachable") as ei:
-                orchestrator.onboard_service(SERVICE_ID)
+                _run_onboarding(SERVICE_ID)
 
         config.set_service_enabled.assert_called_once_with(service, False)
         assert ei.value.__context__ is build_error
@@ -658,7 +673,7 @@ class TestRollbackOnBuildFailure:
         ):
             spb.build.side_effect = build_error
             with pytest.raises(RuntimeError, match="Keycloak unreachable") as ei:
-                orchestrator.onboard_service(SERVICE_ID)
+                _run_onboarding(SERVICE_ID)
 
         quarantine.assert_called_once_with(CLIENT_ID, [created_role])
         assert ei.value.__context__ is build_error
@@ -684,7 +699,7 @@ class TestRollbackLogInjectionSanitized:
         ):
             spb.build.side_effect = LLMAccessError("boom")
             with pytest.raises(LLMAccessError):
-                orchestrator.onboard_service(evil_id)
+                _run_onboarding(evil_id)
 
         for record in caplog.records:
             assert "\n" not in record.getMessage()
@@ -711,7 +726,7 @@ class TestRollbackDeletesOnlyCreated:
         ):
             spb.build.side_effect = LLMAccessError("boom")
             with pytest.raises(LLMAccessError):
-                orchestrator.onboard_service(SERVICE_ID)
+                _run_onboarding(SERVICE_ID)
 
         config.delete_service_role.assert_called_once_with(service, created_role)
         config.delete_service_scope.assert_called_once_with(service, created_scope)
@@ -753,7 +768,7 @@ class TestRollbackDeletesOnlyCreated:
         ):
             spb.build.side_effect = LLMAccessError("boom")
             with pytest.raises(LLMAccessError):
-                orchestrator.onboard_service(SERVICE_ID)
+                _run_onboarding(SERVICE_ID)
 
         config.link_subject_scope.assert_called_once_with(service)
         config.delete_service_scope.assert_called_once_with(service, created_scope)
@@ -781,7 +796,7 @@ class TestRollbackScopedToFourErrors:
         ):
             spb.build.side_effect = HTTPException(502, "IdP Configuration Service unavailable")
             with pytest.raises(HTTPException) as exc:
-                orchestrator.onboard_service(SERVICE_ID)
+                _run_onboarding(SERVICE_ID)
 
         assert exc.value.status_code == 502
         graph.invoke.assert_called_once()
@@ -809,7 +824,7 @@ class TestRetryableReRunRollsBackIdempotently:
             ):
                 spb.build.side_effect = LLMAccessError("transient")
                 with pytest.raises(LLMAccessError):
-                    orchestrator.onboard_service(SERVICE_ID)
+                    _run_onboarding(SERVICE_ID)
 
         _attempt(
             Role(id="r-run1", name="weather.forecast", composite=False),
@@ -843,7 +858,7 @@ class TestLockRegistryEviction:
             patch.object(orchestrator, "_config", return_value=_config_returning(_service())),
         ):
             spb.build.return_value = [object()]
-            orchestrator.onboard_service(SERVICE_ID)
+            _run_onboarding(SERVICE_ID)
 
         assert SERVICE_ID not in orchestrator._service_locks
 
@@ -861,7 +876,7 @@ class TestLockRegistryEviction:
         ):
             spb.build.side_effect = error
             with pytest.raises(type(error)):
-                orchestrator.onboard_service(SERVICE_ID)
+                _run_onboarding(SERVICE_ID)
 
         assert SERVICE_ID not in orchestrator._service_locks
 
@@ -876,7 +891,7 @@ class TestLockRegistryEviction:
         ):
             spb.build.side_effect = HTTPException(502, "IdP config unavailable")
             with pytest.raises(HTTPException):
-                orchestrator.onboard_service(SERVICE_ID)
+                _run_onboarding(SERVICE_ID)
 
         assert SERVICE_ID not in orchestrator._service_locks
 
@@ -891,7 +906,7 @@ class TestLockRegistryEviction:
             patch.object(orchestrator, "_config", return_value=_config_returning(_service())),
         ):
             with pytest.raises(HTTPException):
-                orchestrator.onboard_service(SERVICE_ID)
+                _run_onboarding(SERVICE_ID)
 
         assert SERVICE_ID not in orchestrator._service_locks
 
@@ -922,7 +937,7 @@ class TestLockRegistryEviction:
             spb.build.side_effect = _build
 
             def _run():
-                orchestrator.onboard_service(SERVICE_ID)
+                _run_onboarding(SERVICE_ID)
 
             threads = [threading.Thread(target=_run) for _ in range(6)]
             for t in threads:
@@ -930,7 +945,7 @@ class TestLockRegistryEviction:
                 threading.Event().wait(0.02)  # stagger so runs cross eviction boundaries
             for t in threads:
                 t.join(timeout=10)
-                assert not t.is_alive(), "onboard_service thread hung (deadlock?)"
+                assert not t.is_alive(), "onboard_and_apply thread hung (deadlock?)"
 
         assert concurrency["max"] == 1, "same-service runs overlapped across an eviction"
         assert SERVICE_ID not in orchestrator._service_locks
@@ -966,14 +981,14 @@ class TestPerServiceSerialization:
             spb.build.side_effect = _build
 
             def _run():
-                orchestrator.onboard_service(SERVICE_ID)
+                _run_onboarding(SERVICE_ID)
 
             threads = [threading.Thread(target=_run) for _ in range(2)]
             for t in threads:
                 t.start()
             for t in threads:
                 t.join(timeout=5)
-                assert not t.is_alive(), "onboard_service thread hung (deadlock?)"
+                assert not t.is_alive(), "onboard_and_apply thread hung (deadlock?)"
 
         assert concurrency["max"] == 1
 
@@ -1000,7 +1015,7 @@ class TestPerServiceSerialization:
             spb.build.side_effect = _build
 
             def _run(service_id):
-                orchestrator.onboard_service(service_id)
+                _run_onboarding(service_id)
 
             threads = [
                 threading.Thread(target=_run, args=("svc-a",)),
@@ -1010,7 +1025,7 @@ class TestPerServiceSerialization:
                 t.start()
             for t in threads:
                 t.join(timeout=10)
-                assert not t.is_alive(), "onboard_service thread hung"
+                assert not t.is_alive(), "onboard_and_apply thread hung"
 
         assert errors == [], "different service_ids did not run concurrently"
 
@@ -1136,7 +1151,7 @@ class TestPreconditionChecksRunFirst:
             patch.object(orchestrator, "_config", return_value=config),
         ):
             with pytest.raises(EnforcementPreconditionError) as ei:
-                orchestrator.onboard_service(SERVICE_ID)
+                _run_onboarding(SERVICE_ID)
 
         assert len(ei.value.failures) == 1
         assert ei.value.failures[0].startswith(check)
@@ -1162,7 +1177,7 @@ class TestPreconditionChecksRunFirst:
             patch.object(orchestrator, "_config", return_value=_config_returning(_service())),
         ):
             with pytest.raises(EnforcementPreconditionError) as ei:
-                orchestrator.onboard_service(SERVICE_ID)
+                _run_onboarding(SERVICE_ID)
 
         assert [f[:2] for f in ei.value.failures] == ["#1", "#2", "#6"]
 
@@ -1173,7 +1188,7 @@ class TestPreconditionChecksRunFirst:
             patch.object(orchestrator, "_config", return_value=_config_returning(_service())),
         ):
             spb.build.return_value = []
-            orchestrator.onboard_service(SERVICE_ID)
+            _run_onboarding(SERVICE_ID)
 
         k8s.list_namespaced_pod.assert_called_with(kf.NAMESPACE)
         k8s.read_namespaced_config_map.assert_called_once_with(kf.PIPELINE_CONFIGMAP, kf.NAMESPACE)
@@ -1196,7 +1211,7 @@ class TestBootstrapOfATool:
         ):
             order.attach_mock(spb.build, "prb")
             spb.build.return_value = []
-            orchestrator.onboard_service(SERVICE_ID)
+            _run_onboarding(SERVICE_ID)
 
         bootstrap.assert_called_once_with(CLIENT_ID, ServiceType.TOOL)
         assert [c[0] for c in order.mock_calls] == ["bootstrap", "provision", "prb"]
@@ -1208,7 +1223,7 @@ class TestBootstrapOfATool:
             patch.object(orchestrator, "_config", return_value=_config_returning(_service())),
         ):
             spb.build.return_value = []
-            orchestrator.onboard_service(SERVICE_ID)
+            _run_onboarding(SERVICE_ID)
 
         bootstrap.assert_not_called()
 
@@ -1224,7 +1239,7 @@ class TestBootstrapOfATool:
             patch.object(orchestrator, "_config", return_value=_config_returning(_service(enabled=False))),
         ):
             spb.build.return_value = []
-            orchestrator.onboard_service(SERVICE_ID)
+            _run_onboarding(SERVICE_ID)
 
         bootstrap.assert_not_called()
         graph.invoke.assert_called_once()
@@ -1247,7 +1262,7 @@ class TestBootstrapOfATool:
             patch.object(orchestrator, "_config", return_value=_config_returning(_service())),
         ):
             spb.build.return_value = []
-            orchestrator.onboard_service(SERVICE_ID)
+            _run_onboarding(SERVICE_ID)
 
         bootstrap.assert_called_once_with(CLIENT_ID, ServiceType.TOOL)
         assert [c[0] for c in order.mock_calls] == ["bootstrap", "provision"]
@@ -1264,7 +1279,7 @@ class TestBootstrapOfATool:
             patch.object(orchestrator, "_config", return_value=config),
         ):
             with pytest.raises(EnforcementPreconditionError) as ei:
-                orchestrator.onboard_service(SERVICE_ID)
+                _run_onboarding(SERVICE_ID)
 
         assert [f[:2] for f in ei.value.failures] == ["#2"]
         graph.invoke.assert_not_called()
@@ -1286,7 +1301,7 @@ class TestBootstrapOfATool:
             patch.object(orchestrator, "_config", return_value=config),
         ):
             with pytest.raises(RuntimeError, match="PDP unreachable"):
-                orchestrator.onboard_service(SERVICE_ID)
+                _run_onboarding(SERVICE_ID)
 
         graph.invoke.assert_not_called()
         spb.build.assert_not_called()

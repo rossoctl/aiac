@@ -165,12 +165,13 @@ class TestPostTargetSide:
         refs = [(cr["metadata"]["namespace"], cr["metadata"]["name"]) for cr in _applied(api)]
         assert refs == [("team1", "github-tool"), ("team1", "github-agent"), ("team2", "weather-tool")]
 
-    def test_bad_id_is_400_naming_it_and_the_entries_before_stay_written(self, api):
-        # "github-tool" has no derivable namespace.
-        resp = TestClient(app).post("/policy", json=_target_side(_spm(TOOL), _spm("github-tool")))
-        assert resp.status_code == 400
-        assert "github-tool" in resp.json()["error"]
-        assert [cr["metadata"]["name"] for cr in _applied(api)] == ["github-tool"]  # no rollback
+    def test_a_bad_id_is_skipped_and_logged_and_the_other_entries_are_written(self, api, caplog):
+        # "github-agent" has no derivable namespace: it cannot have a CR (D20 denies it).
+        body = _target_side(_spm("github-agent"), _spm(TOOL))
+        resp = TestClient(app).post("/policy", json=body)
+        assert resp.status_code == 204
+        assert [cr["metadata"]["name"] for cr in _applied(api)] == ["github-tool"]
+        assert "github-agent" in caplog.text
 
     def test_api_exception_is_502(self, api):
         api.patch_namespaced_custom_object.side_effect = ApiException(status=500)
@@ -249,12 +250,12 @@ class TestPostAgentSide:
         ],
         ids=["agent-id", "pass-through-id"],
     )
-    def test_bad_id_is_400_naming_it_and_the_entries_before_stay_written(self, api, body):
-        # "github-agent" has no derivable namespace.
+    def test_a_bad_id_is_skipped_and_logged_and_the_other_entries_are_written(self, api, caplog, body):
+        # "github-agent" has no derivable namespace: it cannot have a CR (D20 denies it).
         resp = TestClient(app).post("/policy", json=body)
-        assert resp.status_code == 400
-        assert "github-agent" in resp.json()["error"]
-        assert [cr["metadata"]["name"] for cr in _applied(api)] == ["github-agent"]  # no rollback
+        assert resp.status_code == 204
+        assert [cr["metadata"]["name"] for cr in _applied(api)] == ["github-agent"]
+        assert "'github-agent'" in caplog.text
 
     def test_empty_model_writes_nothing(self, api):
         resp = TestClient(app).post("/policy", json=_agent_side())
@@ -501,10 +502,11 @@ class TestDeleteService:
         assert resp.status_code == 502
         assert "error" in resp.json()
 
-    def test_a_bad_id_is_400(self, api):
+    def test_a_bad_id_has_no_cr_to_delete(self, api, caplog):
+        # The quarantine and the decommission of such a service must be able to finish.
         resp = TestClient(app).delete("/policy/services/github-tool")
-        assert resp.status_code == 400
-        assert "github-tool" in resp.json()["error"]
+        assert resp.status_code == 204
+        assert "github-tool" in caplog.text
         api.delete_namespaced_custom_object.assert_not_called()
 
 

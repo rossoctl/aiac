@@ -351,7 +351,7 @@ class Configuration:
 
 `get_roles()` — enriched read:
 1. `GET {AIAC_PDP_CONFIG_URL}/roles?realm=<self.realm>` — fetch all realm roles.
-2. For each role, if `role.composite` is `True`: `GET /roles/{name}/composites?realm=<self.realm>` → `Role.childRoles`
+2. For each role, if `role.composite` is `True`: `GET /roles/{name}/composites?realm=<self.realm>` → `Role.childRoles`. The library URL-encodes the role name as one path segment (`quote(name, safe="")`), because a role name can contain `?`, `#` or `/`.
 3. Raise `IdPHTTPError` on any non-2xx response.
 4. Return `list[Role]` with `childRoles` populated.
 

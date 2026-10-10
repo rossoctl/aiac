@@ -160,7 +160,7 @@ operator + Keycloak + a real LLM, they are `@pytest.mark.system` (out of the def
 - **The event path is part of the wired platform.** The NATS Event Broker
   (`aiac-event-broker-service`, ns `aiac-system`) and the Keycloak SPI listener (`aiac-event-listener`,
   emitting `CLIENT_CREATED` over NATS) are standing platform components — like the OPA pipeline / SPIRE /
-  bundle-service — that carry a workload deployment through to `onboard_service`.
+  bundle-service — that carry a workload deployment through to `onboard_and_apply`.
 - **The deployed OPA plugin is the evaluator.** Onboarding upserts the `AuthorizationPolicy` CR of each
   affected service (D23) on the live Kubernetes API — one CR per managed service, the agent's and the
   tool's (D20); `bundle-service` (in `rossoctl-system`) recomposes the namespace bundle,
@@ -223,7 +223,7 @@ cleanly** when any of it is absent (they never stand it up, and never false-pass
   `AIAC_KIND_CLUSTER`), so a cluster not named `rossoctl` still loads correctly.
 - **Users + realm roles.** The fixture provisions them (UC-1 does not) — see
   *[Scenario](#scenario)* — via `KeycloakAdmin` into `AIAC_TEST_REALM`, **before** deploying (the PRB
-  reads the realm role universe when the event fires `onboard_service`); idempotent; left in place.
+  reads the realm role universe when the event fires `onboard_and_apply`); idempotent; left in place.
   `verify_login_subject` mints a login token through the login client `rossoctl` and checks that its
   `sub` is the username. It skips when it cannot mint the token (Direct Access Grants is a
   prerequisite), and fails when `sub` is not the username. The `sub` comes from the client scope
@@ -251,7 +251,7 @@ real requests + assert → full teardown.**
    `reenable_provisioned_clients` restores any disabled client, and the harness polls until both clients
    are gone (a leftover client would stop the deploy from firing `CLIENT_CREATED` again). Then `provision_realm_and_users` (idempotent) + `ensure_agent_policy` (mount
    the abstract `policy.md` on the Controller pod). Both **must** run **before** deploying, because when
-   the `CLIENT_CREATED` event fires `onboard_service` the PRB reads the realm role universe and the
+   the `CLIENT_CREATED` event fires `onboard_and_apply` the PRB reads the realm role universe and the
    mounted `policy.md`.
 2. **Load images, then deploy in the rung's order, one workload at a time, waiting for convergence** before
    deploying the next. First `load_workload_images` runs `demo/assets/kind-load.sh` (build-if-absent +
@@ -260,7 +260,7 @@ real requests + assert → full teardown.**
    trigger:
    the operator registers the Keycloak client (`client.name = "{ns}/{workload}"`), Keycloak emits
    `CLIENT_CREATED`, the SPI publishes over NATS, and the Agent's consumer runs `onboard_and_apply`.
-   - **Tool** (`github-tool`) → `onboard_service` classifies it a **Tool**, writes its bootstrap CR
+   - **Tool** (`github-tool`) → `onboard_and_apply` classifies it a **Tool**, writes its bootstrap CR
      before Provision (so that the discovery `tools/list` passes D20; under target side through the self-discovery rule), reads
      the MCP manifest,
      provisions scopes `github-tool.{source-read, source-write, issues-read, issues-write}`, sets
@@ -273,7 +273,7 @@ real requests + assert → full teardown.**
      bootstrap CR is present before Provision, so the CR check alone does not prove the final CR. For the
      tool, the CR check is the per-workload gate, because a live decision on github-tool's inbound
      needs the outbound token-exchange leg (step 3). The live proof is the step-4 poll.
-   - **Agent** (`github-agent`) → `onboard_service` classifies it an **Agent**, reads the AgentCard,
+   - **Agent** (`github-agent`) → `onboard_and_apply` classifies it an **Agent**, reads the AgentCard,
      provisions **one operator role per skill** `github-agent.{source_operations, issue_operations}`
      (mirroring the scopes) + scopes `github-agent.{source_operations, issue_operations}`, sets
      `client.type=Agent`; the Service Policy Builder maps roles→scopes via the real PRB (real LLM,

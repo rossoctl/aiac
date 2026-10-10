@@ -442,6 +442,14 @@ class TestGetRoleComposites:
         assert resp.json() == [{"id": "r2", "name": "viewer"}]
         admin.get_composite_realm_roles_of_role.assert_called_once_with(role_name="admin")
 
+    def test_a_role_name_with_a_slash_reaches_the_route(self):
+        # The library sends "%2F"; the server decodes it before routing.
+        admin = MagicMock()
+        admin.get_composite_realm_roles_of_role.return_value = []
+        resp = _make_client(admin).get(f"/roles/team%2Fa%3Fb/composites?realm={REALM}")
+        assert resp.status_code == 200
+        admin.get_composite_realm_roles_of_role.assert_called_once_with(role_name="team/a?b")
+
 
 # ---------------------------------------------------------------------------
 # Realm query parameter: required, lazy per-realm cache

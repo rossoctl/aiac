@@ -360,7 +360,7 @@ All endpoints accept a `?realm=<realm>` query parameter. `/health` uses `KEYCLOA
 | GET | `/scopes` | List client scopes |
 | GET | `/subjects/{subject_id}/assignments` | Realm and service role mappings for a user |
 | GET | `/services/{service_id}/permissions` | Client roles for a service |
-| GET | `/roles/{role_name}/composites` | Composite roles for a realm role |
+| GET | `/roles/{role_name:path}/composites` | Composite roles for a realm role (the role name can contain `/`) |
 | GET | `/health` | Readiness probe — `200 ok` or `503 unavailable` |
 
 All list endpoints return a JSON array. `/subjects/{id}/assignments` returns:

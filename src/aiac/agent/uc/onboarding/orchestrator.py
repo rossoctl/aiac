@@ -23,7 +23,7 @@ trigger, it sequences the two sub-agents and returns ``(list[PolicyRule], overri
     2. Service Policy Builder — reads the excluded-self IdP universe and builds the rules.
 
 :func:`onboard_and_apply` is the whole UC1 for the Controller route and the NATS consumer: it runs
-:func:`onboard_service`, then the single ``compute_and_apply(rules, override=False)`` (PCE) call,
+:func:`_onboard` (the build), then the single ``compute_and_apply(rules, override=False)`` (PCE) call,
 which re-enables the client under the PCE lock after the apply succeeds, all inside the per-service
 lock. UC1 is incremental, so ``override`` is always ``False`` (append; existing roles keep their
 other access).
@@ -32,7 +32,7 @@ other access).
 reconcile is idempotent, so a crash between stages simply re-runs the full pipeline to
 convergence on NATS redelivery. A build **failure**, however, triggers a **compensating
 rollback** (UC1-only) and then the PCE ``quarantine`` before the error propagates — see
-:func:`_rollback` and :func:`onboard_service`. A failed precondition check is **not** a build
+:func:`_rollback` and :func:`_onboard`. A failed precondition check is **not** a build
 failure: nothing changed yet, so it runs no rollback, no client disable and no quarantine
 (checkpoint O2). The PCE owns the PDP: this module never imports ``aiac.pdp.policy.library``.
 """
@@ -105,7 +105,7 @@ CLIENT_WAIT = WaitConfig("ONBOARD_CLIENT_WAIT_ATTEMPTS", "ONBOARD_CLIENT_WAIT_BA
 # --------------------------------------------------------------------------- #
 # Per-service_id serialization                                                 #
 # --------------------------------------------------------------------------- #
-# ``onboard_service`` runs the full provision → build → rollback lifecycle. Two
+# ``onboard_and_apply`` runs the full provision → build → rollback lifecycle, then the apply. Two
 # concurrent runs for the SAME ``service_id`` (an overlapping ``POST /apply/service/{id}``
 # and an ``aiac.apply.service.{id}`` NATS delivery, say) each snapshot the existing
 # role/scope names before creating, so both can record the same resolved entity in their
@@ -178,7 +178,7 @@ def _config() -> Configuration:
 
 
 def _read_service(config: Configuration, service_id: ServiceUuid, wait: bool = True) -> Service:
-    """The first IdP read of ``onboard_service``: ``get_service(service_id)``, tolerant of the
+    """The first IdP read of ``_onboard``: ``get_service(service_id)``, tolerant of the
     event-before-commit race (see ``CLIENT_WAIT``).
 
     A ``404`` (``IdPHTTPError`` with ``status == 404``) means that the new client is not visible
@@ -262,7 +262,7 @@ def reenable_service(service_id: ServiceUuid) -> None:
 
 
 def onboard_and_apply(service_id: ServiceUuid, *, wait_for_client: bool = True) -> None:
-    """The whole UC1 for the Controller route and the NATS consumer: :func:`onboard_service`, then
+    """The whole UC1 for the Controller route and the NATS consumer: :func:`_onboard` (the build), then
     ``compute_and_apply(rules, override, focus_service=client_id)`` with :func:`reenable_service` as
     its ``on_applied``, all inside the per-service lock (:func:`_service_lock`).
 
@@ -280,7 +280,7 @@ def onboard_and_apply(service_id: ServiceUuid, *, wait_for_client: bool = True) 
         )
 
 
-def onboard_service(service_id: ServiceUuid) -> tuple[list[PolicyRule], bool, ClientId]:
+def _onboard(service_id: ServiceUuid, wait_for_client: bool) -> tuple[list[PolicyRule], bool, ClientId]:
     """Sequence the precondition checks → (tool) bootstrap → Provision → Policy Builder and return
     ``(rules, override=False, client_id)``.
 
@@ -325,18 +325,13 @@ def onboard_service(service_id: ServiceUuid) -> tuple[list[PolicyRule], bool, Cl
     only AFTER its ``compute_and_apply`` (PCE) call succeeds, so a PCE failure leaves the client
     disabled rather than enabled-with-no-policy.
 
-    The full checks → provision → build → rollback lifecycle is serialized per ``service_id`` (see
+    The caller (:func:`onboard_and_apply`) holds the per-service lock: the full checks → provision →
+    build → rollback lifecycle, and the apply after it, is serialized per ``service_id`` (see
     :func:`_service_lock`): a concurrent same-service run cannot corrupt the created-manifest
     or roll back a shared entity, while different service_ids run concurrently. The registry
     entry is reference-counted and evicted once the last run using it exits (issue 202), on
     both the success and failure paths, without breaking serialization. This is an in-process
     lock (one agent replica only); cross-replica serialization is out of scope."""
-    with _service_lock(service_id):
-        return _onboard(service_id, wait_for_client=True)
-
-
-def _onboard(service_id: ServiceUuid, wait_for_client: bool) -> tuple[list[PolicyRule], bool, ClientId]:
-    """The body of :func:`onboard_service`; the caller holds the per-service lock."""
     config = _config()
     # A 404 is the event-before-commit race: read again for a bounded time (ServiceNotVisibleError
     # after the budget). Any other error is a 502 at once.

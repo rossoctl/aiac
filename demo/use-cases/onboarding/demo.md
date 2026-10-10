@@ -477,7 +477,7 @@ onto a Deployment's pod-template labels the first time its `AgentRuntime` CR res
 what `ClientRegistrationReconciler`'s watch predicate keys on, and that calls
 `RegisterOrFetchClientWithToken` — producing a genuine Keycloak `CLIENT_CREATE` admin event. The SPI
 listener from step 1 publishes it on NATS as `aiac.apply.service.<uuid>`, and `aiac-agent`'s
-consumer runs `onboard_service`. There is no `POST /apply/service/{id}` call anywhere in this path.
+consumer runs `onboard_and_apply`. There is no `POST /apply/service/{id}` call anywhere in this path.
 
 VERIFY-TRIGGER polls until each of these is true, in order:
 

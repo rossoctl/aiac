@@ -196,18 +196,3 @@ def test_a_refreshed_model_is_a_separate_copy():
     fresh.owned_scopes.append(Scope(id="other", name="other"))
 
     assert model == _spm(allow=[PolicyRule(role=DEV, scope=READ)])
-
-
-def test_refresh_live_models_keeps_the_live_services_sorted_with_the_current_holders():
-    # What a target-side render of stored SPMs deploys: a disabled or absent service is not in it.
-    def stored(service_id):
-        return _spm(allow=[PolicyRule(role=_agent_role(SHARED.id, "stale"), scope=READ)]).model_copy(
-            update={"service_id": service_id}
-        )
-
-    holders = RoleHolders([_agent(_AGENT_2, SHARED), _agent(_AGENT_1, SHARED, enabled=False), _agent(_TOOL)], [])
-
-    live = holders.refresh_live_models([stored(_AGENT_2), stored(_AGENT_1), stored(_TOOL), stored(_AGENT_2 + "x")])
-
-    assert [model.service_id for model in live] == [_TOOL, _AGENT_2]  # sorted by service id
-    assert [model.inbound_allow_rules[0].role.actorIds for model in live] == [[_AGENT_2], [_AGENT_2]]

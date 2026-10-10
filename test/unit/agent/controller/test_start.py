@@ -121,6 +121,11 @@ class TestStartSequencePasses:
         _serve()
         assert cluster.get_namespaced_custom_object.call_args.kwargs["namespace"] == "authbridge-system"
 
+    def test_a_default_false_and_the_body_reference_are_no_failure(self, cluster):
+        content = _package("inbound", "request", fail_open=False) + "default client_ok := false\n"
+        cluster.combiner["spec"]["policies"][0]["content"] = content
+        assert _serve() == 200
+
     def test_a_commented_out_line_is_no_failure(self, cluster):
         # Rego ignores a comment, so a commented-out default line does not allow a pod with no CR.
         content = _package("inbound", "request", fail_open=False) + f"# {_INBOUND_LINE}\n"
@@ -175,6 +180,33 @@ class TestCheck4StopsTheController:
         cluster.resync.assert_not_called()
         assert "consumer" not in cluster.events
         assert any("#4" in r.getMessage() and r.levelname == "ERROR" for r in caplog.records)
+
+    @pytest.mark.parametrize(
+        "rule",
+        [
+            "client_ok if {\n    not data.authbridge.client.inbound.request\n}",
+            "client_ok if not data.authbridge.client.inbound.request.allow",
+            "default client_ok := true",
+            "client_ok := true",
+        ],
+        ids=["multi-line-body", "not-allow", "default-true", "constant"],
+    )
+    def test_an_equivalent_fail_open_rule_in_another_form_stops_the_start(self, cluster, rule):
+        # The check is an allowlist: each client_ok rule must be a safe rule of the AIAC combiner.
+        content = _package("inbound", "request", fail_open=False) + rule + "\n"
+        cluster.combiner["spec"]["policies"][0]["content"] = content
+        with pytest.raises(start.StartCheckError, match="inbound/request.rego") as ei:
+            _serve()
+        assert rule.splitlines()[0] in str(ei.value)
+        cluster.resync.assert_not_called()
+
+    def test_a_package_with_no_client_ok_rule_stops_the_start(self, cluster):
+        content = _package("inbound", "request", fail_open=False).replace(
+            "client_ok if data.authbridge.client.inbound.request.allow\n", ""
+        )
+        cluster.combiner["spec"]["policies"][0]["content"] = content
+        with pytest.raises(start.StartCheckError, match="no client_ok rule"):
+            _serve()
 
     def test_both_lines_are_named(self, cluster):
         cluster.combiner = _combiner(inbound_fail_open=True, outbound_fail_open=True)

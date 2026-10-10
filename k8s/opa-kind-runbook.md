@@ -358,8 +358,11 @@ Until it exists, `opa-kind-enable.sh` applies the changed `default` CR in its
 Step 1, in place of the stock one. A later install or upgrade of the operator
 chart's bundle service (without the value) brings back the stock combiner. The
 AIAC Controller checks the combiner at every start (check #4, D30), and it stops
-if the combiner still allows a pod that has no client CR. Check 2 of
-[Verify](#verify) makes the same check.
+if the combiner still allows a pod that has no client CR. The Controller check
+is an allowlist: each `client_ok` rule of the two request packages must be
+`client_ok if data.authbridge.client.<direction>.request.allow` or
+`default client_ok := false`. Check 2 of [Verify](#verify) is a manual check:
+it finds only the stock fallback rule.
 
 ### What OPA sees on each leg
 

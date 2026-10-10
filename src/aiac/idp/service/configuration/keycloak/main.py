@@ -799,7 +799,9 @@ def create_role(body: _RoleCreate, admin: KeycloakAdmin = Depends(get_admin)):
         return JSONResponse(status_code=502, content={"error": str(e)})
 
 
-@app.get("/roles/{role_name}/composites")
+# ``{role_name:path}``: the library encodes a "/" in a role name as "%2F", and the server decodes it
+# before routing, so a single-segment ``{role_name}`` would not match it.
+@app.get("/roles/{role_name:path}/composites")
 def list_role_composites(role_name: str, admin: KeycloakAdmin = Depends(get_admin)):
     try:
         return admin.get_composite_realm_roles_of_role(role_name=role_name)

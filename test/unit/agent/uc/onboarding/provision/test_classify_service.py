@@ -84,6 +84,12 @@ class TestClassifyServiceHappyPaths:
         result = _run(service=_service(), pods=[pod])
         assert result["service_type"] is ServiceType.TOOL
 
+    def test_a_pod_of_a_workload_whose_name_starts_with_the_same_prefix_is_not_owned(self):
+        # Deployment "weather-tool" has the ReplicaSet "weather-tool-5d8f9": it is not "weather"'s.
+        other = _pod({"rossoctl.io/type": "agent"}, owner_name="weather-tool-5d8f9")
+        result = _run(service=_service(), pods=[other, _pod({"rossoctl.io/type": "tool"})])
+        assert result["service_type"] is ServiceType.TOOL
+
     def test_terminating_pod_is_skipped(self):
         # The wait reads only live pods, as the precondition checks do (one shared wait).
         old = _pod({})

@@ -301,6 +301,23 @@ def _seed_from_catalog(model: ServicePolicyModel, catalog: dict[str, Service]) -
         _seed_identity(model, svc)
 
 
+def _rendered(model: ServicePolicyModel, catalog: dict[str, Service], holders: RoleHolders) -> ServicePolicyModel:
+    """A stored SPM as a render that writes no SPM deploys it: with the current holders
+    (``refresh_model``) and its type and identity seeded from the catalog, as ``_SpmCache`` gives it
+    to ``compute_and_apply``. So a CR is the same whichever path renders it."""
+    fresh = holders.refresh_model(model)
+    _seed_from_catalog(fresh, catalog)
+    return fresh
+
+
+def _rendered_live(
+    models: Iterable[ServicePolicyModel], catalog: dict[str, Service], holders: RoleHolders
+) -> list[ServicePolicyModel]:
+    """The models of the live services in ``models``, sorted by service id, each ``_rendered``."""
+    ordered = sorted(models, key=lambda model: model.service_id)
+    return [_rendered(model, catalog, holders) for model in ordered if model.service_id in holders.live]
+
+
 def _read_idp(focus_service: str | None = None) -> tuple[dict[str, Service], RoleHolders]:
     """Read the IdP one time for an operation (D32): the ``get_services()`` catalog, keyed by
     clientId, and the current holders of every role, from that catalog and one ``get_roles()`` call.
@@ -341,7 +358,8 @@ class _SpmCache:
     When ``stale`` is given, the cache adds to it each SPM whose stored holders were not the current
     ones: its id, mapped to its former holders (``_former_holders``). A caller that has already read
     the stored SPM (for example from ``list_service_policies``) gives it as ``stored``, so the cache
-    does not read it again; an SPM that is already cached stays as it is.
+    does not read it again; an SPM that is already cached stays as it is. ``prime`` caches every
+    listed SPM; ``by_role`` then answers from the cache, with no store query.
     """
 
     def __init__(
@@ -350,6 +368,7 @@ class _SpmCache:
         self._catalog = catalog
         self._holders = holders
         self._stale = stale
+        self._listed: list[str] | None = None
         self.loaded: dict[str, ServicePolicyModel] = {}
 
     def __call__(self, service_id: str, stored: ServicePolicyModel | None = None) -> ServicePolicyModel:
@@ -366,6 +385,24 @@ class _SpmCache:
     def put(self, service_id: str, model: ServicePolicyModel) -> None:
         """Cache ``model`` as the SPM of ``service_id`` as it is: no store read, no refresh, no seed."""
         self.loaded[service_id] = model
+
+    def prime(self, listed: Iterable[ServicePolicyModel]) -> None:
+        """Cache each SPM of ``listed`` (every stored SPM, from ``list_service_policies``, in the
+        store's order), so that ``by_role`` answers from the cache. Only for an operation that writes
+        no SPM after it."""
+        self._listed = []
+        for model in listed:
+            self(model.service_id, model)
+            self._listed.append(model.service_id)
+
+    def by_role(self, role: Role) -> list[ServicePolicyModel]:
+        """The cached SPM of each service whose SPM has an edge of ``role``: from the cache after
+        ``prime``, else from ``get_service_policies_by_role``. Both keep the store's order, so the
+        render (the rule order of an APM) is the same on both paths."""
+        if self._listed is None:
+            return [self(stored.service_id, stored) for stored in get_service_policies_by_role(role)]
+        models = (self.loaded[service_id] for service_id in self._listed)
+        return [m for m in models if any(r.role.id == role.id for r in m.inbound_allow_rules + m.inbound_deny_rules)]
 
 
 def _fresh_apm(agent_id: str) -> AgentPolicyModel:
@@ -674,16 +711,14 @@ def _rerender_role(role_id: str, side: EnforcementSide) -> None:
         # The event gives only the role id, and ``get_service_policies_by_role`` sends only
         # ``role.id`` to the store, so the other fields of this Role are placeholders.
         role = Role(id=role_id, name=role_id, composite=False)
-        services = holders.refresh_live_models(get_service_policies_by_role(role))
+        services = _rendered_live(get_service_policies_by_role(role), catalog, holders)
         if services:
             apply_policy(TargetSidePolicyModel(services=services))
         return
     spms = _SpmCache(catalog, holders)
-    agents: set[str] = set()
-    for model in list_service_policies():
-        spms(model.service_id, model)  # already read: the derive makes no store read for it
-        if model.service_id in live:
-            agents.add(model.service_id)
+    listed = list_service_policies()
+    spms.prime(listed)  # already read: the derive makes no store read
+    agents = {model.service_id for model in listed if model.service_id in live}
     _deploy_agent_side(agents, spms, catalog)
 
 
@@ -713,7 +748,7 @@ def policy_model_for(service_id: ClientId) -> PolicyModel | None:
         return AgentSidePolicyModel(agents=[], pass_through=[service_id])
     catalog, holders = _read_idp()
     if side == EnforcementSide.TARGET_SIDE:
-        return TargetSidePolicyModel(services=[holders.refresh_model(stored)])
+        return TargetSidePolicyModel(services=[_rendered(stored, catalog, holders)])
     spms = _SpmCache(catalog, holders)
     spms(service_id, stored)  # refresh the stored SPM and seed its identity from the catalog
     return AgentSidePolicyModel(agents=[_derive(service_id, spms)])
@@ -758,7 +793,7 @@ def _bootstrap(service_id: str, service_type: ServiceType, side: EnforcementSide
     catalog, holders = _read_idp(service_id)
     model = find_service_policy(service_id)
     if model is not None:
-        model = holders.refresh_model(model)
+        model = _rendered(model, catalog, holders)
     else:
         model = ServicePolicyModel(service_id=service_id, service_type=service_type, owned_roles=[], owned_scopes=[])
         svc = catalog.get(service_id)
@@ -976,22 +1011,22 @@ def _resync(side: EnforcementSide) -> None:
     # (1) The IdP once (the catalog and the current role holders, D32), and every stored SPM — the
     # managed set (D21).
     catalog, holders = _read_idp()
-    stored = sorted(list_service_policies(), key=lambda model: model.service_id)
+    listed = list_service_policies()
+    stored = sorted(listed, key=lambda model: model.service_id)
 
     # (2) Replace every AIAC CR with the CRs of the live managed services, in the current side. A
     # disabled service is not in the model: step 3 removes it, and its rules must not come back,
     # even for a moment. Each CR names the current role holders, so the resync repairs a missed
     # role-members event.
     live = holders.live
-    live_stored = holders.refresh_live_models(stored)
+    live_stored = _rendered_live(stored, catalog, holders)
     if side == EnforcementSide.TARGET_SIDE:
         replace_policy(TargetSidePolicyModel(services=live_stored))
     else:
         # The APM of each live stored agent, derived from the store, and a pass-through CR for each
         # live stored tool (D24).
         spms = _SpmCache(catalog, holders)
-        for model in stored:
-            spms(model.service_id, model)  # already read: the derive makes no store read for it
+        spms.prime(listed)  # already read: the derive makes no store read
         replace_policy(
             AgentSidePolicyModel(
                 agents=[_derive(m.service_id, spms) for m in live_stored if _is_agent(catalog, m.service_id)],
@@ -1298,8 +1333,8 @@ def _derive(agent_id: str, spms: _SpmCache) -> AgentPolicyModel:
     # creates a false edge to a service A does not target. The store finds the SPMs; the cache gives
     # each one with the current holders.
     for role in sa.owned_roles:
-        for stored in get_service_policies_by_role(role):
-            _derive_outbound(apm, role, spms(stored.service_id, stored))
+        for stored in spms.by_role(role):
+            _derive_outbound(apm, role, stored)
 
     return apm
 
