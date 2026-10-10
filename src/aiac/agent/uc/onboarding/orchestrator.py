@@ -3,7 +3,8 @@
 The only use case with an Orchestrator, because it is a **two-stage** pipeline. Invoked by
 the Controller for the ``aiac.apply.service.{id}`` / ``POST /apply/service/{service_id}``
 trigger, it sequences the two sub-agents and returns ``(list[PolicyRule], override=False, client_id)``
-(``client_id`` is the service's clientId, which the Controller passes to the PCE as ``focus_service``):
+(``client_id`` is the service's clientId, which :func:`onboard_and_apply` passes to the PCE as
+``focus_service``):
 
     0. The precondition checks (D30, see ``preconditions``) — run FIRST, after the one IdP read
        that resolves the clientId (a ``404`` on that read is the event-before-commit race: it is read
@@ -21,9 +22,11 @@ trigger, it sequences the two sub-agents and returns ``(list[PolicyRule], overri
        roles/scopes it created on this run — see ``provision_service``).
     2. Service Policy Builder — reads the excluded-self IdP universe and builds the rules.
 
-There is **no Apply stage** here: the Controller makes the single
-``compute_and_apply(rules, override=False)`` (PCE) call. UC1 is incremental, so ``override``
-is always ``False`` (append; existing roles keep their other access).
+:func:`onboard_and_apply` is the whole UC1 for the Controller route and the NATS consumer: it runs
+:func:`onboard_service`, then the single ``compute_and_apply(rules, override=False)`` (PCE) call,
+which re-enables the client under the PCE lock after the apply succeeds, all inside the per-service
+lock. UC1 is incremental, so ``override`` is always ``False`` (append; existing roles keep their
+other access).
 
 **Replay safety (at-least-once delivery):** Provision IdP writes are idempotent and the PCE
 reconcile is idempotent, so a crash between stages simply re-runs the full pipeline to
@@ -35,6 +38,7 @@ failure: nothing changed yet, so it runs no rollback, no client disable and no q
 """
 
 import contextlib
+import functools
 import logging
 import threading
 
@@ -53,7 +57,7 @@ from aiac.agent.uc.onboarding.provision.nodes import WaitConfig, poll_until_read
 from aiac.agent.uc.onboarding.provision.state import OnboardingProvisionState, Trigger
 from aiac.idp.configuration.api import Configuration, IdPHTTPError
 from aiac.idp.configuration.models import ClientId, Service, ServiceType, ServiceUuid
-from aiac.policy.computation import bootstrap, quarantine
+from aiac.policy.computation import bootstrap, compute_and_apply, quarantine
 from aiac.policy.model.models import PolicyRule
 
 logger = logging.getLogger(__name__)
@@ -92,8 +96,9 @@ class ServiceNotVisibleError(HTTPException):
 # runs inside ``_service_lock``, and the NATS consumer handles one message at a time, so it blocks
 # the other onboardings: keep the default short (≈30 s, as the label wait). Tests set it fast.
 # A 404 cannot tell a not-yet-committed client from one that does not exist, so an unknown or
-# deleted UUID (a manual POST, a phantom event, a redelivery after a teardown) also waits the
-# whole budget before its 502; before this wait it was a 502 at once.
+# deleted UUID (a manual POST, a phantom event) also waits the whole budget before its 502. The
+# consumer gives ``wait_for_client=False`` on a NATS redelivery: the nak delay already gave the
+# client time to become visible, so a redelivery reads once and does not block the consumer again.
 CLIENT_WAIT = WaitConfig("ONBOARD_CLIENT_WAIT_ATTEMPTS", "ONBOARD_CLIENT_WAIT_BACKOFF", 15, 2.0)
 
 
@@ -172,7 +177,7 @@ def _config() -> Configuration:
     return Configuration.for_default_realm()
 
 
-def _read_service(config: Configuration, service_id: ServiceUuid) -> Service:
+def _read_service(config: Configuration, service_id: ServiceUuid, wait: bool = True) -> Service:
     """The first IdP read of ``onboard_service``: ``get_service(service_id)``, tolerant of the
     event-before-commit race (see ``CLIENT_WAIT``).
 
@@ -182,7 +187,8 @@ def _read_service(config: Configuration, service_id: ServiceUuid) -> Service:
     ``ONBOARD_CLIENT_WAIT_BACKOFF`` seconds between them. A client that is still not visible after
     the budget raises :class:`ServiceNotVisibleError` (a ``502``). Any other error (a ``5xx`` after
     the library retries, another ``4xx``, a ``RuntimeError``) is a real failure, never the race: it
-    raises ``HTTPException(502)`` at once."""
+    raises ``HTTPException(502)`` at once. With ``wait=False`` the read is made one time: a ``404``
+    raises :class:`ServiceNotVisibleError` at once."""
     last_not_found: IdPHTTPError | None = None
     reads = 0
 
@@ -199,7 +205,7 @@ def _read_service(config: Configuration, service_id: ServiceUuid) -> Service:
             # a 502, not a raw error that the Controller turns into a 500.
             raise HTTPException(502, f"IdP config unavailable resolving service {service_id!r}: {e}") from e
 
-    service = poll_until_ready(_probe, CLIENT_WAIT)
+    service = poll_until_ready(_probe, CLIENT_WAIT) if wait else _probe()
     if service is None:
         raise ServiceNotVisibleError(
             f"IdP config unavailable resolving service {service_id!r}: the client is not visible after "
@@ -244,8 +250,8 @@ def _rollback(config: Configuration, service: Service, created_roles, created_sc
 def reenable_service(service_id: ServiceUuid) -> None:
     """Re-enable the Keycloak client (UC1-only, idempotent), clearing any prior failed-disable marker.
 
-    The **caller** (Controller route or NATS consumer) invokes this AFTER a successful
-    ``compute_and_apply`` (PCE) call — deliberately post-apply. Re-enabling only after the policy
+    :func:`onboard_and_apply` gives it to ``compute_and_apply`` as ``on_applied``, so the PCE calls
+    it under its lock AFTER a successful run — deliberately post-apply. Re-enabling only after the policy
     is applied means a PCE failure leaves the client **disabled** (the failed-service marker set by
     a prior :func:`_rollback` stays in place), so a client is never enabled with no applied policy.
 
@@ -255,14 +261,34 @@ def reenable_service(service_id: ServiceUuid) -> None:
     config.set_service_enabled(config.get_service(service_id), True)
 
 
+def onboard_and_apply(service_id: ServiceUuid, *, wait_for_client: bool = True) -> None:
+    """The whole UC1 for the Controller route and the NATS consumer: :func:`onboard_service`, then
+    ``compute_and_apply(rules, override, focus_service=client_id)`` with :func:`reenable_service` as
+    its ``on_applied``, all inside the per-service lock (:func:`_service_lock`).
+
+    The PCE calls the re-enable under its lock, after the apply succeeds: no other PCE operation can
+    read the catalog between the lift of a quarantine and the re-enable, so none takes the service
+    out of the CRs of its roles. A ``compute_and_apply`` failure propagates and the client stays
+    disabled (the failed-service marker), never enabled-with-no-policy. The per-service lock covers
+    the apply and the re-enable too, so a concurrent run of the same service (an HTTP onboarding and
+    a NATS redelivery) cannot quarantine the service between this run's apply and its re-enable.
+    ``wait_for_client`` is given to the first IdP read (see :func:`_read_service`)."""
+    with _service_lock(service_id):
+        rules, override, client_id = _onboard(service_id, wait_for_client)
+        compute_and_apply(
+            rules, override, focus_service=client_id, on_applied=functools.partial(reenable_service, service_id)
+        )
+
+
 def onboard_service(service_id: ServiceUuid) -> tuple[list[PolicyRule], bool, ClientId]:
     """Sequence the precondition checks → (tool) bootstrap → Provision → Policy Builder and return
     ``(rules, override=False, client_id)``.
 
     ``service_id`` is the Keycloak internal client UUID that the trigger carries. The Orchestrator
     reads the ``Service`` from the IdP **once**, before Provision, and resolves its clientId
-    (``Service.serviceId``) — the only service id the PCE takes. The caller passes the returned
-    ``client_id`` to ``compute_and_apply`` as ``focus_service``, so it makes no second IdP read. The
+    (``Service.serviceId``) — the only service id the PCE takes. :func:`onboard_and_apply` passes the
+    returned ``client_id`` to ``compute_and_apply`` as ``focus_service``, so it makes no second IdP
+    read. The
     SPI event can come before Keycloak commits the new client, so a ``404`` on this read is polled
     again for a bounded time (``ONBOARD_CLIENT_WAIT_*``, default ≈30 s, see :func:`_read_service`).
     If the read fails, nothing exists yet that needs compensation: it raises ``HTTPException(502)``
@@ -295,9 +321,9 @@ def onboard_service(service_id: ServiceUuid) -> tuple[list[PolicyRule], bool, Cl
     run tries the compensation again. If the build error won, a permanent build error would
     ``term()`` the message and leave the half-compensated service fail-open. The
     quarantine is lifted only by a successful re-onboarding. On
-    success it does **not** re-enable the client here: the client is re-enabled by the caller via
-    :func:`reenable_service`, but only AFTER the caller's ``compute_and_apply`` (PCE) call succeeds,
-    so a PCE failure leaves the client disabled rather than enabled-with-no-policy.
+    success it does **not** re-enable the client here: :func:`onboard_and_apply` re-enables it, but
+    only AFTER its ``compute_and_apply`` (PCE) call succeeds, so a PCE failure leaves the client
+    disabled rather than enabled-with-no-policy.
 
     The full checks → provision → build → rollback lifecycle is serialized per ``service_id`` (see
     :func:`_service_lock`): a concurrent same-service run cannot corrupt the created-manifest
@@ -306,39 +332,44 @@ def onboard_service(service_id: ServiceUuid) -> tuple[list[PolicyRule], bool, Cl
     both the success and failure paths, without breaking serialization. This is an in-process
     lock (one agent replica only); cross-replica serialization is out of scope."""
     with _service_lock(service_id):
-        config = _config()
-        # A 404 is the event-before-commit race: read again for a bounded time (ServiceNotVisibleError
-        # after the budget). Any other error is a 502 at once.
-        service = _read_service(config, service_id)
-        client_id = ClientId(service.serviceId)
+        return _onboard(service_id, wait_for_client=True)
 
-        # D30: the precondition checks run FIRST, before anything changes. A failed check raises
-        # EnforcementPreconditionError, which is NOT a rollback error (checkpoint O2): nothing was
-        # provisioned, so there is no rollback, no client disable and no quarantine. Under agent
-        # side a tool gets no check, but its pod type is still returned (for the bootstrap below).
-        pod_type = check_preconditions(service)  # the type from the pod label (no catalog type yet)
-        # Checkpoint B1: the first CR of a tool, before Provision, so that discovery (tools/list
-        # through the tool's own inbound) passes D20. Only for an enabled client: a disabled
-        # (quarantined) tool fails at the discovery-token mint anyway (C5), and its bootstrap CR
-        # would stay stale until the next resync. Agents get no bootstrap.
-        if pod_type is ServiceType.TOOL and service.enabled:
-            bootstrap(client_id, ServiceType.TOOL)
 
-        provision = build_provision_graph().invoke(OnboardingProvisionState(trigger=Trigger(entity_id=service_id)))
-        service_type = provision["service_type"]
-        created_roles = provision["created_roles"]
-        created_scopes = provision["created_scopes"]
+def _onboard(service_id: ServiceUuid, wait_for_client: bool) -> tuple[list[PolicyRule], bool, ClientId]:
+    """The body of :func:`onboard_service`; the caller holds the per-service lock."""
+    config = _config()
+    # A 404 is the event-before-commit race: read again for a bounded time (ServiceNotVisibleError
+    # after the budget). Any other error is a 502 at once.
+    service = _read_service(config, service_id, wait_for_client)
+    client_id = ClientId(service.serviceId)
 
+    # D30: the precondition checks run FIRST, before anything changes. A failed check raises
+    # EnforcementPreconditionError, which is NOT a rollback error (checkpoint O2): nothing was
+    # provisioned, so there is no rollback, no client disable and no quarantine. Under agent
+    # side a tool gets no check, but its pod type is still returned (for the bootstrap below).
+    pod_type = check_preconditions(service)  # the type from the pod label (no catalog type yet)
+    # Checkpoint B1: the first CR of a tool, before Provision, so that discovery (tools/list
+    # through the tool's own inbound) passes D20. Only for an enabled client: a disabled
+    # (quarantined) tool fails at the discovery-token mint anyway (C5), and its bootstrap CR
+    # would stay stale until the next resync. Agents get no bootstrap.
+    if pod_type is ServiceType.TOOL and service.enabled:
+        bootstrap(client_id, ServiceType.TOOL)
+
+    provision = build_provision_graph().invoke(OnboardingProvisionState(trigger=Trigger(entity_id=service_id)))
+    service_type = provision["service_type"]
+    created_roles = provision["created_roles"]
+    created_scopes = provision["created_scopes"]
+
+    try:
+        rules = ServicePolicyBuilder.build(service_id, service_type)
+    except _ROLLBACK_ERRORS:
         try:
-            rules = ServicePolicyBuilder.build(service_id, service_type)
-        except _ROLLBACK_ERRORS:
-            try:
-                _rollback(config, service, created_roles, created_scopes)
-            finally:
-                # A failed rollback must not leave a first onboarding fail-open.
-                # Pass the created roles: the rollback deleted them from the IdP, so the quarantine
-                # cannot find them in the catalog, but their grants can be on other SPMs.
-                quarantine(client_id, created_roles)
-            raise
+            _rollback(config, service, created_roles, created_scopes)
+        finally:
+            # A failed rollback must not leave a first onboarding fail-open.
+            # Pass the created roles: the rollback deleted them from the IdP, so the quarantine
+            # cannot find them in the catalog, but their grants can be on other SPMs.
+            quarantine(client_id, created_roles)
+        raise
 
-        return rules, False, client_id
+    return rules, False, client_id

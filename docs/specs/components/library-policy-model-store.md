@@ -11,7 +11,7 @@ Companion library for the [AIAC Policy Model Store](policy-model-store.md). Foll
 src/aiac/policy/model_store/
 └── library/
     ├── __init__.py     # empty
-    └── api.py          # seven module-level functions (SPM-centric surface)
+    └── api.py          # eight module-level functions (SPM-centric surface)
 ```
 
 All `__init__.py` files are empty. Callers use explicit submodule paths:
@@ -19,6 +19,7 @@ All `__init__.py` files are empty. Callers use explicit submodule paths:
 ```python
 from aiac.policy.model_store.library.api import (
     get_service_policy,
+    find_service_policy,
     get_service_policy_by_scope,
     get_service_policies_by_role,
     list_service_policies,
@@ -45,7 +46,7 @@ are the **managed set** (D21).
 ## Submodule: `aiac.policy.model_store.library.api`
 
 ### Description
-HTTP client module wrapping the [AIAC Policy Model Store](policy-model-store.md) REST API. Exposes seven module-level functions returning `ServicePolicyModel` objects directly — no Kubernetes client boilerplate. Service URL is read from the `AIAC_POLICY_MODEL_STORE_URL` environment variable (default: `http://127.0.0.1:7074`). All functions raise `RuntimeError` on an unexpected non-2xx response (a `404` on the by-id read is handled, not raised — see below).
+HTTP client module wrapping the [AIAC Policy Model Store](policy-model-store.md) REST API. Exposes eight module-level functions returning `ServicePolicyModel` objects directly — no Kubernetes client boilerplate. Service URL is read from the `AIAC_POLICY_MODEL_STORE_URL` environment variable (default: `http://127.0.0.1:7074`). All functions raise `RuntimeError` on an unexpected non-2xx response (a `404` on the by-id read is handled, not raised — see below).
 
 ### Dependencies
 ```
@@ -62,6 +63,13 @@ def get_service_policy(service_id: str) -> ServicePolicyModel
     # On miss (service returns 404) the library returns a *fresh empty*
     # ServicePolicyModel for that service_id — never raises on 404.
     # (Matches the existing "engine creates a fresh model on 404" convention.)
+    # Built on find_service_policy.
+
+def find_service_policy(service_id: str) -> ServicePolicyModel | None
+    # GET /policy/services/{service_id}  — the stored SPM, or None on 404.
+    # For a caller that must tell "no SPM" from a stored zero-rule SPM
+    # (get_service_policy gives both as an empty model): the PCE read model
+    # (policy_model_for) and bootstrap.
 
 def get_service_policy_by_scope(scope: Scope) -> ServicePolicyModel | None
     # Singular: each copy of a scope has one owner, scope.serviceId. A scope that
@@ -100,7 +108,7 @@ def clear_service_policies() -> None
 ```
 
 `service_id` is a plain string everywhere in this API (slashes and all) — callers never encode
-anything. Internally, the three functions above base64url-encode `service_id` into the URL path
+anything. Internally, the by-id functions above base64url-encode `service_id` into the URL path
 segment via `aiac.policy.model_store.keying.encode_service_id` before issuing the request (the clientId is
 slash-bearing and can't be a single path segment); the service decodes it back. `service_id` in every
 returned `ServicePolicyModel` is always the original, decoded form.
@@ -167,6 +175,7 @@ apply_service_policy("weather-service", updated_spm)
 Key behaviors to assert:
 - `get_service_policy(id)` issues `GET /policy/services/{id}`; response body deserialized to `ServicePolicyModel` (hit).
 - `get_service_policy(id)` on `404` returns a fresh empty `ServicePolicyModel` for that `service_id` — no `RuntimeError` (miss).
+- `find_service_policy(id)` issues `GET /policy/services/{id}`; returns the stored SPM on a hit, `None` on `404`, and raises `RuntimeError` on another non-2xx response.
 - `get_service_policy_by_scope(scope)` resolves via `scope.serviceId` (sugar over the by-id read).
 - `get_service_policies_by_role(role)` issues the by-role query; returns every SPM referencing `role.id`; returns `[]` when none match; returns multiple when several match.
 - `list_service_policies()` issues `GET /policy/services` with no `role` param; returns every SPM; returns `[]` on an empty store.

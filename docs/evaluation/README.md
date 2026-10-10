@@ -69,20 +69,20 @@ doesn't already parallelize scenarios internally:
 ```bash
 # scenarios (test_policy_pipeline_eval.py) — full pipeline; concurrency across scenarios is
 # already internal to the shared `pipeline` fixture (ProcessPoolExecutor), so -n is not used here.
-.venv/bin/pytest eval/test_policy_pipeline_eval.py -m eval -v
+.venv/bin/pytest -m eval -k test_policy_pipeline_eval -v
 
 # correctness-prb — PRB-direct, no shared fixture, -n parallelizes cleanly.
-.venv/bin/pytest eval/test_policy_pipeline_correctness_prb.py -m eval -n 8 -v -s
+.venv/bin/pytest -m eval -k test_policy_pipeline_correctness_prb -n 8 -v -s
 
 # correctness-e2e — same shared-fixture internal concurrency as the scenarios suite, no -n.
-.venv/bin/pytest eval/test_policy_pipeline_correctness_e2e.py -m eval -v -s
+.venv/bin/pytest -m eval -k test_policy_pipeline_correctness_e2e -v -s
 
 # consistency — PRB-direct, no shared fixture, -n parallelizes cleanly.
-.venv/bin/pytest eval/test_policy_pipeline_consistency.py -m eval -n 8 -v
+.venv/bin/pytest -m eval -k test_policy_pipeline_consistency -n 8 -v
 
 # robustness — PRB-direct, no shared fixture, -n parallelizes cleanly.
 # (all four mechanical/semantic x invariance/sensitivity combinations feed the trend log)
-.venv/bin/pytest eval/test_policy_pipeline_robustness.py -m eval -n 8 -v
+.venv/bin/pytest -m eval -k test_policy_pipeline_robustness -n 8 -v
 
 # scale — procedurally generated fixed-100 corpus; never pass -n here. Each dimension/level
 # shares one module-scoped fixture between its structural and correctness test, which -n's

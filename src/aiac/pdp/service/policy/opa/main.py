@@ -24,7 +24,9 @@ Routes:
 - ``POST /policy`` — upsert one CR per entry (no rollback on a partial failure).
 - ``PUT /policy`` — replace: upsert every entry, then delete every other CR that has the
   managed-by label. The delete step runs only after every upsert succeeded. Both sides; a side
-  change rewrites both packages of a kept CR in one write (``spec.policies`` is atomic).
+  change rewrites both packages of a kept CR in one write (``spec.policies`` is atomic). An entry
+  whose service id gives no CR identity (``identity_ref`` raises) is logged and skipped, not a 400:
+  it cannot have a CR, and one bad stored SPM must not block the resync at every Controller start.
 - ``DELETE /policy/services/{service_id:path}`` — delete the CR of one service (the quarantine and
   the decommission); a k8s 404 is success.
 - ``DELETE /policy`` — delete every CR that has the managed-by label.
@@ -38,6 +40,7 @@ The CR write is **always active** — it is never gated by an env var. Setting
 disables, replaces, or gates the CR write.
 """
 
+import logging
 import os
 import shutil
 from collections.abc import Iterator
@@ -71,6 +74,7 @@ from aiac.shared.logging_config import configure_logging
 # client's) logs. Without it the root logger has no handler and defaults to WARNING — see
 # ``aiac.shared.logging_config``.
 configure_logging()
+logger = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------- #
 # CR coordinates & write identity — code constants, never env vars (Q6, Q8a). #
@@ -234,12 +238,13 @@ def _upsert(service_id: str, policies: ClientPolicies) -> tuple[str, str]:
     return namespace, name
 
 
-def _apply(model: PolicyModel) -> set[tuple[str, str]]:
-    """Upsert one CR per entry of ``model``; return the ``(namespace, name)`` of each.
+def _apply(model: PolicyModel) -> None:
+    """``POST /policy``: upsert one CR per entry of ``model``.
 
     No rollback: a failure stops the batch, and the entries already written stay written (SSA is
     idempotent, so a retry re-applies the whole set)."""
-    return {_upsert(service_id, policies) for service_id, policies in _entries(model)}
+    for service_id, policies in _entries(model):
+        _upsert(service_id, policies)
 
 
 def _delete_cr(namespace: str, name: str) -> None:
@@ -271,8 +276,17 @@ def _replace(model: PolicyModel) -> None:
     """``PUT /policy``: upsert every entry, then delete every other managed CR.
 
     The delete step runs only after every upsert succeeded: an upsert failure propagates before
-    the list, so nothing is deleted. A per-item 404 (a concurrent delete) is success."""
-    keep = _apply(model)
+    the list, so nothing is deleted. A per-item 404 (a concurrent delete) is success. An entry whose
+    service id gives no CR identity is logged and skipped: it cannot have a CR, and the PCE resync
+    sends every stored SPM, so a 400 would stop every Controller start."""
+    keep: set[tuple[str, str]] = set()
+    for service_id, policies in _entries(model):
+        try:
+            identity_ref(service_id)
+        except ValueError as e:
+            logger.warning("PUT /policy skipped an entry that cannot have a CR: %s", e)
+            continue
+        keep.add(_upsert(service_id, policies))
     for namespace, name in _managed_crs():
         if (namespace, name) not in keep:
             _delete_cr(namespace, name)

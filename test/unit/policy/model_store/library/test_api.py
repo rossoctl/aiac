@@ -96,6 +96,40 @@ class TestGetServicePolicy:
 
 
 # ---------------------------------------------------------------------------
+# find_service_policy  (by-id, None on 404)
+# ---------------------------------------------------------------------------
+
+
+class TestFindServicePolicy:
+    def test_hit_returns_the_stored_spm(self):
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = _mock_response(200, _spm_dict("svc-1"))
+            from aiac.policy.model_store.library.api import find_service_policy
+
+            result = find_service_policy("svc-1")
+            mock_get.assert_called_once_with(
+                f"{BASE_URL}/policy/services/{encode_service_id('svc-1')}", timeout=_HTTP_TIMEOUT
+            )
+            assert result is not None and result.service_id == "svc-1"
+
+    def test_miss_returns_none(self):
+        # Not a fresh empty SPM: the caller can tell "no SPM" from a stored zero-rule SPM.
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = _mock_response(404)
+            from aiac.policy.model_store.library.api import find_service_policy
+
+            assert find_service_policy("brand-new") is None
+
+    def test_raises_on_other_error_response(self):
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = _mock_response(500)
+            from aiac.policy.model_store.library.api import find_service_policy
+
+            with pytest.raises(RuntimeError):
+                find_service_policy("svc-1")
+
+
+# ---------------------------------------------------------------------------
 # get_service_policy_by_scope
 # ---------------------------------------------------------------------------
 

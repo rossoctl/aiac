@@ -12,9 +12,8 @@ with them:
 
 - an agent role: each **live** service in the catalog (``get_services()``) whose ``roles`` contain
   the role id (its ``serviceId``). Live = in the catalog and enabled; the focus service of a
-  run counts as live, and so does a service that waits for its re-enable after the lift of its
-  quarantine (the caller of the PCE re-enables the client after the lift's run). A quarantined or
-  deleted service is not a holder;
+  run counts as live (a re-onboarding of a quarantined service applies while its client is still
+  disabled). A quarantined or deleted service is not a holder;
 - a user role: the ``actorIds`` that ``get_roles()`` gives for the role id now (the direct members
   of an ``aiac.managed`` realm role). A role that ``get_roles()`` does not list (deleted) has no
   holder (fail closed).
@@ -48,17 +47,14 @@ class RoleHolders:
         roles: Iterable[Role],
         *,
         focus_service: str | None = None,
-        awaiting_reenable: Iterable[str] = (),
     ):
         """``services`` is the ``get_services()`` catalog; ``roles`` the ``get_roles()`` realm roles
         (required: with no roles, every user role has no holder); ``focus_service`` the clientId of
-        the service that a run builds; ``awaiting_reenable`` the clientIds of the services that wait
-        for their re-enable after a lift. Each of these counts as live."""
+        the service that a run builds, which counts as live."""
         services = list(services)
-        also_live = {*awaiting_reenable, focus_service}
-        #: The clientIds of the live services in the catalog: enabled, the focus service, or waiting
-        #: for its re-enable. Only these are holders.
-        self.live = frozenset(svc.serviceId for svc in services if svc.enabled or svc.serviceId in also_live)
+        #: The clientIds of the live services in the catalog: enabled, or the focus service. Only
+        #: these are holders.
+        self.live = frozenset(svc.serviceId for svc in services if svc.enabled or svc.serviceId == focus_service)
         # Every role id that a service in the catalog holds (an agent role), with its live holders.
         agents: dict[str, set[str]] = {}
         for svc in services:

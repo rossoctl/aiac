@@ -70,24 +70,11 @@ def test_the_focus_service_is_a_holder_while_it_is_disabled():
     assert holders.of(SHARED) == [_AGENT_1]
 
 
-def test_a_service_that_waits_for_its_re_enable_is_a_holder_while_it_is_disabled():
-    # The lift of a quarantine is done, and its caller has not re-enabled the client yet: the PCE
-    # counts the service as live, so a render in that window keeps it in the CRs of its roles.
-    holders = RoleHolders([_agent(_AGENT_1, SHARED, enabled=False)], [], awaiting_reenable=[_AGENT_1])
+def test_live_is_the_enabled_services_and_the_focus():
+    services = [_agent(_AGENT_1), _agent(_AGENT_2, enabled=False), _agent("focus", enabled=False)]
+    holders = RoleHolders(services, [], focus_service="focus")
 
-    assert holders.of(SHARED) == [_AGENT_1]
-
-
-def test_live_is_the_enabled_services_the_focus_and_the_services_that_wait_for_their_re_enable():
-    services = [
-        _agent(_AGENT_1),
-        _agent(_AGENT_2, enabled=False),
-        _agent("focus", enabled=False),
-        _agent("waiting", enabled=False),
-    ]
-    holders = RoleHolders(services, [], focus_service="focus", awaiting_reenable=["waiting", "not-in-the-catalog"])
-
-    assert holders.live == {_AGENT_1, "focus", "waiting"}
+    assert holders.live == {_AGENT_1, "focus"}
 
 
 def test_an_agent_role_that_no_live_service_has_has_no_holder():

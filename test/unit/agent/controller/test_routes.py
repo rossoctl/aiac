@@ -4,7 +4,7 @@ The orchestrator/sub-agent handlers and the Policy Computation Engine are
 mocked at the routes module boundary — no live services, no real graphs.
 """
 
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import patch
 
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
@@ -32,10 +32,6 @@ from aiac.policy.model.models import PolicyRule, RuleEffect, ServicePolicyModel,
 
 client = TestClient(app)
 
-# What onboard_service returns for the onboarded service: the route gets the UUID in the path, the PCE
-# takes the clientId.
-CLIENT_ID = "spiffe://example.org/ns/team1/sa/svc"
-
 
 def _rule(role_id: str = "r-1", scope_id: str = "s-1") -> PolicyRule:
     return PolicyRule(
@@ -48,7 +44,7 @@ def test_health_returns_ok_without_touching_handlers_or_pce():
     # Liveness/readiness: the Controller is stateless, so /health answers 200 on its own
     # without dispatching to any use-case handler or the PCE.
     with (
-        patch("aiac.agent.controller.routes.onboard_service") as orch,
+        patch("aiac.agent.controller.routes.onboard_and_apply") as orch,
         patch("aiac.agent.controller.routes.compute_and_apply") as pce,
     ):
         resp = client.get("/health")
@@ -59,36 +55,31 @@ def test_health_returns_ok_without_touching_handlers_or_pce():
     pce.assert_not_called()
 
 
-def test_apply_service_dispatches_to_orchestrator_and_calls_pce_once():
+def test_apply_service_calls_onboard_and_apply_once_with_the_path_uuid():
+    # The route gives the Keycloak UUID of the path to onboard_and_apply. The orchestrator makes the
+    # compute_and_apply call and the re-enable, so the route itself does not call the PCE.
     with (
-        patch("aiac.agent.controller.routes.onboard_service", return_value=([], False, CLIENT_ID)) as orch,
+        patch("aiac.agent.controller.routes.onboard_and_apply") as onboard,
         patch("aiac.agent.controller.routes.compute_and_apply") as pce,
-        patch("aiac.agent.controller.routes.reenable_service") as reenable,
     ):
         resp = client.post("/apply/service/svc-123")
 
     assert resp.status_code == 200
-    orch.assert_called_once_with("svc-123")
-    # The focus service reaches the PCE routing guard as the clientId from onboard_service, not the
-    # path's Keycloak UUID.
-    pce.assert_called_once_with([], False, focus_service=CLIENT_ID)
-    # The client is re-enabled (an IdP call, by its UUID) only after the PCE apply succeeds.
-    reenable.assert_called_once_with("svc-123")
+    assert resp.content == b""
+    onboard.assert_called_once_with("svc-123")
+    pce.assert_not_called()
 
 
 def test_apply_service_ignores_a_default_effect_env():
     # The default effect is always DENY: a stale AIAC_DEFAULT_EFFECT on the Controller has no effect.
     with (
-        patch("aiac.agent.controller.routes.onboard_service", return_value=([], False, CLIENT_ID)) as orch,
-        patch("aiac.agent.controller.routes.compute_and_apply") as pce,
-        patch("aiac.agent.controller.routes.reenable_service"),
+        patch("aiac.agent.controller.routes.onboard_and_apply") as onboard,
         patch.dict("os.environ", {"AIAC_DEFAULT_EFFECT": "Allow"}, clear=False),
     ):
         resp = client.post("/apply/service/svc-123")
 
     assert resp.status_code == 200
-    orch.assert_called_once_with("svc-123")
-    pce.assert_called_once_with([], False, focus_service=CLIENT_ID)
+    onboard.assert_called_once_with("svc-123")
     assert not hasattr(routes, "DEFAULT_EFFECT_ENV")
     assert not hasattr(routes, "_default_effect_from_env")
 
@@ -245,29 +236,26 @@ def test_get_policy_model_of_an_unmanaged_service_returns_404():
 
 
 def test_controller_forwards_handler_rules_and_override_verbatim():
+    # A route that makes the PCE call itself (here UC3) forwards the handler's tuple as it is.
     rules = [_rule("r-a"), _rule("r-b")]
     with (
-        patch(
-            "aiac.agent.controller.routes.onboard_service",
-            return_value=(rules, False, CLIENT_ID),
-        ),
+        patch("aiac.agent.controller.routes.update_role", return_value=(rules, True)),
         patch("aiac.agent.controller.routes.compute_and_apply") as pce,
-        patch("aiac.agent.controller.routes.reenable_service"),
     ):
-        resp = client.post("/apply/service/svc-9")
+        resp = client.post("/apply/role/role-9")
 
     assert resp.status_code == 200
     # Exactly one PCE call, with the handler's own rules object and flag — not a rebuilt/empty one.
-    pce.assert_called_once_with(rules, False, focus_service=CLIENT_ID)
+    pce.assert_called_once_with(rules, True)
     forwarded_rules, forwarded_override = pce.call_args.args
     assert forwarded_rules is rules
-    assert forwarded_override is False
+    assert forwarded_override is True
 
 
 def test_handler_upstream_error_surfaces_status_and_skips_pce():
     with (
         patch(
-            "aiac.agent.controller.routes.onboard_service",
+            "aiac.agent.controller.routes.onboard_and_apply",
             side_effect=HTTPException(status_code=502),
         ),
         patch("aiac.agent.controller.routes.compute_and_apply") as pce,
@@ -281,90 +269,17 @@ def test_handler_upstream_error_surfaces_status_and_skips_pce():
 def test_service_not_visible_after_the_wait_surfaces_502_and_skips_pce():
     # Handoff 20: the IdP still answers 404 for the new client after the bounded wait on the first
     # read. ServiceNotVisibleError is an HTTPException(502) subclass, so the route answers 502 with
-    # its detail, as for the other failed reads. Nothing is applied and the client is not re-enabled.
+    # its detail, as for the other failed reads. The route does not call the PCE.
     detail = "IdP config unavailable resolving service 'svc-new': the client is not visible after the wait"
     with (
-        patch("aiac.agent.controller.routes.onboard_service", side_effect=ServiceNotVisibleError(detail)),
+        patch("aiac.agent.controller.routes.onboard_and_apply", side_effect=ServiceNotVisibleError(detail)),
         patch("aiac.agent.controller.routes.compute_and_apply") as pce,
-        patch("aiac.agent.controller.routes.reenable_service") as reenable,
     ):
         resp = client.post("/apply/service/svc-new")
 
     assert resp.status_code == 502
     assert resp.json() == {"detail": detail}
     pce.assert_not_called()
-    reenable.assert_not_called()
-
-
-def test_apply_service_does_not_reenable_when_pce_apply_raises():
-    # The re-enable is strictly post-apply: if compute_and_apply raises, the route never reaches
-    # reenable_service, so the client stays disabled (the failed-service marker) — never left
-    # enabled with no applied policy.
-    with (
-        patch(
-            "aiac.agent.controller.routes.onboard_service",
-            return_value=([], False, CLIENT_ID),
-        ),
-        patch(
-            "aiac.agent.controller.routes.compute_and_apply",
-            side_effect=HTTPException(status_code=500),
-        ),
-        patch("aiac.agent.controller.routes.reenable_service") as reenable,
-    ):
-        resp = client.post("/apply/service/svc-pce-boom")
-
-    assert resp.status_code == 500
-    reenable.assert_not_called()
-
-
-def _onboarding_calls(reenable_error=None) -> tuple[int, list]:
-    """POST /apply/service with the handler, the PCE, the re-enable and the PCE ``lift_done`` mocked;
-    returns the status and the order of the calls."""
-    order = MagicMock()
-    order.reenable.side_effect = reenable_error
-    with (
-        patch("aiac.agent.controller.routes.onboard_service", return_value=([], False, CLIENT_ID)),
-        patch("aiac.agent.controller.routes.compute_and_apply", order.compute_and_apply),
-        patch("aiac.agent.controller.routes.reenable_service", order.reenable),
-        patch("aiac.agent.controller.routes.lift_done", order.lift_done),
-    ):
-        resp = client.post("/apply/service/svc-123")
-    return resp.status_code, order.mock_calls
-
-
-def test_apply_service_ends_the_wait_of_a_lift_after_the_re_enable():
-    # A lift counts the service as live until lift_done (LIM-09): a render between the apply and the
-    # re-enable must not take it out of the CRs of its roles. So lift_done comes after the re-enable.
-    status, calls = _onboarding_calls()
-
-    assert status == 200
-    assert calls == [
-        call.compute_and_apply([], False, focus_service=CLIENT_ID),
-        call.reenable("svc-123"),
-        call.lift_done(CLIENT_ID),
-    ]
-
-
-def test_apply_service_ends_the_wait_of_a_lift_when_the_re_enable_fails():
-    # The client stays disabled, so the service must not count as live any more.
-    status, calls = _onboarding_calls(reenable_error=HTTPException(status_code=502))
-
-    assert status == 502
-    assert calls[-2:] == [call.reenable("svc-123"), call.lift_done(CLIENT_ID)]
-
-
-def test_apply_service_does_not_end_a_wait_when_the_pce_apply_raises():
-    # A failed compute_and_apply lifts nothing: there is no wait to end.
-    with (
-        patch("aiac.agent.controller.routes.onboard_service", return_value=([], False, CLIENT_ID)),
-        patch("aiac.agent.controller.routes.compute_and_apply", side_effect=HTTPException(status_code=500)),
-        patch("aiac.agent.controller.routes.reenable_service"),
-        patch("aiac.agent.controller.routes.lift_done") as lift_done,
-    ):
-        resp = client.post("/apply/service/svc-pce-boom")
-
-    assert resp.status_code == 500
-    lift_done.assert_not_called()
 
 
 def test_policy_rules_builder_error_surfaces_422_and_skips_pce():
@@ -373,7 +288,7 @@ def test_policy_rules_builder_error_surfaces_422_and_skips_pce():
     # PCE is never reached (the raise fires during rule construction inside the handler).
     with (
         patch(
-            "aiac.agent.controller.routes.onboard_service",
+            "aiac.agent.controller.routes.onboard_and_apply",
             side_effect=PolicyRulesBuilderError("Auditor rejected after 3 retries: no grants"),
         ),
         patch("aiac.agent.controller.routes.compute_and_apply") as pce,
@@ -387,7 +302,7 @@ def test_policy_rules_builder_error_surfaces_422_and_skips_pce():
 def test_policy_conflict_error_surfaces_422_with_conflict_report_body_and_skips_pce():
     # A structural PolicyConflictError (the cross-pass detector, already enriched) surfaces as 422
     # whose BODY IS the structured ConflictReport (not a bare {"detail": ...}), and the PCE is never
-    # reached. onboard_service raises the carrier exception so the route handler is exercised.
+    # reached. onboard_and_apply raises the carrier exception so the route handler is exercised.
     tester = Role(id="r-tester", name="tester", composite=False)
     issues = Scope(id="s-iss", name="issues")
     report = detect_conflicts(
@@ -398,7 +313,7 @@ def test_policy_conflict_error_surfaces_422_with_conflict_report_body_and_skips_
     )
     with (
         patch(
-            "aiac.agent.controller.routes.onboard_service",
+            "aiac.agent.controller.routes.onboard_and_apply",
             side_effect=PolicyConflictError(report),
         ),
         patch("aiac.agent.controller.routes.compute_and_apply") as pce,
@@ -424,7 +339,7 @@ def test_policy_contradiction_error_surfaces_422_conflict_report_and_skips_pce()
         [Contradiction(candidate_name="tester", description="granted and prohibited")],
     )
     with (
-        patch("aiac.agent.controller.routes.onboard_service", side_effect=err),
+        patch("aiac.agent.controller.routes.onboard_and_apply", side_effect=err),
         patch("aiac.agent.controller.routes.compute_and_apply") as pce,
     ):
         resp = client.post("/apply/service/svc-conflict")
@@ -439,16 +354,14 @@ def test_policy_contradiction_error_surfaces_422_conflict_report_and_skips_pce()
 
 def test_failed_precondition_check_surfaces_409_with_the_failed_checks_and_skips_pce():
     # A failed UC1 precondition check (D30) is a cluster problem that the operator must fix, not a
-    # server fault: 409, with a body that names each failed check. The PCE is never reached and the
-    # client is not re-enabled (the checks run before Provision, so nothing changed).
+    # server fault: 409, with a body that names each failed check. The route does not call the PCE.
     failures = [
         "#1 sidecar: pod 'svc-abc' in namespace 'team1' has no 'authbridge-proxy' container",
         "#6 probes: container 'app' of pod 'svc-abc' has an httpGet readinessProbe",
     ]
     with (
-        patch("aiac.agent.controller.routes.onboard_service", side_effect=EnforcementPreconditionError(failures)),
+        patch("aiac.agent.controller.routes.onboard_and_apply", side_effect=EnforcementPreconditionError(failures)),
         patch("aiac.agent.controller.routes.compute_and_apply") as pce,
-        patch("aiac.agent.controller.routes.reenable_service") as reenable,
     ):
         resp = client.post("/apply/service/svc-unenforceable")
 
@@ -458,7 +371,6 @@ def test_failed_precondition_check_surfaces_409_with_the_failed_checks_and_skips
     assert isinstance(body["detail"], str) and body["detail"]
     assert body["failed_checks"] == failures
     pce.assert_not_called()
-    reenable.assert_not_called()
 
 
 # --------------------------------------------------------------------------- #
@@ -487,7 +399,7 @@ def test_llm_access_error_surfaces_502_with_sanitized_body_and_no_leak():
     # (502), and the poisoned endpoint/host/key never reaches the client body.
     err = LLMAccessError(_POISON)
     with (
-        patch("aiac.agent.controller.routes.onboard_service", side_effect=err),
+        patch("aiac.agent.controller.routes.onboard_and_apply", side_effect=err),
         patch("aiac.agent.controller.routes.compute_and_apply") as pce,
     ):
         resp = client.post("/apply/service/svc-llm")
@@ -500,7 +412,7 @@ def test_unparseable_llm_response_error_surfaces_502_with_sanitized_body_and_no_
     # A reachable-but-unparseable LLM response is likewise an upstream fault (502), sanitized.
     err = UnparseableLLMResponseError(_POISON)
     with (
-        patch("aiac.agent.controller.routes.onboard_service", side_effect=err),
+        patch("aiac.agent.controller.routes.onboard_and_apply", side_effect=err),
         patch("aiac.agent.controller.routes.compute_and_apply") as pce,
     ):
         resp = client.post("/apply/service/svc-llm")
@@ -514,7 +426,7 @@ def test_policy_rules_builder_error_body_is_sanitized_to_detail_without_leak():
     # summary, not str(exc) — a poisoned message must not escape to the client.
     err = PolicyRulesBuilderError(f"Auditor rejected after 3 retries: {_POISON}")
     with (
-        patch("aiac.agent.controller.routes.onboard_service", side_effect=err),
+        patch("aiac.agent.controller.routes.onboard_and_apply", side_effect=err),
         patch("aiac.agent.controller.routes.compute_and_apply") as pce,
     ):
         resp = client.post("/apply/service/svc-reject")
@@ -529,7 +441,7 @@ def test_policy_rules_builder_base_error_safety_net_surfaces_500():
     # 502/422 tests above), because Starlette resolves the most-specific registered handler.
     err = PolicyRulesBuilderBaseError(_POISON)
     with (
-        patch("aiac.agent.controller.routes.onboard_service", side_effect=err),
+        patch("aiac.agent.controller.routes.onboard_and_apply", side_effect=err),
         patch("aiac.agent.controller.routes.compute_and_apply") as pce,
     ):
         resp = client.post("/apply/service/svc-boom")
@@ -549,7 +461,7 @@ def test_log_by_type_invoked_with_the_raised_error_for_each_sanitized_handler():
     ]
     for err, expected_status in cases:
         with (
-            patch("aiac.agent.controller.routes.onboard_service", side_effect=err),
+            patch("aiac.agent.controller.routes.onboard_and_apply", side_effect=err),
             patch("aiac.agent.controller.routes.compute_and_apply"),
             patch("aiac.agent.controller.routes.log_by_type") as log,
         ):

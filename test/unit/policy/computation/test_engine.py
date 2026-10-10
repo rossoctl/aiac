@@ -29,7 +29,7 @@ run pushes (``FakeStore.pushed_apm``). The expected values are literals.
 import os
 import threading
 from contextlib import ExitStack, contextmanager
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -145,6 +145,9 @@ class FakeStore:
             return self.data[service_id].model_copy(deep=True)
         return _spm(service_id)  # real lib returns a fresh empty SPM on 404
 
+    def find_service_policy(self, service_id):
+        return self.data[service_id].model_copy(deep=True) if service_id in self.data else None
+
     def _scan_by_role(self, role):
         return [
             m.model_copy(deep=True)
@@ -221,6 +224,7 @@ class FakeStore:
 
 _BOUNDARY = (
     "get_service_policy",
+    "find_service_policy",
     "get_service_policies_by_role",
     "list_service_policies",
     "apply_service_policy",
@@ -3582,154 +3586,68 @@ def test_a_lift_of_a_service_that_holds_no_shared_role_deploys_what_an_onboardin
     assert sorted(sid for sid, _ in store.service_writes) == [_T1, "x-agent"]
 
 
-# ---- the window between the lift and the re-enable (LIM-09) ----------------- #
-# The caller re-enables the client after ``compute_and_apply`` returns, outside  #
-# the PCE lock. A render in that window reads the client as disabled. So the     #
-# lift counts the focus as waiting for its re-enable, and every operation counts #
-# a waiting service as live, until the caller calls ``lift_done`` (after the     #
-# re-enable, also when it fails).                                                #
-def _lift_then(catalog, store, *, lift_done=False):
-    """The lift of team2 (the focus, still disabled), then ``lift_done`` if asked."""
-    with engine_env(catalog, store) as compute:
-        from aiac.policy import computation
+# ---- on_applied: the re-enable under the PCE lock --------------------------- #
+# A render after the lift that read the client as disabled would take the focus  #
+# out of the CRs of its roles again. So the caller gives the re-enable as        #
+# ``on_applied``, and ``compute_and_apply`` calls it under the PCE lock, after   #
+# the run succeeds: no other operation reads the catalog in between.             #
+def test_on_applied_runs_under_the_pce_lock_after_the_deploy():
+    from aiac.policy.computation import engine
 
-        compute([], focus_service=_A2)
-        if lift_done:
-            computation.lift_done(_A2)
-
-
-def _rerender_tool(catalog, store) -> ServicePolicyModel:
-    """A role-members event of the shared role; the tool's entry that it deploys."""
-    before = len(store.policy_pushes)
-    run_rerender("r-src-op", catalog=catalog, store=store)
-    (push,) = store.policy_pushes[before:]
-    return next(spm for spm in push.services if spm.service_id == _T1)
-
-
-def test_a_render_after_the_lift_and_before_the_re_enable_keeps_the_lifted_holder():
     catalog, initial = _lift_fixture()  # team2 is still disabled in the catalog
     store = FakeStore(initial)
-    _lift_then(catalog, store)
+    seen = []
 
-    assert _source_roles(_rerender_tool(catalog, store)) == {_A1: ["r-src-op"], _A2: ["r-src-op"]}
-
-
-def test_a_run_after_the_lift_and_before_the_re_enable_keeps_the_rules_and_the_cr_of_the_lifted_service():
-    # The routing guard keeps a rule of team2's role, and the deploy keeps the CR of team2.
-    catalog, initial = _lift_fixture()
-    store = FakeStore(initial)
-    _lift_then(catalog, store)
-    A2S = _scope("s-a2-inbound", "a2.inbound", service_id=_A2)
-    catalog = [svc.model_copy(update={"scopes": [A2S]}) if svc.serviceId == _A2 else svc for svc in catalog]
-    before = len(store.policy_pushes)
+    def on_applied():
+        seen.append((engine._pce_lock.locked(), store.apply_policy_count))
 
     with engine_env(catalog, store) as compute:
-        compute([_rule(_developer("dev-user"), A2S)])
+        compute([], focus_service=_A2, on_applied=on_applied)
+
+    assert seen == [(True, 1)]
+
+
+def test_a_render_after_a_lift_whose_on_applied_re_enabled_the_client_keeps_the_lifted_holder():
+    catalog, initial = _lift_fixture()
+    store = FakeStore(initial)
+
+    def reenable():
+        catalog[:] = [svc.model_copy(update={"enabled": True}) if svc.serviceId == _A2 else svc for svc in catalog]
+
+    with engine_env(catalog, store) as compute:
+        compute([], focus_service=_A2, on_applied=reenable)
+    before = len(store.policy_pushes)
+    run_rerender("r-src-op", catalog=catalog, store=store)
 
     (push,) = store.policy_pushes[before:]
-    assert [spm.service_id for spm in push.services] == [_A2]
-    assert _pairs(store.data[_A2].inbound_allow_rules) == [("r-user-dev", "s-a2-inbound")]
+    tool = next(spm for spm in push.services if spm.service_id == _T1)
+    assert _source_roles(tool) == {_A1: ["r-src-op"], _A2: ["r-src-op"]}
 
 
-def test_after_lift_done_a_service_that_is_still_disabled_is_not_live():
-    # The re-enable failed: the client is still disabled, so team2 must not count as live any more.
+def test_a_failed_run_does_not_call_on_applied():
+    # The client then stays disabled (the failed-service marker), never enabled-with-no-policy.
     catalog, initial = _lift_fixture()
     store = FakeStore(initial)
-    _lift_then(catalog, store, lift_done=True)
-
-    assert _source_roles(_rerender_tool(catalog, store)) == {_A1: ["r-src-op"]}
-
-
-def test_each_lift_waits_for_its_own_lift_done():
-    # Two lifts of team2 overlap (an HTTP onboarding and a NATS redelivery). The re-enable of one
-    # fails: team2 still waits for the re-enable of the other.
-    catalog, initial = _lift_fixture()
-    store = FakeStore(initial)
-    _lift_then(catalog, store)
-    _lift_then(catalog, store, lift_done=True)
-    assert _source_roles(_rerender_tool(catalog, store)) == {_A1: ["r-src-op"], _A2: ["r-src-op"]}
-
-    with engine_env(catalog, store):
-        from aiac.policy import computation
-
-        computation.lift_done(_A2)
-    assert _source_roles(_rerender_tool(catalog, store)) == {_A1: ["r-src-op"]}
-
-
-def test_a_failed_lift_does_not_wait_for_a_re_enable():
-    # compute_and_apply raises, so the caller does not re-enable the client and calls no lift_done.
-    catalog, initial = _lift_fixture()
-    store = FakeStore(initial)
+    on_applied = MagicMock()
     with (
         engine_env(catalog, store) as compute,
         patch("aiac.policy.computation.engine.apply_policy", side_effect=RuntimeError("writer down")),
         pytest.raises(RuntimeError, match="writer down"),
     ):
-        compute([], focus_service=_A2)
+        compute([], focus_service=_A2, on_applied=on_applied)
 
-    assert _source_roles(_rerender_tool(catalog, store)) == {_A1: ["r-src-op"]}
-
-
-def test_a_run_of_an_enabled_focus_does_not_wait_for_a_re_enable():
-    # Not a lift. If an admin disables the client later, it is not live.
-    catalog, initial = _lift_fixture(a2_enabled=True, a2_stored=True)
-    store = FakeStore(initial)
-    _lift_then(catalog, store)
-    disabled, _ = _lift_fixture()
-
-    assert _source_roles(_rerender_tool(disabled, store)) == {_A1: ["r-src-op"]}
+    on_applied.assert_not_called()
 
 
-def test_a_quarantine_ends_the_wait_for_a_re_enable():
-    # A later onboarding of team2 failed before the re-enable of the lift: the quarantine wins.
+def test_a_failed_on_applied_propagates_and_releases_the_pce_lock():
+    from aiac.policy.computation import engine
+
     catalog, initial = _lift_fixture()
     store = FakeStore(initial)
-    _lift_then(catalog, store)
-    before = len(store.policy_pushes)
+    with (
+        engine_env(catalog, store) as compute,
+        pytest.raises(RuntimeError, match="idp down"),
+    ):
+        compute([], focus_service=_A2, on_applied=MagicMock(side_effect=RuntimeError("idp down")))
 
-    run_quarantine(_A2, catalog=catalog, store=store)
-
-    (push,) = store.policy_pushes[before:]
-    assert [_source_roles(spm) for spm in push.services] == [{_A1: ["r-src-op"]}] * 2
-    assert _source_roles(_rerender_tool(catalog, store)) == {_A1: ["r-src-op"]}
-
-
-def test_the_wait_is_read_before_the_catalog():
-    # The caller ends the wait only after the re-enable returns. A render whose catalog read comes
-    # before the re-enable, while the caller's lift_done comes before the render reads the set, would
-    # see team2 disabled and not waiting. So the set is read first.
-    catalog, initial = _lift_fixture()
-    store = FakeStore(initial)
-    _lift_then(catalog, store)
-
-    def get_services(roles=None):
-        from aiac.policy.computation import lift_done
-
-        lift_done(_A2)  # the re-enable commits after this read; then the caller ends the wait
-        return list(catalog)
-
-    with engine_env(catalog, store), patch.object(Configuration, "get_services", side_effect=get_services):
-        from aiac.policy.computation import rerender_role
-
-        rerender_role("r-src-op")
-
-    tool = next(spm for spm in store.last_push.services if spm.service_id == _T1)
-    assert _source_roles(tool) == {_A1: ["r-src-op"], _A2: ["r-src-op"]}
-
-
-def test_lift_done_of_a_service_that_waits_for_nothing_is_a_no_op():
-    from aiac.policy.computation import engine, lift_done
-
-    lift_done(_A2)
-
-    assert engine._awaiting_reenable == {}
-
-
-def test_the_read_model_counts_a_service_that_waits_for_its_re_enable_as_live():
-    catalog, initial = _lift_fixture()
-    store = FakeStore(initial)
-    _lift_then(catalog, store)
-
-    model = _read_model(_T1, store=store, catalog=catalog)
-
-    assert _source_roles(model.services[0]) == {_A1: ["r-src-op"], _A2: ["r-src-op"]}
+    assert not engine._pce_lock.locked()

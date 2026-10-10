@@ -136,7 +136,7 @@ The callers:
 - `DELETE /policy/services/{service_id:path}` — the PCE quarantine and decommission (D20).
 - `DELETE /policy` — no AIAC caller (C1). It stays as an operator tool. Under D20 it denies every managed pod.
 
-**`PUT /policy` (replace).** The writer upserts every entry. Then it lists every CR with the managed-by label, cluster-wide, and deletes each CR whose `(namespace, name)` is not an entry of the model. A CR without the label is never touched. An empty model deletes every AIAC CR. The delete step runs only after every upsert succeeded: if an upsert fails, the PUT returns the error and deletes nothing.
+**`PUT /policy` (replace).** The writer upserts every entry. Then it lists every CR with the managed-by label, cluster-wide, and deletes each CR whose `(namespace, name)` is not an entry of the model. A CR without the label is never touched. An empty model deletes every AIAC CR. The delete step runs only after every upsert succeeded: if an upsert fails, the PUT returns the error and deletes nothing. An entry whose id gives no CR identity (`identity_ref` raises `ValueError`) is logged and skipped, not a `400`: such an entry cannot have a CR, and one bad stored SPM must not stop the resync at every Controller start.
 
 **`{service_id:path}`.** The id is a SPIFFE URI or `<ns>/<name>`, so it contains `/`. The server decodes the library's `%2F` back to `/` before routing, so a single-segment `{service_id}` never matches it (HTTP 404).
 
@@ -145,14 +145,14 @@ The callers:
 | Endpoint | Success | Error |
 |----------|---------|-------|
 | `POST /policy` | `204 No Content` | **400** `{"error": …}` for a malformed / namespace-less id (an SPM `service_id`, an APM `agent_id` or a `pass_through` id; the batch aborts, naming the bad id; entries already applied stay written — no rollback); **422** for a body with a wrong or missing tag (pydantic), a body that mixes the sides, or an agent-side model that has an agent also in `pass_through` (see [The policy model](#the-policy-model-anypolicymodel-d18a)); nothing is written; **502** `{"error": …}` for a Kubernetes API failure (or the additive dump's `OSError`) |
-| `PUT /policy` | `204 No Content` | The same as `POST /policy`. An error in the upsert step stops the PUT before the delete step. A per-item 404 in the delete step is success (a concurrent delete) |
+| `PUT /policy` | `204 No Content` | The same as `POST /policy`, but no **400**: an entry with a malformed / namespace-less id is logged and skipped, and the other entries are written. An error in the upsert step stops the PUT before the delete step. A per-item 404 in the delete step is success (a concurrent delete) |
 | `DELETE /policy/services/{service_id:path}` | `204 No Content` | **400** for a malformed id; **502** for a Kubernetes API failure. Deleting a **missing** CR is a no-op **204** (k8s 404 treated as success — idempotent) |
 | `DELETE /policy` | `204 No Content` | **502** for a Kubernetes API failure |
 | `GET /health` | `200 OK` `{"status": "ok"}` | `503 Service Unavailable` `{"status": "unavailable", "error": …}` if the bounded CR list fails |
 
 `GET /health` performs a bounded (`limit=1`) cluster-wide list of the CRD: a successful list — **including an empty one** — is `200`; any failure (unreachable API, RBAC-forbidden, CRD not served) is `503`.
 
-**400 vs 502 (Q11).** `400` is reserved strictly for a malformed / namespace-less id — the `identity_ref` `ValueError`, whose message names the bad id. `502` is strictly for Kubernetes API failures and the additive rego dump's `OSError`. The two are never conflated. **422** is a body that does not parse (FastAPI / pydantic validation, for example a wrong or missing `enforcement_side` tag) or that fails one of the two body checks (a body that mixes the sides, or an agent that is also in `pass_through`); a 400 is a parsed body with a bad id.
+**400 vs 502 (Q11).** `400` is reserved strictly for a malformed / namespace-less id — the `identity_ref` `ValueError`, whose message names the bad id (`POST /policy` and `DELETE /policy/services/{service_id:path}`; `PUT /policy` skips such an entry). `502` is strictly for Kubernetes API failures and the additive rego dump's `OSError`. The two are never conflated. **422** is a body that does not parse (FastAPI / pydantic validation, for example a wrong or missing `enforcement_side` tag) or that fails one of the two body checks (a body that mixes the sides, or an agent that is also in `pass_through`); a 400 is a parsed body with a bad id.
 
 ---
 
@@ -616,7 +616,7 @@ These limits concern the writer, the Rego and the bundle:
 
 ## Library: `aiac.pdp.policy.library.api`
 
-HTTP client module wrapping the PDP Policy Writer REST API. Exposes four module-level functions. Service URL is read from the `AIAC_PDP_POLICY_URL` environment variable (default: `http://127.0.0.1:7072`). All functions raise `RuntimeError` on non-2xx response.
+HTTP client module wrapping the PDP Policy Writer REST API. Exposes four module-level functions. Service URL is read from the `AIAC_PDP_POLICY_URL` environment variable (default: `http://127.0.0.1:7072`). Every request has a timeout (`AIAC_PDP_HTTP_TIMEOUT`, default 60 s). All functions raise `RuntimeError` on non-2xx response.
 
 ```python
 def apply_policy(model: PolicyModel) -> None
@@ -732,7 +732,7 @@ docker build -f src/aiac/pdp/service/policy/opa/Dockerfile \
 
 - **Kube config at import:** `_load_kube_config()` tries `config.load_incluster_config()`, falling back to `config.load_kube_config()` (local dev). Both failing is non-fatal — the module stays importable and API calls surface as 502/503 until real config exists. A module-level `client.CustomObjectsApi` handles all CR operations.
 - **Code constants (never env vars):** `_GROUP = "agent.rossoctl.dev"`, `_VERSION = "v1alpha1"`, `_PLURAL = "authorizationpolicies"`, `_MANAGED_BY_LABEL = {"app.kubernetes.io/managed-by": "aiac-pdp-policy-writer"}`, `_FIELD_MANAGER = "aiac-pdp-policy-writer"` (Q8).
-- **`identity_ref(service_id) -> (namespace, name)`** (in `rego.py`): SPIFFE or `<ns>/<name>` → DNS-1123-validated `(namespace, name)`; raises `ValueError` (→ 400) when no namespace is derivable or a segment is an invalid label — no fallback.
+- **`identity_ref(service_id) -> (namespace, name)`** (in `rego.py`): SPIFFE or `<ns>/<name>` → DNS-1123-validated `(namespace, name)`; raises `ValueError` (→ 400; `PUT /policy` skips the entry) when no namespace is derivable or a segment is an invalid label — no fallback.
 - **The generators** (in `rego.py`) render four package kinds: the agent inbound (both sides), the agent outbound (agent side), the tool inbound (target side) and the pass-through (both sides). See [What each side renders](#what-each-side-renders).
 - **The tool inbound generator** renders the target-side tool package from the projection of one SPM (D26): `owned_tools`, `self_client_id` (the SPM `service_id`), `subject_roles` / `source_roles`, the four de-prefixed role maps, `session_methods`, the gate functions (`subject_allows` / `subject_denies` / `source_allows` / `source_denies`), `tool_ok(tool)`, `default allow := false`, and the three `allow` rules (`tools/call`; the session messages over `owned_tools`, only when the tool owns a tool; the session messages for `self_client_id`). It emits no platform-client bypass.
 - **The pass-through generator** `generate_pass_through_rego(tier)` renders one pass-through package: the package header, `import rego.v1` and `allow := true` (D24), for either tier.
@@ -748,7 +748,7 @@ docker build -f src/aiac/pdp/service/policy/opa/Dockerfile \
 - **`_delete_all()`:** `list_cluster_custom_object` filtered by the managed-by label selector, then delete each item (per-item 404 tolerated for concurrent-delete races); then clear the dumped tree if enabled.
 - **`_run_write(op)`** maps outcomes to responses: success → **204**; `ValueError` → **400** `{"error": …}`; `ApiException` → **502** `{"error": …}`; `OSError` (the additive dump) → **502**. A body that does not parse, or that fails a body check (`_one_side_only`, `_no_agent_pass_through`), never reaches `_run_write`: FastAPI returns **422**.
 - **`POST /policy`:** dispatch on the subclass. `TargetSidePolicyModel`: upsert one CR per `services[]` SPM — the tool inbound or the agent inbound (by `service_type`), and the pass-through outbound. `AgentSidePolicyModel`: upsert one agent CR per `agents[]` APM, and one pass-through CR per `pass_through[]` id. A malformed id aborts the batch with a 400 naming it (entries already applied before that point stay written — no rollback).
-- **`PUT /policy`:** the same upserts as `POST /policy`; then list the CRs by the managed-by label and delete each one whose `(namespace, name)` is not an entry (per-item 404 tolerated). An upsert error stops the PUT before the delete step.
+- **`PUT /policy`:** the same upserts as `POST /policy`, but an entry whose id makes `identity_ref` raise is logged (a warning) and skipped; then list the CRs by the managed-by label and delete each one whose `(namespace, name)` is not an entry (per-item 404 tolerated). An upsert error stops the PUT before the delete step.
 - **`DELETE /policy/services/{service_id}`:** the per-service delete.
 - **`DELETE /policy`:** `_delete_all()`.
 - **`GET /health`:** a bounded `list_cluster_custom_object(..., limit=1)` — a successful list (even empty) → `200 {"status": "ok"}`; any failure (unreachable API, RBAC-forbidden, CRD not served) → `503 {"status": "unavailable", "error": …}`. The dump dir is not part of this signal.

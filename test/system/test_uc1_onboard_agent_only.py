@@ -4,7 +4,7 @@ The simplest rung (issue ``testing/5.4.1-uc1-onboard-agent-only.md``; spec
 ``docs/testing/uc1-onboarding-pipeline.md``): onboard **only** the ``github-agent`` **event-driven**,
 by deploying its workload (deploy → the rossoctl operator registers a Keycloak client → Keycloak
 emits ``CLIENT_CREATED`` → the AIAC SPI ``aiac-event-listener`` publishes on NATS → the agent's
-consumer runs ``onboard_service`` — the same handler the removed ``POST /apply`` once called). The
+consumer runs ``onboard_and_apply`` — the same handler the removed ``POST /apply`` once called). The
 ``github-tool`` is **not deployed** (deploying it would onboard it), so no tool is onboarded. Then
 assert the agent-side outcome by driving **real HTTP requests through AuthBridge** and reading the
 **real OPA plugin's** allow/deny (handoff 08; live loop shape in ``k8s/opa-kind-runbook.md``). Proves

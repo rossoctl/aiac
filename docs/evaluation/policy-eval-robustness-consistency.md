@@ -345,12 +345,11 @@ Neither suite reads `KEYCLOAK_URL`, `KEYCLOAK_ADMIN_USERNAME`/`PASSWORD`, `AIAC_
 
 ```bash
 # Both suites need only LLM_BASE_URL/LLM_MODEL/LLM_API_KEY — no Keycloak/opa:
-.venv/bin/pytest eval/test_policy_pipeline_consistency.py -m eval -v
-.venv/bin/pytest eval/test_policy_pipeline_robustness.py -m eval -v
+.venv/bin/pytest -m eval -k test_policy_pipeline_consistency -v
+.venv/bin/pytest -m eval -k test_policy_pipeline_robustness -v
 
 # Override repeat count for the consistency suite:
-PRB_CONSISTENCY_REPEATS=10 .venv/bin/pytest eval/test_policy_pipeline_consistency.py \
-  -m eval -v
+PRB_CONSISTENCY_REPEATS=10 .venv/bin/pytest -m eval -k test_policy_pipeline_consistency -v
 
 # A pass/fail/skip/error report for the run is written alongside the policy-eval-scenarios one:
 #   eval/reports/report_<DD_MM_HH_MM_SS>.md (UTC by default; set EVAL_REPORT_TZ to change it)

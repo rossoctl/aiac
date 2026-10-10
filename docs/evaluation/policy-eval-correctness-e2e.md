@@ -149,13 +149,13 @@ mechanism (same underlying `orchestrate_prb` parameter).
 
 ```bash
 # Unit-test the pure-logic helpers first (no live infra, runs in the default fast pass):
-.venv/bin/pytest eval/test_correctness_e2e_helpers.py -v
+.venv/bin/pytest -k test_correctness_e2e_helpers -v
 
 # The suite itself — needs KEYCLOAK_URL + admin creds + LLM_* + opa on PATH:
-.venv/bin/pytest eval/test_policy_pipeline_correctness_e2e.py -m eval -v -s
+.venv/bin/pytest -m eval -k test_policy_pipeline_correctness_e2e -v -s
 
 # Sanity-check the fixture's primary consumer still passes against the now-parallelized fixture:
-.venv/bin/pytest eval/test_policy_pipeline_eval.py -m eval -v
+.venv/bin/pytest -m eval -k test_policy_pipeline_eval -v
 ```
 
 `require_env_or_skip(...)` is the first line of the parametrized test function; `opa_bin()` skips the test

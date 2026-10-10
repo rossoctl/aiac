@@ -45,6 +45,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -137,13 +138,15 @@ class Stack:
         self.deliver_role_events()
         self.onboard(workload.client_id)
 
-    def onboard(self, client_id: str) -> None:
+    def onboard(self, client_id: str, on_applied: Callable[[], None] | None = None) -> None:
         """UC-1 after Provision: the Service Policy Builder (with the real resolver and PRB graphs)
         for the service's Keycloak UUID, then one ``compute_and_apply`` with the clientId as
-        ``focus_service`` and ``override=False``, as the Controller does with ``onboard_service``."""
+        ``focus_service`` and ``override=False``, as ``onboard_and_apply`` does. ``on_applied`` is the
+        re-enable that ``onboard_and_apply`` gives (the client of these services stays enabled, so
+        most tests give none)."""
         service = self.realm.service(client_id)
         rules = ServicePolicyBuilder.build(service.id, service.type)
-        computation.compute_and_apply(rules, override=False, focus_service=client_id)
+        computation.compute_and_apply(rules, override=False, focus_service=client_id, on_applied=on_applied)
 
     def deliver_role_events(self) -> None:
         """Deliver the role-members events that the realm recorded: the Controller calls
@@ -212,6 +215,7 @@ def stack(monkeypatch: pytest.MonkeyPatch, tmp_path) -> Stack:
     monkeypatch.setattr(Configuration, "_request", _no_network("IdP library"))
     for name in (
         "get_service_policy",
+        "find_service_policy",
         "list_service_policies",
         "get_service_policies_by_role",
         "apply_service_policy",

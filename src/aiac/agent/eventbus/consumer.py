@@ -53,12 +53,12 @@ from aiac.agent.policy_rules_builder.graph import (
 )
 from aiac.agent.shared.env import env_num
 from aiac.agent.shared.error_logging import log_by_type
-from aiac.agent.uc.onboarding.orchestrator import ServiceNotVisibleError, onboard_service, reenable_service
+from aiac.agent.uc.onboarding.orchestrator import ServiceNotVisibleError, onboard_and_apply
 from aiac.agent.uc.onboarding.preconditions import EnforcementPreconditionError
 from aiac.agent.uc.policy_update.build import build_policy
 from aiac.agent.uc.role_update.role import update_role
-from aiac.idp.configuration.models import ClientId, ServiceUuid
-from aiac.policy.computation import compute_and_apply, lift_done, rerender_role
+from aiac.idp.configuration.models import ServiceUuid
+from aiac.policy.computation import compute_and_apply, rerender_role
 from aiac.policy.model.models import PolicyRule
 
 logger = logging.getLogger(__name__)
@@ -126,29 +126,30 @@ async def _nak_not_visible(msg: Msg) -> None:
     )
 
 
-def _handle(subject: str) -> tuple[list[PolicyRule], bool, ClientId | None]:
+def _handle(subject: str) -> tuple[list[PolicyRule], bool]:
     """Dispatch ``subject`` to its use-case handler — the subject switch for every subject that goes
-    through ``compute_and_apply`` (``_process`` sends a role-membership subject to ``rerender_role``
-    first). Returns ``(rules, override, focus_service)``: ``focus_service`` is the onboarded service's
-    clientId (from ``onboard_service``), and ``None`` for every other subject."""
-    if subject.startswith(_SERVICE_PREFIX):
-        return onboard_service(ServiceUuid(subject[len(_SERVICE_PREFIX) :]))
+    through the caller's ``compute_and_apply`` (``_process`` sends an onboarding subject to
+    ``onboard_and_apply`` and a role-membership subject to ``rerender_role`` first). Returns
+    ``(rules, override)``."""
     if subject.startswith(_ROLE_PREFIX):
         # Mirror image of the Keycloak SPI's SubjectMapper.encodeSubjectToken: role names may
         # contain '.', which NATS treats as a token separator, so the SPI percent-encodes them
         # into a single token before publishing. unquote() is the general-purpose inverse; safe
         # here because every literal '%' in the original name was itself escaped to "%25".
-        return *update_role(unquote(subject[len(_ROLE_PREFIX) :])), None
+        return update_role(unquote(subject[len(_ROLE_PREFIX) :]))
     if subject == _POLICY_BUILD_SUBJECT:
-        return *build_policy(), None
+        return build_policy()
     raise ValueError(f"no handler for subject {subject!r}")
 
 
-async def _process(subject: str) -> None:
+async def _process(subject: str, redelivered: bool = False) -> None:
     """Do the work of one message, mirroring its ``/apply/*`` route. Raises on a failure; the ack
-    contract is ``_dispatch``'s."""
-    # ``_handle`` (the LLM-backed policy-rules builder) and ``compute_and_apply`` are SYNCHRONOUS and
-    # slow (tens of seconds); ``rerender_role`` is synchronous too (IdP, store and PDP calls). nats-py
+    contract is ``_dispatch``'s. ``redelivered`` (not the first delivery) makes an onboarding read
+    its client one time, with no wait (``wait_for_client=False``): the nak delay already gave the
+    client time to become visible."""
+    # ``_handle`` and ``onboard_and_apply`` (the LLM-backed policy-rules builder) and
+    # ``compute_and_apply`` are SYNCHRONOUS and slow (tens of seconds); ``rerender_role`` is
+    # synchronous too (IdP, store and PDP calls). nats-py
     # runs the consumer callback ON the event loop, so calling them inline froze the loop for the whole
     # onboard — starving the FastAPI ``/health`` endpoint until the liveness probe killed the pod
     # mid-onboard (then NATS redelivered the unacked message and the race repeated). Offload each to
@@ -160,22 +161,15 @@ async def _process(subject: str) -> None:
         # compute_and_apply, no re-enable. The role id is a UUID: one token, passed as it is (no decode).
         await loop.run_in_executor(None, rerender_role, subject.removeprefix(_ROLE_MEMBERS_PREFIX))
         return
-    # UC1 only: ``focus`` is the onboarded service's clientId, so the PCE routing guard keeps
-    # its rules while its client is still disabled (a re-onboarding of a quarantined service).
-    rules, override, focus = await loop.run_in_executor(None, _handle, subject)
-    await loop.run_in_executor(None, functools.partial(compute_and_apply, rules, override, focus_service=focus))
-    # UC1 only (only an onboarding has a focus service): re-enable the client AFTER a
-    # successful compute_and_apply, mirroring the HTTP route. If compute_and_apply raised
-    # above, this is skipped and the client stays disabled (the failed-service marker), never
-    # enabled-with-no-policy. The re-enable is an IdP call, so it takes the subject's UUID. A lift
-    # of a quarantine counts the service as live until lift_done (LIM-09): end that wait only after
-    # the re-enable, also when the re-enable fails (the client then stays disabled). lift_done takes
-    # no PCE lock, so it does not block the event loop.
-    if focus is not None:
-        try:
-            reenable_service(ServiceUuid(subject.removeprefix(_SERVICE_PREFIX)))
-        finally:
-            lift_done(focus)
+    if subject.startswith(_SERVICE_PREFIX):
+        # UC1, mirroring the HTTP route: onboard_and_apply makes the compute_and_apply call and
+        # re-enables the client under the PCE lock after the apply succeeds. The subject token is
+        # the client's Keycloak UUID.
+        uuid = ServiceUuid(subject.removeprefix(_SERVICE_PREFIX))
+        await loop.run_in_executor(None, functools.partial(onboard_and_apply, uuid, wait_for_client=not redelivered))
+        return
+    rules, override = await loop.run_in_executor(None, _handle, subject)
+    await loop.run_in_executor(None, compute_and_apply, rules, override)
 
 
 class AiacEventConsumer:
@@ -231,7 +225,7 @@ class AiacEventConsumer:
 
     async def _dispatch(self, msg: Msg) -> None:
         try:
-            await _process(msg.subject)
+            await _process(msg.subject, redelivered=msg.metadata.num_delivered > 1)
         except Exception as exc:
             # Log exactly once, routed by exception TYPE to its per-persona named logger.
             # FastAPI's exception handlers never fire on this path (there is no request), so

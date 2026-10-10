@@ -26,7 +26,7 @@ from aiac.policy.model.models import PolicyModel, TargetSidePolicyModel, AgentSi
 ## Submodule: `aiac.pdp.policy.library.api`
 
 ### Description
-HTTP client module wrapping the PDP Policy Writer REST API. Exposes four module-level functions. Service URL is read from the `AIAC_PDP_POLICY_URL` environment variable (default: `http://127.0.0.1:7072`). All functions raise `RuntimeError` on non-2xx response.
+HTTP client module wrapping the PDP Policy Writer REST API. Exposes four module-level functions. Service URL is read from the `AIAC_PDP_POLICY_URL` environment variable (default: `http://127.0.0.1:7072`). All functions raise `RuntimeError` on non-2xx response. Every request has a timeout (`AIAC_PDP_HTTP_TIMEOUT`, default 60 s), so a hung writer (for example a stuck Kubernetes API) cannot block the caller, which holds the PCE lock, for an unlimited time. A request that times out raises the `requests` timeout error.
 
 No `realm` parameter — the PDP Policy Writer operates on a Kubernetes CR, not a Keycloak realm.
 
@@ -60,7 +60,7 @@ def delete_policy() -> None
 
 The `model` of `apply_policy` and `replace_policy` is a subclass of the policy model (D18a): a `TargetSidePolicyModel` or an `AgentSidePolicyModel`. The library sends it with its `enforcement_side` tag. The writer parses the body as `AnyPolicyModel` (a discriminated union on the tag) and dispatches the render on the subclass. The writer also rejects with **422** a body with a wrong or missing tag, a body that has an entry field of the other side, and an agent-side model that has an agent also in `pass_through` (see [`pdp-policy-writer-opa.md` → The policy model](pdp-policy-writer-opa.md#the-policy-model-anypolicymodel-d18a)). An **entry** is one CR: under target side, each `services[]` SPM; under agent side, each `agents[]` APM (the agent CR) and each `pass_through[]` clientId (a pass-through CR). See [`policy-model.md`](policy-model.md) and [`pdp-policy-writer-opa.md`](pdp-policy-writer-opa.md).
 
-`service_id` is the clientId (it can contain `/`). The library URL-encodes it into one safe path segment before it builds the URL. The writer takes the CR name and namespace from `identity_ref(service_id)`. The writer returns `204` on success, `400` for a bad id, `422` for a bad body, and `502` for a Kubernetes API failure. The library raises `RuntimeError` on every non-2xx response.
+`service_id` is the clientId (it can contain `/`). The library URL-encodes it into one safe path segment before it builds the URL. The writer takes the CR name and namespace from `identity_ref(service_id)`. The writer returns `204` on success, `400` for a bad id (`PUT /policy` logs and skips such an entry instead), `422` for a bad body, and `502` for a Kubernetes API failure. The library raises `RuntimeError` on every non-2xx response.
 
 ### Routes and callers (D18c)
 
@@ -84,11 +84,12 @@ Known limits:
 
 ### Configuration
 
-Read from `AIAC_PDP_POLICY_URL` environment variable (or `.env` file co-located with `api.py`). Falls back to the default if absent.
+Read from the environment (or `.env` file co-located with `api.py`). Falls back to the default if absent. `AIAC_PDP_HTTP_TIMEOUT` is read one time, at import.
 
 | Variable | Default |
 |----------|---------|
 | `AIAC_PDP_POLICY_URL` | `http://127.0.0.1:7072` |
+| `AIAC_PDP_HTTP_TIMEOUT` | `60` (seconds, per request; longer than the store's `AIAC_HTTP_TIMEOUT`, because one `PUT /policy` writes every CR) |
 
 ### Usage
 
@@ -122,6 +123,7 @@ Key behaviors to assert:
 - `delete_policy()` issues `DELETE /policy`.
 - The module has no `apply_agent_policy` and no `delete_agent_policy`.
 - Any non-2xx response raises `RuntimeError`.
+- Every call sends the timeout (`AIAC_PDP_HTTP_TIMEOUT`).
 - `AIAC_PDP_POLICY_URL` is read from env; falls back to `http://127.0.0.1:7072`.
 
 ---

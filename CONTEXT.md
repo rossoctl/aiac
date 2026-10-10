@@ -153,11 +153,12 @@ _Avoid_: rollback (the IdP-side teardown that comes before it), block, ban.
 
 **Focus service**:
 The service that the current onboarding builds rules for — the `focus_service`
-the onboarding route and the NATS consumer pass to the PCE, as its clientId
+the orchestrator (`onboard_and_apply`) passes to the PCE, as its clientId
 (never its Keycloak UUID). It is the one
 disabled service that the routing guard and the focal resolver do not skip,
 because a re-onboarding of a quarantined service builds and applies while its
-client is still disabled (`reenable_service` runs after the apply).
+client is still disabled (the PCE calls `reenable_service`, the `on_applied` of
+the onboarding, under its lock after the apply).
 _Avoid_: target service (a target is the service an agent calls), focal entity
 (the per-pass subject inside one build).
 

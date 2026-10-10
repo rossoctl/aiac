@@ -244,15 +244,15 @@ which applies here unchanged.
 
 ```bash
 # TDD the scorer first (pure logic, no live infra, runs in the default fast pass):
-.venv/bin/pytest eval/test_correctness_scorer.py -v
+.venv/bin/pytest -k test_correctness_scorer -v
 
 # The suite itself — needs only LLM_BASE_URL/LLM_MODEL/LLM_API_KEY, no Keycloak/opa:
-.venv/bin/pytest eval/test_policy_pipeline_correctness_prb.py -m eval -v -s
+.venv/bin/pytest -m eval -k test_policy_pipeline_correctness_prb -v -s
 
 # Regression-check the rewritten policy text against the suites that already depend on this
 # corpus (the real risk of the rewrite — that reworded text still produces the same decisions):
-.venv/bin/pytest eval/test_policy_pipeline_consistency.py -m eval -v
-.venv/bin/pytest eval/test_policy_pipeline_robustness.py -m eval -v
+.venv/bin/pytest -m eval -k test_policy_pipeline_consistency -v
+.venv/bin/pytest -m eval -k test_policy_pipeline_robustness -v
 ```
 
 Like every sibling suite, `require_env_or_skip("LLM_BASE_URL", "LLM_MODEL", "LLM_API_KEY")` is the

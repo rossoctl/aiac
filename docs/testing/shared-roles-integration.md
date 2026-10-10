@@ -96,17 +96,16 @@ files):
 
 | File | Class | What it checks |
 |---|---|---|
-| `test_quarantine_lift.py` | `TestTheLiftPutsTheHolderBack`, `TestTheStoreAfterALift`, `TestNoExtraDeploy`, `TestTheWindowBeforeTheReEnable` | A failed onboarding of one holder of a shared role quarantines it, and a successful re-onboarding lifts the quarantine (the tests drop the role-members event of the Provision re-map, which Keycloak sends also for a mapping that is already there). Each callee CR of the shared role names the lifted holder again, also a callee that the lift routes no rule to (both sides). While every holder of the role is quarantined, the callees keep the edges of the role, and each lift gives the role back to the lifted holder only. The resync after the lift gives the same CRs. The lift writes a stale callee, so a later loss of the role with no event takes the holder out at the next run that touches the callee. The lift of a service that holds no shared role deploys only what its run changed. A role-members event between the lift and the re-enable keeps the lifted holder (both sides), and after a failed re-enable the next render takes it out. 14 tests. |
+| `test_quarantine_lift.py` | `TestTheLiftPutsTheHolderBack`, `TestTheStoreAfterALift`, `TestNoExtraDeploy`, `TestTheReEnableUnderThePceLock` | A failed onboarding of one holder of a shared role quarantines it, and a successful re-onboarding lifts the quarantine (the tests drop the role-members event of the Provision re-map, which Keycloak sends also for a mapping that is already there). Each callee CR of the shared role names the lifted holder again, also a callee that the lift routes no rule to (both sides). While every holder of the role is quarantined, the callees keep the edges of the role, and each lift gives the role back to the lifted holder only. The resync after the lift gives the same CRs. The lift writes a stale callee, so a later loss of the role with no event takes the holder out at the next run that touches the callee. The lift of a service that holds no shared role deploys only what its run changed. The re-enable is the `on_applied` of the lift run (under the PCE lock), so a role-members event after the lift keeps the lifted holder (both sides). After a failed re-enable (the run raises, and the client stays disabled), the next render takes it out. 14 tests. |
 | `test_decommission_shared.py` | `TestALaterHolderIsDecommissioned`, `TestARetriedDecommission` | An admin maps the shared role to `review-agent` after its SPM was written, and the event puts `review-agent` in the CRs. A decommission of `review-agent` takes it out of every CR of the role at once, and writes only the delete of `SPM(review-agent)`. A decommission that fails at the redeploy (one CR patch fails) keeps `SPM(review-agent)`, and its retry takes `review-agent` out of every CR of the role. Both sides. 4 tests. |
 | `test_snapshot_repair.py` | `TestADuplicateRuleRepairsTheCr`, `TestAgentSideAFormerHolderIsDerivedAgain`, `TestAgentSideTheResyncRepairsAMissedEvent` | A `rerender_role` puts a later holder in the tool CR (no write), and the holder then loses the role with no event. A re-onboarding whose rule on the tool is a duplicate takes the holder out of the CR. Under agent side, that holder is re-derived as a former holder of the stale tool SPMs, and its outbound loses the tools. Under agent side, the resync repairs missed events: the inbound of the callee and the outbound of the remaining holder name the current holders and members. 7 tests. |
 
 New with the D32 fixes: `test_decommission_shared.py`, `test_snapshot_repair.py`, and in
-`test_quarantine_lift.py` the class `TestTheWindowBeforeTheReEnable` and the test
+`test_quarantine_lift.py` the class `TestTheReEnableUnderThePceLock` and the test
 `test_a_callee_that_no_lift_routes_a_rule_to_keeps_the_role_while_every_holder_is_quarantined`. The
-tests of the decommission gap, of the snapshot repair and of the lift window fail on the code before
-their fix. `TestAgentSideTheResyncRepairsAMissedEvent` and the every-holder-quarantined test pin
-paths that were already correct: each fails under a mutation of its path. The whole lane has 76
-tests.
+tests of the decommission gap and of the snapshot repair fail on the code before their fix.
+`TestAgentSideTheResyncRepairsAMissedEvent` and the every-holder-quarantined test pin paths that were
+already correct: each fails under a mutation of its path. The whole lane has 76 tests.
 
 ## Configuration (env)
 

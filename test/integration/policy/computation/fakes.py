@@ -249,6 +249,10 @@ class FakeStore:
             service_id=service_id, service_type=ServiceType.AGENT, owned_roles=[], owned_scopes=[]
         )
 
+    def find_service_policy(self, service_id: str) -> ServicePolicyModel | None:
+        row = self._rows.get(service_id)
+        return ServicePolicyModel.model_validate(row) if row is not None else None
+
     def list_service_policies(self) -> list[ServicePolicyModel]:
         return [ServicePolicyModel.model_validate(row) for row in self._rows.values()]
 

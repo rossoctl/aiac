@@ -21,7 +21,7 @@ pipeline wired into both legs:
       → start from a no-workloads slate (undeploy + delete registrations) + policy-store clear
       → deploy the rung's workloads in order, one at a time — each deploy fires the EVENT-DRIVEN
         trigger (operator registers a Keycloak client → Keycloak CLIENT_CREATED → the aiac-event-listener
-        SPI publishes on NATS → the agent consumer runs onboard_service, upserting the AuthorizationPolicy
+        SPI publishes on NATS → the agent consumer runs onboard_and_apply, upserting the AuthorizationPolicy
         CR of each affected service on the live API), converging before the next
       → right after each workload converges, check that its client links the subject scope
         ``aiac-username-sub`` as a default scope (``require_subject_scope``, D31; a missing link fails)
@@ -229,7 +229,7 @@ BUNDLE_TIMEOUT = float(os.environ.get("AIAC_BUNDLE_TIMEOUT", "300"))
 BUNDLE_POLL_INTERVAL = float(os.environ.get("AIAC_BUNDLE_POLL_INTERVAL", "10"))
 
 # Deploying a workload fires the event-driven trigger (deploy -> operator registers a Keycloak client
-# -> CLIENT_CREATED -> SPI -> NATS -> the agent consumer runs ``onboard_service``). The operator's
+# -> CLIENT_CREATED -> SPI -> NATS -> the agent consumer runs ``onboard_and_apply``). The operator's
 # client registration is asynchronous (reconcile after the pod comes up), so the fixture polls for it
 # up to this budget (``AIAC_DEPLOY_TIMEOUT``, seconds).
 DEPLOY_TIMEOUT = float(os.environ.get("AIAC_DEPLOY_TIMEOUT", "180"))
@@ -607,7 +607,7 @@ def deploy_workload(workload: str) -> None:
     """Deploy ``workload`` (``github-agent`` / ``github-tool``) into the cluster — the **event-driven
     onboarding trigger**: the operator reconciles the bundled ``AgentRuntime`` CR, registers a Keycloak
     client, Keycloak emits ``CLIENT_CREATED``, the SPI publishes on NATS, and the agent consumer runs
-    ``onboard_service`` (the same handler the retired ``POST /apply`` called).
+    ``onboard_and_apply`` (the same handler the retired ``POST /apply`` called).
 
     ``kubectl apply``s the workload's demo manifests in order via the generic ``kubectl_apply`` and
     waits for the Deployment rollout. It does **not** build or ``kind load`` images — ``onboarded_stack``
@@ -1355,7 +1355,7 @@ def onboarded_stack(
     the Kind node (``load_workload_images`` — build-if-absent, the images precondition), then **deploy**
     the given ``workloads`` **in order, one at a time** — each ``kubectl apply`` fires the production trigger
     (operator registers a Keycloak client -> Keycloak ``CLIENT_CREATED`` -> the ``aiac-event-listener``
-    SPI publishes on NATS -> the agent consumer runs ``onboard_service``, the same handler the retired
+    SPI publishes on NATS -> the agent consumer runs ``onboard_and_apply``, the same handler the retired
     ``POST /apply`` called) — waiting for each to converge before the next, and then checking that its
     client links the subject scope ``aiac-username-sub`` as a default scope (``require_subject_scope``,
     D31: AIAC makes this link at onboarding, so a missing link **fails** the run at once, with the
@@ -2313,8 +2313,9 @@ def controller_commit_race_hint(since: datetime | None = None, *, admin=None, wo
 def publish_service_event(service_uuid: str) -> None:
     """Re-fire the onboarding trigger for an EXISTING Keycloak client: publish on
     ``aiac.apply.service.<uuid>`` (the subject + ``{"id": ...}`` payload the ``aiac-event-listener`` SPI
-    publishes on ``CLIENT_CREATED``), so the agent consumer runs the same ``onboard_service`` →
-    ``compute_and_apply(focus_service=client_id)`` → ``reenable_service`` path a deploy fires.
+    publishes on ``CLIENT_CREATED``), so the agent consumer runs the same ``onboard_and_apply`` path
+    that a deploy fires (the build, then ``compute_and_apply(focus_service=client_id)`` with the
+    re-enable as ``on_applied``).
 
     A redeploy cannot do this — the SPI publishes only on client CREATE, and a re-created client has a
     new UUID (a new service, not the quarantined one). The publish runs from INSIDE the Controller pod,

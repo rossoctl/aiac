@@ -19,10 +19,9 @@ there. That event would repair the CRs, so each test drops it, to show that the 
 them. The lift also writes each lifted SPM whose stored holders are stale, so its snapshot names the
 holders that its CR names.
 
-The caller re-enables the client after ``compute_and_apply`` returns, outside the PCE lock. So the
-lift counts X as waiting for its re-enable, and the PCE counts a waiting service as live until the
-caller calls ``lift_done`` (after ``reenable_service``, also when it fails). A render in that window
-(for example the role-members event of the re-map) then keeps X in the CRs of its roles.
+The onboarding gives the re-enable to ``compute_and_apply`` as ``on_applied``, and the PCE calls it
+under its lock after the run. So no render (for example the role-members event of the re-map) can
+read the client of X as disabled between the lift and the re-enable.
 
 The harness is the one of ``test_shared_roles.py`` (the real resolver, PRB graphs, PCE and writer
 between the fakes).
@@ -84,23 +83,13 @@ def _fail_onboarding(stack: Stack, workload: Workload) -> None:
 
 def _lift(stack: Stack, workload: Workload) -> None:
     """A successful re-onboarding of the quarantined ``workload``: Provision again (create-or-get),
-    the build and ``compute_and_apply`` with the client still disabled (the focus service), then
-    ``reenable_service`` and ``lift_done``, as the Controller does. Provision maps the kept shared role
+    the build and ``compute_and_apply`` with the client still disabled (the focus service), and the
+    re-enable as its ``on_applied``, as ``onboard_and_apply`` does. Provision maps the kept shared role
     again, and Keycloak sends a role-members event also for a mapping that is already there; the test
     drops it, so only the lift can repair the CRs."""
     stack.realm.provision(workload.namespace, workload.name, workload.type, workload.entries)
     stack.drop_role_events()
-    stack.onboard(workload.client_id)
-    _set_enabled(stack, workload, True)
-    computation.lift_done(workload.client_id)
-
-
-@pytest.fixture(autouse=True)
-def _no_service_waits_for_its_re_enable():
-    """No test leaves a service in the PCE's in-process set of services that wait for their re-enable
-    (a test that fails before its ``lift_done`` would leave it for the next test)."""
-    yield
-    engine._awaiting_reenable.clear()
+    stack.onboard(workload.client_id, on_applied=lambda: _set_enabled(stack, workload, True))
 
 
 class TestTheLiftPutsTheHolderBack:
@@ -208,15 +197,14 @@ class TestTheLiftPutsTheHolderBack:
         assert stack.cluster.crs == after_lift
 
 
-class TestTheWindowBeforeTheReEnable:
-    """A render between the lift (``compute_and_apply``) and ``reenable_service`` reads the client of
-    team2 as disabled. Here it is the role-members event of Provision's re-map of the shared role. The
-    NATS consumer can run it in that window when the onboarding came on the HTTP route
-    ``POST /apply/service/{service_id}`` (the consumer is then free), and so can the route
-    ``POST /apply/role-members/{role_id}``."""
+class TestTheReEnableUnderThePceLock:
+    """The re-enable is the ``on_applied`` of the lift's ``compute_and_apply``, so a render after the
+    lift reads the client of team2 as enabled. Here it is the role-members event of Provision's re-map
+    of the shared role, which the NATS consumer or ``POST /apply/role-members/{role_id}`` can run as
+    soon as the PCE lock is free."""
 
     @pytest.mark.parametrize("side", list(EnforcementSide), ids=lambda side: side.value)
-    def test_a_role_members_event_before_the_re_enable_keeps_the_lifted_holder(
+    def test_a_role_members_event_after_the_lift_keeps_the_lifted_holder(
         self, stack: Stack, side: EnforcementSide, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv("AIAC_ENFORCEMENT_SIDE", side.value)
@@ -228,29 +216,31 @@ class TestTheWindowBeforeTheReEnable:
         callees = (TOOL1, REVIEWER) if side == EnforcementSide.TARGET_SIDE else (REVIEWER,)
         stack.realm.provision(AGENT2.namespace, AGENT2.name, AGENT2.type, AGENT2.entries)
         assert stack.realm.events, "Provision's re-map of the shared role sends a role-members event"
-        stack.onboard(AGENT2.client_id)  # the lift
+        stack.onboard(AGENT2.client_id, on_applied=lambda: _set_enabled(stack, AGENT2, True))  # the lift
 
-        stack.deliver_role_events()  # before reenable_service
+        stack.deliver_role_events()
         for callee in callees:
-            assert _holders(stack, callee) == {AGENT1.client_id, AGENT2.client_id}, f"{callee.client_id}: in the window"
+            assert _holders(stack, callee) == {AGENT1.client_id, AGENT2.client_id}, f"{callee.client_id}: the event"
 
-        _set_enabled(stack, AGENT2, True)  # reenable_service
-        computation.lift_done(AGENT2.client_id)
         stack.onboard(AGENT1.client_id)  # a later run that touches the callees
         for callee in callees:
             assert _holders(stack, callee) == {AGENT1.client_id, AGENT2.client_id}, f"{callee.client_id}: after it"
 
     def test_after_a_failed_re_enable_the_next_render_takes_the_holder_out(self, stack: Stack) -> None:
-        # reenable_service failed: the client of team2 stays disabled, and lift_done ends the wait.
+        # reenable_service failed: compute_and_apply raises, and the client of team2 stays disabled.
         for workload in ORDERS["agents-first"]:
             stack.bring_up(workload)
         _fail_onboarding(stack, AGENT2)
         stack.realm.provision(AGENT2.namespace, AGENT2.name, AGENT2.type, AGENT2.entries)
-        stack.onboard(AGENT2.client_id)  # the lift
+
+        def failed_reenable() -> None:
+            raise RuntimeError("IdP down")
+
+        with pytest.raises(RuntimeError, match="IdP down"):
+            stack.onboard(AGENT2.client_id, on_applied=failed_reenable)  # the lift
         for tool in TOOLS:
             assert _holders(stack, tool) == {AGENT1.client_id, AGENT2.client_id}, f"{tool.client_id}: the lift"
 
-        computation.lift_done(AGENT2.client_id)
         stack.deliver_role_events()
 
         for tool in TOOLS:

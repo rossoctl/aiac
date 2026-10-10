@@ -349,7 +349,7 @@ or OPA URLs, no `opa` binary.
 
 ```bash
 # Heavy scenarios (needs KEYCLOAK_URL + admin creds + LLM_* + opa on PATH):
-.venv/bin/pytest eval/test_policy_pipeline_eval.py -m eval -v
+.venv/bin/pytest -m eval -k test_policy_pipeline_eval -v
 # A failing node names the exact scenario/agent/subject(/scope) cell, e.g.:
 #   test_inbound[baseline-team1/repo-agent-test-user] — expected allow, opa denied
 # .rego left on disk per scenario for eyeballing:
@@ -359,8 +359,7 @@ or OPA URLs, no `opa` binary.
 #   eval/reports/report_<DD_MM_HH_MM_SS>.md (UTC by default; see Test report below)
 
 # Light scenarios (needs only LLM_BASE_URL/LLM_MODEL/LLM_API_KEY):
-.venv/bin/pytest test/unit/agent/policy_rules_builder/test_guardrail_conflicts.py \
-  test/unit/agent/policy_rules_builder/test_guardrail_injection.py -m llm -v
+.venv/bin/pytest -m llm -k "test_guardrail_conflicts or test_guardrail_injection" -v
 # Expect XFAIL (not XPASS) on both guardrail-contract tests; the plain over-grant
 # assertion in test_guardrail_injection.py should pass.
 ```

@@ -979,7 +979,7 @@ def event_path_reason(*, broker_phase: str, realm_config: dict) -> str | None:
 
     The event path is: deploy -> operator registers a Keycloak client -> Keycloak emits the admin
     event ``CLIENT_CREATED`` -> the AIAC SPI (``aiac-event-listener``) publishes on NATS -> the agent
-    consumer runs ``onboard_service``. All three facts must hold or the trigger never fires."""
+    consumer runs ``onboard_and_apply``. All three facts must hold or the trigger never fires."""
     if "Running" not in (broker_phase or ""):
         return f"NATS event broker not Running (phase={broker_phase!r})"
     if "aiac-event-listener" not in (realm_config.get("eventsListeners") or []):

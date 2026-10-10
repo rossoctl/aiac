@@ -24,6 +24,12 @@ load_dotenv(Path(__file__).resolve().parent / ".env")
 # partial-SSRF vector). The fullmatch barrier is what CodeQL recognises; ``quote`` alone does not.
 _URL_SEGMENT_RE = re.compile(r"[A-Za-z0-9._~%-]+")
 
+# Per-request timeout (seconds) for every PDP Policy Writer call. Without it a hung writer (for
+# example a stuck Kubernetes API) would block the caller, which holds the PCE lock, indefinitely.
+# Longer than the store's: one ``PUT /policy`` server-side-applies every CR. Tunable via
+# ``AIAC_PDP_HTTP_TIMEOUT``.
+_HTTP_TIMEOUT = float(os.getenv("AIAC_PDP_HTTP_TIMEOUT", "60"))
+
 
 def _base_url() -> str:
     return os.getenv("AIAC_PDP_POLICY_URL", "http://127.0.0.1:7072")
@@ -49,20 +55,20 @@ def _check(resp: requests.Response) -> None:
 
 def apply_policy(model: PolicyModel) -> None:
     """``POST /policy`` — upsert one CR per entry of ``model``."""
-    _check(requests.post(f"{_base_url()}/policy", json=model.model_dump(mode="json")))
+    _check(requests.post(f"{_base_url()}/policy", json=model.model_dump(mode="json"), timeout=_HTTP_TIMEOUT))
 
 
 def replace_policy(model: PolicyModel) -> None:
     """``PUT /policy`` — upsert every entry of ``model``, then delete every other AIAC CR."""
-    _check(requests.put(f"{_base_url()}/policy", json=model.model_dump(mode="json")))
+    _check(requests.put(f"{_base_url()}/policy", json=model.model_dump(mode="json"), timeout=_HTTP_TIMEOUT))
 
 
 def delete_service_cr(service_id: str) -> None:
     """``DELETE /policy/services/{service_id}`` — delete the CR of one service (a missing CR is
     success). Under D20 the service is then denied."""
-    _check(requests.delete(f"{_base_url()}/policy/services/{_service_id_segment(service_id)}"))
+    _check(requests.delete(f"{_base_url()}/policy/services/{_service_id_segment(service_id)}", timeout=_HTTP_TIMEOUT))
 
 
 def delete_policy() -> None:
     """``DELETE /policy`` — delete every AIAC CR. No AIAC code calls it (C1)."""
-    _check(requests.delete(f"{_base_url()}/policy"))
+    _check(requests.delete(f"{_base_url()}/policy", timeout=_HTTP_TIMEOUT))

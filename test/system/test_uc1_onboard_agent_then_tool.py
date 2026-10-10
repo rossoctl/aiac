@@ -4,7 +4,7 @@ Issue ``testing/5.4.2-uc1-onboard-agent-then-tool.md``; spec
 ``docs/testing/uc1-onboarding-pipeline.md``. Onboard **event-driven** by deploying the ``github-agent``
 workload **first** and the ``github-tool`` workload **second** (each deploy → operator registers a
 Keycloak client → ``CLIENT_CREATED`` → ``aiac-event-listener`` SPI → NATS → the agent consumer runs
-``onboard_service``), then assert the **full** truth table at the end by driving **real HTTP requests
+``onboard_and_apply``), then assert the **full** truth table at the end by driving **real HTTP requests
 through AuthBridge** and reading the **real OPA plugin's** allow/deny (handoff 08; live loop shape in
 ``k8s/opa-kind-runbook.md``).
 

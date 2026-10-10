@@ -103,7 +103,7 @@ over the fully onboarded stack.
    loads the demo images into the Kind node, then `deploy_workload` deploys the `github-agent` and then
    the `github-tool`, one at a time, each converging before the next. Deploying is the event-driven
    trigger: the operator registers the Keycloak client → Keycloak emits `CLIENT_CREATED` → the
-   `aiac-event-listener` SPI publishes on NATS → the agent consumer runs `onboard_service`. UC-1 classifies each service,
+   `aiac-event-listener` SPI publishes on NATS → the agent consumer runs `onboard_and_apply`. UC-1 classifies each service,
    reads the MCP `tools/list` / AgentCard skills (for the tool, after the PCE bootstrap wrote its CR,
    so that the discovery passes D20; under target side through the self-discovery rule), provisions the **workload-prefixed** scopes
    (`github-tool.{source-read, source-write, issues-read, issues-write}`) and the agent's **one

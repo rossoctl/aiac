@@ -41,12 +41,19 @@ def _fresh_empty(service_id: str) -> ServicePolicyModel:
     )
 
 
-def get_service_policy(service_id: str) -> ServicePolicyModel:
+def find_service_policy(service_id: str) -> ServicePolicyModel | None:
+    # The stored SPM, or ``None`` on a 404 — for a caller that must tell "no SPM" from a stored
+    # zero-rule SPM (``get_service_policy`` gives both as an empty model).
     resp = requests.get(f"{_base_url()}/policy/services/{encode_service_id(service_id)}", timeout=_HTTP_TIMEOUT)
     if resp.status_code == 404:
-        return _fresh_empty(service_id)
+        return None
     _check(resp)
     return ServicePolicyModel.model_validate(resp.json())
+
+
+def get_service_policy(service_id: str) -> ServicePolicyModel:
+    stored = find_service_policy(service_id)
+    return stored if stored is not None else _fresh_empty(service_id)
 
 
 def get_service_policy_by_scope(scope: Scope) -> ServicePolicyModel | None:

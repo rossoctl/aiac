@@ -99,6 +99,9 @@ def _derived_apm(tool_spms: list[ServicePolicyModel], agent_roles=(AGENT_ROLE,))
             if any(r.role.id == role.id for r in m.inbound_allow_rules + m.inbound_deny_rules)
         ]
 
+    def find_service_policy(service_id: str) -> ServicePolicyModel | None:
+        return stored[service_id].model_copy(deep=True) if service_id in stored else None
+
     def list_service_policies() -> list[ServicePolicyModel]:
         return [m.model_copy(deep=True) for m in stored.values()]
 
@@ -108,7 +111,7 @@ def _derived_apm(tool_spms: list[ServicePolicyModel], agent_roles=(AGENT_ROLE,))
         )
         stack.enter_context(patch.object(Configuration, "get_services", return_value=catalog))
         stack.enter_context(patch.object(Configuration, "get_roles", return_value=[DEV, OPS]))
-        for fake in (get_service_policy, get_service_policies_by_role, list_service_policies):
+        for fake in (get_service_policy, find_service_policy, get_service_policies_by_role, list_service_policies):
             stack.enter_context(patch.object(engine, fake.__name__, side_effect=fake))
         model = engine.policy_model_for(AGENT)
     assert model is not None and len(model.agents) == 1

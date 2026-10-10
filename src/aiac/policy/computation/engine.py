@@ -114,14 +114,10 @@ the focus service, with the focus as a holder again. It writes only those whose 
 stale (a run wrote them while the service was quarantined), so each snapshot names the holders that
 its CR names.
 
-The caller re-enables the client after ``compute_and_apply`` returns, outside the PCE lock, so a
-render in that window would read the client as disabled and take the service out of the CRs again
-(with no SPM write, so no later stale check finds it). So a lift that succeeds adds the focus, under
-the lock, to an in-process set of services that wait for their re-enable, and every operation counts
-a waiting service as live (``RoleHolders``, ``holders.live``). The caller (the onboarding route, the
-NATS consumer) calls ``lift_done`` after ``reenable_service``, also when the re-enable fails: the
-client then stays disabled, and the service must not count as live. A quarantine or a decommission
-of the service ends every wait.
+The client must be enabled before the PCE lock is released: a render after the lift that read the
+client as disabled would take the service out of the CRs again (with no SPM write, so no later stale
+check finds it). So the caller gives the re-enable as ``on_applied``, and ``compute_and_apply`` calls
+it under the PCE lock after the run succeeds. If the run fails, the client stays disabled.
 
 Resync, read model, bootstrap. ``resync()`` (D28) runs at every Controller start: one
 ``replace_policy`` (``PUT /policy``) with the full policy model of the side for the live managed
@@ -145,8 +141,7 @@ before ``compute_and_apply``, outside the lock, so concurrent onboardings still 
 parallel; the part under the lock makes no LLM call. Known limits:
 
 - It serializes one process only (one Controller replica, as for the orchestrator's per-service
-  lock). More replicas need store versions or a distributed lock. The set of services that wait for
-  their re-enable is in process too.
+  lock). More replicas need store versions or a distributed lock.
 - When two onboardings overlap, a pair between the two new services can stay unjudged (each
   service's resolver read the catalog before the other's Provision). That pair then gives no
   grant (fail closed).
@@ -155,7 +150,7 @@ parallel; the part under the lock makes no LLM call. Known limits:
 import logging
 import os
 import threading
-from collections.abc import Hashable, Iterable
+from collections.abc import Callable, Hashable, Iterable
 from dataclasses import dataclass, field
 
 from aiac.idp.configuration.api import Configuration
@@ -178,6 +173,7 @@ from aiac.policy.model.projection import project_inbound, rule_key
 from aiac.policy.model_store.library.api import (
     apply_service_policy,
     delete_service_policy,
+    find_service_policy,
     get_service_policies_by_role,
     get_service_policy,
     list_service_policies,
@@ -187,13 +183,6 @@ logger = logging.getLogger(__name__)
 
 # The PCE lock — see "Serialization" in the module docstring.
 _pce_lock = threading.Lock()
-
-# The services that wait for their re-enable after the lift of their quarantine, each with the number
-# of lifts that wait (see "Quarantine" in the module docstring and ``lift_done``). In process: one
-# Controller replica. ``_awaiting_lock`` guards it; it is held only for a set operation, so
-# ``lift_done`` never waits for the PCE lock.
-_awaiting_reenable: dict[str, int] = {}
-_awaiting_lock = threading.Lock()
 
 
 def _inbound_list(model: ServicePolicyModel, effect: RuleEffect) -> list[PolicyRule]:
@@ -317,58 +306,12 @@ def _read_idp(focus_service: str | None = None) -> tuple[dict[str, Service], Rol
     clientId, and the current holders of every role, from that catalog and one ``get_roles()`` call.
     The catalog is built from the same ``get_roles()`` result, so ``GET /roles`` is sent one time
     and the agent holders and the user holders come from one snapshot.
-    The focus service counts as live, and so does each service that waits for its re-enable
-    (``holders.live``). The PCE never reads ``get_subjects()``.
-
-    The set of waiting services is read before the catalog: its caller ends a wait only after
-    ``reenable_service`` returns, so a service that is not in the set any more is enabled in the
-    catalog that this read gives, or its re-enable failed."""
-    with _awaiting_lock:
-        awaiting = frozenset(_awaiting_reenable)
+    The focus service counts as live (``holders.live``). The PCE never reads ``get_subjects()``."""
     config = Configuration.for_default_realm()
     roles = config.get_roles()
     catalog = {svc.serviceId: svc for svc in config.get_services(roles)}
-    holders = RoleHolders(catalog.values(), roles, focus_service=focus_service, awaiting_reenable=awaiting)
+    holders = RoleHolders(catalog.values(), roles, focus_service=focus_service)
     return catalog, holders
-
-
-def lift_done(service_id: ClientId) -> None:
-    """End one wait of ``service_id`` (its clientId) for its re-enable after the lift of its
-    quarantine (LIM-09).
-
-    A run that lifts a quarantine (its focus service is in the catalog but disabled) adds the focus
-    to the PCE's set of services that wait for their re-enable, under the PCE lock, when the run
-    succeeds. The caller (the onboarding route and the NATS consumer) re-enables the client after
-    ``compute_and_apply`` returns, outside the lock, and calls ``lift_done`` after
-    ``reenable_service``, also when the re-enable fails. Until then every operation counts the
-    service as live, so a render in that window (for example a role-members event) keeps it in the
-    CRs of its roles, and the run's routing guard keeps its rules. After a failed re-enable the
-    client stays disabled, so the service must not count as live any more.
-
-    Each lift waits for its own ``lift_done``: two lifts that overlap (an HTTP onboarding and a NATS
-    redelivery) keep the service live until both are done. A ``lift_done`` that finds no wait is a
-    no-op: the caller cannot tell a lift from another onboarding, so it calls it after every
-    onboarding that reaches the re-enable. A quarantine or a decommission of the service ends every
-    wait. The set is in process: it serializes one Controller replica only, as the PCE lock does.
-    Takes no PCE lock."""
-    with _awaiting_lock:
-        count = _awaiting_reenable.get(service_id, 0)
-        if count > 1:
-            _awaiting_reenable[service_id] = count - 1
-        else:
-            _awaiting_reenable.pop(service_id, None)
-
-
-def _wait_for_reenable(service_id: str) -> None:
-    """Add one wait of ``service_id`` for its re-enable (see ``lift_done``)."""
-    with _awaiting_lock:
-        _awaiting_reenable[service_id] = _awaiting_reenable.get(service_id, 0) + 1
-
-
-def _end_every_wait(service_id: str) -> None:
-    """End every wait of ``service_id`` for its re-enable: it is quarantined or decommissioned."""
-    with _awaiting_lock:
-        _awaiting_reenable.pop(service_id, None)
 
 
 def _former_holders(stored: ServicePolicyModel, current: ServicePolicyModel) -> set[str]:
@@ -464,6 +407,7 @@ def compute_and_apply(
     rules: list[PolicyRule],
     override: bool = False,
     focus_service: ClientId | None = None,
+    on_applied: Callable[[], None] | None = None,
 ) -> None:
     """Route and persist ``rules``, then deploy the changed live services — fire-and-forget.
 
@@ -484,8 +428,7 @@ def compute_and_apply(
 
     The policy-model stage (D23). After the store writes, the run partial-upserts the policy model
     of the current side (``enforcement_side()``, read once) with one ``apply_policy`` call — no call
-    when it is empty. Live = in the catalog and not disabled; the focus service and a service that
-    waits for its re-enable (see "The lift") count as live.
+    when it is empty. Live = in the catalog and not disabled; the focus service counts as live.
 
     - target side: ``TargetSidePolicyModel(services=[SPM(x) for x in touched | lifted if x is
       live])``. ``touched`` is every SPM that the run routed a rule to (also a duplicate rule),
@@ -514,10 +457,13 @@ def compute_and_apply(
     them. They are deployed. Their rules did not change, so the run writes only those whose stored
     holders are stale (for example a callee that a run wrote while the focus was quarantined): the
     snapshot then names the holders that the CR names, so a later stale-holders check sees a later
-    change of the holders. In every other run ``lifted`` is empty. A lift that succeeds also adds the
-    focus to the set of services that wait for their re-enable (LIM-09): the caller re-enables the
-    client after this call returns, outside the lock, and every operation counts the focus as live
-    until the caller's ``lift_done``, so a render in that window does not take it out of the CRs.
+    change of the holders. In every other run ``lifted`` is empty.
+
+    ``on_applied`` (UC1: the re-enable of the focus client) is called under the PCE lock, after the
+    run succeeds. So no other operation reads the catalog between the lift and the re-enable: a
+    render there would read the client as disabled and take the focus out of the CRs of its roles
+    again. A run that fails does not call it, so the client stays disabled. An ``on_applied`` that
+    raises propagates as a run failure does.
 
     Routing guard. A disabled client is a failed (quarantined) service; a service absent from the
     catalog is deleted. Under the PCE lock, after the IdP read, the run drops each rule whose scope
@@ -527,10 +473,9 @@ def compute_and_apply(
     holder's grant too. The run also deploys only live services. ``focus_service`` — the
     clientId (``Service.serviceId``, the SPM key) of the service this onboarding builds, not its
     Keycloak UUID — is exempt: a re-onboarding applies while its client is still disabled
-    (``reenable_service`` runs after the apply). A service that waits for its re-enable is exempt
-    too. The onboarding route and the NATS consumer pass the
-    clientId that ``onboard_service`` returns; every other caller passes nothing, so every rule that
-    touches a disabled service is dropped.
+    (``on_applied`` re-enables it after the apply). The onboarding passes the clientId that it
+    resolved; every other caller passes nothing, so every rule that touches a disabled service is
+    dropped.
 
     Exceptions from any dependency (IdP, Policy Store, PDP) are logged and **re-raised** so the
     caller (the Controller) surfaces the failure — e.g. as a 500 — instead of returning success
@@ -540,6 +485,8 @@ def compute_and_apply(
         side = enforcement_side()
         with _pce_lock:
             _run(rules, override, focus_service, side)
+            if on_applied is not None:
+                on_applied()
     except Exception:
         logger.exception("compute_and_apply failed for %d rule(s)", len(rules))
         raise
@@ -641,9 +588,8 @@ def quarantine(service_id: ClientId, deleted_roles: Iterable[Role] = ()) -> None
     disabled) stores ``SPM(X)`` again (also with zero rules, D21), writes a new CR, and deploys the
     SPMs of step 3 that keep an edge of a shared role of X, with X as a holder again (the quarantine
     did not write them, so the stale-holders check cannot find them; the lift writes only those whose
-    stored holders are stale); then ``reenable_service`` re-enables the client, and the caller's
-    ``lift_done`` ends the wait for the re-enable. A quarantine ends every wait of X for its re-enable:
-    a lift of X whose caller has not re-enabled the client yet must not keep X live.
+    stored holders are stale); then, under the same lock hold, its ``on_applied`` re-enables the
+    client.
 
     Exceptions from any dependency are logged and **re-raised**.
     """
@@ -733,7 +679,11 @@ def _rerender_role(role_id: str, side: EnforcementSide) -> None:
             apply_policy(TargetSidePolicyModel(services=services))
         return
     spms = _SpmCache(catalog, holders)
-    agents = {model.service_id for model in list_service_policies() if model.service_id in live}
+    agents: set[str] = set()
+    for model in list_service_policies():
+        spms(model.service_id, model)  # already read: the derive makes no store read for it
+        if model.service_id in live:
+            agents.add(model.service_id)
     _deploy_agent_side(agents, spms, catalog)
 
 
@@ -756,7 +706,7 @@ def policy_model_for(service_id: ClientId) -> PolicyModel | None:
     roles of an agent and writes no SPM, so the stored ``owned_roles`` can be old (G-21). Read-only:
     it takes no lock and writes nothing."""
     side = enforcement_side()
-    stored = _stored_spm(service_id)
+    stored = find_service_policy(service_id)
     if stored is None:
         return None
     if side == EnforcementSide.AGENT_SIDE and stored.service_type != ServiceType.AGENT:
@@ -767,15 +717,6 @@ def policy_model_for(service_id: ClientId) -> PolicyModel | None:
     spms = _SpmCache(catalog, holders)
     spms(service_id, stored)  # refresh the stored SPM and seed its identity from the catalog
     return AgentSidePolicyModel(agents=[_derive(service_id, spms)])
-
-
-def _stored_spm(service_id: str) -> ServicePolicyModel | None:
-    """The stored SPM of ``service_id``, or ``None`` if the store has none.
-
-    Reads the list of every stored SPM (``list_service_policies``, C3), because
-    ``get_service_policy`` cannot tell a 404 from a stored SPM: on a 404 it returns a fresh empty
-    SPM, which looks the same as a stored zero-rule SPM with no ``aiac.managed`` roles or scopes."""
-    return next((model for model in list_service_policies() if model.service_id == service_id), None)
 
 
 def bootstrap(service_id: ClientId, service_type: ServiceType) -> None:
@@ -815,7 +756,7 @@ def _bootstrap(service_id: str, service_type: ServiceType, side: EnforcementSide
     # The IdP once (D32): the catalog seeds a new SPM; the holders refresh a stored one. The service
     # is the focus of its onboarding, so it counts as live.
     catalog, holders = _read_idp(service_id)
-    model = _stored_spm(service_id)
+    model = find_service_policy(service_id)
     if model is not None:
         model = holders.refresh_model(model)
     else:
@@ -858,8 +799,8 @@ def _run(rules: list[PolicyRule], override: bool, focus_service: str | None, sid
         distinct_roles.setdefault(rule.role.id, rule.role)
 
     # (1b) Routing guard — drop every rule whose scope owner is not live — disabled (quarantined,
-    # except the focus service and a service that waits for its re-enable) or absent from the catalog
-    # (deleted) — or whose agent role has no live holder. See ``compute_and_apply``.
+    # except the focus service) or absent from the catalog (deleted) — or whose agent role has no live
+    # holder. See ``compute_and_apply``.
     live = holders.live
     kept = [rule for rule in rules if _routable(rule, live)]
     if len(kept) != len(rules):
@@ -883,7 +824,7 @@ def _run(rules: list[PolicyRule], override: bool, focus_service: str | None, sid
     if override:
         for role in distinct_roles.values():
             for stored in get_service_policies_by_role(role):
-                model = spms(stored.service_id)
+                model = spms(stored.service_id, stored)
                 if _purge_role(model, role.id):
                     changed.add(model.service_id)
 
@@ -957,17 +898,10 @@ def _run(rules: list[PolicyRule], override: bool, focus_service: str | None, sid
         pass_through = [focus_service] if focus_service in live and _is_tool(catalog, focus_service) else []
         _deploy_agent_side(affected & live, spms, catalog, pass_through)
 
-    # (6) A lift waits for its re-enable: the caller re-enables the client after this run returns,
-    # outside the PCE lock, and every operation counts the focus as live until the caller's
-    # ``lift_done``. Only a run that succeeded waits: a failed run lifts nothing, and its caller does
-    # not re-enable the client.
-    if _lifts(focus_service, catalog):
-        _wait_for_reenable(focus_service)
-
 
 def _lifts(focus_service: str | None, catalog: dict[str, Service]) -> bool:
     """True iff a run with ``focus_service`` lifts its quarantine: the focus service is in the
-    catalog but disabled (a successful re-onboarding; ``reenable_service`` runs after the apply)."""
+    catalog but disabled (a successful re-onboarding; its ``on_applied`` re-enables the client)."""
     svc = catalog.get(focus_service) if focus_service is not None else None
     return svc is not None and not svc.enabled
 
@@ -978,7 +912,7 @@ def _lift_callees(
     """The services that the lift of a quarantine re-renders (D32), the focus service excluded.
 
     A run whose focus service X is in the catalog but disabled is the successful re-onboarding that
-    lifts the quarantine of X (``reenable_service`` runs after the apply). The quarantine rendered the
+    lifts the quarantine of X (its ``on_applied`` re-enables the client). The quarantine rendered the
     CRs of the SPMs that have an edge of a shared role of X without X, and did not write those SPMs
     (``_remove_footprint``, a shared role). So their stored holders can still name X: the stale-holders
     check (step 3c) does not find them, and the run's rules need not touch them. Now X counts as
@@ -1002,15 +936,14 @@ def _lift_callees(
     for role in spms(focus_service).owned_roles:
         for stored in get_service_policies_by_role(role):
             if stored.service_id != focus_service and stored.service_id in live:
-                callees.add(spms(stored.service_id).service_id)
+                callees.add(spms(stored.service_id, stored).service_id)
     return callees
 
 
 def _decommission(service_id: str, side: EnforcementSide) -> None:
     # (1) The IdP once (D32). X itself is absent (it was offboarded); the catalog is used to seed
     # and filter the still-live services that the redeploy writes, and with get_roles() it gives
-    # the current role holders (X is not one). X waits for no re-enable any more.
-    _end_every_wait(service_id)
+    # the current role holders (X is not one).
     catalog, holders = _read_idp()
     spms = _SpmCache(catalog, holders)
 
@@ -1057,6 +990,8 @@ def _resync(side: EnforcementSide) -> None:
         # The APM of each live stored agent, derived from the store, and a pass-through CR for each
         # live stored tool (D24).
         spms = _SpmCache(catalog, holders)
+        for model in stored:
+            spms(model.service_id, model)  # already read: the derive makes no store read for it
         replace_policy(
             AgentSidePolicyModel(
                 agents=[_derive(m.service_id, spms) for m in live_stored if _is_agent(catalog, m.service_id)],
@@ -1076,10 +1011,7 @@ def _quarantine(service_id: str, deleted_roles: list[Role], side: EnforcementSid
     # holder. spms() seeds X's current roles from the catalog, so step 4 removes the roles X still
     # has. The roles the rollback deleted are not in the catalog any more, so the caller passes them
     # in ``deleted_roles`` and step 4 removes their edges too — else an edge a concurrent run stored
-    # (X_role → other_scope) keeps allowing X until a later run reconciles that SPM. A quarantine ends
-    # every wait of X for its re-enable first (a lift of X whose caller has not re-enabled the client
-    # yet): X failed, so it must not count as live.
-    _end_every_wait(service_id)
+    # (X_role → other_scope) keeps allowing X until a later run reconciles that SPM.
     catalog, holders = _read_idp()
     _quarantine_in(catalog, holders, service_id, deleted_roles, side)
 
@@ -1160,7 +1092,7 @@ def _remove_footprint(
         for stored in get_service_policies_by_role(role):
             if stored.service_id == service_id:
                 continue
-            model = spms(stored.service_id)
+            model = spms(stored.service_id, stored)
             if role.id not in held_elsewhere:
                 if _purge_role(model, role.id):
                     footprint.changed.add(model.service_id)
@@ -1367,7 +1299,7 @@ def _derive(agent_id: str, spms: _SpmCache) -> AgentPolicyModel:
     # each one with the current holders.
     for role in sa.owned_roles:
         for stored in get_service_policies_by_role(role):
-            _derive_outbound(apm, role, spms(stored.service_id))
+            _derive_outbound(apm, role, spms(stored.service_id, stored))
 
     return apm
 

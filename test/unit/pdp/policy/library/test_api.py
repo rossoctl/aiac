@@ -266,6 +266,26 @@ class TestDeleteServiceCr:
         m.assert_not_called()
 
 
+class TestTimeout:
+    # A hung writer must not block the caller, which holds the PCE lock, indefinitely.
+    @pytest.mark.parametrize(
+        ("method", "call"),
+        [
+            ("post", lambda api: api.apply_policy(_policy_model())),
+            ("put", lambda api: api.replace_policy(_policy_model())),
+            ("delete", lambda api: api.delete_service_cr("team1/weather-tool")),
+            ("delete", lambda api: api.delete_policy()),
+        ],
+        ids=["apply_policy", "replace_policy", "delete_service_cr", "delete_policy"],
+    )
+    def test_every_call_sends_the_timeout(self, method, call):
+        import aiac.pdp.policy.library.api as api
+
+        with patch(f"aiac.pdp.policy.library.api.requests.{method}", return_value=_ok(204)) as m:
+            call(api)
+        assert m.call_args.kwargs["timeout"] == api._HTTP_TIMEOUT
+
+
 class TestRetiredFunctions:
     def test_the_per_agent_functions_are_gone(self):
         import aiac.pdp.policy.library.api as api

@@ -4,15 +4,17 @@ The Orchestrator is a plain function that sequences exactly two stages:
 Service Provision (a compiled StateGraph) -> Service Policy Builder. Both are mocked
 here via the module-level `build_provision_graph` / `ServicePolicyBuilder` seams, and the
 idp-library `Configuration` is mocked via the `_config` seam -- no live graph, IdP,
-Kubernetes, or LLM. The Orchestrator applies nothing (no PCE call); it returns
-`(list[PolicyRule], override=False)` to the Controller, which makes the
-single `compute_and_apply` call afterwards.
+Kubernetes, or LLM. `onboard_service` applies nothing (no PCE call); it returns
+`(list[PolicyRule], override=False, client_id)`. `onboard_and_apply` (the entry point of the
+Controller route and the NATS consumer) then makes the single `compute_and_apply` call, inside the
+per-service lock, with the re-enable as its `on_applied`; `compute_and_apply` is patched at its import
+site.
 
 Issue 171 adds a compensating rollback (UC1-only): on any of the four typed build
 failures the Orchestrator tears down exactly what Provision *created this run* (the
 created-manifest) and disables the client (failed-service marker). The client type is
 kept (handoff 11 B2). Then it calls the PCE's ``quarantine`` (the policy teardown) and
-re-raises. The caller re-enables the client after a successful apply (idempotent).
+re-raises. `onboard_and_apply` re-enables the client after a successful apply (idempotent).
 
 Handoff 12 (D30, checkpoint B1) adds the enforcement precondition checks, which run first (before
 Provision and the PRB), and the bootstrap CR of a tool, which the PCE writes after the checks and
@@ -511,10 +513,9 @@ class TestFirstReadAgainstTheRealLibrary:
 
 class TestSuccessDoesNotReEnableClient:
     def test_success_does_not_touch_enabled_and_does_not_tear_down(self):
-        # On a successful onboarding the Orchestrator no longer re-enables the client itself —
-        # the caller does that via reenable_service(), but only AFTER compute_and_apply succeeds
-        # (so a PCE failure leaves the client disabled). onboard_service tears nothing down and
-        # never sets enabled here.
+        # onboard_service does not re-enable the client itself — onboard_and_apply does that via
+        # reenable_service(), but only AFTER compute_and_apply succeeds (so a PCE failure leaves the
+        # client disabled). onboard_service tears nothing down and never sets enabled here.
         service = _service()
         config = _config_returning(service)
         graph = _graph(
@@ -537,8 +538,9 @@ class TestSuccessDoesNotReEnableClient:
 
 class TestReenableService:
     def test_reenable_sets_enabled_true_and_touches_nothing_else(self):
-        # reenable_service is the UC1-only, idempotent post-apply hook the caller runs after a
-        # successful compute_and_apply. It resolves the service and sets enabled=true — nothing else.
+        # reenable_service is the UC1-only, idempotent post-apply hook that compute_and_apply calls
+        # (as on_applied) after a successful run. It resolves the service and sets enabled=true —
+        # nothing else.
         service = _service()
         config = _config_returning(service)
 
@@ -1011,6 +1013,83 @@ class TestPerServiceSerialization:
                 assert not t.is_alive(), "onboard_service thread hung"
 
         assert errors == [], "different service_ids did not run concurrently"
+
+
+class TestOnboardAndApply:
+    """The whole UC1: the build, then ``compute_and_apply`` with the re-enable as its ``on_applied``,
+    all inside the per-service lock. The PCE calls ``on_applied`` under its own lock after a
+    successful run, so no PCE operation reads the catalog between the lift and the re-enable."""
+
+    def _run(self, *, pce=None, build_error=None):
+        rules = [object()]
+        config = _config_returning(_service(enabled=False))
+        pce = pce or MagicMock()
+        with (
+            patch.object(orchestrator, "build_provision_graph", return_value=_graph()),
+            patch.object(orchestrator, "ServicePolicyBuilder") as spb,
+            patch.object(orchestrator, "_config", return_value=config),
+            patch.object(orchestrator, "compute_and_apply", pce),
+        ):
+            spb.build.return_value = rules
+            spb.build.side_effect = build_error
+            orchestrator.onboard_and_apply(SERVICE_ID)
+        return rules, config, pce
+
+    def test_applies_the_rules_with_the_client_id_and_re_enables_by_the_uuid_in_on_applied(self):
+        def pce(rules, override, *, focus_service, on_applied):
+            on_applied()  # what the PCE does under its lock after a successful run
+
+        rules, config, mock = self._run(pce=MagicMock(side_effect=pce))
+
+        mock.assert_called_once()
+        assert mock.call_args.args == (rules, False)
+        assert mock.call_args.kwargs["focus_service"] == CLIENT_ID
+        config.set_service_enabled.assert_called_once_with(config.get_service.return_value, True)
+        assert all(c.args == (SERVICE_ID,) for c in config.get_service.call_args_list)
+
+    def test_the_apply_runs_inside_the_per_service_lock(self):
+        # A concurrent run of the same service cannot quarantine it between the apply and the
+        # re-enable.
+        held = []
+
+        def pce(*_args, **_kwargs):
+            entry = orchestrator._service_locks.get(SERVICE_ID)
+            held.append(entry is not None and entry.lock.locked())
+
+        self._run(pce=MagicMock(side_effect=pce))
+
+        assert held == [True]
+        assert SERVICE_ID not in orchestrator._service_locks
+
+    def test_a_pce_failure_propagates(self):
+        with pytest.raises(RuntimeError, match="writer down"):
+            self._run(pce=MagicMock(side_effect=RuntimeError("writer down")))
+
+    def test_a_build_failure_does_not_reach_the_pce(self, quarantine):
+        pce = MagicMock()
+        with pytest.raises(PolicyRulesBuilderError):
+            self._run(pce=pce, build_error=PolicyRulesBuilderError("auditor rejected"))
+
+        pce.assert_not_called()
+        quarantine.assert_called_once()
+
+    def test_no_wait_for_the_client_reads_it_one_time(self, monkeypatch):
+        # A NATS redelivery: the nak delay already gave the client time to become visible, so a
+        # phantom or deleted UUID does not block the consumer for the whole wait again.
+        monkeypatch.setenv("ONBOARD_CLIENT_WAIT_ATTEMPTS", "3")
+        monkeypatch.setenv("ONBOARD_CLIENT_WAIT_BACKOFF", "0")
+        config = MagicMock()
+        config.get_service.side_effect = _not_found()
+        pce = MagicMock()
+        with (
+            patch.object(orchestrator, "_config", return_value=config),
+            patch.object(orchestrator, "compute_and_apply", pce),
+            pytest.raises(orchestrator.ServiceNotVisibleError),
+        ):
+            orchestrator.onboard_and_apply(SERVICE_ID, wait_for_client=False)
+
+        assert config.get_service.call_count == 1
+        pce.assert_not_called()
 
 
 class TestPceOwnsThePdp:

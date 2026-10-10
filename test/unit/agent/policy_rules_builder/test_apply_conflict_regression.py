@@ -141,15 +141,16 @@ def test_apply_service_maps_policy_contradiction_to_422_conflict_report_and_skip
     # The Controller maps a PolicyContradictionError raised inside the onboarding handler to HTTP 422
     # (a policy finding, not a 500), and the PCE is never reached. The 422 body is now the SAME
     # ConflictReport shape as the structural detector (Q15) — re-shaped from the auditor's name-string
-    # contradictions with NO LLM (lower fidelity: no ids, quotes_verified=False). onboard_service is
-    # patched to raise directly so the route mapping is exercised without a cluster or the LLM.
+    # contradictions with NO LLM (lower fidelity: no ids, quotes_verified=False). The onboarding build
+    # inside the real onboard_and_apply is patched to raise directly, so the route mapping and the
+    # skipped PCE call are exercised without a cluster or the LLM.
     err = PolicyContradictionError(
         "scope name=issues: the issue tracker",
         [Contradiction(candidate_name="tester", description="granted and prohibited")],
     )
     with (
-        patch("aiac.agent.controller.routes.onboard_service", side_effect=err),
-        patch("aiac.agent.controller.routes.compute_and_apply") as pce,
+        patch("aiac.agent.uc.onboarding.orchestrator._onboard", side_effect=err),
+        patch("aiac.agent.uc.onboarding.orchestrator.compute_and_apply") as pce,
     ):
         resp = client.post("/apply/service/svc-conflict")
 
@@ -271,7 +272,7 @@ def test_conflicting_build_falls_back_when_quotes_not_verbatim():
 
 
 def _drive_apply_with_passes(scope_rules, applied=None) -> tuple[MagicMock, MagicMock]:
-    """Drive ``POST /apply/service/{id}`` through the REAL onboarding sequence (provision graph
+    """Drive ``POST /apply/service/{id}`` through the REAL route and ``onboard_and_apply`` (provision graph
     stubbed to a Tool, the scope-focal pass stubbed to ``scope_rules``, LLM/cluster untouched)
     and return ``(compute_and_apply, explain_seam)`` mocks so the caller can assert on the PCE seam
     AND that the explain/LLM enrichment seam fired only when a conflict was detected. ``applied`` is
@@ -280,7 +281,7 @@ def _drive_apply_with_passes(scope_rules, applied=None) -> tuple[MagicMock, Magi
     source is stubbed and the explain seam returns a fixed ExplainResult, so no live endpoint or
     on-disk policy file is touched even on the conflicting path."""
     provision = MagicMock()
-    # The provision graph now also returns the created-manifest (issue 171); onboard_service reads
+    # The provision graph now also returns the created-manifest (issue 171); the onboarding build reads
     # both keys. Empty here — these cases pin the PCE/enrichment seams, not the UC1 rollback.
     provision.invoke.return_value = {
         "service_type": ServiceType.TOOL,
@@ -290,8 +291,8 @@ def _drive_apply_with_passes(scope_rules, applied=None) -> tuple[MagicMock, Magi
     explained = ExplainResult(kind=ConflictKind.DIRECT, granting_quotes=[], prohibiting_quotes=[])
     with (
         patch("aiac.agent.uc.onboarding.orchestrator.build_provision_graph", return_value=provision),
-        # The Orchestrator's IdP seam: the success path re-enables the client and the failure path
-        # rolls back through it (issue 171). Stubbed so neither touches a live IdP.
+        # The Orchestrator's IdP seam: the first read resolves the clientId and the failure path rolls
+        # back through it (issue 171). Stubbed so neither touches a live IdP.
         patch("aiac.agent.uc.onboarding.orchestrator._config", return_value=MagicMock()),
         # The D30 precondition checks (they read the cluster) pass for a tool, and the tool's
         # bootstrap CR (a PCE write, checkpoint B1) is stubbed: these cases pin the PRB/PCE seams.
@@ -303,7 +304,9 @@ def _drive_apply_with_passes(scope_rules, applied=None) -> tuple[MagicMock, Magi
         patch(f"{_BUILDER}.get_policy_source", return_value=_Source()),
         patch(_APPLIED_SEAM, return_value=applied or []),
         patch(_EXPLAIN_SEAM, return_value=explained) as explain,
-        patch("aiac.agent.controller.routes.compute_and_apply") as pce,
+        # onboard_and_apply makes the PCE call from the orchestrator module. With the PCE mocked, the
+        # re-enable (its on_applied callback) does not run.
+        patch("aiac.agent.uc.onboarding.orchestrator.compute_and_apply") as pce,
     ):
         tolerant_client.post("/apply/service/svc-tool")
     return pce, explain

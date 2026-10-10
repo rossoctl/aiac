@@ -3,9 +3,9 @@
 The Controller is stateless. Each ``/apply/*`` route dispatches to its use-case handler
 (orchestrator or sub-agent), receives the ``(list[PolicyRule], override)`` tuple
 the handler returns, and makes the **single** ``compute_and_apply(rules, override)``
-call to the Policy Computation Engine. The onboarding route then re-enables the client
-(``reenable_service``) and calls the PCE ``lift_done`` (also when the re-enable fails): a lift of a
-quarantine counts the service as live until then. No per-use-case business logic, retry
+call to the Policy Computation Engine. The onboarding route calls the orchestrator's
+``onboard_and_apply``, which makes that call itself and re-enables the client under the PCE lock
+after the apply. No per-use-case business logic, retry
 handling, or state assembly lives here. Two routes call the PCE directly instead:
 ``/apply/offboard/...`` (``decommission``) and ``/apply/role-members/{role_id}``
 (``rerender_role``, a role-membership change, D32).
@@ -43,13 +43,13 @@ from aiac.agent.policy_rules_builder.graph import (
 )
 from aiac.agent.shared.error_logging import log_by_type
 from aiac.agent.uc.offboarding.offboard import offboard_service
-from aiac.agent.uc.onboarding.orchestrator import onboard_service, reenable_service
+from aiac.agent.uc.onboarding.orchestrator import onboard_and_apply
 from aiac.agent.uc.onboarding.preconditions import EnforcementPreconditionError
 from aiac.agent.uc.policy_update.build import build_policy
 from aiac.agent.uc.policy_update.rebuild import rebuild_policy
 from aiac.agent.uc.role_update.role import update_role
 from aiac.idp.configuration.models import ClientId, ServiceUuid
-from aiac.policy.computation import compute_and_apply, decommission, lift_done, policy_model_for, rerender_role
+from aiac.policy.computation import compute_and_apply, decommission, policy_model_for, rerender_role
 from aiac.shared.logging_config import configure_logging
 
 # Before the app object exists, so the consumer's startup logs (the ``lifespan`` above) and
@@ -152,21 +152,10 @@ def health() -> dict[str, str]:
 
 @app.post("/apply/service/{service_id}")
 def apply_service(service_id: str) -> Response:
-    # service_id is the Keycloak UUID (an IdP key). onboard_service resolves the clientId once; the
-    # PCE routing guard takes it as the focus service and keeps its rules while its client is still
-    # disabled (a re-onboarding of a quarantined service).
-    uuid = ServiceUuid(service_id)
-    rules, override, client_id = onboard_service(uuid)
-    compute_and_apply(rules, override, focus_service=client_id)
-    # Re-enable the client only AFTER the PCE apply succeeds — a compute_and_apply failure above
-    # propagates and leaves the client disabled (the failed-service marker), never enabled-with-no-policy.
-    # A lift of a quarantine counts the service as live until lift_done, so a render before the re-enable
-    # keeps it in the CRs of its roles (LIM-09). End that wait only after the re-enable, also when the
-    # re-enable fails: the client then stays disabled, and the service must not count as live.
-    try:
-        reenable_service(uuid)
-    finally:
-        lift_done(client_id)
+    # service_id is the Keycloak UUID (an IdP key). onboard_and_apply resolves the clientId once, runs
+    # compute_and_apply with it as the focus service, and re-enables the client under the PCE lock only
+    # after the apply succeeds: a failure leaves the client disabled (the failed-service marker).
+    onboard_and_apply(ServiceUuid(service_id))
     return Response(status_code=200)
 
 

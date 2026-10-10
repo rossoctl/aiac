@@ -206,7 +206,8 @@ AIAC_ENFORCEMENT_SIDE=agent-side REGO_OUTPUT_DIR=/tmp/aiac-rego-agent-side \
   - a tool CR: the name and namespace from `identity_ref`, the managed-by label, the field manager,
     and both request packages (D20);
   - a batch (`POST /policy`, one CR per entry);
-  - `PUT /policy`: it deletes the stale labelled CRs and keeps the others (D18c);
+  - `PUT /policy`: it deletes the stale labelled CRs and keeps the others (D18c); it logs and skips
+    an entry with a bad id and writes the others (no 400);
   - `DELETE /policy/services/{service_id:path}`: a 404 counts as success (D18c);
   - the Rego with `opa eval` (`_assert_opa_allow` / `_opa_verdict`, which skip without `opa` on
     PATH): both renderings for an agent and for a tool; the tool inbound (a granted `tools/call`

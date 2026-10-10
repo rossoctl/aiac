@@ -364,6 +364,10 @@ def _deleted(api) -> list[tuple[str, str]]:
     return [(c.kwargs["namespace"], c.kwargs["name"]) for c in api.delete_namespaced_custom_object.call_args_list]
 
 
+def _upserted(api) -> list[tuple[str, str]]:
+    return [(c.kwargs["namespace"], c.kwargs["name"]) for c in api.patch_namespaced_custom_object.call_args_list]
+
+
 class TestPut:
     def test_deletes_the_stale_labelled_crs_and_keeps_the_entries(self, api):
         api.list_cluster_custom_object.return_value = _listing(
@@ -403,12 +407,14 @@ class TestPut:
         api.list_cluster_custom_object.assert_not_called()
         api.delete_namespaced_custom_object.assert_not_called()
 
-    def test_a_bad_id_is_400_and_deletes_nothing(self, api):
-        api.list_cluster_custom_object.return_value = _listing(("team1", "old-agent"))
-        resp = TestClient(app).put("/policy", json=_target_side(_spm(TOOL), _spm("github-agent")))
-        assert resp.status_code == 400
-        assert "github-agent" in resp.json()["error"]
-        api.delete_namespaced_custom_object.assert_not_called()
+    def test_a_bad_id_is_skipped_and_the_rest_is_replaced(self, api, caplog):
+        # A bad id cannot have a CR. One bad stored SPM must not stop the resync at every start.
+        api.list_cluster_custom_object.return_value = _listing(("team1", "github-tool"), ("team1", "old-agent"))
+        resp = TestClient(app).put("/policy", json=_target_side(_spm("github-agent"), _spm(TOOL)))
+        assert resp.status_code == 204
+        assert _upserted(api) == [("team1", "github-tool")]
+        assert _deleted(api) == [("team1", "old-agent")]
+        assert "github-agent" in caplog.text
 
     def test_an_empty_model_deletes_every_labelled_cr(self, api):
         api.list_cluster_custom_object.return_value = _listing(("team1", "github-tool"), ("team1", "github-agent"))
@@ -448,12 +454,13 @@ class TestPut:
         }
         assert sorted(_deleted(api)) == [("team1", "old-tool"), ("team2", "gone-agent")]
 
-    def test_agent_side_bad_id_is_400_and_deletes_nothing(self, api):
+    def test_agent_side_bad_id_is_skipped_and_the_rest_is_replaced(self, api, caplog):
         api.list_cluster_custom_object.return_value = _listing(("team1", "old-tool"))
         resp = TestClient(app).put("/policy", json=_agent_side(_apm(AGENT), pass_through=("github-tool",)))
-        assert resp.status_code == 400
-        assert "github-tool" in resp.json()["error"]
-        api.delete_namespaced_custom_object.assert_not_called()
+        assert resp.status_code == 204
+        assert _upserted(api) == [("team1", "github-agent")]
+        assert _deleted(api) == [("team1", "old-tool")]
+        assert "github-tool" in caplog.text
 
     def test_an_empty_agent_side_model_deletes_every_labelled_cr(self, api):
         api.list_cluster_custom_object.return_value = _listing(("team1", "github-tool"), ("team1", "github-agent"))

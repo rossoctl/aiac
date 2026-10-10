@@ -112,10 +112,10 @@ deploy github-agent / github-tool into the Kind cluster
   → operator registers a Keycloak client  (client.name = "{ns}/{workload}")
   → Keycloak emits a CLIENT_CREATED admin event
   → AIAC Keycloak SPI (aiac-event-listener) publishes to the NATS Event Broker
-  → the AIAC Agent's NATS consumer runs onboard_service(uuid)   ← same handler the POST calls
+  → the AIAC Agent's NATS consumer runs onboard_and_apply(uuid)   ← same handler the POST calls
 ```
 
-The consumer is wired into the in-cluster Controller and calls the same `onboard_service` handler the
+The consumer is wired into the in-cluster Controller and calls the same `onboard_and_apply` handler the
 debugging `POST` route calls, which upserts the `AuthorizationPolicy` CR of each affected service (D23)
 on the live Kubernetes API — the tool's CR included. The SPI maps `CLIENT_CREATED` to the internal client UUID and publishes
 `aiac.apply.service.{uuid}`, so the harness never resolves a UUID to trigger onboarding (except rung 5,
@@ -259,7 +259,7 @@ real requests + assert → full teardown.**
    host; then `deploy_workload` only `kubectl apply`s the workload's manifests and waits. Deploying is the
    trigger:
    the operator registers the Keycloak client (`client.name = "{ns}/{workload}"`), Keycloak emits
-   `CLIENT_CREATED`, the SPI publishes over NATS, and the Agent's consumer runs `onboard_service`.
+   `CLIENT_CREATED`, the SPI publishes over NATS, and the Agent's consumer runs `onboard_and_apply`.
    - **Tool** (`github-tool`) → `onboard_service` classifies it a **Tool**, writes its bootstrap CR
      before Provision (so that the discovery `tools/list` passes D20; under target side through the self-discovery rule), reads
      the MCP manifest,

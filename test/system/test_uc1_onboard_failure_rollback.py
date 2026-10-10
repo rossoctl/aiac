@@ -231,7 +231,7 @@ def _run_phases(ctx: dict, run: dict) -> None:
     # --- Phase 1 — a failed first onboarding of the agent ---------------------------------------
     with uc1.controller_llm_unusable():
         deployed_at = datetime.now(timezone.utc)  # the log window of the race hint (handoff 20)
-        uc1.deploy_workload(AGENT)  # fires CLIENT_CREATED -> onboard_service -> build raises
+        uc1.deploy_workload(AGENT)  # fires CLIENT_CREATED -> onboard_and_apply -> build raises
         agent = _registered_client(admin, AGENT)
         # Terminal: disabled (rollback) AND no CR (the quarantine deletes it; an agent gets no bootstrap
         # CR, so it never had one in this phase). ``_settle_failed`` then waits for the dead-letter
