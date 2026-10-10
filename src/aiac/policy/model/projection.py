@@ -9,6 +9,7 @@ sides give the same inbound gates.
 Pure: no I/O.
 """
 
+from collections.abc import Callable, Hashable
 from typing import TypeVar
 
 from pydantic import BaseModel
@@ -32,10 +33,15 @@ class InboundProjection(BaseModel):
     source_roles: dict[str, list[Role]] = {}  # calling clientId -> roles held
 
 
-def add_rule(rules: list[PolicyRule], rule: PolicyRule) -> None:
-    """Append ``rule`` unless one with the same dedup identity ``(role.id, scope.id, effect)`` is
+def rule_key(rule: PolicyRule) -> Hashable:
+    """The dedup identity of a rule: ``(role.id, scope.id, effect)``."""
+    return (rule.role.id, rule.scope.id, rule.effect)
+
+
+def add_rule(rules: list[PolicyRule], rule: PolicyRule, key: Callable[[PolicyRule], Hashable] = rule_key) -> None:
+    """Append ``rule`` unless one with the same ``key`` (default: the dedup identity ``rule_key``) is
     present."""
-    if any(r.role.id == rule.role.id and r.scope.id == rule.scope.id and r.effect == rule.effect for r in rules):
+    if any(key(r) == key(rule) for r in rules):
         return
     rules.append(rule)
 

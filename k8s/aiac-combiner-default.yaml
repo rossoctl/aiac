@@ -26,7 +26,7 @@
 # app.kubernetes.io/managed-by=aiac-pdp-policy-writer: PUT /policy deletes every
 # labelled CR that is not in its policy model.
 #
-# Test: test/unit/pdp/service/policy/opa/test_combiner.py (opa eval).
+# Test: test/unit/k8s/test_combiner_manifest.py (opa eval).
 ---
 apiVersion: agent.rossoctl.dev/v1alpha1
 kind: AuthorizationPolicy

@@ -99,6 +99,10 @@ __all__ = [
     "render_target_side",
 ]
 
+# The platform source clients of the agent inbound's bypass rules (Q5) when none are configured:
+# dropping the bypass would deny end-user traffic, which carries the platform client.
+DEFAULT_PLATFORM_CLIENTS: tuple[str, ...] = ("rossoctl",)
+
 # The two request tiers of a client CR, and their fixed package headers (Q2).
 Tier = Literal["inbound", "outbound"]
 _PACKAGES: dict[str, str] = {
@@ -505,7 +509,9 @@ def _tool_inbound_rego(spm: ServicePolicyModel) -> str:
     return "\n\n".join([_PACKAGES["inbound"], owned_tools, declarations, rules]) + "\n"
 
 
-def render_target_side(spm: ServicePolicyModel, platform_clients: tuple[str, ...] = ("rossoctl",)) -> ClientPolicies:
+def render_target_side(
+    spm: ServicePolicyModel, platform_clients: tuple[str, ...] = DEFAULT_PLATFORM_CLIENTS
+) -> ClientPolicies:
     """Render the two request packages of the target-side CR of ``spm``'s service.
 
     The stored SPM is the render input; the writer does no join. The inbound is the tool inbound
@@ -527,7 +533,9 @@ def generate_pass_through_rego(tier: Tier) -> str:
     return f"{_PACKAGES[tier]}\n\nallow := true\n"
 
 
-def render_agent_side(apm: AgentPolicyModel, platform_clients: tuple[str, ...] = ("rossoctl",)) -> ClientPolicies:
+def render_agent_side(
+    apm: AgentPolicyModel, platform_clients: tuple[str, ...] = DEFAULT_PLATFORM_CLIENTS
+) -> ClientPolicies:
     """Render the two request packages of the agent-side CR of ``apm``'s agent.
 
     The APM is the render input (the PCE derives it; the writer does no join). The inbound is the
@@ -551,7 +559,7 @@ def render_pass_through() -> ClientPolicies:
     )
 
 
-def generate_inbound_rego(model: AgentPolicyModel, platform_clients: tuple[str, ...] = ("rossoctl",)) -> str:
+def generate_inbound_rego(model: AgentPolicyModel, platform_clients: tuple[str, ...] = DEFAULT_PLATFORM_CLIENTS) -> str:
     """Render the agent inbound package (``authbridge.client.inbound.request``) from an APM.
 
     The agent side input. Under target side, ``render_target_side`` renders the same package from

@@ -99,3 +99,9 @@ class RoleHolders:
         fresh.inbound_allow_rules = [self.refresh_rule(rule) for rule in fresh.inbound_allow_rules]
         fresh.inbound_deny_rules = [self.refresh_rule(rule) for rule in fresh.inbound_deny_rules]
         return fresh
+
+    def refresh_live_models(self, models: Iterable[ServicePolicyModel]) -> list[ServicePolicyModel]:
+        """The models of ``models`` whose service is ``live``, sorted by service id, each refreshed
+        (``refresh_model``): what a target-side render of stored SPMs deploys."""
+        ordered = sorted(models, key=lambda model: model.service_id)
+        return [self.refresh_model(model) for model in ordered if model.service_id in self.live]

@@ -51,13 +51,20 @@ from pydantic import AfterValidator, BeforeValidator
 from starlette.responses import JSONResponse, Response
 
 from aiac.pdp.service.policy.opa.rego import (
+    DEFAULT_PLATFORM_CLIENTS,
     ClientPolicies,
     identity_ref,
     render_agent_side,
     render_pass_through,
     render_target_side,
 )
-from aiac.policy.model.models import AgentSidePolicyModel, AnyPolicyModel, PolicyModel, TargetSidePolicyModel
+from aiac.policy.model.models import (
+    AgentSidePolicyModel,
+    AnyPolicyModel,
+    EnforcementSide,
+    PolicyModel,
+    TargetSidePolicyModel,
+)
 from aiac.shared.logging_config import configure_logging
 
 # Before the app object exists, so LOG_LEVEL governs this writer's (and the kubernetes
@@ -124,14 +131,10 @@ def _platform_clients() -> tuple[str, ...]:
     """Platform source clients for the inbound generator's bypass rules (Q5).
 
     ``PLATFORM_SOURCE_CLIENTS`` comma-split, blanks dropped; unset or all-blank
-    falls back to ``("rossoctl",)`` (dropping the bypass would deny end-user
-    traffic, which carries the platform client).
+    falls back to ``DEFAULT_PLATFORM_CLIENTS``.
     """
-    raw = os.environ.get("PLATFORM_SOURCE_CLIENTS")
-    if raw is None:
-        return ("rossoctl",)
-    clients = tuple(c.strip() for c in raw.split(",") if c.strip())
-    return clients or ("rossoctl",)
+    raw = os.environ.get("PLATFORM_SOURCE_CLIENTS", "")
+    return tuple(c.strip() for c in raw.split(",") if c.strip()) or DEFAULT_PLATFORM_CLIENTS
 
 
 # --------------------------------------------------------------------------- #
@@ -321,12 +324,15 @@ def _run_write(op) -> Response:
 app = FastAPI()
 
 
-# The entry fields of each side (every field but the tag), keyed by the tag value.
+def _entry_fields(side: type[PolicyModel]) -> frozenset[str]:
+    """The entry fields of ``side``: every field but the tag."""
+    return frozenset(side.model_fields.keys() - PolicyModel.model_fields.keys())
+
+
+# The entry fields of each side, keyed by the tag value.
 _SIDE_FIELDS: dict[str, frozenset[str]] = {
-    side.model_fields["enforcement_side"].default.value: frozenset(
-        side.model_fields.keys() - PolicyModel.model_fields.keys()
-    )
-    for side in (TargetSidePolicyModel, AgentSidePolicyModel)
+    EnforcementSide.TARGET_SIDE.value: _entry_fields(TargetSidePolicyModel),
+    EnforcementSide.AGENT_SIDE.value: _entry_fields(AgentSidePolicyModel),
 }
 
 

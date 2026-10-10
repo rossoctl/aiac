@@ -22,8 +22,8 @@ from pathlib import Path
 import pytest
 import yaml
 
-# test/unit/pdp/service/policy/opa/ is 6 levels below the repo root.
-_REPO_ROOT = Path(__file__).resolve().parents[6]
+# test/unit/k8s/ is 3 levels below the repo root.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
 _MANIFEST = _REPO_ROOT / "k8s" / "aiac-combiner-default.yaml"
 
 _requires_opa = pytest.mark.skipif(not shutil.which("opa"), reason="opa binary not on PATH")

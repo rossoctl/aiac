@@ -52,7 +52,9 @@ _SUBJECT_MAPPER = "username-to-sub"
 
 # Comma-separated clientIds of the platform login clients that get ``_SUBJECT_SCOPE`` (D31). The
 # same setting, with the same meaning, as the PDP policy writer's platform source clients; unset
-# or all-blank falls back to ``_DEFAULT_LOGIN_CLIENTS``.
+# or all-blank falls back to ``_DEFAULT_LOGIN_CLIENTS``. The parse (``_login_clients``) is a copy of
+# the writer's ``_platform_clients``, not an import: this image holds only ``main.py`` (see the
+# Dockerfile), so it cannot import the ``aiac`` package.
 _LOGIN_CLIENTS_ENV = "PLATFORM_SOURCE_CLIENTS"
 _DEFAULT_LOGIN_CLIENTS = ("rossoctl",)
 
@@ -316,11 +318,8 @@ def _converge_subject_mapper(admin: KeycloakAdmin, scope_id: str, existing: dict
 
 def _login_clients() -> tuple[str, ...]:
     """The clientIds in ``_LOGIN_CLIENTS_ENV``, comma-split, blanks dropped (default ``rossoctl``)."""
-    raw = os.environ.get(_LOGIN_CLIENTS_ENV)
-    if raw is None:
-        return _DEFAULT_LOGIN_CLIENTS
-    clients = tuple(c.strip() for c in raw.split(",") if c.strip())
-    return clients or _DEFAULT_LOGIN_CLIENTS
+    raw = os.environ.get(_LOGIN_CLIENTS_ENV, "")
+    return tuple(c.strip() for c in raw.split(",") if c.strip()) or _DEFAULT_LOGIN_CLIENTS
 
 
 def _link_default_scope(admin: KeycloakAdmin, client_uuid: str, scope_id: str) -> None:

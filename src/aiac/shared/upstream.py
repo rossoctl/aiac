@@ -38,9 +38,9 @@ def max_retries() -> int:
 def _status_code(exc: BaseException) -> int | None:
     """Best-effort HTTP status of an exception: ``requests`` HTTPError carries it on
     ``.response.status_code``; a Kubernetes ``ApiException`` and the IdP library's ``IdPHTTPError``
-    carry it on ``.status``. Only an ``int`` or a numeric ``str`` is a status: a stand-in response
-    with no status (for example a ``MagicMock``, where ``int(MagicMock())`` is 1) is skipped, so it
-    does not hide the error's own ``.status``. A ``bool`` is not a status."""
+    carry it on ``.status``. Only an ``int`` or a numeric ``str`` is a status: any other value (also
+    an object that ``int()`` can convert) is skipped, so it does not hide the error's own
+    ``.status``. A ``bool`` is not a status."""
     resp = getattr(exc, "response", None)
     for candidate in (getattr(resp, "status_code", None), getattr(exc, "status", None)):
         if isinstance(candidate, bool) or not isinstance(candidate, (int, str)):
