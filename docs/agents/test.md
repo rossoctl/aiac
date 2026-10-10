@@ -34,7 +34,7 @@ to put a new test, see `docs/testing/testing-strategy.md`.
 | Lane | Selection | `test` skill profile | Needs |
 |---|---|---|---|
 | unit | bare `pytest` | `unit` | Nothing |
-| integration | `-m integration` | `integration` | Nothing (offline: several AIAC units in one process, no cluster, no LLM endpoint). The tests are under `test/integration/`, a mirror of `src/aiac/`. The first one is the D32 test of shared roles and scopes (`test/integration/policy/computation/test_shared_roles.py`). |
+| integration | `-m integration` | `integration` | Nothing (offline: several AIAC units in one process, no cluster, no LLM endpoint). The tests are under `test/integration/`, a mirror of `src/aiac/`. |
 | llm | `-m llm` | `system` | An LLM endpoint only (no cluster, no Keycloak) |
 | system | `-m system` | `system` | A wired Kind cluster, Keycloak admin credentials, an LLM endpoint |
 | eval | `-m eval` | `system` | Keycloak, an LLM endpoint, `opa` on `PATH` for the e2e level |
@@ -52,17 +52,19 @@ The live lanes read the repo-root `.env` (gitignored): `LLM_BASE_URL`,
 set -a; . .env; set +a
 ```
 
+A git worktree does not get the gitignored `.env` of the main checkout. Copy or
+link it into the worktree first, or every live lane skips.
+
 ## `integration` lane
 
 The integration tests make several AIAC units work together in one process, with
 no cluster, no Keycloak and no LLM endpoint. So they need no env and no `.env`,
 and they do not skip. The default `addopts` deselects them, so a bare `pytest`
-does not run them. The first test is the D32 test of shared roles and scopes
-(`test/integration/policy/computation/test_shared_roles.py`): the real focal resolver,
-Service Policy Builder (with the LLM seam stubbed), PCE and PDP Policy Writer
-render, for agents and tools that share a role or a scope. Fakes stand in for
-Keycloak, the Policy Model Store and the Kubernetes API (`fakes.py` next to the
-test).
+does not run them. The tests wire the real focal resolver, Service Policy
+Builder (with the LLM seam stubbed), PCE and PDP Policy Writer render — for
+example the D32 shared roles and scopes, quarantine lift, shared decommission
+and snapshot repair. Fakes stand in for Keycloak, the Policy Model Store and the
+Kubernetes API (`fakes.py` next to the tests).
 
 ```bash
 .venv/bin/pytest -m integration
@@ -73,8 +75,8 @@ test).
 The live-LLM Policy Rules Builder tests
 (`test/unit/agent/policy_rules_builder/test_graph_live_llm.py`) run the **real**
 LLM end-to-end. They assert that the emitted `(name, effect)` rule set matches
-the policy text: for allow-only policies, and for policies with explicit,
-description-driven, and exclusivity denies. The tests mock only the role/scope
+the policy text: for allow-only policies, and for policies with explicit and
+description-driven denies. The tests mock only the role/scope
 descriptions and the policy source. The `_structured_call` LLM seam stays live.
 The lane needs only `LLM_BASE_URL` / `LLM_MODEL` / `LLM_API_KEY`.
 
