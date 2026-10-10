@@ -13,7 +13,7 @@ the linked doc — this file copies none of them.
 | Short forms | `agent`, `target` — only in `ac-side=<short>`, never as a bare word |
 | Default | `target-side` |
 | Setting | `AIAC_ENFORCEMENT_SIDE` in the `aiac-agent-config` ConfigMap, namespace `aiac-system` |
-| Read, apply, verify | `k8s/opa-kind-runbook.md` → Part C — Switch the enforcement side |
+| Read, apply, verify | `k8s/opa-kind-runbook.md` → Switch the enforcement side |
 
 Usage: `/deploy ac-side=agent`, `/deploy agent-side`.
 

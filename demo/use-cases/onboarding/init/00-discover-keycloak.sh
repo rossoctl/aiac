@@ -1,7 +1,7 @@
 # shellcheck shell=bash
-# 00-discover-keycloak.sh — set up the environment the uc1-onboarding demo needs.
+# 00-discover-keycloak.sh — set up the environment the onboarding demo needs.
 #
-#   source init/00-discover-keycloak.sh     # from demo/use-cases/uc1-onboarding/
+#   source init/00-discover-keycloak.sh     # from demo/use-cases/onboarding/
 #   source ./00-discover-keycloak.sh        # from within init/
 #
 # Exports KEYCLOAK_URL / KEYCLOAK_ADMIN_USERNAME / KEYCLOAK_ADMIN_PASSWORD and

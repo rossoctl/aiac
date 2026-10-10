@@ -50,6 +50,12 @@ from aiac.agent.uc.policy_update.rebuild import rebuild_policy
 from aiac.agent.uc.role_update.role import update_role
 from aiac.idp.configuration.models import ClientId, ServiceUuid
 from aiac.policy.computation import compute_and_apply, decommission, lift_done, policy_model_for, rerender_role
+from aiac.shared.logging_config import configure_logging
+
+# Before the app object exists, so the consumer's startup logs (the ``lifespan`` above) and
+# every ``logger.info`` in the package reach stdout. Without it the root logger has no
+# handler and defaults to WARNING — see ``aiac.shared.logging_config``.
+configure_logging()
 
 app = FastAPI(lifespan=lifespan)
 

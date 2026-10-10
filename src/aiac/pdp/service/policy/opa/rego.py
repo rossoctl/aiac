@@ -168,10 +168,14 @@ def _render_list(var: str, values: list[str]) -> str:
 
 
 def _render_map(var: str, mapping: dict[str, list[str]]) -> str:
-    """Render ``{var} := { "key": ["a", "b"], ... }`` as Rego (empty-safe: ``{}``).
+    """Render ``{var} := { "key": ["a", "b"], ... }`` as Rego (empty case: ``{}``).
 
     Keys and values are emitted via ``json.dumps`` so quotes/newlines/backslashes are escaped
-    (JSON-compatible Rego string syntax) — this prevents Rego injection / broken output."""
+    (JSON-compatible Rego string syntax) — this prevents Rego injection / broken output.
+
+    An empty mapping renders as a bare ``{}``, which is NOT safe to index
+    directly — every read of a map rendered here must go through :func:`_lookup`.
+    See that function for why."""
     if not mapping:
         return f"{var} := {{}}"
     lines = [f"{var} := {{"]
@@ -627,7 +631,7 @@ def generate_outbound_rego(model: AgentPolicyModel) -> str:
     ``_group_rules_by_target``).
 
     ``agent_roles`` / ``agent_role_scopes`` are emitted for debugging but are
-    **not** referenced by ``allow`` — ``target_allow_scopes[input.identity.service_id]``
+    **not** referenced by ``allow`` — ``object.get(target_allow_scopes, input.identity.service_id, [])``
     already *is* the capability gate. This package emits neither ``agent_scopes``
     nor the inbound scope gates.
 

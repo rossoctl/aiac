@@ -103,8 +103,10 @@ The lane runs under the enforcement side that `AIAC_ENFORCEMENT_SIDE` sets in th
 included, checks its own inbound from its own CR). To change the side, see
 `docs/agents/deploy.md`.
 
-Full prerequisites, wiring, the side switch, and manual probe commands:
-`k8s/opa-kind-runbook.md`. The per-loop shape: `test/system/uc1_onboard.py`.
+The platform prerequisites, wiring, verification and the side switch:
+`k8s/opa-kind-runbook.md`. The realm fix-up (Direct Access Grants) and the manual
+probes of the scenario: `demo/use-cases/onboarding/demo.md`. The per-loop shape:
+`test/system/uc1_onboard.py`.
 
 ```bash
 k8s/opa-kind-enable.sh          # one time: wire the OPA plugin and the AIAC combiner into Kind

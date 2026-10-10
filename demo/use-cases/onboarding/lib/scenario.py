@@ -1,4 +1,4 @@
-"""The UC-1 onboarding demo's scenario data — a standalone copy of the facts
+"""The onboarding demo's scenario data — a standalone copy of the facts
 ``test/system/scenario_uc1.py`` encodes for the pytest ladder, plus the extra data this demo
 needs and pytest does not (login profile fields, human-readable intents). Deliberately not imported
 from ``test/`` — this demo ships outside the test tree and must run with no ``aiac`` checkout beyond
@@ -38,9 +38,9 @@ USER_PASSWORD = "password"
 # grant_type=password will succeed (VERIFY_PROFILE). Not needed by the pytest ladder (it never logs
 # in as these users), but load-bearing here — the whole point of this demo is a real ROPC login.
 USER_PROFILE: dict[str, dict[str, str]] = {
-    "dev-user": {"email": "dev-user@uc1.demo", "firstName": "Dev", "lastName": "User"},
-    "test-user": {"email": "test-user@uc1.demo", "firstName": "Test", "lastName": "User"},
-    "devops-user": {"email": "devops-user@uc1.demo", "firstName": "Devops", "lastName": "User"},
+    "dev-user": {"email": "dev-user@onboarding.demo", "firstName": "Dev", "lastName": "User"},
+    "test-user": {"email": "test-user@onboarding.demo", "firstName": "Test", "lastName": "User"},
+    "devops-user": {"email": "devops-user@onboarding.demo", "firstName": "Devops", "lastName": "User"},
 }
 
 # --- Realm-role descriptions (the PRB reads these when expanding the abstract policy) --------
@@ -57,7 +57,7 @@ USER_ROLES: dict[str, str] = {
     "devops": ("DevOps — an operations user who manages deployment infrastructure and runtime environments."),
 }
 
-# --- Discovered entities (what real UC-1 onboarding provisions; recorded here for the oracle) -
+# --- Discovered entities (what real onboarding provisions; recorded here for the oracle) -
 
 AGENT_SCOPES: dict[str, str] = {
     "github-agent.source_operations": (

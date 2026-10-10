@@ -18,8 +18,8 @@ eval/reports/
 # eval/trend_log.jsonl (committed) + eval/reports/ (gitignored, above), not source of truth itself.
 eval/dashboard.html
 
-# uc1-onboarding demo's captured .rego snapshots — regenerated per run, not source of truth.
-demo/use-cases/uc1-onboarding/generated/
+# onboarding demo's captured .rego snapshots — regenerated per run, not source of truth.
+demo/use-cases/onboarding/generated/
 
 # system-test CR captures (test/system/uc1_onboard.py capture_aiac_crs): every AIAC CR + the global
 # combiner, written before each teardown for post-mortem debugging; one directory per capture,

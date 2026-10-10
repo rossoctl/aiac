@@ -371,7 +371,7 @@ def port_forward(
 # **real OPA plugin's** decision off the response. AuthBridge's own ``jwt-validation`` + ``mcp-parser``
 # build ``input.identity.*`` + ``input.mcp.params.name`` — the test never hand-builds an input doc.
 #
-# Request shaping + outcome classification follow ``k8s/opa-kind-runbook.md`` exactly (Parts A/B).
+# Outcome classification follows ``k8s/opa-kind-runbook.md`` "Reading a decision".
 
 KEYCLOAK_CLIENT_ID = "rossoctl"  # the platform client the runbook mints user tokens through
 _CURL_IMAGE = "curlimages/curl:8.10.1"  # same throwaway image the runbook probes with
@@ -387,7 +387,7 @@ def mint_token(
     scope: str = "openid",
     timeout: float = 30.0,
 ) -> str:
-    """Mint a user access token via the OIDC password grant (runbook A.1 / B.4).
+    """Mint a user access token via the OIDC password grant.
 
     Requires Direct Access Grants enabled on ``client_id`` and the user's password set; a token whose
     ``sub`` is the username further needs the client scope ``aiac-username-sub`` linked to
@@ -522,7 +522,7 @@ def inbound_probe(
 ) -> tuple[int | None, str]:
     """Send an inbound request through AuthBridge as ``token`` and return ``(http_code, body)``.
 
-    Mirrors the runbook's ``probe_as`` (A.2): a throwaway ``curlimages/curl`` pod in ``namespace``
+    A throwaway ``curlimages/curl`` pod in ``namespace``
     POSTs a ``ping/nonexistent`` JSON-RPC method to the agent Service — enough to clear
     ``jwt-validation`` + OPA and reach (or be blocked before) the app, without triggering the CrewAI
     flow. ``curl -w`` appends the sentinel ``HTTP_CODE:<n>`` line the caller parses. ``--command`` is
@@ -576,7 +576,7 @@ def outbound_probe(
     """Drive an outbound MCP ``tools/call`` through AuthBridge's forward proxy and return
     ``(http_code, body)``.
 
-    Mirrors the runbook's outbound probe (B.4) but invokes a **bare** tool (``params.name = tool_name``,
+    Invokes a **bare** tool (``params.name = tool_name``,
     e.g. ``source-read``) instead of ``tools/list``, so AuthBridge's ``mcp-parser`` surfaces
     ``input.mcp.params.name`` and OPA's per-tool check is actually exercised (github-tool's inbound
     under target side, the agent's outbound under agent side). The agent app
@@ -686,7 +686,7 @@ def notification_outcome(code: int | None) -> str:
 
 def inbound_outcome(code: int | None) -> str:
     """Classify an inbound probe: HTTP 200 -> ``"allow"`` (reached the app), 403 -> ``"deny"`` (OPA
-    blocked it), anything else -> ``"error"`` (runbook A.4)."""
+    blocked it), anything else -> ``"error"``."""
     if code == 200:
         return "allow"
     if code == 403:
@@ -710,7 +710,7 @@ def _json_or_none(body: str) -> object:
 
 
 def outbound_outcome(code: int | None, body: str) -> str:
-    """Classify an outbound probe by **body**, per runbook B.4.
+    """Classify an outbound probe by **body** (``k8s/opa-kind-runbook.md`` "Reading a decision").
 
     A denied ``tools/call`` has one of two shapes, by the enforcement side:
 
@@ -1040,10 +1040,10 @@ def verify_login_subject(
 
     The live loop keys OPA decisions on ``input.identity.subject`` (the token ``sub``). To mint the
     token, Direct Access Grants must be enabled on ``client_id`` — a one-time Keycloak prerequisite the
-    fixture does **not** provision (runbook Prerequisites), so a mint failure is a skip. The ``sub`` =
-    username comes from the client scope ``aiac-username-sub``, which the IdP Configuration Service
-    links as a default scope to the login client (``client_id``, by default ``rossoctl``) at its startup
-    and at each onboarding (D31). That is an AIAC step, not a prerequisite, so a wrong ``sub`` fails.
+    fixture does **not** provision (``demo/use-cases/onboarding/demo.md`` realm fix-up), so a mint
+    failure is a skip. The ``sub`` = username comes from the client scope ``aiac-username-sub``, which
+    the IdP Configuration Service links as a default scope to the login client (``client_id``, by
+    default ``rossoctl``) at its startup and at each onboarding (D31). That is an AIAC step, not a prerequisite, so a wrong ``sub`` fails.
     ``uc1_onboard.require_subject_scope`` checks the links again after each onboarding. Returns the
     minted token on success."""
     import pytest
@@ -1054,7 +1054,7 @@ def verify_login_subject(
         pytest.skip(
             f"cannot mint a {user!r} token in realm {realm!r} via client {client_id!r}: {exc}. "
             "Enable Direct Access Grants on the client and set the user's password "
-            "(see k8s/opa-kind-runbook.md Prerequisites)."
+            "(see the realm fix-up in demo/use-cases/onboarding/demo.md)."
         )
     sub = jwt_claim(token, "sub")
     if sub != user:
