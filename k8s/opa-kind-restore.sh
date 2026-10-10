@@ -3,8 +3,8 @@
 #
 # Re-applies the rossoctl chart's real, untouched charts/rossoctl/values.yaml
 # (no OPA/parser overlay) and restarts the authbridge sidecars so they pick
-# up the reverted pipeline. Mirrors the "Rollback" section of
-# authbridge/docs/opa-kind-runbook.md verbatim — since opa-kind-enable.sh
+# up the reverted pipeline. This is the "Restore" section of
+# k8s/opa-kind-runbook.md — since opa-kind-enable.sh
 # never wrote to values.yaml, "restoring" it is just re-running helm upgrade
 # against that same file with no overlay on top.
 #
@@ -26,6 +26,9 @@
 #
 # Then it restarts the agent AND the tool pods, because the webhook copies the
 # namespace pipeline into a pod only at pod CREATE.
+#
+# Leaves bundle-service, the AuthorizationPolicy CRD and the client policy CRs
+# in place — without opa in the pipeline nothing consults them.
 #
 # Env vars:
 #   OPERATOR_DIR        path to the rossoctl/operator repo clone; the stock
@@ -81,7 +84,7 @@ echo "==> Step 2/3: restoring the stock global combiner (${OPERATOR_DIR}/charts/
 # get their `client_ok if not data.authbridge.client.<dir>.request` rule back.
 # Skip when the AuthorizationPolicy CRD is absent (the enable script never ran).
 if kubectl get crd authorizationpolicies.agent.rossoctl.dev >/dev/null 2>&1; then
-  helm template rossoctl-operator "$OPERATOR_DIR/charts/operator" \
+  helm template "$RELEASE_NAME" "$OPERATOR_DIR/charts/operator" \
     --namespace "$RELEASE_NAMESPACE" \
     --set bundleService.enabled=true \
     --show-only templates/bundleservice/default-policy.yaml \
@@ -91,6 +94,7 @@ else
 fi
 
 echo "==> Step 3/3: restarting the agent and tool pods in ${AGENT_NAMESPACE}"
+# --ignore-not-found so this no-ops cleanly when the namespace has no such pods.
 kubectl delete pods -n "$AGENT_NAMESPACE" -l 'rossoctl.io/type in (agent,tool)' --ignore-not-found
 
 cat <<EOF

@@ -6,6 +6,12 @@ metadata:
   namespace: aiac-system
 data:
   SERVICEPOLICY_DB_PATH: "/data/policy_model.db"
+  # Root-logger level (DEBUG | INFO | WARNING | ERROR | CRITICAL, or a number); an unrecognized
+  # value falls back to INFO. Change it with:
+  #   kubectl patch configmap aiac-policy-model-store-config -n aiac-system --type merge \
+  #     -p '{"data":{"LOG_LEVEL":"DEBUG"}}' \
+  #     && kubectl rollout restart statefulset/aiac-policy-model-store -n aiac-system
+  LOG_LEVEL: "INFO"
 
 ---
 apiVersion: apps/v1

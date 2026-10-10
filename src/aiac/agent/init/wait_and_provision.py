@@ -21,8 +21,9 @@ import nats
 from tenacity import retry, stop_after_delay, wait_fixed
 
 from aiac.agent.eventbus.stream import DEFAULT_NATS_URL, ensure_stream
+from aiac.shared.logging_config import configure_logging
 
-logging.basicConfig(level=logging.INFO)
+configure_logging()
 logger = logging.getLogger(__name__)
 
 _RETRY_KWARGS = {"wait": wait_fixed(2), "stop": stop_after_delay(300), "reraise": True}

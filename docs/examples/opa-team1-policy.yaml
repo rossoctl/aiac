@@ -68,9 +68,9 @@
 # the exchanged token, so client_id is the calling agent's client. `subject` is
 # the JWT `sub` claim, the username on every leg (D31). The one source is the
 # client scope aiac-username-sub: the login token gets it from the link that AIAC
-# makes to the rossoctl client (A.1 in k8s/opa-kind-runbook.md), and the
-# exchanged token from the link that AIAC makes to each managed client
-# (github-agent) at onboarding.
+# makes to the rossoctl client (see "One-time Keycloak realm fix-up" in
+# demo/use-cases/onboarding/demo.md), and the exchanged token from the link
+# that AIAC makes to each managed client (github-agent) at onboarding.
 apiVersion: agent.rossoctl.dev/v1alpha1
 kind: AuthorizationPolicy
 metadata:

@@ -150,7 +150,7 @@ POST /apply/service/{service_id}     # onboard (or re-onboard) one service
 ```
 
 Re-onboard **every** managed agent and tool. Reference onboarding drivers live
-at `demo/use-cases/uc1-onboarding/onboard/` (`04-onboard-agent.py`,
+at `demo/use-cases/onboarding/onboard/` (`04-onboard-agent.py`,
 `05-onboard-tool.py`); in a real environment, drive the same
 `POST /apply/service/{service_id}` for each service id in your catalog, e.g.:
 

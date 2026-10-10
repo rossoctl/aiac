@@ -240,6 +240,66 @@ cd aiac
 pkill -f "port-forward.*7071"
 ```
 
+## Changing log levels
+
+Every workload reads a `LOG_LEVEL` key from its ConfigMap. The manifests ship `INFO`, and you can
+change the level on a running cluster **without rebuilding any image**. `LOG_LEVEL` is read once,
+at process start, so after patching a ConfigMap you must restart the workload. The env of a running
+pod is fixed when the pod is created, so patching the ConfigMap alone changes nothing.
+
+| Workload | ConfigMap | Restart with |
+|---|---|---|
+| Agent (`aiac-init` + Controller) | `aiac-agent-config` | `kubectl rollout restart deployment/aiac-agent -n aiac-system` |
+| Interface Pod (IdP Configuration Service + PDP Policy Writer) | `aiac-pdp-config` | `kubectl rollout restart deployment/aiac-interface -n aiac-system` |
+| Policy Model Store | `aiac-policy-model-store-config` | `kubectl rollout restart statefulset/aiac-policy-model-store -n aiac-system` |
+| Event Broker (NATS) | `aiac-event-broker-config` | `kubectl rollout restart deployment/aiac-event-broker -n aiac-system` |
+| Isolated IdP dev pod | `aiac-pdp-config-standalone` | delete and re-create the Pod (see below) |
+
+**Accepted values.** The Python services (Agent, Interface Pod, Policy Model Store) accept
+`DEBUG`, `INFO`, `WARNING`, `ERROR` and `CRITICAL`, case-insensitive, or a numeric level such as
+`10`. An unrecognized value falls back to `INFO` instead of stopping the service. NATS has no level
+setting below its default, so for the Event Broker only `DEBUG` (`-D`) and `TRACE` (`-DV`, which
+adds protocol tracing) change anything. Any other value gives NATS's default output.
+
+**Example: raise the Agent to DEBUG** while diagnosing an onboarding that never lands:
+
+```bash
+kubectl patch configmap aiac-agent-config -n aiac-system --type merge \
+  -p '{"data":{"LOG_LEVEL":"DEBUG"}}' \
+  && kubectl rollout restart deployment/aiac-agent -n aiac-system
+
+kubectl rollout status deployment/aiac-agent -n aiac-system
+kubectl logs deployment/aiac-agent -n aiac-system -c aiac-agent -f      # Controller
+kubectl logs deployment/aiac-agent -n aiac-system -c aiac-init          # init container
+```
+
+Use the same pattern for any other row of the table. Swap in that row's ConfigMap name and
+restart command. Set the value back to `INFO` the same way when you are done.
+
+```bash
+# e.g. the Interface Pod (both of its containers share the one key)
+kubectl patch configmap aiac-pdp-config -n aiac-system --type merge \
+  -p '{"data":{"LOG_LEVEL":"DEBUG"}}' \
+  && kubectl rollout restart deployment/aiac-interface -n aiac-system
+```
+
+Notes:
+
+- **Precedence in the Agent pod.** Both Agent containers load `aiac-pdp-config` first and
+  `aiac-agent-config` second, and in `envFrom` the last source wins. So the Agent's level is
+  always the one in `aiac-agent-config`, and patching `aiac-pdp-config` changes only the Interface
+  Pod.
+- **Re-applying a manifest resets the level.** `kubectl apply -f k8s/<manifest>.yaml` writes the
+  ConfigMap back to `INFO`. To make a level permanent, edit `LOG_LEVEL` in the manifest itself.
+- **Restarting the Event Broker drops its JetStream data**, because the data lives on an
+  `emptyDir`. The Agent's `aiac-init` recreates the stream, but in-flight messages are lost.
+- **The isolated IdP dev pod** is a bare Pod, so `rollout restart` does not apply to it. Patch
+  `aiac-pdp-config-standalone`, then `kubectl delete pod idp-configuration-keycloak-pod -n aiac-system`
+  and re-create the Pod. Re-creating it with `kubectl apply -f k8s/idp-configuration-keycloak-pod.yaml`
+  also resets the ConfigMap, so for that pod, edit the manifest instead of patching.
+- `LOG_LEVEL` sets the **application** (root) logger. It does not change uvicorn's `--log-level`,
+  so uvicorn's own access and error lines stay at uvicorn's default.
+
 ## Redeploying after a code change
 
 ```bash
@@ -263,7 +323,7 @@ in place to the CR-backed implementation, which writes Rego packages to an
 `AuthorizationPolicy` Kubernetes CR instead. The image name, ClusterIP Service name, and
 port are unchanged — no image swap and no Agent reconfiguration required.
 
-See issue [4.18 — K8s: OPA PDP Policy Writer AuthorizationPolicy CR + RBAC upgrade](../docs/issues/deployment/4.18-k8s-opa-authorizationpolicy-rbac.md) for the full procedure (ServiceAccount, ClusterRole, ClusterRoleBinding, CR instance).
+See issue [#70 — K8s: OPA PDP Policy Writer AuthorizationPolicy CR + RBAC upgrade](https://github.com/rossoctl/aiac/issues/70) for the full procedure (ServiceAccount, ClusterRole, ClusterRoleBinding, CR instance).
 
 ```bash
 # Rebuild the OPA PDP Policy Writer image with the Phase 2 (CR-backed) implementation

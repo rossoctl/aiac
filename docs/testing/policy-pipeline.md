@@ -287,8 +287,8 @@ Runnable against a live rossoctl/Kind cluster (operator + Keycloak + SPIRE) with
 pipeline wired into **both** legs, the **NATS Event Broker deployed**, the **Keycloak SPI installed +
 `aiac-event-listener` enabled on the realm**, and a real LLM in-pod. The fixture loads, deploys, and tears
 down `github-agent` + `github-tool` itself (it runs `demo/assets/kind-load.sh`, so the `kind` CLI +
-`kubectl` + a container runtime must be on the pytest host). Stand the pipeline up with `k8s/opa-kind-enable.sh`; the full
-prerequisites, wiring, and manual probe commands are in `k8s/opa-kind-runbook.md`.
+`kubectl` + a container runtime must be on the pytest host). Stand the pipeline up with `k8s/opa-kind-enable.sh`; its
+prerequisites, wiring and verification are in `k8s/opa-kind-runbook.md`.
 
 ```bash
 k8s/opa-kind-enable.sh          # one-time: wire the OPA plugin into both legs and apply the changed combiner
@@ -313,8 +313,8 @@ kubectl -n aiac-system rollout status deployment/aiac-agent
 
 Without `-m system` the suite is deselected (the default `addopts`); when the cluster is not wired
 (including the combiner not changed) or the env is unset
-it **skips cleanly** (it never false-passes). To eyeball the pipeline manually, follow
-`k8s/opa-kind-runbook.md` (Part A inbound, Part B outbound) and inspect the upserted
+it **skips cleanly** (it never false-passes). To eyeball the pipeline manually, read the sidecars'
+decision logs (`k8s/opa-kind-runbook.md` "What OPA sees on each leg") and inspect the upserted
 `AuthorizationPolicy` CR and the provisioned Keycloak realm.
 
 ## Testing Decisions

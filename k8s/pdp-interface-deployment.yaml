@@ -26,6 +26,14 @@ data:
   PLATFORM_SOURCE_CLIENTS: "rossoctl"
   # NATS_URL points the PDP services at the Event Broker (Phase 2, issue 4.19).
   NATS_URL: "nats://aiac-event-broker-service:4222"
+  # Root-logger level (DEBUG | INFO | WARNING | ERROR | CRITICAL, or a number) for BOTH Interface
+  # Pod containers — the IdP Configuration Service and the PDP Policy Writer. An unrecognized value
+  # falls back to INFO. The Agent pod also loads this ConfigMap, but its own aiac-agent-config is
+  # listed after it in envFrom and wins, so this key does not change the Agent's level. Change it with:
+  #   kubectl patch configmap aiac-pdp-config -n aiac-system --type merge \
+  #     -p '{"data":{"LOG_LEVEL":"DEBUG"}}' \
+  #     && kubectl rollout restart deployment/aiac-interface -n aiac-system
+  LOG_LEVEL: "INFO"
   # AIAC_RAG_INGEST_URL and AIAC_CHROMADB_URL are added in Phase 3 (RAG Pod, issue 4.20).
 
 ---

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify (and, where safe, install) everything the UC-1 onboarding demo needs before ``make
+"""Verify (and, where safe, install) everything the onboarding demo needs before ``make
 setup`` touches Keycloak. Two classes of check, per the handoff:
 
   1. VERIFY ONLY, else abort with a pointer to the installer: cluster reachable, the
@@ -28,7 +28,7 @@ import scenario as scn
 from _lib import Config, abort, kubectl, kubectl_get_json, kubectl_rollout_status, load_config, note, ok, rule, say
 
 HERE = Path(__file__).resolve().parent
-AIAC_ROOT = HERE.parents[3]  # demo/use-cases/uc1-onboarding/init/ -> aiac/
+AIAC_ROOT = HERE.parents[3]  # demo/use-cases/onboarding/init/ -> aiac/
 ASSETS_DIR = HERE.parents[2] / "assets"  # demo/assets/
 
 AIAC_NAMESPACE = "aiac-system"
@@ -219,7 +219,7 @@ def verify_mcp_label(namespace: str) -> None:
     if label != "true":
         abort(
             f"Service {scn.TOOL_WORKLOAD!r} in {namespace!r} is missing the "
-            f"protocol.rossoctl.io/mcp='true' LABEL (found: {label!r}) — UC-1's analyze_tool will "
+            f"protocol.rossoctl.io/mcp='true' LABEL (found: {label!r}) — onboarding's analyze_tool will "
             f"502 during onboarding. See demo/assets/INSTALL.md."
         )
     ok(f"Service {scn.TOOL_WORKLOAD!r} carries protocol.rossoctl.io/mcp='true'")

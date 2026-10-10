@@ -706,7 +706,7 @@ AuthBridge OPA pipeline wired into **both** legs, the **NATS Event Broker deploy
 SPI installed + `aiac-event-listener` enabled on the realm**, and a real LLM in-pod. The tests **load,
 deploy, and tear down** the workloads themselves (for the image toolchain, see
 *[Preconditions](#preconditions-the-wired-platform--not-stood-up-by-the-tests)*). Stand the pipeline up with `k8s/opa-kind-enable.sh`;
-the full prerequisites, wiring, and manual probe commands are in `k8s/opa-kind-runbook.md`, and the SPI
+its prerequisites, wiring and verification are in `k8s/opa-kind-runbook.md`, and the SPI
 setup is in `keycloak-spi/README.md`.
 
 ```bash
