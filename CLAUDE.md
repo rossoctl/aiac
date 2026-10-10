@@ -45,4 +45,4 @@ GitHub issues in this repo's own remote (`rossoctl/aiac`), filtered by the `aiac
 
 ### Domain docs
 
-Single-context (`CONTEXT.md` glossary at the repo root; design decisions documented in the relevant PRD/spec under `docs/specs/`). Consult decisions on demand, not up front. See `docs/agents/domain.md`.
+Single-context (`CONTEXT.md` glossary at the repo root; design decisions documented in the relevant PRD/spec under `docs/specs/`). Consult decisions on demand, not up front. See `docs/agents/domain.md`. Where a skill says `GLOSSARY.md` or `docs/adr/`, use `CONTEXT.md` and the specs instead; never create either.
