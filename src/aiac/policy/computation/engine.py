@@ -687,8 +687,10 @@ def rerender_role(role_id: str) -> None:
     - target side: the live stored SPMs that have an edge of the role
       (``get_service_policies_by_role``), each with the current holders; no call when there is none;
     - agent side (the legacy method): the APM of every live stored agent, re-derived from the store.
-      An agent that lost the role is not a holder any more, so it cannot be found from the holders;
-      no call when there is no live stored agent.
+      An agent that lost the role is not a holder any more, so it cannot be found from the holders,
+      and a stored snapshot can be stale (a render that wrote no SPM), so it cannot be found from the
+      store either. So every agent is re-derived, on purpose; the SPM cache is primed from one list
+      read, so the derive makes no store query. No call when there is no live stored agent.
 
     ``role_id`` is the Keycloak role id. A deleted role still re-renders: its edges get no holder
     (fail closed). A missed event is repaired by the resync.
@@ -1120,7 +1122,9 @@ def _remove_footprint(
     # services' SPMs. Dedup by id: an extra role can also still be on SPM(X). Skip a role that
     # another service holds: the edges are keyed by role id, so a purge would also remove that
     # service's grants. X itself stays denied — its CR is deleted, and the combiner denies a pod
-    # that has no client CR (D20).
+    # that has no client CR (D20). A disabled (quarantined) service still holds its roles (a disabled
+    # client keeps its role mappings), so its shared role is kept on purpose: the edges were judged
+    # by the PRB for it, they give no grant while it has no live holder, and its lift gives them back.
     held_elsewhere = {r.id for sid, svc in catalog.items() if sid != service_id for r in svc.roles}
     roles = {role.id: role for role in [*spm_x.owned_roles, *extra_roles]}
     for role in roles.values():

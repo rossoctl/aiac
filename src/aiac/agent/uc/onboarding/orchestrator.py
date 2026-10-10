@@ -184,11 +184,14 @@ def _read_service(config: Configuration, service_id: ServiceUuid, wait: bool = T
     A ``404`` (``IdPHTTPError`` with ``status == 404``) means that the new client is not visible
     yet (or that it does not exist: the two look the same, so an unknown UUID also waits the whole
     budget): the read is polled again, up to ``ONBOARD_CLIENT_WAIT_ATTEMPTS`` reads with
-    ``ONBOARD_CLIENT_WAIT_BACKOFF`` seconds between them. A client that is still not visible after
-    the budget raises :class:`ServiceNotVisibleError` (a ``502``). Any other error (a ``5xx`` after
-    the library retries, another ``4xx``, a ``RuntimeError``) is a real failure, never the race: it
-    raises ``HTTPException(502)`` at once. With ``wait=False`` the read is made one time: a ``404``
-    raises :class:`ServiceNotVisibleError` at once."""
+    ``ONBOARD_CLIENT_WAIT_BACKOFF`` seconds between them. A ``404`` of a sub-read of ``get_service``
+    (the service roles, or the composites of a role deleted during the read) is polled again too, on
+    purpose: it is a read race that the next read fixes (see the tests of the real library). A
+    client that is still not visible after the budget raises :class:`ServiceNotVisibleError` (a
+    ``502``). Any other error (a ``5xx`` after the library retries, another ``4xx``, a
+    ``RuntimeError``) is a real failure, never the race: it raises ``HTTPException(502)`` at once.
+    With ``wait=False`` the read is made one time: a ``404`` raises :class:`ServiceNotVisibleError`
+    at once."""
     last_not_found: IdPHTTPError | None = None
     reads = 0
 

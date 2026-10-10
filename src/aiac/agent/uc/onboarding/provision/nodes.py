@@ -109,9 +109,10 @@ _MCP_TIMEOUT = (5, 30)
 # ("connection refused"), or the sidecar can answer 502/503/504 while the app starts. Also, the
 # tool's OPA loads the bootstrap CR (written just before Provision, checkpoint B1) only at its next
 # bundle poll (10 s to 120 s); until then the tool's inbound denies the discovery call with 403
-# (D20). Failing here is retryable, but the NATS redelivery comes only after ACK_WAIT (600 s), so
-# discovery waits for the endpoint instead. The default covers the bundle poll. Read from the env at
-# call time; keep it well below ACK_WAIT.
+# (D20). This is so under both sides: under agent side the tool also has no CR until its OPA loads
+# the pass-through bootstrap CR. Failing here is retryable, but the NATS redelivery comes only after
+# ACK_WAIT (600 s), so discovery waits for the endpoint instead. The default covers the bundle poll.
+# Read from the env at call time; keep it well below ACK_WAIT.
 _MCP_READY_TIMEOUT_ENV = "AIAC_MCP_DISCOVERY_READY_TIMEOUT"
 _MCP_READY_TIMEOUT_DEFAULT = 180.0
 _MCP_READY_INTERVAL = 3.0  # seconds between readiness attempts (patched in unit tests)
