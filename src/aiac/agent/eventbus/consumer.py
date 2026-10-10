@@ -51,7 +51,6 @@ from aiac.agent.policy_rules_builder.graph import (
     PolicyRulesBuilderError,
     UnparseableLLMResponseError,
 )
-from aiac.agent.shared.env import env_num
 from aiac.agent.shared.error_logging import log_by_type
 from aiac.agent.uc.onboarding.orchestrator import ServiceNotVisibleError, onboard_and_apply
 from aiac.agent.uc.onboarding.preconditions import EnforcementPreconditionError
@@ -60,6 +59,7 @@ from aiac.agent.uc.role_update.role import update_role
 from aiac.idp.configuration.models import ServiceUuid
 from aiac.policy.computation import compute_and_apply, rerender_role
 from aiac.policy.model.models import PolicyRule
+from aiac.shared.env import env_num
 
 logger = logging.getLogger(__name__)
 

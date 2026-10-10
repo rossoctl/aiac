@@ -2428,6 +2428,26 @@ def test_agent_side_bootstrap_of_a_tool_pushes_its_pass_through_and_stores_nothi
     assert [op for op, _ in store.calls] == ["apply_policy"]
 
 
+def test_drop_bootstrap_deletes_the_cr_of_a_service_with_no_spm():
+    store = FakeStore()
+    with engine_env([], store):
+        from aiac.policy.computation import drop_bootstrap
+
+        drop_bootstrap("new-tool")
+
+    assert store.cr_deletes == ["new-tool"]
+
+
+def test_drop_bootstrap_keeps_the_cr_of_a_managed_service():
+    store = FakeStore({"github-tool": _spm("github-tool", type=ServiceType.TOOL)})
+    with engine_env([], store):
+        from aiac.policy.computation import drop_bootstrap
+
+        drop_bootstrap("github-tool")
+
+    assert store.cr_deletes == []
+
+
 def test_agent_side_bootstrap_of_a_tool_makes_no_idp_read(agent_side):
     # A pass-through CR names no rule and no holder: no catalog read under the PCE lock.
     store = FakeStore()

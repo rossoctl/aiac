@@ -136,7 +136,7 @@ definition that leaks effect (e.g. a role described _"works in issues, not
 source"_) is **malformed input**, not a deny source — which is why a
 description-only prohibition yields no durable DENY (see the PRB spec's _digested
 input retires exclusivity handling and Door B_ decision). Enforcement is tracked
-in the neutrality-guard follow-up (`rossoctl/aiac`).
+in the neutrality-guard follow-up (rossoctl/aiac#217).
 _Avoid_: description-driven deny, effect-in-description.
 
 **Quarantine**:

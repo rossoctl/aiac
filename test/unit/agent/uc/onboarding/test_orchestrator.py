@@ -63,6 +63,14 @@ def quarantine():
 
 
 @pytest.fixture(autouse=True)
+def drop_bootstrap():
+    """The PCE ``drop_bootstrap`` seam (the undo of a bootstrap after a failure with no quarantine) —
+    patched for every test. Tests that check it request this fixture by name."""
+    with patch.object(orchestrator, "drop_bootstrap") as mock:
+        yield mock
+
+
+@pytest.fixture(autouse=True)
 def pce():
     """The PCE ``compute_and_apply`` seam of ``onboard_and_apply`` — patched for every test, so the
     apply never reaches a live PCE (and the ``on_applied`` re-enable does not run)."""
@@ -1213,6 +1221,78 @@ class TestBootstrapOfATool:
 
         bootstrap.assert_called_once_with(CLIENT_ID, ServiceType.TOOL)
         assert [c[0] for c in order.mock_calls] == ["bootstrap", "provision", "prb"]
+        # Provision gets the pod coordinates and type that the checks read, so it reads them no more.
+        (state,) = graph.invoke.call_args.args
+        assert (state.namespace, state.workload_name, state.service_type) == (
+            kf.SERVICE_NAME.split("/")[0],
+            kf.SERVICE_NAME.split("/")[1],
+            ServiceType.TOOL,
+        )
+
+    @pytest.mark.parametrize("stage", ["provision", "build"])
+    def test_a_failure_with_no_quarantine_drops_the_bootstrap_cr(self, k8s, quarantine, drop_bootstrap, stage):
+        # Under agent side the bootstrap CR is an allow-all pass-through: a 502 of Provision, or a
+        # build error that is not a rollback error, must not leave it for a tool that is not managed.
+        k8s.list_namespaced_pod.return_value = kf.pod_list(kf.pod(type_label="tool"))
+        graph = _graph(service_type=ServiceType.TOOL)
+        error = HTTPException(502, "no MCP manifest")
+        if stage == "provision":
+            graph.invoke.side_effect = error
+
+        with (
+            patch.object(orchestrator, "build_provision_graph", return_value=graph),
+            patch.object(orchestrator, "ServicePolicyBuilder") as spb,
+            patch.object(orchestrator, "_config", return_value=_config_returning(_service())),
+            pytest.raises(HTTPException),
+        ):
+            spb.build.side_effect = error
+            _run_onboarding(SERVICE_ID)
+
+        drop_bootstrap.assert_called_once_with(CLIENT_ID)
+        quarantine.assert_not_called()
+
+    def test_a_failed_apply_drops_the_bootstrap_cr(self, k8s, pce, drop_bootstrap):
+        k8s.list_namespaced_pod.return_value = kf.pod_list(kf.pod(type_label="tool"))
+        pce.side_effect = RuntimeError("writer down")
+        with (
+            patch.object(orchestrator, "build_provision_graph", return_value=_graph(service_type=ServiceType.TOOL)),
+            patch.object(orchestrator, "ServicePolicyBuilder") as spb,
+            patch.object(orchestrator, "_config", return_value=_config_returning(_service())),
+            pytest.raises(RuntimeError, match="writer down"),
+        ):
+            spb.build.return_value = []
+            orchestrator.onboard_and_apply(SERVICE_ID)
+
+        drop_bootstrap.assert_called_once_with(CLIENT_ID)
+
+    def test_a_rollback_error_quarantines_and_does_not_drop_again(self, k8s, quarantine, drop_bootstrap):
+        # The quarantine already deletes the CR.
+        k8s.list_namespaced_pod.return_value = kf.pod_list(kf.pod(type_label="tool"))
+        with (
+            patch.object(orchestrator, "build_provision_graph", return_value=_graph(service_type=ServiceType.TOOL)),
+            patch.object(orchestrator, "ServicePolicyBuilder") as spb,
+            patch.object(orchestrator, "_config", return_value=_config_returning(_service())),
+            pytest.raises(PolicyRulesBuilderError),
+        ):
+            spb.build.side_effect = PolicyRulesBuilderError("auditor rejected")
+            _run_onboarding(SERVICE_ID)
+
+        quarantine.assert_called_once()
+        drop_bootstrap.assert_not_called()
+
+    def test_a_failed_drop_is_logged_and_the_original_error_propagates(self, k8s, drop_bootstrap, caplog):
+        k8s.list_namespaced_pod.return_value = kf.pod_list(kf.pod(type_label="tool"))
+        graph = _graph(service_type=ServiceType.TOOL)
+        graph.invoke.side_effect = HTTPException(502, "no MCP manifest")
+        drop_bootstrap.side_effect = RuntimeError("writer down")
+        with (
+            patch.object(orchestrator, "build_provision_graph", return_value=graph),
+            patch.object(orchestrator, "_config", return_value=_config_returning(_service())),
+            pytest.raises(HTTPException, match="no MCP manifest"),
+        ):
+            _run_onboarding(SERVICE_ID)
+
+        assert "drop of the bootstrap CR failed" in caplog.text
 
     def test_a_passing_agent_gets_no_bootstrap(self, bootstrap):
         with (

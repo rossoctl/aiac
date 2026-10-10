@@ -271,6 +271,14 @@ def test_conflicting_build_falls_back_when_quotes_not_verbatim():
     assert "tester" in c.explanation and "issues" in c.explanation
 
 
+def _orchestrator_config() -> MagicMock:
+    """The Orchestrator's IdP seam: ``get_service`` gives a client whose ``client.name`` is
+    ``<namespace>/<workload>``, so the Orchestrator can give the pod coordinates to Provision."""
+    config = MagicMock()
+    config.get_service.return_value.name = "team1/github-tool"
+    return config
+
+
 def _drive_apply_with_passes(scope_rules, applied=None) -> tuple[MagicMock, MagicMock]:
     """Drive ``POST /apply/service/{id}`` through the REAL route and ``onboard_and_apply`` (provision graph
     stubbed to a Tool, the scope-focal pass stubbed to ``scope_rules``, LLM/cluster untouched)
@@ -293,7 +301,7 @@ def _drive_apply_with_passes(scope_rules, applied=None) -> tuple[MagicMock, Magi
         patch("aiac.agent.uc.onboarding.orchestrator.build_provision_graph", return_value=provision),
         # The Orchestrator's IdP seam: the first read resolves the clientId and the failure path rolls
         # back through it (issue 171). Stubbed so neither touches a live IdP.
-        patch("aiac.agent.uc.onboarding.orchestrator._config", return_value=MagicMock()),
+        patch("aiac.agent.uc.onboarding.orchestrator._config", return_value=_orchestrator_config()),
         # The D30 precondition checks (they read the cluster) pass for a tool, and the tool's
         # bootstrap CR (a PCE write, checkpoint B1) is stubbed: these cases pin the PRB/PCE seams.
         patch("aiac.agent.uc.onboarding.orchestrator.check_preconditions", return_value=ServiceType.TOOL),

@@ -92,7 +92,7 @@ No FastAPI. No Kubernetes deployment. No container image. Imported as a library 
 
 ### Public API
 
-Six entry points change the deployed policy — an incremental fold, an authoritative offboard, the teardown of a failed onboarding, the resync at the Controller start, the bootstrap CR of a tool before its Provision, and the re-render of the CRs that use a role. Two entry points only read — the read model and the side:
+Seven entry points change the deployed policy — an incremental fold, an authoritative offboard, the teardown of a failed onboarding, the resync at the Controller start, the bootstrap CR of a tool before its Provision, the drop of that CR after a failure with no quarantine, and the re-render of the CRs that use a role. Two entry points only read — the read model and the side:
 
 ```python
 def compute_and_apply(
@@ -105,6 +105,7 @@ def decommission(service_id: ClientId) -> None
 def quarantine(service_id: ClientId, deleted_roles: Iterable[Role] = ()) -> None   # deleted_roles = roles the rollback deleted
 def resync() -> None                                              # D28: at every Controller start
 def bootstrap(service_id: ClientId, service_type: ServiceType) -> None   # the focus tool's CR, before Provision
+def drop_bootstrap(service_id: ClientId) -> None                  # the undo of bootstrap after a failure with no quarantine
 def rerender_role(role_id: str) -> None                           # D32: the role-members event
 def policy_model_for(service_id: ClientId) -> PolicyModel | None  # D18: read-only, no lock
 def enforcement_side() -> EnforcementSide                         # D29: reads AIAC_ENFORCEMENT_SIDE
@@ -112,7 +113,7 @@ def enforcement_side() -> EnforcementSide                         # D29: reads A
 
 **Service ids: the PCE takes only the clientId.** Keycloak gives every client two ids: the internal UUID (`Service.id`, type `ServiceUuid`) and the `clientId` (`Service.serviceId`, a SPIFFE ID, type `ClientId`; both `NewType`s of `str` in `aiac.idp.configuration.models`). Every service id the PCE takes is the clientId — the SPM key, `PolicyRule.scope.serviceId`, and OPA `input.identity.service_id`. The UUID is only for finding the service in the IdP. The asymmetry stays at the HTTP/NATS boundary: an onboarding comes in with a UUID (`/apply/service/{uuid}`, `aiac.apply.service.<uuid>`), and the UC1 Orchestrator resolves the clientId once, before Provision, while the client still exists; an offboard comes in with the clientId, because after the client is deleted UUID→clientId resolution is impossible.
 
-- **No return value; failures propagate:** on success the caller receives no return value. The six functions that change policy log exceptions and **re-raise** them — a failure in IdP resolution, Policy Model Store I/O, or PDP Policy Writer push surfaces to the caller rather than being silently swallowed while nothing is applied. The Controller returns HTTP 500. The NATS consumer does not ack the message: NATS redelivers it after `AckWait` (600 s), and after the 5th failed delivery (`MAX_DELIVER`) the consumer moves it to `aiac.apply.dlq`. Only a `ServiceNotVisibleError` of the UC1 Orchestrator gets a nak with a delay (D33), and the PCE does not raise it. See [`aiac-agent.md` → Ack contract](aiac-agent.md#ack-contract).
+- **No return value; failures propagate:** on success the caller receives no return value. The seven functions that change policy log exceptions and **re-raise** them — a failure in IdP resolution, Policy Model Store I/O, or PDP Policy Writer push surfaces to the caller rather than being silently swallowed while nothing is applied. The Controller returns HTTP 500. The NATS consumer does not ack the message: NATS redelivers it after `AckWait` (600 s), and after the 5th failed delivery (`MAX_DELIVER`) the consumer moves it to `aiac.apply.dlq`. Only a `ServiceNotVisibleError` of the UC1 Orchestrator gets a nak with a delay (D33), and the PCE does not raise it. See [`aiac-agent.md` → Ack contract](aiac-agent.md#ack-contract).
 - **`override`:** selects the merge mode (see [Merge Semantics](#merge-semantics)). `False` (default) appends additively at the SPM layer; `True` authoritatively replaces every input role's mappings **across all SPMs** (role-level revocation). Set by the caller (the Controller) from the producing UC's choice — UC1 = `False`, UC3 = `True`, UC2 Rebuild = `True`, UC2 Build = TBD.
 - **`focus_service`:** the clientId (`Service.serviceId`) of the service that this onboarding builds — not its Keycloak UUID. The [routing guard](#routing-guard-disabled-services) does not drop the rules of this service while its client is disabled. The UC1 Orchestrator (`onboard_and_apply`, which the onboarding route `POST /apply/service/{uuid}` and the NATS consumer `aiac.apply.service.<uuid>` call) passes the clientId that it resolved. Other callers pass nothing.
 - **`on_applied`:** a callable with no arguments. The PCE calls it under the PCE lock, after the run succeeds. A failed run does not call it. An `on_applied` that raises propagates as a run failure. UC1 gives the re-enable of the focus client (`reenable_service`), so no other PCE operation reads the IdP catalog between the lift of a quarantine and the re-enable (see [Quarantine (failed onboarding)](#quarantine-failed-onboarding) → The lift). Other callers pass nothing.
@@ -121,11 +122,12 @@ def enforcement_side() -> EnforcementSide                         # D29: reads A
 - **`quarantine`:** the UC1 failure-path teardown of a failed onboarding (see [Quarantine (failed onboarding)](#quarantine-failed-onboarding)). Keyed by the **clientId (SPM key)**, as `decommission` is. The failed service stays in the catalog (disabled).
 - **`resync`:** the full redeploy at every Controller start (D28; see [Resync (Controller start)](#resync-controller-start)). It writes the CR of every live managed service (in the IdP catalog and not disabled) in the current side, deletes every other AIAC CR, and quarantines each disabled service that still has an SPM.
 - **`bootstrap`:** writes the CR of the focus tool before its Provision, so that UC-1 discovery passes D20 at the first onboarding (see [Bootstrap CR (tool discovery)](#bootstrap-cr-tool-discovery)). Keyed by the clientId. It stores no SPM.
+- **`drop_bootstrap`:** deletes the CR of a service that has no stored SPM, under the PCE lock (a stored SPM gives a no-op). The UC1 Orchestrator calls it after a failure that runs no quarantine, so a bootstrap CR (an allow-all pass-through under agent side) does not stay for a service that is not managed (see [Bootstrap CR (tool discovery)](#bootstrap-cr-tool-discovery)).
 - **`rerender_role`:** re-renders the CRs that use one role, with its current holders, after a change of its members (D32; see [Role re-render (`rerender_role`)](#role-re-render-rerender_role)). Keyed by the Keycloak role id. It makes no PRB call and writes no SPM.
 - **`policy_model_for`:** the read model of one service (D18; see [Read model (`policy_model_for`)](#read-model-policy_model_for)). It changes nothing.
 - **`enforcement_side`:** the current enforcement side (D29; see [Enforcement side and the managed set](#enforcement-side-and-the-managed-set)).
-- **Serialization:** `compute_and_apply`, `decommission`, `quarantine`, `resync`, `bootstrap` and `rerender_role` hold one PCE lock for their whole body (see [Serialization (the PCE lock)](#serialization-the-pce-lock)). `policy_model_for` and `enforcement_side` take no PCE lock.
-- Import path: `from aiac.policy.computation import compute_and_apply, decommission, quarantine, resync, bootstrap, rerender_role, policy_model_for, enforcement_side`
+- **Serialization:** `compute_and_apply`, `decommission`, `quarantine`, `resync`, `bootstrap`, `drop_bootstrap` and `rerender_role` hold one PCE lock for their whole body (see [Serialization (the PCE lock)](#serialization-the-pce-lock)). `policy_model_for` and `enforcement_side` take no PCE lock.
+- Import path: `from aiac.policy.computation import compute_and_apply, decommission, quarantine, resync, bootstrap, drop_bootstrap, rerender_role, policy_model_for, enforcement_side`
 
 ### Rule-builder input contract (upstream)
 
@@ -403,7 +405,7 @@ Steps (under the PCE lock):
 
 - A successful onboarding stores the SPM of the tool (D21) and writes its CR again.
 - A build failure runs the [quarantine](#quarantine-failed-onboarding), which deletes the CR.
-- If the onboarding stops in a different way (for example, a retryable failure in Provision), the CR stays until the next onboarding of the tool, or until the [resync](#resync-controller-start): the tool has no SPM, so the `PUT` deletes its CR.
+- If the onboarding fails in a different way that the Orchestrator sees (a `502` from Provision, a build error that is not a rollback error, a failed `compute_and_apply`), the Orchestrator calls `drop_bootstrap(service_id)`: with no stored SPM, the PCE deletes the CR (D20 then denies the tool again). This matters most under agent side, where the bootstrap CR is an allow-all pass-through. If the process stops before that (a crash), the CR stays until the next onboarding of the tool, or until the [resync](#resync-controller-start) (the tool has no SPM, so the `PUT /policy` deletes it).
 
 The CR takes effect at the next poll of the OPA plugin of the tool (10 s min, up to 120 s). So discovery waits for it: it treats a `403` from the tool as not ready and polls again, until `AIAC_MCP_DISCOVERY_READY_TIMEOUT` ends (default 180 s).
 

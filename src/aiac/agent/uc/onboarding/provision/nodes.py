@@ -17,9 +17,9 @@ from dataclasses import dataclass
 
 from fastapi import HTTPException
 
-from aiac.agent.shared.env import env_num
 from aiac.idp.configuration.api import Configuration
 from aiac.idp.configuration.models import ServiceType
+from aiac.shared.env import env_num
 from aiac.shared.upstream import run_upstream
 
 from .kube import list_agentcards, list_pods, read_service
@@ -231,8 +231,19 @@ def _label_missing_detail(workload_name: str, pod) -> str:
 # --------------------------------------------------------------------------- #
 def classify_service(state: OnboardingProvisionState) -> dict:
     """Resolve identity and determine service type from the operator's `rossoctl.io/type`
-    pod label (authoritative — not the entity_id format)."""
+    pod label (authoritative — not the entity_id format).
+
+    The UC1 Orchestrator has already read the service and its pod label (the precondition checks run
+    first), and gives ``namespace``, ``workload_name`` and ``service_type`` in the state: then this
+    node makes no IdP read and no second pod wait."""
     service_id = state.trigger.entity_id
+    if state.service_type is not None and state.namespace and state.workload_name:
+        return {
+            "service_id": service_id,
+            "namespace": state.namespace,
+            "workload_name": state.workload_name,
+            "service_type": state.service_type,
+        }
 
     try:
         service = _config().get_service(service_id)

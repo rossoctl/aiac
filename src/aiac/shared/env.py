@@ -1,4 +1,4 @@
-"""Tolerant numeric environment knobs, shared by the onboarding waits and the NATS consumer."""
+"""Tolerant numeric environment knobs, shared by the onboarding waits, the NATS consumer and the PDP library."""
 
 import math
 import os

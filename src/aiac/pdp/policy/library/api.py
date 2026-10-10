@@ -6,7 +6,6 @@ entry and reads the enforcement side from the tag. The PDP Policy Writer operate
 CRs, not a Keycloak realm, so none of these functions take or send a ``realm`` parameter.
 """
 
-import math
 import os
 import re
 from pathlib import Path
@@ -16,6 +15,7 @@ import requests
 from dotenv import load_dotenv
 
 from aiac.policy.model.models import PolicyModel
+from aiac.shared.env import env_num
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
@@ -36,11 +36,8 @@ _HTTP_TIMEOUT_DEFAULT = 60.0
 def _http_timeout() -> float:
     """The timeout in seconds, read at call time. An unset, non-numeric, non-finite, zero or negative
     value falls back to the default: a bad value must not stop the Controller at import."""
-    try:
-        value = float(os.environ[_HTTP_TIMEOUT_ENV])
-    except (KeyError, ValueError):
-        return _HTTP_TIMEOUT_DEFAULT
-    return value if math.isfinite(value) and value > 0 else _HTTP_TIMEOUT_DEFAULT
+    timeout = env_num(_HTTP_TIMEOUT_ENV, _HTTP_TIMEOUT_DEFAULT, float, minimum=0.0)
+    return timeout if timeout > 0 else _HTTP_TIMEOUT_DEFAULT
 
 
 def _base_url() -> str:

@@ -53,11 +53,11 @@ from aiac.agent.policy_rules_builder.graph import (
 from aiac.agent.uc.onboarding.policy_builder.builder import ServicePolicyBuilder
 from aiac.agent.uc.onboarding.preconditions import check_preconditions
 from aiac.agent.uc.onboarding.provision.graph import build_provision_graph
-from aiac.agent.uc.onboarding.provision.nodes import WaitConfig, poll_until_ready
+from aiac.agent.uc.onboarding.provision.nodes import WaitConfig, poll_until_ready, split_client_name
 from aiac.agent.uc.onboarding.provision.state import OnboardingProvisionState, Trigger
 from aiac.idp.configuration.api import Configuration, IdPHTTPError
 from aiac.idp.configuration.models import ClientId, Service, ServiceType, ServiceUuid
-from aiac.policy.computation import bootstrap, compute_and_apply, quarantine
+from aiac.policy.computation import bootstrap, compute_and_apply, drop_bootstrap, quarantine
 from aiac.policy.model.models import PolicyRule
 
 logger = logging.getLogger(__name__)
@@ -278,9 +278,24 @@ def onboard_and_apply(service_id: ServiceUuid, *, wait_for_client: bool = True) 
     ``wait_for_client`` is given to the first IdP read (see :func:`_read_service`)."""
     with _service_lock(service_id):
         rules, override, client_id = _onboard(service_id, wait_for_client)
-        compute_and_apply(
-            rules, override, focus_service=client_id, on_applied=functools.partial(reenable_service, service_id)
-        )
+        try:
+            compute_and_apply(
+                rules, override, focus_service=client_id, on_applied=functools.partial(reenable_service, service_id)
+            )
+        except Exception:
+            _drop_bootstrap(client_id)
+            raise
+
+
+def _drop_bootstrap(client_id: ClientId) -> None:
+    """After a failure that runs no quarantine: the PCE ``drop_bootstrap`` deletes the bootstrap CR
+    of a service that is not managed (no SPM), so an agent-side pass-through CR does not stay open.
+    A failure here is logged, and the caller re-raises the original error: the next delivery tries
+    again."""
+    try:
+        drop_bootstrap(client_id)
+    except Exception:
+        logger.exception("UC1: the drop of the bootstrap CR failed (service %s)", _loggable(client_id))
 
 
 def _onboard(service_id: ServiceUuid, wait_for_client: bool) -> tuple[list[PolicyRule], bool, ClientId]:
@@ -350,10 +365,27 @@ def _onboard(service_id: ServiceUuid, wait_for_client: bool) -> tuple[list[Polic
     # through the tool's own inbound) passes D20. Only for an enabled client: a disabled
     # (quarantined) tool fails at the discovery-token mint anyway (C5), and its bootstrap CR
     # would stay stale until the next resync. Agents get no bootstrap.
-    if pod_type is ServiceType.TOOL and service.enabled:
+    bootstrapped = pod_type is ServiceType.TOOL and service.enabled
+    if bootstrapped:
         bootstrap(client_id, ServiceType.TOOL)
 
-    provision = build_provision_graph().invoke(OnboardingProvisionState(trigger=Trigger(entity_id=service_id)))
+    # A failure that runs no quarantine (a 502 from Provision, any error of the build that is not a
+    # rollback error) must not leave the bootstrap CR: under agent side it is an allow-all
+    # pass-through for a service that is not managed. The PCE drops it if the store has no SPM.
+    try:
+        # The checks already read the pods and their type label: Provision does not read them again.
+        namespace, workload_name = split_client_name(service_id, service.name)
+        state = OnboardingProvisionState(
+            trigger=Trigger(entity_id=service_id),
+            namespace=namespace,
+            workload_name=workload_name,
+            service_type=pod_type,
+        )
+        provision = build_provision_graph().invoke(state)
+    except Exception:
+        if bootstrapped:
+            _drop_bootstrap(client_id)
+        raise
     service_type = provision["service_type"]
     created_roles = provision["created_roles"]
     created_scopes = provision["created_scopes"]
@@ -368,6 +400,10 @@ def _onboard(service_id: ServiceUuid, wait_for_client: bool) -> tuple[list[Polic
             # Pass the created roles: the rollback deleted them from the IdP, so the quarantine
             # cannot find them in the catalog, but their grants can be on other SPMs.
             quarantine(client_id, created_roles)
+        raise
+    except Exception:
+        if bootstrapped:
+            _drop_bootstrap(client_id)
         raise
 
     return rules, False, client_id

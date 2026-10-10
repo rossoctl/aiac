@@ -62,6 +62,25 @@ def _run(service=None, pods=None, get_service_exc=None, list_pods_exc=None):
 
 
 class TestClassifyServiceHappyPaths:
+    def test_the_coordinates_that_the_orchestrator_gives_need_no_read(self):
+        # The precondition checks already read the service and its pod label: no second IdP read
+        # and no second pod wait.
+        state = OnboardingProvisionState(
+            trigger=Trigger(entity_id=ENTITY),
+            namespace="team-a",
+            workload_name="weather",
+            service_type=ServiceType.TOOL,
+        )
+        with patch.object(nodes, "_config") as cfg, patch.object(kube, "_core_v1") as core_v1:
+            result = nodes.classify_service(state)
+        cfg.assert_not_called()
+        core_v1.assert_not_called()
+        assert (result["namespace"], result["workload_name"], result["service_type"]) == (
+            "team-a",
+            "weather",
+            ServiceType.TOOL,
+        )
+
     def test_agent_label_routes_to_agent_and_sets_identity(self):
         result = _run(service=_service(), pods=[_pod({"rossoctl.io/type": "agent"})])
         assert result["service_id"] == ENTITY

@@ -209,8 +209,11 @@ client_ok_rules() {
 check_combiner() {
   local dir content rules bad
   for dir in inbound outbound; do
-    content="$(kubectl get authorizationpolicy default -n "$RELEASE_NAMESPACE" \
-      -o jsonpath="{.spec.policies[?(@.path==\"${dir}/request.rego\")].content}")"
+    if ! content="$(kubectl get authorizationpolicy default -n "$RELEASE_NAMESPACE" \
+      -o jsonpath="{.spec.policies[?(@.path==\"${dir}/request.rego\")].content}")"; then
+      echo "ERROR: cannot read the default AuthorizationPolicy in ${RELEASE_NAMESPACE} to check the combiner" >&2
+      exit 1
+    fi
     rules="$(printf '%s\n' "$content" | client_ok_rules)"
     bad="$(printf '%s\n' "$rules" | grep -vxF \
       -e "client_ok if data.authbridge.client.${dir}.request.allow" \

@@ -388,8 +388,9 @@ class _SpmCache:
 
     def prime(self, listed: Iterable[ServicePolicyModel]) -> None:
         """Cache each SPM of ``listed`` (every stored SPM, from ``list_service_policies``, in the
-        store's order), so that ``by_role`` answers from the cache. Only for an operation that writes
-        no SPM after it."""
+        store's order), so that ``by_role`` answers from the cache. The cache is then the truth of the
+        operation: it must change SPMs only in the cache until it writes them (a decommission writes
+        them at its end), so ``by_role`` gives the SPMs as the operation has changed them."""
         self._listed = []
         for model in listed:
             self(model.service_id, model)
@@ -786,6 +787,28 @@ def bootstrap(service_id: ClientId, service_type: ServiceType) -> None:
             _bootstrap(service_id, service_type, side)
     except Exception:
         logger.exception("bootstrap failed for service %r", _loggable(service_id))
+        raise
+
+
+def drop_bootstrap(service_id: ClientId) -> None:
+    """Delete the CR of ``service_id`` if the store has no SPM of it — the undo of ``bootstrap``
+    after a failed onboarding that ran no quarantine.
+
+    A first onboarding of a tool writes its bootstrap CR before Provision (checkpoint B1). Under agent
+    side that CR is a pass-through, which allows every request. If the onboarding then fails with an
+    error that runs no rollback and no quarantine (for example a ``502`` from Provision, or a failed
+    ``compute_and_apply``), the CR must not stay: the service is not in the managed set (no SPM), and
+    before the bootstrap D20 denied it. Under the PCE lock: no stored SPM gives ``delete_service_cr``
+    (a 404 counts as success); a stored SPM gives a no-op, because a managed service keeps its CR.
+
+    Exceptions from any dependency are logged and **re-raised**.
+    """
+    try:
+        with _pce_lock:
+            if find_service_policy(service_id) is None:
+                delete_service_cr(service_id)
+    except Exception:
+        logger.exception("drop_bootstrap failed for service %r", _loggable(service_id))
         raise
 
 
@@ -1198,13 +1221,16 @@ def _add_callees_of_every_agent_role(
     one whose stored edge carries ``kind=User`` (a child of a composite role), has no holder now. A
     user role with members cannot name a service (Assumption 1), so an SPM with only such edges is
     not redeployed. Under agent side the current holders of the ``Agent``-kind edges join
-    ``footprint.agents``. The scan reads ``list_service_policies()`` once and gives each listed SPM
-    to the cache, so it reads no SPM again. Quarantine does not need this: X is still in the catalog
-    (disabled), so ``SPM(X)`` is seeded with the roles that X has now."""
-    for stored in list_service_policies():
+    ``footprint.agents``. The scan reads ``list_service_policies()`` once and primes the cache with
+    it, so it reads no SPM again, and the derive of each affected agent makes no by-role store query.
+    Quarantine does not need this: X is still in the catalog (disabled), so ``SPM(X)`` is seeded with
+    the roles that X has now."""
+    listed = list_service_policies()
+    spms.prime(listed)  # a purged SPM stays as the purge left it
+    for stored in listed:
         if stored.service_id == service_id or stored.service_id not in live:
             continue
-        model = spms(stored.service_id, stored)
+        model = spms.loaded[stored.service_id]
         edges = model.inbound_allow_rules + model.inbound_deny_rules
         if not any(edge.role.kind == RoleKind.AGENT or not edge.role.actorIds for edge in edges):
             continue
