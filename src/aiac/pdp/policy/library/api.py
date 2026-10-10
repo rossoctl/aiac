@@ -6,6 +6,7 @@ entry and reads the enforcement side from the tag. The PDP Policy Writer operate
 CRs, not a Keycloak realm, so none of these functions take or send a ``realm`` parameter.
 """
 
+import math
 import os
 import re
 from pathlib import Path
@@ -28,7 +29,18 @@ _URL_SEGMENT_RE = re.compile(r"[A-Za-z0-9._~%-]+")
 # example a stuck Kubernetes API) would block the caller, which holds the PCE lock, indefinitely.
 # Longer than the store's: one ``PUT /policy`` server-side-applies every CR. Tunable via
 # ``AIAC_PDP_HTTP_TIMEOUT``.
-_HTTP_TIMEOUT = float(os.getenv("AIAC_PDP_HTTP_TIMEOUT", "60"))
+_HTTP_TIMEOUT_ENV = "AIAC_PDP_HTTP_TIMEOUT"
+_HTTP_TIMEOUT_DEFAULT = 60.0
+
+
+def _http_timeout() -> float:
+    """The timeout in seconds, read at call time. An unset, non-numeric, non-finite, zero or negative
+    value falls back to the default: a bad value must not stop the Controller at import."""
+    try:
+        value = float(os.environ[_HTTP_TIMEOUT_ENV])
+    except (KeyError, ValueError):
+        return _HTTP_TIMEOUT_DEFAULT
+    return value if math.isfinite(value) and value > 0 else _HTTP_TIMEOUT_DEFAULT
 
 
 def _base_url() -> str:
@@ -55,20 +67,20 @@ def _check(resp: requests.Response) -> None:
 
 def apply_policy(model: PolicyModel) -> None:
     """``POST /policy`` — upsert one CR per entry of ``model``."""
-    _check(requests.post(f"{_base_url()}/policy", json=model.model_dump(mode="json"), timeout=_HTTP_TIMEOUT))
+    _check(requests.post(f"{_base_url()}/policy", json=model.model_dump(mode="json"), timeout=_http_timeout()))
 
 
 def replace_policy(model: PolicyModel) -> None:
     """``PUT /policy`` — upsert every entry of ``model``, then delete every other AIAC CR."""
-    _check(requests.put(f"{_base_url()}/policy", json=model.model_dump(mode="json"), timeout=_HTTP_TIMEOUT))
+    _check(requests.put(f"{_base_url()}/policy", json=model.model_dump(mode="json"), timeout=_http_timeout()))
 
 
 def delete_service_cr(service_id: str) -> None:
     """``DELETE /policy/services/{service_id}`` — delete the CR of one service (a missing CR is
     success). Under D20 the service is then denied."""
-    _check(requests.delete(f"{_base_url()}/policy/services/{_service_id_segment(service_id)}", timeout=_HTTP_TIMEOUT))
+    _check(requests.delete(f"{_base_url()}/policy/services/{_service_id_segment(service_id)}", timeout=_http_timeout()))
 
 
 def delete_policy() -> None:
     """``DELETE /policy`` — delete every AIAC CR. No AIAC code calls it (C1)."""
-    _check(requests.delete(f"{_base_url()}/policy", timeout=_HTTP_TIMEOUT))
+    _check(requests.delete(f"{_base_url()}/policy", timeout=_http_timeout()))

@@ -197,15 +197,30 @@ load_image_to_kind() {
 # Check the global combiner as the Controller start check #4 (D30) does: the
 # two request packages must not keep
 # `client_ok if not data.authbridge.client.<dir>.request`.
+# The same allowlist as the Controller's start check #4 (src/aiac/agent/controller/start.py): in each
+# request package, every client_ok rule (comments dropped, white-space runs as one space) must be
+# `client_ok if data.authbridge.client.<dir>.request.allow` or `default client_ok := false`, and
+# there must be at least one. A search for the stock fail-open line only would pass a fail-open rule
+# in another form, and the Controller would then stop at its start.
+client_ok_rules() {
+  sed 's/#.*//' | tr -s ' \t' ' ' | sed 's/^ //; s/ $//' | grep -E '^(default )?client_ok\b.' || true
+}
+
 check_combiner() {
-  local content
-  content="$(kubectl get authorizationpolicy default -n "$RELEASE_NAMESPACE" \
-    -o jsonpath='{.spec.policies[*].content}')"
-  if printf '%s\n' "$content" \
-    | grep -qE 'client_ok if not data\.authbridge\.client\.(inbound|outbound)\.request'; then
-    echo "ERROR: the default AuthorizationPolicy in ${RELEASE_NAMESPACE} still allows a pod that has no client CR" >&2
-    exit 1
-  fi
+  local dir content rules bad
+  for dir in inbound outbound; do
+    content="$(kubectl get authorizationpolicy default -n "$RELEASE_NAMESPACE" \
+      -o jsonpath="{.spec.policies[?(@.path==\"${dir}/request.rego\")].content}")"
+    rules="$(printf '%s\n' "$content" | client_ok_rules)"
+    bad="$(printf '%s\n' "$rules" | grep -vxF \
+      -e "client_ok if data.authbridge.client.${dir}.request.allow" \
+      -e "default client_ok := false" || true)"
+    if [ -z "$rules" ] || [ -n "$bad" ]; then
+      echo "ERROR: the default AuthorizationPolicy in ${RELEASE_NAMESPACE} can allow a pod that has no client CR" \
+        "(${dir}/request.rego: ${bad:-no client_ok rule})" >&2
+      exit 1
+    fi
+  done
 }
 
 OVERLAY_FILE="$(mktemp "${TMPDIR:-/tmp}/opa-kind-enable-overlay.XXXXXX")"

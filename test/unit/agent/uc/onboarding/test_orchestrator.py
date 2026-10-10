@@ -554,16 +554,15 @@ class TestSuccessDoesNotReEnableClient:
 class TestReenableService:
     def test_reenable_sets_enabled_true_and_touches_nothing_else(self):
         # reenable_service is the UC1-only, idempotent post-apply hook that compute_and_apply calls
-        # (as on_applied) after a successful run. It resolves the service and sets enabled=true —
-        # nothing else.
-        service = _service()
-        config = _config_returning(service)
+        # (as on_applied) after a successful run. It sets enabled=true by the UUID — nothing else. It
+        # runs under the PCE lock, so it reads no Service first (one IdP call only).
+        config = _config_returning(_service())
 
         with patch.object(orchestrator, "_config", return_value=config):
             orchestrator.reenable_service(SERVICE_ID)
 
-        config.get_service.assert_called_once_with(SERVICE_ID)
-        config.set_service_enabled.assert_called_once_with(service, True)
+        config.get_service.assert_not_called()
+        config.set_service_enabled_by_id.assert_called_once_with(SERVICE_ID, True)
         config.delete_service_role.assert_not_called()
         config.delete_service_scope.assert_not_called()
 
@@ -1059,8 +1058,7 @@ class TestOnboardAndApply:
         mock.assert_called_once()
         assert mock.call_args.args == (rules, False)
         assert mock.call_args.kwargs["focus_service"] == CLIENT_ID
-        config.set_service_enabled.assert_called_once_with(config.get_service.return_value, True)
-        assert all(c.args == (SERVICE_ID,) for c in config.get_service.call_args_list)
+        config.set_service_enabled_by_id.assert_called_once_with(SERVICE_ID, True)
 
     def test_the_apply_runs_inside_the_per_service_lock(self):
         # A concurrent run of the same service cannot quarantine it between the apply and the

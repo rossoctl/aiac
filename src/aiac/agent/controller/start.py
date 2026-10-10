@@ -81,16 +81,20 @@ def check_combiner() -> None:
             ) from e
         raise StartCheckError(f"start check #4 failed: cannot read {where}: {e}") from e
 
-    policies = {p.get("path"): p.get("content") or "" for p in ((cr.get("spec") or {}).get("policies") or [])}
+    # Every entry of a path: a CR that lists a path two times must not hide a fail-open entry.
+    contents: dict[str, list[str]] = {}
+    for policy in (cr.get("spec") or {}).get("policies") or []:
+        contents.setdefault(policy.get("path"), []).append(policy.get("content") or "")
     problems = []
     for path, safe in _SAFE_CLIENT_OK_RULES.items():
-        if path not in policies:
+        if path not in contents:
             problems.append(f"{path} is missing")
             continue
-        rules = _client_ok_rules(policies[path])
-        if not rules:
-            problems.append(f"{path} has no client_ok rule")
-        problems.extend(f"{path} has the rule {rule!r}" for rule in rules if rule not in safe)
+        for content in contents[path]:
+            rules = _client_ok_rules(content)
+            if not rules:
+                problems.append(f"{path} has no client_ok rule")
+            problems.extend(f"{path} has the rule {rule!r}" for rule in rules if rule not in safe)
     if problems:
         raise StartCheckError(
             f"start check #4 failed: the global combiner ({where}) allows a pod that has no client CR: "

@@ -258,10 +258,10 @@ def reenable_service(service_id: ServiceUuid) -> None:
     is applied means a PCE failure leaves the client **disabled** (the failed-service marker set by
     a prior :func:`_rollback` stays in place), so a client is never enabled with no applied policy.
 
-    ``set_service_enabled(service, True)`` is idempotent, so a redelivery that re-enables an
-    already-enabled client is a no-op."""
-    config = _config()
-    config.set_service_enabled(config.get_service(service_id), True)
+    ``set_service_enabled_by_id(service_id, True)`` is idempotent, so a redelivery that re-enables an
+    already-enabled client is a no-op. It makes one IdP call and reads no ``Service``: it runs under
+    the PCE lock, so every other PCE operation waits for it."""
+    _config().set_service_enabled_by_id(service_id, True)
 
 
 def onboard_and_apply(service_id: ServiceUuid, *, wait_for_client: bool = True) -> None:

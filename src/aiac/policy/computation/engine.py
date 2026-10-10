@@ -790,10 +790,18 @@ def bootstrap(service_id: ClientId, service_type: ServiceType) -> None:
 
 
 def _bootstrap(service_id: str, service_type: ServiceType, side: EnforcementSide) -> None:
+    model = find_service_policy(service_id)
+    # Agent side, a tool (by the pod label and by the stored SPM): its pass-through CR names no rule
+    # and no holder, so it needs no IdP read under the PCE lock.
+    if side == EnforcementSide.AGENT_SIDE and ServiceType.AGENT not in (
+        service_type,
+        getattr(model, "service_type", None),
+    ):
+        apply_policy(AgentSidePolicyModel(agents=[], pass_through=[service_id]))
+        return
     # The IdP once (D32): the catalog seeds a new SPM; the holders refresh a stored one. The service
     # is the focus of its onboarding, so it counts as live.
     catalog, holders = _read_idp(service_id)
-    model = find_service_policy(service_id)
     if model is not None:
         model = _rendered(model, catalog, holders)
     else:

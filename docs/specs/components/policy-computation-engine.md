@@ -393,6 +393,7 @@ The resync is also the path for these changes:
 
 Steps (under the PCE lock):
 
+0. **Agent side, a tool:** load the stored `SPM(service_id)` (`find_service_policy`). If neither the given `service_type` nor the stored SPM says `Agent`, write the pass-through CR (`AgentSidePolicyModel(agents=[], pass_through=[service_id])`) and stop. A pass-through CR names no rule and no holder, so this makes no IdP read under the PCE lock.
 1. **IdP once** (`get_services()` and `get_roles()`, D32; the tool is the focus, so it counts as live), and **load the stored `SPM(service_id)`** (`find_service_policy`; a 404 gives `None`), with the current role holders and its type and identity seeded from the catalog. If the store has no SPM, use a zero-rule SPM with the given `service_type`, its identity seeded from the catalog. The type comes from the pod label (`rossoctl.io/type`), because the catalog type is not set before Provision.
 2. **Write the CR** with one `apply_policy` call (`POST /policy`):
    - **target side:** `TargetSidePolicyModel(services=[that SPM])`. The tool inbound then allows only the self-discovery rule (plus any stored rules), and the outbound is a pass-through (see [`pdp-policy-writer-opa.md` → Tool inbound package](pdp-policy-writer-opa.md#tool-inbound-package-target-side-authbridgeclientinboundrequest));

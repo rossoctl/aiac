@@ -283,7 +283,16 @@ class TestTimeout:
 
         with patch(f"aiac.pdp.policy.library.api.requests.{method}", return_value=_ok(204)) as m:
             call(api)
-        assert m.call_args.kwargs["timeout"] == api._HTTP_TIMEOUT
+        assert m.call_args.kwargs["timeout"] == api._HTTP_TIMEOUT_DEFAULT
+
+    @pytest.mark.parametrize(
+        ("value", "expected"), [("15", 15.0), ("60s", 60.0), ("", 60.0), ("0", 60.0), ("inf", 60.0)]
+    )
+    def test_a_bad_value_falls_back_to_the_default(self, monkeypatch, value, expected):
+        import aiac.pdp.policy.library.api as api
+
+        monkeypatch.setenv("AIAC_PDP_HTTP_TIMEOUT", value)
+        assert api._http_timeout() == expected
 
 
 class TestRetiredFunctions:

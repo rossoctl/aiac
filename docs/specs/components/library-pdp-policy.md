@@ -84,7 +84,7 @@ Known limits:
 
 ### Configuration
 
-Read from the environment (or `.env` file co-located with `api.py`). Falls back to the default if absent. `AIAC_PDP_HTTP_TIMEOUT` is read one time, at import.
+Read from the environment (or `.env` file co-located with `api.py`). Falls back to the default if absent. `AIAC_PDP_HTTP_TIMEOUT` is read at each call. An unset, non-numeric, non-finite, zero or negative value falls back to `60`, so a bad value does not stop the Controller at import.
 
 | Variable | Default |
 |----------|---------|

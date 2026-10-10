@@ -121,6 +121,11 @@ metadata:
   namespace: aiac-system
 spec:
   replicas: 1
+  # Recreate, not RollingUpdate: the PCE lock and the per-service lock are in one process, so two
+  # Controller pods must never run at the same time. Else the new pod's start resync (PUT /policy)
+  # and the old pod's writes race, and a side change can leave CRs of both sides.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: aiac-agent

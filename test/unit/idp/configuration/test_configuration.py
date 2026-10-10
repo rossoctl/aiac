@@ -1750,6 +1750,19 @@ class TestSetServiceEnabled:
         assert isinstance(result, Service)
         assert result.enabled is False
 
+    def test_by_id_posts_to_the_same_endpoint_with_no_service_read(self, monkeypatch):
+        monkeypatch.setenv("AIAC_PDP_CONFIG_URL", BASE)
+        updated = {"id": "svc-uuid", "clientId": "svc-uuid", "name": "my-svc", "enabled": True}
+        with (
+            patch("aiac.idp.configuration.api.requests.post", return_value=_ok(updated, 200)) as post,
+            patch("aiac.idp.configuration.api.requests.get") as get,
+        ):
+            result = Configuration.for_realm(REALM).set_service_enabled_by_id("svc-uuid", True)
+        assert result.enabled is True
+        assert post.call_args[0][0] == f"{BASE}/services/svc-uuid/enabled"
+        assert post.call_args[1].get("json") == {"enabled": True}
+        get.assert_not_called()
+
     def test_posts_to_enabled_endpoint_with_enabled_body(self, monkeypatch):
         monkeypatch.setenv("AIAC_PDP_CONFIG_URL", BASE)
         service = self._make_service()

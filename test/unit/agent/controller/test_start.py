@@ -200,6 +200,13 @@ class TestCheck4StopsTheController:
         assert rule.splitlines()[0] in str(ei.value)
         cluster.resync.assert_not_called()
 
+    def test_a_repeated_path_with_a_fail_open_entry_stops_the_start(self, cluster):
+        # The bundle can carry both entries: the safe second one must not hide the first.
+        fail_open = {"path": "inbound/request.rego", "content": _package("inbound", "request", fail_open=True)}
+        cluster.combiner["spec"]["policies"].insert(0, fail_open)
+        with pytest.raises(start.StartCheckError, match="client_ok if not"):
+            _serve()
+
     def test_a_package_with_no_client_ok_rule_stops_the_start(self, cluster):
         content = _package("inbound", "request", fail_open=False).replace(
             "client_ok if data.authbridge.client.inbound.request.allow\n", ""

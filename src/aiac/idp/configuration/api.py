@@ -319,9 +319,13 @@ class Configuration:
         ``IdPHTTPError`` (a ``RuntimeError``) on a non-OK status. Returns the updated ``Service`` with
         the new ``enabled`` value (``get_service`` / ``get_services`` surface it on subsequent reads).
         """
+        return self.set_service_enabled_by_id(service.id, enabled)
+
+    def set_service_enabled_by_id(self, service_id: str, enabled: bool) -> Service:
+        """``set_service_enabled`` by the Keycloak UUID of the service: no ``Service`` read first."""
         resp = self._request(
             "POST",
-            f"/services/{service.id}/enabled",
+            f"/services/{service_id}/enabled",
             json={"enabled": enabled},
             params=self._params(),
         )

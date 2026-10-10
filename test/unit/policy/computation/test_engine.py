@@ -2428,6 +2428,20 @@ def test_agent_side_bootstrap_of_a_tool_pushes_its_pass_through_and_stores_nothi
     assert [op for op, _ in store.calls] == ["apply_policy"]
 
 
+def test_agent_side_bootstrap_of_a_tool_makes_no_idp_read(agent_side):
+    # A pass-through CR names no rule and no holder: no catalog read under the PCE lock.
+    store = FakeStore()
+    with (
+        engine_env([], store),
+        patch.object(Configuration, "for_default_realm", side_effect=AssertionError("an IdP read")),
+    ):
+        from aiac.policy.computation import bootstrap
+
+        bootstrap("new-tool", ServiceType.TOOL)
+
+    assert store.policy_pushes == [AgentSidePolicyModel(agents=[], pass_through=["new-tool"])]
+
+
 def test_agent_side_bootstrap_of_a_managed_tool_pushes_its_pass_through(agent_side):
     AR, UR, AS, TS, catalog = _repro()
     stored = _spm("github-tool", type=ServiceType.TOOL, owned_scopes=[TS], inbound=[_rule(AR, TS)])
@@ -2549,6 +2563,9 @@ def test_every_writing_entry_point_reads_the_idp_once_under_the_pce_lock(side, e
         ):
             _ENTRY_POINTS[entry_point](policy.computation)
 
+    if side == EnforcementSide.AGENT_SIDE and entry_point == "bootstrap":
+        assert reads == []  # a tool's pass-through CR needs no IdP read
+        return
     assert reads == [("get_roles", True), ("get_services", True, given[0])]
 
 

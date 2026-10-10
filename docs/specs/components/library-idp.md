@@ -209,7 +209,7 @@ retried write then makes no duplicate, as follows:
 | `create_scope` | `POST /scopes` | The same as `create_role`, for the client-scope name; `create_service_scope` takes the `409` as reuse. |
 | `map_role_to_service` | `POST /services/{id}/roles/{role_id}` | No second mapping and no error: Keycloak skips the grant of a role that the service account already has. Keycloak still sends the `REALM_ROLE_MAPPING` event, so the SPI publishes `aiac.apply.role-members.{role-id}` again (a new render with the same holders). |
 | `map_scope_to_service` | `POST /services/{id}/scopes/{scope_id}` | No second link and no error: Keycloak skips a scope that is already linked to the client. |
-| `set_service_type`, `set_service_enabled` | `POST /services/{id}/type`, `POST /services/{id}/enabled` | Writes the same value again. |
+| `set_service_type`, `set_service_enabled`, `set_service_enabled_by_id` | `POST /services/{id}/type`, `POST /services/{id}/enabled` | Writes the same value again. |
 | `link_subject_scope` | `POST /services/{id}/subject-scope` | Idempotent (see the method below). |
 | `delete_service_role`, `delete_service_scope` | `DELETE /services/{id}/roles/{role_id}`, `DELETE /services/{id}/scopes/{scope_id}` | Idempotent: an already-gone object is success. |
 | `mint_discovery_token` | `GET /services/{id}/discovery-token` | Mints a new token; no state change. |
@@ -292,6 +292,7 @@ class Configuration:
     def delete_service_role(self, service: Service, role: Role) -> None: ...
     def delete_service_scope(self, service: Service, scope: Scope) -> None: ...
     def set_service_enabled(self, service: Service, enabled: bool) -> Service: ...
+    def set_service_enabled_by_id(self, service_id: str, enabled: bool) -> Service: ...
 
     # Mint a bearer token, minted as the service's own client, whose `aud` contains that
     # client's client-id — for authenticating UC-1 tool discovery against the tool's
@@ -469,6 +470,8 @@ The PCE calls `get_roles()` one time for each operation, next to `get_services()
 3. Idempotent: disabling an already-disabled client (or enabling an already-enabled one) is not an error.
 4. Raises `IdPHTTPError` on non-2xx HTTP status. Returns the updated `Service` with the new `enabled` value.
 
+`set_service_enabled_by_id(service_id: str, enabled: bool) -> Service`: the same write, by the Keycloak UUID of the service, with no `Service` read first. `set_service_enabled` calls it with `service.id`. The UC1 re-enable (`reenable_service`) uses it: it runs under the PCE lock, so it makes one IdP call only.
+
 > **Shared-object safety.** Provisioning uses **create-or-reuse-by-name** (`create_service_role` /
 > `create_service_scope` reuse an existing realm role / client scope of the same name), so one role
 > or scope can be shared by several services (by design, D32). Teardown therefore deletes **only** an object **this**
@@ -479,7 +482,7 @@ The PCE calls `get_roles()` one time for each operation, next to `get_services()
 > Configuration Service — see `idp-configuration-service.md`) refuses to delete a role or scope that is
 > still mapped to another client: such an object is at most unmapped from the caller, never deleted.
 > The **consumer** of `delete_service_role`, `delete_service_scope` and `set_service_enabled` is the
-> UC1 compensating rollback (see the AIAC Agent UC1 spec, `aiac-agent/uc1-service-onboarding.md`),
+> UC1 compensating rollback (the UC1 re-enable uses `set_service_enabled_by_id`) (see the AIAC Agent UC1 spec, `aiac-agent/uc1-service-onboarding.md`),
 > which deletes what Provision created and then disables the client as a failed-service marker. The
 > rollback **keeps** the client type, because this run did not create it, so the library has no
 > clear-type primitive.

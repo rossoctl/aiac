@@ -176,17 +176,15 @@ def _entries(model: PolicyModel) -> Iterator[tuple[str, ClientPolicies]]:
     raise TypeError(f"no renderer for the policy model {type(model).__name__}")
 
 
-def _build_cr(service_id: str, policies: ClientPolicies) -> dict:
+def _build_cr(namespace: str, name: str, policies: ClientPolicies) -> dict:
     """Build the ``AuthorizationPolicy`` CR body of one entry (Q6a).
 
-    ``metadata.name`` / ``.namespace`` come from ``identity_ref(service_id)``;
-    ``spec.clientID`` is the DNS-label-safe ``name`` — display / print-column
-    only, since bundle-service matches on name+namespace, never ``clientID``.
+    ``metadata.name`` / ``.namespace`` are the CR identity of the entry (``identity_ref`` of its
+    service id, see ``_identified``); ``spec.clientID`` is the DNS-label-safe ``name`` — display /
+    print-column only, since bundle-service matches on name+namespace, never ``clientID``.
     ``spec.policies`` is exactly the two request packages; the list is atomic under
-    server-side apply, so one write replaces both. Raises ``ValueError`` (via
-    ``identity_ref``) on a malformed ``service_id``.
+    server-side apply, so one write replaces both.
     """
-    namespace, name = identity_ref(service_id)
     return {
         "apiVersion": f"{_GROUP}/{_VERSION}",
         "kind": "AuthorizationPolicy",
@@ -230,12 +228,19 @@ def _cr_identity(service_id: str) -> tuple[str, str] | None:
         return None
 
 
-def _upsert(service_id: str, policies: ClientPolicies) -> tuple[str, str]:
-    """Server-side-apply the CR of one entry (idempotent), then dump if enabled (Q6b).
+def _identified(model: PolicyModel) -> Iterator[tuple[str, str, ClientPolicies]]:
+    """``(namespace, name, packages)`` for each entry of ``model`` that can have a CR, in order: the
+    CR identity is parsed one time here. An entry that cannot have a CR is skipped (``_cr_identity``)."""
+    for service_id, policies in _entries(model):
+        identity = _cr_identity(service_id)
+        if identity is not None:
+            yield *identity, policies
 
-    Returns the CR's ``(namespace, name)``."""
-    body = _build_cr(service_id, policies)
-    namespace, name = body["metadata"]["namespace"], body["metadata"]["name"]
+
+def _upsert(namespace: str, name: str, policies: ClientPolicies) -> None:
+    """Server-side-apply the CR ``namespace/name`` of one entry (idempotent), then dump if enabled
+    (Q6b)."""
+    body = _build_cr(namespace, name, policies)
     _api.patch_namespaced_custom_object(
         group=_GROUP,
         version=_VERSION,
@@ -249,7 +254,6 @@ def _upsert(service_id: str, policies: ClientPolicies) -> tuple[str, str]:
     )
     if _dump_enabled():
         _dump_cr(namespace, name, body)
-    return namespace, name
 
 
 def _apply(model: PolicyModel) -> None:
@@ -257,9 +261,8 @@ def _apply(model: PolicyModel) -> None:
 
     No rollback: a failure stops the batch, and the entries already written stay written (SSA is
     idempotent, so a retry re-applies the whole set). An entry that cannot have a CR is skipped."""
-    for service_id, policies in _entries(model):
-        if _cr_identity(service_id) is not None:
-            _upsert(service_id, policies)
+    for namespace, name, policies in _identified(model):
+        _upsert(namespace, name, policies)
 
 
 def _delete_cr(namespace: str, name: str) -> None:
@@ -293,11 +296,10 @@ def _replace(model: PolicyModel) -> None:
     The delete step runs only after every upsert succeeded: an upsert failure propagates before
     the list, so nothing is deleted. A per-item 404 (a concurrent delete) is success. An entry that
     cannot have a CR is skipped."""
-    keep = {
-        _upsert(service_id, policies)
-        for service_id, policies in _entries(model)
-        if _cr_identity(service_id) is not None
-    }
+    keep: set[tuple[str, str]] = set()
+    for namespace, name, policies in _identified(model):
+        _upsert(namespace, name, policies)
+        keep.add((namespace, name))
     for namespace, name in _managed_crs():
         if (namespace, name) not in keep:
             _delete_cr(namespace, name)
