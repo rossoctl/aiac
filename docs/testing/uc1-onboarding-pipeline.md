@@ -804,7 +804,8 @@ Rungs 6 and 7 restart the Controller twice each, so each one takes several minut
     focus SPM, the `changed` set, the affected set for each side); the quarantine and the decommission
     call `delete_service_cr` (D20); the resync (D28: one `PUT` with every live stored SPM, the deletes by
     the label, the teardown of a disabled service); the bootstrap (the CR of a focus tool, and no SPM
-    stored); and the switch parse (`enforcement_side()`: an
+    stored); `drop_bootstrap` (it holds the PCE lock, deletes the CR of a service that has no stored
+    SPM, and changes nothing when an SPM is stored); and the switch parse (`enforcement_side()`: an
     unknown `AIAC_ENFORCEMENT_SIDE` value raises `ValueError`).
   - `test/unit/pdp/service/policy/opa/` — the writer: a tool CR (name and namespace from
     `identity_ref`, the label, both request packages), a batch, `PUT /policy` deletes the stale
@@ -816,8 +817,10 @@ Rungs 6 and 7 restart the Controller twice each, so each one takes several minut
   - `test/unit/agent/` — the start sequence (an unknown side, a failed start check #4, or a failed
     resync stops the Controller before it serves), the onboarding checks #1, #2 and
     #6 (each gives 409, is permanent in the NATS consumer, runs no rollback and no quarantine, and runs
-    before the bootstrap, Provision and the PRB, D30), the bootstrap of a tool before Provision, and the
-    read-only route `GET /policy/services/{service_id:path}` (D18). For D31: Provision links the
+    before the bootstrap, Provision and the PRB, D30), the bootstrap of a tool before Provision, the
+    drop of the bootstrap CR (a failure that runs no quarantine, and a failed `compute_and_apply`, call
+    `drop_bootstrap` for a tool that this run bootstrapped only; a failed drop does not hide the
+    original error), and the read-only route `GET /policy/services/{service_id:path}` (D18). For D31: Provision links the
     subject scope before `set_service_type`, keeps it out of the created-manifest, and the rollback
     never deletes it; `test_uc1_subject_scope.py` covers the harness helpers `subject_scope_problems`,
     `subject_scope_link_problems`, `require_subject_scope`, `exchange_token` and `exchanged_subject`

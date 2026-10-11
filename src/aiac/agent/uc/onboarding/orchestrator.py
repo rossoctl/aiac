@@ -41,6 +41,7 @@ import contextlib
 import functools
 import logging
 import threading
+from typing import NamedTuple
 
 from fastapi import HTTPException
 
@@ -266,7 +267,7 @@ def reenable_service(service_id: ServiceUuid) -> None:
 
 def onboard_and_apply(service_id: ServiceUuid, *, wait_for_client: bool = True) -> None:
     """The whole UC1 for the Controller route and the NATS consumer: :func:`_onboard` (the build), then
-    ``compute_and_apply(rules, override, focus_service=client_id)`` with :func:`reenable_service` as
+    ``compute_and_apply(rules, override=False, focus_service=client_id)`` with :func:`reenable_service` as
     its ``on_applied``, all inside the per-service lock (:func:`_service_lock`).
 
     The PCE calls the re-enable under its lock, after the apply succeeds: no other PCE operation can
@@ -277,15 +278,19 @@ def onboard_and_apply(service_id: ServiceUuid, *, wait_for_client: bool = True) 
     a NATS redelivery) cannot quarantine the service between this run's apply and its re-enable.
     ``wait_for_client`` is given to the first IdP read (see :func:`_read_service`)."""
     with _service_lock(service_id):
-        rules, override, client_id, bootstrapped = _onboard(service_id, wait_for_client)
+        built = _onboard(service_id, wait_for_client)
         try:
+            # UC1 is incremental: override is always False (append).
             compute_and_apply(
-                rules, override, focus_service=client_id, on_applied=functools.partial(reenable_service, service_id)
+                built.rules,
+                False,
+                focus_service=built.client_id,
+                on_applied=functools.partial(reenable_service, service_id),
             )
         except Exception:
-            # Only a bootstrapped tool has a bootstrap CR to drop.
-            if bootstrapped:
-                _drop_bootstrap(client_id)
+            # Only a tool that this run bootstrapped has a bootstrap CR to drop.
+            if built.bootstrapped:
+                _drop_bootstrap(built.client_id)
             raise
 
 
@@ -300,10 +305,21 @@ def _drop_bootstrap(client_id: ClientId) -> None:
         logger.exception("UC1: the drop of the bootstrap CR failed (service %s)", _loggable(client_id))
 
 
-def _onboard(service_id: ServiceUuid, wait_for_client: bool) -> tuple[list[PolicyRule], bool, ClientId, bool]:
+class _Onboarded(NamedTuple):
+    """The result of :func:`_onboard`, for the ``compute_and_apply`` call of :func:`onboard_and_apply`."""
+
+    rules: list[PolicyRule]
+    """The rules of the Policy Builder."""
+    client_id: ClientId
+    """The clientId of the service (``Service.serviceId``): the ``focus_service`` of the apply."""
+    bootstrapped: bool
+    """True when this run wrote the bootstrap CR of a tool: only then does a failed apply drop it."""
+
+
+def _onboard(service_id: ServiceUuid, wait_for_client: bool) -> _Onboarded:
     """Sequence the precondition checks → (tool) bootstrap → Provision → Policy Builder and return
-    ``(rules, override=False, client_id, bootstrapped)``. ``bootstrapped`` is true when this run
-    wrote the bootstrap CR of a tool: only then does a failed apply drop it.
+    an :class:`_Onboarded` (``rules``, ``client_id``, ``bootstrapped``). ``bootstrapped`` is true
+    when this run wrote the bootstrap CR of a tool: only then does a failed apply drop it.
 
     ``service_id`` is the Keycloak internal client UUID that the trigger carries. The Orchestrator
     reads the ``Service`` from the IdP **once**, before Provision, and resolves its clientId
@@ -407,4 +423,4 @@ def _onboard(service_id: ServiceUuid, wait_for_client: bool) -> tuple[list[Polic
             _drop_bootstrap(client_id)
         raise
 
-    return rules, False, client_id, bootstrapped
+    return _Onboarded(rules, client_id, bootstrapped)

@@ -16,11 +16,11 @@ The Agent subscribes to the Event Broker as a durable competing consumer (`aiac-
 
 The `/apply/*` HTTP endpoints are retained as a debugging escape hatch. The **NATS consumer is a thin adapter layer** that receives events from the Event Broker and calls the same use-case handlers and `compute_and_apply` (UC1: the Orchestrator's `onboard_and_apply`) that the `/apply/*` routes call — or, for a role-membership change, the same PCE `rerender_role` that `POST /apply/role-members/{role_id}` calls. There is no duplicated business logic.
 
-The service is structured as a **Controller** (FastAPI routes) that dispatches to the **Service Onboarding Orchestrator** (UC1) or directly to the Policy Update and Role Update sub-agents (UC2, UC3). Each producing sub-agent calls the **shared Policy Rules Builder** (`agent/policy_rules_builder/`) directly, merges the results internally, and returns a single `list[PolicyRule]` and an `override` flag to the Controller. The Controller calls `compute_and_apply(merged_rules, override)` from `aiac.policy.computation` (PCE) once.
+The service is structured as a **Controller** (FastAPI routes) that dispatches to the **Service Onboarding Orchestrator** (UC1) or directly to the Policy Update and Role Update sub-agents (UC2, UC3). Each producing sub-agent calls the **shared Policy Rules Builder** (`agent/policy_rules_builder/`) directly, merges the results internally, and returns a single `list[PolicyRule]` and an `override` flag to the Controller. The Controller calls `compute_and_apply(merged_rules, override)` from `aiac.policy.computation` (PCE) once. UC1 is different: the Orchestrator (`onboard_and_apply`) calls the PCE `compute_and_apply` itself, and the Controller gets nothing back.
 
 | Use Case | Dispatch | Sub-agents | Sub-agent output |
 |---|---|---|---|
-| Service Onboarding (UC1) | via Orchestrator | Service Provision + Service Policy Builder | `(list[PolicyRule], override=False, client_id)` |
+| Service Onboarding (UC1) | via Orchestrator | Service Provision + Service Policy Builder | None to the Controller: `onboard_and_apply` calls `compute_and_apply(rules, override=False, focus_service=client_id)` itself and returns `None` |
 | Policy Update (UC2) | Controller → sub-agent directly | Build or Rebuild (TBD) | `(list[PolicyRule], override)` |
 | Role Update (UC3) | Controller → sub-agent directly | Role sub-agent | `(list[PolicyRule], override)` |
 
@@ -71,7 +71,7 @@ flowchart TD
     SA4  -->|"calls"| PRB
     SA6  -->|"calls"| PRB
 
-    ORC1 -->|"(list[PolicyRule], override=False, client_id)"| CTRL
+    ORC1 -->|"onboard_and_apply:\nrules, override=False,\nfocus_service=client_id"| PCE
     SA4  -->|"(list[PolicyRule], override)"| CTRL
     SA5  -->|"(list[PolicyRule], override)"| CTRL
     SA6  -->|"(list[PolicyRule], override)"| CTRL
@@ -384,7 +384,7 @@ src/aiac/
     │   ├── offboarding/
     │   │   └── offboard.py             ← offboard_service stub: returns the clientId unchanged
     │   ├── onboarding/
-    │   │   ├── orchestrator.py         ← sequences the precondition checks (D30) → (tool only) PCE bootstrap → provision → policy_builder, returns (list[PolicyRule], override=False, client_id)
+    │   │   ├── orchestrator.py         ← sequences the precondition checks (D30) → (tool only) PCE bootstrap → provision → policy_builder, then onboard_and_apply calls compute_and_apply(rules, override=False, focus_service=client_id) itself (returns None)
     │   │   ├── preconditions.py        ← check_preconditions (#1, #2, #6; D30); EnforcementPreconditionError
     │   │   ├── provision/              ← non-LLM sub-agent: classify, analyze, write to IdP; kube.py = retrying K8s seam
     │   │   └── policy_builder/         ← IdP reader + PRB invoker: read IdP, call PRB, return list[PolicyRule]; cross_service.py = read-only Policy Store read (applied_rules_for_scopes)
