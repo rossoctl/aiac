@@ -190,8 +190,8 @@ def _plugin_policies(config, direction: str) -> dict[str, str] | None:
         for p in plugins:
             if isinstance(p, str):
                 name, policy = p, "enforce"
-            elif isinstance(p, dict):
-                name, policy = p.get("name"), _on_error(p)
+            elif isinstance(p, dict) and isinstance(p.get("name"), str):
+                name, policy = p["name"], _on_error(p)
             else:
                 continue
             if policies.get(name) != "enforce":
