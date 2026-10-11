@@ -219,7 +219,7 @@ github-tool's** (D20) — each with both request packages:
 | **target side** (default) | inbound: rules, agent-level (D26a); outbound: pass-through (D24) | inbound: rules, per tool (D26); outbound: pass-through (D24) |
 | **agent side** | inbound: rules, agent-level; outbound: rules (per-tool checks + the MCP session rule) | inbound and outbound: pass-through (a pass-through CR, D24) |
 
-The UC-1 ladder asserts these CR shapes, the D20 deny of a service with no CR, the quarantine, the
+The UC-1 ladder asserts these CR shapes, the D20 deny of a service with no CR, the quarantine
 and the resync ([uc1-onboarding-pipeline.md](uc1-onboarding-pipeline.md), rungs 5–6).
 This test asserts only the enforced decisions. This fixture is **ALLOW-only** (see
 *[Further Notes](#further-notes)*): the single `policy.md` carries only positive fine-grained grants and
@@ -305,10 +305,6 @@ of AIAC with `agent-side` first (a live switch is not supported; see
 Do a clean redeploy with `target-side` afterwards to restore it.
 
 ```bash
-kubectl -n aiac-system patch configmap aiac-agent-config --type merge \
-  -p '{"data":{"AIAC_ENFORCEMENT_SIDE":"agent-side"}}'
-kubectl -n aiac-system rollout restart deployment/aiac-agent
-kubectl -n aiac-system rollout status deployment/aiac-agent
 .venv/bin/pytest -m system -k test_policy_pipeline -v
 ```
 

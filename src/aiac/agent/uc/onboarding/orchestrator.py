@@ -11,10 +11,10 @@ clientId, which :func:`onboard_and_apply` gives to the PCE as ``focus_service``:
        that resolves the clientId (a ``404`` on that read is the event-before-commit race: it is read
        again for a bounded time, see ``CLIENT_WAIT``): the pod has the AuthBridge sidecar (#1),
        the namespace pipeline has ``opa`` (and ``mcp-parser`` for a tool) inbound, and under agent
-       side also ``opa`` outbound (#2), no app container has an ``httpGet`` probe (#6). The scope
-       depends on the enforcement side: every service under target side, agents only under agent side (a tool
-       then gets a pass-through CR, which needs no check; its pod type is still read). A failed
-       check raises ``EnforcementPreconditionError``.
+       side also ``mcp-parser`` and ``opa`` outbound (#2), no app container has an ``httpGet`` probe
+       (#6). The scope depends on the enforcement side: every service under target side, agents only
+       under agent side (a tool then gets a pass-through CR, which needs no check; its pod type is
+       still read). A failed check raises ``EnforcementPreconditionError``.
        Then, for an enabled TOOL only, the PCE ``bootstrap`` writes the tool's first CR (under
        target side its rules-based CR, under agent side a pass-through CR), so that discovery
        (``tools/list`` through the tool's own inbound) passes D20 (checkpoint B1).
@@ -314,8 +314,7 @@ class _Onboarded(NamedTuple):
     client_id: ClientId
     """The clientId of the service (``Service.serviceId``): the ``focus_service`` of the apply."""
     bootstrapped: bool
-    """True when this run wrote the bootstrap CR of a tool. Only then does a failed apply, or a build
-    failure with no quarantine, drop that CR."""
+    """True when this run wrote the bootstrap CR of a tool. Only then does a failed apply drop that CR."""
 
 
 def _onboard(service_id: ServiceUuid, wait_for_client: bool) -> _Onboarded:
@@ -343,7 +342,8 @@ def _onboard(service_id: ServiceUuid, wait_for_client: bool) -> _Onboarded:
     before Provision (of the current side: rules-based under target side, a pass-through under
     agent side), so that discovery passes (checkpoint B1). A disabled tool gets no bootstrap:
     it fails at the discovery-token mint anyway (C5). A bootstrap failure propagates (no rollback:
-    Provision has not run).
+    Provision has not run). Any other failure of Provision or the build (no quarantine) drops this
+    run's bootstrap CR (:func:`_drop_bootstrap`) and propagates.
 
     On any of the four typed build failures (see ``_ROLLBACK_ERRORS``, for agents and tools, on the
     first failure — also the retryable ``LLMAccessError``) the Orchestrator runs the compensating
