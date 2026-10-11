@@ -10,7 +10,15 @@ import pytest
 import requests
 
 from aiac.idp.configuration.api import Configuration, IdPHTTPError
-from aiac.idp.configuration.models import Role, RoleKind, Scope, Service, ServiceType, Subject
+from aiac.idp.configuration.models import (
+    PlatformToolAudience,
+    Role,
+    RoleKind,
+    Scope,
+    Service,
+    ServiceType,
+    Subject,
+)
 
 REALM = "rossoctl"
 BASE = "http://127.0.0.1:7071"
@@ -653,6 +661,45 @@ class TestLinkSubjectScope:
         with patch("aiac.idp.configuration.api.requests.post", return_value=_err(status)):
             with pytest.raises(RuntimeError):
                 Configuration.for_realm(REALM).link_subject_scope(self._make_service())
+
+
+class TestGetPlatformToolAudiences:
+    TOOL = "spiffe://localtest.me/ns/team1/sa/github-tool"
+    ITEM = {
+        "login_client": "rossoctl",
+        "link": "default",
+        "scope": "agent-team1-github-tool-aud",
+        "mapper": "agent-team1-github-tool-aud",
+        "tool_client_id": TOOL,
+    }
+
+    def test_gets_the_endpoint_with_the_realm(self, monkeypatch):
+        monkeypatch.setenv("AIAC_PDP_CONFIG_URL", BASE)
+        with patch("aiac.idp.configuration.api.requests.get", return_value=_ok([])) as m:
+            assert Configuration.for_realm(REALM).get_platform_tool_audiences() == []
+        assert m.call_args[0][0] == f"{BASE}/platform-clients/tool-audiences"
+        assert m.call_args[1].get("params") == {"realm": REALM}
+
+    def test_sends_the_client_id_filter(self, monkeypatch):
+        monkeypatch.setenv("AIAC_PDP_CONFIG_URL", BASE)
+        with patch("aiac.idp.configuration.api.requests.get", return_value=_ok([])) as m:
+            Configuration.for_realm(REALM).get_platform_tool_audiences(self.TOOL)
+        assert m.call_args[1].get("params") == {"realm": REALM, "client_id": self.TOOL}
+
+    def test_parses_each_item_into_a_platform_tool_audience(self, monkeypatch):
+        monkeypatch.setenv("AIAC_PDP_CONFIG_URL", BASE)
+        client_item = {**self.ITEM, "link": "client", "scope": None, "mapper": "direct-aud"}
+        with patch("aiac.idp.configuration.api.requests.get", return_value=_ok([self.ITEM, client_item])):
+            result = Configuration.for_realm(REALM).get_platform_tool_audiences()
+        assert all(isinstance(r, PlatformToolAudience) for r in result)
+        assert [r.model_dump() for r in result] == [self.ITEM, client_item]
+
+    def test_a_non_ok_status_raises_idp_http_error(self, monkeypatch):
+        monkeypatch.setenv("AIAC_PDP_CONFIG_URL", BASE)
+        with patch("aiac.idp.configuration.api.requests.get", return_value=_err(404)):
+            with pytest.raises(IdPHTTPError) as ei:
+                Configuration.for_realm(REALM).get_platform_tool_audiences()
+        assert ei.value.status == 404
 
 
 # ---------------------------------------------------------------------------

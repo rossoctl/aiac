@@ -5,6 +5,7 @@ import json
 import os
 from unittest.mock import MagicMock, patch
 
+import pytest
 from fastapi.testclient import TestClient
 from keycloak.exceptions import KeycloakError, KeycloakGetError
 
@@ -1631,6 +1632,226 @@ class TestLinkSubjectScopeToLoginClients:
 
     def teardown_method(self):
         app.dependency_overrides.clear()
+
+
+# ---------------------------------------------------------------------------
+# GET /platform-clients/tool-audiences (the login-client audience warning, C2)
+# ---------------------------------------------------------------------------
+
+TOOL = "spiffe://localtest.me/ns/team1/sa/github-tool"
+OTHER_TOOL = "spiffe://localtest.me/ns/team1/sa/other-tool"
+AGENT = "spiffe://localtest.me/ns/team1/sa/github-agent"
+
+
+def _audience_mapper(audience, *, name=None, key="included.custom.audience", claim="true", kind=None):
+    """An ``oidc-audience-mapper`` as the operator makes it (``included.custom.audience``, the access
+    token claim ``"true"``). ``claim=None`` drops the ``access.token.claim`` key."""
+    config = {key: audience, "id.token.claim": "false"}
+    if claim is not None:
+        config["access.token.claim"] = claim
+    return {
+        "id": f"m-{name or audience}",
+        "name": name or "audience",
+        "protocol": "openid-connect",
+        "protocolMapper": kind or "oidc-audience-mapper",
+        "config": config,
+    }
+
+
+def _audience_admin(*, clients=None, scopes=None, default=None, optional=None, client_mappers=None):
+    """A ``MagicMock`` Keycloak admin for the tool-audience read.
+
+    ``clients`` maps a clientId to its ``client.type`` (``None``: no type); each client has the UUID
+    ``<clientId>-uuid``. Default: the login client ``rossoctl`` (no type) and the tool ``TOOL``.
+    ``scopes`` maps a scope id to ``(name, mappers)``: the realm scope list carries ``protocolMappers``
+    only when the scope has mappers, as Keycloak does. ``default`` / ``optional`` map a clientId to its
+    linked scope ids, and ``client_mappers`` a clientId to the mappers on the client itself."""
+    clients = {"rossoctl": None, TOOL: "Tool"} if clients is None else clients
+    scopes = scopes or {}
+    default, optional, client_mappers = default or {}, optional or {}, client_mappers or {}
+    by_uuid = {f"{cid}-uuid": cid for cid in clients}
+
+    def _client(cid, kind):
+        return {"id": f"{cid}-uuid", "clientId": cid, "attributes": {"client.type": kind} if kind else {}}
+
+    def _realm_scope(sid):
+        name, mappers = scopes[sid]
+        return {"id": sid, "name": name, **({"protocolMappers": list(mappers)} if mappers else {})}
+
+    def _links(links):
+        return lambda uuid: [{"id": sid, "name": scopes.get(sid, (sid,))[0]} for sid in links.get(by_uuid[uuid], [])]
+
+    admin = MagicMock()
+    admin.get_clients.return_value = [_client(cid, kind) for cid, kind in clients.items()]
+    admin.get_client_id.side_effect = lambda cid: f"{cid}-uuid" if cid in clients else None
+    admin.get_client_scopes.side_effect = lambda: [_realm_scope(sid) for sid in scopes]
+    admin.get_client_default_client_scopes.side_effect = _links(default)
+    admin.get_client_optional_client_scopes.side_effect = _links(optional)
+    admin.get_mappers_from_client.side_effect = lambda uuid: list(client_mappers.get(by_uuid[uuid], []))
+    return admin
+
+
+class TestListPlatformToolAudiences:
+    """The client scopes (and the client mappers) of the platform login clients that put a managed
+    tool's clientId into ``aud`` (C2). The operator links ``agent-<ns>-<workload>-aud`` to each client
+    in its ``PLATFORM_CLIENT_IDS`` as a default scope; under agent side such a login client's user
+    tokens then pass the tool's jwt-validation. Read only."""
+
+    _URL = f"/platform-clients/tool-audiences?realm={REALM}"
+    _SCOPE = "agent-team1-github-tool-aud"
+
+    @pytest.fixture(autouse=True)
+    def _env(self, monkeypatch):
+        monkeypatch.delenv("PLATFORM_SOURCE_CLIENTS", raising=False)
+        yield
+        app.dependency_overrides.clear()
+
+    def _get(self, admin, url=None):
+        resp = _make_client(admin).get(url or self._URL)
+        assert resp.status_code == 200, resp.text
+        return resp.json()
+
+    def test_a_default_scope_with_the_operator_audience_mapper_is_listed(self):
+        admin = _audience_admin(
+            scopes={"s1": (self._SCOPE, [_audience_mapper(TOOL, name=self._SCOPE)])}, default={"rossoctl": ["s1"]}
+        )
+        assert self._get(admin) == [
+            {
+                "login_client": "rossoctl",
+                "link": "default",
+                "scope": self._SCOPE,
+                "mapper": self._SCOPE,
+                "tool_client_id": TOOL,
+            }
+        ]
+
+    def test_an_optional_scope_is_listed_as_optional(self):
+        # The user's client can name an optional scope in the token request, so it counts too.
+        admin = _audience_admin(scopes={"s1": (self._SCOPE, [_audience_mapper(TOOL)])}, optional={"rossoctl": ["s1"]})
+        assert [(i["link"], i["scope"]) for i in self._get(admin)] == [("optional", self._SCOPE)]
+
+    def test_included_client_audience_counts_too(self):
+        mapper = _audience_mapper(TOOL, key="included.client.audience")
+        admin = _audience_admin(scopes={"s1": ("x", [mapper])}, default={"rossoctl": ["s1"]})
+        assert [i["tool_client_id"] for i in self._get(admin)] == [TOOL]
+
+    def test_the_match_is_by_the_mapper_not_by_the_scope_name(self):
+        admin = _audience_admin(
+            scopes={
+                "s1": ("x", [_audience_mapper(TOOL)]),
+                "s2": (self._SCOPE, [_audience_mapper("some-other-audience")]),
+                "s3": (f"{self._SCOPE}-no-mapper", []),
+            },
+            default={"rossoctl": ["s1", "s2", "s3"]},
+        )
+        assert [i["scope"] for i in self._get(admin)] == ["x"]
+
+    @pytest.mark.parametrize("kind", ["Agent", None])
+    def test_an_audience_of_a_client_that_is_not_a_tool_is_not_listed(self, kind):
+        admin = _audience_admin(
+            clients={"rossoctl": None, AGENT: kind},
+            scopes={"s1": ("x", [_audience_mapper(AGENT)])},
+            default={"rossoctl": ["s1"]},
+        )
+        assert self._get(admin) == []
+
+    @pytest.mark.parametrize(("claim", "listed"), [(None, True), ("true", True), ("false", False), ("False", False)])
+    def test_the_access_token_claim_follows_keycloak(self, claim, listed):
+        # Keycloak includeInAccessToken: a missing key is true, and only "true" is true.
+        admin = _audience_admin(
+            scopes={"s1": ("x", [_audience_mapper(TOOL, claim=claim)])}, default={"rossoctl": ["s1"]}
+        )
+        assert bool(self._get(admin)) is listed
+
+    def test_a_mapper_of_another_type_is_not_listed(self):
+        mapper = _audience_mapper(TOOL, kind="oidc-usermodel-property-mapper")
+        admin = _audience_admin(scopes={"s1": ("x", [mapper])}, default={"rossoctl": ["s1"]})
+        assert self._get(admin) == []
+
+    def test_the_client_id_filter_matches_only_that_audience_and_reads_no_client_list(self):
+        admin = _audience_admin(
+            clients={"rossoctl": None, TOOL: "Tool", OTHER_TOOL: "Tool"},
+            scopes={"s1": ("a", [_audience_mapper(TOOL)]), "s2": ("b", [_audience_mapper(OTHER_TOOL)])},
+            default={"rossoctl": ["s1", "s2"]},
+        )
+        items = self._get(admin, f"{self._URL}&client_id={TOOL}")
+        assert [i["tool_client_id"] for i in items] == [TOOL]
+        admin.get_clients.assert_not_called()
+
+    def test_every_platform_source_client_is_read(self, monkeypatch):
+        monkeypatch.setenv("PLATFORM_SOURCE_CLIENTS", "rossoctl, ui")
+        admin = _audience_admin(
+            clients={"rossoctl": None, "ui": None, TOOL: "Tool"},
+            scopes={"s1": ("x", [_audience_mapper(TOOL)])},
+            default={"rossoctl": ["s1"], "ui": ["s1"]},
+        )
+        assert [i["login_client"] for i in self._get(admin)] == ["rossoctl", "ui"]
+
+    def test_a_login_client_that_is_not_in_the_realm_is_skipped(self):
+        admin = _audience_admin(clients={TOOL: "Tool"}, scopes={"s1": ("x", [_audience_mapper(TOOL)])})
+        assert self._get(admin) == []
+        admin.get_client_default_client_scopes.assert_not_called()
+
+    def test_the_realm_scope_list_is_read_one_time_and_no_scope_is_read_alone(self, monkeypatch):
+        # The operator links the audience scope of every workload to rossoctl: one read of each linked
+        # scope would grow with the realm. The realm list carries the mappers, so it is read one time.
+        monkeypatch.setenv("PLATFORM_SOURCE_CLIENTS", "rossoctl,ui")
+        admin = _audience_admin(
+            clients={"rossoctl": None, "ui": None, TOOL: "Tool", OTHER_TOOL: "Tool"},
+            scopes={"s1": ("a", [_audience_mapper(TOOL)]), "s2": ("b", [_audience_mapper(OTHER_TOOL)])},
+            default={"rossoctl": ["s1", "s2"], "ui": ["s1"]},
+        )
+        assert len(self._get(admin)) == 3
+        admin.get_client_scopes.assert_called_once_with()
+        admin.get_mappers_from_client_scope.assert_not_called()
+        admin.get_client_scope.assert_not_called()
+
+    def test_a_keycloak_error_is_a_502(self):
+        admin = _audience_admin()
+        admin.get_client_default_client_scopes.side_effect = KeycloakGetError(
+            error_message="backend failure", response_code=500
+        )
+        resp = _make_client(admin).get(self._URL)
+        assert resp.status_code == 502
+        assert "backend failure" in resp.json()["error"]
+
+    def test_no_tool_gives_an_empty_list_and_reads_no_login_client(self):
+        admin = _audience_admin(clients={"rossoctl": None, AGENT: "Agent"})
+        assert self._get(admin) == []
+        admin.get_client_id.assert_not_called()
+        admin.get_client_scopes.assert_not_called()
+
+    def test_an_audience_mapper_on_the_login_client_itself_is_listed(self):
+        mapper = _audience_mapper(TOOL, name="direct-aud", key="included.client.audience")
+        admin = _audience_admin(client_mappers={"rossoctl": [mapper]})
+        assert self._get(admin) == [
+            {
+                "login_client": "rossoctl",
+                "link": "client",
+                "scope": None,
+                "mapper": "direct-aud",
+                "tool_client_id": TOOL,
+            }
+        ]
+
+    def test_a_linked_scope_that_is_not_in_the_realm_list_is_skipped(self):
+        # A race with a delete: the link is still there, the scope is gone.
+        admin = _audience_admin(default={"rossoctl": ["gone"]})
+        assert self._get(admin) == []
+
+    def test_the_read_changes_nothing(self):
+        admin = _audience_admin(scopes={"s1": ("x", [_audience_mapper(TOOL)])}, default={"rossoctl": ["s1"]})
+        self._get(admin)
+        written = [
+            name
+            for name, *_ in admin.method_calls
+            if name.split(".")[0].startswith(("add_", "update_", "delete_", "create_", "assign_"))
+        ]
+        assert written == []
+
+    def test_missing_realm_returns_422(self):
+        app.dependency_overrides.clear()
+        assert TestClient(app).get("/platform-clients/tool-audiences").status_code == 422
 
 
 # ---------------------------------------------------------------------------

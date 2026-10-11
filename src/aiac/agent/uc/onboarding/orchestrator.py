@@ -23,6 +23,9 @@ clientId, which :func:`onboard_and_apply` gives to the PCE as ``focus_service``:
        producing the discovered ``service_type`` and the **created-manifest** (exactly the
        roles/scopes it created on this run — see ``provision_service``).
     2. Service Policy Builder — reads the excluded-self IdP universe and builds the rules.
+       Then, for a TOOL under agent side, the login-client audience warning (C2, see
+       ``platform_audience``): a WARNING for each platform login client that holds the tool's
+       audience. It is best effort and never raises.
 
 :func:`onboard_and_apply` is the whole UC1 for the Controller route and the NATS consumer: it runs
 :func:`_onboard` (the build), then the single
@@ -54,6 +57,7 @@ from aiac.agent.policy_rules_builder.graph import (
     PolicyRulesBuilderError,
     UnparseableLLMResponseError,
 )
+from aiac.agent.uc.onboarding.platform_audience import warn_platform_tool_audiences
 from aiac.agent.uc.onboarding.policy_builder.builder import ServicePolicyBuilder
 from aiac.agent.uc.onboarding.preconditions import check_preconditions
 from aiac.agent.uc.onboarding.provision.graph import build_provision_graph
@@ -340,7 +344,10 @@ def _onboard(service_id: ServiceUuid, wait_for_client: bool) -> _Onboarded:
     agent side), so that discovery passes (checkpoint B1). A disabled tool gets no bootstrap:
     it fails at the discovery-token mint anyway (C5). A bootstrap failure propagates (no rollback:
     Provision has not run). Any other failure of Provision or the build (no quarantine) drops this
-    run's bootstrap CR (:func:`_drop_bootstrap`) and propagates.
+    run's bootstrap CR (:func:`_drop_bootstrap`) and propagates. After a successful build of a tool,
+    the login-client audience warning runs (C2,
+    :func:`~aiac.agent.uc.onboarding.platform_audience.warn_platform_tool_audiences`): under agent side
+    only, best effort, log only.
 
     On any of the four typed build failures (see ``_ROLLBACK_ERRORS``, for agents and tools, on the
     first failure — also the retryable ``LLMAccessError``) the Orchestrator runs the compensating
@@ -421,5 +428,11 @@ def _onboard(service_id: ServiceUuid, wait_for_client: bool) -> _Onboarded:
         if bootstrapped:
             _drop_bootstrap(client_id)
         raise
+
+    # C2 (agent side only, best effort): warn when a platform login client holds a scope that puts this
+    # tool's clientId into aud. Its pass-through CR then lets such a user token in with no AIAC check.
+    # It never raises, so it cannot fail the onboarding or drop the bootstrap CR.
+    if pod_type is ServiceType.TOOL:
+        warn_platform_tool_audiences(config, client_id)
 
     return _Onboarded(rules, client_id, bootstrapped)
