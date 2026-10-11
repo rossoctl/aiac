@@ -626,7 +626,9 @@ Closed:
   §8 (D31).
 - Question 7 (closed on 2026-10-07): the agent side works at one hop on the live cluster. With D31
   deployed, rung 7 (the side switch) passed (40 tests): the verdicts are the same under target side
-  and under agent side, and the deny comes from the enforcement point of each side.
+  and under agent side, and the deny comes from the enforcement point of each side. (Rung 7 was
+  deleted on 2026-10-11, commit `fcec4e0`: a live side switch is not supported. To check the agent
+  side again, run the system lane after a clean redeploy of AIAC with `agent-side`.)
 - D31 works on the live cluster (2026-10-07, `kind-rossoctl`, target side). Rung 2 (agent, then tool)
   passed (23 tests), also the new `test_subject_scope_linked` and
   `test_exchanged_token_subject_is_username`: a standard token exchange as the agent client gives
