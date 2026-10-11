@@ -198,7 +198,7 @@ All endpoints except `/health` require a `?realm=<realm>` query parameter specif
 All GET endpoints return `200 OK` with a JSON array on success, except `/subjects/{subject_id}/assignments` (a JSON object with `realmMappings` and `serviceMappings` fields), `/services/{service_id}`, `/services/{service_id}/discovery-token` and `/health`, which return a JSON object. All endpoints return `502 Bad Gateway` with a JSON error body if the Keycloak Admin API call fails, with these exceptions:
 - `/health` returns `503` with `{"status": "unavailable", "error": ...}`.
 - `GET /roles` returns `409 Conflict` on an Assumption 1 violation (a cross-kind role). `GET /services/{service_id}/scopes` has no `409`: a shared scope is valid (D32).
-- `POST /services/{service_id}/subject-scope` returns `409 Conflict` when the shared subject scope `aiac-username-sub` carries the `aiac.managed` marker (D31).
+- `POST /services/{service_id}/subject-scope` returns `409 Conflict` when the shared subject scope `aiac-username-sub` carries the `aiac.managed` marker (D31), and `404 Not Found` when Keycloak answers `404` (an unknown `service_id`), so the IdP library does not retry a bad UUID as an outage.
 - `POST /roles`, `POST /scopes`, `POST /services/{service_id}/roles/{role_id}` and `POST /services/{service_id}/scopes/{scope_id}` return `409 Conflict` when Keycloak answers `409` (for the two creates: the name already exists).
 - The two `DELETE` endpoints return `200 OK` when Keycloak answers `404` (idempotent teardown).
 - `GET /services/{service_id}/roles` returns `[]` when Keycloak answers `400`.

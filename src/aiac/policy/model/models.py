@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from enum import Enum
 from typing import Annotated, Literal
 
@@ -55,6 +56,23 @@ class ServicePolicyModel(BaseModel):
     # what the ``Allow`` edges grant (deny-overrides).
     inbound_allow_rules: list[PolicyRule] = []
     inbound_deny_rules: list[PolicyRule] = []
+
+    def all_edges(self) -> list[PolicyRule]:
+        """Every inbound edge, in a new list: the ``Allow`` edges, then the ``Deny`` edges."""
+        return self.inbound_allow_rules + self.inbound_deny_rules
+
+    def prune_edges(self, prune: Callable[[list[PolicyRule]], list[PolicyRule]]) -> bool:
+        """Replace each inbound list (``Allow`` and ``Deny``, one at a time) with ``prune(list)``, the
+        edges of that list to keep. Each list is pruned on its own, so an edge of one list never
+        changes what is kept in the other list. Returns ``True`` iff an edge was removed."""
+        changed = False
+        for attr in ("inbound_allow_rules", "inbound_deny_rules"):
+            edges: list[PolicyRule] = getattr(self, attr)
+            kept = prune(edges)
+            if len(kept) != len(edges):
+                setattr(self, attr, kept)
+                changed = True
+        return changed
 
 
 class AgentPolicyModel(BaseModel):

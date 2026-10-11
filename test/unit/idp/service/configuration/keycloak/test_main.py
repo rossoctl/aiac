@@ -1290,6 +1290,18 @@ class TestLinkSubjectScope:
         assert resp.status_code == 502
         assert "error" in resp.json()
 
+    def test_returns_404_for_an_unknown_service(self):
+        # Keycloak answers 404 for an unknown client UUID: pass it through, so the library (which
+        # retries a 5xx) does not try a bad UUID again as if Keycloak were down.
+        admin = MagicMock()
+        self._wire(admin)
+        admin.get_client_optional_client_scopes.side_effect = KeycloakError(
+            error_message="Could not find client", response_code=404
+        )
+        resp = _make_client(admin).post(self._URL)
+        assert resp.status_code == 404
+        assert "error" in resp.json()
+
     def test_create_error_other_than_409_returns_502(self):
         admin = MagicMock()
         self._wire(admin)
@@ -1309,7 +1321,9 @@ class TestLinkSubjectScope:
     def test_link_error_returns_502(self):
         admin = MagicMock()
         self._wire(admin)
-        admin.add_client_default_client_scope.side_effect = KeycloakError(error_message="not found", response_code=404)
+        admin.add_client_default_client_scope.side_effect = KeycloakError(
+            error_message="backend failure", response_code=500
+        )
         resp = _make_client(admin).post(self._URL)
         assert resp.status_code == 502
         assert "error" in resp.json()
@@ -2007,7 +2021,7 @@ class TestKeycloakErrorProduces502:
 
 
 # ---------------------------------------------------------------------------
-# Keycloak 404 → 404 on the reads of one service (the onboarding read path, handoff 20)
+# Keycloak 404 → 404 on the reads of one service (the onboarding read path, D33)
 # ---------------------------------------------------------------------------
 
 

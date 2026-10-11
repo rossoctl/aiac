@@ -198,12 +198,47 @@ load_image_to_kind() {
 # two request packages must not keep
 # `client_ok if not data.authbridge.client.<dir>.request`.
 # The same allowlist as the Controller's start check #4 (src/aiac/agent/controller/start.py): in each
-# request package, every client_ok rule (comments dropped, white-space runs as one space) must be
-# `client_ok if data.authbridge.client.<dir>.request.allow` or `default client_ok := false`, and
-# there must be at least one. A search for the stock fail-open line only would pass a fail-open rule
-# in another form, and the Controller would then stop at its start.
+# request package, every client_ok rule (comments dropped, string text dropped, white-space runs as
+# one space) must be `client_ok if data.authbridge.client.<dir>.request.allow` or
+# `default client_ok := false`, and there must be at least one. A search for the stock fail-open line
+# only would pass a fail-open rule in another form, and the Controller would then stop at its start.
+# A rule start is each line that names client_ok and starts outside every bracket (a rule head can
+# span lines, so a line that is only `client_ok` there is a rule too); unbalanced brackets print the
+# whole content, which is not a safe rule. See `_client_ok_rules` in start.py.
 client_ok_rules() {
-  sed 's/#.*//' | tr -s ' \t' ' ' | sed 's/^ //; s/ $//' | grep -E '^(default )?client_ok\b.' || true
+  awk '
+    { text = text $0 "\n" }
+    END {
+      n = length(text); code = ""; depth = 0; bad = 0; raw = 0
+      for (i = 1; i <= n; i++) {
+        c = substr(text, i, 1)
+        if (raw) { if (c == "`") { raw = 0; code = code "``" } else if (c == "\n") code = code c; continue }
+        if (c == "`") { raw = 1; continue }
+        if (c == "#") { while (i < n && substr(text, i + 1, 1) != "\n") i++; continue }
+        if (c == "\"") {
+          for (i++; i <= n && substr(text, i, 1) != "\"" && substr(text, i, 1) != "\n"; i++)
+            if (substr(text, i, 1) == "\\") i++
+          code = code "\"\""
+          if (substr(text, i, 1) == "\n") i--
+          continue
+        }
+        code = code c
+      }
+      m = split(code, lines, "\n")
+      for (j = 1; j <= m; j++) {
+        line = lines[j]; gsub(/[ \t]+/, " ", line); sub(/^ /, "", line); sub(/ $/, "", line)
+        if (depth == 0 && line ~ /(^|[^A-Za-z0-9_])client_ok([^A-Za-z0-9_]|$)/) out[++k] = line
+        for (x = 1; x <= length(line); x++) {
+          c = substr(line, x, 1)
+          if (index("{[(", c)) depth++
+          else if (index("}])", c)) depth--
+          if (depth < 0) break
+        }
+        if (depth < 0) break
+      }
+      if (depth != 0) { gsub(/[ \t\n]+/, " ", text); print text; exit }
+      for (j = 1; j <= k; j++) print out[j]
+    }'
 }
 
 check_combiner() {

@@ -40,9 +40,9 @@ _SERVICE_TYPE_ATTRIBUTE = "client.type"
 _DISCOVERY_AUDIENCE_MAPPER = "aiac-discovery-audience"
 
 # Name of the shared client scope that is the one source of ``sub`` = username (D31). AIAC links
-# it as a default scope to each platform login client (``_LOGIN_CLIENTS_ENV``), so the login token
-# has ``sub`` = username, and, at onboarding, to each AIAC-managed client, so an exchanged token has
-# it too: the standard token exchange (V2) applies only the requester client's scopes. The scope is
+# it as a default scope to each platform login client (``_PLATFORM_SOURCE_CLIENTS_ENV``), so the
+# login token has ``sub`` = username, and, at onboarding, to each AIAC-managed client, so an
+# exchanged token has it too: the standard token exchange (V2) applies only the requester client's scopes. The scope is
 # linked to many clients, so it deliberately has NO ``aiac.managed`` marker: a marked scope would
 # become an own scope of every linked service. Never a realm default scope.
 _SUBJECT_SCOPE = "aiac-username-sub"
@@ -51,12 +51,12 @@ _SUBJECT_SCOPE = "aiac-username-sub"
 _SUBJECT_MAPPER = "username-to-sub"
 
 # Comma-separated clientIds of the platform login clients that get ``_SUBJECT_SCOPE`` (D31). The
-# same setting, with the same meaning, as the PDP policy writer's platform source clients; unset
-# or all-blank falls back to ``_DEFAULT_LOGIN_CLIENTS``. The parse (``_login_clients``) is a copy of
-# the writer's ``_platform_clients``, not an import: this image holds only ``main.py`` (see the
-# Dockerfile), so it cannot import the ``aiac`` package.
-_LOGIN_CLIENTS_ENV = "PLATFORM_SOURCE_CLIENTS"
-_DEFAULT_LOGIN_CLIENTS = ("rossoctl",)
+# same setting, with the same name and meaning, as the PDP policy writer's platform source clients
+# (``PLATFORM_SOURCE_CLIENTS``); unset or all-blank falls back to ``_DEFAULT_PLATFORM_CLIENTS``. The
+# parse (``_platform_clients``) is a copy of the writer's ``_platform_clients``, not an import: this
+# image holds only ``main.py`` (see the Dockerfile), so it cannot import the ``aiac`` package.
+_PLATFORM_SOURCE_CLIENTS_ENV = "PLATFORM_SOURCE_CLIENTS"
+_DEFAULT_PLATFORM_CLIENTS = ("rossoctl",)
 
 # The realm whose login clients get ``_SUBJECT_SCOPE`` at startup.
 _REALM_ENV = "KEYCLOAK_REALM"
@@ -161,9 +161,10 @@ def _is_aiac_managed(attributes: dict | None) -> bool:
 
 
 def _read_error(e: KeycloakError) -> JSONResponse:
-    """The response for a ``KeycloakError`` on a read that names one entity: a read of one service
-    (``GET /services/{id}`` and its roles, scopes and discovery token) and the composites of one role
-    (a sub-read of the library's ``get_service``). ``404`` when Keycloak answers ``404`` (the entity
+    """The response for a ``KeycloakError`` on a call that names one entity: a read of one service
+    (``GET /services/{id}`` and its roles, scopes and discovery token), the composites of one role
+    (a sub-read of the library's ``get_service``) and the subject-scope link of one service
+    (``POST /services/{id}/subject-scope``). ``404`` when Keycloak answers ``404`` (the entity
     does not exist, or a reader asks for a new client before Keycloak commits it), else ``502``. The
     ``404`` lets the caller tell an entity that is not there (yet) from an IdP outage: the library does
     not retry a ``4xx``, and the onboarding reads ``get_service`` again for a short time."""
@@ -316,10 +317,10 @@ def _converge_subject_mapper(admin: KeycloakAdmin, scope_id: str, existing: dict
     _add_subject_mapper(admin, scope_id)
 
 
-def _login_clients() -> tuple[str, ...]:
-    """The clientIds in ``_LOGIN_CLIENTS_ENV``, comma-split, blanks dropped (default ``rossoctl``)."""
-    raw = os.environ.get(_LOGIN_CLIENTS_ENV, "")
-    return tuple(c.strip() for c in raw.split(",") if c.strip()) or _DEFAULT_LOGIN_CLIENTS
+def _platform_clients() -> tuple[str, ...]:
+    """The clientIds in ``PLATFORM_SOURCE_CLIENTS``, comma-split, blanks dropped (default ``rossoctl``)."""
+    raw = os.environ.get(_PLATFORM_SOURCE_CLIENTS_ENV, "")
+    return tuple(c.strip() for c in raw.split(",") if c.strip()) or _DEFAULT_PLATFORM_CLIENTS
 
 
 def _link_default_scope(admin: KeycloakAdmin, client_uuid: str, scope_id: str) -> None:
@@ -340,7 +341,7 @@ def _link_login_clients(admin: KeycloakAdmin, scope_id: str) -> None:
     A login client is found by its clientId. A login client that is not in the realm is not an
     error: log it and continue. Adds no client mapper and never makes the scope a realm default.
     """
-    for client_id in _login_clients():
+    for client_id in _platform_clients():
         client_uuid = admin.get_client_id(client_id)
         if client_uuid is None:
             _log.warning("login client '%s' not found: '%s' is not linked to it", client_id, _SUBJECT_SCOPE)
@@ -720,7 +721,9 @@ def link_subject_scope(service_id: str, admin: KeycloakAdmin = Depends(get_admin
     except _InvariantViolation as e:
         return JSONResponse(status_code=409, content={"error": str(e)})
     except KeycloakError as e:
-        return JSONResponse(status_code=502, content={"error": str(e)})
+        # 404 for an unknown service_id: the library does not retry a 4xx, so a bad UUID is not tried
+        # again as if Keycloak were down.
+        return _read_error(e)
 
 
 @app.delete("/services/{service_id}/scopes/{scope_id}", status_code=200)

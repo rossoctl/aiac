@@ -62,6 +62,7 @@ from aiac.idp.configuration.api import Configuration, IdPHTTPError
 from aiac.idp.configuration.models import ClientId, Role, Scope, Service, ServiceType, ServiceUuid
 from aiac.policy.computation import bootstrap, compute_and_apply, drop_bootstrap, quarantine
 from aiac.policy.model.models import PolicyRule
+from aiac.shared.logging_config import loggable
 
 logger = logging.getLogger(__name__)
 
@@ -90,18 +91,19 @@ class ServiceNotVisibleError(HTTPException):
         super().__init__(502, detail)
 
 
-# Event-before-commit race tolerance for the first IdP read (handoff 20). The Keycloak SPI listener runs
-# inside the admin request, so the ``CLIENT_CREATED`` event (and the ``aiac.apply.service.{id}``
-# message) can come BEFORE Keycloak commits the new client: the first ``get_service`` then gets
-# ``404``. A ``404`` on that read is therefore a transient not-visible state, read again before we
-# give up with a 502; without the wait, the next try is the NATS redelivery after ACK_WAIT (600 s).
-# The SPI fix (publish after the commit) removes the race; this wait is defense in depth. The wait
-# runs inside ``_service_lock``, and the NATS consumer handles one message at a time, so it blocks
-# the other onboardings: keep the default short (≈30 s, as the label wait). Tests set it fast.
-# A 404 cannot tell a not-yet-committed client from one that does not exist, so an unknown or
-# deleted UUID (a manual POST, a phantom event) also waits the whole budget before its 502. The
-# consumer gives ``wait_for_client=False`` on a NATS redelivery: the nak delay already gave the
-# client time to become visible, so a redelivery reads once and does not block the consumer again.
+# Event-before-commit race tolerance for the first IdP read (D33 in docs/specs/PRD.md). The Keycloak
+# SPI listener runs inside the admin request, so the ``CLIENT_CREATED`` event (and the
+# ``aiac.apply.service.{id}`` message) can come BEFORE Keycloak commits the new client: the first
+# ``get_service`` then gets ``404``. A ``404`` on that read is therefore a transient not-visible state,
+# read again before we give up with a 502; without the wait, the next try is the NATS redelivery after
+# ACK_WAIT (600 s). The SPI fix (publish after the commit) removes the race; this wait is defense in
+# depth. The wait runs inside ``_service_lock``, and the NATS consumer handles one message at a time,
+# so it blocks the other onboardings: keep the default short (≈30 s, as the label wait). Tests set it
+# fast. A 404 cannot tell a not-yet-committed client from one that does not exist, so an unknown or
+# deleted UUID (a manual POST, a phantom event) also waits the whole budget before its 502 (a known
+# limit of D33). The consumer gives ``wait_for_client=False`` only on the redelivery after a
+# not-visible nak: the nak delay already gave the client time to become visible, so that redelivery
+# reads once and does not block the consumer again.
 CLIENT_WAIT = WaitConfig("ONBOARD_CLIENT_WAIT_ATTEMPTS", "ONBOARD_CLIENT_WAIT_BACKOFF", 15, 2.0)
 
 
@@ -220,13 +222,6 @@ def _read_service(config: Configuration, service_id: ServiceUuid, wait: bool = T
     return service
 
 
-def _loggable(value: object) -> str:
-    """Neutralize a value for single-line logging: coerce to ``str`` and drop CR/LF so a
-    user-controlled ``service_id`` or entity name cannot forge or inject extra log lines
-    (mitigates CodeQL ``py/log-injection``)."""
-    return str(value).replace("\r", "").replace("\n", "")
-
-
 def _rollback(config: Configuration, service: Service, created_roles, created_scopes) -> None:
     """Compensating rollback (UC1-only): tear down exactly what Provision created on this run, then
     disable the client as a failed-service marker.
@@ -242,13 +237,13 @@ def _rollback(config: Configuration, service: Service, created_roles, created_sc
     was not created by it. The
     policy side of the teardown is the PCE's :func:`~aiac.policy.computation.quarantine`, which
     the caller runs next."""
-    safe_id = _loggable(service.id)
+    safe_id = loggable(service.id)
     for role in created_roles:
         config.delete_service_role(service, role)
-        logger.info("UC1 rollback: deleted role %r (service %s)", _loggable(getattr(role, "name", role)), safe_id)
+        logger.info("UC1 rollback: deleted role %r (service %s)", loggable(getattr(role, "name", role)), safe_id)
     for scope in created_scopes:
         config.delete_service_scope(service, scope)
-        logger.info("UC1 rollback: deleted scope %r (service %s)", _loggable(getattr(scope, "name", scope)), safe_id)
+        logger.info("UC1 rollback: deleted scope %r (service %s)", loggable(getattr(scope, "name", scope)), safe_id)
     config.set_service_enabled(service, False)
     logger.info("UC1 rollback: disabled client — failed-service marker (service %s)", safe_id)
 
@@ -303,7 +298,7 @@ def _drop_bootstrap(client_id: ClientId) -> None:
     try:
         drop_bootstrap(client_id)
     except Exception:
-        logger.exception("UC1: the drop of the bootstrap CR failed (service %s)", _loggable(client_id))
+        logger.exception("UC1: the drop of the bootstrap CR failed (service %s)", loggable(client_id))
 
 
 class _Onboarded(NamedTuple):

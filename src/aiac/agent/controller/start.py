@@ -49,20 +49,75 @@ _SAFE_CLIENT_OK_RULES = {
     for path, direction in (("inbound/request.rego", "inbound"), ("outbound/request.rego", "outbound"))
 }
 
-# The start of a rule of ``client_ok``: its head, also a ``default`` one. A line that is only
-# ``client_ok`` is a reference in the body of another rule.
-_CLIENT_OK_HEAD = re.compile(r"(default )?client_ok\b.")
+# The name ``client_ok`` as a whole word.
+_CLIENT_OK = re.compile(r"\bclient_ok\b")
+
+# The brackets that open and close a nested part of a Rego statement (a rule body, a collection, a call).
+_OPEN, _CLOSE = "{[(", "}])"
 
 
 class StartCheckError(RuntimeError):
     """A Controller start check failed; the Controller must not serve."""
 
 
+def _code(content: str) -> str:
+    """``content`` with each comment removed and the text of each string replaced by nothing.
+
+    Rego ignores a comment (``#`` to the end of the line, outside a string), and a bracket or a
+    ``client_ok`` in a string is not code. A ``"..."`` string ends at the line end at the latest; a
+    raw string (in back-ticks) can span lines, so its line breaks are kept.
+    """
+    out: list[str] = []
+    i, n = 0, len(content)
+    while i < n:
+        c = content[i]
+        if c == "#":
+            end = content.find("\n", i)
+            i = n if end < 0 else end
+        elif c == '"':
+            i += 1
+            while i < n and content[i] not in '"\n':
+                i += 2 if content[i] == "\\" else 1
+            out.append('""')
+            i += 1 if i < n and content[i] == '"' else 0
+        elif c == "`":
+            end = content.find("`", i + 1)
+            end = n if end < 0 else end
+            out.append("``" + "\n" * content.count("\n", i, end))
+            i = end + 1
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
 def _client_ok_rules(content: str) -> list[str]:
-    """Each line of ``content`` that starts a rule of ``client_ok``: comments (``#`` to the end of
-    the line) are ignored and runs of white space count as one space."""
-    lines = (" ".join(raw.split("#", 1)[0].split()) for raw in content.splitlines())
-    return [line for line in lines if _CLIENT_OK_HEAD.match(line)]
+    """Each line of ``content`` that can start a rule of ``client_ok``, with runs of white space as
+    one space: each line that names ``client_ok`` and starts outside every bracket.
+
+    A rule head is never inside a bracket, and the head of a rule can span lines (``client_ok`` on
+    one line and ``if ...`` on the next one is a valid rule), so a line that is only ``client_ok`` is
+    a rule start too when it is outside every bracket. A ``client_ok`` inside a bracket (the body
+    ``{ ns_ok; client_ok }`` of ``allow``) is a reference, not a rule. This fails closed: a
+    reference in a body with no brackets (``allow if`` and then ``client_ok``) is also returned, and
+    it is not a safe rule. Comments and strings are ignored (``_code``). Unbalanced brackets also
+    fail closed: the whole ``content`` is then returned as one rule, which is not a safe rule.
+    """
+    depth = 0
+    rules = []
+    for raw in _code(content).splitlines():
+        line = " ".join(raw.split())
+        if depth == 0 and _CLIENT_OK.search(line):
+            rules.append(line)
+        for c in line:
+            depth += (c in _OPEN) - (c in _CLOSE)
+            if depth < 0:
+                break
+        if depth < 0:
+            break
+    if depth != 0:
+        return [" ".join(content.split())]
+    return rules
 
 
 def combiner_problems(cr: dict) -> list[str]:

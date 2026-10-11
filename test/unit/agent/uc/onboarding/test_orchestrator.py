@@ -386,7 +386,7 @@ class TestFirstReadWaitsForANewClient:
         assert [c.args for c in sleep.call_args_list] == [(2.0,), (2.0,)]
 
 
-# The first read against the real IdP library (handoff 20). The class above gives the Orchestrator a
+# The first read against the real IdP library (D33). The class above gives the Orchestrator a
 # mocked Configuration and an IdPHTTPError that the test builds. The class below gives it the real
 # Configuration, with only ``requests.get`` scripted, so that the race fix is pinned across the
 # layers: the IdP service's 404 -> ``Configuration._check`` (IdPHTTPError) -> ``run_upstream`` (a

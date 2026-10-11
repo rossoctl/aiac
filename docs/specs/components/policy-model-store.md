@@ -124,7 +124,7 @@ segment).
 - `delete_service_policy(service_id: str)` — `DELETE /policy/services/{service_id}`; under the write lock: `DELETE FROM service_policies WHERE service_id = ?`, then evict the cache entry (no-op if absent) — DB + cache eviction as one locked critical section.
 - `clear_service_policies()` — `DELETE /policy/services`; under the write lock: `DELETE FROM service_policies` (all rows) and clear the cache — the collection-root clean slate.
 - `get_service_policy(service_id: str) -> ServicePolicyModel` — `GET /policy/services/{service_id}`; read from in-memory cache; raise `404` if absent.
-- `list_service_policies_by_role(role: str | None = None) -> list[ServicePolicyModel]` — `GET /policy/services[?role={role_id}]`; with `role`, return every cached SPM whose `inbound_allow_rules` or `inbound_deny_rules` references `role_id`; with no `role`, return every cached SPM (C3).
+- `list_service_policies(role: str | None = None) -> list[ServicePolicyModel]` — `GET /policy/services[?role={role_id}]`; with `role`, return every cached SPM whose `inbound_allow_rules` or `inbound_deny_rules` references `role_id`; with no `role`, return every cached SPM (C3).
 - `_load_cache(conn)` — called by `lifespan` on startup; load all rows from SQLite into the in-memory cache.
 
 **Configuration:**

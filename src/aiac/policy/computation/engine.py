@@ -178,6 +178,7 @@ from aiac.policy.model_store.library.api import (
     get_service_policy,
     list_service_policies,
 )
+from aiac.shared.logging_config import loggable
 
 logger = logging.getLogger(__name__)
 
@@ -201,14 +202,7 @@ def _route(model: ServicePolicyModel, rule: PolicyRule) -> bool:
 def _purge_role(model: ServicePolicyModel, role_id: str) -> bool:
     """Drop every inbound edge whose role is ``role_id`` from **both** lists (allow and deny) — the
     role-level revocation / footprint-purge primitive. Returns ``True`` iff any edge was removed."""
-    removed = False
-    for attr in ("inbound_allow_rules", "inbound_deny_rules"):
-        rules: list[PolicyRule] = getattr(model, attr)
-        kept = [r for r in rules if r.role.id != role_id]
-        if len(kept) != len(rules):
-            setattr(model, attr, kept)
-            removed = True
-    return removed
+    return model.prune_edges(lambda rules: [r for r in rules if r.role.id != role_id])
 
 
 def _reconcile(
@@ -274,14 +268,7 @@ def _reconcile(
             )
         ]
 
-    changed = False
-    for attr in ("inbound_allow_rules", "inbound_deny_rules"):
-        edges: list[PolicyRule] = getattr(model, attr)
-        kept = _prune(edges)
-        if len(kept) != len(edges):
-            setattr(model, attr, kept)
-            changed = True
-    return changed
+    return model.prune_edges(_prune)
 
 
 def _seed_identity(model: ServicePolicyModel, svc: Service) -> None:
@@ -337,8 +324,8 @@ def _former_holders(stored: ServicePolicyModel, current: ServicePolicyModel) -> 
     current holders, so the edges have the same order."""
     former: set[str] = set()
     for old, new in zip(
-        stored.inbound_allow_rules + stored.inbound_deny_rules,
-        current.inbound_allow_rules + current.inbound_deny_rules,
+        stored.all_edges(),
+        current.all_edges(),
         strict=True,
     ):
         if new.role.kind == RoleKind.AGENT:
@@ -403,7 +390,7 @@ class _SpmCache:
         if self._listed is None:
             return [self(stored.service_id, stored) for stored in get_service_policies_by_role(role)]
         models = (self.loaded[service_id] for service_id in self._listed)
-        return [m for m in models if any(r.role.id == role.id for r in m.inbound_allow_rules + m.inbound_deny_rules)]
+        return [m for m in models if any(r.role.id == role.id for r in m.all_edges())]
 
 
 def _fresh_apm(agent_id: str) -> AgentPolicyModel:
@@ -576,7 +563,7 @@ def decommission(service_id: ClientId) -> None:
         with _pce_lock:
             _decommission(service_id, side)
     except Exception:
-        logger.exception("decommission failed for service %r", _loggable(service_id))
+        logger.exception("decommission failed for service %r", loggable(service_id))
         raise
 
 
@@ -636,7 +623,7 @@ def quarantine(service_id: ClientId, deleted_roles: Iterable[Role] = ()) -> None
         with _pce_lock:
             _quarantine(service_id, list(deleted_roles), side)
     except Exception:
-        logger.exception("quarantine failed for service %r", _loggable(service_id))
+        logger.exception("quarantine failed for service %r", loggable(service_id))
         raise
 
 
@@ -702,7 +689,7 @@ def rerender_role(role_id: str) -> None:
         with _pce_lock:
             _rerender_role(role_id, side)
     except Exception:
-        logger.exception("rerender_role failed for role %r", _loggable(role_id))
+        logger.exception("rerender_role failed for role %r", loggable(role_id))
         raise
 
 
@@ -785,7 +772,7 @@ def bootstrap(service_id: ClientId, service_type: ServiceType) -> None:
         with _pce_lock:
             _bootstrap(service_id, service_type, side)
     except Exception:
-        logger.exception("bootstrap failed for service %r", _loggable(service_id))
+        logger.exception("bootstrap failed for service %r", loggable(service_id))
         raise
 
 
@@ -807,7 +794,7 @@ def drop_bootstrap(service_id: ClientId) -> None:
             if find_service_policy(service_id) is None:
                 delete_service_cr(service_id)
     except Exception:
-        logger.exception("drop_bootstrap failed for service %r", _loggable(service_id))
+        logger.exception("drop_bootstrap failed for service %r", loggable(service_id))
         raise
 
 
@@ -841,11 +828,6 @@ def _bootstrap(service_id: str, service_type: ServiceType, side: EnforcementSide
         apply_policy(AgentSidePolicyModel(agents=[_derive(service_id, spms)]))
     else:
         apply_policy(AgentSidePolicyModel(agents=[], pass_through=[service_id]))
-
-
-def _loggable(value: str) -> str:
-    """Strip CR/LF so a hostile id cannot forge log records."""
-    return value.replace("\r", "").replace("\n", "")
 
 
 def _run(rules: list[PolicyRule], override: bool, focus_service: str | None, side: EnforcementSide) -> None:
@@ -1092,7 +1074,7 @@ def _quarantine_in(
 ) -> None:
     """The body of ``quarantine`` for an IdP read already done (``quarantine`` and ``resync``)."""
     if service_id not in catalog:
-        logger.warning("quarantine: service %r is not in the IdP catalog — nothing to do", _loggable(service_id))
+        logger.warning("quarantine: service %r is not in the IdP catalog — nothing to do", loggable(service_id))
         return
     spms = _SpmCache(catalog, holders)
 
@@ -1171,7 +1153,7 @@ def _remove_footprint(
             # role-mapping event). The remaining holders carry these edges on their outbound (agent
             # side).
             footprint.shared.add(model.service_id)
-            edges = model.inbound_allow_rules + model.inbound_deny_rules
+            edges = model.all_edges()
             footprint.agents.update(actor for edge in edges if edge.role.id == role.id for actor in edge.role.actorIds)
 
     # In the cache, SPM(X) has no edges from now on: the store still has SPM(X) until
@@ -1230,7 +1212,7 @@ def _add_callees_of_every_agent_role(
         if stored.service_id == service_id or stored.service_id not in live:
             continue
         model = spms.loaded[stored.service_id]
-        edges = model.inbound_allow_rules + model.inbound_deny_rules
+        edges = model.all_edges()
         if not any(edge.role.kind == RoleKind.AGENT or not edge.role.actorIds for edge in edges):
             continue
         if model.service_id not in footprint.changed:
@@ -1300,12 +1282,7 @@ def _affected_agents(
 def _targeters(model: ServicePolicyModel) -> set[str]:
     """The agents that target ``model``'s service: the current holders (``actorIds``) of every
     Agent-kind inbound edge on it, allow and deny."""
-    return {
-        actor
-        for edge in model.inbound_allow_rules + model.inbound_deny_rules
-        if edge.role.kind == RoleKind.AGENT
-        for actor in edge.role.actorIds
-    }
+    return {actor for edge in model.all_edges() if edge.role.kind == RoleKind.AGENT for actor in edge.role.actorIds}
 
 
 def _is_agent(catalog: dict[str, Service], service_id: str) -> bool:

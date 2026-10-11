@@ -9,6 +9,9 @@ the ``kube._custom_objects`` seam, the PCE ``resync`` at its import site, and th
 fake.
 """
 
+import json
+import shutil
+import subprocess
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -60,6 +63,16 @@ def _combiner(*, inbound_fail_open=False, outbound_fail_open=False, drop=()):
         "metadata": {"name": "default", "namespace": "rossoctl-system"},
         "spec": {"scope": "global", "policies": [p for p in policies if p["path"] not in drop]},
     }
+
+
+# Fail-open client_ok rules whose head is not on one line (or that hide a bracket in a string). Each
+# one is valid Rego (``opa parse`` accepts it, see ``TestTheCheckAgreesWithOpaParse``).
+_SPLIT_FAIL_OPEN_RULES = [
+    "client_ok\n\tif not data.authbridge.client.inbound.request",
+    "client_ok\n\nif not data.authbridge.client.inbound.request",
+    "default\nclient_ok := true",
+    'x := "{"\nclient_ok if not data.authbridge.client.inbound.request',
+]
 
 
 class _FakeConsumer:
@@ -200,6 +213,25 @@ class TestCheck4StopsTheController:
         assert rule.splitlines()[0] in str(ei.value)
         cluster.resync.assert_not_called()
 
+    @pytest.mark.parametrize(
+        "rule",
+        _SPLIT_FAIL_OPEN_RULES,
+        ids=["head-on-two-lines", "head-after-a-blank-line", "default-on-its-own-line", "brace-in-a-string"],
+    )
+    def test_a_fail_open_rule_with_a_split_head_stops_the_start(self, cluster, rule):
+        # A rule head can span lines; a line that is only client_ok outside every bracket is a rule.
+        content = _package("inbound", "request", fail_open=False) + rule + "\n"
+        cluster.combiner["spec"]["policies"][0]["content"] = content
+        with pytest.raises(start.StartCheckError, match="inbound/request.rego"):
+            _serve()
+        cluster.resync.assert_not_called()
+
+    def test_unbalanced_brackets_stop_the_start(self, cluster):
+        content = _package("inbound", "request", fail_open=False) + "x if {\n"
+        cluster.combiner["spec"]["policies"][0]["content"] = content
+        with pytest.raises(start.StartCheckError, match="inbound/request.rego"):
+            _serve()
+
     def test_a_repeated_path_with_a_fail_open_entry_stops_the_start(self, cluster):
         # The bundle can carry both entries: the safe second one must not hide the first.
         fail_open = {"path": "inbound/request.rego", "content": _package("inbound", "request", fail_open=True)}
@@ -242,3 +274,44 @@ class TestResyncStopsTheController:
             _serve()
         assert "consumer" not in cluster.events
         assert any("resync" in r.getMessage() and r.levelname == "ERROR" for r in caplog.records)
+
+
+def _opa_client_ok_rules(content: str) -> list[dict]:
+    """The ``client_ok`` rules of ``content`` as ``opa parse`` gives them (the AST, no locations)."""
+    out = subprocess.run(
+        [shutil.which("opa"), "parse", "--format", "json", "/dev/stdin"],
+        input=content,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return [r for r in json.loads(out.stdout)["rules"] if r["head"]["name"] == "client_ok"]
+
+
+@pytest.mark.skipif(not shutil.which("opa"), reason="opa binary not on PATH")
+class TestTheCheckAgreesWithOpaParse:
+    """The text check of start check #4 against the Rego parser: when the check finds no problem in a
+    package, each ``client_ok`` rule that ``opa parse`` finds is a rule of the AIAC combiner."""
+
+    _CONTENTS = [
+        _package("inbound", "request", fail_open=False),
+        _package("inbound", "request", fail_open=False) + "default client_ok := false\n",
+        _package("inbound", "request", fail_open=False) + "# client_ok if not data.authbridge.client.inbound.request\n",
+        _package("inbound", "request", fail_open=True),
+        _package("inbound", "request", fail_open=False) + "client_ok := true\n",
+        _package("inbound", "request", fail_open=False)
+        + "client_ok if {\n    not data.authbridge.client.inbound.request\n}\n",
+        *(_package("inbound", "request", fail_open=False) + rule + "\n" for rule in _SPLIT_FAIL_OPEN_RULES),
+    ]
+
+    @pytest.mark.parametrize("content", _CONTENTS)
+    def test_no_problem_means_only_safe_rules(self, content):
+        safe = _opa_client_ok_rules(_package("inbound", "request", fail_open=False) + "default client_ok := false\n")
+        rules = _opa_client_ok_rules(content)  # also asserts that the content is valid Rego
+        cr = _combiner()
+        cr["spec"]["policies"][0]["content"] = content
+        found = [p for p in start.combiner_problems(cr) if p.startswith("inbound/request.rego")]
+        if not found:
+            assert rules and all(r in safe for r in rules)
+        else:
+            assert not rules or any(r not in safe for r in rules)

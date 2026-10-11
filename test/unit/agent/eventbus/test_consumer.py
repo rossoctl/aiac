@@ -44,11 +44,12 @@ from aiac.agent.uc.onboarding.orchestrator import ServiceNotVisibleError
 from aiac.agent.uc.onboarding.preconditions import EnforcementPreconditionError
 
 
-def _fake_msg(subject: str, num_delivered: int = 1) -> MagicMock:
+def _fake_msg(subject: str, num_delivered: int = 1, seq: int = 1) -> MagicMock:
     msg = MagicMock()
     msg.subject = subject
     msg.data = b'{"id":"x"}'
     msg.metadata.num_delivered = num_delivered
+    msg.metadata.sequence.stream = seq
     msg.ack = AsyncMock()
     msg.nak = AsyncMock()
     msg.term = AsyncMock()
@@ -139,10 +140,28 @@ def test_dispatch_onboards_a_first_delivery_with_the_client_wait():
     msg.ack.assert_called_once()
 
 
+def test_dispatch_onboards_the_redelivery_after_a_not_visible_nak_with_no_client_wait():
+    # The redelivery after a not-visible nak comes after the nak delay, which already gave the client
+    # time to become visible: the orchestrator reads the client one time, with no wait.
+    consumer = AiacEventConsumer()
+    consumer._nc = _fake_nc()
+    first = _fake_msg("aiac.apply.service.svc-1", num_delivered=1, seq=7)
+    again = _fake_msg("aiac.apply.service.svc-1", num_delivered=2, seq=7)
+
+    with patch("aiac.agent.eventbus.consumer.onboard_and_apply", side_effect=[_not_visible(), None]) as onboard:
+        asyncio.run(consumer._dispatch(first))
+        asyncio.run(consumer._dispatch(again))
+
+    assert [c.kwargs["wait_for_client"] for c in onboard.call_args_list] == [True, False]
+    first.nak.assert_called_once()
+    again.ack.assert_called_once()
+    assert consumer._not_visible_seqs == set()
+
+
 @pytest.mark.parametrize("num_delivered", [2, MAX_DELIVER])
-def test_dispatch_onboards_a_redelivery_with_no_client_wait(num_delivered):
-    # A redelivery comes after the nak delay, which already gave the client time to become visible:
-    # the orchestrator reads the client one time, with no wait.
+def test_dispatch_onboards_a_redelivery_after_another_failure_with_the_client_wait(num_delivered):
+    # A redelivery after another failure (an LLM timeout and the ACK_WAIT redelivery, say) did not get
+    # the nak delay for the client: it waits again, so one IdP read does not use up a delivery.
     consumer = AiacEventConsumer()
     consumer._nc = AsyncMock()
     msg = _fake_msg("aiac.apply.service.svc-1", num_delivered=num_delivered)
@@ -150,8 +169,21 @@ def test_dispatch_onboards_a_redelivery_with_no_client_wait(num_delivered):
     with patch("aiac.agent.eventbus.consumer.onboard_and_apply") as onboard:
         asyncio.run(consumer._dispatch(msg))
 
-    onboard.assert_called_once_with("svc-1", wait_for_client=False)
+    onboard.assert_called_once_with("svc-1", wait_for_client=True)
     msg.ack.assert_called_once()
+
+
+def test_a_not_visible_nak_of_one_message_does_not_change_another_message():
+    consumer = AiacEventConsumer()
+    consumer._nc = _fake_nc()
+    naked = _fake_msg("aiac.apply.service.svc-1", seq=7)
+    other = _fake_msg("aiac.apply.service.svc-2", num_delivered=2, seq=8)
+
+    with patch("aiac.agent.eventbus.consumer.onboard_and_apply", side_effect=[_not_visible(), None]) as onboard:
+        asyncio.run(consumer._dispatch(naked))
+        asyncio.run(consumer._dispatch(other))
+
+    assert onboard.call_args_list[1].kwargs["wait_for_client"] is True
 
 
 def test_dispatch_applies_a_role_subject_with_no_focus_service_and_no_onboarding():
@@ -387,7 +419,7 @@ def test_dispatch_routes_retryable_llm_access_error_to_dlq_at_max_deliver():
 
 
 # The IdP still answers 404 for the service after the orchestrator's bounded wait (the
-# event-before-commit race, handoff 20): the client can become visible in some seconds, so the consumer
+# event-before-commit race, D33): the client can become visible in some seconds, so the consumer
 # naks with a short delay instead of waiting ACK_WAIT (600 s) for the redelivery.
 def _not_visible() -> ServiceNotVisibleError:
     return ServiceNotVisibleError("IdP has no service svc-1 yet")

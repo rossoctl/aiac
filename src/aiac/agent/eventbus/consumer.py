@@ -92,10 +92,10 @@ _PERMANENT_ERRORS: tuple[type[Exception], ...] = (
     EnforcementPreconditionError,
 )
 
-# The event-before-commit race (handoff 20): the IdP can still answer 404 for a new service after the
-# orchestrator's bounded wait (``ServiceNotVisibleError``). The client can become visible in some
-# seconds, so the consumer naks that message with this delay instead of leaving it unacked: the
-# redelivery then comes after the delay, not after ACK_WAIT (600 s). Each nak uses one of the
+# The event-before-commit race (D33 in docs/specs/PRD.md): the IdP can still answer 404 for a new
+# service after the orchestrator's bounded wait (``ServiceNotVisibleError``). The client can become
+# visible in some seconds, so the consumer naks that message with this delay instead of leaving it
+# unacked: the redelivery then comes after the delay, not after ACK_WAIT (600 s). Each nak uses one of the
 # MAX_DELIVER deliveries. Only this error class is nak'd; ACK_WAIT stays sized for long LLM
 # onboardings (see stream.py). Read from the env at call time; keep it well below ACK_WAIT.
 _NOT_VISIBLE_NAK_DELAY_ENV = "AIAC_NOT_VISIBLE_NAK_DELAY_SECONDS"
@@ -142,11 +142,11 @@ def _handle(subject: str) -> tuple[list[PolicyRule], bool]:
     raise ValueError(f"no handler for subject {subject!r}")
 
 
-async def _process(subject: str, redelivered: bool = False) -> None:
+async def _process(subject: str, wait_for_client: bool = True) -> None:
     """Do the work of one message, mirroring its ``/apply/*`` route. Raises on a failure; the ack
-    contract is ``_dispatch``'s. ``redelivered`` (not the first delivery) makes an onboarding read
-    its client one time, with no wait (``wait_for_client=False``): the nak delay already gave the
-    client time to become visible."""
+    contract is ``_dispatch``'s. ``wait_for_client`` is given to an onboarding: ``False`` makes it
+    read its client one time, with no wait (``_dispatch`` gives ``False`` only after a not-visible
+    nak, whose delay already gave the client time to become visible)."""
     # ``_handle`` and ``onboard_and_apply`` (the LLM-backed policy-rules builder) and
     # ``compute_and_apply`` are SYNCHRONOUS and slow (tens of seconds); ``rerender_role`` is
     # synchronous too (IdP, store and PDP calls). nats-py
@@ -166,7 +166,7 @@ async def _process(subject: str, redelivered: bool = False) -> None:
         # re-enables the client under the PCE lock after the apply succeeds. The subject token is
         # the client's Keycloak UUID.
         uuid = ServiceUuid(subject.removeprefix(_SERVICE_PREFIX))
-        await loop.run_in_executor(None, functools.partial(onboard_and_apply, uuid, wait_for_client=not redelivered))
+        await loop.run_in_executor(None, functools.partial(onboard_and_apply, uuid, wait_for_client=wait_for_client))
         return
     rules, override = await loop.run_in_executor(None, _handle, subject)
     await loop.run_in_executor(None, compute_and_apply, rules, override)
@@ -177,6 +177,12 @@ class AiacEventConsumer:
         self._nats_url = nats_url
         self._nc: nats.aio.client.Client | None = None
         self._sub = None
+        # The stream sequence of each message that this consumer nak'd because its service was not
+        # visible yet (``ServiceNotVisibleError``). Only the redelivery of such a message reads the
+        # client with no wait: a redelivery after another failure (an LLM timeout, say) waits again,
+        # so it does not use up a MAX_DELIVER delivery on one IdP read. In memory: after a restart,
+        # a redelivery waits again (the safe side). An entry is removed at the next delivery.
+        self._not_visible_seqs: set[int] = set()
 
     async def start(self) -> None:
         # max_reconnect_attempts=-1: once connected, never give up on a dropped connection
@@ -224,8 +230,11 @@ class AiacEventConsumer:
             await self._nc.close()
 
     async def _dispatch(self, msg: Msg) -> None:
+        seq = msg.metadata.sequence.stream
+        after_not_visible = seq in self._not_visible_seqs
+        self._not_visible_seqs.discard(seq)
         try:
-            await _process(msg.subject, redelivered=msg.metadata.num_delivered > 1)
+            await _process(msg.subject, wait_for_client=not after_not_visible)
         except Exception as exc:
             # Log exactly once, routed by exception TYPE to its per-persona named logger.
             # FastAPI's exception handlers never fire on this path (there is no request), so
@@ -248,6 +257,7 @@ class AiacEventConsumer:
             elif isinstance(exc, ServiceNotVisibleError):
                 # Retryable + still under MAX_DELIVER, and the IdP does not show the new service yet:
                 # nak with a short delay, so the redelivery comes after the delay, not after ACK_WAIT.
+                self._not_visible_seqs.add(msg.metadata.sequence.stream)
                 await _nak_not_visible(msg)
             # Any other retryable failure still under MAX_DELIVER: leave unacked so NATS redelivers.
             return

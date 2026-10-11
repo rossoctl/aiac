@@ -70,7 +70,8 @@ app = FastAPI(lifespan=lifespan)
 
 
 @app.get("/policy/services", response_model=None)
-def list_service_policies_by_role(role: str | None = None) -> list[ServicePolicyModel]:
+def list_service_policies(role: str | None = None) -> list[ServicePolicyModel]:
+    # One collection route with an optional filter (``role``), so the name has no ``by_role``.
     # With no ``role``: every cached SPM — the managed set (D21), read by the PCE resync (C3).
     # With a ``role``: every cached SPM referencing that role id across BOTH inbound rule lists
     # (allow and deny) — a role that appears only in a deny edge must still surface. This must
@@ -79,11 +80,7 @@ def list_service_policies_by_role(role: str | None = None) -> list[ServicePolicy
     # exactly what override-purge needs. Never 404s; empty list on no match.
     if role is None:
         return list(_cache.values())
-    return [
-        spm
-        for spm in _cache.values()
-        if any(rule.role.id == role for rule in (*spm.inbound_allow_rules, *spm.inbound_deny_rules))
-    ]
+    return [spm for spm in _cache.values() if any(rule.role.id == role for rule in spm.all_edges())]
 
 
 @app.delete("/policy/services", response_model=None)
