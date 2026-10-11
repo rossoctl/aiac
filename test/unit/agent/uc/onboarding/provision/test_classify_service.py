@@ -62,6 +62,25 @@ def _run(service=None, pods=None, get_service_exc=None, list_pods_exc=None):
 
 
 class TestClassifyServiceHappyPaths:
+    def test_the_coordinates_that_the_orchestrator_gives_need_no_read(self):
+        # The precondition checks already read the service and its pod label: no second IdP read
+        # and no second pod wait.
+        state = OnboardingProvisionState(
+            trigger=Trigger(entity_id=ENTITY),
+            namespace="team-a",
+            workload_name="weather",
+            service_type=ServiceType.TOOL,
+        )
+        with patch.object(nodes, "_config") as cfg, patch.object(kube, "_core_v1") as core_v1:
+            result = nodes.classify_service(state)
+        cfg.assert_not_called()
+        core_v1.assert_not_called()
+        assert (result["namespace"], result["workload_name"], result["service_type"]) == (
+            "team-a",
+            "weather",
+            ServiceType.TOOL,
+        )
+
     def test_agent_label_routes_to_agent_and_sets_identity(self):
         result = _run(service=_service(), pods=[_pod({"rossoctl.io/type": "agent"})])
         assert result["service_id"] == ENTITY
@@ -82,6 +101,19 @@ class TestClassifyServiceHappyPaths:
     def test_statefulset_owner_matched_by_exact_name(self):
         pod = _pod({"rossoctl.io/type": "tool"}, owner_kind="StatefulSet", owner_name="weather")
         result = _run(service=_service(), pods=[pod])
+        assert result["service_type"] is ServiceType.TOOL
+
+    def test_a_pod_of_a_workload_whose_name_starts_with_the_same_prefix_is_not_owned(self):
+        # Deployment "weather-tool" has the ReplicaSet "weather-tool-5d8f9": it is not "weather"'s.
+        other = _pod({"rossoctl.io/type": "agent"}, owner_name="weather-tool-5d8f9")
+        result = _run(service=_service(), pods=[other, _pod({"rossoctl.io/type": "tool"})])
+        assert result["service_type"] is ServiceType.TOOL
+
+    def test_terminating_pod_is_skipped(self):
+        # The wait reads only live pods, as the precondition checks do (one shared wait).
+        old = _pod({})
+        old.metadata.deletion_timestamp = "2026-10-08T00:00:00Z"
+        result = _run(service=_service(), pods=[old, _pod({"rossoctl.io/type": "tool"})])
         assert result["service_type"] is ServiceType.TOOL
 
 

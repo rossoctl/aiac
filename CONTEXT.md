@@ -136,5 +136,106 @@ definition that leaks effect (e.g. a role described _"works in issues, not
 source"_) is **malformed input**, not a deny source — which is why a
 description-only prohibition yields no durable DENY (see the PRB spec's _digested
 input retires exclusivity handling and Door B_ decision). Enforcement is tracked
-in the neutrality-guard follow-up (`rossoctl/aiac`).
+in the neutrality-guard follow-up (rossoctl/aiac#217).
 _Avoid_: description-driven deny, effect-in-description.
+
+**Quarantine**:
+The policy teardown of a failed onboarding, done by the PCE after the UC1
+rollback disables the client. Keyed by the clientId, as every PCE operation
+is. It deletes the service's SPM, removes its roles
+from the other SPMs, deletes the service's CR (a pod that has no CR is denied),
+and redeploys the CRs of the affected services. A disabled client
+_is_ a quarantined service: the routing guard drops every rule that touches it,
+and the focal resolver gives it no candidate role or scope. Only a successful
+re-onboarding lifts it. Distinct from **decommission** (the offboard teardown of
+a deleted client, keyed by clientId).
+_Avoid_: rollback (the IdP-side teardown that comes before it), block, ban.
+
+**Focus service**:
+The service that the current onboarding builds rules for — the `focus_service`
+the orchestrator (`onboard_and_apply`) passes to the PCE, as its clientId
+(never its Keycloak UUID). It is the one
+disabled service that the routing guard and the focal resolver do not skip,
+because a re-onboarding of a quarantined service builds and applies while its
+client is still disabled (the PCE calls `reenable_service`, the `on_applied` of
+the onboarding, under its lock after the apply).
+_Avoid_: target service (a target is the service an agent calls), focal entity
+(the per-pass subject inside one build).
+
+## Policy stack
+
+**SPM** (service policy model):
+The stored policy of one service, agent or tool: its own roles and scopes, and
+every inbound edge (allow and deny) on those scopes. A rule is stored on the SPM
+of the service that owns the rule's scope. The SPM is the only policy the store
+keeps.
+_Avoid_: complete SPM, service policy.
+
+**APM** (agent policy model):
+The policy of one agent under **agent side**: its inbound gates and its outbound
+tool checks, joined from the SPMs of the services that it calls. The PCE derives
+it in memory at each deploy and never stores it.
+_Avoid_: agent policy (as a stored thing).
+
+**Policy model**:
+The deploy input that the PCE gives to the PDP Policy Writer. It is tagged with
+its **enforcement side**. A **target-side policy model** holds stored SPMs. An
+**agent-side policy model** holds APMs and the IDs of the managed tools that get
+a **pass-through CR**. One policy model never mixes the two sides.
+_Avoid_: POM, complete SPM, PolicyModel of agents.
+
+**Managed set**:
+The services that have a stored SPM. Every service in the managed set has a CR.
+A service that leaves the set (quarantine, decommission) loses its CR, and is
+then denied.
+_Avoid_: onboarded services, known services.
+
+**Role holder**:
+A user or an agent that holds a role **now**. For an `Agent`-kind role: each
+live service (in the catalog and enabled) whose roles contain the role. For a
+`User`-kind role: each direct member that the IdP gives now (`get_roles()`).
+The PCE reads the holders from the IdP at render time (D32). The `actorIds` in
+a stored edge is only a snapshot, not the authority. A role that comes only
+through a group or a composite parent role gives no holder.
+_Avoid_: actor list of an edge, stored members.
+
+**Shared role**:
+A realm role that more than one agent holds. Across namespaces, Provision
+reuses it by name for agents with the same workload name (`team1/github-agent`
+and `team2/github-agent` share `github-agent.source_operations`). In one
+namespace, an admin assigns it to a second agent. A realm is a tenant and one
+policy covers the realm, so every **role holder** of a shared role gets the
+same allow and deny. It is deleted only when its last holder goes (D32).
+_Avoid_: duplicate role, name collision (the sharing is by design).
+
+**Shared scope**:
+A client scope that more than one service links, for example
+`github-tool.source-read` of `team1/github-tool` and `team2/github-tool`. The
+IdP gives **one copy for each owner**, with `Scope.serviceId` = that owner, so
+each copy routes to the SPM of its owner. The PRB decides it once, and the
+assembly gives one rule for each copy. It is deleted only when its last owner
+goes (D32).
+_Avoid_: multi-owner scope (as a fault), name collision.
+
+## Enforcement
+
+**Enforcement side**:
+Where the access to a callee is checked. Under **target side**, each callee
+(agent or tool) checks the access to itself in its own inbound OPA, from its own
+CR. Under **agent side** (the legacy method), each agent's outbound OPA checks
+the agent's calls to tools, and tools check nothing. One global switch selects
+the side for every callee. The two sides never exist together.
+_Avoid_: AC method, AC model (that names a modeling paradigm, RBAC/ABAC),
+enforcement mode, PEP side.
+
+**Callee**:
+A service that is called — agent or tool. Under **target side** the callee's own
+inbound OPA decides each call.
+_Avoid_: target (ambiguous with the agent-side outbound target), server.
+
+**Pass-through CR**:
+A CR whose two request packages allow every request. Under **agent side**, every
+managed tool gets one, because a pod that has no CR is denied. Under **target
+side**, only the outbound package of each CR is a pass-through: the callee
+decides.
+_Avoid_: allow-all CR, open CR, empty CR (an empty CR denies).

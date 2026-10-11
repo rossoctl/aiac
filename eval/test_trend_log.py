@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from eval.trend_log import append_row, pool_correctness_metrics
+from eval.trend_log import append_row, pool_consistency_metrics, pool_correctness_metrics, pool_scale_metrics
 
 
 def test_pool_empty_entries_is_vacuously_perfect() -> None:
@@ -116,6 +116,96 @@ def test_pool_multiple_scenarios_pools_by_count_not_average() -> None:
     naive_average = (0.5 + 1.0) / 2
     assert metrics["precision"] != naive_average
     assert metrics["precision"] == 10 / 11
+
+
+def test_pool_consistency_empty_entries_has_full_agreement_rate() -> None:
+    metrics = pool_consistency_metrics([])
+
+    assert metrics == {"scenarios_scored": 0, "agreement_rate": 1.0}
+
+
+def test_pool_consistency_all_consistent_has_full_agreement_rate() -> None:
+    entries = [{"inconsistent": False}, {"inconsistent": False}, {"inconsistent": False}]
+
+    metrics = pool_consistency_metrics(entries)
+
+    assert metrics == {"scenarios_scored": 3, "agreement_rate": 1.0}
+
+
+def test_pool_consistency_one_disagreement_out_of_several() -> None:
+    entries = [{"inconsistent": False}, {"inconsistent": True}, {"inconsistent": False}, {"inconsistent": False}]
+
+    metrics = pool_consistency_metrics(entries)
+
+    assert metrics["scenarios_scored"] == 4
+    assert metrics["agreement_rate"] == 0.75
+
+
+def test_pool_consistency_all_disagree_has_zero_agreement_rate() -> None:
+    entries = [{"inconsistent": True}, {"inconsistent": True}]
+
+    metrics = pool_consistency_metrics(entries)
+
+    assert metrics == {"scenarios_scored": 2, "agreement_rate": 0.0}
+
+
+def test_pool_scale_empty_entries_is_vacuously_clean() -> None:
+    metrics = pool_scale_metrics([])
+
+    assert metrics == {
+        "scenarios_scored": 0,
+        "structural_pass_rate": 1.0,
+        "structural_issue_count": 0,
+        "total_tokens": 0,
+        "mean_wall_clock_seconds": 0.0,
+        "mean_token_coverage": 1.0,
+    }
+
+
+def test_pool_scale_one_clean_run() -> None:
+    entries = [
+        {
+            "structural_pass": True,
+            "structural_issue_count": 0,
+            "wall_clock_seconds": 12.5,
+            "total_tokens": 5000,
+            "token_coverage": 1.0,
+        }
+    ]
+
+    metrics = pool_scale_metrics(entries)
+
+    assert metrics["scenarios_scored"] == 1
+    assert metrics["structural_pass_rate"] == 1.0
+    assert metrics["structural_issue_count"] == 0
+    assert metrics["total_tokens"] == 5000
+    assert metrics["mean_wall_clock_seconds"] == 12.5
+    assert metrics["mean_token_coverage"] == 1.0
+
+
+def test_pool_scale_a_failing_run_lowers_pass_rate_and_sums_issues() -> None:
+    entries = [
+        {"structural_pass": False, "structural_issue_count": 3, "wall_clock_seconds": 10.0, "total_tokens": 100},
+        {"structural_pass": True, "structural_issue_count": 0, "wall_clock_seconds": 20.0, "total_tokens": 200},
+    ]
+
+    metrics = pool_scale_metrics(entries)
+
+    assert metrics["scenarios_scored"] == 2
+    assert metrics["structural_pass_rate"] == 0.5
+    assert metrics["structural_issue_count"] == 3
+    assert metrics["total_tokens"] == 300
+    assert metrics["mean_wall_clock_seconds"] == 15.0
+
+
+def test_pool_scale_missing_token_coverage_defaults_vacuously() -> None:
+    entries = [{"structural_pass": True, "structural_issue_count": 0}]
+
+    metrics = pool_scale_metrics(entries)
+
+    assert metrics["mean_token_coverage"] == 1.0
+    assert metrics["mean_wall_clock_seconds"] == 0.0
+    assert metrics["total_tokens"] == 0
 
 
 def test_append_row_writes_one_json_line(tmp_path: Path) -> None:

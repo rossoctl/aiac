@@ -1,20 +1,32 @@
-"""AIAC Agent Controller — FastAPI app factory + the four ``/apply/*`` routes.
+"""AIAC Agent Controller — FastAPI app factory, the ``/apply/*`` routes and one read-only route.
 
-The Controller is stateless. Each route dispatches to its use-case handler
-(orchestrator or sub-agent), receives the ``(list[PolicyRule], override)`` tuple
-the handler returns, and makes the **single** ``compute_and_apply(rules, override)``
-call to the Policy Computation Engine. No per-use-case business logic, retry
-handling, or state assembly lives here.
+The Controller is stateless. Each ``/apply/*`` route dispatches to its use-case handler.
+The policy and role routes call a sub-agent, receive the ``(list[PolicyRule], override)`` tuple
+the handler returns, and make the **single** ``compute_and_apply(rules, override)``
+call to the Policy Computation Engine. The onboarding route calls only the orchestrator's
+``onboard_and_apply``, which makes the ``compute_and_apply`` call itself, re-enables the client
+under the PCE lock after the apply, and returns ``None``. No per-use-case business logic, retry
+handling, or state assembly lives here. Two routes call the PCE directly instead:
+``/apply/offboard/...`` (``decommission``) and ``/apply/role-members/{role_id}``
+(``rerender_role``, a role-membership change, D32).
+
+``GET /policy/services/{service_id:path}`` is a read-only view (D18): the policy model of the
+current side with only the entry of one service (by its clientId), or 404 if it has no SPM. It
+calls the PCE ``policy_model_for`` and writes nothing.
+
+The app's lifespan (``eventbus.consumer.lifespan``) runs the start sequence first — the enforcement
+side (``AIAC_ENFORCEMENT_SIDE``), start check #4 and the PCE resync (see ``controller.start``) — then
+starts the NATS consumer. A failed step (also an unknown side) stops the Controller before it serves.
 
 Responses are bare HTTP status codes: ``200 OK`` on success (no body). Upstream
 failures are raised as FastAPI ``HTTPException``s by the handlers; the status
-code is authoritative (the accompanying default JSON error body is incidental).
+code is authoritative (the accompanying default JSON error body is incidental). The exception
+handlers below map the PRB errors (422 / 502 / 500, sanitized or a ``ConflictReport``) and a failed
+UC1 precondition check (``EnforcementPreconditionError`` → 409 with ``failed_checks``).
 """
 
-import os
-
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 
 from aiac.agent.eventbus.consumer import lifespan
@@ -31,12 +43,19 @@ from aiac.agent.policy_rules_builder.graph import (
 )
 from aiac.agent.shared.error_logging import log_by_type
 from aiac.agent.uc.offboarding.offboard import offboard_service
-from aiac.agent.uc.onboarding.orchestrator import onboard_service, reenable_service
+from aiac.agent.uc.onboarding.orchestrator import onboard_and_apply
+from aiac.agent.uc.onboarding.preconditions import EnforcementPreconditionError
 from aiac.agent.uc.policy_update.build import build_policy
 from aiac.agent.uc.policy_update.rebuild import rebuild_policy
 from aiac.agent.uc.role_update.role import update_role
-from aiac.policy.computation import compute_and_apply, decommission
-from aiac.policy.model.models import RuleEffect
+from aiac.idp.configuration.models import ClientId, ServiceUuid
+from aiac.policy.computation import compute_and_apply, decommission, policy_model_for, rerender_role
+from aiac.shared.logging_config import configure_logging
+
+# Before the app object exists, so the consumer's startup logs (the ``lifespan`` above) and
+# every ``logger.info`` in the package reach stdout. Without it the root logger has no
+# handler and defaults to WARNING — see ``aiac.shared.logging_config``.
+configure_logging()
 
 app = FastAPI(lifespan=lifespan)
 
@@ -93,6 +112,23 @@ def _policy_contradiction_error(_request: Request, exc: PolicyContradictionError
     return JSONResponse(status_code=422, content=report.model_dump(mode="json"))
 
 
+# A failed UC1 precondition check (D30): the pod of the service cannot enforce its CR. This is a
+# conflict with the state of the cluster that the operator must fix, not a server fault, so 409. The
+# body names each failed check, so the operator knows what to fix; the items carry check, pod,
+# container and namespace names only (no endpoint, host or key). The checks run before Provision,
+# so nothing changed and the PCE is never reached.
+@app.exception_handler(EnforcementPreconditionError)
+def _enforcement_precondition_error(_request: Request, exc: EnforcementPreconditionError) -> JSONResponse:
+    log_by_type(exc)
+    return JSONResponse(
+        status_code=409,
+        content={
+            "detail": "The service cannot enforce its access policy: one or more precondition checks failed.",
+            "failed_checks": exc.failures,
+        },
+    )
+
+
 # Safety net — registered LAST, on purpose. Any ``PolicyRulesBuilderBaseError`` WITHOUT its own
 # handler above (a future subclass, or a bare base error) is an unexpected builder fault → 500,
 # sanitized the same way (never leaks, full detail logged). Registering the base-class net after
@@ -103,21 +139,6 @@ def _policy_contradiction_error(_request: Request, exc: PolicyContradictionError
 @app.exception_handler(PolicyRulesBuilderBaseError)
 def _policy_builder_base_error(_request: Request, exc: PolicyRulesBuilderBaseError) -> JSONResponse:
     return _sanitized(exc, 500, "The policy build failed unexpectedly.")
-
-
-# Live on-ramp for the per-onboarding default_effect. The PCE-threading side (#146) exposes
-# default_effect as an onboard_service parameter; the integration harness (#149) requests a
-# non-default value by patching AIAC_DEFAULT_EFFECT ("Allow"/"Deny") onto the Controller
-# deployment before onboarding. This is the single point where those two halves meet. Absent or
-# unrecognised env → DENY, today's least-privilege default, so existing deployments are unchanged.
-DEFAULT_EFFECT_ENV = "AIAC_DEFAULT_EFFECT"
-
-
-def _default_effect_from_env() -> RuleEffect:
-    try:
-        return RuleEffect(os.environ.get(DEFAULT_EFFECT_ENV, RuleEffect.DENY.value))
-    except ValueError:
-        return RuleEffect.DENY
 
 
 @app.get("/health")
@@ -131,11 +152,10 @@ def health() -> dict[str, str]:
 
 @app.post("/apply/service/{service_id}")
 def apply_service(service_id: str) -> Response:
-    rules, override, default_effect = onboard_service(service_id, _default_effect_from_env())
-    compute_and_apply(rules, override, default_effect)
-    # Re-enable the client only AFTER the PCE apply succeeds — a compute_and_apply failure above
-    # propagates and leaves the client disabled (the failed-service marker), never enabled-with-no-policy.
-    reenable_service(service_id)
+    # service_id is the Keycloak UUID (an IdP key). onboard_and_apply resolves the clientId once, runs
+    # compute_and_apply with it as the focus service, and re-enables the client under the PCE lock only
+    # after the apply succeeds: a failure leaves the client disabled (the failed-service marker).
+    onboard_and_apply(ServiceUuid(service_id))
     return Response(status_code=200)
 
 
@@ -160,6 +180,17 @@ def apply_role(role_id: str) -> Response:
     return Response(status_code=200)
 
 
+# A role-membership change (D32; the operator route of the ``aiac.apply.role-members.{role-id}`` event): a
+# user or a service account got or lost the role. That changes only who holds the role, not the policy,
+# so the route bypasses the use-case handlers (no PRB run) and compute_and_apply, and calls the PCE's
+# rerender_role directly: it re-renders the CRs that use the role with its current holders. role_id is
+# the Keycloak role id (a UUID).
+@app.post("/apply/role-members/{role_id}")
+def apply_role_members(role_id: str) -> Response:
+    rerender_role(role_id)
+    return Response(status_code=200)
+
+
 # Offboard is keyed by the clientId (the SPM key), NOT the Keycloak internal UUID that
 # /apply/service/{service_id} carries: an offboarded client is gone from get_services(), so
 # UUID→clientId resolution is impossible. The {service_id:path} converter carries slash-bearing
@@ -167,8 +198,21 @@ def apply_role(role_id: str) -> Response:
 # (rules, override) → compute_and_apply path and calls the PCE's decommission directly.
 @app.post("/apply/offboard/{service_id:path}")
 def apply_offboard(service_id: str) -> Response:
-    decommission(offboard_service(service_id))
+    decommission(offboard_service(ClientId(service_id)))
     return Response(status_code=200)
+
+
+# A read-only view for tests and debugging (D18): the policy model of the current side with only the
+# entry of one service, as JSON in the shape of the writer's POST /policy body. Keyed by the clientId
+# (the SPM key), as on the offboard path, so the {service_id:path} converter carries a slash-bearing
+# SPIFFE URI. 404 if the service has no SPM (it is not in the managed set). It takes no PCE lock and
+# writes nothing.
+@app.get("/policy/services/{service_id:path}")
+def get_service_policy_model(service_id: str) -> JSONResponse:
+    model = policy_model_for(ClientId(service_id))
+    if model is None:
+        raise HTTPException(404, "The service has no policy model (it is not in the managed set).")
+    return JSONResponse(status_code=200, content=model.model_dump(mode="json"))
 
 
 def main() -> None:

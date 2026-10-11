@@ -2,7 +2,7 @@
 
 The event-driven onboarding path (deploy -> operator registers a Keycloak client -> Keycloak emits
 ``CLIENT_CREATED`` -> the AIAC SPI ``aiac-event-listener`` publishes on NATS -> the agent consumer
-runs ``onboard_service``) is wired only when three facts hold: the NATS broker pod is Running, the
+runs ``onboard_and_apply``) is wired only when three facts hold: the NATS broker pod is Running, the
 realm lists ``aiac-event-listener`` in ``eventsListeners``, and ``adminEventsEnabled`` is true
 (``CLIENT_CREATED`` is an *admin* event). ``event_path_reason`` decides that from the two
 already-gathered facts, side-effect-free, so a cluster wired for OPA but not for events skips cleanly

@@ -107,7 +107,7 @@ import os
 import shutil
 import subprocess
 import sys
-import tempfile
+from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from types import ModuleType
@@ -295,12 +295,34 @@ def _read_back(config: Configuration) -> tuple[dict[str, Role], dict[str, Scope]
 
     Scopes are sourced from each service's scope list (not the standalone get_scopes()), so that
     scope.serviceId is populated — a required input for the PCE's SPM routing.
+
+    The flat ``config.get_roles()`` call does not reliably carry the correct ``kind``/``actorIds``
+    for an agent-owned role (confirmed empirically: it can return ``kind=USER`` with an unrelated
+    ``actorIds`` value for a role actually owned by an agent) — each service's own ``.roles`` list
+    does (``Configuration._build_service`` merges the authoritative per-service ``kind``/
+    ``actorIds`` in from the per-service roles endpoint, which ``get_roles()``'s plain ``/roles``
+    call never queries). Overlaid below, once, for every role any service actually owns, piggy-
+    backing on the ``get_services()`` call already made for scopes rather than paying for a
+    second one — so every caller gets the correct attribution for free, not just one that
+    remembers to patch it locally. Getting this wrong is why ``compute_and_apply`` could
+    misattribute an agent role's rules away from its owning agent's own outbound APM, leaving an
+    agent that genuinely received grants with no rendered outbound Rego at all.
     """
     roles = {r.name: r for r in config.get_roles()}
+    owned: dict[str, Role] = {}
     scopes: dict[str, Scope] = {}
     for svc in config.get_services():
+        for role in svc.roles:
+            # A role that more than one service holds (D32) gives each holder in its own
+            # per-service list: union them, so the last service does not replace the others.
+            if (held := owned.get(role.name)) is not None:
+                role = held.model_copy(update={"actorIds": sorted(set(held.actorIds) | set(role.actorIds))})
+            owned[role.name] = role
         for s in svc.scopes:
-            scopes.setdefault(s.name, s)  # first owner wins; each scope has exactly one owner
+            # One entry for each name: no eval scenario shares a scope between tools. (A shared scope is
+            # valid, D32; it then has one copy for each owner, and this map keeps the first one.)
+            scopes.setdefault(s.name, s)
+    roles.update(owned)
     return roles, scopes
 
 
@@ -631,7 +653,62 @@ def _init_worker(realm_lock: Any) -> None:
 # ======================================================================================
 
 
-def _provision_scenario(name: str, idp_port: int, store_port: int, opa_port: int) -> dict:
+def prepare_pipeline(
+    setenv: Callable[[str, str], None],
+    *,
+    realm: str,
+    rego_dir: Path,
+    db_path: Path,
+    idp: tuple[str, int],
+    store: tuple[str, int],
+    opa: tuple[str, int],
+) -> tuple[Service, Service, Service]:
+    """The env and the idp/store/opa ``Service`` triple that one in-process PRB+PCE run needs.
+
+    Wipes and recreates ``rego_dir``, points the store at ``db_path`` (the caller gives a fresh
+    path and owns its directory), and sets (through ``setenv``) every env var that the in-process
+    PCE reads: the realm, the four ``AIAC_*_URL`` vars at the ``(host, port)`` pairs, and the
+    enforcement side. Each caller that runs the pipeline uses this one helper, so a new pipeline
+    setting reaches all of them. The caller sets ``AIAC_POLICY_FILE`` itself (a run can use more
+    than one policy file). ``setenv`` is ``os.environ.__setitem__`` in a ``ProcessPoolExecutor``
+    worker (never the pytest process), else a ``MonkeyPatch.setenv`` that restores the env when
+    the caller is done. Set every var on each call, never conditionally: a worker can run more
+    than one scenario, and a later scenario must not keep the realm or URLs of an earlier one."""
+    if rego_dir.exists():
+        shutil.rmtree(rego_dir)
+    rego_dir.mkdir(parents=True)
+
+    setenv("KEYCLOAK_REALM", realm)  # PCE reads this back
+    setenv("AIAC_PDP_CONFIG_URL", f"http://{idp[0]}:{idp[1]}")
+    setenv("AIAC_POLICY_STORE_URL", f"http://{store[0]}:{store[1]}")
+    # The model-store client actually reads AIAC_POLICY_MODEL_STORE_URL, not
+    # AIAC_POLICY_STORE_URL (which nothing consumes) — set both so each run's PCE calls land on
+    # its own store subprocess instead of every run colliding on the hardcoded 127.0.0.1:7074
+    # default once ports diverge.
+    setenv("AIAC_POLICY_MODEL_STORE_URL", f"http://{store[0]}:{store[1]}")
+    setenv("AIAC_PDP_POLICY_URL", f"http://{opa[0]}:{opa[1]}")
+    # The suites score each AGENT's outbound Rego (agent_role_scopes, target_allow_scopes), which is
+    # a pass-through under target side, so this in-process PCE always deploys the agent side.
+    setenv("AIAC_ENFORCEMENT_SIDE", "agent-side")
+
+    return (
+        Service("aiac.idp.service.configuration.keycloak.main:app", port=idp[1], host=idp[0]),
+        Service(
+            "aiac.policy.model_store.service.main:app",
+            port=store[1],
+            host=store[0],
+            env={"SERVICEPOLICY_DB_PATH": str(db_path)},
+        ),
+        Service(
+            "aiac.pdp.service.policy.opa.main:app",
+            port=opa[1],
+            host=opa[0],
+            env={"REGO_OUTPUT_DIR": str(rego_dir), "POLICY_WRITER_DUMP_REGO": "true"},
+        ),
+    )
+
+
+def _provision_scenario(name: str, idp_port: int, store_port: int, opa_port: int, store_root: str) -> dict:
     """Provision one scenario's realm and run the real PRB+PCE pipeline, leaving ``.rego`` on disk
     under ``rego_out/policy_pipeline_eval/<scenario>/``. Returns ``{"rego_dir": Path, "rules":
     list[PolicyRule], "reasoning_by_scope": dict[str, str], "reasoning_by_agent_role": dict[str,
@@ -664,24 +741,23 @@ def _provision_scenario(name: str, idp_port: int, store_port: int, opa_port: int
         opa_host, _ = _host_port(os.environ["AIAC_PDP_POLICY_URL"], DEFAULT_OPA_PORT)
 
         admin = _connect_admin()
-        os.environ["KEYCLOAK_REALM"] = scenario.REALM_DEFAULT  # PCE reads this back
         with _REALM_LOCK:
             provision_keycloak_admin(admin, scenario.REALM_DEFAULT, scenario)
 
         rego_dir = HERE / "rego_out" / "policy_pipeline_eval" / name
-        if rego_dir.exists():
-            shutil.rmtree(rego_dir)
-        rego_dir.mkdir(parents=True)
-        db_path = Path(tempfile.mkdtemp(prefix=f"aiac-store-eval-{name}-")) / "policy_model.db"
         os.environ["AIAC_POLICY_FILE"] = str(digested_policy_path(scenario))
-        os.environ["AIAC_PDP_CONFIG_URL"] = f"http://{idp_host}:{idp_port}"
-        os.environ["AIAC_POLICY_STORE_URL"] = f"http://{store_host}:{store_port}"
-        # The model-store client actually reads AIAC_POLICY_MODEL_STORE_URL, not
-        # AIAC_POLICY_STORE_URL (which nothing consumes) — set both so this worker's PCE calls
-        # land on its own store subprocess instead of every worker colliding on the hardcoded
-        # 127.0.0.1:7074 default once ports diverge per worker.
-        os.environ["AIAC_POLICY_MODEL_STORE_URL"] = f"http://{store_host}:{store_port}"
-        os.environ["AIAC_PDP_POLICY_URL"] = f"http://{opa_host}:{opa_port}"
+        # A worker process, never the pytest process, so a direct os.environ write cannot leak into a
+        # test. A worker can run more than one scenario (EVAL_PIPELINE_PARALLELISM < 8); that is safe
+        # only because prepare_pipeline sets every var on each call -- keep it so (no conditional set).
+        idp, store, opa = prepare_pipeline(
+            os.environ.__setitem__,
+            realm=scenario.REALM_DEFAULT,
+            rego_dir=rego_dir,
+            db_path=Path(store_root) / f"{name}.db",
+            idp=(idp_host, idp_port),
+            store=(store_host, store_port),
+            opa=(opa_host, opa_port),
+        )
         log.info(
             "scenario %s: realm=%s policy=%s rego_dir=%s ports=(idp=%d store=%d opa=%d)",
             name,
@@ -693,19 +769,6 @@ def _provision_scenario(name: str, idp_port: int, store_port: int, opa_port: int
             opa_port,
         )
 
-        idp = Service("aiac.idp.service.configuration.keycloak.main:app", port=idp_port, host=idp_host)
-        store = Service(
-            "aiac.policy.model_store.service.main:app",
-            port=store_port,
-            host=store_host,
-            env={"SERVICEPOLICY_DB_PATH": str(db_path)},
-        )
-        opa = Service(
-            "aiac.pdp.service.policy.opa.main:app",
-            port=opa_port,
-            host=opa_host,
-            env={"REGO_OUTPUT_DIR": str(rego_dir), "POLICY_WRITER_DUMP_REGO": "true"},
-        )
         with running_services([idp, store, opa], src=SRC):
             config = Configuration.for_realm(scenario.REALM_DEFAULT)
             provision_via_config(config, scenario)  # exactly once — not idempotent
@@ -751,7 +814,7 @@ def _provision_scenario(name: str, idp_port: int, store_port: int, opa_port: int
 
 
 @pytest.fixture(scope="session")
-def pipeline() -> dict[str, dict]:
+def pipeline(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
     """Provision Keycloak and run the real PRB+PCE pipeline once per scenario — in parallel, one
     ``ProcessPoolExecutor`` worker per scenario (see the module docstring) — leaving ``.rego`` on
     disk under ``rego_out/policy_pipeline_eval/<scenario>/``. Returns ``{scenario_name:
@@ -776,6 +839,10 @@ def pipeline() -> dict[str, dict]:
     # escape-hatch env var surface as an opaque crash deep inside the executor.
     max_workers = max(1, int(os.environ.get("EVAL_PIPELINE_PARALLELISM", str(len(SCENARIOS)))))
     realm_lock = multiprocessing.Lock()  # serializes admin.create_realm — see _provision_scenario
+    # One store DB for each scenario, under the pytest basetemp (pytest keeps only the dirs of its
+    # last few sessions). A str: each argument must pickle across to the worker, which cannot use
+    # tmp_path_factory itself.
+    store_root = str(tmp_path_factory.mktemp("pipeline_store"))
     results: dict[str, dict] = {}
     with ProcessPoolExecutor(max_workers=max_workers, initializer=_init_worker, initargs=(realm_lock,)) as executor:
         futures = {
@@ -785,6 +852,7 @@ def pipeline() -> dict[str, dict]:
                 DEFAULT_IDP_PORT + i * 10,
                 DEFAULT_STORE_PORT + i * 10,
                 DEFAULT_OPA_PORT + i * 10,
+                store_root,
             ): name
             for i, name in enumerate(SCENARIOS)
         }

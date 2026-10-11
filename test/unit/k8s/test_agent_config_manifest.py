@@ -35,6 +35,14 @@ def test_llm_retry_knobs_present_with_defaults():
     assert data.get("LLM_RETRY_BACKOFF_MAX") == "30"
 
 
+def test_log_level_knob_present_with_info_default():
+    """The root-logger level (``aiac.shared.logging_config``) is surfaced so an operator can
+    raise it to DEBUG without rebuilding the image. INFO is the default that makes the
+    onboarding trace visible in ``kubectl logs deployment/aiac-agent`` at all."""
+    data = _agent_config_data()
+    assert data.get("LOG_LEVEL") == "INFO"
+
+
 def test_upstream_max_retries_remains_and_is_distinct_from_llm_knobs():
     """The transport-layer knob is not removed and is a separate key from the LLM knobs."""
     data = _agent_config_data()
@@ -46,3 +54,11 @@ def test_upstream_max_retries_remains_and_is_distinct_from_llm_knobs():
         "LLM_RETRY_BACKOFF_MIN",
         "LLM_RETRY_BACKOFF_MAX",
     }
+
+
+def test_the_enforcement_side_switch_defaults_to_target_side():
+    """The switch (D29) is on the ConfigMap with the default side, and the start check #4 reads the
+    combiner in the bundle-service namespace that the ConfigMap names."""
+    data = _agent_config_data()
+    assert data.get("AIAC_ENFORCEMENT_SIDE") == "target-side"
+    assert data.get("AIAC_BUNDLE_SERVICE_NAMESPACE") == "rossoctl-system"

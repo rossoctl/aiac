@@ -1,9 +1,42 @@
-"""PDP Policy Writer (OPA) — always-on Custom Resource writer.
+"""PDP Policy Writer (OPA) — always-on Custom Resource writer (D18c).
 
-Renders the two fixed-package Rego strings via ``rego.py`` and writes them into
-a per-agent ``AuthorizationPolicy`` Custom Resource (``agent.rossoctl.dev/
-v1alpha1``, one CR per agent) on the live Kubernetes API. ``bundle-service``
-(operator repo) composes those CRs into per-pod OPA bundles that AuthBridge polls.
+The body of ``POST`` / ``PUT /policy`` is a policy model tagged with its enforcement side
+(``AnyPolicyModel``). The writer reads the side from the tag, never from an env var (D29). For each
+entry of the model it renders the two request packages via ``rego.py`` and server-side-applies them
+into one ``AuthorizationPolicy`` Custom Resource (``agent.rossoctl.dev/v1alpha1``, ``scope:
+client``) — one CR per managed service, agent or tool. The entries of each side:
+
+- target side (``TargetSidePolicyModel``): each ``services[]`` SPM — the tool inbound or the agent
+  inbound, and a pass-through outbound (the callee decides);
+- agent side (``AgentSidePolicyModel``): each ``agents[]`` APM — the agent CR, with the agent
+  inbound and the agent outbound (per-tool checks and the MCP session rule) — and each
+  ``pass_through[]`` tool id — a pass-through CR, with a pass-through in both tiers (D24).
+
+The writer does no join: the PCE builds the policy model. ``bundle-service`` (operator repo)
+composes those CRs into per-pod OPA bundles that AuthBridge polls.
+
+A body with a wrong or missing tag is a 422 (the discriminated union). So is a body that carries the
+entry fields of the other side (the models ignore unknown fields, so pydantic alone would drop
+them), and an agent-side body that names an agent also as a pass-through.
+
+Routes:
+
+- ``POST /policy`` — upsert one CR per entry (no rollback on a partial failure).
+- ``PUT /policy`` — replace: upsert every entry, then delete every other CR that has the
+  managed-by label. The delete step runs only after every upsert succeeded. Both sides; a side
+  change rewrites both packages of a kept CR in one write (``spec.policies`` is atomic).
+- ``DELETE /policy/services/{service_id:path}`` — delete the CR of one service (the quarantine and
+  the decommission); a k8s 404 is success.
+
+A service id that gives no CR identity (``identity_ref`` raises) cannot have a CR. So each write
+logs it and skips it, never a 400: ``POST`` and ``PUT`` skip its entry, and ``DELETE`` has nothing
+to delete. With D20 such a service is denied (it has no CR). A 400 would make one bad stored SPM
+fail every later write that has it: the resync at every Controller start, each quarantine and
+decommission of the service, and each batch that deploys it.
+- ``DELETE /policy`` — delete every CR that has the managed-by label.
+- ``GET /health`` — a bounded CR list.
+
+With the changed combiner (D20) a pod that has no CR is denied, so a delete closes the service.
 
 The CR write is **always active** — it is never gated by an env var. Setting
 ``POLICY_WRITER_DUMP_REGO`` truthy *additionally* dumps the same rego to
@@ -11,21 +44,41 @@ The CR write is **always active** — it is never gated by an env var. Setting
 disables, replaces, or gates the CR write.
 """
 
+import logging
 import os
 import shutil
+from collections.abc import Iterator
 from pathlib import Path
+from typing import Annotated
 
 from fastapi import FastAPI
 from kubernetes import client, config
 from kubernetes.client import ApiException
+from pydantic import AfterValidator, BeforeValidator
 from starlette.responses import JSONResponse, Response
 
 from aiac.pdp.service.policy.opa.rego import (
-    generate_inbound_rego,
-    generate_outbound_rego,
+    DEFAULT_PLATFORM_CLIENTS,
+    ClientPolicies,
     identity_ref,
+    render_agent_side,
+    render_pass_through,
+    render_target_side,
 )
-from aiac.policy.model.models import AgentPolicyModel, PolicyModel
+from aiac.policy.model.models import (
+    AgentSidePolicyModel,
+    AnyPolicyModel,
+    EnforcementSide,
+    PolicyModel,
+    TargetSidePolicyModel,
+)
+from aiac.shared.logging_config import configure_logging
+
+# Before the app object exists, so LOG_LEVEL governs this writer's (and the kubernetes
+# client's) logs. Without it the root logger has no handler and defaults to WARNING — see
+# ``aiac.shared.logging_config``.
+configure_logging()
+logger = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------- #
 # CR coordinates & write identity — code constants, never env vars (Q6, Q8a). #
@@ -35,7 +88,7 @@ _VERSION = "v1alpha1"
 _PLURAL = "authorizationpolicies"
 _MANAGED_BY_LABEL = {"app.kubernetes.io/managed-by": "aiac-pdp-policy-writer"}
 _FIELD_MANAGER = "aiac-pdp-policy-writer"
-# Selects only CRs this writer owns (used by delete-all and the label filter).
+# Selects only CRs this writer owns (the delete step of PUT /policy, and DELETE /policy).
 _MANAGED_BY_SELECTOR = "app.kubernetes.io/managed-by=aiac-pdp-policy-writer"
 
 # Truthy spellings for the additive rego-dump toggle.
@@ -86,28 +139,52 @@ def _platform_clients() -> tuple[str, ...]:
     """Platform source clients for the inbound generator's bypass rules (Q5).
 
     ``PLATFORM_SOURCE_CLIENTS`` comma-split, blanks dropped; unset or all-blank
-    falls back to ``("rossoctl",)`` (dropping the bypass would deny end-user
-    traffic, which carries the platform client).
+    falls back to ``DEFAULT_PLATFORM_CLIENTS``.
     """
-    raw = os.environ.get("PLATFORM_SOURCE_CLIENTS")
-    if raw is None:
-        return ("rossoctl",)
-    clients = tuple(c.strip() for c in raw.split(",") if c.strip())
-    return clients or ("rossoctl",)
+    raw = os.environ.get("PLATFORM_SOURCE_CLIENTS", "")
+    return tuple(c.strip() for c in raw.split(",") if c.strip()) or DEFAULT_PLATFORM_CLIENTS
 
 
 # --------------------------------------------------------------------------- #
 # CR body + write ops                                                          #
 # --------------------------------------------------------------------------- #
-def _build_cr(model: AgentPolicyModel) -> dict:
-    """Build the per-agent ``AuthorizationPolicy`` CR body (Q6a).
+def _entries(model: PolicyModel) -> Iterator[tuple[str, ClientPolicies]]:
+    """The CRs that ``model`` asks for: one ``(service_id, packages)`` per entry (D18c).
 
-    ``metadata.name`` / ``.namespace`` come from ``identity_ref(agent_id)``;
-    ``spec.clientID`` is the DNS-label-safe ``name`` — display / print-column
-    only, since bundle-service matches on name+namespace, never ``clientID``.
-    Raises ``ValueError`` (via ``identity_ref``) on a malformed ``agent_id``.
+    Dispatches on the policy-model subclass, so the side comes from the tag, never from an env var
+    (D29):
+
+    - target side: one CR per ``services[]`` SPM (the tool inbound or the agent inbound, and a
+      pass-through outbound);
+    - agent side: one agent CR per ``agents[]`` APM (the agent inbound and the agent outbound), then
+      one pass-through CR per ``pass_through[]`` tool id.
+
+    Lazy, so a batch writes its entries in order and stops at the first failure.
     """
-    namespace, name = identity_ref(model.agent_id)
+    if isinstance(model, TargetSidePolicyModel):
+        platform_clients = _platform_clients()
+        for spm in model.services:
+            yield spm.service_id, render_target_side(spm, platform_clients=platform_clients)
+        return
+    if isinstance(model, AgentSidePolicyModel):
+        platform_clients = _platform_clients()
+        for apm in model.agents:
+            yield apm.agent_id, render_agent_side(apm, platform_clients=platform_clients)
+        for tool_id in model.pass_through:
+            yield tool_id, render_pass_through()
+        return
+    raise TypeError(f"no renderer for the policy model {type(model).__name__}")
+
+
+def _build_cr(namespace: str, name: str, policies: ClientPolicies) -> dict:
+    """Build the ``AuthorizationPolicy`` CR body of one entry (Q6a).
+
+    ``metadata.name`` / ``.namespace`` are the CR identity of the entry (``identity_ref`` of its
+    service id, see ``_identified``); ``spec.clientID`` is the DNS-label-safe ``name`` — display /
+    print-column only, since bundle-service matches on name+namespace, never ``clientID``.
+    ``spec.policies`` is exactly the two request packages; the list is atomic under
+    server-side apply, so one write replaces both.
+    """
     return {
         "apiVersion": f"{_GROUP}/{_VERSION}",
         "kind": "AuthorizationPolicy",
@@ -120,14 +197,8 @@ def _build_cr(model: AgentPolicyModel) -> dict:
             "scope": "client",
             "clientID": name,
             "policies": [
-                {
-                    "path": "inbound/request.rego",
-                    "content": generate_inbound_rego(model, platform_clients=_platform_clients()),
-                },
-                {
-                    "path": "outbound/request.rego",
-                    "content": generate_outbound_rego(model),
-                },
+                {"path": "inbound/request.rego", "content": policies.inbound},
+                {"path": "outbound/request.rego", "content": policies.outbound},
             ],
         },
     }
@@ -147,10 +218,29 @@ def _dump_cr(namespace: str, name: str, body: dict) -> None:
         dest.write_text(policy["content"])
 
 
-def _upsert_agent(model: AgentPolicyModel) -> None:
-    """Server-side-apply the agent's CR (idempotent), then dump if enabled (Q6b)."""
-    namespace, name = identity_ref(model.agent_id)
-    body = _build_cr(model)
+def _cr_identity(service_id: str) -> tuple[str, str] | None:
+    """The ``(namespace, name)`` of the CR of ``service_id``, or ``None`` (logged) when the id gives
+    no CR identity: the service cannot have a CR, so the write skips it (see the module docstring)."""
+    try:
+        return identity_ref(service_id)
+    except ValueError as e:
+        logger.warning("skipped a service that cannot have a CR: %s", e)
+        return None
+
+
+def _identified(model: PolicyModel) -> Iterator[tuple[str, str, ClientPolicies]]:
+    """``(namespace, name, packages)`` for each entry of ``model`` that can have a CR, in order: the
+    CR identity is parsed one time here. An entry that cannot have a CR is skipped (``_cr_identity``)."""
+    for service_id, policies in _entries(model):
+        identity = _cr_identity(service_id)
+        if identity is not None:
+            yield *identity, policies
+
+
+def _upsert(namespace: str, name: str, policies: ClientPolicies) -> None:
+    """Server-side-apply the CR ``namespace/name`` of one entry (idempotent), then dump if enabled
+    (Q6b)."""
+    body = _build_cr(namespace, name, policies)
     _api.patch_namespaced_custom_object(
         group=_GROUP,
         version=_VERSION,
@@ -166,9 +256,17 @@ def _upsert_agent(model: AgentPolicyModel) -> None:
         _dump_cr(namespace, name, body)
 
 
-def _delete_agent(agent_id: str) -> None:
-    """Delete the agent's CR (idempotent: k8s 404 == success), then dump-clear (Q6c)."""
-    namespace, name = identity_ref(agent_id)
+def _apply(model: PolicyModel) -> None:
+    """``POST /policy``: upsert one CR per entry of ``model``.
+
+    No rollback: a failure stops the batch, and the entries already written stay written (SSA is
+    idempotent, so a retry re-applies the whole set). An entry that cannot have a CR is skipped."""
+    for namespace, name, policies in _identified(model):
+        _upsert(namespace, name, policies)
+
+
+def _delete_cr(namespace: str, name: str) -> None:
+    """Delete one CR (idempotent: a k8s 404 is success), then dump-clear its tree (Q6c)."""
     try:
         _api.delete_namespaced_custom_object(
             group=_GROUP,
@@ -184,26 +282,37 @@ def _delete_agent(agent_id: str) -> None:
         shutil.rmtree(get_output_dir() / namespace / name, ignore_errors=True)
 
 
+def _managed_crs() -> list[tuple[str, str]]:
+    """``(namespace, name)`` of every CR that carries the managed-by label, cluster-wide.
+
+    A CR without the label is never listed, so it is never touched."""
+    listing = _api.list_cluster_custom_object(_GROUP, _VERSION, _PLURAL, label_selector=_MANAGED_BY_SELECTOR)
+    return [(item["metadata"]["namespace"], item["metadata"]["name"]) for item in listing.get("items", [])]
+
+
+def _replace(model: PolicyModel) -> None:
+    """``PUT /policy``: upsert every entry, then delete every other managed CR.
+
+    The delete step runs only after every upsert succeeded: an upsert failure propagates before
+    the list, so nothing is deleted. A per-item 404 (a concurrent delete) is success. An entry that
+    cannot have a CR is skipped."""
+    keep: set[tuple[str, str]] = set()
+    for namespace, name, policies in _identified(model):
+        _upsert(namespace, name, policies)
+        keep.add((namespace, name))
+    for namespace, name in _managed_crs():
+        if (namespace, name) not in keep:
+            _delete_cr(namespace, name)
+
+
 def _delete_all() -> None:
     """Delete every CR carrying the managed-by label, cluster-wide (Q6c).
 
     A per-item 404 (a concurrent delete race) is tolerated; other API failures
     propagate (mapped to 502). If the dump is on, clear the dumped tree too.
     """
-    listing = _api.list_cluster_custom_object(_GROUP, _VERSION, _PLURAL, label_selector=_MANAGED_BY_SELECTOR)
-    for item in listing.get("items", []):
-        meta = item["metadata"]
-        try:
-            _api.delete_namespaced_custom_object(
-                group=_GROUP,
-                version=_VERSION,
-                namespace=meta["namespace"],
-                plural=_PLURAL,
-                name=meta["name"],
-            )
-        except ApiException as e:
-            if e.status != 404:
-                raise
+    for namespace, name in _managed_crs():
+        _delete_cr(namespace, name)
     if _dump_enabled():
         # Clear the dumped tree's contents without removing the mount point itself.
         for child in get_output_dir().glob("*"):
@@ -216,13 +325,15 @@ def _delete_all() -> None:
 def _run_write(op) -> Response:
     """Run a write op, mapping failures to HTTP responses.
 
-    - ``ValueError`` — a malformed / namespace-less ``agent_id`` from
-      ``identity_ref`` — maps to **400** (its message names the bad id).
+    - ``ValueError`` — a malformed / namespace-less service id from
+      ``identity_ref`` — maps to **400** (its message names the bad id). Each route skips such an
+      id first (``_cr_identity``), so this is a guard only.
     - ``ApiException`` — a Kubernetes API failure — maps to **502**.
     - ``OSError`` — the additive rego dump's filesystem write — maps to **502**.
 
-    400 is reserved for a malformed ``agent_id``; 502 strictly for Kubernetes
-    API failures and the additive dump. The two are never conflated.
+    400 is reserved for a malformed id; 502 strictly for Kubernetes API failures
+    and the additive dump. The two are never conflated. A body that does not parse
+    (a wrong or missing tag) never gets here: FastAPI returns **422**.
     """
     try:
         op()
@@ -241,35 +352,73 @@ def _run_write(op) -> Response:
 app = FastAPI()
 
 
+def _entry_fields(side: type[PolicyModel]) -> frozenset[str]:
+    """The entry fields of ``side``: every field but the tag."""
+    return frozenset(side.model_fields.keys() - PolicyModel.model_fields.keys())
+
+
+# The entry fields of each side, keyed by the tag value.
+_SIDE_FIELDS: dict[str, frozenset[str]] = {
+    EnforcementSide.TARGET_SIDE.value: _entry_fields(TargetSidePolicyModel),
+    EnforcementSide.AGENT_SIDE.value: _entry_fields(AgentSidePolicyModel),
+}
+
+
+def _one_side_only(body: object) -> object:
+    """Reject a body that carries the entry fields of another side (422).
+
+    The models ignore unknown fields, so pydantic alone would drop, for example, the ``services``
+    of an agent-side body without a word, and a ``PUT`` would then delete their CRs. A body with no
+    tag, or with an unknown tag, goes on to the discriminator, which rejects it."""
+    if isinstance(body, dict) and isinstance(side := body.get("enforcement_side"), str) and side in _SIDE_FIELDS:
+        foreign = sorted(
+            field for other, fields in _SIDE_FIELDS.items() if other != side for field in fields & body.keys()
+        )
+        if foreign:
+            raise ValueError(f"the {side} policy model has no {', '.join(foreign)}: the body mixes the sides")
+    return body
+
+
+def _no_agent_pass_through(model: PolicyModel) -> PolicyModel:
+    """Reject an agent-side model that names an agent also as a pass-through tool (422).
+
+    Fail closed: written in order, the pass-through CR would replace the agent CR and open the
+    agent. The PCE never builds such a model (an agent's APM and a tool's pass-through come from
+    SPMs of different service types)."""
+    if isinstance(model, AgentSidePolicyModel):
+        both = sorted({apm.agent_id for apm in model.agents} & set(model.pass_through))
+        if both:
+            raise ValueError(f"an agent cannot also be a pass-through: {', '.join(both)}")
+    return model
+
+
+# The body of POST / PUT /policy. The discriminated union makes the tag mandatory: a body with a
+# wrong or missing ``enforcement_side`` is a 422 (pydantic). The two validators add the 422 of a body
+# that mixes the sides, and of an agent that is also a pass-through.
+_PolicyBody = Annotated[AnyPolicyModel, BeforeValidator(_one_side_only), AfterValidator(_no_agent_pass_through)]
+
+
 @app.post("/policy", status_code=204)
-def upsert_policy(policy: PolicyModel):
-    def _op():
-        # A malformed agent_id aborts the batch with a 400 naming it; agents
-        # already applied before that point stay written (no rollback). The
-        # batch is also unbounded in size. This partial-write semantic is
-        # acceptable for the current caller (store-derived, pre-validated ids;
-        # SSA is idempotent so a retry re-applies the whole set) and is tracked
-        # for hardening in s-and-p-team/cortex#143.
-        for agent in policy.agents:
-            _upsert_agent(agent)
-
-    return _run_write(_op)
+def upsert_policy(policy: _PolicyBody):
+    return _run_write(lambda: _apply(policy))
 
 
-@app.post("/policy/agents/{agent_id}", status_code=204)
-def upsert_agent(agent_id: str, model: AgentPolicyModel):
-    # The ``{agent_id}`` path segment is intentionally ignored: the request
-    # body is authoritative. ``_upsert_agent`` derives namespace/name from
-    # ``model.agent_id`` (via ``identity_ref``), the single source of truth, so
-    # a mismatched or placeholder URL segment (e.g. ``/policy/agents/ignored``)
-    # never affects which CR is written. The segment is kept only to give the
-    # route a RESTful shape.
-    return _run_write(lambda: _upsert_agent(model))
+@app.put("/policy", status_code=204)
+def replace_policy(policy: _PolicyBody):
+    return _run_write(lambda: _replace(policy))
 
 
-@app.delete("/policy/agents/{agent_id}", status_code=204)
-def delete_agent(agent_id: str):
-    return _run_write(lambda: _delete_agent(agent_id))
+# The id is a SPIFFE URI or ``<ns>/<name>``: the server decodes the library's ``%2F`` back to ``/``
+# before routing, so the route takes ``{service_id:path}`` (a single-segment ``{service_id}`` never
+# matches it — HTTP 404).
+@app.delete("/policy/services/{service_id:path}", status_code=204)
+def delete_service(service_id: str):
+    def _delete() -> None:
+        identity = _cr_identity(service_id)
+        if identity is not None:
+            _delete_cr(*identity)
+
+    return _run_write(_delete)
 
 
 @app.delete("/policy", status_code=204)

@@ -17,6 +17,21 @@ data:
   LLM_BASE_URL: "https://openai-compatible-endpoint.example.com/v1"
   LLM_MODEL: "your-model-name"
   AIAC_AC_MODEL: "RBAC"
+  # Enforcement side (D16, D29): where the access to each callee is checked.
+  #   target-side (default): each callee (agent or tool) checks the access to
+  #     itself in its own inbound OPA, from its own CR.
+  #   agent-side (legacy): each agent's outbound OPA checks the agent's calls
+  #     to tools; each tool gets a pass-through CR.
+  # The Controller reads it at start and stops on an unknown value. Set it at
+  # deploy time: a live switch is not supported, and a change is a clean
+  # redeploy of AIAC (k8s/opa-kind-runbook.md, "Set the enforcement side").
+  # Not the same as AIAC_AC_MODEL above, which names a modeling
+  # paradigm (RBAC/ABAC/REBAC) and is read by no code.
+  AIAC_ENFORCEMENT_SIDE: "target-side"
+  # Namespace of the bundle service and its `default` global combiner CR (D20).
+  # At every start the Controller reads that CR (start check #4, D30) and stops
+  # if a request package still allows a pod that has no client CR.
+  AIAC_BUNDLE_SERVICE_NAMESPACE: "rossoctl-system"
   # Per-request LLM timeout (seconds): a stalled connection raises after this instead
   # of wedging /apply forever. Timeouts are transient, so _structured_call retries them
   # up to LLM_MAX_RETRIES (default 3, below) with exponential backoff before surfacing.
@@ -30,6 +45,19 @@ data:
   LLM_MAX_RETRIES: "3"
   LLM_RETRY_BACKOFF_MIN: "1"
   LLM_RETRY_BACKOFF_MAX: "30"
+  # Root-logger level for the Agent's own logs (aiac.shared.logging_config), applied by
+  # BOTH the aiac-init container and the Controller. INFO is what makes the onboarding
+  # trace — "aiac-agent-consumer subscribed to ...", the per-service apply lines — visible
+  # in `kubectl logs deployment/aiac-agent`. Note this is NOT uvicorn's --log-level, which
+  # only governs uvicorn's own access/error loggers and leaves application logs silent.
+  # Accepts DEBUG | INFO | WARNING | ERROR | CRITICAL (case-insensitive) or a number; an
+  # unrecognized value falls back to INFO. This overrides the LOG_LEVEL in aiac-pdp-config
+  # (listed earlier in both containers' envFrom).
+  # Raise to DEBUG when diagnosing an onboarding that never lands:
+  #   kubectl patch configmap aiac-agent-config -n aiac-system --type merge \
+  #     -p '{"data":{"LOG_LEVEL":"DEBUG"}}' \
+  #     && kubectl rollout restart deployment/aiac-agent -n aiac-system
+  LOG_LEVEL: "INFO"
 
 ---
 # Prerequisites: create this Secret before applying this manifest:
@@ -55,9 +83,22 @@ rules:
   - apiGroups: [""]
     resources: ["services"]
     verbs: ["get"]
+  # UC1 onboarding check #2 (D30): the namespace pipeline of the service, in
+  # any service namespace. Read-only, and only this ConfigMap name.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["authbridge-runtime-config"]
+    verbs: ["get"]
   - apiGroups: ["agent.rossoctl.dev"]
     resources: ["agentcards"]
     verbs: ["list"]
+  # Start check #4 (D30): the `default` global combiner CR in the bundle-service
+  # namespace (AIAC_BUNDLE_SERVICE_NAMESPACE). Read-only; the PDP Policy Writer
+  # does every AuthorizationPolicy write.
+  - apiGroups: ["agent.rossoctl.dev"]
+    resources: ["authorizationpolicies"]
+    resourceNames: ["default"]
+    verbs: ["get"]
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -81,6 +122,11 @@ metadata:
   namespace: aiac-system
 spec:
   replicas: 1
+  # Recreate, not RollingUpdate: the PCE lock and the per-service lock are in one process, so two
+  # Controller pods must never run at the same time. Else the new pod's start resync (PUT /policy)
+  # and the old pod's writes race.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: aiac-agent
@@ -106,9 +152,13 @@ spec:
           image: localhost/aiac-agent:local
           imagePullPolicy: Never
           command: ["python", "-m", "aiac.agent.init.wait_and_provision"]
+          # aiac-agent-config comes AFTER aiac-pdp-config so its LOG_LEVEL wins (envFrom: last
+          # source takes precedence) — the init container and the Controller share one level.
           envFrom:
             - configMapRef:
                 name: aiac-pdp-config
+            - configMapRef:
+                name: aiac-agent-config
           # Same hardening baseline as the app container; temp writes go to /tmp.
           securityContext:
             allowPrivilegeEscalation: false
@@ -150,11 +200,27 @@ spec:
           # signal (200 {"status": "ok"} whenever the process is serving).
           # Explicit timeoutSeconds/failureThreshold (not the k8s defaults of 1s/3):
           # the blocking onboard now runs off the event loop (eventbus/consumer.py runs
-          # _handle + compute_and_apply in an executor), so /health stays responsive — but
-          # give the probe generous slack anyway so a momentarily busy loop can never be a
-          # hair-trigger kill. Liveness tolerates ~50s (5 x 10s) of unresponsiveness with a
+          # onboard_and_apply, or _handle + compute_and_apply, in an executor), so /health
+          # stays responsive — but give the probe generous slack anyway so a momentarily
+          # busy loop can never be a hair-trigger kill. Liveness tolerates ~50s (5 x 10s) of unresponsiveness with a
           # 5s per-probe timeout before restarting; readiness just gates traffic, so it can
           # react a little faster.
+          #
+          # Uvicorn serves /health only after the FastAPI lifespan start ends: read the
+          # enforcement side, start check #4 (the combiner, D30), then the resync (D28,
+          # PUT /policy). The startupProbe gives that sequence its own budget —
+          # 30 x 10s = 5 min (it typically takes < 30s) — and holds the liveness and
+          # readiness probes until /health first answers, so a slow resync is not killed
+          # by the liveness probe. A failed start check or resync exits the process: the
+          # container restarts (with the kubelet back-off) and does not wait out this budget.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 7070
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 30
           readinessProbe:
             httpGet:
               path: /health
@@ -171,17 +237,6 @@ spec:
             periodSeconds: 10
             timeoutSeconds: 5
             failureThreshold: 5
-          # Optional per-onboarding default effect for pairs no rule mentions.
-          # Unset/unrecognised => "Deny" (least-privilege, today's behavior).
-          # "Allow" opts an onboarding into permissive-default posture (explicit
-          # DENY rules still override). This is an integration-harness knob today
-          # (patched onto this Deployment before onboarding); it is NOT persisted
-          # on the SPM, so an unrelated recompute re-derives the agent at "Deny"
-          # (see the non-durability caveat in policy/computation/engine.py).
-          # Uncomment to set it deployment-wide:
-          # env:
-          #   - name: AIAC_DEFAULT_EFFECT
-          #     value: "Allow"   # or "Deny"
           envFrom:
             - configMapRef:
                 name: aiac-pdp-config

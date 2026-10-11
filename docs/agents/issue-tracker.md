@@ -34,6 +34,10 @@ The triage-role → label/board mapping is in `docs/agents/triage-labels.md`.
 - **Apply / remove labels**: `gh issue edit <number> -R rossoctl/aiac --add-label "..."` / `--remove-label "..."`.
 - **Close**: `gh issue close <number> -R rossoctl/aiac --comment "..."`.
 
+## Pull requests as a triage surface
+
+**PRs as a request surface: no.** `/triage` reads this flag and covers issues only.
+
 ## Hierarchy
 
 Issues are filtered by `aiac` + cumulative `area:<path>` labels. Use native
@@ -48,7 +52,7 @@ are a **title-prefix** convention — native GitHub *issue types* are not set, s
 The board is the org-level Project **AIAC**, project number **`12`** on the
 `rossoctl` owner (id `PVT_kwDODC4bxc4Bi_vF`) —
 <https://github.com/orgs/rossoctl/projects/12>. Note `rossoctl` also has a
-separate, older **AIAC** Project **#11**, which is *not* this board; always
+separate, older, now-closed **AIAC** Project **#11**, which is *not* this board; always
 address the board by number `12` (its title alone is ambiguous). When you file
 or update an `aiac` issue, add it to the board and set its status:
 

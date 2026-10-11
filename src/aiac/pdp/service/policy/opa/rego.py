@@ -1,10 +1,33 @@
 """Rego package generation for the PDP Policy Writer (OPA).
 
-Translates an ``AgentPolicyModel`` into the two fixed-package Rego strings the
-live AuthBridge embedded OPA plugin evaluates.
+Renders the two request packages of one client CR (``ClientPolicies``) for each
+entry of a policy model. Three CR renderers, one per kind of entry:
+
+- ``render_target_side(spm)`` — target side, one stored SPM: the tool inbound or the
+  agent inbound, and a pass-through outbound (the callee decides);
+- ``render_agent_side(apm)`` — agent side, one APM: the agent inbound and the agent
+  outbound;
+- ``render_pass_through()`` — agent side, one managed tool: a pass-through in both
+  tiers.
+
+Four package kinds:
+
+- **tool inbound** (target side, D26) — ``render_target_side`` of a tool's SPM;
+- **agent inbound** (both sides, D26a) — ``render_target_side`` of an agent's SPM,
+  or ``generate_inbound_rego`` of an APM (agent side); one shared renderer, so one
+  SPM gives the same inbound under both sides (D18b);
+- **agent outbound** (agent side) — ``generate_outbound_rego`` of an APM. Known
+  limit: it denies the agent's A2A and LLM calls through the outbound proxy;
+- **pass-through** (D24) — ``generate_pass_through_rego``: ``allow := true``. Under
+  target side the outbound of every service is one: the callee decides. Under agent
+  side both packages of every managed tool are one.
+
+The target-side render input is the stored SPM of the callee, through
+``project_inbound`` (D18b). The agent-side render input is the APM, which the PCE
+derives. The writer does no join.
 
 Both packages use **fixed** names — ``authbridge.client.inbound.request`` and
-``authbridge.client.outbound.request`` (each ``import rego.v1``). Per-agent
+``authbridge.client.outbound.request`` (each ``import rego.v1``). Per-service
 isolation is at the CR/bundle level (the bundle-service looks a CR up by
 namespace+name), never in the package name. The bundle-service combiner requires
 the exact path ``data.authbridge.client.<tier>``, so no slug ever appears in the
@@ -13,23 +36,44 @@ package name.
 The Rego ``input`` follows the live plugin shape:
 
 - ``input.identity.subject`` — the delegated user (``sub`` claim).
-- ``input.identity.client_id`` — the calling client (inbound) / the agent's own
-  client (outbound).
+- ``input.identity.client_id`` — the calling client: on an agent inbound the
+  source, on a tool inbound the calling agent (or, for UC-1 discovery, the tool's
+  own client).
 - ``input.identity.service_id`` — the downstream target audience the exchanged
-  token was minted for (a full SPIFFE ID); outbound only.
+  token was minted for (a full SPIFFE ID); agent outbound only.
+- ``input.mcp.method`` — the MCP JSON-RPC method (``tools/call``, ``tools/list``,
+  …); tool inbound and agent outbound.
 - ``input.mcp.params.name`` — the **bare** invoked MCP tool name (e.g.
-  ``source-read``); outbound only. A missing ``params.name`` (e.g. ``tools/list``)
-  or an absent ``service_id`` matches nothing and is therefore denied.
+  ``source-read``), carried by ``tools/call``; tool inbound and agent outbound.
 
-**ALLOW/DENY (deny-overrides).** Each gate is emitted twice — an ``*_allow_ok``
-gate driven by the ALLOW scope maps and a symmetric ``*_deny_ok`` gate driven by
-the DENY scope maps. A request is permitted iff every ALLOW gate passes and no
-DENY gate matches::
+**ALLOW gates and DENY gates, always deny by default (D25).** Every rules-based
+package ends with ``default allow := false``: a request that no rule allows is
+denied. A request is permitted iff every ALLOW gate passes and no DENY gate
+matches::
 
-    # inbound
+    # agent inbound
     allow if { subject_allow_ok; source_allow_ok; not subject_deny_ok; not source_deny_ok }
-    # outbound
-    allow if { subject_allow_ok; target_allow_ok; not subject_deny_ok; not target_deny_ok }
+    # tool inbound — tools/call, per invoked tool; the session messages; self-discovery
+    allow if { input.mcp.method == "tools/call"; tool_ok(input.mcp.params.name) }
+    allow if { input.mcp.method in session_methods; some tool in owned_tools; tool_ok(tool) }
+    allow if { input.mcp.method in session_methods; input.identity.client_id == self_client_id }
+    # agent outbound — tools/call, per invoked tool; the session messages
+    allow if { input.mcp.method == "tools/call"; subject_allow_ok; target_allow_ok;
+               not subject_deny_ok; not target_deny_ok }
+    allow if { input.mcp.method in session_methods;
+               some tool in object.get(target_allow_scopes, input.identity.service_id, []); tool_ok(tool) }
+
+**The MCP session.** ``initialize``, ``notifications/initialized``, ``ping`` and
+``tools/list`` carry no tool name. On a tool inbound they are allowed iff at least
+one tool of the service passes ``tool_ok`` (the user gate and the calling-agent
+gate allow it, no deny vetoes it), or the caller is the tool's own client (the
+self-discovery rule of UC-1, checkpoint B1; never ``tools/call``). On an agent
+outbound they are allowed to a target iff at least one tool of that target passes
+``tool_ok``. Every other MCP method, and a request with no method, is denied.
+
+**No request without identity passes a rules-based inbound (D27).** Both inbound
+packages need a subject that holds a role. A tool inbound has no platform-client
+bypass; an agent inbound bypasses the source gate only (``platform_clients``).
 
 The identity maps (``subject_roles`` / ``source_roles``) are **effect-agnostic**,
 so a principal that appears only in a DENY rule still resolves and its
@@ -38,10 +82,33 @@ prohibition fires.
 
 import json
 import re
+from typing import Literal, NamedTuple
 
-from aiac.policy.model.models import AgentPolicyModel, PolicyRule, RuleEffect
+from aiac.idp.configuration.models import Scope, ServiceType
+from aiac.policy.model.models import AgentPolicyModel, PolicyRule, ServicePolicyModel
+from aiac.policy.model.projection import InboundProjection, project_inbound
 
-__all__ = ["identity_ref", "generate_inbound_rego", "generate_outbound_rego"]
+__all__ = [
+    "ClientPolicies",
+    "identity_ref",
+    "generate_inbound_rego",
+    "generate_outbound_rego",
+    "generate_pass_through_rego",
+    "render_agent_side",
+    "render_pass_through",
+    "render_target_side",
+]
+
+# The platform source clients of the agent inbound's bypass rules (Q5) when none are configured:
+# dropping the bypass would deny end-user traffic, which carries the platform client.
+DEFAULT_PLATFORM_CLIENTS: tuple[str, ...] = ("rossoctl",)
+
+# The two request tiers of a client CR, and their fixed package headers (Q2).
+Tier = Literal["inbound", "outbound"]
+_PACKAGES: dict[str, str] = {
+    "inbound": "package authbridge.client.inbound.request\nimport rego.v1",
+    "outbound": "package authbridge.client.outbound.request\nimport rego.v1",
+}
 
 _SPIFFE_RE = re.compile(r"^spiffe://[^/]+/ns/(?P<ns>[^/]+)/sa/(?P<name>[^/]+)$")
 
@@ -54,8 +121,8 @@ def _valid_label(segment: str) -> bool:
     return len(segment) <= 63 and _DNS1123_LABEL_RE.fullmatch(segment) is not None
 
 
-def identity_ref(agent_id: str) -> tuple[str, str]:
-    """``(namespace, name)`` for CR placement.
+def identity_ref(service_id: str) -> tuple[str, str]:
+    """``(namespace, name)`` of the CR of the service (agent or tool) whose clientId is ``service_id``.
 
     Accepts a SPIFFE URI (``spiffe://<trust-domain>/ns/<ns>/sa/<name>``) or a
     plain ``<ns>/<name>``. Both segments are validated as DNS-1123 labels
@@ -65,22 +132,34 @@ def identity_ref(agent_id: str) -> tuple[str, str]:
     ``github-agent`` with no ``/``) or either segment is not a valid label —
     there is **no** fallback.
     """
-    match = _SPIFFE_RE.match(agent_id)
+    match = _SPIFFE_RE.match(service_id)
     if match:
         namespace, name = match["ns"], match["name"]
     else:
-        parts = agent_id.split("/")
+        parts = service_id.split("/")
         if len(parts) != 2:
             raise ValueError(
-                f"agent_id {agent_id!r} has no derivable namespace (expected "
+                f"service id {service_id!r} has no derivable namespace (expected "
                 "SPIFFE spiffe://td/ns/<ns>/sa/<name> or plain <ns>/<name>)"
             )
         namespace, name = parts
     if not _valid_label(namespace) or not _valid_label(name):
         raise ValueError(
-            f"agent_id {agent_id!r} yields invalid DNS-1123 label(s): namespace={namespace!r}, name={name!r}"
+            f"service id {service_id!r} yields invalid DNS-1123 label(s): namespace={namespace!r}, name={name!r}"
         )
     return namespace, name
+
+
+def _lookup(var: str, *keys: str) -> str:
+    """Render a read of the map ``var`` at ``keys`` as ``object.get`` with an empty default.
+
+    An empty map renders as ``{}`` (``_render_map``), and OPA 1.21 types ``{}`` as an object with
+    no keys: a direct index ``var[key]`` into it is a type error (``undefined ref``) that stops the
+    whole bundle from activating, so the sidecar denies every request. ``object.get`` takes any
+    object, and a missing key gives the default ``[]``, which matches nothing — the same result as
+    the undefined index. Two keys use the path form ``object.get(var, [k1, k2], [])``."""
+    key = keys[0] if len(keys) == 1 else "[" + ", ".join(keys) + "]"
+    return f"object.get({var}, {key}, [])"
 
 
 def _render_list(var: str, values: list[str]) -> str:
@@ -93,10 +172,14 @@ def _render_list(var: str, values: list[str]) -> str:
 
 
 def _render_map(var: str, mapping: dict[str, list[str]]) -> str:
-    """Render ``{var} := { "key": ["a", "b"], ... }`` as Rego (empty-safe: ``{}``).
+    """Render ``{var} := { "key": ["a", "b"], ... }`` as Rego (empty case: ``{}``).
 
     Keys and values are emitted via ``json.dumps`` so quotes/newlines/backslashes are escaped
-    (JSON-compatible Rego string syntax) — this prevents Rego injection / broken output."""
+    (JSON-compatible Rego string syntax) — this prevents Rego injection / broken output.
+
+    An empty mapping renders as a bare ``{}``, which is NOT safe to index
+    directly — every read of a map rendered here must go through :func:`_lookup`.
+    See that function for why."""
     if not mapping:
         return f"{var} := {{}}"
     lines = [f"{var} := {{"]
@@ -107,8 +190,26 @@ def _render_map(var: str, mapping: dict[str, list[str]]) -> str:
     return "\n".join(lines)
 
 
+def _render_nested_map(var: str, mapping: dict[str, dict[str, list[str]]]) -> str:
+    """Render ``{var} := { "key": { "inner": ["a", "b"], ... }, ... }`` as Rego (empty-safe: ``{}``).
+
+    The two-level counterpart of ``_render_map``, with the same ``json.dumps`` escaping of every
+    key and value."""
+    if not mapping:
+        return f"{var} := {{}}"
+    lines = [f"{var} := {{"]
+    for key, inner_map in mapping.items():
+        lines.append(f"    {json.dumps(key)}: {{")
+        for inner_key, values in inner_map.items():
+            inner = ", ".join(json.dumps(v) for v in values)
+            lines.append(f"        {json.dumps(inner_key)}: [{inner}],")
+        lines.append("    },")
+    lines.append("}")
+    return "\n".join(lines)
+
+
 def _deprefix(scope) -> str:
-    """De-prefix an outbound scope value to the bare MCP tool name.
+    """De-prefix a scope value to the bare MCP tool name (agent outbound, tool inbound).
 
     Provisioned scope names are prefixed with their owning workload
     (``github-tool.source-read``, ``github-agent.source_operations``), but the
@@ -142,18 +243,46 @@ def _group_rules(rules: list[PolicyRule]) -> dict[str, list[str]]:
 
 
 def _group_rules_deprefixed(rules: list[PolicyRule]) -> dict[str, list[str]]:
-    """Like ``_group_rules`` but de-prefixes each scope value (outbound only).
+    """Like ``_group_rules`` but de-prefixes each scope value.
 
-    Groups ``{role.name: [_deprefix(scope), ...]}`` — used for the outbound
-    ``subject_role_allow_scopes`` / ``subject_role_deny_scopes`` /
-    ``agent_role_scopes`` maps, whose values must match the bare
-    ``input.mcp.params.name``."""
+    Groups ``{role.name: [_deprefix(scope), ...]}`` — used for the agent outbound
+    ``agent_role_scopes`` map and for the four role maps of the tool inbound,
+    whose values must match the bare ``input.mcp.params.name``."""
     grouped: dict[str, list[str]] = {}
     for rule in rules:
         scopes = grouped.setdefault(rule.role.name, [])
         value = _deprefix(rule.scope)
         if value not in scopes:
             scopes.append(value)
+    return grouped
+
+
+def _group_rules_by_target(rules: list[PolicyRule]) -> dict[str, dict[str, list[str]]]:
+    """Group the outbound subject rules into ``{role.name: {target: [tool, ...]}}`` (LIM-02).
+
+    A bare tool name alone does not name a tool: two targets can each have a ``source-read``. So
+    each rule decides only on the copy of the scope that it names (``scope.serviceId``): the key is
+    the **full** service id of the copy's owner (it matches ``input.identity.service_id``), and the
+    tool is the de-prefixed name of that copy, so it is the value that the target gate of that
+    target has. A rule of another scope (another scope id) with the same bare name never decides
+    there. A scope with no ``serviceId`` names no target.
+
+    A shared scope (D32) has one copy for each owner, and each copy has the user rules of its own
+    SPM. So a grant or a deny decides only on its own copy, as under target side: a grant on one copy
+    must not admit the user on a copy whose SPM has no grant (fail-open), and a deny on one copy must
+    not block the user on a copy whose SPM has no deny. A copy with no rule gets no entry, also when
+    the agent may call that copy. The PCE keeps one outbound subject rule for each copy (role, scope
+    id, copy owner, effect), so a rule that two copies have is in the APM for each copy, and each
+    copy gets its entry. First-seen order is kept.
+    """
+    grouped: dict[str, dict[str, list[str]]] = {}
+    for rule in rules:
+        if not rule.scope.serviceId:
+            continue
+        tools = grouped.setdefault(rule.role.name, {}).setdefault(rule.scope.serviceId, [])
+        value = _deprefix(rule.scope)
+        if value not in tools:
+            tools.append(value)
     return grouped
 
 
@@ -176,7 +305,7 @@ def _name_map_deprefixed(mapping) -> dict[str, list[str]]:
     return {key: [_deprefix(scope) for scope in scopes] for key, scopes in mapping.items()}
 
 
-# --- inbound gate templates -------------------------------------------------
+# --- agent inbound gate templates -------------------------------------------
 #
 # The inbound subject gate is emitted twice against the SAME shape: an
 # ``*_allow_ok`` gate reads the ALLOW scope map, a symmetric ``*_deny_ok`` gate
@@ -190,8 +319,8 @@ def _name_map_deprefixed(mapping) -> dict[str, list[str]]:
 def _inbound_subject_gate(gate: str, scope_map: str) -> str:
     return (
         f"{gate} if {{\n"
-        "    some role in subject_roles[input.identity.subject]\n"
-        f"    some scope in {scope_map}[role]\n"
+        f"    some role in {_lookup('subject_roles', 'input.identity.subject')}\n"
+        f"    some scope in {_lookup(scope_map, 'role')}\n"
         "    scope in agent_scopes\n"
         "}"
     )
@@ -210,8 +339,8 @@ def _inbound_source_allow_gate(platform_clients: tuple[str, ...]) -> str:
         rules.append(f"source_allow_ok if {{ input.identity.client_id == {json.dumps(client)} }}")
     rules.append(
         "source_allow_ok if {\n"
-        "    some role in source_roles[input.identity.client_id]\n"
-        "    some scope in source_role_allow_scopes[role]\n"
+        f"    some role in {_lookup('source_roles', 'input.identity.client_id')}\n"
+        f"    some scope in {_lookup('source_role_allow_scopes', 'role')}\n"
         "    scope in agent_scopes\n"
         "}"
     )
@@ -226,73 +355,232 @@ def _inbound_source_deny_gate() -> str:
     """
     return (
         "source_deny_ok if {\n"
-        "    some role in source_roles[input.identity.client_id]\n"
-        "    some scope in source_role_deny_scopes[role]\n"
+        f"    some role in {_lookup('source_roles', 'input.identity.client_id')}\n"
+        f"    some scope in {_lookup('source_role_deny_scopes', 'role')}\n"
         "    scope in agent_scopes\n"
         "}"
     )
 
 
-# --- outbound gate templates ------------------------------------------------
+# --- agent outbound gate templates (agent side) ------------------------------
 #
-# The outbound decision is a per-tool two-gate AND, both keyed on the invoked
-# tool ``input.mcp.params.name`` (the delegated user reaching a downstream
-# target):
-#   subject gate    — the delegated user's role admits the invoked tool
-#   capability gate — the target service admits the invoked tool
-# Each gate is emitted twice (allow/deny). ``allow`` is deny-overrides: both
-# ALLOW gates pass on the invoked tool and neither DENY gate matches it.
+# The outbound decision is a per-tool two-gate AND (the delegated user reaching a
+# downstream target):
+#   subject gate    — the delegated user's role admits the tool on this target
+#   capability gate — the target service admits the tool
+# Both gates are keyed by the target (``input.identity.service_id``): a bare tool
+# name alone does not name a tool, because two targets can each have one with
+# that name (LIM-02).
+# Each gate is emitted twice (allow/deny) as a Rego FUNCTION over a bare tool
+# name, so ``tools/call`` (the invoked ``input.mcp.params.name``) and the MCP
+# session (any tool of the target) use one definition of the per-tool check.
+# ``allow`` holds only when both ALLOW gates pass on the tool and neither DENY gate
+# matches it.
+
+# The MCP messages that carry no tool name and open / keep a session with a tool (the agent
+# outbound and the tool inbound).
+_SESSION_METHODS = ("initialize", "notifications/initialized", "ping", "tools/list")
 
 
-def _outbound_subject_gate(gate: str, scope_map: str) -> str:
+def _render_session_methods() -> str:
+    return "session_methods := {" + ", ".join(json.dumps(m) for m in _SESSION_METHODS) + "}"
+
+
+def _outbound_subject_gate(fn: str, gate: str, scope_map: str) -> str:
     return (
-        f"{gate} if {{\n"
-        "    some role in subject_roles[input.identity.subject]\n"
-        f"    input.mcp.params.name in {scope_map}[role]\n"
+        f"{fn}(tool) if {{\n"
+        f"    some role in {_lookup('subject_roles', 'input.identity.subject')}\n"
+        f"    tool in {_lookup(scope_map, 'role', 'input.identity.service_id')}\n"
+        "}\n"
+        f"{gate} if {{ {fn}(input.mcp.params.name) }}"
+    )
+
+
+def _outbound_target_gate(fn: str, gate: str, scope_map: str) -> str:
+    return (
+        f"{fn}(tool) if {{\n    tool in {_lookup(scope_map, 'input.identity.service_id')}\n}}\n"
+        f"{gate} if {{ {fn}(input.mcp.params.name) }}"
+    )
+
+
+def _outbound_tool_ok() -> str:
+    """The full per-tool check as one function: ``tool_ok(tool)``."""
+    return (
+        "tool_ok(tool) if {\n"
+        "    subject_allows(tool)\n"
+        "    target_allows(tool)\n"
+        "    not subject_denies(tool)\n"
+        "    not target_denies(tool)\n"
         "}"
     )
 
 
-def _outbound_target_gate(gate: str, scope_map: str) -> str:
-    return f"{gate} if {{\n    input.mcp.params.name in {scope_map}[input.identity.service_id]\n}}"
-
-
-# --- trailing decision block (the only thing default_effect changes) --------
+# --- trailing decision block -------------------------------------------------
 #
 # CRITICAL: the generator assumes disjoint ALLOW/DENY per (role, scope). A
 # genuine grant/deny overlap on the same pair is an upstream policy conflict
 # surfaced as HTTP 422 (PRB ``PolicyContradictionError``) and is NEVER
-# reconciled here. The ``allow := false if { <deny> }`` rules below are not
-# conflict reconciliation: they give an explicit deny precedence over a
-# permissive default, and resolve co-occurring-but-disjoint denies at request
-# time (a subject holding multiple roles; the outbound two-gate decision) —
-# each individual (role, scope) stays allow-XOR-deny.
+# reconciled here. The inline ``not …_deny_ok`` guards resolve
+# co-occurring-but-disjoint denies at request time (a subject holding multiple
+# roles; the outbound two-gate decision) — each individual (role, scope) stays
+# allow-XOR-deny.
 
 
-def _decision_block(default_effect: RuleEffect, allow_body: str, deny_gates: tuple[str, ...]) -> str:
-    """Render the trailing ``allow`` decision — the *only* part that varies by mode.
-
-    ``DENY`` (least-privilege) reproduces today's output byte-for-byte:
-    ``default allow := false`` plus the single ``allow if { <allow_body> }`` rule
-    (an allow-conjunction with inline ``not …_deny_ok`` guards).
-
-    ``ALLOW`` opens the default and lets explicit denies override: ``default
-    allow := true`` plus one ``allow := false if { <gate> }`` rule per deny gate.
-    A literal flip of the constant alone is insufficient — an incremental
-    ``allow if { … }`` body can only push ``allow`` toward ``true``, so the deny
-    guards must become separate ``allow := false if`` rules to pull it back down
-    (deny-overrides over a permissive default)."""
-    if default_effect == RuleEffect.ALLOW:
-        lines = ["default allow := true"]
-        lines += [f"allow := false if {{ {gate} }}" for gate in deny_gates]
-        return "\n".join(lines)
-    return "default allow := false\n" + f"allow if {{ {allow_body} }}"
+def _decision_block(*allow_bodies: str) -> str:
+    """Render the trailing ``allow`` decision: ``default allow := false`` plus one
+    ``allow if { <body> }`` rule per body (each an allow-conjunction with inline ``not …_deny_ok``
+    guards). The default is always DENY — a request that no rule allows is denied."""
+    return "\n".join(["default allow := false"] + [f"allow if {{ {body} }}" for body in allow_bodies])
 
 
-def generate_inbound_rego(model: AgentPolicyModel, platform_clients: tuple[str, ...] = ("rossoctl",)) -> str:
-    """Render the fixed ``authbridge.client.inbound.request`` Rego package.
+class ClientPolicies(NamedTuple):
+    """The two request packages of one client CR (D20): ``inbound/request.rego`` and
+    ``outbound/request.rego``."""
 
-    Gates a caller reaching the agent. The decision is deny-overrides:
+    inbound: str
+    outbound: str
+
+
+# --- tool inbound (target side, D26) -----------------------------------------
+#
+# Today's agent-outbound per-tool check, moved to the callee. The callee is the key (the CR
+# belongs to the tool), so there is no ``target_*_scopes[input.identity.service_id]`` map. Two
+# gates, each a pair of functions over a bare tool name: the user gate
+# (``input.identity.subject``) and the calling-agent gate (``input.identity.client_id``).
+
+
+def _tool_gate(fn: str, identity_map: str, identity_field: str, scope_map: str) -> str:
+    return (
+        f"{fn}(tool) if {{\n"
+        f"    some role in {_lookup(identity_map, f'input.identity.{identity_field}')}\n"
+        f"    tool in {_lookup(scope_map, 'role')}\n"
+        "}"
+    )
+
+
+def _tool_inbound_rego(spm: ServicePolicyModel) -> str:
+    """Render the tool inbound package — "who may call which tool of this service" (D26).
+
+    ``tool_ok(tool)``: the user gate allows the tool, the calling-agent gate allows it, and
+    neither gate denies it. ``tools/call`` is checked on the invoked tool; a session message is
+    allowed iff some tool of the service (``owned_tools``) passes ``tool_ok``, or the caller is the
+    tool's own client (``self_client_id`` = the SPM ``service_id``; the UC-1 discovery token is
+    minted as that client — checkpoint B1). Both gates are mandatory: no platform-client bypass,
+    and a request with no identity is denied (D27).
+
+    A service that owns no tool (the bootstrap CR before discovery) gets no session rule over
+    ``owned_tools``: that rule can never match, and OPA 1.21 rejects a loop over an empty array
+    literal (``some tool in []``) as a type error that stops the whole bundle from activating.
+    """
+    projection = project_inbound(spm)
+    owned_tools = _render_list("owned_tools", [_deprefix(scope) for scope in spm.owned_scopes])
+    owned_session = "input.mcp.method in session_methods; some tool in owned_tools; tool_ok(tool)"
+    declarations = "\n".join(
+        [
+            _render_map("subject_roles", _name_map(projection.subject_roles)),
+            _render_map("source_roles", _name_map(projection.source_roles)),
+            _render_map("subject_role_allow_scopes", _group_rules_deprefixed(projection.subject_allow_rules)),
+            _render_map("subject_role_deny_scopes", _group_rules_deprefixed(projection.subject_deny_rules)),
+            _render_map("source_role_allow_scopes", _group_rules_deprefixed(projection.source_allow_rules)),
+            _render_map("source_role_deny_scopes", _group_rules_deprefixed(projection.source_deny_rules)),
+            _render_session_methods(),
+            f"self_client_id := {json.dumps(spm.service_id)}",
+        ]
+    )
+    rules = "\n".join(
+        [
+            _tool_gate("subject_allows", "subject_roles", "subject", "subject_role_allow_scopes"),
+            _tool_gate("subject_denies", "subject_roles", "subject", "subject_role_deny_scopes"),
+            _tool_gate("source_allows", "source_roles", "client_id", "source_role_allow_scopes"),
+            _tool_gate("source_denies", "source_roles", "client_id", "source_role_deny_scopes"),
+            "tool_ok(tool) if {\n"
+            "    subject_allows(tool)\n"
+            "    source_allows(tool)\n"
+            "    not subject_denies(tool)\n"
+            "    not source_denies(tool)\n"
+            "}",
+            _decision_block(
+                'input.mcp.method == "tools/call"; tool_ok(input.mcp.params.name)',
+                *([owned_session] if spm.owned_scopes else []),
+                "input.mcp.method in session_methods; input.identity.client_id == self_client_id",
+            ),
+        ]
+    )
+    return "\n\n".join([_PACKAGES["inbound"], owned_tools, declarations, rules]) + "\n"
+
+
+def render_target_side(
+    spm: ServicePolicyModel, platform_clients: tuple[str, ...] = DEFAULT_PLATFORM_CLIENTS
+) -> ClientPolicies:
+    """Render the two request packages of the target-side CR of ``spm``'s service.
+
+    The stored SPM is the render input; the writer does no join. The inbound is the tool inbound
+    (D26) or the agent inbound (D26a), by ``spm.service_type``; ``platform_clients`` feeds the
+    agent inbound's bypass only. The outbound is a pass-through (D24): the callee decides.
+    """
+    if spm.service_type == ServiceType.TOOL:
+        inbound = _tool_inbound_rego(spm)
+    else:
+        inbound = _agent_inbound_rego(spm.owned_scopes, project_inbound(spm), platform_clients)
+    return ClientPolicies(inbound=inbound, outbound=generate_pass_through_rego("outbound"))
+
+
+def generate_pass_through_rego(tier: Tier) -> str:
+    """Render the pass-through package of ``tier`` (D24): the header and ``allow := true``.
+
+    The pass-throughs are the only ALLOW packages (D25). Under target side the outbound of every
+    service is one: the callee decides."""
+    return f"{_PACKAGES[tier]}\n\nallow := true\n"
+
+
+def render_agent_side(
+    apm: AgentPolicyModel, platform_clients: tuple[str, ...] = DEFAULT_PLATFORM_CLIENTS
+) -> ClientPolicies:
+    """Render the two request packages of the agent-side CR of ``apm``'s agent.
+
+    The APM is the render input (the PCE derives it; the writer does no join). The inbound is the
+    agent inbound (agent-level, D26a); ``platform_clients`` feeds its bypass. The outbound is the
+    agent outbound: the per-tool checks and the MCP session rule. Known limit: it denies the
+    agent's A2A and LLM calls through the outbound proxy (``b435aa1``).
+    """
+    return ClientPolicies(
+        inbound=generate_inbound_rego(apm, platform_clients=platform_clients),
+        outbound=generate_outbound_rego(apm),
+    )
+
+
+def render_pass_through() -> ClientPolicies:
+    """Render the two request packages of a pass-through CR: a pass-through in both tiers (D24).
+
+    Agent side: the CR of each managed tool (``pass_through[]``). AIAC checks nothing on it, but a
+    pod with no CR is denied (D20), also on its outbound."""
+    return ClientPolicies(
+        inbound=generate_pass_through_rego("inbound"), outbound=generate_pass_through_rego("outbound")
+    )
+
+
+def generate_inbound_rego(model: AgentPolicyModel, platform_clients: tuple[str, ...] = DEFAULT_PLATFORM_CLIENTS) -> str:
+    """Render the agent inbound package (``authbridge.client.inbound.request``) from an APM.
+
+    The agent side input. Under target side, ``render_target_side`` renders the same package from
+    the agent's SPM; both call one renderer, so one SPM gives the same inbound under both sides
+    (D18b). See ``_agent_inbound_rego`` for the gates.
+    """
+    gates = InboundProjection(
+        subject_allow_rules=model.inbound_subject_allow_rules,
+        subject_deny_rules=model.inbound_subject_deny_rules,
+        source_allow_rules=model.inbound_source_allow_rules,
+        source_deny_rules=model.inbound_source_deny_rules,
+        subject_roles=model.subject_roles,
+        source_roles=model.source_roles,
+    )
+    return _agent_inbound_rego(model.agent_scopes, gates, platform_clients)
+
+
+def _agent_inbound_rego(agent_scopes: list[Scope], gates: InboundProjection, platform_clients: tuple[str, ...]) -> str:
+    """Render the agent inbound package — "who may call this agent" (agent-level, D26a).
+
+    Gates a caller reaching the agent. A matching DENY gate blocks the request:
     ``allow`` requires ``subject_allow_ok`` (the subject holds a role granting
     >=1 of ``agent_scopes`` via the ALLOW map) AND ``source_allow_ok``, and
     fires only when neither ``subject_deny_ok`` nor ``source_deny_ok`` matches.
@@ -300,29 +588,18 @@ def generate_inbound_rego(model: AgentPolicyModel, platform_clients: tuple[str, 
     ``source_allow_ok`` passes when there is no calling ``client_id`` (end-user
     traffic), when the ``client_id`` is one of ``platform_clients`` (the
     mandatory bypass), or when that client holds a role granting an agent scope.
-    Inbound values are **not** de-prefixed — the gates compare scopes internally
+    The subject gate is mandatory, so a request with no identity is denied (D27).
+    Values are **not** de-prefixed — the gates compare scopes internally
     against ``agent_scopes``, never against ``input.mcp.params.name``.
     """
     declarations = "\n".join(
         [
-            _render_map("subject_roles", _name_map(model.subject_roles)),
-            _render_map("source_roles", _name_map(model.source_roles)),
-            _render_map(
-                "subject_role_allow_scopes",
-                _group_rules(model.inbound_subject_allow_rules),
-            ),
-            _render_map(
-                "subject_role_deny_scopes",
-                _group_rules(model.inbound_subject_deny_rules),
-            ),
-            _render_map(
-                "source_role_allow_scopes",
-                _group_rules(model.inbound_source_allow_rules),
-            ),
-            _render_map(
-                "source_role_deny_scopes",
-                _group_rules(model.inbound_source_deny_rules),
-            ),
+            _render_map("subject_roles", _name_map(gates.subject_roles)),
+            _render_map("source_roles", _name_map(gates.source_roles)),
+            _render_map("subject_role_allow_scopes", _group_rules(gates.subject_allow_rules)),
+            _render_map("subject_role_deny_scopes", _group_rules(gates.subject_deny_rules)),
+            _render_map("source_role_allow_scopes", _group_rules(gates.source_allow_rules)),
+            _render_map("source_role_deny_scopes", _group_rules(gates.source_deny_rules)),
         ]
     )
     rules = "\n".join(
@@ -331,20 +608,12 @@ def generate_inbound_rego(model: AgentPolicyModel, platform_clients: tuple[str, 
             _inbound_subject_gate("subject_deny_ok", "subject_role_deny_scopes"),
             _inbound_source_allow_gate(platform_clients),
             _inbound_source_deny_gate(),
-            # Branch ONLY the trailing decision block on model.default_effect. Under
-            # ALLOW the allow gates / allow scope maps above are inert-but-emitted
-            # (kept for structural symmetry and downstream tooling); the decision
-            # is deny-if-either-side.
-            _decision_block(
-                model.default_effect,
-                "subject_allow_ok; source_allow_ok; not subject_deny_ok; not source_deny_ok",
-                ("subject_deny_ok", "source_deny_ok"),
-            ),
+            _decision_block("subject_allow_ok; source_allow_ok; not subject_deny_ok; not source_deny_ok"),
         ]
     )
     parts = [
-        "package authbridge.client.inbound.request\nimport rego.v1",
-        _render_list("agent_scopes", _names(model.agent_scopes)),
+        _PACKAGES["inbound"],
+        _render_list("agent_scopes", _names(agent_scopes)),
         declarations,
         rules,
     ]
@@ -352,32 +621,44 @@ def generate_inbound_rego(model: AgentPolicyModel, platform_clients: tuple[str, 
 
 
 def generate_outbound_rego(model: AgentPolicyModel) -> str:
-    """Render the fixed ``authbridge.client.outbound.request`` Rego package.
+    """Render the agent outbound package (``authbridge.client.outbound.request``) from an APM.
+
+    Agent side only; under target side the outbound of every service is a pass-through.
 
     Gates the agent's token-exchanged call to a downstream target, per invoked
-    tool. The decision is deny-overrides on the **same** ``input.mcp.params.name``:
+    tool. A matching DENY gate blocks the request, on the **same** ``input.mcp.params.name``:
     ``allow`` requires ``subject_allow_ok`` (the delegated user's role admits the
-    tool, via de-prefixed ``subject_role_allow_scopes``) AND ``target_allow_ok``
-    (the target service — keyed by the full ``input.identity.service_id`` SPIFFE
-    id — admits the tool, via de-prefixed ``target_allow_scopes``), and fires only
-    when neither ``subject_deny_ok`` nor ``target_deny_ok`` matches.
+    tool on this target, via de-prefixed ``subject_role_allow_scopes[role][target]``)
+    AND ``target_allow_ok`` (the target service admits the tool, via de-prefixed
+    ``target_allow_scopes[target]``), and fires only when neither ``subject_deny_ok``
+    nor ``target_deny_ok`` matches. ``target`` is the full ``input.identity.service_id``
+    SPIFFE id in all four gates, so a grant or a deny for one target never decides on
+    another target that has a tool with the same bare name (LIM-02). A grant or a
+    deny of a shared scope (D32) decides only on the copy that it names, as under
+    target side; the APM has one outbound subject rule for each copy (see
+    ``_group_rules_by_target``).
 
     ``agent_roles`` / ``agent_role_scopes`` are emitted for debugging but are
-    **not** referenced by ``allow`` — ``target_allow_scopes[input.identity.service_id]``
+    **not** referenced by ``allow`` — ``object.get(target_allow_scopes, input.identity.service_id, [])``
     already *is* the capability gate. This package emits neither ``agent_scopes``
     nor the inbound scope gates.
+
+    A ``tools/call`` is checked per invoked tool. The MCP session messages
+    (``initialize``, ``notifications/initialized``, ``ping``, ``tools/list``) carry
+    no tool name; they are allowed to a target iff at least one tool of that target
+    passes the same per-tool check (``tool_ok``). Every other method is denied.
     """
     declarations = "\n".join(
         [
             _render_list("agent_roles", _names(model.agent_roles)),
             _render_map("subject_roles", _name_map(model.subject_roles)),
-            _render_map(
+            _render_nested_map(
                 "subject_role_allow_scopes",
-                _group_rules_deprefixed(model.outbound_subject_allow_rules),
+                _group_rules_by_target(model.outbound_subject_allow_rules),
             ),
-            _render_map(
+            _render_nested_map(
                 "subject_role_deny_scopes",
-                _group_rules_deprefixed(model.outbound_subject_deny_rules),
+                _group_rules_by_target(model.outbound_subject_deny_rules),
             ),
             # agent_role_scopes is emitted for debugging/observability only; the
             # allow decision never references it (target_allow_scopes is the
@@ -389,29 +670,26 @@ def generate_outbound_rego(model: AgentPolicyModel) -> str:
             ),
             _render_map("target_allow_scopes", _name_map_deprefixed(model.target_allow_scopes)),
             _render_map("target_deny_scopes", _name_map_deprefixed(model.target_deny_scopes)),
+            _render_session_methods(),
         ]
     )
     rules = "\n".join(
         [
-            _outbound_subject_gate("subject_allow_ok", "subject_role_allow_scopes"),
-            _outbound_subject_gate("subject_deny_ok", "subject_role_deny_scopes"),
-            _outbound_target_gate("target_allow_ok", "target_allow_scopes"),
-            _outbound_target_gate("target_deny_ok", "target_deny_scopes"),
-            # Branch ONLY the trailing decision block on model.default_effect.
-            # Under ALLOW this drops the old subject_allow_ok AND target_allow_ok
-            # conjunction (deny-if-either-side): a negated allow-gate AND would
-            # wrongly DENY every unmentioned pair. An unmentioned (role, tool)
-            # pair falls through to the permissive default; an explicit deny on
-            # EITHER gate overrides it.
+            _outbound_subject_gate("subject_allows", "subject_allow_ok", "subject_role_allow_scopes"),
+            _outbound_subject_gate("subject_denies", "subject_deny_ok", "subject_role_deny_scopes"),
+            _outbound_target_gate("target_allows", "target_allow_ok", "target_allow_scopes"),
+            _outbound_target_gate("target_denies", "target_deny_ok", "target_deny_scopes"),
+            _outbound_tool_ok(),
             _decision_block(
-                model.default_effect,
+                'input.mcp.method == "tools/call"; '
                 "subject_allow_ok; target_allow_ok; not subject_deny_ok; not target_deny_ok",
-                ("subject_deny_ok", "target_deny_ok"),
+                "input.mcp.method in session_methods; "
+                f"some tool in {_lookup('target_allow_scopes', 'input.identity.service_id')}; tool_ok(tool)",
             ),
         ]
     )
     parts = [
-        "package authbridge.client.outbound.request\nimport rego.v1",
+        _PACKAGES["outbound"],
         declarations,
         rules,
     ]

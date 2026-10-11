@@ -28,8 +28,9 @@ def _fresh_empty(service_id: str) -> ServicePolicyModel:
     # The "engine creates a fresh model on 404" convention: the first time a service is
     # seen the store has no row, so callers get an empty SPM to append to. ``service_type``
     # is required by the model but genuinely unknown here; the PCE re-seeds it (along with
-    # ``owned_roles`` / ``owned_scopes``) from the IdP catalog before it is ever consulted,
-    # so the placeholder below never reaches a policy decision.
+    # ``owned_roles`` / ``owned_scopes``) from the IdP catalog when the service is in it. For a
+    # service absent from the catalog (deleted) the placeholder AGENT type would stay, so the PCE
+    # drops every rule for such a service and never derives it (routing guard in ``_run``).
     return ServicePolicyModel(
         service_id=service_id,
         service_type=ServiceType.AGENT,
@@ -40,20 +41,36 @@ def _fresh_empty(service_id: str) -> ServicePolicyModel:
     )
 
 
-def get_service_policy(service_id: str) -> ServicePolicyModel:
+def find_service_policy(service_id: str) -> ServicePolicyModel | None:
+    # The stored SPM, or ``None`` on a 404 — for a caller that must tell "no SPM" from a stored
+    # zero-rule SPM (``get_service_policy`` gives both as an empty model).
     resp = requests.get(f"{_base_url()}/policy/services/{encode_service_id(service_id)}", timeout=_HTTP_TIMEOUT)
     if resp.status_code == 404:
-        return _fresh_empty(service_id)
+        return None
     _check(resp)
     return ServicePolicyModel.model_validate(resp.json())
 
 
+def get_service_policy(service_id: str) -> ServicePolicyModel:
+    stored = find_service_policy(service_id)
+    return stored if stored is not None else _fresh_empty(service_id)
+
+
 def get_service_policy_by_scope(scope: Scope) -> ServicePolicyModel | None:
-    # Singular: a scope has exactly one owning service (Assumption 2). Pure sugar over the
-    # by-id read — no dedicated HTTP route. A scope with no resolved owner has no SPM.
+    # Singular: a scope copy names one owner in ``serviceId`` (a shared scope has one copy for
+    # each owner, D32). Pure sugar over the by-id read — no dedicated HTTP route. A scope with no
+    # resolved owner has no SPM.
     if not scope.serviceId:
         return None
     return get_service_policy(scope.serviceId)
+
+
+def list_service_policies() -> list[ServicePolicyModel]:
+    # Every stored SPM — the managed set (D21). The collection-root GET with no ``role`` (C3);
+    # the PCE resync reads it to write every CR.
+    resp = requests.get(f"{_base_url()}/policy/services", timeout=_HTTP_TIMEOUT)
+    _check(resp)
+    return [ServicePolicyModel.model_validate(item) for item in resp.json()]
 
 
 def get_service_policies_by_role(role: Role) -> list[ServicePolicyModel]:

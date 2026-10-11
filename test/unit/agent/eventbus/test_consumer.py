@@ -1,17 +1,29 @@
 """Unit tests for aiac.agent.eventbus.consumer.
 
 Covers subject-based dispatch and the ack/DLQ contract: ack on success,
-no ack (implicit redelivery) on failure below MAX_DELIVER, and DLQ
-publish + term() once MAX_DELIVER is reached.
+no ack (implicit redelivery) on failure below MAX_DELIVER, a delayed nak for a
+service that the IdP does not show yet (``ServiceNotVisibleError``), and DLQ
+publish + term() once MAX_DELIVER is reached. A role-membership subject
+(``aiac.apply.role-members.{role-id}``) goes to the PCE ``rerender_role``, with no
+use-case handler and no ``compute_and_apply``.
 """
 
 import asyncio
+import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from fastapi import HTTPException
 from nats.js.api import AckPolicy
 
-from aiac.agent.eventbus.consumer import AiacEventConsumer, _handle, lifespan
+from aiac.agent.eventbus.consumer import (
+    _NOT_VISIBLE_NAK_DELAY_DEFAULT,
+    _NOT_VISIBLE_NAK_DELAY_ENV,
+    AiacEventConsumer,
+    _handle,
+    _not_visible_nak_delay,
+    lifespan,
+)
 from aiac.agent.eventbus.stream import (
     ACK_WAIT_SECONDS,
     CONSUMER_FILTER_SUBJECTS,
@@ -28,15 +40,18 @@ from aiac.agent.policy_rules_builder.graph import (
     PolicyRulesBuilderError,
     UnparseableLLMResponseError,
 )
-from aiac.policy.model.models import RuleEffect
+from aiac.agent.uc.onboarding.orchestrator import ServiceNotVisibleError
+from aiac.agent.uc.onboarding.preconditions import EnforcementPreconditionError
 
 
-def _fake_msg(subject: str, num_delivered: int = 1) -> MagicMock:
+def _fake_msg(subject: str, num_delivered: int = 1, seq: int = 1) -> MagicMock:
     msg = MagicMock()
     msg.subject = subject
     msg.data = b'{"id":"x"}'
     msg.metadata.num_delivered = num_delivered
+    msg.metadata.sequence.stream = seq
     msg.ack = AsyncMock()
+    msg.nak = AsyncMock()
     msg.term = AsyncMock()
     return msg
 
@@ -49,27 +64,23 @@ def _fake_nc() -> MagicMock:
     return nc
 
 
-def test_handle_routes_service_subject_to_onboard_service():
-    # onboard_service is the one handler that returns its own (rules, override, default_effect),
-    # so _handle forwards its 3-tuple verbatim (only onboarding carries a caller-set default_effect).
-    with patch(
-        "aiac.agent.eventbus.consumer.onboard_service",
-        return_value=([], False, RuleEffect.ALLOW),
-    ) as onboard:
-        result = _handle("aiac.apply.service.svc-1")
+def test_handle_has_no_handler_for_a_service_subject():
+    # _process sends a service subject to onboard_and_apply before _handle, so _handle has no handler for it.
+    with (
+        patch("aiac.agent.eventbus.consumer.onboard_and_apply") as onboard,
+        pytest.raises(ValueError, match="no handler"),
+    ):
+        _handle("aiac.apply.service.svc-1")
 
-    onboard.assert_called_once_with("svc-1")
-    assert result == ([], False, RuleEffect.ALLOW)
+    onboard.assert_not_called()
 
 
 def test_handle_routes_role_subject_to_update_role():
-    # update_role returns (rules, override); _handle normalizes it to a 3-tuple with the
-    # least-privilege DENY default (role updates carry no caller-requestable default_effect).
     with patch("aiac.agent.eventbus.consumer.update_role", return_value=([], True)) as role:
         result = _handle("aiac.apply.role.role-1")
 
     role.assert_called_once_with("role-1")
-    assert result == ([], True, RuleEffect.DENY)
+    assert result == ([], True)
 
 
 def test_handle_decodes_percent_encoded_dotted_role_name():
@@ -79,17 +90,15 @@ def test_handle_decodes_percent_encoded_dotted_role_name():
         result = _handle("aiac.apply.role.team%2Eadmin")
 
     role.assert_called_once_with("team.admin")
-    assert result == ([], True, RuleEffect.DENY)
+    assert result == ([], True)
 
 
 def test_handle_routes_policy_build_subject():
-    # build_policy returns (rules, override); _handle normalizes it to a 3-tuple with the
-    # least-privilege DENY default (policy builds carry no caller-requestable default_effect).
     with patch("aiac.agent.eventbus.consumer.build_policy", return_value=([], False)) as build:
         result = _handle("aiac.apply.policy.build")
 
     build.assert_called_once_with()
-    assert result == ([], False, RuleEffect.DENY)
+    assert result == ([], False)
 
 
 def test_handle_raises_for_unknown_subject():
@@ -103,49 +112,167 @@ def test_dispatch_acks_on_success():
     msg = _fake_msg("aiac.apply.service.svc-1")
 
     with (
-        patch(
-            "aiac.agent.eventbus.consumer.onboard_service",
-            return_value=([], False, RuleEffect.DENY),
-        ),
+        patch("aiac.agent.eventbus.consumer.onboard_and_apply") as onboard,
         patch("aiac.agent.eventbus.consumer.compute_and_apply") as pce,
-        patch("aiac.agent.eventbus.consumer.reenable_service") as reenable,
     ):
         asyncio.run(consumer._dispatch(msg))
 
-    # _dispatch forwards the normalized (rules, override, default_effect) triple to the PCE.
-    pce.assert_called_once_with([], False, RuleEffect.DENY)
-    # UC1 service-onboarding subject: the client is re-enabled with the derived service_id, only
-    # after the PCE apply succeeds.
-    reenable.assert_called_once_with("svc-1")
+    # UC1 service-onboarding subject: onboard_and_apply gets the subject's UUID. It makes the
+    # compute_and_apply call and the re-enable itself, so the consumer does not call the PCE.
+    onboard.assert_called_once()
+    assert onboard.call_args.args == ("svc-1",)
+    pce.assert_not_called()
     msg.ack.assert_called_once()
     msg.term.assert_not_called()
 
 
-def test_dispatch_does_not_reenable_when_pce_apply_raises():
-    # The re-enable is strictly post-apply: if compute_and_apply raises, _dispatch never reaches
-    # reenable_service, so the client stays disabled (the failed-service marker). The failure is
-    # then handled by the normal ack/DLQ path (here: left unacked below MAX_DELIVER).
+def test_dispatch_onboards_a_first_delivery_with_the_client_wait():
+    # The first delivery can come before Keycloak commits the new client (the event-before-commit
+    # race), so the orchestrator waits for the client on its first IdP read.
+    consumer = AiacEventConsumer()
+    consumer._nc = AsyncMock()
+    msg = _fake_msg("aiac.apply.service.svc-1", num_delivered=1)
+
+    with patch("aiac.agent.eventbus.consumer.onboard_and_apply") as onboard:
+        asyncio.run(consumer._dispatch(msg))
+
+    onboard.assert_called_once_with("svc-1", wait_for_client=True)
+    msg.ack.assert_called_once()
+
+
+def test_dispatch_onboards_the_redelivery_after_a_not_visible_nak_with_no_client_wait():
+    # The redelivery after a not-visible nak comes after the nak delay, which already gave the client
+    # time to become visible: the orchestrator reads the client one time, with no wait.
     consumer = AiacEventConsumer()
     consumer._nc = _fake_nc()
-    msg = _fake_msg("aiac.apply.service.svc-1", num_delivered=MAX_DELIVER - 1)
+    first = _fake_msg("aiac.apply.service.svc-1", num_delivered=1, seq=7)
+    again = _fake_msg("aiac.apply.service.svc-1", num_delivered=2, seq=7)
+
+    with patch("aiac.agent.eventbus.consumer.onboard_and_apply", side_effect=[_not_visible(), None]) as onboard:
+        asyncio.run(consumer._dispatch(first))
+        asyncio.run(consumer._dispatch(again))
+
+    assert [c.kwargs["wait_for_client"] for c in onboard.call_args_list] == [True, False]
+    first.nak.assert_called_once()
+    again.ack.assert_called_once()
+    assert consumer._not_visible_seqs == set()
+
+
+@pytest.mark.parametrize("num_delivered", [2, MAX_DELIVER])
+def test_dispatch_onboards_a_redelivery_after_another_failure_with_the_client_wait(num_delivered):
+    # A redelivery after another failure (an LLM timeout and the ACK_WAIT redelivery, say) did not get
+    # the nak delay for the client: it waits again, so one IdP read does not use up a delivery.
+    consumer = AiacEventConsumer()
+    consumer._nc = AsyncMock()
+    msg = _fake_msg("aiac.apply.service.svc-1", num_delivered=num_delivered)
+
+    with patch("aiac.agent.eventbus.consumer.onboard_and_apply") as onboard:
+        asyncio.run(consumer._dispatch(msg))
+
+    onboard.assert_called_once_with("svc-1", wait_for_client=True)
+    msg.ack.assert_called_once()
+
+
+def test_a_not_visible_nak_of_one_message_does_not_change_another_message():
+    consumer = AiacEventConsumer()
+    consumer._nc = _fake_nc()
+    naked = _fake_msg("aiac.apply.service.svc-1", seq=7)
+    other = _fake_msg("aiac.apply.service.svc-2", num_delivered=2, seq=8)
+
+    with patch("aiac.agent.eventbus.consumer.onboard_and_apply", side_effect=[_not_visible(), None]) as onboard:
+        asyncio.run(consumer._dispatch(naked))
+        asyncio.run(consumer._dispatch(other))
+
+    assert onboard.call_args_list[1].kwargs["wait_for_client"] is True
+
+
+def test_dispatch_applies_a_role_subject_with_no_focus_service_and_no_onboarding():
+    # Only an onboarding has a focus service: a role subject goes through _handle and the consumer's
+    # own compute_and_apply call, with no focus_service, and never reaches onboard_and_apply.
+    consumer = AiacEventConsumer()
+    consumer._nc = AsyncMock()
+    msg = _fake_msg("aiac.apply.role.role-1")
 
     with (
-        patch(
-            "aiac.agent.eventbus.consumer.onboard_service",
-            return_value=([], False, RuleEffect.DENY),
-        ),
-        patch("aiac.agent.eventbus.consumer.compute_and_apply", side_effect=RuntimeError("pce boom")),
-        patch("aiac.agent.eventbus.consumer.reenable_service") as reenable,
+        patch("aiac.agent.eventbus.consumer.update_role", return_value=([], True)),
+        patch("aiac.agent.eventbus.consumer.compute_and_apply") as pce,
+        patch("aiac.agent.eventbus.consumer.onboard_and_apply") as onboard,
     ):
         asyncio.run(consumer._dispatch(msg))
 
-    reenable.assert_not_called()
-    msg.ack.assert_not_called()
+    pce.assert_called_once_with([], True)
+    onboard.assert_not_called()
+    msg.ack.assert_called_once()
 
 
-def test_dispatch_does_not_reenable_for_non_service_subject():
-    # Re-enable is UC1-only: a role-update subject that applies cleanly must NOT re-enable any
-    # client (role updates provision nothing and disable nothing).
+# A role-membership change (D32): the Keycloak SPI publishes ``aiac.apply.role-members.{role-id}`` when a
+# user or a service account gets or loses a realm role. The role id is a UUID.
+ROLE_ID = "5f0c2a8e-1b7d-4c3e-9a61-2d8f4e7b9c10"
+
+
+def test_dispatch_routes_role_members_subject_to_rerender_role_with_no_prb_run():
+    # A membership change does not change the policy, only who holds the role: the consumer re-renders
+    # the CRs that use the role. No use-case handler (so no PRB run), no compute_and_apply, no onboarding.
+    consumer = AiacEventConsumer()
+    consumer._nc = AsyncMock()
+    msg = _fake_msg(f"aiac.apply.role-members.{ROLE_ID}")
+
+    with (
+        patch("aiac.agent.eventbus.consumer.rerender_role") as rerender,
+        patch("aiac.agent.eventbus.consumer.update_role") as role,
+        patch("aiac.agent.eventbus.consumer.onboard_and_apply") as onboard,
+        patch("aiac.agent.eventbus.consumer.compute_and_apply") as pce,
+    ):
+        asyncio.run(consumer._dispatch(msg))
+
+    rerender.assert_called_once_with(ROLE_ID)
+    role.assert_not_called()
+    onboard.assert_not_called()
+    pce.assert_not_called()
+    msg.ack.assert_called_once()
+    msg.term.assert_not_called()
+
+
+def test_dispatch_runs_rerender_role_in_the_thread_pool():
+    # rerender_role is synchronous (IdP, store and PDP calls): it must not run on the event loop, which
+    # also serves /health.
+    consumer = AiacEventConsumer()
+    consumer._nc = AsyncMock()
+    msg = _fake_msg(f"aiac.apply.role-members.{ROLE_ID}")
+    threads = []
+
+    with patch(
+        "aiac.agent.eventbus.consumer.rerender_role",
+        side_effect=lambda _role_id: threads.append(threading.current_thread()),
+    ):
+        asyncio.run(consumer._dispatch(msg))
+
+    assert len(threads) == 1
+    assert threads[0] is not threading.main_thread()
+    msg.ack.assert_called_once()
+
+
+def test_dispatch_routes_a_role_named_role_members_to_update_role():
+    # The two prefixes are different: "aiac.apply.role.role-members" is the role subject of a role NAMED
+    # "role-members", not a role-membership change.
+    consumer = AiacEventConsumer()
+    consumer._nc = AsyncMock()
+    msg = _fake_msg("aiac.apply.role.role-members")
+
+    with (
+        patch("aiac.agent.eventbus.consumer.update_role", return_value=([], True)) as role,
+        patch("aiac.agent.eventbus.consumer.compute_and_apply") as pce,
+        patch("aiac.agent.eventbus.consumer.rerender_role") as rerender,
+    ):
+        asyncio.run(consumer._dispatch(msg))
+
+    role.assert_called_once_with("role-members")
+    pce.assert_called_once_with([], True)
+    rerender.assert_not_called()
+    msg.ack.assert_called_once()
+
+
+def test_dispatch_does_not_rerender_for_a_role_subject():
     consumer = AiacEventConsumer()
     consumer._nc = AsyncMock()
     msg = _fake_msg("aiac.apply.role.role-1")
@@ -153,12 +280,45 @@ def test_dispatch_does_not_reenable_for_non_service_subject():
     with (
         patch("aiac.agent.eventbus.consumer.update_role", return_value=([], True)),
         patch("aiac.agent.eventbus.consumer.compute_and_apply"),
-        patch("aiac.agent.eventbus.consumer.reenable_service") as reenable,
+        patch("aiac.agent.eventbus.consumer.rerender_role") as rerender,
     ):
         asyncio.run(consumer._dispatch(msg))
 
-    reenable.assert_not_called()
-    msg.ack.assert_called_once()
+    rerender.assert_not_called()
+
+
+def test_dispatch_leaves_a_failed_rerender_unacked_before_max_deliver():
+    # A dependency error of rerender_role (IdP, store or PDP) is retryable: left unacked, so NATS
+    # redelivers it after ACK_WAIT. Logged once.
+    consumer = AiacEventConsumer()
+    consumer._nc = nc = _fake_nc()
+    msg = _fake_msg(f"aiac.apply.role-members.{ROLE_ID}", num_delivered=MAX_DELIVER - 1)
+    exc = HTTPException(502, "IdP config unavailable")
+
+    with (
+        patch("aiac.agent.eventbus.consumer.rerender_role", side_effect=exc),
+        patch("aiac.agent.eventbus.consumer.log_by_type") as log,
+    ):
+        asyncio.run(consumer._dispatch(msg))
+
+    msg.ack.assert_not_called()
+    msg.nak.assert_not_called()
+    msg.term.assert_not_called()
+    nc.jetstream.assert_not_called()
+    log.assert_called_once_with(exc)
+
+
+def test_dispatch_routes_a_failed_rerender_to_dlq_at_max_deliver():
+    consumer = AiacEventConsumer()
+    consumer._nc = nc = _fake_nc()
+    msg = _fake_msg(f"aiac.apply.role-members.{ROLE_ID}", num_delivered=MAX_DELIVER)
+
+    with patch("aiac.agent.eventbus.consumer.rerender_role", side_effect=RuntimeError("pdp boom")):
+        asyncio.run(consumer._dispatch(msg))
+
+    msg.ack.assert_not_called()
+    msg.term.assert_called_once()
+    nc.jetstream.return_value.publish.assert_called_once_with(DLQ_SUBJECT, msg.data)
 
 
 def test_dispatch_leaves_message_unacked_before_max_deliver():
@@ -166,10 +326,11 @@ def test_dispatch_leaves_message_unacked_before_max_deliver():
     consumer._nc = _fake_nc()
     msg = _fake_msg("aiac.apply.service.svc-1", num_delivered=MAX_DELIVER - 1)
 
-    with patch("aiac.agent.eventbus.consumer.onboard_service", side_effect=RuntimeError("boom")):
+    with patch("aiac.agent.eventbus.consumer.onboard_and_apply", side_effect=RuntimeError("boom")):
         asyncio.run(consumer._dispatch(msg))
 
     msg.ack.assert_not_called()
+    msg.nak.assert_not_called()  # only a not-visible service is nak'd; NATS redelivers after ACK_WAIT
     msg.term.assert_not_called()
     consumer._nc.jetstream.assert_not_called()
 
@@ -179,7 +340,7 @@ def test_dispatch_routes_to_dlq_after_max_deliver():
     consumer._nc = _fake_nc()
     msg = _fake_msg("aiac.apply.service.svc-1", num_delivered=MAX_DELIVER)
 
-    with patch("aiac.agent.eventbus.consumer.onboard_service", side_effect=RuntimeError("boom")):
+    with patch("aiac.agent.eventbus.consumer.onboard_and_apply", side_effect=RuntimeError("boom")):
         asyncio.run(consumer._dispatch(msg))
 
     msg.ack.assert_not_called()
@@ -192,6 +353,8 @@ _PERMANENT_EXCEPTIONS = [
     PolicyContradictionError("scope:read", []),
     PolicyRulesBuilderError("builder blew up"),
     UnparseableLLMResponseError("cannot parse"),
+    # A failed onboarding precondition check (D30) needs a fix in the cluster first: no retry helps.
+    EnforcementPreconditionError(["#1 sidecar: no authbridge-proxy container"]),
 ]
 
 
@@ -204,7 +367,7 @@ def test_dispatch_terminates_permanent_failure_immediately_below_max_deliver(exc
     msg = _fake_msg("aiac.apply.service.svc-1", num_delivered=1)
 
     with (
-        patch("aiac.agent.eventbus.consumer.onboard_service", side_effect=exc),
+        patch("aiac.agent.eventbus.consumer.onboard_and_apply", side_effect=exc),
         patch("aiac.agent.eventbus.consumer.log_by_type") as log,
     ):
         asyncio.run(consumer._dispatch(msg))
@@ -224,12 +387,13 @@ def test_dispatch_leaves_retryable_llm_access_error_unacked_below_max_deliver():
     exc = LLMAccessError("endpoint unreachable")
 
     with (
-        patch("aiac.agent.eventbus.consumer.onboard_service", side_effect=exc),
+        patch("aiac.agent.eventbus.consumer.onboard_and_apply", side_effect=exc),
         patch("aiac.agent.eventbus.consumer.log_by_type") as log,
     ):
         asyncio.run(consumer._dispatch(msg))
 
     msg.ack.assert_not_called()
+    msg.nak.assert_not_called()
     msg.term.assert_not_called()
     consumer._nc.jetstream.assert_not_called()
     log.assert_called_once_with(exc)
@@ -243,7 +407,7 @@ def test_dispatch_routes_retryable_llm_access_error_to_dlq_at_max_deliver():
     exc = LLMAccessError("endpoint unreachable")
 
     with (
-        patch("aiac.agent.eventbus.consumer.onboard_service", side_effect=exc),
+        patch("aiac.agent.eventbus.consumer.onboard_and_apply", side_effect=exc),
         patch("aiac.agent.eventbus.consumer.log_by_type") as log,
     ):
         asyncio.run(consumer._dispatch(msg))
@@ -252,6 +416,121 @@ def test_dispatch_routes_retryable_llm_access_error_to_dlq_at_max_deliver():
     msg.term.assert_called_once()
     consumer._nc.jetstream.return_value.publish.assert_called_once_with(DLQ_SUBJECT, msg.data)
     log.assert_called_once_with(exc)
+
+
+# The IdP still answers 404 for the service after the orchestrator's bounded wait (the
+# event-before-commit race, D33): the client can become visible in some seconds, so the consumer
+# naks with a short delay instead of waiting ACK_WAIT (600 s) for the redelivery.
+def _not_visible() -> ServiceNotVisibleError:
+    return ServiceNotVisibleError("IdP has no service svc-1 yet")
+
+
+@pytest.mark.parametrize("num_delivered", [1, MAX_DELIVER - 1])
+def test_dispatch_naks_not_visible_service_with_delay_below_max_deliver(monkeypatch, num_delivered):
+    monkeypatch.delenv(_NOT_VISIBLE_NAK_DELAY_ENV, raising=False)
+    consumer = AiacEventConsumer()
+    consumer._nc = nc = _fake_nc()
+    msg = _fake_msg("aiac.apply.service.svc-1", num_delivered=num_delivered)
+    exc = _not_visible()
+
+    with (
+        patch("aiac.agent.eventbus.consumer.onboard_and_apply", side_effect=exc),
+        patch("aiac.agent.eventbus.consumer.log_by_type") as log,
+    ):
+        asyncio.run(consumer._dispatch(msg))
+
+    msg.nak.assert_called_once_with(delay=_NOT_VISIBLE_NAK_DELAY_DEFAULT)
+    msg.ack.assert_not_called()
+    msg.term.assert_not_called()
+    nc.jetstream.assert_not_called()
+    log.assert_called_once_with(exc)
+
+
+def test_dispatch_naks_not_visible_service_with_the_configured_delay(monkeypatch):
+    monkeypatch.setenv(_NOT_VISIBLE_NAK_DELAY_ENV, "5")
+    consumer = AiacEventConsumer()
+    consumer._nc = _fake_nc()
+    msg = _fake_msg("aiac.apply.service.svc-1", num_delivered=1)
+
+    with patch("aiac.agent.eventbus.consumer.onboard_and_apply", side_effect=_not_visible()):
+        asyncio.run(consumer._dispatch(msg))
+
+    msg.nak.assert_called_once_with(delay=5.0)
+
+
+def test_dispatch_routes_not_visible_service_to_dlq_at_max_deliver():
+    # At MAX_DELIVER the not-visible service goes to the DLQ like every other retryable failure: no
+    # nak (a nak would ask for a delivery that the consumer's max_deliver does not allow).
+    consumer = AiacEventConsumer()
+    consumer._nc = nc = _fake_nc()
+    msg = _fake_msg("aiac.apply.service.svc-1", num_delivered=MAX_DELIVER)
+
+    with patch("aiac.agent.eventbus.consumer.onboard_and_apply", side_effect=_not_visible()):
+        asyncio.run(consumer._dispatch(msg))
+
+    msg.nak.assert_not_called()
+    msg.ack.assert_not_called()
+    msg.term.assert_called_once()
+    nc.jetstream.return_value.publish.assert_called_once_with(DLQ_SUBJECT, msg.data)
+
+
+def test_dispatch_does_not_nak_another_http_502():
+    # Only the not-visible class is nak'd. Another 502 from onboard_and_apply (for example an IdP
+    # outage) keeps the old behaviour: no ack and no nak, so NATS redelivers after ACK_WAIT.
+    consumer = AiacEventConsumer()
+    consumer._nc = nc = _fake_nc()
+    msg = _fake_msg("aiac.apply.service.svc-1", num_delivered=1)
+    exc = HTTPException(502, "IdP config unavailable resolving service svc-1")
+
+    with patch("aiac.agent.eventbus.consumer.onboard_and_apply", side_effect=exc):
+        asyncio.run(consumer._dispatch(msg))
+
+    msg.nak.assert_not_called()
+    msg.ack.assert_not_called()
+    msg.term.assert_not_called()
+    nc.jetstream.assert_not_called()
+
+
+def test_dispatch_survives_a_failed_nak(caplog):
+    # A failed nak (for example a dropped connection) must not crash the callback: the consumer logs
+    # it, and NATS redelivers the unacked message after ACK_WAIT.
+    consumer = AiacEventConsumer()
+    consumer._nc = nc = _fake_nc()
+    msg = _fake_msg("aiac.apply.service.svc-1", num_delivered=1)
+    msg.nak.side_effect = RuntimeError("connection closed")
+
+    with (
+        patch("aiac.agent.eventbus.consumer.onboard_and_apply", side_effect=_not_visible()),
+        caplog.at_level("ERROR", logger="aiac.agent.eventbus.consumer"),
+    ):
+        asyncio.run(consumer._dispatch(msg))
+
+    msg.nak.assert_called_once()
+    msg.ack.assert_not_called()
+    msg.term.assert_not_called()
+    nc.jetstream.assert_not_called()
+    assert any(r.name == "aiac.agent.eventbus.consumer" and "nak" in r.getMessage() for r in caplog.records)
+
+
+def test_not_visible_nak_delay_defaults_to_about_30_seconds(monkeypatch):
+    monkeypatch.delenv(_NOT_VISIBLE_NAK_DELAY_ENV, raising=False)
+
+    assert _not_visible_nak_delay() == _NOT_VISIBLE_NAK_DELAY_DEFAULT == 30.0
+
+
+def test_not_visible_nak_delay_reads_the_env(monkeypatch):
+    monkeypatch.setenv(_NOT_VISIBLE_NAK_DELAY_ENV, "12.5")
+
+    assert _not_visible_nak_delay() == 12.5
+
+
+@pytest.mark.parametrize("raw", ["", "abc", "0", "-1", "nan", "inf"])
+def test_not_visible_nak_delay_falls_back_to_the_default_on_a_bad_value(monkeypatch, raw):
+    # A bad value must not crash the callback. A delay of 0 (or less) is bad too: nats-py then sends
+    # a plain nak, and NATS redelivers at once.
+    monkeypatch.setenv(_NOT_VISIBLE_NAK_DELAY_ENV, raw)
+
+    assert _not_visible_nak_delay() == _NOT_VISIBLE_NAK_DELAY_DEFAULT
 
 
 def test_start_with_retry_retries_on_failure_then_succeeds():
@@ -273,15 +552,25 @@ def test_start_connects_and_subscribes_with_expected_config():
     fake_js = AsyncMock()
     fake_nc = MagicMock()
     fake_nc.jetstream.return_value = fake_js
+    # The parent mock records the order of the three calls.
+    calls = MagicMock()
+    calls.ensure_stream = AsyncMock()
+    calls.ensure_consumer = AsyncMock()
+    calls.subscribe = fake_js.subscribe = AsyncMock()
 
     with (
         patch("aiac.agent.eventbus.consumer.nats.connect", AsyncMock(return_value=fake_nc)) as connect,
-        patch("aiac.agent.eventbus.consumer.ensure_stream", AsyncMock()) as ensure_stream_mock,
+        patch("aiac.agent.eventbus.consumer.ensure_stream", calls.ensure_stream),
+        patch("aiac.agent.eventbus.consumer.ensure_consumer", calls.ensure_consumer),
     ):
         asyncio.run(consumer.start())
 
     connect.assert_called_once_with(consumer._nats_url, max_reconnect_attempts=-1)
-    ensure_stream_mock.assert_called_once_with(fake_js)
+    calls.ensure_stream.assert_called_once_with(fake_js)
+    # The start updates an existing durable consumer to the config of the code BEFORE the subscribe,
+    # because nats-py binds to an existing durable consumer with its old config.
+    calls.ensure_consumer.assert_called_once_with(fake_js)
+    assert [c[0] for c in calls.mock_calls] == ["ensure_stream", "ensure_consumer", "subscribe"]
     _, kwargs = fake_js.subscribe.call_args
     assert kwargs["subject"] == "aiac.apply.>"
     assert kwargs["queue"] == CONSUMER_NAME
@@ -316,7 +605,11 @@ def test_lifespan_awaits_cancelled_task_before_stopping_consumer():
             events.append("stopped")
 
     async def run():
-        with patch("aiac.agent.eventbus.consumer.AiacEventConsumer", return_value=FakeConsumer()):
+        # The start sequence (check #4, resync) is covered in test/unit/agent/controller/test_start.py.
+        with (
+            patch("aiac.agent.eventbus.consumer.run_start_sequence"),
+            patch("aiac.agent.eventbus.consumer.AiacEventConsumer", return_value=FakeConsumer()),
+        ):
             async with lifespan(MagicMock()):
                 await asyncio.sleep(0)  # let the background task actually start
 
@@ -332,7 +625,7 @@ def test_dispatch_does_not_term_when_dlq_publish_fails():
     msg = _fake_msg("aiac.apply.service.svc-1", num_delivered=MAX_DELIVER)
 
     with (
-        patch("aiac.agent.eventbus.consumer.onboard_service", side_effect=RuntimeError("boom")),
+        patch("aiac.agent.eventbus.consumer.onboard_and_apply", side_effect=RuntimeError("boom")),
         pytest.raises(RuntimeError, match="dlq publish failed"),
     ):
         asyncio.run(consumer._dispatch(msg))

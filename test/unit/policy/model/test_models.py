@@ -11,10 +11,13 @@ from aiac.idp.configuration.models import (
 )
 from aiac.policy.model.models import (
     AgentPolicyModel,
-    PolicyModel,
+    AgentSidePolicyModel,
+    EnforcementSide,
     PolicyRule,
     RuleEffect,
     ServicePolicyModel,
+    TargetSidePolicyModel,
+    parse_policy_model,
 )
 
 
@@ -427,13 +430,82 @@ def test_agent_policy_model_ignores_extra_fields():
 
 
 def test_policy_model_ignores_extra_fields():
-    model = PolicyModel.model_validate({"agents": [], "extra_key": "ignored"})
+    model = parse_policy_model({"enforcement_side": "target-side", "services": [], "extra_key": "ignored"})
     assert not hasattr(model, "extra_key")
 
 
-# --- Empty PolicyModel ---
+# --- The policy-model hierarchy (D18a) ---
 
 
-def test_policy_model_empty():
-    model = PolicyModel(agents=[])
-    assert model.agents == []
+def _spm_body(service_id="team1/github-tool") -> dict:
+    return {
+        "service_id": service_id,
+        "service_type": "Tool",
+        "owned_roles": [],
+        "owned_scopes": [{"id": "s1", "name": "github-tool.source-read"}],
+    }
+
+
+def test_target_side_body_parses_to_target_side_policy_model():
+    model = parse_policy_model({"enforcement_side": "target-side", "services": [_spm_body()]})
+    assert isinstance(model, TargetSidePolicyModel)
+    assert model.enforcement_side == EnforcementSide.TARGET_SIDE
+    assert [spm.service_id for spm in model.services] == ["team1/github-tool"]
+
+
+def test_target_side_policy_model_sets_its_own_tag():
+    model = TargetSidePolicyModel(services=[])
+    assert model.model_dump(mode="json")["enforcement_side"] == "target-side"
+
+
+def test_enforcement_side_values():
+    assert EnforcementSide.TARGET_SIDE == "target-side"
+    assert EnforcementSide.AGENT_SIDE == "agent-side"
+
+
+def test_policy_model_without_a_tag_is_rejected():
+    # The old shape (a bare agents list, no tag) is no longer a policy model.
+    with pytest.raises(ValidationError):
+        parse_policy_model({"agents": []})
+
+
+def test_target_side_body_without_a_tag_is_rejected():
+    # The tag has a default on the class, but a body must still carry it.
+    with pytest.raises(ValidationError):
+        parse_policy_model({"services": [_spm_body()]})
+
+
+def test_policy_model_with_an_unknown_tag_is_rejected():
+    with pytest.raises(ValidationError):
+        parse_policy_model({"enforcement_side": "both-sides", "services": []})
+
+
+def _apm_body(agent_id="team1/github-agent") -> dict:
+    return {"agent_id": agent_id, "agent_roles": [], "agent_scopes": [], "source_roles": {}, "subject_roles": {}}
+
+
+def test_agent_side_body_parses_to_agent_side_policy_model():
+    model = parse_policy_model(
+        {"enforcement_side": "agent-side", "agents": [_apm_body()], "pass_through": ["team1/github-tool"]}
+    )
+    assert isinstance(model, AgentSidePolicyModel)
+    assert model.enforcement_side == EnforcementSide.AGENT_SIDE
+    assert [apm.agent_id for apm in model.agents] == ["team1/github-agent"]
+    assert model.pass_through == ["team1/github-tool"]
+
+
+def test_agent_side_policy_model_sets_its_own_tag_and_defaults_pass_through():
+    model = AgentSidePolicyModel(agents=[])
+    assert model.model_dump(mode="json") == {"enforcement_side": "agent-side", "agents": [], "pass_through": []}
+
+
+def test_a_body_cannot_mix_the_sides():
+    # The tag selects the subclass: an agent-side tag with target-side content is not a policy model.
+    with pytest.raises(ValidationError):
+        parse_policy_model({"enforcement_side": "agent-side", "services": [_spm_body()]})
+
+
+def test_target_side_policy_model_round_trips_through_json():
+    model = TargetSidePolicyModel(services=[ServicePolicyModel.model_validate(_spm_body())])
+    again = parse_policy_model(model.model_dump(mode="json"))
+    assert again == model

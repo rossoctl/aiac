@@ -1,6 +1,8 @@
 import base64
 import json
+import logging
 import os
+import sys
 import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -15,6 +17,7 @@ from starlette.responses import JSONResponse
 
 _cache: dict[str, KeycloakAdmin] = {}
 _lock = threading.Lock()
+_log = logging.getLogger(__name__)
 
 # AIAC naming convention: stamp every role/scope this service provisions with the
 # ``aiac.managed=true`` Keycloak attribute so downstream consumers (the Policy Computation
@@ -36,11 +39,84 @@ _SERVICE_TYPE_ATTRIBUTE = "client.type"
 # own clientId as the audience (it defaults ``audience_file`` to ``/shared/client-id.txt``).
 _DISCOVERY_AUDIENCE_MAPPER = "aiac-discovery-audience"
 
+# Name of the shared client scope that is the one source of ``sub`` = username (D31). AIAC links
+# it as a default scope to each platform login client (``_PLATFORM_SOURCE_CLIENTS_ENV``), so the
+# login token has ``sub`` = username, and, at onboarding, to each AIAC-managed client, so an
+# exchanged token has it too: the standard token exchange (V2) applies only the requester client's scopes. The scope is
+# linked to many clients, so it deliberately has NO ``aiac.managed`` marker: a marked scope would
+# become an own scope of every linked service. Never a realm default scope.
+_SUBJECT_SCOPE = "aiac-username-sub"
+
+# Name of the one protocol mapper in ``_SUBJECT_SCOPE``.
+_SUBJECT_MAPPER = "username-to-sub"
+
+# Comma-separated clientIds of the platform login clients that get ``_SUBJECT_SCOPE`` (D31). The
+# same setting, with the same name and meaning, as the PDP policy writer's platform source clients
+# (``PLATFORM_SOURCE_CLIENTS``); unset or all-blank falls back to ``_DEFAULT_PLATFORM_CLIENTS``. The
+# parse (``_platform_clients``) is a copy of the writer's ``_platform_clients``, not an import: this
+# image holds only ``main.py`` (see the Dockerfile), so it cannot import the ``aiac`` package.
+_PLATFORM_SOURCE_CLIENTS_ENV = "PLATFORM_SOURCE_CLIENTS"
+_DEFAULT_PLATFORM_CLIENTS = ("rossoctl",)
+
+# The realm whose login clients get ``_SUBJECT_SCOPE`` at startup.
+_REALM_ENV = "KEYCLOAK_REALM"
+
+# Keycloak representation of ``_SUBJECT_SCOPE``. Not in the token ``scope`` claim and not on the
+# consent screen; no ``aiac.managed`` attribute (see above).
+_SUBJECT_SCOPE_REPRESENTATION = {
+    "name": _SUBJECT_SCOPE,
+    "description": "AIAC subject scope (D31): sets the token sub to the username",
+    "protocol": "openid-connect",
+    "attributes": {"include.in.token.scope": "false", "display.on.consent.screen": "false"},
+}
+
+# Keycloak representation of ``_SUBJECT_MAPPER``: a mapper with claim name ``sub`` overrides the
+# token ``sub`` (the Keycloak user ID) with the username, in every token type.
+_SUBJECT_MAPPER_REPRESENTATION = {
+    "name": _SUBJECT_MAPPER,
+    "protocol": "openid-connect",
+    "protocolMapper": "oidc-usermodel-property-mapper",
+    "config": {
+        "user.attribute": "username",
+        "claim.name": "sub",
+        "jsonType.label": "String",
+        "access.token.claim": "true",
+        "id.token.claim": "true",
+        "userinfo.token.claim": "true",
+        "introspection.token.claim": "true",
+    },
+}
+
 # Optional hard assertion of the public issuer the tool's sidecar validates against. When set, the
 # discovery-token endpoint refuses to emit a token whose ``iss`` differs (frontend-URL pinning is a
 # Keycloak deployment property, not something we can force here); when unset it only records the
 # observed ``iss`` for the caller / rollout gate.
 _EXPECTED_ISSUER_ENV = "AIAC_KEYCLOAK_ISSUER"
+
+
+def _log_level() -> int:
+    """Root-logger level from ``LOG_LEVEL`` (default ``INFO``): a name (case-insensitive) or a
+    number; an unrecognized value falls back to ``INFO`` rather than stopping the service.
+    Defined locally because this service image ships only ``main.py`` (the aiac library is not
+    on its path); it mirrors ``aiac.shared.logging_config.log_level``."""
+    raw = os.getenv("LOG_LEVEL", "INFO").strip()
+    if raw.isdigit():
+        return int(raw)
+    level = logging.getLevelName(raw.upper())
+    return level if isinstance(level, int) else logging.INFO
+
+
+def _configure_logging() -> None:
+    """Point the root logger at stdout at ``LOG_LEVEL``. Mirrors
+    ``aiac.shared.logging_config.configure_logging`` (same format, same idempotence)."""
+    level = _log_level()
+    logging.basicConfig(level=level, format="%(levelname)s:%(name)s:%(message)s", stream=sys.stdout)
+    logging.getLogger().setLevel(level)
+
+
+# Before the app object exists — without it the root logger has no handler and defaults to
+# WARNING, so LOG_LEVEL would have no effect on this service's (or python-keycloak's) logs.
+_configure_logging()
 
 
 class _InvariantViolation(Exception):
@@ -63,30 +139,15 @@ def _assert_single_kind(members: list[dict], role_name: str) -> None:
 
 
 def _build_scope_owner_index(admin: "KeycloakAdmin") -> dict[str, list[str]]:
-    """Map each client-scope id -> the clientIds exposing it as a default scope, from a single
-    pass over all clients. Building this once per request turns the Assumption-2 check from an
-    O(scopes × clients) nested rescan (a full ``get_clients`` + per-client default-scope fetch
-    for every scope) into a single scan plus O(1) lookups."""
+    """Map each client-scope id -> the client UUIDs that link it as a default scope, from a single
+    pass over all clients. The delete guard of ``delete_scope_from_service`` uses it: a scope that
+    another client still links is shared (D32) and is kept. It reads only the scope ``id``, which
+    is all that ``get_client_default_client_scopes`` gives besides the ``name``."""
     index: dict[str, list[str]] = {}
     for client in admin.get_clients():
         for s in admin.get_client_default_client_scopes(client["id"]):
             index.setdefault(s["id"], []).append(client["id"])
     return index
-
-
-def _assert_single_owner(scope: dict, owner_index: dict[str, list[str]]) -> None:
-    """Assumption 2 (single scope owner): an AIAC-managed client scope must be exposed as a
-    default scope by exactly one client. Keycloak client scopes are realm-level and assignable
-    to many clients, so this is not a Keycloak guarantee — look the scope up in the precomputed
-    ``owner_index`` and fail loud on more than one owner, since a single ``Scope.serviceId``
-    cannot represent it."""
-    scope_id = scope["id"]
-    owners = owner_index.get(scope_id, [])
-    if len(owners) > 1:
-        raise _InvariantViolation(
-            f"AIAC-managed scope '{scope.get('name', scope_id)}' is exposed by {len(owners)} "
-            f"clients (Assumption 2: a scope has exactly one owner)"
-        )
 
 
 def _is_aiac_managed(attributes: dict | None) -> bool:
@@ -97,6 +158,18 @@ def _is_aiac_managed(attributes: dict | None) -> bool:
     if isinstance(value, list):
         return "true" in value
     return value == "true"
+
+
+def _read_error(e: KeycloakError) -> JSONResponse:
+    """The response for a ``KeycloakError`` on a call that names one entity: a read of one service
+    (``GET /services/{id}`` and its roles, scopes and discovery token), the composites of one role
+    (a sub-read of the library's ``get_service``) and the subject-scope link of one service
+    (``POST /services/{id}/subject-scope``). ``404`` when Keycloak answers ``404`` (the entity
+    does not exist, or a reader asks for a new client before Keycloak commits it), else ``502``. The
+    ``404`` lets the caller tell an entity that is not there (yet) from an IdP outage: the library does
+    not retry a ``4xx``, and the onboarding reads ``get_service`` again for a short time."""
+    status = 404 if e.response_code == 404 else 502
+    return JSONResponse(status_code=status, content={"error": str(e)})
 
 
 def _get_or_create_admin(realm: str) -> KeycloakAdmin:
@@ -150,9 +223,154 @@ def _ensure_audience_mapper(admin: KeycloakAdmin, service_id: str, client_id: st
     )
 
 
+def _find_client_scope(admin: KeycloakAdmin, name: str) -> dict | None:
+    """Return the realm client scope named ``name``, or ``None`` when there is none."""
+    return next((s for s in admin.get_client_scopes() if s.get("name") == name), None)
+
+
+def _ensure_subject_scope(admin: KeycloakAdmin) -> dict:
+    """Idempotently ensure the shared subject scope ``_SUBJECT_SCOPE`` and its mapper (D31).
+
+    Create the scope (with no ``aiac.managed`` marker) when it is absent, and add the
+    ``oidc-usermodel-property-mapper`` (named ``_SUBJECT_MAPPER``) when the scope does not have it;
+    a second call is a no-op, and a deleted scope or mapper is created again on the next call.
+    An existing mapper of that name is converged to ``_SUBJECT_MAPPER_REPRESENTATION``
+    (``_converge_subject_mapper``): a wrong mapper would keep ``sub`` = the Keycloak user ID while
+    onboarding reports success. Different services onboard concurrently, so a 409 from a concurrent
+    create or mapper add is success. An existing scope that carries the marker violates D31 (it
+    would become an own scope of every linked service): raise ``_InvariantViolation``. Returns the
+    full scope representation.
+    """
+    scope = _find_client_scope(admin, _SUBJECT_SCOPE)
+    if scope is None:
+        try:
+            scope_id = admin.create_client_scope(_SUBJECT_SCOPE_REPRESENTATION)
+            scope = {**_SUBJECT_SCOPE_REPRESENTATION, "id": scope_id}
+        except KeycloakError as e:
+            # 409: a concurrent onboarding of another service created the scope first, so read it
+            # again by name. Do not use ``skip_exists=True``: in python-keycloak 7.x a 409 then
+            # fails on the missing ``Location`` header.
+            scope = _find_client_scope(admin, _SUBJECT_SCOPE) if e.response_code == 409 else None
+            if scope is None:
+                raise
+    if _is_aiac_managed(scope.get("attributes")):
+        raise _InvariantViolation(
+            f"client scope '{_SUBJECT_SCOPE}' carries the '{_AIAC_MANAGED_ATTRIBUTE}' marker, but the "
+            f"shared subject scope (D31) must not: it is linked to every AIAC-managed client, so a "
+            f"marked scope becomes an own scope of each linked service. "
+            f"Remove the '{_AIAC_MANAGED_ATTRIBUTE}' attribute from the scope"
+        )
+    scope_id = scope["id"]
+
+    # Only the mapper named ``_SUBJECT_MAPPER`` is AIAC's. Another mapper in the scope that also
+    # writes ``sub`` is left as it is and does not fail the call: AIAC did not make it, so to
+    # delete or change it would destroy an operator's configuration, and to fail would block every
+    # onboarding over a state this endpoint cannot prove wrong (it can be the same mapping under
+    # another name).
+    mappers = admin.get_mappers_from_client_scope(scope_id)
+    existing = next((m for m in mappers if m.get("name") == _SUBJECT_MAPPER), None)
+    if existing is None:
+        _add_subject_mapper(admin, scope_id)
+    else:
+        _converge_subject_mapper(admin, scope_id, existing)
+    return admin.get_client_scope(scope_id)
+
+
+def _add_subject_mapper(admin: KeycloakAdmin, scope_id: str) -> None:
+    """Add ``_SUBJECT_MAPPER_REPRESENTATION`` to the subject scope; a 409 is success."""
+    try:
+        admin.add_mapper_to_client_scope(scope_id, _SUBJECT_MAPPER_REPRESENTATION)
+    except KeycloakError as e:
+        # 409: a concurrent onboarding added the mapper first — the mapper is there.
+        if e.response_code != 409:
+            raise
+
+
+def _converge_subject_mapper(admin: KeycloakAdmin, scope_id: str, existing: dict) -> None:
+    """Make the existing ``_SUBJECT_MAPPER`` in the subject scope equal the expected mapper (D31).
+
+    Compare the mapper type and only the keys of ``_SUBJECT_MAPPER_REPRESENTATION["config"]``:
+    Keycloak can add config keys of its own, and these must not cause a write at each call. A
+    correct mapper gets no write. A wrong config gets an in-place update (PUT, 204): Keycloak
+    replaces the full config map, and Keycloak 26.0 reads the mapper id from the payload (not from
+    the path), so the payload carries the ``id``. A wrong type is not changed in place (the admin
+    console does not offer a type change, so do not rely on the PUT for it): delete the mapper,
+    then add the expected one. A 404 on that delete or a 409 on that add is a concurrent onboarding that did
+    the same fix first, so it is success. Any other ``KeycloakError`` propagates (HTTP 502).
+    """
+    expected = _SUBJECT_MAPPER_REPRESENTATION
+    config = existing.get("config") or {}
+    type_ok = existing.get("protocolMapper") == expected["protocolMapper"]
+    config_ok = all(config.get(key) == value for key, value in expected["config"].items())
+    if type_ok and config_ok:
+        return
+    mapper_id = existing["id"]
+    if type_ok:
+        admin.update_mapper_in_client_scope(scope_id, mapper_id, {**expected, "id": mapper_id})
+        return
+    try:
+        admin.delete_mapper_from_client_scope(scope_id, mapper_id)
+    except KeycloakError as e:
+        # 404: a concurrent onboarding deleted the wrong mapper first.
+        if e.response_code != 404:
+            raise
+    _add_subject_mapper(admin, scope_id)
+
+
+def _platform_clients() -> tuple[str, ...]:
+    """The clientIds in ``PLATFORM_SOURCE_CLIENTS``, comma-split, blanks dropped (default ``rossoctl``)."""
+    raw = os.environ.get(_PLATFORM_SOURCE_CLIENTS_ENV, "")
+    return tuple(c.strip() for c in raw.split(",") if c.strip()) or _DEFAULT_PLATFORM_CLIENTS
+
+
+def _link_default_scope(admin: KeycloakAdmin, client_uuid: str, scope_id: str) -> None:
+    """Link a scope to a client as a default scope; an optional link is moved to default.
+
+    Keycloak skips a default link of a scope that is already linked as optional (no error), and an
+    optional scope's mapper runs only when the token request names it, so remove an optional link
+    first. Keycloak also skips an existing default link with no error, so a second call is a no-op.
+    """
+    if any(s.get("id") == scope_id for s in admin.get_client_optional_client_scopes(client_uuid)):
+        admin.delete_client_optional_client_scope(client_uuid, scope_id)  # optional -> default
+    admin.add_client_default_client_scope(client_uuid, scope_id, {})
+
+
+def _link_login_clients(admin: KeycloakAdmin, scope_id: str) -> None:
+    """Link the subject scope as a default scope to each platform login client (D31).
+
+    A login client is found by its clientId. A login client that is not in the realm is not an
+    error: log it and continue. Adds no client mapper and never makes the scope a realm default.
+    """
+    for client_id in _platform_clients():
+        client_uuid = admin.get_client_id(client_id)
+        if client_uuid is None:
+            _log.warning("login client '%s' not found: '%s' is not linked to it", client_id, _SUBJECT_SCOPE)
+            continue
+        _link_default_scope(admin, client_uuid, scope_id)
+
+
+def _link_login_clients_at_startup() -> None:
+    """Ensure the subject scope and link it to the login clients of ``$KEYCLOAK_REALM`` (D31).
+
+    A failure (for example, Keycloak is not ready) must not stop the service: log it. The call at
+    each onboarding (``POST /services/{id}/subject-scope``) repairs the link.
+    """
+    realm = os.environ.get(_REALM_ENV)
+    if not realm:
+        _log.warning("%s is not set: '%s' is not linked to the login clients at startup", _REALM_ENV, _SUBJECT_SCOPE)
+        return
+    try:
+        admin = _get_or_create_admin(realm)
+        scope = _ensure_subject_scope(admin)
+        _link_login_clients(admin, scope["id"])
+    except Exception as e:  # noqa: BLE001 — any failure here must not crash the service
+        _log.warning("cannot link '%s' to the login clients at startup: %s", _SUBJECT_SCOPE, e)
+
+
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
     load_dotenv(Path(__file__).parent / ".env")
+    _link_login_clients_at_startup()
     yield
 
 
@@ -239,7 +457,7 @@ def get_service(service_id: str, admin: KeycloakAdmin = Depends(get_admin)):
     try:
         return admin.get_client(service_id)
     except KeycloakError as e:
-        return JSONResponse(status_code=502, content={"error": str(e)})
+        return _read_error(e)
 
 
 @app.get("/services/{service_id}/discovery-token")
@@ -300,7 +518,7 @@ def mint_discovery_token(
             access_token=access_token, client_id=client_id, issuer=iss, audience=aud_list
         ).model_dump()
     except KeycloakError as e:
-        return JSONResponse(status_code=502, content={"error": str(e)})
+        return _read_error(e)
 
 
 @app.post("/services/{service_id}/type", status_code=200)
@@ -385,7 +603,7 @@ def list_service_roles(service_id: str, admin: KeycloakAdmin = Depends(get_admin
     except KeycloakError as e:
         if e.response_code == 400:
             return []
-        return JSONResponse(status_code=502, content={"error": str(e)})
+        return _read_error(e)
 
 
 @app.post("/services/{service_id}/roles/{role_id}", status_code=201)
@@ -432,7 +650,7 @@ def delete_role_from_service(service_id: str, role_id: str, admin: KeycloakAdmin
         # Idempotent teardown: an already-gone role or mapping surfaces as 404
         # (python-keycloak raises KeycloakGetError/KeycloakDeleteError with
         # response_code 404). A UC1 rollback retry must treat that as success, so it
-        # proceeds to unset-type + disable instead of aborting here. Other errors → 502.
+        # proceeds to the disable instead of aborting here. Other errors → 502.
         if getattr(e, "response_code", None) == 404:
             return JSONResponse(status_code=200, content={})
         return JSONResponse(status_code=502, content={"error": str(e)})
@@ -443,25 +661,15 @@ def list_service_scopes(service_id: str, admin: KeycloakAdmin = Depends(get_admi
     try:
         scopes = admin.get_client_default_client_scopes(service_id)
         if scopes:
-            # Scope.serviceId = the owning client. For a per-service listing the owner is this
-            # service; resolve its serviceId (clientId). AIAC-managed scopes must have exactly
-            # one owner (Assumption 2) — enforce fail-loud. Built-ins are shared by design, so
-            # they are exempt from the single-owner scan.
+            # Scope.serviceId = the owner of this copy: this service, resolved to its serviceId
+            # (clientId). A scope that more clients link (a shared scope, D32) is listed for each of
+            # them, each time with that client as serviceId, so each copy routes to its owner's SPM.
             owner = admin.get_client(service_id)["clientId"]
-            # Build the scope->owners reverse index at most once per request, only when there is
-            # an AIAC-managed scope to check (built-ins are exempt).
-            owner_index: dict[str, list[str]] | None = None
             for scope in scopes:
-                if _is_aiac_managed(scope.get("attributes")):
-                    if owner_index is None:
-                        owner_index = _build_scope_owner_index(admin)
-                    _assert_single_owner(scope, owner_index)  # Assumption 2, fail loud
                 scope["serviceId"] = owner
         return scopes
-    except _InvariantViolation as e:
-        return JSONResponse(status_code=409, content={"error": str(e)})
     except KeycloakError as e:
-        return JSONResponse(status_code=502, content={"error": str(e)})
+        return _read_error(e)
 
 
 @app.post("/services/{service_id}/scopes", status_code=201)
@@ -492,6 +700,32 @@ def assign_scope_to_service(service_id: str, scope_id: str, admin: KeycloakAdmin
         return JSONResponse(status_code=502, content={"error": str(e)})
 
 
+@app.post("/services/{service_id}/subject-scope", status_code=200)
+def link_subject_scope(service_id: str, admin: KeycloakAdmin = Depends(get_admin)):
+    """Ensure the shared subject scope and link it to a service and the login clients (D31).
+
+    Every token that reaches an AIAC-managed agent or tool must have ``sub`` = username, also after
+    a token exchange (the standard token exchange applies only the requester client's scopes). So
+    ensure ``_SUBJECT_SCOPE`` and its mapper first (``_ensure_subject_scope``), then link the scope
+    as a default scope to THIS client and again to each platform login client
+    (``_link_login_clients``), which repairs a link that the startup call could not make. An
+    optional link is moved to default (``_link_default_scope``); a second call is a no-op. Touches
+    no other client and never makes the scope a realm default. Returns the scope.
+    """
+    try:
+        scope = _ensure_subject_scope(admin)
+        scope_id = scope["id"]
+        _link_default_scope(admin, service_id, scope_id)
+        _link_login_clients(admin, scope_id)
+        return scope
+    except _InvariantViolation as e:
+        return JSONResponse(status_code=409, content={"error": str(e)})
+    except KeycloakError as e:
+        # 404 for an unknown service_id: the library does not retry a 4xx, so a bad UUID is not tried
+        # again as if Keycloak were down.
+        return _read_error(e)
+
+
 @app.delete("/services/{service_id}/scopes/{scope_id}", status_code=200)
 def delete_scope_from_service(service_id: str, scope_id: str, admin: KeycloakAdmin = Depends(get_admin)):
     """Tear down a client scope this service created (UC1 rollback).
@@ -516,7 +750,7 @@ def delete_scope_from_service(service_id: str, scope_id: str, admin: KeycloakAdm
     except KeycloakError as e:
         # Idempotent teardown: an already-gone scope or mapping surfaces as 404
         # (python-keycloak raises KeycloakDeleteError with response_code 404). A UC1
-        # rollback retry must treat that as success, so it proceeds to unset-type +
+        # rollback retry must treat that as success, so it proceeds to the
         # disable instead of aborting here. Other errors → 502.
         if getattr(e, "response_code", None) == 404:
             return JSONResponse(status_code=200, content={})
@@ -568,12 +802,14 @@ def create_role(body: _RoleCreate, admin: KeycloakAdmin = Depends(get_admin)):
         return JSONResponse(status_code=502, content={"error": str(e)})
 
 
-@app.get("/roles/{role_name}/composites")
+# ``{role_name:path}``: the library encodes a "/" in a role name as "%2F", and the server decodes it
+# before routing, so a single-segment ``{role_name}`` would not match it.
+@app.get("/roles/{role_name:path}/composites")
 def list_role_composites(role_name: str, admin: KeycloakAdmin = Depends(get_admin)):
     try:
         return admin.get_composite_realm_roles_of_role(role_name=role_name)
     except KeycloakError as e:
-        return JSONResponse(status_code=502, content={"error": str(e)})
+        return _read_error(e)
 
 
 @app.get("/scopes")

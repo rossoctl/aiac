@@ -1,11 +1,15 @@
 """Unit tests for aiac.idp.configuration."""
 
+import copy
+import logging
+import pickle
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
+import requests
 
-from aiac.idp.configuration.api import Configuration
+from aiac.idp.configuration.api import Configuration, IdPHTTPError
 from aiac.idp.configuration.models import Role, RoleKind, Scope, Service, ServiceType, Subject
 
 REALM = "rossoctl"
@@ -14,8 +18,9 @@ BASE = "http://127.0.0.1:7071"
 
 @pytest.fixture(autouse=True)
 def _single_attempt(monkeypatch):
-    """Configuration now retries transient failures internally (``_request`` → ``run_upstream``).
-    Pin the budget to a single attempt so error-path unit tests stay fast and single-call."""
+    """Configuration now retries transient failures internally (``_request`` → ``run_upstream``),
+    a ``5xx`` included (``IdPHTTPError`` keeps the status). Pin the budget to a single attempt so
+    error-path unit tests stay fast and single-call. ``TestTransientRetry`` sets its own budget."""
     monkeypatch.setenv("UPSTREAM_MAX_RETRIES", "1")
 
 
@@ -221,6 +226,14 @@ class TestGetRoles:
             result = Configuration.for_realm(REALM).get_roles()
         assert not hasattr(result[0], "mappedScopes")
 
+    def test_a_role_name_is_encoded_as_one_path_segment(self, monkeypatch):
+        # A name with "?", "#" or "/" must not end the path or open a query.
+        monkeypatch.setenv("AIAC_PDP_CONFIG_URL", BASE)
+        roles = [{"id": "r1", "name": "team/a?b#c", "composite": True}]
+        with patch("aiac.idp.configuration.api.requests.get", side_effect=[_ok(roles), _ok([])]) as m:
+            Configuration.for_realm(REALM).get_roles()
+        assert m.call_args_list[1].args[0] == f"{BASE}/roles/team%2Fa%3Fb%23c/composites"
+
     def test_raises_if_composites_call_fails(self, monkeypatch):
         monkeypatch.setenv("AIAC_PDP_CONFIG_URL", BASE)
         roles = [{"id": "r1", "name": "admin", "composite": True}]
@@ -287,6 +300,33 @@ class TestGetServices:
             result = Configuration.for_realm(REALM).get_services()
         assert result[0].roles[0].name == "viewer"
 
+    def test_each_owner_of_a_shared_scope_gets_its_own_copy(self, monkeypatch):
+        # A shared scope (D32): two clients link one aiac.managed scope. Each service gets its own
+        # copy, with that owner's clientId as serviceId, so each copy routes to its owner's SPM.
+        monkeypatch.setenv("AIAC_PDP_CONFIG_URL", BASE)
+        services = [
+            {"id": "uuid-1", "clientId": "team1/github-tool", "enabled": True},
+            {"id": "uuid-2", "clientId": "team2/github-tool", "enabled": True},
+        ]
+        shared = {"id": "s-read", "name": "github-tool.source-read", "description": "Read source"}
+        all_scopes = [{**shared, "attributes": {"aiac.managed": "true"}}]
+        with patch(
+            "aiac.idp.configuration.api.requests.get",
+            side_effect=[
+                _ok(services),  # GET /services
+                _ok([]),  # GET /roles
+                _ok(all_scopes),  # GET /scopes
+                _ok([]),  # GET /services/uuid-1/roles
+                _ok([{"id": "s-read", "name": shared["name"], "serviceId": "team1/github-tool"}]),
+                _ok([]),  # GET /services/uuid-2/roles
+                _ok([{"id": "s-read", "name": shared["name"], "serviceId": "team2/github-tool"}]),
+            ],
+        ):
+            team1, team2 = Configuration.for_realm(REALM).get_services()
+        assert team1.scopes == [Scope.model_validate({**all_scopes[0], "serviceId": "team1/github-tool"})]
+        assert team2.scopes == [Scope.model_validate({**all_scopes[0], "serviceId": "team2/github-tool"})]
+        assert team1.scopes[0].aiac_managed and team2.scopes[0].aiac_managed
+
     def test_raises_on_non_2xx(self, monkeypatch):
         monkeypatch.setenv("AIAC_PDP_CONFIG_URL", BASE)
         with patch("aiac.idp.configuration.api.requests.get", return_value=_err()):
@@ -326,6 +366,26 @@ class TestGetService:
         assert result.id == self.SERVICE_ID
         assert result.roles[0].name == "viewer"
         assert result.scopes[0].name == "read:data"
+
+    def test_unmarked_subject_scope_kept_with_aiac_managed_false(self, monkeypatch):
+        # D31: the shared aiac-username-sub scope has no aiac.managed marker. The library does not
+        # filter on the marker: the scope stays in Service.scopes, and the consumers (the PCE, the
+        # focal-entity resolver) drop it through Scope.aiac_managed.
+        monkeypatch.setenv("AIAC_PDP_CONFIG_URL", BASE)
+        raw = {"id": self.SERVICE_ID, "clientId": self.SERVICE_ID, "name": "my-svc", "enabled": True}
+        all_scopes = [
+            {"id": "s1", "name": "read:data", "attributes": {"aiac.managed": "true"}},
+            {"id": "s-sub", "name": "aiac-username-sub", "attributes": {"include.in.token.scope": "false"}},
+        ]
+        service_scopes = [{"id": "s1"}, {"id": "s-sub"}]
+        with patch(
+            "aiac.idp.configuration.api.requests.get",
+            side_effect=[_ok(raw), _ok([]), _ok(all_scopes), _ok([]), _ok(service_scopes)],
+        ):
+            result = Configuration.for_realm(REALM).get_service(self.SERVICE_ID)
+        managed = {s.name: s.aiac_managed for s in result.scopes}
+        assert managed == {"read:data": True, "aiac-username-sub": False}
+        assert all(s.serviceId == self.SERVICE_ID for s in result.scopes)
 
     def test_type_resolved_from_client_type_attribute(self, monkeypatch):
         # Typing comes from the client.type attribute (via Service._resolve_keycloak_fields),
@@ -528,6 +588,74 @@ class TestSetServiceType:
 
 
 # ---------------------------------------------------------------------------
+# link_subject_scope — D31: links the shared, unmarked aiac-username-sub scope
+#
+# POST /services/{id}/subject-scope with no body → the service ensures the scope and
+# its username -> sub mapper, and links it as a default scope of the client. Returns
+# the Scope; it has no aiac.managed marker, so aiac_managed is False.
+# ---------------------------------------------------------------------------
+
+
+class TestLinkSubjectScope:
+    SUBJECT_SCOPE = {
+        "id": "subject-scope-id",
+        "name": "aiac-username-sub",
+        "description": "AIAC subject scope (D31): sets the token sub to the username",
+        "protocol": "openid-connect",
+        "attributes": {"include.in.token.scope": "false", "display.on.consent.screen": "false"},
+        "protocolMappers": [{"name": "username-to-sub", "protocolMapper": "oidc-usermodel-property-mapper"}],
+    }
+
+    def _make_service(self, **kwargs):
+        defaults = {"id": "svc-uuid", "clientId": "svc-uuid", "name": "my-svc", "enabled": True}
+        return Service.model_validate({**defaults, **kwargs})
+
+    def test_posts_to_subject_scope_endpoint(self, monkeypatch):
+        monkeypatch.setenv("AIAC_PDP_CONFIG_URL", BASE)
+        with patch("aiac.idp.configuration.api.requests.post", return_value=_ok(self.SUBJECT_SCOPE, 200)) as m:
+            Configuration.for_realm(REALM).link_subject_scope(self._make_service())
+        m.assert_called_once()
+        assert m.call_args[0][0] == f"{BASE}/services/svc-uuid/subject-scope"
+
+    def test_forwards_realm_as_query_param(self, monkeypatch):
+        monkeypatch.setenv("AIAC_PDP_CONFIG_URL", BASE)
+        with patch("aiac.idp.configuration.api.requests.post", return_value=_ok(self.SUBJECT_SCOPE, 200)) as m:
+            Configuration.for_realm(REALM).link_subject_scope(self._make_service())
+        assert m.call_args[1].get("params") == {"realm": REALM}
+
+    def test_sends_no_body(self, monkeypatch):
+        monkeypatch.setenv("AIAC_PDP_CONFIG_URL", BASE)
+        with patch("aiac.idp.configuration.api.requests.post", return_value=_ok(self.SUBJECT_SCOPE, 200)) as m:
+            Configuration.for_realm(REALM).link_subject_scope(self._make_service())
+        assert "json" not in m.call_args[1]
+        assert "data" not in m.call_args[1]
+
+    def test_returns_scope_from_response(self, monkeypatch):
+        monkeypatch.setenv("AIAC_PDP_CONFIG_URL", BASE)
+        with patch("aiac.idp.configuration.api.requests.post", return_value=_ok(self.SUBJECT_SCOPE, 200)):
+            result = Configuration.for_realm(REALM).link_subject_scope(self._make_service())
+        assert isinstance(result, Scope)
+        assert result.id == "subject-scope-id"
+        assert result.name == "aiac-username-sub"
+
+    def test_returned_scope_is_not_aiac_managed(self, monkeypatch):
+        # The subject scope is shared by every managed client, so it never carries the marker:
+        # a marked scope would become an own scope of each linked service.
+        monkeypatch.setenv("AIAC_PDP_CONFIG_URL", BASE)
+        with patch("aiac.idp.configuration.api.requests.post", return_value=_ok(self.SUBJECT_SCOPE, 200)):
+            result = Configuration.for_realm(REALM).link_subject_scope(self._make_service())
+        assert result.aiac_managed is False
+
+    @pytest.mark.parametrize("status", [502, 409])
+    def test_raises_on_non_2xx(self, status, monkeypatch):
+        # 502: a Keycloak error; 409: the scope exists but carries the aiac.managed marker.
+        monkeypatch.setenv("AIAC_PDP_CONFIG_URL", BASE)
+        with patch("aiac.idp.configuration.api.requests.post", return_value=_err(status)):
+            with pytest.raises(RuntimeError):
+                Configuration.for_realm(REALM).link_subject_scope(self._make_service())
+
+
+# ---------------------------------------------------------------------------
 # create_service_role / create_service_scope — idempotent create-or-get + map
 # (tested by patching the Configuration methods they compose)
 # ---------------------------------------------------------------------------
@@ -548,10 +676,11 @@ class TestCreateServiceRole:
             patch.object(cfg, "get_service", return_value=svc),
             patch.object(cfg, "map_role_to_service", return_value=svc) as mapper,
         ):
-            result = cfg.create_service_role("svc-1", role_def)
+            result, was_created = cfg.create_service_role("svc-1", role_def)
         create.assert_called_once_with("app.agent", "Agent role")
         mapper.assert_called_once_with(svc, created)
         assert result is created
+        assert was_created is True  # this call created the role: it goes into the created-manifest
 
     def test_reuses_existing_role_without_creating(self):
         cfg = Configuration.for_realm(REALM)
@@ -564,10 +693,150 @@ class TestCreateServiceRole:
             patch.object(cfg, "get_service", return_value=svc),
             patch.object(cfg, "map_role_to_service", return_value=svc) as mapper,
         ):
-            result = cfg.create_service_role("svc-1", role_def)
+            result, was_created = cfg.create_service_role("svc-1", role_def)
         create.assert_not_called()
         mapper.assert_called_once_with(svc, existing)
         assert result is existing
+        assert was_created is False  # a reuse is not in the created-manifest
+
+    # A reused role is shared (D32): it keeps its first description, Keycloak is not updated, and a
+    # different new description is logged as a WARNING (handoff 19 Bug 3).
+    def _reuse(self, cfg, existing, role_def):
+        svc = self._svc()
+        with (
+            patch.object(cfg, "get_roles", return_value=[existing]),
+            patch.object(cfg, "create_role") as create,
+            patch.object(cfg, "get_service", return_value=svc),
+            patch.object(cfg, "map_role_to_service", return_value=svc),
+            patch("aiac.idp.configuration.api.requests") as http,
+        ):
+            result, was_created = cfg.create_service_role("svc-1", role_def)
+        create.assert_not_called()
+        assert was_created is False
+        # No update of the kept description: no request at all (``assert_not_called`` would see only a
+        # call of the module mock itself, not ``http.put(...)`` or ``http.post(...)``).
+        assert http.mock_calls == []
+        return result
+
+    def test_reuse_with_a_different_description_warns_and_keeps_the_first(self, caplog):
+        cfg = Configuration.for_realm(REALM)
+        existing = Role(id="r-1", name="app.agent", description="First agent", composite=False)
+        with caplog.at_level(logging.WARNING, logger="aiac.idp.configuration.api"):
+            result = self._reuse(cfg, existing, SimpleNamespace(name="app.agent", description="Second agent"))
+        assert result.description == "First agent"
+        [record] = caplog.records
+        assert record.levelno == logging.WARNING
+        assert all(text in record.getMessage() for text in ("app.agent", "First agent", "Second agent"))
+
+    @pytest.mark.parametrize(("kept", "new"), [("Agent role", "Agent role"), (None, "")], ids=["same", "none-is-empty"])
+    def test_reuse_with_the_same_description_does_not_warn(self, kept, new, caplog):
+        cfg = Configuration.for_realm(REALM)
+        existing = Role(id="r-1", name="app.agent", description=kept, composite=False)
+        with caplog.at_level(logging.WARNING, logger="aiac.idp.configuration.api"):
+            self._reuse(cfg, existing, SimpleNamespace(name="app.agent", description=new))
+        assert caplog.records == []
+
+    def test_new_role_does_not_warn(self, caplog):
+        cfg = Configuration.for_realm(REALM)
+        created = Role(id="r-1", name="app.agent", description="Agent role", composite=False)
+        svc = self._svc()
+        with (
+            caplog.at_level(logging.WARNING, logger="aiac.idp.configuration.api"),
+            patch.object(cfg, "get_roles", return_value=[]),
+            patch.object(cfg, "create_role", return_value=created),
+            patch.object(cfg, "get_service", return_value=svc),
+            patch.object(cfg, "map_role_to_service", return_value=svc),
+        ):
+            cfg.create_service_role("svc-1", SimpleNamespace(name="app.agent", description="Agent role"))
+        assert caplog.records == []
+
+    # REJ-02: the check and the create are two requests. Two services with the same workload name
+    # that provision at the same time both find no role, and Keycloak answers 409 to the second
+    # create. A 409 from the create is reuse: read again by name, as the subject scope does (D31).
+    def _race(self, cfg, reads, create_error):
+        svc = self._svc()
+        with (
+            patch.object(cfg, "get_roles", side_effect=reads) as read,
+            patch.object(cfg, "create_role", side_effect=create_error) as create,
+            patch.object(cfg, "get_service", return_value=svc),
+            patch.object(cfg, "map_role_to_service", return_value=svc) as mapper,
+        ):
+            try:
+                result, self.created = cfg.create_service_role(
+                    "svc-1", SimpleNamespace(name="app.agent", description="Second")
+                )
+                return result
+            finally:
+                self.reads, self.creates, self.maps = read.call_count, create.call_count, mapper.call_args_list
+
+    def test_a_409_from_the_create_reuses_the_role_that_is_there_now(self, caplog):
+        cfg = Configuration.for_realm(REALM)
+        winner = Role(id="r-1", name="app.agent", description="First", composite=False)
+        with caplog.at_level(logging.WARNING, logger="aiac.idp.configuration.api"):
+            result = self._race(cfg, [[], [winner]], IdPHTTPError(409, "Conflict"))
+        assert result is winner
+        # The other run created the object, so it is not in this run's created-manifest (REJ-02).
+        assert self.created is False
+        assert (self.reads, self.creates) == (2, 1)
+        assert self.maps == [call(self._svc(), winner)]
+        # The same description rule as a reuse that the first read finds.
+        [record] = caplog.records
+        assert all(text in record.getMessage() for text in ("app.agent", "First", "Second"))
+
+    def test_a_409_with_the_same_description_does_not_warn(self, caplog):
+        # Also the case of a create that _request repeats after Keycloak committed the first attempt.
+        cfg = Configuration.for_realm(REALM)
+        mine = Role(id="r-1", name="app.agent", description="Second", composite=False)
+        with caplog.at_level(logging.WARNING, logger="aiac.idp.configuration.api"):
+            assert self._race(cfg, [[], [mine]], IdPHTTPError(409, "Conflict")) is mine
+        # A 409 does not tell this run's committed first attempt from another run's create, so it
+        # is reuse: the object is not in the created-manifest, and the rollback does not delete it.
+        assert self.created is False
+        assert caplog.records == []
+
+    def test_a_409_that_the_read_again_does_not_explain_is_raised(self):
+        cfg = Configuration.for_realm(REALM)
+        with pytest.raises(IdPHTTPError) as ei:
+            self._race(cfg, [[], []], IdPHTTPError(409, "Conflict"))
+        assert ei.value.status == 409
+        assert self.maps == []
+
+    def test_an_error_other_than_409_from_the_create_is_raised_with_no_read_again(self):
+        cfg = Configuration.for_realm(REALM)
+        with pytest.raises(IdPHTTPError) as ei:
+            self._race(cfg, [[], []], IdPHTTPError(502, "Bad gateway"))
+        assert ei.value.status == 502
+        assert (self.reads, self.maps) == (1, [])
+
+    def test_a_concurrent_create_on_the_wire_is_reuse(self):
+        # The wire of rej02_race.py: GET /roles misses the role, POST /roles answers 409, GET /roles
+        # again finds it, and the role is mapped to the service.
+        cfg = Configuration.for_realm(REALM)
+        winner = {"id": "r-1", "name": "app.agent", "description": "Second", "composite": False}
+        roles_reads = iter([[]])  # the check misses the role; each later read finds it
+        posts = []
+
+        def get(url, **_kwargs):
+            path = url.removeprefix(BASE)
+            if path == "/roles":
+                return _ok(next(roles_reads, [winner]))
+            if path == "/services/svc-1":
+                return _ok({"id": "svc-1", "clientId": "svc-1", "enabled": True})
+            return _ok([])  # /scopes and the service's own roles and scopes
+
+        def post(url, **_kwargs):
+            posts.append(url.removeprefix(BASE))
+            if url == f"{BASE}/roles":
+                return _err(409)
+            return _ok({}, status=201)
+
+        with (
+            patch("aiac.idp.configuration.api.requests.get", side_effect=get),
+            patch("aiac.idp.configuration.api.requests.post", side_effect=post),
+        ):
+            result, created = cfg.create_service_role("svc-1", SimpleNamespace(name="app.agent", description="Second"))
+        assert (result.id, created) == ("r-1", False)
+        assert posts == ["/roles", "/services/svc-1/roles/r-1"]
 
 
 class TestCreateServiceScope:
@@ -585,10 +854,11 @@ class TestCreateServiceScope:
             patch.object(cfg, "get_service", return_value=svc),
             patch.object(cfg, "map_scope_to_service", return_value=svc) as mapper,
         ):
-            result = cfg.create_service_scope("svc-1", scope_def)
+            result, was_created = cfg.create_service_scope("svc-1", scope_def)
         create.assert_called_once_with("app.read", "Read tool")
         mapper.assert_called_once_with(svc, created)
         assert result is created
+        assert was_created is True  # this call created the scope: it goes into the created-manifest
 
     def test_reuses_existing_scope_without_creating(self):
         cfg = Configuration.for_realm(REALM)
@@ -601,10 +871,147 @@ class TestCreateServiceScope:
             patch.object(cfg, "get_service", return_value=svc),
             patch.object(cfg, "map_scope_to_service", return_value=svc) as mapper,
         ):
-            result = cfg.create_service_scope("svc-1", scope_def)
+            result, was_created = cfg.create_service_scope("svc-1", scope_def)
         create.assert_not_called()
         mapper.assert_called_once_with(svc, existing)
         assert result is existing
+        assert was_created is False  # a reuse is not in the created-manifest
+
+    # A reused scope is shared (D32): it keeps its first description, Keycloak is not updated, and a
+    # different new description is logged as a WARNING (handoff 19 Bug 3).
+    def _reuse(self, cfg, existing, scope_def):
+        svc = self._svc()
+        with (
+            patch.object(cfg, "get_scopes", return_value=[existing]),
+            patch.object(cfg, "create_scope") as create,
+            patch.object(cfg, "get_service", return_value=svc),
+            patch.object(cfg, "map_scope_to_service", return_value=svc),
+            patch("aiac.idp.configuration.api.requests") as http,
+        ):
+            result, was_created = cfg.create_service_scope("svc-1", scope_def)
+        create.assert_not_called()
+        assert was_created is False
+        # No update of the kept description: no request at all (``assert_not_called`` would see only a
+        # call of the module mock itself, not ``http.put(...)`` or ``http.post(...)``).
+        assert http.mock_calls == []
+        return result
+
+    def test_reuse_with_a_different_description_warns_and_keeps_the_first(self, caplog):
+        cfg = Configuration.for_realm(REALM)
+        existing = Scope(id="s-1", name="github-tool.source-read", description="Read the source")
+        with caplog.at_level(logging.WARNING, logger="aiac.idp.configuration.api"):
+            result = self._reuse(
+                cfg, existing, SimpleNamespace(name="github-tool.source-read", description="Read a repository")
+            )
+        assert result.description == "Read the source"
+        [record] = caplog.records
+        assert record.levelno == logging.WARNING
+        message = record.getMessage()
+        assert all(text in message for text in ("github-tool.source-read", "Read the source", "Read a repository"))
+
+    @pytest.mark.parametrize(("kept", "new"), [("Read tool", "Read tool"), (None, "")], ids=["same", "none-is-empty"])
+    def test_reuse_with_the_same_description_does_not_warn(self, kept, new, caplog):
+        cfg = Configuration.for_realm(REALM)
+        existing = Scope(id="s-1", name="app.read", description=kept)
+        with caplog.at_level(logging.WARNING, logger="aiac.idp.configuration.api"):
+            self._reuse(cfg, existing, SimpleNamespace(name="app.read", description=new))
+        assert caplog.records == []
+
+    def test_new_scope_does_not_warn(self, caplog):
+        cfg = Configuration.for_realm(REALM)
+        created = Scope(id="s-1", name="app.read", description="Read tool")
+        svc = self._svc()
+        with (
+            caplog.at_level(logging.WARNING, logger="aiac.idp.configuration.api"),
+            patch.object(cfg, "get_scopes", return_value=[]),
+            patch.object(cfg, "create_scope", return_value=created),
+            patch.object(cfg, "get_service", return_value=svc),
+            patch.object(cfg, "map_scope_to_service", return_value=svc),
+        ):
+            cfg.create_service_scope("svc-1", SimpleNamespace(name="app.read", description="Read tool"))
+        assert caplog.records == []
+
+    # REJ-02: the same race as for a role (see TestCreateServiceRole._race).
+    def _race(self, cfg, reads, create_error):
+        svc = self._svc()
+        with (
+            patch.object(cfg, "get_scopes", side_effect=reads) as read,
+            patch.object(cfg, "create_scope", side_effect=create_error) as create,
+            patch.object(cfg, "get_service", return_value=svc),
+            patch.object(cfg, "map_scope_to_service", return_value=svc) as mapper,
+        ):
+            try:
+                result, self.created = cfg.create_service_scope(
+                    "svc-1", SimpleNamespace(name="app.read", description="Second")
+                )
+                return result
+            finally:
+                self.reads, self.creates, self.maps = read.call_count, create.call_count, mapper.call_args_list
+
+    def test_a_409_from_the_create_reuses_the_scope_that_is_there_now(self, caplog):
+        cfg = Configuration.for_realm(REALM)
+        winner = Scope(id="s-1", name="app.read", description="First")
+        with caplog.at_level(logging.WARNING, logger="aiac.idp.configuration.api"):
+            result = self._race(cfg, [[], [winner]], IdPHTTPError(409, "Conflict"))
+        assert result is winner
+        # The other run created the object, so it is not in this run's created-manifest (REJ-02).
+        assert self.created is False
+        assert (self.reads, self.creates) == (2, 1)
+        assert self.maps == [call(self._svc(), winner)]
+        [record] = caplog.records
+        assert all(text in record.getMessage() for text in ("app.read", "First", "Second"))
+
+    def test_a_409_with_the_same_description_does_not_warn(self, caplog):
+        cfg = Configuration.for_realm(REALM)
+        mine = Scope(id="s-1", name="app.read", description="Second")
+        with caplog.at_level(logging.WARNING, logger="aiac.idp.configuration.api"):
+            assert self._race(cfg, [[], [mine]], IdPHTTPError(409, "Conflict")) is mine
+        # A 409 does not tell this run's committed first attempt from another run's create, so it
+        # is reuse: the object is not in the created-manifest, and the rollback does not delete it.
+        assert self.created is False
+        assert caplog.records == []
+
+    def test_a_409_that_the_read_again_does_not_explain_is_raised(self):
+        cfg = Configuration.for_realm(REALM)
+        with pytest.raises(IdPHTTPError) as ei:
+            self._race(cfg, [[], []], IdPHTTPError(409, "Conflict"))
+        assert ei.value.status == 409
+        assert self.maps == []
+
+    def test_an_error_other_than_409_from_the_create_is_raised_with_no_read_again(self):
+        cfg = Configuration.for_realm(REALM)
+        with pytest.raises(IdPHTTPError) as ei:
+            self._race(cfg, [[], []], IdPHTTPError(502, "Bad gateway"))
+        assert ei.value.status == 502
+        assert (self.reads, self.maps) == (1, [])
+
+    def test_a_concurrent_create_on_the_wire_is_reuse(self):
+        cfg = Configuration.for_realm(REALM)
+        winner = {"id": "s-1", "name": "app.read", "description": "Second", "attributes": {"aiac.managed": "true"}}
+        scopes_reads = iter([[]])  # the check misses the scope; each later read finds it
+        posts = []
+
+        def get(url, **_kwargs):
+            path = url.removeprefix(BASE)
+            if path == "/scopes":
+                return _ok(next(scopes_reads, [winner]))
+            if path == "/services/svc-1":
+                return _ok({"id": "svc-1", "clientId": "svc-1", "enabled": True})
+            return _ok([])  # /roles and the service's own roles and scopes
+
+        def post(url, **_kwargs):
+            posts.append(url.removeprefix(BASE))
+            if url == f"{BASE}/scopes":
+                return _err(409)
+            return _ok({}, status=201)
+
+        with (
+            patch("aiac.idp.configuration.api.requests.get", side_effect=get),
+            patch("aiac.idp.configuration.api.requests.post", side_effect=post),
+        ):
+            result, created = cfg.create_service_scope("svc-1", SimpleNamespace(name="app.read", description="Second"))
+        assert (result.id, created) == ("s-1", False)
+        assert posts == ["/scopes", "/services/svc-1/scopes/s-1"]
 
 
 # ---------------------------------------------------------------------------
@@ -900,6 +1307,15 @@ class TestRealmParameter:
         with patch("aiac.idp.configuration.api.requests.get", return_value=_ok([])) as m:
             Configuration.for_realm(REALM).get_services()
         assert call(f"{BASE}/services", params={"realm": REALM}) in m.call_args_list
+
+    def test_get_services_with_the_roles_given_does_not_read_the_roles_again(self, monkeypatch):
+        # The PCE reads the roles one time and gives them to get_services (D32): one GET /roles
+        # for each operation, so the agent holders and the user holders come from one snapshot.
+        monkeypatch.setenv("AIAC_PDP_CONFIG_URL", BASE)
+        with patch("aiac.idp.configuration.api.requests.get", return_value=_ok([])) as m:
+            Configuration.for_realm(REALM).get_services(roles=[])
+        assert call(f"{BASE}/services", params={"realm": REALM}) in m.call_args_list
+        assert call(f"{BASE}/roles", params={"realm": REALM}) not in m.call_args_list
 
 
 # ---------------------------------------------------------------------------
@@ -1311,66 +1727,6 @@ class TestDeleteServiceScope:
 
 
 # ---------------------------------------------------------------------------
-# unset_service_type — clears the client.type attribute
-#
-# Reuses the set_service_type POST /services/{id}/type pattern with an empty/clear
-# type; the service clears client.type via the same read-merge-update_client path.
-# Returns the updated Service (type now None). Idempotent — clearing an
-# already-clear type is not an error.
-# ---------------------------------------------------------------------------
-
-
-class TestUnsetServiceType:
-    def _make_service(self, **kwargs):
-        defaults = {"id": "svc-uuid", "clientId": "svc-uuid", "name": "my-svc", "enabled": True}
-        return Service.model_validate({**defaults, **kwargs})
-
-    def test_returns_service_with_type_cleared(self, monkeypatch):
-        monkeypatch.setenv("AIAC_PDP_CONFIG_URL", BASE)
-        service = self._make_service(attributes={"client.type": "Agent"})
-        # The service returns the updated client with client.type gone → type resolves to None.
-        updated = {"id": "svc-uuid", "clientId": "svc-uuid", "name": "my-svc", "enabled": True}
-        with patch("aiac.idp.configuration.api.requests.post", return_value=_ok(updated, 200)):
-            result = Configuration.for_realm(REALM).unset_service_type(service)
-        assert isinstance(result, Service)
-        assert result.type is None
-
-    def test_posts_to_type_endpoint_with_empty_type_body(self, monkeypatch):
-        monkeypatch.setenv("AIAC_PDP_CONFIG_URL", BASE)
-        service = self._make_service()
-        updated = {"id": "svc-uuid", "clientId": "svc-uuid", "name": "my-svc", "enabled": True}
-        with patch("aiac.idp.configuration.api.requests.post", return_value=_ok(updated, 200)) as m:
-            Configuration.for_realm(REALM).unset_service_type(service)
-        assert m.call_args[0][0] == f"{BASE}/services/svc-uuid/type"
-        assert m.call_args[1].get("json") == {"type": ""}
-
-    def test_forwards_realm_as_query_param(self, monkeypatch):
-        monkeypatch.setenv("AIAC_PDP_CONFIG_URL", BASE)
-        service = self._make_service()
-        updated = {"id": "svc-uuid", "clientId": "svc-uuid", "name": "my-svc", "enabled": True}
-        with patch("aiac.idp.configuration.api.requests.post", return_value=_ok(updated, 200)) as m:
-            Configuration.for_realm(REALM).unset_service_type(service)
-        assert m.call_args[1].get("params") == {"realm": REALM}
-
-    def test_raises_on_non_2xx(self, monkeypatch):
-        monkeypatch.setenv("AIAC_PDP_CONFIG_URL", BASE)
-        service = self._make_service()
-        with patch("aiac.idp.configuration.api.requests.post", return_value=_err(502)):
-            with pytest.raises(RuntimeError):
-                Configuration.for_realm(REALM).unset_service_type(service)
-
-    def test_idempotent_clearing_already_clear_type_does_not_raise(self, monkeypatch):
-        # A service with no client.type: clearing is a no-op the service reports as
-        # success; the returned Service still has type None and no error is raised.
-        monkeypatch.setenv("AIAC_PDP_CONFIG_URL", BASE)
-        service = self._make_service()  # type already None
-        updated = {"id": "svc-uuid", "clientId": "svc-uuid", "name": "my-svc", "enabled": True}
-        with patch("aiac.idp.configuration.api.requests.post", return_value=_ok(updated, 200)):
-            result = Configuration.for_realm(REALM).unset_service_type(service)
-        assert result.type is None
-
-
-# ---------------------------------------------------------------------------
 # set_service_enabled — the writer for Service.enabled
 #
 # POST /services/{id}/enabled with {"enabled": bool} → the service calls
@@ -1393,6 +1749,19 @@ class TestSetServiceEnabled:
             result = Configuration.for_realm(REALM).set_service_enabled(service, False)
         assert isinstance(result, Service)
         assert result.enabled is False
+
+    def test_by_id_posts_to_the_same_endpoint_with_no_service_read(self, monkeypatch):
+        monkeypatch.setenv("AIAC_PDP_CONFIG_URL", BASE)
+        updated = {"id": "svc-uuid", "clientId": "svc-uuid", "name": "my-svc", "enabled": True}
+        with (
+            patch("aiac.idp.configuration.api.requests.post", return_value=_ok(updated, 200)) as post,
+            patch("aiac.idp.configuration.api.requests.get") as get,
+        ):
+            result = Configuration.for_realm(REALM).set_service_enabled_by_id("svc-uuid", True)
+        assert result.enabled is True
+        assert post.call_args[0][0] == f"{BASE}/services/svc-uuid/enabled"
+        assert post.call_args[1].get("json") == {"enabled": True}
+        get.assert_not_called()
 
     def test_posts_to_enabled_endpoint_with_enabled_body(self, monkeypatch):
         monkeypatch.setenv("AIAC_PDP_CONFIG_URL", BASE)
@@ -1476,3 +1845,121 @@ class TestServiceEnabledRoundTrip:
         ):
             result = Configuration.for_realm(REALM).get_services()
         assert result[0].enabled is False
+
+
+# ---------------------------------------------------------------------------
+# Transient retry — the error keeps the status, a 5xx is retried, a 4xx is not
+#
+# _check raises IdPHTTPError (a RuntimeError subclass) with the HTTP status and
+# the response, so run_upstream (aiac.shared.upstream) retries a 5xx up to
+# UPSTREAM_MAX_RETRIES with exponential backoff (1 s, 2 s, ...) and raises a 4xx
+# at once. The fixture sets a budget of 3 attempts (it overrides _single_attempt)
+# and records each backoff instead of sleeping: tenacity's default sleep calls
+# time.sleep at run time, so patch time.sleep, not tenacity.nap.sleep.
+# ---------------------------------------------------------------------------
+
+
+def _real_response(status: int, text: str = "boom") -> requests.Response:
+    """A real ``requests.Response`` (not a MagicMock), so ``.ok`` / ``.text`` / ``.status_code`` are
+    the library's own."""
+    resp = requests.Response()
+    resp.status_code = status
+    resp._content = text.encode()
+    return resp
+
+
+class TestTransientRetry:
+    SERVICE_ID = "svc-001"
+
+    @pytest.fixture(autouse=True)
+    def waits(self, monkeypatch):
+        monkeypatch.setenv("AIAC_PDP_CONFIG_URL", BASE)
+        monkeypatch.setenv("UPSTREAM_MAX_RETRIES", "3")
+        recorded: list[float] = []
+        monkeypatch.setattr("time.sleep", recorded.append)
+        return recorded
+
+    @pytest.mark.parametrize("status", [500, 502, 503])
+    def test_5xx_is_retried_up_to_the_budget_then_raised(self, status, waits):
+        with patch("aiac.idp.configuration.api.requests.get", return_value=_err(status)) as m:
+            with pytest.raises(IdPHTTPError) as ei:
+                Configuration.for_realm(REALM).get_scopes()
+        assert m.call_count == 3  # UPSTREAM_MAX_RETRIES
+        assert ei.value.status == status
+        assert waits == [1, 2]  # exponential backoff, no real sleep
+
+    def test_5xx_then_200_succeeds(self, waits):
+        scopes = [{"id": "s1", "name": "read:data"}]
+        with patch("aiac.idp.configuration.api.requests.get", side_effect=[_err(502), _ok(scopes)]) as m:
+            result = Configuration.for_realm(REALM).get_scopes()
+        assert [s.name for s in result] == ["read:data"]
+        assert m.call_count == 2
+        assert waits == [1]
+
+    @pytest.mark.parametrize("status", [400, 404, 409])
+    def test_4xx_is_not_retried(self, status, waits):
+        with patch("aiac.idp.configuration.api.requests.get", return_value=_err(status)) as m:
+            with pytest.raises(IdPHTTPError) as ei:
+                Configuration.for_realm(REALM).get_service(self.SERVICE_ID)
+        assert m.call_count == 1
+        assert ei.value.status == status
+        assert waits == []
+
+    def test_real_response_5xx_is_retried_and_4xx_is_not(self, waits):
+        with patch("aiac.idp.configuration.api.requests.get", return_value=_real_response(503)) as m:
+            with pytest.raises(IdPHTTPError):
+                Configuration.for_realm(REALM).get_scopes()
+        assert m.call_count == 3
+        with patch("aiac.idp.configuration.api.requests.get", return_value=_real_response(404)) as m:
+            with pytest.raises(IdPHTTPError):
+                Configuration.for_realm(REALM).get_service(self.SERVICE_ID)
+        assert m.call_count == 1
+
+    def test_write_5xx_is_retried_and_write_409_is_not(self, waits):
+        # A write is retried at the same leaf (_request). library-idp.md ("Retry safety of the
+        # writes") tells what a repeated write of each primitive does.
+        with patch("aiac.idp.configuration.api.requests.post", return_value=_err(502)) as m:
+            with pytest.raises(IdPHTTPError):
+                Configuration.for_realm(REALM).create_scope("read:data", "Read access")
+        assert m.call_count == 3
+        with patch("aiac.idp.configuration.api.requests.post", return_value=_err(409)) as m:
+            with pytest.raises(IdPHTTPError):
+                Configuration.for_realm(REALM).create_scope("read:data", "Read access")
+        assert m.call_count == 1
+
+    def test_error_is_a_runtime_error_that_keeps_the_status_and_the_response(self):
+        resp = _err(404)
+        with patch("aiac.idp.configuration.api.requests.get", return_value=resp):
+            with pytest.raises(RuntimeError) as ei:
+                Configuration.for_realm(REALM).get_service(self.SERVICE_ID)
+        assert isinstance(ei.value, IdPHTTPError)
+        assert ei.value.status == 404
+        assert ei.value.response is resp
+        assert str(ei.value) == "HTTP 404: internal error"  # the message text does not change
+
+    @pytest.mark.parametrize(
+        "clone",
+        [
+            pytest.param(lambda e: pickle.loads(pickle.dumps(e)), id="pickle"),
+            pytest.param(copy.copy, id="copy"),
+            pytest.param(copy.deepcopy, id="deepcopy"),
+        ],
+    )
+    @pytest.mark.parametrize("with_response", [True, False], ids=["response", "no-response"])
+    def test_error_survives_pickle_and_copy(self, clone, with_response):
+        # BaseException rebuilds a copy from ``self.args`` (the message only), which would call
+        # IdPHTTPError(message) and fail with a TypeError. A checkpointer, a process pool or a log
+        # handler that copies the error must get the same error back.
+        resp = _real_response(502, "upstream down") if with_response else None
+        err = IdPHTTPError(502, "upstream down", resp)
+        err.add_note("first get_service")
+        got = clone(err)
+        assert type(got) is IdPHTTPError
+        assert got.status == 502
+        assert str(got) == "HTTP 502: upstream down"
+        assert got.__notes__ == ["first get_service"]
+        if with_response:
+            assert got.response.status_code == 502
+            assert got.response.text == "upstream down"
+        else:
+            assert got.response is None

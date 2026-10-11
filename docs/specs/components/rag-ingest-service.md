@@ -1,5 +1,7 @@
 # Component PRD: RAG Ingest Service
 
+> **Status: not built yet** — no RAG Ingest Service code, image or k8s manifest exists. It is planned for Phase 3 (RAG Pod, issue 4.20).
+
 ## Description
 A FastAPI REST service co-located with ChromaDB and the Policy Guardrails Agent in the RAG Pod. Accepts knowledge documents for any configured collection, chunks and embeds them, and writes the resulting vectors into the ChromaDB instance in the same Pod. Supports both access control policies (`aiac-policies`) and org/business domain context (`aiac-domain-knowledge`) through a single collection-parameterized API surface. Developer-driven ingestion is performed via `kubectl port-forward`.
 
@@ -51,7 +53,7 @@ Before writing any document to ChromaDB, the service sends it to the co-located 
 
 ## Post-ingest Event Broker notification
 
-After every successful ingest operation (replace, update, or delete), the service publishes `{"id": ""}` to `aiac.apply.policy.build` on the Event Broker (`NATS_URL`). The publish is non-blocking: ingest success is reported to the caller before the NATS publish completes. Publish failures are logged but do not cause the ingest endpoint to return an error. This preserves ingest availability even when the Event Broker is temporarily unavailable.
+After every successful ingest operation (replace, update, or delete), the service publishes an empty payload (`{}`) to `aiac.apply.policy.build` on the Event Broker (`NATS_URL`), as [event-broker.md → Message Payload](event-broker.md#message-payload) specifies. The publish is non-blocking: ingest success is reported to the caller before the NATS publish completes. Publish failures are logged but do not cause the ingest endpoint to return an error. This preserves ingest availability even when the Event Broker is temporarily unavailable.
 
 The AIAC Agent's durable consumer receives the event and acknowledges it after successful processing. Delivery guarantees (at-least-once, replay on Agent restart) are managed by the Event Broker — the RAG Ingest Service is fire-and-forget from its perspective.
 

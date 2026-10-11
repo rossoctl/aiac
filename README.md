@@ -64,7 +64,7 @@ set -a; . .env; set +a          # LLM_BASE_URL / LLM_MODEL / LLM_API_KEY
 
 Integration tests additionally need a live rossoctl/Kind cluster with the AuthBridge OPA pipeline
 wired in, plus Keycloak admin creds. Stand it up with `k8s/opa-kind-enable.sh` — see
-[k8s/opa-kind-runbook.md](k8s/opa-kind-runbook.md) for prerequisites and manual probe commands.
+[k8s/opa-kind-runbook.md](k8s/opa-kind-runbook.md) for prerequisites and verification.
 
 ## Deploying to Kubernetes
 

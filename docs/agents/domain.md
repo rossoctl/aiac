@@ -7,9 +7,13 @@ when exploring the codebase. The repo (`rossoctl/aiac`) is a single context.
 
 - **`CONTEXT.md`** at the repo root.
 
-If it doesn't exist, **proceed silently**. Don't flag its absence; don't suggest
-creating it upfront. The `domain-modeling` skill (or the user-invoked
-`/grill-with-docs`) creates it lazily when terms actually get resolved.
+**Gotcha — the file names differ from the skills' defaults.** The engineering
+skills (mattpocock-skills 1.3 and later, including `domain-modeling` and the
+user-invoked `/grill-with-docs`) call the glossary `GLOSSARY.md` and record
+decisions under `docs/adr/`. This repo does not. Wherever a skill says
+`GLOSSARY.md`, read and edit `CONTEXT.md`; wherever it says ADR, record a
+"Design decision: …" section in the relevant spec (next section). Never create
+`GLOSSARY.md` or `docs/adr/`.
 
 ## Design decisions — consult on demand, not up front
 
@@ -22,17 +26,6 @@ without context**, and **the result of a real trade-off**; otherwise leave it ou
 **Do not read decisions up front.** Consult only the one that touches the area you
 are about to work in — follow the reference from the PRD/spec you are already
 reading. This keeps decisions for unrelated features out of your context.
-
-## File structure
-
-```
-/
-├── CONTEXT.md
-├── docs/
-│   ├── specs/          ← PRD.md + components/ (see CLAUDE.md); design decisions live embedded here
-│   └── agents/         ← this file and its siblings
-└── src/aiac/
-```
 
 ## Use the glossary's vocabulary
 
@@ -56,5 +49,4 @@ section in a PRD/spec — surface it explicitly rather than silently overriding:
 
 `CLAUDE.md` documents `docs/specs/PRD.md` and `docs/specs/components/` as the
 requirements source. `CONTEXT.md` is a different layer — domain vocabulary, not
-requirements. Design decisions live **embedded in** the relevant PRD/spec (a
-"Design decision: …" section).
+requirements.

@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 from aiac.agent.uc.onboarding.provision import graph as graph_mod
 from aiac.agent.uc.onboarding.provision import kube, nodes
 from aiac.agent.uc.onboarding.provision.state import OnboardingProvisionState, Trigger
-from aiac.idp.configuration.models import Service, ServiceType
+from aiac.idp.configuration.models import Role, Scope, Service, ServiceType
 
 ENTITY = "svc-1"
 
@@ -30,6 +30,15 @@ def _pod(type_value):
 
 def _service():
     return Service.model_validate({"id": ENTITY, "clientId": ENTITY, "name": "team-a/weather", "enabled": True})
+
+
+def _idp(cfg):
+    """The mocked ``Configuration``: it gives the service, and its ``create_service_role`` /
+    ``create_service_scope`` create each object (they return ``(object, True)``)."""
+    conf = cfg.return_value
+    conf.get_service.return_value = _service()
+    conf.create_service_role.side_effect = lambda _sid, d: (Role(id=f"r-{d.name}", name=d.name, composite=False), True)
+    conf.create_service_scope.side_effect = lambda _sid, d: (Scope(id=f"s-{d.name}", name=d.name), True)
 
 
 class TestRoute:
@@ -57,7 +66,7 @@ class TestEndToEnd:
             patch.object(kube, "_core_v1") as core_v1,
             patch.object(kube, "_custom_objects") as co,
         ):
-            cfg.return_value.get_service.return_value = _service()
+            _idp(cfg)
             core = MagicMock()
             core.list_namespaced_pod.return_value = SimpleNamespace(items=[_pod("agent")])
             core_v1.return_value = core
@@ -77,6 +86,9 @@ class TestEndToEnd:
         assert [r.name for r in provision.roles] == ["weather.forecast"]
         assert [s.name for s in provision.scopes] == ["weather.forecast"]
         cfg.return_value.set_service_type.assert_called_once()
+        # This run created both objects, so both are in the created-manifest.
+        assert [r.name for r in _get(result, "created_roles")] == ["weather.forecast"]
+        assert [s.name for s in _get(result, "created_scopes")] == ["weather.forecast"]
 
     def test_tool_path_end_to_end(self):
         with (
@@ -84,7 +96,7 @@ class TestEndToEnd:
             patch.object(kube, "_core_v1") as core_v1,
             patch.object(nodes, "_mcp_tools_list", return_value=[{"name": "t1", "description": "d"}]),
         ):
-            cfg.return_value.get_service.return_value = _service()
+            _idp(cfg)
             core = MagicMock()
             core.list_namespaced_pod.return_value = SimpleNamespace(items=[_pod("tool")])
             core.read_namespaced_service.return_value = SimpleNamespace(
@@ -98,3 +110,5 @@ class TestEndToEnd:
         provision = _get(result, "service_provision")
         assert provision.roles == []
         assert [s.name for s in provision.scopes] == ["weather.t1"]
+        assert _get(result, "created_roles") == []
+        assert [s.name for s in _get(result, "created_scopes")] == ["weather.t1"]
