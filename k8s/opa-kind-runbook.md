@@ -284,8 +284,8 @@ wait for the resync. So no CR of the old side stays.
 > inbound on `github-tool` check nothing.
 
 Under agent side, the onboarding checks (D30) run for agents only, and check #2
-also needs `opa` in the outbound pipeline. The overlay of [Enable](#enable) has
-it.
+also needs `mcp-parser` and `opa` in the outbound pipeline. The overlay of
+[Enable](#enable) has them.
 
 Check the result:
 

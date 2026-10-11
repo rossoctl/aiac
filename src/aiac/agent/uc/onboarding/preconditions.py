@@ -9,8 +9,9 @@ focus service can enforce its CR:
 - **#2 — the pipeline:** the namespace ConfigMap ``authbridge-runtime-config`` (key
   ``config.yaml``, ``pipeline.inbound.plugins[].name``) has ``opa`` in the inbound pipeline, and
   also ``mcp-parser`` for a tool (the tool's inbound package checks ``input.mcp.params.name``).
-  Under agent side, ``opa`` must also be in the outbound pipeline
-  (``pipeline.outbound.plugins[].name``), because the agent's outbound checks its calls to tools.
+  Under agent side, ``mcp-parser`` and ``opa`` must also be in the outbound pipeline
+  (``pipeline.outbound.plugins[].name``), because the agent's outbound checks its calls to tools
+  (its package reads ``input.mcp.method`` and ``input.mcp.params.name``).
   A missing ConfigMap fails the check. One #2 failure names each missing plugin.
 - **#6 — the probes:** no app container (every container except ``authbridge-proxy``) has an
   ``httpGet`` readiness, liveness or startup probe. A kubelet probe carries no identity, and no
@@ -147,9 +148,11 @@ def _required_inbound_plugins(service_type: ServiceType) -> list[str]:
 
 
 def _required_outbound_plugins(side: EnforcementSide) -> list[str]:
-    """The plugins #2 needs in the outbound pipeline: ``opa`` under agent side (the agent's outbound
-    checks its calls to tools), none under target side (every outbound is a pass-through, D24)."""
-    return ["opa"] if side is EnforcementSide.AGENT_SIDE else []
+    """The plugins #2 needs in the outbound pipeline: ``mcp-parser`` and ``opa`` under agent side (the
+    agent's outbound checks its calls to tools, and its Rego reads ``input.mcp.method`` and
+    ``input.mcp.params.name``, which ``mcp-parser`` sets), none under target side (every outbound is
+    a pass-through, D24)."""
+    return ["mcp-parser", "opa"] if side is EnforcementSide.AGENT_SIDE else []
 
 
 def _plugin_names(config, direction: str) -> set | None:

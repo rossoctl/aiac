@@ -370,8 +370,9 @@ def _onboard(service_id: ServiceUuid, wait_for_client: bool) -> tuple[list[Polic
         bootstrap(client_id, ServiceType.TOOL)
 
     # A failure that runs no quarantine (a 502 from Provision, any error of the build that is not a
-    # rollback error) must not leave the bootstrap CR: under agent side it is an allow-all
-    # pass-through for a service that is not managed. The PCE drops it if the store has no SPM.
+    # rollback error) must not leave the bootstrap CR: under agent side it is a pass-through CR,
+    # which allows every request, for a service that is not managed. The PCE drops it if the store
+    # has no SPM. A rollback error runs the quarantine, which deletes the CR, so it drops nothing.
     try:
         # The checks already read the pods and their type label: Provision does not read them again.
         namespace, workload_name = split_client_name(service_id, service.name)
@@ -382,16 +383,10 @@ def _onboard(service_id: ServiceUuid, wait_for_client: bool) -> tuple[list[Polic
             service_type=pod_type,
         )
         provision = build_provision_graph().invoke(state)
-    except Exception:
-        if bootstrapped:
-            _drop_bootstrap(client_id)
-        raise
-    service_type = provision["service_type"]
-    created_roles = provision["created_roles"]
-    created_scopes = provision["created_scopes"]
-
-    try:
-        rules = ServicePolicyBuilder.build(service_id, service_type)
+        created_roles = provision["created_roles"]
+        created_scopes = provision["created_scopes"]
+        # Only the PRB raises a rollback error, so Provision has set the created roles and scopes.
+        rules = ServicePolicyBuilder.build(service_id, provision["service_type"])
     except _ROLLBACK_ERRORS:
         try:
             _rollback(config, service, created_roles, created_scopes)

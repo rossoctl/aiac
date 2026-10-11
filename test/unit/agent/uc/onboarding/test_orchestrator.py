@@ -1231,8 +1231,9 @@ class TestBootstrapOfATool:
 
     @pytest.mark.parametrize("stage", ["provision", "build"])
     def test_a_failure_with_no_quarantine_drops_the_bootstrap_cr(self, k8s, quarantine, drop_bootstrap, stage):
-        # Under agent side the bootstrap CR is an allow-all pass-through: a 502 of Provision, or a
-        # build error that is not a rollback error, must not leave it for a tool that is not managed.
+        # Under agent side the bootstrap CR is a pass-through CR, which allows every request: a 502
+        # of Provision, or a build error that is not a rollback error, must not leave it for a tool
+        # that is not managed.
         k8s.list_namespaced_pod.return_value = kf.pod_list(kf.pod(type_label="tool"))
         graph = _graph(service_type=ServiceType.TOOL)
         error = HTTPException(502, "no MCP manifest")

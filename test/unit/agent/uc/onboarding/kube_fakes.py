@@ -69,7 +69,9 @@ def pod(
     )
 
 
-def pipeline_configmap(inbound=("jwt-validation", "mcp-parser", "opa"), outbound=("token-exchange", "opa")):
+def pipeline_configmap(
+    inbound=("jwt-validation", "mcp-parser", "opa"), outbound=("mcp-parser", "token-exchange", "opa")
+):
     """The namespace ConfigMap ``authbridge-runtime-config``: ``config.yaml`` holds the pipeline."""
     config = {
         "pipeline": {

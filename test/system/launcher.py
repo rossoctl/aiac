@@ -22,10 +22,11 @@ Two halves, both live here so a single module import serves every launcher:
 The evaluator is now the deployed plugin, not a standalone OPA-CLI run over dumped ``.rego``: there is
 deliberately no ``opa`` binary dependency and no ``.rego``-dump oracle here anymore (handoff 08).
 
-It imports only the standard library and ``requests`` — never ``aiac`` — so a launcher may import
-it *before* setting the environment variables the aiac libraries read at import time. ``pytest`` is
-imported lazily inside the skip gates (only the live suite uses them, and only under pytest) so the
-module stays importable in the standalone launchers.
+At import time it imports only the standard library and ``requests`` — never ``aiac`` — so a
+launcher may import it *before* setting the environment variables the aiac libraries read at import
+time. ``pytest`` is imported lazily inside the skip gates (only the live suite uses them, and only
+under pytest) so the module stays importable in the standalone launchers; the combiner gate
+(``combiner_reason``) imports the rules of start check #4 the same way.
 """
 
 from __future__ import annotations
@@ -852,35 +853,27 @@ def _kubectl_try(*args: str, timeout: float = 30.0) -> tuple[bool, str, str]:
 # ``AuthorizationPolicy`` (the combiner). Same env name and default as the Controller's start check #4.
 BUNDLE_SERVICE_NAMESPACE = os.environ.get("AIAC_BUNDLE_SERVICE_NAMESPACE", "rossoctl-system")
 
-# D20: in an AIAC setup the combiner's two **request** packages must not carry these fallback lines,
-# which allow a pod that has no client CR. ``k8s/opa-kind-enable.sh`` applies the changed ``default``
-# CR; a ``helm upgrade`` of the operator puts the lines back. The response packages keep the default.
-COMBINER_FALLBACK_LINES: dict[str, str] = {
-    "inbound/request.rego": "client_ok if not data.authbridge.client.inbound.request",
-    "outbound/request.rego": "client_ok if not data.authbridge.client.outbound.request",
-}
-
 
 def combiner_reason(default_cr: dict | None, *, namespace: str = BUNDLE_SERVICE_NAMESPACE) -> str | None:
     """Return ``None`` when the global combiner denies a pod that has no client CR (D20), else a skip
     reason. **Pure** — decides from the already-read ``default`` ``AuthorizationPolicy`` object
     (``None`` when it is missing), like ``event_path_reason``.
 
-    The combiner is changed when both request packages exist and neither holds its
-    ``COMBINER_FALLBACK_LINES`` line (whitespace-normalized). A missing CR or package also fails, as
-    in the Controller's start check #4."""
+    The rules are those of the Controller's start check #4 (``combiner_problems`` in
+    ``aiac.agent.controller.start``): each ``client_ok`` rule of every entry of the two request
+    packages must be a rule of the AIAC combiner. ``k8s/opa-kind-enable.sh`` applies the changed
+    ``default`` CR; a ``helm upgrade`` of the operator puts the stock fallback lines back. The import
+    is in the function, so this module still imports no ``aiac`` at import time."""
+    from aiac.agent.controller.start import combiner_problems
+
     fix = "run k8s/opa-kind-enable.sh to apply the changed combiner (D20; a helm upgrade of the operator reverts it)"
     if not default_cr:
         return f"the global combiner (AuthorizationPolicy 'default' in {namespace}) is missing — {fix}"
-    policies = {p.get("path", ""): p.get("content") or "" for p in (default_cr.get("spec") or {}).get("policies") or []}
-    for path, line in COMBINER_FALLBACK_LINES.items():
-        if path not in policies:
-            return f"the global combiner in {namespace} has no {path} package — {fix}"
-        if any(" ".join(raw.split()) == line for raw in policies[path].splitlines()):
-            return (
-                f"the global combiner in {namespace} still allows a pod that has no client CR "
-                f"({path} holds {line!r}) — {fix}"
-            )
+    problems = combiner_problems(default_cr)
+    if problems:
+        return (
+            f"the global combiner in {namespace} can allow a pod that has no client CR ({'; '.join(problems)}) — {fix}"
+        )
     return None
 
 

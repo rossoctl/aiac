@@ -36,8 +36,7 @@ _HTTP_TIMEOUT_DEFAULT = 60.0
 def _http_timeout() -> float:
     """The timeout in seconds, read at call time. An unset, non-numeric, non-finite, zero or negative
     value falls back to the default: a bad value must not stop the Controller at import."""
-    timeout = env_num(_HTTP_TIMEOUT_ENV, _HTTP_TIMEOUT_DEFAULT, float, minimum=0.0)
-    return timeout if timeout > 0 else _HTTP_TIMEOUT_DEFAULT
+    return env_num(_HTTP_TIMEOUT_ENV, _HTTP_TIMEOUT_DEFAULT, float, minimum=0.0, exclusive=True)
 
 
 def _base_url() -> str:

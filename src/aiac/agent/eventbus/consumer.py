@@ -104,8 +104,7 @@ _NOT_VISIBLE_NAK_DELAY_DEFAULT = 30.0
 def _not_visible_nak_delay() -> float:
     """The nak delay in seconds for a not-visible service; an unset, non-numeric, non-finite, zero
     or negative value falls back to the default (nats-py sends a plain nak, with no delay, for 0)."""
-    delay = env_num(_NOT_VISIBLE_NAK_DELAY_ENV, _NOT_VISIBLE_NAK_DELAY_DEFAULT, float, minimum=0.0)
-    return delay if delay > 0 else _NOT_VISIBLE_NAK_DELAY_DEFAULT
+    return env_num(_NOT_VISIBLE_NAK_DELAY_ENV, _NOT_VISIBLE_NAK_DELAY_DEFAULT, float, minimum=0.0, exclusive=True)
 
 
 async def _nak_not_visible(msg: Msg) -> None:

@@ -66,6 +66,27 @@ def _client_ok_rules(content: str) -> list[str]:
     return [line for line in lines if _CLIENT_OK_HEAD.match(line)]
 
 
+def combiner_problems(cr: dict) -> list[str]:
+    """Each reason why the combiner ``cr`` (the ``default`` ``AuthorizationPolicy``, already read) can
+    allow a pod that has no client CR; an empty list when it cannot. Pure: start check #4 and the
+    skip gate of the system tests (``test/system/launcher.py``) use the same rules."""
+    # Every entry of a path: a CR that lists a path two times must not hide a fail-open entry.
+    contents: dict[str, list[str]] = {}
+    for policy in (cr.get("spec") or {}).get("policies") or []:
+        contents.setdefault(policy.get("path"), []).append(policy.get("content") or "")
+    problems = []
+    for path, safe in _SAFE_CLIENT_OK_RULES.items():
+        if path not in contents:
+            problems.append(f"{path} is missing")
+            continue
+        for content in contents[path]:
+            rules = _client_ok_rules(content)
+            if not rules:
+                problems.append(f"{path} has no client_ok rule")
+            problems.extend(f"{path} has the rule {rule!r}" for rule in rules if rule not in safe)
+    return problems
+
+
 def check_combiner() -> None:
     """Start check #4 (D30). Raise :class:`StartCheckError` if the global combiner can allow a pod
     that has no client CR, or if the check cannot read it."""
@@ -81,20 +102,7 @@ def check_combiner() -> None:
             ) from e
         raise StartCheckError(f"start check #4 failed: cannot read {where}: {e}") from e
 
-    # Every entry of a path: a CR that lists a path two times must not hide a fail-open entry.
-    contents: dict[str, list[str]] = {}
-    for policy in (cr.get("spec") or {}).get("policies") or []:
-        contents.setdefault(policy.get("path"), []).append(policy.get("content") or "")
-    problems = []
-    for path, safe in _SAFE_CLIENT_OK_RULES.items():
-        if path not in contents:
-            problems.append(f"{path} is missing")
-            continue
-        for content in contents[path]:
-            rules = _client_ok_rules(content)
-            if not rules:
-                problems.append(f"{path} has no client_ok rule")
-            problems.extend(f"{path} has the rule {rule!r}" for rule in rules if rule not in safe)
+    problems = combiner_problems(cr)
     if problems:
         raise StartCheckError(
             f"start check #4 failed: the global combiner ({where}) allows a pod that has no client CR: "

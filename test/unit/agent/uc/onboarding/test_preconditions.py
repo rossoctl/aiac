@@ -278,8 +278,21 @@ class TestAgentSideScope:
         assert failures[0].startswith("#2") and "outbound" in failures[0] and "'opa'" in failures[0]
         assert "inbound pipeline has no" not in failures[0]
 
-    def test_an_agent_with_opa_in_both_pipelines_passes(self, agent_side):
-        core = kf.core_v1(configmap=kf.pipeline_configmap(inbound=("jwt-validation", "opa"), outbound=("opa",)))
+    def test_an_agent_needs_mcp_parser_in_the_outbound_pipeline(self, agent_side):
+        # The agent outbound package reads input.mcp.method and input.mcp.params.name: without
+        # mcp-parser they are not set, and the package denies every call to a tool.
+        core = kf.core_v1(
+            configmap=kf.pipeline_configmap(inbound=("jwt-validation", "opa"), outbound=("token-exchange", "opa"))
+        )
+        failures = _failures(core)
+        assert len(failures) == 1
+        assert failures[0].startswith("#2") and "outbound" in failures[0] and "'mcp-parser'" in failures[0]
+        assert "inbound pipeline has no" not in failures[0]
+
+    def test_an_agent_with_opa_in_both_pipelines_and_mcp_parser_outbound_passes(self, agent_side):
+        core = kf.core_v1(
+            configmap=kf.pipeline_configmap(inbound=("jwt-validation", "opa"), outbound=("mcp-parser", "opa"))
+        )
         assert _check(core) is ServiceType.AGENT
 
     def test_an_agent_with_no_opa_in_either_pipeline_gets_one_2_failure_that_names_both(self, agent_side):
