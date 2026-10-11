@@ -2,7 +2,8 @@
 
 Subscribes to the ``aiac-agent-consumer`` durable queue group and, on each
 message, calls the same use-case handler + ``compute_and_apply`` sequence the
-HTTP routes use, awaiting completion before acking. A role-membership change
+HTTP routes use (UC1: only ``onboard_and_apply``, which makes the ``compute_and_apply`` call
+itself), awaiting completion before acking. A role-membership change
 (``aiac.apply.role-members.{role-id}``, D32) calls the PCE ``rerender_role`` instead, as the
 ``POST /apply/role-members/{role_id}`` route does: no use-case handler (no PRB run) and no
 ``compute_and_apply``. Before it subscribes, the start updates an existing durable consumer to the

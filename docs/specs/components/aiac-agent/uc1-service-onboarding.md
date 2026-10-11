@@ -46,7 +46,7 @@ flowchart TD
     end
 
     PRB["Policy Rules Builder (shared)\nagent/policy_rules_builder/"]
-    PCE["Policy Computation Engine\naiac.policy.computation\ncompute_and_apply(merged_rules, override)"]
+    PCE["Policy Computation Engine\naiac.policy.computation\ncompute_and_apply(merged_rules, override=False)"]
 
     CTRL -->|"service/:id\nonboard_and_apply"| ORC
     ORC -->|"tool only, before Provision:\nbootstrap(client_id, Tool)"| PCE

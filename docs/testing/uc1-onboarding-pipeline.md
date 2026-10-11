@@ -277,7 +277,8 @@ real requests + assert → full teardown.**
      provisions **one operator role per skill** `github-agent.{source_operations, issue_operations}`
      (mirroring the scopes) + scopes `github-agent.{source_operations, issue_operations}`, sets
      `client.type=Agent`; the Service Policy Builder maps roles→scopes via the real PRB (real LLM,
-     `temperature=0`) and the Controller calls `compute_and_apply(rules, override=False)`; the OPA Policy
+     `temperature=0`) and `onboard_and_apply` calls
+     `compute_and_apply(rules, override=False, focus_service=client_id)`; the OPA Policy
      Writer upserts the agent's `AuthorizationPolicy` CR. **Agent convergence** = a live inbound
      `dev-user` request through AuthBridge → OPA reaches `allow` (polled up to `AIAC_BUNDLE_TIMEOUT`).
      The harness does not check that the CR is present: a CR proves only that the operator reconciled,
@@ -818,9 +819,9 @@ Rungs 6 and 7 restart the Controller twice each, so each one takes several minut
     resync stops the Controller before it serves), the onboarding checks #1, #2 and
     #6 (each gives 409, is permanent in the NATS consumer, runs no rollback and no quarantine, and runs
     before the bootstrap, Provision and the PRB, D30), the bootstrap of a tool before Provision, the
-    drop of the bootstrap CR (a failure that runs no quarantine, and a failed `compute_and_apply`, call
-    `drop_bootstrap` for a tool that this run bootstrapped only; a failed drop does not hide the
-    original error), and the read-only route `GET /policy/services/{service_id:path}` (D18). For D31: Provision links the
+    drop of the bootstrap CR (a failure that runs no quarantine, and a failed `compute_and_apply`,
+    call `drop_bootstrap` only for a tool that this run bootstrapped; a failed drop does not hide
+    the original error), and the read-only route `GET /policy/services/{service_id:path}` (D18). For D31: Provision links the
     subject scope before `set_service_type`, keeps it out of the created-manifest, and the rollback
     never deletes it; `test_uc1_subject_scope.py` covers the harness helpers `subject_scope_problems`,
     `subject_scope_link_problems`, `require_subject_scope`, `exchange_token` and `exchanged_subject`

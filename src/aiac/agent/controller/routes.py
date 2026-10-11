@@ -1,11 +1,11 @@
 """AIAC Agent Controller — FastAPI app factory, the ``/apply/*`` routes and one read-only route.
 
-The Controller is stateless. Each ``/apply/*`` route dispatches to its use-case handler
-(orchestrator or sub-agent), receives the ``(list[PolicyRule], override)`` tuple
-the handler returns, and makes the **single** ``compute_and_apply(rules, override)``
-call to the Policy Computation Engine. The onboarding route calls the orchestrator's
-``onboard_and_apply``, which makes that call itself and re-enables the client under the PCE lock
-after the apply. No per-use-case business logic, retry
+The Controller is stateless. Each ``/apply/*`` route dispatches to its use-case handler.
+The policy and role routes call a sub-agent, receive the ``(list[PolicyRule], override)`` tuple
+the handler returns, and make the **single** ``compute_and_apply(rules, override)``
+call to the Policy Computation Engine. The onboarding route calls only the orchestrator's
+``onboard_and_apply``, which makes the ``compute_and_apply`` call itself, re-enables the client
+under the PCE lock after the apply, and returns ``None``. No per-use-case business logic, retry
 handling, or state assembly lives here. Two routes call the PCE directly instead:
 ``/apply/offboard/...`` (``decommission``) and ``/apply/role-members/{role_id}``
 (``rerender_role``, a role-membership change, D32).

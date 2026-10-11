@@ -1,10 +1,11 @@
 """Service Onboarding Orchestrator (UC1).
 
-The only use case with an Orchestrator, because it is a **two-stage** pipeline. Invoked by
-the Controller for the ``aiac.apply.service.{id}`` / ``POST /apply/service/{service_id}``
-trigger, it sequences the two sub-agents and returns ``(list[PolicyRule], override=False, client_id)``
-(``client_id`` is the service's clientId, which :func:`onboard_and_apply` passes to the PCE as
-``focus_service``):
+The only use case with an Orchestrator, because it is a **two-stage** pipeline. The Controller
+route (``POST /apply/service/{service_id}``) and the NATS consumer (``aiac.apply.service.{id}``)
+call only :func:`onboard_and_apply`. It calls the PCE ``compute_and_apply`` itself and returns
+``None``: the Controller gets nothing back. :func:`_onboard` sequences the two sub-agents and returns
+an :class:`_Onboarded` (``rules``, ``client_id``, ``bootstrapped``). ``client_id`` is the service's
+clientId, which :func:`onboard_and_apply` gives to the PCE as ``focus_service``:
 
     0. The precondition checks (D30, see ``preconditions``) — run FIRST, after the one IdP read
        that resolves the clientId (a ``404`` on that read is the event-before-commit race: it is read
@@ -23,7 +24,8 @@ trigger, it sequences the two sub-agents and returns ``(list[PolicyRule], overri
     2. Service Policy Builder — reads the excluded-self IdP universe and builds the rules.
 
 :func:`onboard_and_apply` is the whole UC1 for the Controller route and the NATS consumer: it runs
-:func:`_onboard` (the build), then the single ``compute_and_apply(rules, override=False)`` (PCE) call,
+:func:`_onboard` (the build), then the single
+``compute_and_apply(rules, override=False, focus_service=client_id)`` (PCE) call,
 which re-enables the client under the PCE lock after the apply succeeds, all inside the per-service
 lock. UC1 is incremental, so ``override`` is always ``False`` (append; existing roles keep their
 other access).
@@ -280,10 +282,9 @@ def onboard_and_apply(service_id: ServiceUuid, *, wait_for_client: bool = True) 
     with _service_lock(service_id):
         built = _onboard(service_id, wait_for_client)
         try:
-            # UC1 is incremental: override is always False (append).
             compute_and_apply(
                 built.rules,
-                False,
+                override=False,
                 focus_service=built.client_id,
                 on_applied=functools.partial(reenable_service, service_id),
             )
@@ -313,13 +314,13 @@ class _Onboarded(NamedTuple):
     client_id: ClientId
     """The clientId of the service (``Service.serviceId``): the ``focus_service`` of the apply."""
     bootstrapped: bool
-    """True when this run wrote the bootstrap CR of a tool: only then does a failed apply drop it."""
+    """True when this run wrote the bootstrap CR of a tool. Only then does a failed apply, or a build
+    failure with no quarantine, drop that CR."""
 
 
 def _onboard(service_id: ServiceUuid, wait_for_client: bool) -> _Onboarded:
     """Sequence the precondition checks → (tool) bootstrap → Provision → Policy Builder and return
-    an :class:`_Onboarded` (``rules``, ``client_id``, ``bootstrapped``). ``bootstrapped`` is true
-    when this run wrote the bootstrap CR of a tool: only then does a failed apply drop it.
+    an :class:`_Onboarded` (``rules``, ``client_id``, ``bootstrapped``).
 
     ``service_id`` is the Keycloak internal client UUID that the trigger carries. The Orchestrator
     reads the ``Service`` from the IdP **once**, before Provision, and resolves its clientId

@@ -5,7 +5,7 @@ Service Provision (a compiled StateGraph) -> Service Policy Builder. Both are mo
 here via the module-level `build_provision_graph` / `ServicePolicyBuilder` seams, and the
 idp-library `Configuration` is mocked via the `_config` seam -- no live graph, IdP,
 Kubernetes, or LLM. `onboard_and_apply` (the entry point of the Controller route and the NATS
-consumer) builds `(list[PolicyRule], override=False, client_id)` and then makes the single
+consumer) builds an `_Onboarded` (rules, client_id, bootstrapped) and then makes the single
 `compute_and_apply` call, inside the per-service lock, with the re-enable as its `on_applied`;
 `compute_and_apply` is patched at its import site, and most tests check what it was given.
 
@@ -82,8 +82,8 @@ def _run_onboarding(service_id):
     """Run ``onboard_and_apply`` and return ``(rules, override, focus_service)``: what it gave the
     PCE (the patched ``compute_and_apply``)."""
     orchestrator.onboard_and_apply(service_id)
-    args, kwargs = orchestrator.compute_and_apply.call_args
-    return (*args, kwargs["focus_service"])
+    (rules,), kwargs = orchestrator.compute_and_apply.call_args
+    return rules, kwargs["override"], kwargs["focus_service"]
 
 
 @pytest.fixture(autouse=True)
@@ -148,7 +148,7 @@ def _rollback_errors():
 
 
 class TestBothStagesSucceed:
-    def test_provision_result_fed_to_builder_and_rules_returned_with_override_false(self):
+    def test_provision_result_fed_to_builder_and_rules_passed_to_compute_and_apply_with_override_false(self):
         # The Orchestrator treats the rule list as opaque -- the builder (mocked) owns
         # PolicyRule construction, so a sentinel list is enough to prove pass-through.
         rules = [object()]
@@ -164,9 +164,9 @@ class TestBothStagesSucceed:
 
         # service_type produced by Provision is fed into the Service Policy Builder
         spb.build.assert_called_once_with(SERVICE_ID, ServiceType.AGENT)
-        # Orchestrator returns the builder's rules, the append flag, and the service's clientId (the
-        # PCE focus service). There is no default effect to forward: the deployed Rego always denies
-        # an unmentioned pair.
+        # The builder's rules, and the service's clientId (the PCE focus service), are passed to
+        # compute_and_apply with override=False. There is no default effect to forward: the
+        # deployed Rego always denies an unmentioned pair.
         assert result == (rules, False, CLIENT_ID)
 
     def test_onboard_and_apply_takes_no_default_effect(self):
@@ -1058,13 +1058,14 @@ class TestOnboardAndApply:
         return rules, config, pce
 
     def test_applies_the_rules_with_the_client_id_and_re_enables_by_the_uuid_in_on_applied(self):
-        def pce(rules, override, *, focus_service, on_applied):
+        def pce(rules, *, override, focus_service, on_applied):
             on_applied()  # what the PCE does under its lock after a successful run
 
         rules, config, mock = self._run(pce=MagicMock(side_effect=pce))
 
         mock.assert_called_once()
-        assert mock.call_args.args == (rules, False)
+        assert mock.call_args.args == (rules,)
+        assert mock.call_args.kwargs["override"] is False
         assert mock.call_args.kwargs["focus_service"] == CLIENT_ID
         config.set_service_enabled_by_id.assert_called_once_with(SERVICE_ID, True)
 

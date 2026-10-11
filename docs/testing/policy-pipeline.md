@@ -108,8 +108,8 @@ over the fully onboarded stack.
    so that the discovery passes D20; under target side through the self-discovery rule), provisions the **workload-prefixed** scopes
    (`github-tool.{source-read, source-write, issues-read, issues-write}`) and the agent's **one
    operator role per skill** (`github-agent.{source_operations, issue_operations}`), maps roles→scopes
-   via the real PRB (real LLM, `temperature=0`), and the Controller calls
-   `compute_and_apply(rules, override=False)`; the OPA Policy Writer upserts the `AuthorizationPolicy`
+   via the real PRB (real LLM, `temperature=0`), and `onboard_and_apply` calls
+   `compute_and_apply(rules, override=False, focus_service=client_id)`; the OPA Policy Writer upserts the `AuthorizationPolicy`
    CR of each affected service (D23) on the live Kubernetes API. Every managed service gets a CR with
    both request packages, the tool included (D20). Under target side, github-tool's CR has the
    rules-based tool inbound (D26) and a pass-through outbound, and github-agent's CR has the
