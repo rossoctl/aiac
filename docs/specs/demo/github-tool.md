@@ -278,11 +278,12 @@ ConfigMaps/secrets assumed present), consistent with the agent spec.
   `outbound/request.rego` is a pass-through. Under agent side both packages are pass-throughs. The
   quarantine and the decommission delete the CR, and the pod is then denied (D20).
 
-- **Onboarding preconditions (D30), checked at the start of the onboarding under target side.** The pod
-  has the AuthBridge sidecar (`injectTools=true`); the namespace inbound pipeline has `opa` and
-  `mcp-parser`; and no app container has an `httpGet` probe. The manifest uses `tcpSocket` probes on
+- **Onboarding preconditions (D30), checked at the start of the onboarding.** The pod has the
+  AuthBridge sidecar (`injectTools=true`); the namespace inbound pipeline has `jwt-validation`, `opa`
+  and `mcp-parser`; and no app container has an `httpGet` probe. The manifest uses `tcpSocket` probes on
   `9095`. This is necessary: a request with no identity does not pass the tool inbound package (D27).
-  Under agent side a tool's pass-through CR needs no check.
+  Under agent side the tool needs the sidecar and `jwt-validation` only (its pass-through CR needs no
+  `opa`, no `mcp-parser` and no probe check).
 
 - **Prerequisite (reused, not created here):** a running rossoctl cluster with the rossoctl-operator
   (Keycloak realm as configured by the installer, namespace `team1`), so the `AgentRuntime` is

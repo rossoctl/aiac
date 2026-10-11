@@ -1492,7 +1492,7 @@ def onboarded_stack(
                             f"(scopes = all of {sorted(scn.TOOL_SCOPES)} provisioned; spm = "
                             f"SPM({scn.TOOL_WORKLOAD}) stored; cr = its AuthorizationPolicy CR with both request "
                             "packages). A failed onboarding check (D30: the tool pod has no authbridge-proxy "
-                            "sidecar — injectTools; no opa / mcp-parser in the namespace inbound pipeline; an "
+                            "sidecar — injectTools; no jwt-validation / opa / mcp-parser in the namespace inbound pipeline; an "
                             "httpGet probe) leaves no CR — see the Controller log and k8s/opa-kind-enable.sh.",
                             controller_commit_race_hint(deployed_at, admin=admin, workload=workload),
                         )
