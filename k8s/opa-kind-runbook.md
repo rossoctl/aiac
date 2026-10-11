@@ -274,7 +274,13 @@ no service is managed: onboard each service again.
 > inbound on `github-tool` check nothing.
 
 The clean redeploy (Kind; `enable.sh` automates
-[`aiac-deployment-guide.md`](aiac-deployment-guide.md)):
+[`aiac-deployment-guide.md`](aiac-deployment-guide.md)).
+
+Precondition: the LLM key Secret `team1/openai-secret` (data key `apikey`)
+exists. `enable.sh` reads it, and stops if it is missing. The teardown does not
+delete it. To make it:
+`kubectl create secret generic openai-secret -n team1 --from-literal=apikey="$LLM_API_KEY"`
+(see [`demo.md` → Two secrets to create first](../demo/use-cases/onboarding/demo.md#two-secrets-to-create-first)).
 
 ```bash
 SIDE=agent-side    # or target-side
@@ -283,17 +289,26 @@ SIDE=agent-side    # or target-side
 #    until it is onboarded again.
 kubectl delete authorizationpolicy -A -l app.kubernetes.io/managed-by=aiac-pdp-policy-writer
 
-# 2. Delete AIAC: the aiac-system namespace, with the Policy Model Store PVC.
+# 2. Delete AIAC: the aiac-system namespace, with the Policy Model Store PVC
+#    and the keycloak-admin-secret.
 demo/use-cases/onboarding/teardown.sh --aiac-only --yes
 
-# 3. Deploy AIAC again: the stack, then the broker. The Controller init
-#    container waits for the broker.
+# 3. Make the namespace and the Keycloak admin Secret again. `enable.sh` does
+#    not make the Secret, and without it aiac-interface stays in
+#    ContainerCreating.
 set -a; . .env; set +a
+kubectl create namespace aiac-system
+kubectl create secret generic keycloak-admin-secret -n aiac-system \
+  --from-literal=KEYCLOAK_ADMIN_USERNAME="$KEYCLOAK_ADMIN_USERNAME" \
+  --from-literal=KEYCLOAK_ADMIN_PASSWORD="$KEYCLOAK_ADMIN_PASSWORD"
+
+# 4. Deploy AIAC again: the stack, then the broker. The Controller init
+#    container waits for the broker.
 demo/use-cases/onboarding/enable.sh --stack-only
 demo/use-cases/onboarding/enable.sh --broker-only
 
-# 4. Set the side. `k8s/agent-deployment.yaml` sets `target-side`, so set the
-#    side after step 3. The store is empty, so the Controller start writes no CR.
+# 5. Set the side. `k8s/agent-deployment.yaml` sets `target-side`, so set the
+#    side after step 4. The store is empty, so the Controller start writes no CR.
 kubectl patch configmap aiac-agent-config -n aiac-system --type merge \
   -p "{\"data\":{\"AIAC_ENFORCEMENT_SIDE\":\"${SIDE}\"}}"
 kubectl rollout restart deployment/aiac-agent -n aiac-system

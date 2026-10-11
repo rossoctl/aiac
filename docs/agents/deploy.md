@@ -25,7 +25,7 @@ Usage: `/deploy ac-side=agent`, `/deploy agent-side`.
 - **Trap:** `kubectl apply -f k8s/agent-deployment.yaml` writes `target-side`
   back. On an `agent-side` deployment, after that apply, patch the live value
   back into the ConfigMap **before** the Controller restarts (this puts back
-  the same value, and runbook step 4 sets it on an empty store; neither is a
+  the same value, and runbook step 5 sets it on an empty store; neither is a
   side change). Else the restart starts the Controller under the other side.
 - **Precondition:** the AIAC global combiner must exist (`k8s/opa-kind-enable.sh`
   applies it), or the Controller does not start.
