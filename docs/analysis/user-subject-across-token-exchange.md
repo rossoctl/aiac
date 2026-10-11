@@ -552,7 +552,8 @@ Risks that are left with B-AIAC:
 >   mint the login token (Direct Access Grants), and fails when `sub` is not the username, because
 >   the link is an AIAC step. `require_subject_scope` and the rung-2 test `test_subject_scope_linked`
 >   now require the default link on `rossoctl`, and no `rossoctl` client mapper that writes `sub`.
-> - Open: AIAC now writes to a client that the rossoctl chart owns, so the rossoctl team must agree.
+> - Decided: AIAC writes to the platform login clients (`PLATFORM_SOURCE_CLIENTS`, default
+>   `rossoctl`, a client that the rossoctl chart owns) by design: it links the subject scope to them.
 >   Option C (§4, AuthBridge `subject_claim`) is still the end state, and it removes the scope too.
 
 **Both enforcement sides (§1.7).** B-AIAC fixes both sides with one setup. Each exchanged token for
