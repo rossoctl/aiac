@@ -22,7 +22,9 @@ data:
   # PLATFORM_SOURCE_CLIENTS is the comma-separated list of the platform login
   # clients. The PDP policy writer: the bypass clients the inbound Rego admits
   # without a user role. The IdP Configuration Service: the clients it links the
-  # client scope aiac-username-sub to, at startup and at each onboarding (D31).
+  # client scope aiac-username-sub to, at startup and at each onboarding (D31),
+  # and the login clients whose client scopes it reads for the login-client
+  # audience warning (GET /platform-clients/tool-audiences, D30).
   PLATFORM_SOURCE_CLIENTS: "rossoctl"
   # NATS_URL points the PDP services at the Event Broker (Phase 2, issue 4.19).
   NATS_URL: "nats://aiac-event-broker-service:4222"

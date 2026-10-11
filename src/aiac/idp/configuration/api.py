@@ -8,7 +8,7 @@ from urllib.parse import quote
 import requests
 from dotenv import load_dotenv
 
-from aiac.idp.configuration.models import Role, Scope, Service, ServiceType, Subject
+from aiac.idp.configuration.models import PlatformToolAudience, Role, Scope, Service, ServiceType, Subject
 from aiac.shared.upstream import run_upstream
 
 logger = logging.getLogger(__name__)
@@ -308,6 +308,18 @@ class Configuration:
         """
         resp = self._request("POST", f"/services/{service.id}/subject-scope", params=self._params())
         return Scope.model_validate(resp.json())
+
+    def get_platform_tool_audiences(self, client_id: str | None = None) -> list[PlatformToolAudience]:
+        """The client scopes of the platform login clients that put a managed tool's clientId into ``aud``.
+
+        Issues ``GET /platform-clients/tool-audiences`` (with ``client_id`` when given: only that tool).
+        The config service reads ``PLATFORM_SOURCE_CLIENTS``, and for each login client its default and
+        optional client scopes and the mappers on the client itself (the login-client audience warning,
+        D30). Read only. Raises ``IdPHTTPError`` (a ``RuntimeError``) on a non-OK status; a ``5xx`` is
+        retried (``_request``)."""
+        params = {**self._params(), **({"client_id": client_id} if client_id else {})}
+        resp = self._request("GET", "/platform-clients/tool-audiences", params=params)
+        return [PlatformToolAudience.model_validate(item) for item in resp.json()]
 
     def set_service_enabled(self, service: Service, enabled: bool) -> Service:
         """The **writer** for ``Service.enabled`` — consumed by the UC1 rollback (disable a failed

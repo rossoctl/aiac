@@ -40,6 +40,7 @@ from aiac.agent.policy_rules_builder.graph import (
     UnparseableLLMResponseError,
 )
 from aiac.agent.uc.onboarding import orchestrator
+from aiac.agent.uc.onboarding import platform_audience as platform_audience_module
 from aiac.agent.uc.onboarding.preconditions import EnforcementPreconditionError
 from aiac.agent.uc.onboarding.provision import kube, nodes
 from aiac.agent.uc.onboarding.provision.state import OnboardingProvisionState, Trigger
@@ -67,6 +68,15 @@ def drop_bootstrap():
     """The PCE ``drop_bootstrap`` seam (the undo of a bootstrap after a failure with no quarantine) —
     patched for every test. Tests that check it request this fixture by name."""
     with patch.object(orchestrator, "drop_bootstrap") as mock:
+        yield mock
+
+
+@pytest.fixture(autouse=True)
+def platform_audience():
+    """The login-client audience warning (D30) — patched for every test, so no test reaches the IdP.
+    Tests that check it request this fixture by name; a test that needs the real helper sets
+    ``platform_audience.side_effect`` to it."""
+    with patch.object(orchestrator, "warn_platform_tool_audiences") as mock:
         yield mock
 
 
@@ -1188,6 +1198,32 @@ class TestPreconditionChecksRunFirst:
 
         assert [f[:2] for f in ei.value.failures] == ["#1", "#2", "#6"]
 
+    def test_under_agent_side_a_tool_with_no_jwt_validation_fails_before_the_bootstrap(
+        self, k8s, quarantine, bootstrap, monkeypatch
+    ):
+        # Under agent side a tool gets a pass-through CR: without jwt-validation on its inbound it is
+        # open to every caller. So #2 runs for it too, before the bootstrap writes that CR.
+        monkeypatch.setenv("AIAC_ENFORCEMENT_SIDE", "agent-side")
+        k8s.list_namespaced_pod.return_value = kf.pod_list(kf.pod(type_label="tool"))
+        k8s.read_namespaced_config_map.return_value = kf.pipeline_configmap(inbound=(), outbound=())
+        config = _config_returning(_service())
+        graph = _graph(service_type=ServiceType.TOOL)
+
+        with (
+            patch.object(orchestrator, "build_provision_graph", return_value=graph),
+            patch.object(orchestrator, "ServicePolicyBuilder"),
+            patch.object(orchestrator, "_config", return_value=config),
+        ):
+            with pytest.raises(EnforcementPreconditionError) as ei:
+                _run_onboarding(SERVICE_ID)
+
+        assert [f[:2] for f in ei.value.failures] == ["#2"]
+        assert "'jwt-validation'" in ei.value.failures[0]
+        bootstrap.assert_not_called()
+        graph.invoke.assert_not_called()
+        quarantine.assert_not_called()
+        config.set_service_enabled.assert_not_called()
+
     def test_the_checks_read_the_pods_and_the_pipeline_of_the_service_namespace(self, k8s):
         with (
             patch.object(orchestrator, "build_provision_graph", return_value=_graph()),
@@ -1355,13 +1391,16 @@ class TestBootstrapOfATool:
         bootstrap.assert_not_called()
         graph.invoke.assert_called_once()
 
-    def test_under_agent_side_a_tool_gets_no_check_but_still_its_bootstrap(self, k8s, bootstrap, monkeypatch):
-        # D30 scope: under agent side a tool gets a pass-through CR, which needs no check. So a tool
-        # pod with no sidecar and no opa passes; its type still comes from the pod label, and the
-        # bootstrap (the pass-through CR under agent side) runs before Provision.
+    def test_under_agent_side_a_tool_that_passes_1_and_2_gets_its_bootstrap_before_provision(
+        self, k8s, bootstrap, monkeypatch
+    ):
+        # D30 scope: under agent side a tool needs the sidecar (#1) and jwt-validation in its inbound
+        # pipeline (#2), and nothing more: its pass-through CR needs no opa, no mcp-parser and no #6.
+        # Its type still comes from the pod label, and the bootstrap (the pass-through CR under agent
+        # side) runs before Provision.
         monkeypatch.setenv("AIAC_ENFORCEMENT_SIDE", "agent-side")
-        k8s.list_namespaced_pod.return_value = kf.pod_list(kf.pod(type_label="tool", containers=[kf.app_container()]))
-        k8s.read_namespaced_config_map.return_value = kf.pipeline_configmap(inbound=(), outbound=())
+        k8s.list_namespaced_pod.return_value = kf.pod_list(kf.pod(type_label="tool"))
+        k8s.read_namespaced_config_map.return_value = kf.pipeline_configmap(inbound=("jwt-validation",), outbound=())
         graph = _graph(service_type=ServiceType.TOOL)
         order = MagicMock()
         order.attach_mock(bootstrap, "bootstrap")
@@ -1418,3 +1457,81 @@ class TestBootstrapOfATool:
         spb.build.assert_not_called()
         config.set_service_enabled.assert_not_called()
         quarantine.assert_not_called()
+
+
+# --------------------------------------------------------------------------- #
+# The login-client audience warning (D30, agent side only, log only)           #
+# --------------------------------------------------------------------------- #
+class TestPlatformAudienceWarning:
+    def test_a_tool_onboarding_runs_the_audience_warning_after_the_build(self, k8s, platform_audience):
+        k8s.list_namespaced_pod.return_value = kf.pod_list(kf.pod(type_label="tool"))
+        graph = _graph(service_type=ServiceType.TOOL)
+        config = _config_returning(_service())
+        order = MagicMock()
+        order.attach_mock(graph.invoke, "provision")
+        order.attach_mock(platform_audience, "warning")
+
+        with (
+            patch.object(orchestrator, "build_provision_graph", return_value=graph),
+            patch.object(orchestrator, "ServicePolicyBuilder") as spb,
+            patch.object(orchestrator, "_config", return_value=config),
+        ):
+            order.attach_mock(spb.build, "build")
+            spb.build.return_value = []
+            _run_onboarding(SERVICE_ID)
+
+        platform_audience.assert_called_once_with(config, CLIENT_ID)
+        assert [c[0] for c in order.mock_calls] == ["provision", "build", "warning"]
+
+    def test_an_agent_onboarding_runs_no_audience_warning(self, platform_audience):
+        with (
+            patch.object(orchestrator, "build_provision_graph", return_value=_graph()),
+            patch.object(orchestrator, "ServicePolicyBuilder") as spb,
+            patch.object(orchestrator, "_config", return_value=_config_returning(_service())),
+        ):
+            spb.build.return_value = []
+            _run_onboarding(SERVICE_ID)
+
+        platform_audience.assert_not_called()
+
+    @pytest.mark.parametrize("failure", ["#2", "conflict"])
+    def test_a_failed_check_or_build_runs_no_audience_warning(self, k8s, platform_audience, failure):
+        k8s.list_namespaced_pod.return_value = kf.pod_list(kf.pod(type_label="tool"))
+        if failure == "#2":
+            k8s.read_namespaced_config_map.return_value = kf.pipeline_configmap(inbound=())
+        error = EnforcementPreconditionError if failure == "#2" else PolicyConflictError
+
+        with (
+            patch.object(orchestrator, "build_provision_graph", return_value=_graph(service_type=ServiceType.TOOL)),
+            patch.object(orchestrator, "ServicePolicyBuilder") as spb,
+            patch.object(orchestrator, "_config", return_value=_config_returning(_service())),
+            pytest.raises(error),
+        ):
+            spb.build.side_effect = PolicyConflictError(ConflictReport.from_survey([], [], evaluated_count=0))
+            _run_onboarding(SERVICE_ID)
+
+        platform_audience.assert_not_called()
+
+    def test_an_audience_warning_failure_does_not_fail_the_onboarding(
+        self, k8s, platform_audience, pce, drop_bootstrap, monkeypatch, caplog
+    ):
+        # The real helper, not the autouse mock: an IdP failure is logged, and the onboarding goes on.
+        platform_audience.side_effect = platform_audience_module.warn_platform_tool_audiences
+        monkeypatch.setenv("AIAC_ENFORCEMENT_SIDE", "agent-side")
+        k8s.list_namespaced_pod.return_value = kf.pod_list(kf.pod(type_label="tool"))
+        k8s.read_namespaced_config_map.return_value = kf.pipeline_configmap(inbound=("jwt-validation",), outbound=())
+        config = _config_returning(_service())
+        config.get_platform_tool_audiences.side_effect = IdPHTTPError(502, "x")
+
+        with (
+            patch.object(orchestrator, "build_provision_graph", return_value=_graph(service_type=ServiceType.TOOL)),
+            patch.object(orchestrator, "ServicePolicyBuilder") as spb,
+            patch.object(orchestrator, "_config", return_value=config),
+        ):
+            spb.build.return_value = []
+            orchestrator.onboard_and_apply(SERVICE_ID)
+
+        config.get_platform_tool_audiences.assert_called_once_with(CLIENT_ID)
+        assert "cannot read" in caplog.text
+        drop_bootstrap.assert_not_called()
+        pce.assert_called_once()

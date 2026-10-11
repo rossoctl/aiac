@@ -149,8 +149,11 @@ Expect two image builds, so allow a few minutes. The script runs six steps:
    `authBridge.pipeline` with the pipeline shown in
    [Architecture](#architecture). Every injected pod in the namespace uses it,
    agent and tool. The inbound leg is `a2a-parser`, `mcp-parser`,
-   `inference-parser`, `jwt-validation`, `opa`: a tool needs `mcp-parser` and
-   `opa` there (onboarding check #2, D30). `charts/rossoctl/values.yaml` is
+   `inference-parser`, `jwt-validation`, `opa`: every service needs
+   `jwt-validation` there, an agent and a tool under target side also `opa`,
+   and a tool under target side also `mcp-parser` (onboarding check #2, D30;
+   under agent side a tool needs only `jwt-validation`). Each of them must
+   keep the default `on_error: enforce`. `charts/rossoctl/values.yaml` is
    never modified.
 4. **Helm upgrade.** Applies the chart's `values.yaml` plus the overlay, with
    the sidecar image pointed at the locally built one.
@@ -316,9 +319,14 @@ kubectl rollout status deployment/aiac-agent -n aiac-system --timeout=300s
 ```
 
 At start, the Controller checks the combiner (check #4, D30). Under agent side,
-the onboarding checks (D30) run for agents only, and check #2 also needs
-`mcp-parser` and `opa` in the outbound pipeline. The overlay of
-[Enable](#enable) has them.
+the onboarding checks #1 and #2 (D30) run for every service (a tool needs only
+`jwt-validation` inbound, and its pod needs the sidecar, so keep
+`injectTools=true`), #6 runs for agents only, and check #2 also needs
+`mcp-parser` and `opa` in the outbound pipeline of an agent. The overlay of
+[Enable](#enable) has them. Under agent side the Controller also logs a warning
+for each tool whose audience scope a platform login client holds, at the
+tool's onboarding and at each start. The operator makes this link by default,
+so expect one warning for each tool (see the PRD known limits).
 
 Then onboard each service again. A service whose Keycloak client exists gets no
 new registration event, so start its onboarding by hand

@@ -49,6 +49,24 @@ def _failures(core) -> list[str]:
     return ei.value.failures
 
 
+def _raw_pipeline(inbound_entries: str):
+    """A pipeline ConfigMap whose inbound plugin list is the YAML flow text ``inbound_entries`` (so a
+    test can write YAML 1.1 values such as an unquoted ``off``), with an empty outbound list."""
+    configmap = kf.pipeline_configmap()
+    configmap.data = {
+        "config.yaml": f"pipeline:\n  inbound:\n    plugins: [{inbound_entries}]\n  outbound:\n    plugins: []\n"
+    }
+    return configmap
+
+
+# (side, pod type label, a passing inbound plugin list) for each kind of service with no outbound needs.
+_ON_ERROR_CASES = [
+    ("target-side", "agent", ("jwt-validation", "opa")),
+    ("target-side", "tool", ("jwt-validation", "mcp-parser", "opa")),
+    ("agent-side", "tool", ("jwt-validation",)),
+]
+
+
 class TestPassingService:
     @pytest.mark.parametrize(("label", "expected"), [("agent", ServiceType.AGENT), ("tool", ServiceType.TOOL)])
     def test_returns_the_type_from_the_pod_label(self, label, expected):
@@ -106,6 +124,28 @@ class TestCheck2Pipeline:
         assert len(failures) == 1
         assert failures[0].startswith("#2") and "'mcp-parser'" in failures[0]
 
+    @pytest.mark.parametrize(
+        ("side", "label", "inbound"),
+        [
+            ("target-side", "agent", ("opa",)),
+            ("target-side", "tool", ("mcp-parser", "opa")),
+            ("agent-side", "agent", ("opa",)),
+            ("agent-side", "tool", ()),
+        ],
+    )
+    def test_every_service_needs_jwt_validation_in_the_inbound_pipeline(self, monkeypatch, side, label, inbound):
+        # jwt-validation is the only plugin that validates the token and sets input.identity: without it
+        # every rules-based package denies (D27), and under agent side a tool (pass-through CR) is open.
+        monkeypatch.setenv("AIAC_ENFORCEMENT_SIDE", side)
+        core = kf.core_v1(
+            pods=[kf.pod(type_label=label)],
+            configmap=kf.pipeline_configmap(inbound=inbound, outbound=("mcp-parser", "token-exchange", "opa")),
+        )
+        failures = _failures(core)
+        assert len(failures) == 1
+        assert failures[0].startswith("#2") and "'jwt-validation'" in failures[0]
+        assert f"under {side.replace('-', ' ')}" in failures[0]
+
     def test_target_side_does_not_need_opa_in_the_outbound_pipeline(self):
         # Under target side every outbound is a pass-through (D24): the callee decides.
         core = kf.core_v1(configmap=kf.pipeline_configmap(outbound=("token-exchange",)))
@@ -128,6 +168,34 @@ class TestCheck2Pipeline:
         configmap.data = {} if config_yaml is None else {"config.yaml": config_yaml}
         failures = _failures(kf.core_v1(configmap=configmap))
         assert [f[:2] for f in failures] == ["#2"]
+
+    # The on_error of an entry (cortex ErrorPolicy): `off` takes the plugin out of the running
+    # pipeline, and `observe` turns its Reject into a pass-through. Unquoted `off` is YAML 1.1 false.
+    @pytest.mark.parametrize("on_error", ["'off'", "off", "observe"])
+    @pytest.mark.parametrize(("side", "label", "inbound"), _ON_ERROR_CASES)
+    def test_a_required_plugin_that_does_not_enforce_fails(self, monkeypatch, on_error, side, label, inbound):
+        monkeypatch.setenv("AIAC_ENFORCEMENT_SIDE", side)
+        entries = ", ".join(
+            f"{{name: {n}, on_error: {on_error}}}" if n == "jwt-validation" else f"{{name: {n}}}" for n in inbound
+        )
+        core = kf.core_v1(pods=[kf.pod(type_label=label)], configmap=_raw_pipeline(entries))
+        failures = _failures(core)
+        assert len(failures) == 1
+        assert failures[0].startswith("#2")
+        assert "'jwt-validation' has on_error=" in failures[0] and "so it does not enforce" in failures[0]
+        assert "has no" not in failures[0]
+
+    def test_opa_that_does_not_enforce_fails_too(self):
+        core = kf.core_v1(configmap=_raw_pipeline("{name: jwt-validation}, {name: opa, on_error: observe}"))
+        failures = _failures(core)
+        assert len(failures) == 1
+        assert "'opa' has on_error='observe', so it does not enforce" in failures[0]
+
+    @pytest.mark.parametrize("entry", ["{name: jwt-validation, on_error: enforce}", "jwt-validation"], ids=str)
+    def test_an_enforcing_entry_and_the_bare_name_form_pass(self, entry):
+        # cortex accepts a bare plugin name as an entry with the default policy (enforce).
+        core = kf.core_v1(configmap=_raw_pipeline(f"{entry}, {{name: opa}}"))
+        assert _check(core) is ServiceType.AGENT
 
     @pytest.mark.parametrize("status", [403, 500])
     def test_a_kubernetes_api_failure_is_a_502_not_a_failed_check(self, status):
@@ -226,39 +294,58 @@ class TestThePodRace:
 
 
 class TestAgentSideScope:
-    """Under agent side the checks run for agents only (D30): a tool gets a pass-through CR (D24),
-    which needs no check. The type is still read from the pod label, because the Orchestrator needs
-    it for the bootstrap of a tool."""
+    """Under agent side #1 and #2 run for every service, and #6 for agents only (D30). A tool gets a
+    pass-through CR (D24), so it needs only ``jwt-validation`` in its inbound pipeline (without it the
+    tool is open to every caller) and nothing in its outbound pipeline. The type is still read from the
+    pod label, because the Orchestrator needs it for the bootstrap of a tool."""
 
-    @pytest.mark.parametrize(
-        "pods",
-        [
-            [kf.pod(type_label="tool", containers=[kf.app_container()])],
-            [kf.pod(type_label="tool", containers=[kf.app_container(readiness=kf.http_get_probe())])],
-        ],
-        ids=["no-sidecar", "http-get-probe"],
-    )
-    def test_a_tool_that_fails_a_pod_check_passes_and_returns_its_type(self, agent_side, pods):
+    def test_a_tool_with_no_sidecar_fails_1(self, agent_side):
+        failures = _failures(kf.core_v1(pods=[kf.pod(type_label="tool", containers=[kf.app_container()])]))
+        assert [f[:2] for f in failures] == ["#1"]
+
+    def test_a_tool_with_an_http_get_probe_passes(self, agent_side):
+        # #6 does not apply: the pass-through CR needs no identity, so a kubelet probe opens nothing.
+        app = kf.app_container(readiness=kf.http_get_probe())
+        pods = [kf.pod(type_label="tool", containers=[app, kf.sidecar_container()])]
         assert _check(kf.core_v1(pods=pods)) is ServiceType.TOOL
 
-    @pytest.mark.parametrize("inbound", [(), ("jwt-validation",), ("jwt-validation", "opa")], ids=str)
-    def test_a_tool_needs_no_pipeline_plugin(self, agent_side, inbound):
+    @pytest.mark.parametrize("inbound", [("jwt-validation",), ("jwt-validation", "opa")], ids=str)
+    def test_a_tool_needs_only_jwt_validation_inbound_and_nothing_outbound(self, agent_side, inbound):
         core = kf.core_v1(
             pods=[kf.pod(type_label="tool")], configmap=kf.pipeline_configmap(inbound=inbound, outbound=())
         )
         assert _check(core) is ServiceType.TOOL
 
-    def test_a_tool_does_not_read_the_pipeline(self, agent_side):
-        # No ConfigMap is needed: a missing one is no failure for a tool under agent side.
+    @pytest.mark.parametrize("inbound", [(), ("opa",), ("mcp-parser", "opa")], ids=str)
+    def test_a_tool_without_jwt_validation_fails_2(self, agent_side, inbound):
+        core = kf.core_v1(
+            pods=[kf.pod(type_label="tool")], configmap=kf.pipeline_configmap(inbound=inbound, outbound=())
+        )
+        failures = _failures(core)
+        assert len(failures) == 1
+        assert failures[0].startswith("#2") and "'jwt-validation'" in failures[0]
+        missing = failures[0].split("has no ", 1)[1]
+        assert "'opa'" not in missing and "'mcp-parser'" not in missing
+
+    def test_a_tool_with_no_configmap_fails_2(self, agent_side):
         core = kf.core_v1(pods=[kf.pod(type_label="tool")])
         core.read_namespaced_config_map.side_effect = kf.not_found()
-        assert _check(core) is ServiceType.TOOL
-        core.read_namespaced_config_map.assert_not_called()
+        failures = _failures(core)
+        assert len(failures) == 1
+        assert failures[0].startswith("#2") and "not found" in failures[0]
+        core.read_namespaced_config_map.assert_called_once_with(kf.PIPELINE_CONFIGMAP, kf.NAMESPACE)
 
-    def test_a_tool_with_no_sidecar_is_not_waited_for(self, agent_side, monkeypatch):
-        # The re-poll waits for a pod that can enforce its CR; a tool's pass-through CR needs none.
+    def test_a_tool_with_no_sidecar_is_waited_for(self, agent_side, monkeypatch):
+        # The operator can still roll the tool onto the injected template, as for an agent.
         monkeypatch.setenv("ONBOARD_LABEL_WAIT_ATTEMPTS", "3")
         core = kf.core_v1(pods=[kf.pod(type_label="tool", containers=[kf.app_container()])])
+        assert [f[:2] for f in _failures(core)] == ["#1"]
+        assert core.list_namespaced_pod.call_count == 3
+
+    def test_a_tool_with_an_http_get_probe_is_not_waited_for(self, agent_side, monkeypatch):
+        monkeypatch.setenv("ONBOARD_LABEL_WAIT_ATTEMPTS", "3")
+        app = kf.app_container(readiness=kf.http_get_probe())
+        core = kf.core_v1(pods=[kf.pod(type_label="tool", containers=[app, kf.sidecar_container()])])
         assert _check(core) is ServiceType.TOOL
         assert core.list_namespaced_pod.call_count == 1
 
@@ -303,7 +390,7 @@ class TestAgentSideScope:
 
     def test_an_agent_with_no_readable_outbound_pipeline_fails(self, agent_side):
         configmap = kf.pipeline_configmap()
-        configmap.data = {"config.yaml": "pipeline:\n  inbound:\n    plugins: [{name: opa}]\n"}
+        configmap.data = {"config.yaml": "pipeline:\n  inbound:\n    plugins: [{name: jwt-validation}, {name: opa}]\n"}
         failures = _failures(kf.core_v1(configmap=configmap))
         assert [f[:2] for f in failures] == ["#2"]
         assert "pipeline.outbound.plugins" in failures[0]

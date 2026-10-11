@@ -1,4 +1,7 @@
-from aiac.idp.configuration.models import Role, Scope, Service, Subject
+import pytest
+from pydantic import ValidationError
+
+from aiac.idp.configuration.models import PlatformToolAudience, Role, Scope, Service, Subject
 
 
 class TestSubject:
@@ -456,3 +459,19 @@ class TestScope:
     def test_extra_fields_ignored(self):
         s = Scope.model_validate({"id": "s3", "name": "roles", "unknownAttr": "dropped"})
         assert not hasattr(s, "unknownAttr")
+
+
+class TestPlatformToolAudience:
+    TOOL = "spiffe://localtest.me/ns/team1/sa/github-tool"
+
+    def test_platform_tool_audience_rejects_an_unknown_link(self):
+        with pytest.raises(ValidationError):
+            PlatformToolAudience.model_validate(
+                {"login_client": "rossoctl", "link": "realm", "scope": "s", "mapper": "m", "tool_client_id": self.TOOL}
+            )
+
+    def test_a_client_link_needs_no_scope(self):
+        item = PlatformToolAudience.model_validate(
+            {"login_client": "rossoctl", "link": "client", "mapper": "m", "tool_client_id": self.TOOL}
+        )
+        assert item.scope is None
