@@ -1,4 +1,4 @@
-"""Shared harness for the UC-1 onboarding integration-test ladder (rungs 1–3 and 5–7).
+"""Shared harness for the UC-1 onboarding integration-test ladder (rungs 1–3 and 5–6).
 
 Spec: ``docs/testing/uc1-onboarding-pipeline.md``; live loop shape (handoff 08):
 ``k8s/opa-kind-runbook.md``. The evaluator is now the **deployed AuthBridge OPA plugin**, not a

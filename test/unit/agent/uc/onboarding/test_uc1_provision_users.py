@@ -65,8 +65,14 @@ def test_an_existing_user_without_a_profile_gets_the_missing_fields() -> None:
 def test_an_existing_full_profile_is_not_changed() -> None:
     # The platform's own dev-user keeps its names: only a missing field is written.
     profiles = {
-        name: {"username": name, "enabled": True, "email": f"{name}@example.org", "emailVerified": True,
-               "firstName": "First", "lastName": "Last"}
+        name: {
+            "username": name,
+            "enabled": True,
+            "email": f"{name}@example.org",
+            "emailVerified": True,
+            "firstName": "First",
+            "lastName": "Last",
+        }
         for name in scn.USERS
     }
     admin = _admin(profiles)

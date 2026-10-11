@@ -126,7 +126,7 @@ it.
 Live enforcement is now **in scope and is the whole point**: each rung onboards, enables the outbound
 token-exchange leg where a tool is present (Part B), waits for `bundle-service` + the AuthBridge OPA
 sidecars to recompose and reload the bundle, then drives real requests through AuthBridge on the **inbound
-leg always** — plus the **outbound leg only where a tool is onboarded** (rungs 2/3, 5–7)
+leg always** — plus the **outbound leg only where a tool is onboarded** (rungs 2/3, 5–6)
 (`jwt-validation` builds `input.identity` inbound; `token-exchange` + `mcp-parser` build the outbound
 `input.identity` + `input.mcp.params.name`). Under **target side** the agent's outbound is a
 pass-through (D24), and github-tool's own inbound OPA decides each tool call: on github-tool's inbound,
@@ -236,7 +236,7 @@ cleanly** when any of it is absent (they never stand it up, and never false-pass
 ## Per-rung flow
 
 **Provision realm/users + mount policy → load demo image(s) into the Kind node → deploy workload(s)
-sequentially, each converging before the next → enable outbound leg (rungs 2/3, 6, 7) → poll bundle → drive
+sequentially, each converging before the next → enable outbound leg (rungs 2/3, 6) → poll bundle → drive
 real requests + assert → full teardown.**
 
 1. **Clean slate, then setup — ordering matters.** First `capture_aiac_crs` writes the leftover CRs of
@@ -343,7 +343,7 @@ real requests + assert → full teardown.**
    audience is github-tool, so `token-exchange` must mint it.
 4. **Poll until the pipeline converges.** `poll_until` drives real decisions until this run's CR is
    reflected (inbound `dev-user` allow, `test-user` allow, `devops-user` deny; and, **only when a tool is
-   onboarded** (rungs 2/3, 6, 7), outbound `dev-user` `source-read` allow and `test-user` `issues-read` allow),
+   onboarded** (rungs 2/3, 6), outbound `dev-user` `source-read` allow and `test-user` `issues-read` allow),
    waiting out the bundle poll +
    post-restart token-exchange window, up to `AIAC_BUNDLE_TIMEOUT`. On rung 1 the convergence set is
    **inbound-only** (`_default_ready_signals` appends the two outbound signals only under
@@ -395,8 +395,8 @@ real requests + assert → full teardown.**
      (without `metadata.managedFields`) to the pytest host for post-mortem debugging — one directory
      `<UTC time>__<test module>__<phase>/` per capture, with one `<namespace>__<name>.yaml` per CR and an
      `index.yaml`, under `AIAC_CR_CAPTURE_DIR` (default: the gitignored `test/system/artifacts/cr-captures/`).
-     Read-only and best-effort: a capture failure is logged, never raised. A Controller restore (rungs 5
-     and 7) and rung 6's hand delete of github-tool's CR capture first too.
+     Read-only and best-effort: a capture failure is logged, never raised. A Controller restore (rung 5)
+     and rung 6's hand delete of github-tool's CR capture first too.
    - **Undeploy** each workload (`kubectl delete -f` the manifests, **reverse** deploy order).
    - **Delete the Keycloak clients explicitly** — the two clients `{ns}/github-agent` and
      `{ns}/github-tool`, their credentials Secret, and the `*-aud` audience scope. Do **not** rely on an
