@@ -22,7 +22,7 @@
    The check runs under both sides.
 3. **The resync (D28):** the PCE ``resync()`` writes every CR of the current side and quarantines
    each disabled service that still has an SPM.
-4. **The login-client audience warning (C2):** under agent side only, a WARNING for each client
+4. **The login-client audience warning (D30):** under agent side only, a WARNING for each client
    scope of a platform login client that puts a managed tool's clientId into ``aud`` (see
    ``aiac.agent.uc.onboarding.platform_audience``). It catches a link that came after the tool's
    onboarding. A failure is logged and does not stop the Controller.
@@ -191,6 +191,6 @@ def run_start_sequence() -> None:
         logger.exception("Controller start stopped: the resync (D28) failed")
         raise
     logger.info("resync (D28) done")
-    # C2 (agent side only, best effort): it logs a warning for each tool whose audience a platform login
-    # client holds, and never stops the start.
+    # The login-client audience warning (D30; agent side only, best effort): it logs a warning for each
+    # tool whose audience a platform login client holds, and never stops the start.
     warn_platform_tool_audiences()

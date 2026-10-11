@@ -1,4 +1,4 @@
-"""The login-client audience warning (C2, PRD D30; agent side only).
+"""The login-client audience warning (PRD D30; agent side only).
 
 Under agent side a tool gets a pass-through CR (D24): AIAC checks nothing on the tool's inbound, and
 only AuthBridge ``jwt-validation`` (signature, issuer, ``aud`` = the tool's clientId) protects it.
@@ -34,9 +34,9 @@ logger = logging.getLogger(__name__)
 _EXPOSED = (
     "login client %r has %s, whose audience mapper %r puts the clientId of the tool %r into aud: under "
     "agent side the tool has a pass-through CR, so a user token of %r passes the tool's jwt-validation "
-    "and reaches the tool with no AIAC check (known limit, PRD D30). Target side closes this. A link "
-    "that you remove by hand comes back when the operator reconciles the workload again (it attaches "
-    "the audience scope to each client in PLATFORM_CLIENT_IDS)"
+    "and reaches the tool with no AIAC check (known limit, PRD §6 Known limits (enforcement); D30). "
+    "Target side closes this. A link that you remove by hand comes back when the operator reconciles "
+    "the workload again (it attaches the audience scope to each client in PLATFORM_CLIENT_IDS)"
 )
 
 _READ_FAILED = (

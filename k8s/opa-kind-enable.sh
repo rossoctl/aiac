@@ -364,8 +364,10 @@ load_image_to_kind "$IMAGE_TAG"
 
 echo "==> Step 3/6: writing throwaway pipeline overlay (${VALUES_FILE} stays untouched)"
 # The inbound leg has jwt-validation, mcp-parser and opa: every service needs
-# jwt-validation and opa, and a tool under target side also mcp-parser (the tool
-# inbound package checks input.mcp.params.name; onboarding check #2, D30).
+# jwt-validation, an agent and a tool under target side also opa, and a tool under
+# target side also mcp-parser (the tool inbound package checks
+# input.mcp.params.name; onboarding check #2, D30). Under agent side a tool needs
+# only jwt-validation. Keep the default on_error (enforce) on each of them.
 cat > "$OVERLAY_FILE" <<YAML
 # Throwaway overlay — merged on top of the real values.yaml at helm-upgrade
 # time, never written back to it. Adds OPA plus the full parser set

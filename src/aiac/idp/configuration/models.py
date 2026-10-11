@@ -179,8 +179,8 @@ class Scope(BaseModel):
 
 class PlatformToolAudience(BaseModel):
     """An audience mapper of a platform login client (in a default or optional client scope, or on the
-    client itself) that puts the clientId of a managed tool into ``aud`` (C2). Read by
-    ``Configuration.get_platform_tool_audiences``."""
+    client itself) that puts the clientId of a managed tool into ``aud`` (the login-client audience
+    warning, D30). Read by ``Configuration.get_platform_tool_audiences``."""
 
     model_config = ConfigDict(extra="ignore")
 

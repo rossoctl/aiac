@@ -314,8 +314,9 @@ class Configuration:
 
         Issues ``GET /platform-clients/tool-audiences`` (with ``client_id`` when given: only that tool).
         The config service reads ``PLATFORM_SOURCE_CLIENTS``, and for each login client its default and
-        optional client scopes and the mappers on the client itself (C2). Read only. Raises
-        ``IdPHTTPError`` (a ``RuntimeError``) on a non-OK status; a ``5xx`` is retried (``_request``)."""
+        optional client scopes and the mappers on the client itself (the login-client audience warning,
+        D30). Read only. Raises ``IdPHTTPError`` (a ``RuntimeError``) on a non-OK status; a ``5xx`` is
+        retried (``_request``)."""
         params = {**self._params(), **({"client_id": client_id} if client_id else {})}
         resp = self._request("GET", "/platform-clients/tool-audiences", params=params)
         return [PlatformToolAudience.model_validate(item) for item in resp.json()]

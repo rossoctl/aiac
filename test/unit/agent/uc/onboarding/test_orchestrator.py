@@ -73,7 +73,7 @@ def drop_bootstrap():
 
 @pytest.fixture(autouse=True)
 def platform_audience():
-    """The login-client audience warning (C2) — patched for every test, so no test reaches the IdP.
+    """The login-client audience warning (D30) — patched for every test, so no test reaches the IdP.
     Tests that check it request this fixture by name; a test that needs the real helper sets
     ``platform_audience.side_effect`` to it."""
     with patch.object(orchestrator, "warn_platform_tool_audiences") as mock:
@@ -1460,7 +1460,7 @@ class TestBootstrapOfATool:
 
 
 # --------------------------------------------------------------------------- #
-# The login-client audience warning (C2, agent side only, log only)            #
+# The login-client audience warning (D30, agent side only, log only)           #
 # --------------------------------------------------------------------------- #
 class TestPlatformAudienceWarning:
     def test_a_tool_onboarding_runs_the_audience_warning_after_the_build(self, k8s, platform_audience):

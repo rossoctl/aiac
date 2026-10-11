@@ -49,6 +49,24 @@ def _failures(core) -> list[str]:
     return ei.value.failures
 
 
+def _raw_pipeline(inbound_entries: str):
+    """A pipeline ConfigMap whose inbound plugin list is the YAML flow text ``inbound_entries`` (so a
+    test can write YAML 1.1 values such as an unquoted ``off``), with an empty outbound list."""
+    configmap = kf.pipeline_configmap()
+    configmap.data = {
+        "config.yaml": f"pipeline:\n  inbound:\n    plugins: [{inbound_entries}]\n  outbound:\n    plugins: []\n"
+    }
+    return configmap
+
+
+# (side, pod type label, a passing inbound plugin list) for each kind of service with no outbound needs.
+_ON_ERROR_CASES = [
+    ("target-side", "agent", ("jwt-validation", "opa")),
+    ("target-side", "tool", ("jwt-validation", "mcp-parser", "opa")),
+    ("agent-side", "tool", ("jwt-validation",)),
+]
+
+
 class TestPassingService:
     @pytest.mark.parametrize(("label", "expected"), [("agent", ServiceType.AGENT), ("tool", ServiceType.TOOL)])
     def test_returns_the_type_from_the_pod_label(self, label, expected):
@@ -150,6 +168,34 @@ class TestCheck2Pipeline:
         configmap.data = {} if config_yaml is None else {"config.yaml": config_yaml}
         failures = _failures(kf.core_v1(configmap=configmap))
         assert [f[:2] for f in failures] == ["#2"]
+
+    # The on_error of an entry (cortex ErrorPolicy): `off` takes the plugin out of the running
+    # pipeline, and `observe` turns its Reject into a pass-through. Unquoted `off` is YAML 1.1 false.
+    @pytest.mark.parametrize("on_error", ["'off'", "off", "observe"])
+    @pytest.mark.parametrize(("side", "label", "inbound"), _ON_ERROR_CASES)
+    def test_a_required_plugin_that_does_not_enforce_fails(self, monkeypatch, on_error, side, label, inbound):
+        monkeypatch.setenv("AIAC_ENFORCEMENT_SIDE", side)
+        entries = ", ".join(
+            f"{{name: {n}, on_error: {on_error}}}" if n == "jwt-validation" else f"{{name: {n}}}" for n in inbound
+        )
+        core = kf.core_v1(pods=[kf.pod(type_label=label)], configmap=_raw_pipeline(entries))
+        failures = _failures(core)
+        assert len(failures) == 1
+        assert failures[0].startswith("#2")
+        assert "'jwt-validation' has on_error=" in failures[0] and "so it does not enforce" in failures[0]
+        assert "has no" not in failures[0]
+
+    def test_opa_that_does_not_enforce_fails_too(self):
+        core = kf.core_v1(configmap=_raw_pipeline("{name: jwt-validation}, {name: opa, on_error: observe}"))
+        failures = _failures(core)
+        assert len(failures) == 1
+        assert "'opa' has on_error='observe', so it does not enforce" in failures[0]
+
+    @pytest.mark.parametrize("entry", ["{name: jwt-validation, on_error: enforce}", "jwt-validation"], ids=str)
+    def test_an_enforcing_entry_and_the_bare_name_form_pass(self, entry):
+        # cortex accepts a bare plugin name as an entry with the default policy (enforce).
+        core = kf.core_v1(configmap=_raw_pipeline(f"{entry}, {{name: opa}}"))
+        assert _check(core) is ServiceType.AGENT
 
     @pytest.mark.parametrize("status", [403, 500])
     def test_a_kubernetes_api_failure_is_a_502_not_a_failed_check(self, status):

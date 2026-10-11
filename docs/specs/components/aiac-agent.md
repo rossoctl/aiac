@@ -333,7 +333,7 @@ Not every error body is sanitized:
 - An unhandled error (`500`) returns only the text `Internal Server Error`.
 - An `HTTPException` that a use-case handler raises returns its detail as it is. The IdP, Kubernetes, discovery-token and MCP `502`s and `ServiceNotVisibleError` put the upstream error text in the detail: for example the body of an IdP `404`, a `requests` error with the host, the port and the URL, or the MCP endpoint URL (see [`uc1-service-onboarding.md` → The first read waits for a new client](aiac-agent/uc1-service-onboarding.md#the-first-read-waits-for-a-new-client-d33)).
 
-`EnforcementPreconditionError` is **not** a UC1 rollback error. The checks run first, so nothing has changed yet: there is no rollback, no client disable and no quarantine. A first onboarding then has no CR, so D20 denies the service (fail closed). An onboarded service keeps its policy (see [`uc1-service-onboarding.md` → Precondition checks](aiac-agent/uc1-service-onboarding.md#precondition-checks-d30)).
+`EnforcementPreconditionError` is **not** a UC1 rollback error. The checks run first, so nothing has changed yet: there is no rollback, no client disable and no quarantine. A first onboarding then has no CR, so D20 denies the service (fail closed) where its inbound pipeline has `opa` (a tool under agent side can have no `opa`). An onboarded service keeps its policy (see [`uc1-service-onboarding.md` → Precondition checks](aiac-agent/uc1-service-onboarding.md#precondition-checks-d30)).
 
 Upstream failures and PRB exceptions propagate as HTTP error responses on the synchronous `/apply/*` paths: a use-case handler raises an upstream failure as a FastAPI `HTTPException`, and the Controller's exception handlers map the PRB exceptions and `EnforcementPreconditionError`. An upstream failure that comes through the PCE, `reenable_service` or the UC1 rollback is not mapped, so it answers `500` (see [Upstream → HTTP status](#upstream--http-status)). The status code is authoritative.
 
@@ -385,8 +385,9 @@ src/aiac/
     │   ├── offboarding/
     │   │   └── offboard.py             ← offboard_service stub: returns the clientId unchanged
     │   ├── onboarding/
-    │   │   ├── orchestrator.py         ← sequences the precondition checks (D30) → (tool only) PCE bootstrap → provision → policy_builder, then onboard_and_apply calls compute_and_apply(rules, override=False, focus_service=client_id) itself (returns None)
+    │   │   ├── orchestrator.py         ← sequences the precondition checks (D30) → (tool only) PCE bootstrap → provision → policy_builder → (tool) audience warning, then onboard_and_apply calls compute_and_apply(rules, override=False, focus_service=client_id) itself (returns None)
     │   │   ├── preconditions.py        ← check_preconditions (#1, #2, #6; D30); EnforcementPreconditionError
+    │   │   ├── platform_audience.py    ← warn_platform_tool_audiences (the login-client audience warning, D30, agent side, log only)
     │   │   ├── provision/              ← non-LLM sub-agent: classify, analyze, write to IdP; kube.py = retrying K8s seam
     │   │   └── policy_builder/         ← IdP reader + PRB invoker: read IdP, call PRB, return list[PolicyRule]; cross_service.py = read-only Policy Store read (applied_rules_for_scopes)
     │   ├── policy_update/

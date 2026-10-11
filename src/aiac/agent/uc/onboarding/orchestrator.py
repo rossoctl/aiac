@@ -23,7 +23,7 @@ clientId, which :func:`onboard_and_apply` gives to the PCE as ``focus_service``:
        producing the discovered ``service_type`` and the **created-manifest** (exactly the
        roles/scopes it created on this run — see ``provision_service``).
     2. Service Policy Builder — reads the excluded-self IdP universe and builds the rules.
-       Then, for a TOOL under agent side, the login-client audience warning (C2, see
+       Then, for a TOOL under agent side, the login-client audience warning (D30, see
        ``platform_audience``): a WARNING for each platform login client that holds the tool's
        audience. It is best effort and never raises.
 
@@ -345,7 +345,7 @@ def _onboard(service_id: ServiceUuid, wait_for_client: bool) -> _Onboarded:
     it fails at the discovery-token mint anyway (C5). A bootstrap failure propagates (no rollback:
     Provision has not run). Any other failure of Provision or the build (no quarantine) drops this
     run's bootstrap CR (:func:`_drop_bootstrap`) and propagates. After a successful build of a tool,
-    the login-client audience warning runs (C2,
+    the login-client audience warning runs (D30,
     :func:`~aiac.agent.uc.onboarding.platform_audience.warn_platform_tool_audiences`): under agent side
     only, best effort, log only.
 
@@ -429,9 +429,10 @@ def _onboard(service_id: ServiceUuid, wait_for_client: bool) -> _Onboarded:
             _drop_bootstrap(client_id)
         raise
 
-    # C2 (agent side only, best effort): warn when a platform login client holds a scope that puts this
-    # tool's clientId into aud. Its pass-through CR then lets such a user token in with no AIAC check.
-    # It never raises, so it cannot fail the onboarding or drop the bootstrap CR.
+    # The login-client audience warning (D30; agent side only, best effort): warn when a platform login
+    # client holds a scope that puts this tool's clientId into aud. Its pass-through CR then lets such a
+    # user token in with no AIAC check. It never raises, so it cannot fail the onboarding or drop the
+    # bootstrap CR.
     if pod_type is ServiceType.TOOL:
         warn_platform_tool_audiences(config, client_id)
 

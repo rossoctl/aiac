@@ -7,16 +7,19 @@ focus service can enforce its CR:
 - **#1 — the sidecar:** every pod of the service has the AuthBridge sidecar container
   ``authbridge-proxy``. Without it, no OPA is in front of the service, and its CR has no effect.
 - **#2 — the pipeline:** the namespace ConfigMap ``authbridge-runtime-config`` (key
-  ``config.yaml``, ``pipeline.inbound.plugins[].name``) has ``jwt-validation`` and ``opa`` in the
-  inbound pipeline of every service (``jwt-validation`` is the only plugin that validates the token
-  and sets ``input.identity``), and also ``mcp-parser`` for a tool under target side (the tool's
-  inbound package checks ``input.mcp.params.name``). Under agent side a tool needs only
+  ``config.yaml``, ``pipeline.inbound.plugins[].name``) has ``jwt-validation`` in the inbound
+  pipeline of every service (it is the only plugin that validates the token and sets
+  ``input.identity``), ``opa`` in the inbound pipeline of every agent and of a tool under target
+  side, and also ``mcp-parser`` for a tool under target side (the tool's inbound package checks
+  ``input.mcp.params.name``). Under agent side a tool needs only
   ``jwt-validation`` (its pass-through CR, D24, needs no ``opa`` and no ``mcp-parser``, but without
   ``jwt-validation`` the tool is open to every caller). Under agent side, ``mcp-parser`` and ``opa``
   must also be in the outbound pipeline of an agent (``pipeline.outbound.plugins[].name``), because
   the agent's outbound checks its calls to tools (its package reads ``input.mcp.method`` and
-  ``input.mcp.params.name``). A missing ConfigMap fails the check. One #2 failure names each missing
-  plugin.
+  ``input.mcp.params.name``). A required plugin counts only if its entry enforces: an entry with
+  ``on_error: off`` (cortex takes the plugin out of the running pipeline) or ``on_error: observe``
+  (cortex turns its Reject into a pass-through) fails the check. A missing ConfigMap fails the
+  check. One #2 failure names each missing or not-enforcing plugin.
 - **#6 — the probes:** no app container (every container except ``authbridge-proxy``) has an
   ``httpGet`` readiness, liveness or startup probe. A kubelet probe carries no identity, and no
   request without identity passes a rules-based inbound package (D27).
@@ -166,20 +169,42 @@ def _required_outbound_plugins(service_type: ServiceType, side: EnforcementSide)
     return ["mcp-parser", "opa"] if side is EnforcementSide.AGENT_SIDE and service_type is ServiceType.AGENT else []
 
 
-def _plugin_names(config, direction: str) -> set | None:
-    """The plugin names of ``pipeline.<direction>.plugins`` in ``config``, or ``None`` if that list
-    cannot be read."""
+def _on_error(entry: dict) -> str:
+    """The ``on_error`` (cortex ErrorPolicy) of a plugin entry, with the default ``enforce``. An
+    unquoted ``off`` is YAML 1.1 false for PyYAML, but cortex (yaml.v3) reads it as ``off``."""
+    value = entry.get("on_error")
+    if value is None or value == "":
+        return "enforce"
+    if value is False:
+        return "off"
+    return str(value)
+
+
+def _plugin_policies(config, direction: str) -> dict[str, str] | None:
+    """The plugins of ``pipeline.<direction>.plugins`` in ``config``, as name -> ``on_error``, or
+    ``None`` if that list cannot be read. An entry is a map or a bare name (cortex reads a bare name
+    as ``{name: <name>}``, so ``enforce``). If a name has more than one entry, an ``enforce`` one wins."""
     try:
         plugins = config["pipeline"][direction]["plugins"] or []
-        return {p.get("name") for p in plugins if isinstance(p, dict)}
+        policies: dict[str, str] = {}
+        for p in plugins:
+            if isinstance(p, str):
+                name, policy = p, "enforce"
+            elif isinstance(p, dict):
+                name, policy = p.get("name"), _on_error(p)
+            else:
+                continue
+            if policies.get(name) != "enforce":
+                policies[name] = policy
+        return policies
     except (KeyError, TypeError, AttributeError):
         return None
 
 
 def _check_pipeline(namespace: str, service_type: ServiceType, side: EnforcementSide) -> list[str]:
     """#2: the namespace pipeline (``authbridge-runtime-config``) has the required inbound plugins,
-    and for an agent under agent side also the required outbound plugins. One failure names every
-    problem."""
+    and for an agent under agent side also the required outbound plugins, each with an enforcing
+    ``on_error``. One failure names every problem."""
     where = f"ConfigMap {PIPELINE_CONFIGMAP!r} in namespace {namespace!r}"
     try:
         configmap = read_configmap(PIPELINE_CONFIGMAP, namespace)
@@ -201,13 +226,20 @@ def _check_pipeline(namespace: str, service_type: ServiceType, side: Enforcement
     for direction, plugins in required.items():
         if not plugins:
             continue
-        names = _plugin_names(config, direction)
-        if names is None:
+        policies = _plugin_policies(config, direction)
+        if policies is None:
             problems.append(f"no readable pipeline.{direction}.plugins in {PIPELINE_CONFIG_KEY!r}")
             continue
-        missing = [name for name in plugins if name not in names]
+        missing = [name for name in plugins if name not in policies]
         if missing:
             problems.append(f"the {direction} pipeline has no {', '.join(repr(n) for n in missing)} plugin ({reason})")
+        # `off` takes the plugin out of the running pipeline, and `observe` turns its Reject into a
+        # pass-through: such an entry is there, but it does not enforce.
+        problems += [
+            f"the {direction} plugin {name!r} has on_error={policies[name]!r}, so it does not enforce ({reason})"
+            for name in plugins
+            if name in policies and policies[name] != "enforce"
+        ]
     if not problems:
         return []
     return [f"#2 pipeline: {where}: " + "; ".join(problems)]

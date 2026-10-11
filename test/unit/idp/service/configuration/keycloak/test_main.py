@@ -1635,7 +1635,7 @@ class TestLinkSubjectScopeToLoginClients:
 
 
 # ---------------------------------------------------------------------------
-# GET /platform-clients/tool-audiences (the login-client audience warning, C2)
+# GET /platform-clients/tool-audiences (the login-client audience warning, D30)
 # ---------------------------------------------------------------------------
 
 TOOL = "spiffe://localtest.me/ns/team1/sa/github-tool"
@@ -1693,9 +1693,10 @@ def _audience_admin(*, clients=None, scopes=None, default=None, optional=None, c
 
 class TestListPlatformToolAudiences:
     """The client scopes (and the client mappers) of the platform login clients that put a managed
-    tool's clientId into ``aud`` (C2). The operator links ``agent-<ns>-<workload>-aud`` to each client
-    in its ``PLATFORM_CLIENT_IDS`` as a default scope; under agent side such a login client's user
-    tokens then pass the tool's jwt-validation. Read only."""
+    tool's clientId into ``aud`` (the login-client audience warning, D30). The operator links
+    ``agent-<ns>-<workload>-aud`` to each client in its ``PLATFORM_CLIENT_IDS`` as a default scope;
+    under agent side such a login client's user tokens then pass the tool's jwt-validation. Read
+    only."""
 
     _URL = f"/platform-clients/tool-audiences?realm={REALM}"
     _SCOPE = "agent-team1-github-tool-aud"
@@ -1733,6 +1734,24 @@ class TestListPlatformToolAudiences:
     def test_included_client_audience_counts_too(self):
         mapper = _audience_mapper(TOOL, key="included.client.audience")
         admin = _audience_admin(scopes={"s1": ("x", [mapper])}, default={"rossoctl": ["s1"]})
+        assert [i["tool_client_id"] for i in self._get(admin)] == [TOOL]
+
+    def test_one_mapper_with_both_keys_on_the_tool_is_listed_once(self):
+        # Both keys name the same audience, so the mapper gives one link (and one WARNING), not two.
+        mapper = _audience_mapper(TOOL)
+        mapper["config"]["included.client.audience"] = TOOL
+        admin = _audience_admin(scopes={"s1": ("x", [mapper])}, default={"rossoctl": ["s1"]})
+        assert [(i["scope"], i["tool_client_id"]) for i in self._get(admin)] == [("x", TOOL)]
+
+    def test_one_mapper_with_another_client_and_the_tool_as_custom_audience_is_listed(self):
+        # Each key counts alone: a custom audience on the tool is listed, whatever the client key names.
+        mapper = _audience_mapper(TOOL)
+        mapper["config"]["included.client.audience"] = OTHER_TOOL
+        admin = _audience_admin(
+            clients={"rossoctl": None, TOOL: "Tool", OTHER_TOOL: None},
+            scopes={"s1": ("x", [mapper])},
+            default={"rossoctl": ["s1"]},
+        )
         assert [i["tool_client_id"] for i in self._get(admin)] == [TOOL]
 
     def test_the_match_is_by_the_mapper_not_by_the_scope_name(self):

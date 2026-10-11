@@ -2,11 +2,11 @@
 
 The sequence: read the enforcement side (D29: ``AIAC_ENFORCEMENT_SIDE``), then start check #4 (D30:
 the global combiner denies a pod that has no client CR), then the PCE ``resync()`` (D28), then the
-login-client audience warning (C2, agent side only, never stops the start), then the NATS consumer. An unknown side, a failed check #4 or a failed resync stops the Controller: the
-lifespan raises, so uvicorn never serves. Driven through the real app with a ``TestClient`` context
-(which runs the lifespan). The side is set in the env, the k8s read of the combiner CR is faked at
-the ``kube._custom_objects`` seam, the PCE ``resync`` at its import site, and the NATS consumer is a
-fake.
+login-client audience warning (D30, agent side only, never stops the start), then the NATS consumer.
+An unknown side, a failed check #4 or a failed resync stops the Controller: the lifespan raises, so
+uvicorn never serves. Driven through the real app with a ``TestClient`` context (which runs the
+lifespan). The side is set in the env, the k8s read of the combiner CR is faked at the
+``kube._custom_objects`` seam, the PCE ``resync`` at its import site, and the NATS consumer is a fake.
 """
 
 import json
@@ -291,7 +291,7 @@ class TestResyncStopsTheController:
 
 
 class TestTheAudienceWarning:
-    """Step 4 (C2): under agent side only, a WARNING for each platform login client that holds a
+    """Step 4 (D30): under agent side only, a WARNING for each platform login client that holds a
     managed tool's audience. Best effort: a failure does not stop the Controller."""
 
     def test_under_agent_side_the_audience_warning_runs_after_the_resync_and_before_the_consumer(

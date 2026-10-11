@@ -800,7 +800,8 @@ def link_subject_scope(service_id: str, admin: KeycloakAdmin = Depends(get_admin
 def list_platform_tool_audiences(
     client_id: str | None = Query(default=None), admin: KeycloakAdmin = Depends(get_admin)
 ):
-    """The client scopes of the platform login clients that put a tool's clientId into ``aud`` (C2).
+    """The client scopes of the platform login clients that put a tool's clientId into ``aud``
+    (the login-client audience warning, D30).
 
     For each login client of ``_platform_clients()`` (D31; a login client that is not in the realm is
     skipped, as in ``_link_login_clients``), read its default and its optional client scopes and the

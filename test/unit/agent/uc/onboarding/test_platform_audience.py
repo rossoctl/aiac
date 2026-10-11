@@ -1,4 +1,4 @@
-"""Unit tests for the login-client audience warning (C2, ``warn_platform_tool_audiences``).
+"""Unit tests for the login-client audience warning (D30, ``warn_platform_tool_audiences``).
 
 The helper reads the enforcement side from ``AIAC_ENFORCEMENT_SIDE`` (unset here, so target side,
 unless a test sets it) and the IdP through a ``Configuration`` (a ``MagicMock`` here, or the
@@ -130,4 +130,15 @@ def test_log_values_have_no_line_breaks(agent_side, caplog):
     with caplog.at_level(logging.WARNING):
         warn_platform_tool_audiences(config, ClientId("tool\nid"))
     (message,) = _warnings(caplog)
+    assert "\n" not in message and "\r" not in message
+
+
+def test_the_read_failure_warning_has_no_line_breaks(agent_side, caplog):
+    # An IdP error body or a Keycloak message can hold a line break: it must not forge a log line.
+    config = MagicMock()
+    config.get_platform_tool_audiences.side_effect = RuntimeError("down\nINFO:forged line\r")
+    with caplog.at_level(logging.WARNING):
+        warn_platform_tool_audiences(config, ClientId("tool\nid"))
+    (message,) = _warnings(caplog)
+    assert "cannot read" in message
     assert "\n" not in message and "\r" not in message

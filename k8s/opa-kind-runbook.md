@@ -150,8 +150,10 @@ Expect two image builds, so allow a few minutes. The script runs six steps:
    [Architecture](#architecture). Every injected pod in the namespace uses it,
    agent and tool. The inbound leg is `a2a-parser`, `mcp-parser`,
    `inference-parser`, `jwt-validation`, `opa`: every service needs
-   `jwt-validation` and `opa` there, and a tool also `mcp-parser` (onboarding
-   check #2, D30). `charts/rossoctl/values.yaml` is
+   `jwt-validation` there, an agent and a tool under target side also `opa`,
+   and a tool under target side also `mcp-parser` (onboarding check #2, D30;
+   under agent side a tool needs only `jwt-validation`). Each of them must
+   keep the default `on_error: enforce`. `charts/rossoctl/values.yaml` is
    never modified.
 4. **Helm upgrade.** Applies the chart's `values.yaml` plus the overlay, with
    the sidecar image pointed at the locally built one.
