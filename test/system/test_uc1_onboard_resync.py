@@ -180,7 +180,10 @@ def _phase(run: dict, key: str) -> dict:
 
 
 def _changed_paths(before: dict[str, dict[str, str]], after: dict[str, dict[str, str]]) -> dict[str, list[str]]:
-    """For each CR in both snapshots whose ``spec.policies`` differ, the paths that differ."""
+    """For each CR in both snapshots whose ``spec.policies`` differ, the paths that differ. The
+    compare is order-agnostic (``uc1.cr_canonical``): the order of a list or of map keys is not a change."""
+    before = {key: uc1.cr_canonical(policies) for key, policies in before.items()}
+    after = {key: uc1.cr_canonical(policies) for key, policies in after.items()}
     return {
         key: sorted(
             path for path in set(before[key]) | set(after[key]) if before[key].get(path) != after[key].get(path)
@@ -261,7 +264,7 @@ def test_resync_writes_the_missing_cr_again(run: dict) -> None:
     repaired = _phase(run, "repaired")["crs"]
     key = uc1.cr_key(TOOL)
     assert key in repaired, f"the resync did not write github-tool's CR again (AIAC CRs: {sorted(repaired)})"
-    assert repaired[key] == before[key], (
+    assert uc1.cr_canonical(repaired[key]) == uc1.cr_canonical(before[key]), (
         f"github-tool's repaired CR differs from phase 1 in {_changed_paths(before, repaired).get(key)}"
     )
     assert set(repaired) == set(before), f"AIAC CR set after the repair {sorted(repaired)} != phase 1 {sorted(before)}"

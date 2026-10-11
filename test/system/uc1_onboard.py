@@ -1738,6 +1738,62 @@ def _rego_lines(rego: str) -> list[str]:
     return [ln.strip() for ln in rego.splitlines() if ln.strip() and not ln.strip().startswith("#")]
 
 
+# A top-level data binding as ``rego._render_list`` / ``_render_map`` / ``_render_nested_map`` emit it:
+# ``var := [...]`` on one line, or ``var := {`` … a ``}`` line in column 0.
+_REGO_DATA_BINDING = re.compile(r"^([A-Za-z_]\w*) := ([\[{].*)$")
+
+
+def _canonical_data(value):
+    """``value`` with every list sorted and every map key sorted, at each depth."""
+    if isinstance(value, dict):
+        return {k: _canonical_data(value[k]) for k in sorted(value)}
+    if isinstance(value, list):
+        return sorted((_canonical_data(v) for v in value), key=lambda v: json.dumps(v, sort_keys=True))
+    return value
+
+
+def rego_canonical(rego: str) -> str:
+    """``rego`` in an order-agnostic form, for an equality check of two CRs.
+
+    The order of a scope or role list, and of map keys, has no meaning in the rendered packages
+    (each read is ``x in list`` or a key lookup), and the renderer keeps the order the IdP returns.
+    So each top-level data binding is read as JSON and written again with every list and map key
+    sorted. Each other line (rule bodies, ``default``, ``allow := true``) stays as it is. A binding
+    that does not parse as JSON also stays as it is, so a format change shows as a difference."""
+    lines = rego.splitlines()
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        m = _REGO_DATA_BINDING.match(lines[i])
+        if not m:
+            out.append(lines[i])
+            i += 1
+            continue
+        name, text = m.groups()
+        end = i
+        if text == "{":
+            while end + 1 < len(lines) and lines[end] != "}":
+                end += 1
+            text = "\n".join(["{", *lines[i + 1 : end + 1]])
+        try:
+            # The renderers end each map entry with a comma; JSON does not accept a trailing comma.
+            value = json.loads(re.sub(r",(\s*[}\]])", r"\1", text))
+        except json.JSONDecodeError:
+            out.extend(lines[i : end + 1])
+        else:
+            out.append(f"{name} := {json.dumps(_canonical_data(value), sort_keys=True)}")
+        i = end + 1
+    return "\n".join(out)
+
+
+def cr_canonical(policies: dict[str, str] | None) -> dict[str, str] | None:
+    """``policies`` (``{path: rego}``, as ``aiac_crs`` gives it) with each package in the
+    order-agnostic form of ``rego_canonical``. ``None`` (no CR) stays ``None``."""
+    if policies is None:
+        return None
+    return {path: rego_canonical(rego) for path, rego in policies.items()}
+
+
 def rego_is_pass_through(rego: str | None) -> bool:
     """True when ``rego`` is a **pass-through** package (D24): a ``package`` line, ``import rego.v1``,
     and ``allow := true`` — nothing else. The pass-throughs are the only ALLOW packages (D25)."""

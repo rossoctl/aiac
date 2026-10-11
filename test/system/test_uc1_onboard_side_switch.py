@@ -379,8 +379,9 @@ def test_switch_back_moves_every_cr_back(run: dict) -> None:
 def test_switch_back_restores_the_start_crs(run: dict) -> None:
     """After the switch back github-agent's and github-tool's CRs have the same ``spec.policies`` as in
     phase 1: the resync renders the same policy model of ``S`` from the same stored SPMs."""
-    before = _demo_crs(_phase(run, "start")["crs"])
-    after = _demo_crs(_phase(run, "restored")["crs"])
+    # Order-agnostic (``uc1.cr_canonical``): the order of a list or of map keys is not a change.
+    before = {key: uc1.cr_canonical(policies) for key, policies in _demo_crs(_phase(run, "start")["crs"]).items()}
+    after = {key: uc1.cr_canonical(policies) for key, policies in _demo_crs(_phase(run, "restored")["crs"]).items()}
     changed = {
         key: sorted(
             path

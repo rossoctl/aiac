@@ -487,7 +487,8 @@ def test_failed_tool_has_no_cr(run: dict) -> None:
 def test_failed_tool_agent_cr_by_side(run: dict) -> None:
     """The agent's CR after the tool's quarantine, by the live enforcement side:
 
-    * **target side** — unchanged since phase 3. The tool owns no role, so the footprint purge changes
+    * **target side** — unchanged since phase 3 (order-agnostic: ``uc1.cr_canonical``; the order of a
+      list or of map keys is not a change). The tool owns no role, so the footprint purge changes
       no other SPM and the agent is not affected: its inbound grants stay, and its outbound stays a
       pass-through (the callee decides, D24).
     * **agent side** — the quarantine re-derives the agent that targeted the tool: its outbound Rego no
@@ -505,7 +506,9 @@ def test_failed_tool_agent_cr_by_side(run: dict) -> None:
         f"target side: the agent's outbound is not a pass-through: {policies.get(uc1.CR_OUTBOUND_PATH)!r}"
     )
     before = _phase(run, "tool_onboarded")["agent_cr"]
-    assert policies == before, "target side: the tool's quarantine changed the agent's CR (no agent SPM changed)"
+    assert uc1.cr_canonical(policies) == uc1.cr_canonical(before), (
+        "target side: the tool's quarantine changed the agent's CR (no agent SPM changed)"
+    )
 
 
 def test_failed_tool_outbound_call_denied(run: dict) -> None:
