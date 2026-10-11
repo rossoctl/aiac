@@ -1188,6 +1188,32 @@ class TestPreconditionChecksRunFirst:
 
         assert [f[:2] for f in ei.value.failures] == ["#1", "#2", "#6"]
 
+    def test_under_agent_side_a_tool_with_no_jwt_validation_fails_before_the_bootstrap(
+        self, k8s, quarantine, bootstrap, monkeypatch
+    ):
+        # Under agent side a tool gets a pass-through CR: without jwt-validation on its inbound it is
+        # open to every caller. So #2 runs for it too, before the bootstrap writes that CR.
+        monkeypatch.setenv("AIAC_ENFORCEMENT_SIDE", "agent-side")
+        k8s.list_namespaced_pod.return_value = kf.pod_list(kf.pod(type_label="tool"))
+        k8s.read_namespaced_config_map.return_value = kf.pipeline_configmap(inbound=(), outbound=())
+        config = _config_returning(_service())
+        graph = _graph(service_type=ServiceType.TOOL)
+
+        with (
+            patch.object(orchestrator, "build_provision_graph", return_value=graph),
+            patch.object(orchestrator, "ServicePolicyBuilder"),
+            patch.object(orchestrator, "_config", return_value=config),
+        ):
+            with pytest.raises(EnforcementPreconditionError) as ei:
+                _run_onboarding(SERVICE_ID)
+
+        assert [f[:2] for f in ei.value.failures] == ["#2"]
+        assert "'jwt-validation'" in ei.value.failures[0]
+        bootstrap.assert_not_called()
+        graph.invoke.assert_not_called()
+        quarantine.assert_not_called()
+        config.set_service_enabled.assert_not_called()
+
     def test_the_checks_read_the_pods_and_the_pipeline_of_the_service_namespace(self, k8s):
         with (
             patch.object(orchestrator, "build_provision_graph", return_value=_graph()),
@@ -1355,13 +1381,16 @@ class TestBootstrapOfATool:
         bootstrap.assert_not_called()
         graph.invoke.assert_called_once()
 
-    def test_under_agent_side_a_tool_gets_no_check_but_still_its_bootstrap(self, k8s, bootstrap, monkeypatch):
-        # D30 scope: under agent side a tool gets a pass-through CR, which needs no check. So a tool
-        # pod with no sidecar and no opa passes; its type still comes from the pod label, and the
-        # bootstrap (the pass-through CR under agent side) runs before Provision.
+    def test_under_agent_side_a_tool_that_passes_1_and_2_gets_its_bootstrap_before_provision(
+        self, k8s, bootstrap, monkeypatch
+    ):
+        # D30 scope: under agent side a tool needs the sidecar (#1) and jwt-validation in its inbound
+        # pipeline (#2), and nothing more: its pass-through CR needs no opa, no mcp-parser and no #6.
+        # Its type still comes from the pod label, and the bootstrap (the pass-through CR under agent
+        # side) runs before Provision.
         monkeypatch.setenv("AIAC_ENFORCEMENT_SIDE", "agent-side")
-        k8s.list_namespaced_pod.return_value = kf.pod_list(kf.pod(type_label="tool", containers=[kf.app_container()]))
-        k8s.read_namespaced_config_map.return_value = kf.pipeline_configmap(inbound=(), outbound=())
+        k8s.list_namespaced_pod.return_value = kf.pod_list(kf.pod(type_label="tool"))
+        k8s.read_namespaced_config_map.return_value = kf.pipeline_configmap(inbound=("jwt-validation",), outbound=())
         graph = _graph(service_type=ServiceType.TOOL)
         order = MagicMock()
         order.attach_mock(bootstrap, "bootstrap")

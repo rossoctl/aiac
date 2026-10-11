@@ -5,7 +5,7 @@ The checks read the pods of the workload (``list_namespaced_pod``) and the names
 These builders give objects with the attributes of the real ``kubernetes`` client models that the
 checks read. By default they describe a service that passes every check: an ``authbridge-proxy``
 sidecar (with its own ``httpGet`` probe, which #6 ignores), an app container with a ``tcpSocket``
-probe, and an inbound pipeline with ``mcp-parser`` and ``opa``.
+probe, and an inbound pipeline with ``jwt-validation``, ``mcp-parser`` and ``opa``.
 """
 
 from types import SimpleNamespace
