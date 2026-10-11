@@ -102,10 +102,11 @@ Preconditions:
 
 The lane runs under the enforcement side that `AIAC_ENFORCEMENT_SIDE` sets in the
 `aiac-agent-config` ConfigMap (default `target-side`: each callee, the tool
-included, checks its own inbound from its own CR). To change the side, see
-`docs/agents/deploy.md`.
+included, checks its own inbound from its own CR). No test changes the side. To
+test both sides, run the lane, do a clean redeploy with the other side (see
+`docs/agents/deploy.md`), and run the lane again.
 
-The platform prerequisites, wiring, verification and the side switch:
+The platform prerequisites, wiring, verification and the setting of the side:
 `k8s/opa-kind-runbook.md`. The realm fix-up (Direct Access Grants) and the manual
 probes of the scenario: `demo/use-cases/onboarding/demo.md`. The per-loop shape:
 `test/system/uc1_onboard.py`.

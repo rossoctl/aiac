@@ -22,9 +22,10 @@ data:
   #     itself in its own inbound OPA, from its own CR.
   #   agent-side (legacy): each agent's outbound OPA checks the agent's calls
   #     to tools; each tool gets a pass-through CR.
-  # The Controller reads it at start and stops on an unknown value. A change
-  # needs a Controller restart: the start resync (D28) then moves every CR to
-  # the new side. Not the same as AIAC_AC_MODEL above, which names a modeling
+  # The Controller reads it at start and stops on an unknown value. Set it at
+  # deploy time: a live switch is not supported, and a change is a clean
+  # redeploy of AIAC (k8s/opa-kind-runbook.md, "Set the enforcement side").
+  # Not the same as AIAC_AC_MODEL above, which names a modeling
   # paradigm (RBAC/ABAC/REBAC) and is read by no code.
   AIAC_ENFORCEMENT_SIDE: "target-side"
   # Namespace of the bundle service and its `default` global combiner CR (D20).
@@ -123,7 +124,7 @@ spec:
   replicas: 1
   # Recreate, not RollingUpdate: the PCE lock and the per-service lock are in one process, so two
   # Controller pods must never run at the same time. Else the new pod's start resync (PUT /policy)
-  # and the old pod's writes race, and a side change can leave CRs of both sides.
+  # and the old pod's writes race.
   strategy:
     type: Recreate
   selector:

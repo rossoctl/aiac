@@ -10,7 +10,7 @@
 > **Ladder, not one test.** This spec was previously a single "complete two-policy" test that assumed a
 > **two-stack** topology (one AIAC stack per `policy.md` variant) which is **not deployed** and so could
 > never run. It is now a **ladder** of three gradual, runnable happy-path tests against **one** AIAC
-> stack, one failure-path rung (rung 5), two Controller-restart rungs (rungs 6 and 7), and one
+> stack, one failure-path rung (rung 5), one Controller-restart rung (rung 6), and one
 > **deferred** rung (two-policy):
 >
 > | Rung | Issue | Onboards | Proves |
@@ -21,12 +21,13 @@
 > | 4 | `testing/5.4.4-uc1-onboard-two-policies.md` | two policies | **deferred / TBD**; two-stack impl discarded |
 > | 5 | `testing/5.4.5-uc1-onboard-failure-rollback.md` | agent / tool (build failure) | UC-1 **compensating rollback + PCE quarantine**: the quarantine deletes the CR, so a failed agent is denied (it has no CR, D20), a failed tool is unreachable, and a successful re-onboarding lifts the quarantine. Also the **MCP session** for a granted user. Test file: `test/system/test_uc1_onboard_failure_rollback.py` |
 > | 6 | — | agent + tool, then Controller restarts | the **resync** at Controller start (D28) leaves every CR unchanged; a service with **no CR is denied** (D20); the next resync writes the missing CR again. Test file: `test/system/test_uc1_onboard_resync.py` |
-> | 7 | — | agent + tool, then a side switch | the **enforcement-side switch** (D16, D29): the demo passes under each side, and a Controller restart with the other `AIAC_ENFORCEMENT_SIDE` value moves every CR, with no mixed state. Test file: `test/system/test_uc1_onboard_side_switch.py` |
 >
 > **Enforcement side.** Every rung runs under the live **enforcement side** (D16): the
 > `AIAC_ENFORCEMENT_SIDE` value in the `aiac-agent-config` ConfigMap (default `target-side`). The
 > verdict tables do not depend on the side. Only the CR shapes and the place of a deny depend on it
-> (see *[CR end state for each side](#cr-end-state-for-each-side)*).
+> (see *[CR end state for each side](#cr-end-state-for-each-side)*). No rung changes the side: the side
+> is set at deploy time, and a live switch is not supported. To cover both sides, run the lane under
+> each side, with a clean redeploy of AIAC between the runs (see *[Runbook](#runbook)*).
 
 > **Relationship to `policy-pipeline`.** This is the **onboarding-order-focused sibling** of
 > [policy-pipeline.md](policy-pipeline.md). Identical *scenario facts and truth tables* (same three users,
@@ -41,12 +42,12 @@
 `test/system/` — pytest modules marked `@pytest.mark.system`, one per **implemented** rung
 (`test_uc1_onboard_agent_only.py`, `test_uc1_onboard_agent_then_tool.py`,
 `test_uc1_onboard_tool_then_agent.py`, `test_uc1_onboard_failure_rollback.py` for rung 5,
-`test_uc1_onboard_resync.py` for rung 6, and `test_uc1_onboard_side_switch.py` for rung 7). Rung 4
+and `test_uc1_onboard_resync.py` for rung 6). Rung 4
 (two-policy) is **deferred and has no test file**. Rungs 1–3 are thin modules that wrap `onboarded_stack` in a
 one-line session fixture and supply only their own rung's oracle (verdicts computed from
 `scenario_uc1.py`) and live assertions. Rung 5 wraps `pristine_stack` in a module-scoped fixture and
-drives its own four phases. Rungs 6 and 7 wrap `onboarded_stack([agent, tool])` in a module-scoped
-fixture, so each rung's stack is torn down when its tests end, and then drive their own Controller
+drives its own four phases. Rung 6 wraps `onboarded_stack([agent, tool])` in a module-scoped
+fixture, so the rung's stack is torn down when its tests end, and then drives its own Controller
 restarts. They import three shared modules:
 
 - `scenario_uc1.py` — the pure-data scenario (users/roles + the pair-lists expressed over the
@@ -72,11 +73,9 @@ restarts. They import three shared modules:
   shape of a given side for an agent or a tool — see
   *[CR end state for each side](#cr-end-state-for-each-side)*), and `deny_origin` (where the raw
   response of a denied tool call comes from: github-tool's inbound or the agent's outbound). The
-  rung-6 and rung-7 helpers are `aiac_crs` (every CR with the managed-by label
-  `app.kubernetes.io/managed-by: aiac-pdp-policy-writer`, name → `spec.policies`),
-  `restart_controller` (rollout restart + wait for Ready), and `controller_enforcement_side(side)`
-  (patch `AIAC_ENFORCEMENT_SIDE` in `aiac-agent-config`, restart the Controller, and restore the
-  original value with a second restart on every exit path). The subject-scope check (D31) is
+  rung-6 helpers are `aiac_crs` (every CR with the managed-by label
+  `app.kubernetes.io/managed-by: aiac-pdp-policy-writer`, name → `spec.policies`) and
+  `restart_controller` (rollout restart + wait for Ready). The subject-scope check (D31) is
   `SUBJECT_SCOPE` (`aiac-username-sub`), the pure helper `subject_scope_problems`, its live reader
   `subject_scope_link_problems`, and `require_subject_scope` (see *[Per-rung flow](#per-rung-flow)*,
   step 2). The rung-2 `sub` probes are `login_subject` (a password-grant token through `rossoctl`) and
@@ -200,8 +199,8 @@ cleanly** when any of it is absent (they never stand it up, and never false-pass
   (the onboarding check #2 for a tool under target side). The fixture deploys fresh workload pods, so
   github-agent and github-tool both get the sidecar at CREATE.
 - **The enforcement side.** `AIAC_ENFORCEMENT_SIDE` in the `aiac-agent-config` ConfigMap selects the
-  side (default `target-side`; the other value is `agent-side`). The suite runs under the live side.
-  Only rung 7 changes it, and rung 7 restores it on every exit path.
+  side (default `target-side`; the other value is `agent-side`). The suite runs under the live side,
+  and no rung changes it.
 - **Event Broker running.** The NATS broker `aiac-event-broker-service` (ns `aiac-system`, port `4222`,
   from `k8s/event-broker-deployment.yaml`) is deployed and reachable, and the Agent's in-pod consumer is
   connected — its `aiac-init` initContainer gates on NATS and provisions the `aiac-events` stream. The
@@ -549,32 +548,6 @@ different rule line is a change. The unit lane pins the rule order of the PCE pa
 (`test/unit/policy/computation/test_engine.py`) and the compare itself
 (`test/unit/agent/uc/onboarding/test_uc1_cr_canonical.py`).
 
-## The enforcement-side switch (rung 7)
-
-Rung 7 (`test/system/test_uc1_onboard_side_switch.py`) proves the switch (D16, D29). A side change is
-a ConfigMap patch and a Controller restart. The resync then writes every CR in the new side (D28), so
-no mixed state stays. Let `S` be the live side at the start, and `O` the other side. The rung onboards
-github-agent and github-tool (`onboarded_stack([agent, tool])`, module-scoped), and then runs these
-phases in order. It skips cleanly in the same way as rung 6.
-
-1. **Under `S`.** Assert: every AIAC CR matches `S` (`cr_matches_side`), and the full inbound and
-   outbound matrix of *[Expected output](#expected-output)* holds.
-2. **Switch to `O`.** Enter `controller_enforcement_side(O)`: it patches `AIAC_ENFORCEMENT_SIDE` in
-   `aiac-agent-config` and restarts the Controller.
-3. **Every CR moved.** Poll until every AIAC CR matches `O`. Then assert: the set of AIAC CRs is the
-   same (github-agent and github-tool), and no AIAC CR still matches `S` (no mixed state).
-4. **The demo passes under `O`.** Poll until `deny_origin` of an ungranted call (`test-user` ×
-   `source-read`) gives the enforcement point of `O`. This proves that the OPA sidecars loaded the new
-   bundles (a CR change takes effect at the next poll of the OPA plugin, up to 120 s). Then assert the
-   full matrix again: the same verdicts as in phase 1.
-5. **Switch back.** Exit the context: it restores the start value and restarts the Controller. Poll
-   until every AIAC CR matches `S` again and `deny_origin` gives the enforcement point of `S`. Assert:
-   the CRs of github-agent and github-tool have the same `spec.policies` as in phase 1 (the compare
-   ignores the order of lists and of map keys, as in rung 6). The context restores `S` on every exit path, also on a failure, so later rungs run under `S`.
-
-The rung needs no second run of the lane to cover both sides, but the whole lane can also run under
-either side (see *[Runbook](#runbook)*).
-
 ## Expected output
 
 Verdicts are **computed from** the `scenario_uc1.py` pair-lists (these tables are the human-readable
@@ -690,7 +663,7 @@ The suite reads its config from the repo-root `.env` (gitignored); source it bef
 | `AIAC_TEST_REALM` | Realm the tests provision/read back against. **Must match the deployed AIAC stack's `KEYCLOAK_REALM`** — the in-cluster consumer onboards in *its own* realm off the `CLIENT_CREATED` event, so a harness that provisions roles in a different realm would leave onboarding unable to see them | `rossoctl` |
 | `AIAC_DEMO_NAMESPACE` | Namespace the tests deploy (and tear down) the demo workloads into | `team1` |
 | `AIAC_TRUST_DOMAIN` | SPIFFE trust domain the operator registers the demo workloads under | `localtest.me` |
-| `AIAC_ENFORCEMENT_SIDE` (ConfigMap `aiac-agent-config`, not a harness env var) | The enforcement side the Controller uses (`target-side` or `agent-side`). `live_enforcement_side` reads it from the live ConfigMap; rung 7 changes it and restores it | `target-side` |
+| `AIAC_ENFORCEMENT_SIDE` (ConfigMap `aiac-agent-config`, not a harness env var) | The enforcement side the Controller uses (`target-side` or `agent-side`). `live_enforcement_side` reads it from the live ConfigMap; no rung changes it | `target-side` |
 | NATS Event Broker (not an env var) | Precondition. `require_event_path` skips unless pods labelled `app=aiac-event-broker` in `aiac-system` are Running; the harness has no env var for the broker | — (`k8s/event-broker-deployment.yaml`) |
 | SPI listener (realm `eventsListeners`) | Must contain `aiac-event-listener` (with `adminEventsEnabled: true`) so `CLIENT_CREATED` reaches NATS (precondition) | — (Helm/realm setup, per `keycloak-spi/README.md`) |
 
@@ -726,26 +699,18 @@ set -a; . .env; set +a
 # A failing node names the exact cell, e.g.:
 #   test_outbound[source-read-test-user] — expected deny, plugin allowed
 .venv/bin/pytest -m system -k uc1_onboard_resync -v        # rung 6 only
-.venv/bin/pytest -m system -k uc1_onboard_side_switch -v   # rung 7 only
 ```
 
-The lane runs under the live side (default `target-side`). To run the whole lane under agent side,
-change the side first (a ConfigMap patch and a Controller restart; the resync moves every CR), and
-restore it afterwards the same way:
-
-```bash
-kubectl -n aiac-system patch configmap aiac-agent-config --type merge \
-  -p '{"data":{"AIAC_ENFORCEMENT_SIDE":"agent-side"}}'
-kubectl -n aiac-system rollout restart deployment/aiac-agent
-kubectl -n aiac-system rollout status deployment/aiac-agent
-.venv/bin/pytest -m system -k uc1_onboard -v
-```
+The lane runs under the live side (default `target-side`). The side is set at deploy time, and a live
+switch is not supported. To run the whole lane under agent side, do a clean redeploy of AIAC with
+`agent-side` first (see [`opa-kind-runbook.md` → Set the enforcement side](../../k8s/opa-kind-runbook.md#set-the-enforcement-side)), then run the lane again. Do a clean redeploy with `target-side`
+afterwards to restore the default.
 
 Without `-m system` the suite is deselected (the default `addopts`); when the cluster/pipeline is not wired — including the
 **broker/SPI not installed** and the **combiner not changed** — or the env is unset, it **skips cleanly** (`require_pipeline`,
 `require_env_or_skip`, `require_event_path`; it never false-passes). Image
 loading is **not** a skip condition (see *[Preconditions](#preconditions-the-wired-platform--not-stood-up-by-the-tests)*).
-Rungs 6 and 7 restart the Controller twice each, so each one takes several minutes.
+Rung 6 restarts the Controller twice, so it takes several minutes.
 
 ## Testing Decisions
 
@@ -786,11 +751,9 @@ Rungs 6 and 7 restart the Controller twice each, so each one takes several minut
   removed (the shared `aiac-username-sub` stays linked, D31), and it has no SPM; a failed tool loses
   the CR its onboarding wrote, has no SPM, and is unreachable from the agent; a clean re-onboard writes the agent's CR again and
   re-enables the client.
-- **The Controller start is tested live** (rungs 6 and 7). A restart with no change leaves every CR
+- **The Controller start is tested live** (rung 6). A restart with no change leaves every CR
   unchanged (the resync, D28). A CR deleted by hand denies its service (D20), and the next resync
-  writes it again. A restart with the other side moves every CR, with no mixed state (D16, D29). The
-  side context restores the start side on every exit path, as `controller_llm_unusable` restores the
-  LLM env.
+  writes it again. No rung changes the side (a live switch is not supported, D16, D29).
 - **Per-scope two-gate AND.** UC-1's per-skill operator roles are mapped to the tool scopes by
   capability-match, so the capability gate is populated; the plugin enforces the real per-scope AND. The
   agent reaches all four tool scopes, so the user gate discriminates. Under target side the same AND
@@ -864,8 +827,8 @@ Rungs 6 and 7 restart the Controller twice each, so each one takes several minut
   wired. **Status: not built yet** — the `5.1` live-Keycloak pytest suite does not exist under `test/`.
 
 Tracking issues: `testing/5.4-uc1-onboarding-integration-test.md` (epic) + `5.4.1`/`5.4.2`/`5.4.3` (rungs)
-+ `5.4.4` (deferred two-policy) + `5.4.5` (failure-path rollback and quarantine). Rungs 6 (resync) and
-7 (side switch) have no tracking issue yet.
++ `5.4.4` (deferred two-policy) + `5.4.5` (failure-path rollback and quarantine). Rung 6 (resync) has
+no tracking issue yet.
 
 ## Out of Scope
 

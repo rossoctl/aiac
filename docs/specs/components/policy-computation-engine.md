@@ -207,7 +207,7 @@ A deleted role still re-renders: its edges get no holder (fail closed). A failur
 - **Target side.** Each callee, agent or tool, checks the access to itself in its own inbound OPA, from its own CR. The render input is the stored SPM of the callee (`TargetSidePolicyModel`). The outbound package of every CR is a pass-through: the callee decides (D24).
 - **Agent side** (the legacy method). Each agent's CR checks the agent's calls to tools on its outbound. The render input is the APM, which the PCE derives in memory (`AgentSidePolicyModel.agents`). Each managed tool gets a pass-through CR (`AgentSidePolicyModel.pass_through`), because a pod that has no CR is denied (D20, D24).
 
-A side change is a ConfigMap patch and a Controller restart. The [resync](#resync-controller-start) then writes every CR in the new side, so no mixed state stays.
+The side is set at deploy time. A live switch (a ConfigMap patch and a Controller restart) is not supported. A side change is a clean redeploy of AIAC: it deletes every AIAC CR and the Policy Model Store, so no mixed state can exist (see [`opa-kind-runbook.md` → Set the enforcement side](../../../k8s/opa-kind-runbook.md#set-the-enforcement-side)).
 
 **The managed set (D21).** The managed set is the services that have a stored SPM. Every managed service has a CR, under both sides (D20): the global combiner denies a pod that has no client CR. A service leaves the set only through the quarantine or the decommission, which delete its SPM and its CR. A successful onboarding stores the focus SPM also when it has zero rules (see [Algorithm](#algorithm) step 2b), so the focus service always joins the set. The [bootstrap CR](#bootstrap-cr-tool-discovery) of a tool is the one CR outside the managed set: it exists from the bootstrap until the onboarding stores the SPM, or until a quarantine or the resync deletes it.
 
@@ -384,7 +384,6 @@ If the resync fails, it re-raises, and the Controller stops. The pod restarts, a
 
 The resync is also the path for these changes:
 
-- **A side change.** The operator patches `AIAC_ENFORCEMENT_SIDE` in the `aiac-agent-config` ConfigMap and restarts the Controller. The resync then writes every CR in the new side. Without it, a partial change is open: for example, an agent gets a pass-through outbound (target side) while a tool keeps a pass-through inbound (agent side), and then nothing checks the calls.
 - **An upgrade.** The resync replaces the per-agent CRs of an older release.
 - **A stale or missing CR.** A run deploys only the affected services (D23). The resync rewrites every CR.
 - **A missed role-members event.** The resync renders every CR with the current role holders, so a user or an agent that got or lost a role while no event reached the Controller gets the right CR.

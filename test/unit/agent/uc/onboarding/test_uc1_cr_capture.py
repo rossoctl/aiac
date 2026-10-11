@@ -137,8 +137,8 @@ def test_cr_file_name_is_namespace_and_name() -> None:
     [
         ("test/system/test_uc1_onboard_resync.py::test_restart_keeps_the_cr_set (setup)", "test_uc1_onboard_resync"),
         (
-            "test/system/test_uc1_onboard_side_switch.py::test_start_verdict[inbound-dev-user] (call)",
-            "test_uc1_onboard_side_switch",
+            "test/system/test_uc1_onboard_tool_then_agent.py::test_inbound[dev-user] (call)",
+            "test_uc1_onboard_tool_then_agent",
         ),
     ],
 )

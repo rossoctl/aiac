@@ -907,8 +907,9 @@ class TestDenyOnCopiesOfASharedScope:
         assert _rego_nested_map(rego, "subject_role_allow_scopes") == {TESTER: {TOOL2.client_id: ["source-read"]}}
 
     def _verdicts_on_both_sides(self, stack: Stack, scenario: str, order: str, monkeypatch) -> dict:
-        """Bring up under target side, then change to agent side as an operator does (the side in the
-        ConfigMap, then the resync at the Controller start). The verdicts of each side, by side."""
+        """Bring up under target side, then render the same stored SPMs under agent side (the side in
+        the env, then a resync). A test shortcut that compares the two sides on one store, not an
+        operator procedure: a live side switch is not supported. The verdicts of each side, by side."""
         self._bring_up(stack, scenario, order, EnforcementSide.TARGET_SIDE, monkeypatch)
         verdicts = {EnforcementSide.TARGET_SIDE: self._verdicts(stack, EnforcementSide.TARGET_SIDE)}
         monkeypatch.setenv("AIAC_ENFORCEMENT_SIDE", EnforcementSide.AGENT_SIDE.value)

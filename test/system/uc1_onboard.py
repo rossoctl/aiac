@@ -80,10 +80,8 @@ This module owns:
   ``controller_commit_race_hint`` (a bounded ``kubectl logs`` from just before the deploy; read-only and
   best-effort, it never raises). Each deploy gate that times out appends the hint (``append_hint``), so
   the message says when the onboarding event probably came before the Keycloak commit.
-* **Controller restart (rungs 6 and 7)** — ``restart_controller`` (rollout restart + wait until no old
-  pod is left; the resync at start ends before the new pod is Ready), and ``controller_enforcement_side``
-  (patch ``AIAC_ENFORCEMENT_SIDE`` in the Controller's ConfigMap + restart; on every exit path a CR
-  capture, then the start value and a second restart).
+* **Controller restart (rung 6)** — ``restart_controller`` (rollout restart + wait until no old pod is
+  left; the resync at start ends before the new pod is Ready).
 
 It imports only stdlib + ``requests`` + ``launcher`` + the pure-data ``scenario_uc1`` (never
 ``aiac``; PyYAML only inside the capture's ``_to_yaml``), so it is importable before the
@@ -180,8 +178,8 @@ CONTROLLER_RESTART_TIMEOUT = float(os.environ.get("AIAC_CONTROLLER_RESTART_TIMEO
 
 # --- Enforcement side (D16) ---------------------------------------------------------------
 # ``AIAC_ENFORCEMENT_SIDE`` in the Controller's ConfigMap selects where the check runs. The harness
-# reads it (``live_enforcement_side``); an absent key means the default, ``target-side``. Only rung 7
-# changes it (``controller_enforcement_side``), and it always puts the start value back.
+# reads it (``live_enforcement_side``); an absent key means the default, ``target-side``. The harness
+# never changes it: the side is set at deploy time, and a side change is a clean redeploy of AIAC.
 AGENT_CONFIGMAP = os.environ.get("AIAC_AGENT_CONFIGMAP", "aiac-agent-config")
 ENFORCEMENT_SIDE_KEY = "AIAC_ENFORCEMENT_SIDE"
 TARGET_SIDE = "target-side"
@@ -194,9 +192,6 @@ SIDE_ENFORCEMENT_POINT: dict[str, str] = {
     TARGET_SIDE: DENY_ORIGIN_TOOL_INBOUND,
     AGENT_SIDE: DENY_ORIGIN_AGENT_OUTBOUND,
 }
-
-# The other side, for a side switch (rung 7).
-OTHER_SIDE: dict[str, str] = {TARGET_SIDE: AGENT_SIDE, AGENT_SIDE: TARGET_SIDE}
 
 # The label the OPA Policy Writer puts on every CR it owns (``_MANAGED_BY_LABEL`` in the writer).
 MANAGED_BY_SELECTOR = "app.kubernetes.io/managed-by=aiac-pdp-policy-writer"
@@ -1833,8 +1828,8 @@ def cr_has_grants(policies: dict[str, str] | None, kind: str = AGENT_KIND) -> bo
 
 def enforcement_side_value() -> str | None:
     """The raw ``AIAC_ENFORCEMENT_SIDE`` value in the Controller's ConfigMap (``aiac-agent-config`` in
-    the Controller namespace), or ``None`` when the key is absent — so a switch can put back exactly
-    what was there. Read-only. Raises when the ConfigMap cannot be read."""
+    the Controller namespace), or ``None`` when the key is absent. Read-only. Raises when the ConfigMap
+    cannot be read."""
     out = kubectl("get", "configmap", AGENT_CONFIGMAP, "-n", CONTROLLER_NAMESPACE, "-o", "json", timeout=30)
     return (json.loads(out).get("data") or {}).get(ENFORCEMENT_SIDE_KEY)
 
@@ -1842,7 +1837,7 @@ def enforcement_side_value() -> str | None:
 def live_enforcement_side() -> str:
     """The live **enforcement side** (D16): ``AIAC_ENFORCEMENT_SIDE`` in the Controller's ConfigMap
     (``aiac-agent-config`` in the Controller namespace); an absent or empty key means the default,
-    ``target-side``. Read-only (only ``controller_enforcement_side`` changes the value). Raises on an
+    ``target-side``. Read-only (the harness never changes the value). Raises on an
     unknown value (the Controller does not start with one) or when the ConfigMap cannot be read."""
     side = (enforcement_side_value() or "").strip() or TARGET_SIDE
     if side not in SIDE_ENFORCEMENT_POINT:
@@ -1906,8 +1901,8 @@ def cr_matches_side(policies: dict[str, str] | None, kind: str, side: str) -> bo
 #       <namespace>__<name>.yaml          one full CR, without metadata.managedFields
 #
 # The phases: ``pre-run-slate`` (before the pre-run cleanup), ``teardown`` (the first teardown step),
-# ``pre-side-restore`` / ``pre-env-restore`` (before a Controller restore) and ``pre-cr-delete`` (rung 6,
-# before it deletes github-tool's CR by hand).
+# ``pre-env-restore`` (before a Controller restore) and ``pre-cr-delete`` (rung 6, before it deletes
+# github-tool's CR by hand).
 
 CAPTURE_INDEX_FILE = "index.yaml"
 
@@ -2081,8 +2076,8 @@ def capture_aiac_crs(phase: str, *, label: str | None = None, root: Path | None 
 
 
 # ======================================================================================
-# Failure path (rung 5), Controller restart (rung 6) and side switch (rung 7) — LLM-seam injection,
-# re-fired trigger, Controller rollouts, the enforcement-side switch, MCP session probe, pristine stack
+# Failure path (rung 5) and Controller restart (rung 6) — LLM-seam injection, re-fired trigger,
+# Controller rollouts, MCP session probe, pristine stack
 # ======================================================================================
 #
 # A failed onboarding does not converge to a live allow, so ``onboarded_stack`` (which polls for the
@@ -2091,8 +2086,7 @@ def capture_aiac_crs(phase: str, *, label: str | None = None, root: Path | None 
 # undone (``controller_llm_unusable``), a re-fire of the onboarding trigger for an existing client
 # (``publish_service_event``), and the read-only views above of the state a rollback + quarantine
 # leaves (the quarantine deletes the CR under both sides, D20). Every Controller rollout runs the
-# resync at start (D28) before the new pod is Ready; ``restart_controller`` is that rollout alone, and
-# ``controller_enforcement_side`` is a ConfigMap patch of the side + that rollout (rung 7).
+# resync at start (D28) before the new pod is Ready; ``restart_controller`` is that rollout.
 
 # The Controller pod selector (``app: aiac-agent`` in ``k8s/agent-deployment.yaml``) and the PRB's
 # endpoint env (``aiac.agent.llm.load_llm_settings`` reads the bare ``LLM_BASE_URL``).
@@ -2191,85 +2185,6 @@ def controller_env(overrides: dict[str, str]) -> Iterator[None]:
             else [{"op": "remove", "path": path}]
         )
         _wait_controller_rolled()
-
-
-def _set_enforcement_side_value(value: str | None) -> None:
-    """Set ``AIAC_ENFORCEMENT_SIDE`` in the Controller's ConfigMap to ``value``; ``None`` removes the
-    key (a JSON merge patch with ``null``). The running Controller does not see the change: it reads
-    the value from ``envFrom`` at pod start, so a restart must follow."""
-    kubectl(
-        "patch",
-        "configmap",
-        AGENT_CONFIGMAP,
-        "-n",
-        CONTROLLER_NAMESPACE,
-        "--type",
-        "merge",
-        "-p",
-        json.dumps({"data": {ENFORCEMENT_SIDE_KEY: value}}),
-        timeout=30,
-    )
-
-
-def _controller_env_pins_side() -> bool:
-    """True when the Controller container has an explicit ``AIAC_ENFORCEMENT_SIDE`` env entry. An
-    explicit entry wins over the ``envFrom`` ConfigMap, so a ConfigMap switch would not reach the
-    Controller."""
-    dep = json.loads(
-        kubectl("get", "deployment", CONTROLLER_DEPLOYMENT, "-n", CONTROLLER_NAMESPACE, "-o", "json", timeout=30)
-    )
-    return any(
-        env.get("name") == ENFORCEMENT_SIDE_KEY
-        for container in dep["spec"]["template"]["spec"]["containers"]
-        if container.get("name") == CONTROLLER_DEPLOYMENT
-        for env in container.get("env") or []
-    )
-
-
-class EnforcementSideRestoreError(RuntimeError):
-    """``controller_enforcement_side`` could not switch back: the patch that puts the start value back,
-    or the Controller restart after it, failed. Later rungs can then run under the other side, or with
-    no Controller. A distinct type, so a caller can tell it from a failure of the switch itself."""
-
-
-@contextmanager
-def controller_enforcement_side(side: str) -> Iterator[None]:
-    """Run the block under the enforcement side ``side`` (D16, D29): patch ``AIAC_ENFORCEMENT_SIDE`` in
-    the Controller's ConfigMap to ``side`` and restart the Controller. At start the new Controller runs
-    the resync (D28, ``PUT /policy`` with the full policy model of ``side``), which writes every AIAC CR
-    in the new side; the new pod is Ready only after that, so the resync has run when the block starts.
-
-    On every exit path — also when the restart of the switch or the block raises — capture the AIAC CRs
-    of ``side`` to the pytest host (``capture_aiac_crs``, phase ``pre-side-restore``), then put back the
-    exact start value (an absent key stays absent) and restart the Controller again, so its resync
-    writes every CR in the start side. A failure of that restore raises ``EnforcementSideRestoreError``. A
-    test-owned mutation of the running Controller, like ``controller_env``; never written into a
-    committed manifest."""
-    if side not in OTHER_SIDE:
-        raise ValueError(f"unknown enforcement side {side!r}; want {TARGET_SIDE!r} or {AGENT_SIDE!r}")
-    if _controller_env_pins_side():
-        raise RuntimeError(
-            f"deployment/{CONTROLLER_DEPLOYMENT} sets {ENFORCEMENT_SIDE_KEY} as an explicit container env, "
-            f"which wins over configmap/{AGENT_CONFIGMAP}; a ConfigMap switch would not reach the Controller"
-        )
-    original = enforcement_side_value()
-    try:
-        _set_enforcement_side_value(side)  # in the try: a patch that times out may still have been applied
-        restart_controller()
-        yield
-    finally:
-        # The switch back rewrites every AIAC CR in the start side: capture the CRs of ``side`` first.
-        capture_aiac_crs("pre-side-restore")
-        try:
-            _set_enforcement_side_value(original)
-            restart_controller()
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, RuntimeError) as exc:
-            detail = (getattr(exc, "stderr", "") or str(exc)).strip()[:300]
-            raise EnforcementSideRestoreError(
-                f"the switch back to {ENFORCEMENT_SIDE_KEY}={original!r} (None = no key, target-side) failed: "
-                f"{detail}. Check configmap/{AGENT_CONFIGMAP} and deployment/{CONTROLLER_DEPLOYMENT} in "
-                f"{CONTROLLER_NAMESPACE} before the next run."
-            ) from exc
 
 
 def controller_llm_unusable():

@@ -438,7 +438,7 @@ class TestPut:
         assert "error" in resp.json()
 
     def test_agent_side_keeps_the_agent_and_pass_through_crs_and_deletes_the_rest(self, api):
-        # A side change: github-tool still has its target-side CR. The PUT writes it again as a
+        # A CR of the other side: github-tool still has its target-side CR. The PUT writes it again as a
         # pass-through CR (spec.policies is atomic, so one write replaces both packages) and never
         # deletes it; only the CRs that are in no entry go.
         api.list_cluster_custom_object.return_value = _listing(

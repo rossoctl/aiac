@@ -31,8 +31,8 @@
 #                per-tool check); every outbound is a pass-through. A tool-call deny is an HTTP 403.
 #   agent-side   github-agent's outbound OPA decides it (the github-agent CR's outbound package);
 #                github-tool gets a pass-through CR. A tool-call deny is a JSON-RPC error frame.
-# The verdicts are the same under both sides. Switch the side with k8s/opa-kind-runbook.md
-# "Switch the enforcement side".
+# The verdicts are the same under both sides. The side is set at deploy time; to change it, do a
+# clean redeploy of AIAC (k8s/opa-kind-runbook.md "Set the enforcement side").
 #
 # step()/pass()/warn()/die() style matches k8s/opa-kind-verify.sh: fails loudly and specifically the
 # moment an observed result doesn't match, rather than continuing silently.

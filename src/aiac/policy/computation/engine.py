@@ -121,8 +121,8 @@ it under the PCE lock after the run succeeds. If the run fails, the client stays
 
 Resync, read model, bootstrap. ``resync()`` (D28) runs at every Controller start: one
 ``replace_policy`` (``PUT /policy``) with the full policy model of the side for the live managed
-services, then a quarantine of each disabled service that still has an SPM. A side change is a
-ConfigMap patch and a Controller restart, so the resync then writes every CR in the new side.
+services, then a quarantine of each disabled service that still has an SPM. The side is set at
+deploy time; a side change is a clean redeploy of AIAC, not a resync.
 ``policy_model_for(service_id)`` (D18) returns the policy model of the side with only that service's
 entry, or ``None``. ``bootstrap(service_id, service_type)`` (checkpoint B1) writes the focus tool's CR
 before UC-1 Provision, so that the discovery passes D20; it stores no SPM.
@@ -659,8 +659,7 @@ def resync() -> None:
 
     A service that has a stored SPM but is absent from the catalog (deleted, not decommissioned) is
     not in the model, so the PUT deletes its CR; its SPM stays (removing it is ``decommission``'s
-    job). The resync is also the path for a side change (a ConfigMap patch and a Controller restart:
-    the PUT writes every CR in the new side, so no mixed state stays), for a stale or missing CR,
+    job). The resync is also the path for a stale or missing CR,
     for a missed role-members event (the render uses the current holders), and for the upgrade from
     the per-agent CRs of an older release.
 

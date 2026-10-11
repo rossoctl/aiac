@@ -114,8 +114,9 @@ read and write source and read issues; a tester can read and write issues but ne
 
 Under **agent side** enforcement (`AIAC_ENFORCEMENT_SIDE=agent-side`), the same per-tool check is in
 `github-agent`'s outbound package instead (keyed by the exchange target
-`input.identity.service_id`), and `github-tool` gets a pass-through CR. To switch, see
-[`k8s/opa-kind-runbook.md` → Switch the enforcement side](../../../k8s/opa-kind-runbook.md#switch-the-enforcement-side).
+`input.identity.service_id`), and `github-tool` gets a pass-through CR. The side is set at deploy
+time; to change it, do a clean redeploy of AIAC (a live switch is not supported). See
+[`k8s/opa-kind-runbook.md` → Set the enforcement side](../../../k8s/opa-kind-runbook.md#set-the-enforcement-side).
 The driver reads the live side and checks the matching CR, so the steps below are the same under
 both sides; only where a tool call is decided changes.
 

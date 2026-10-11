@@ -30,7 +30,7 @@ agent and tool. The **enforcement side** selects where a tool call is checked.
 Under **target side** (the default), the tool's own inbound OPA checks it, and
 the outbound of every service is a pass-through. Under **agent side**, the
 agent's outbound OPA checks it, and the tool gets a pass-through CR. See
-[Switch the enforcement side](#switch-the-enforcement-side).
+[Set the enforcement side](#set-the-enforcement-side).
 
 To see OPA **enforce** a real policy for real users, run a use case on top of
 this setup. For example, the onboarding use case
@@ -248,10 +248,10 @@ Controller does not start again until `opa-kind-enable.sh` runs again.
 
 ---
 
-## Switch the enforcement side
+## Set the enforcement side
 
 AIAC writes the CRs of one **enforcement side** for every managed service (D16).
-The switch is `AIAC_ENFORCEMENT_SIDE` in the `aiac-agent-config` ConfigMap
+The setting is `AIAC_ENFORCEMENT_SIDE` in the `aiac-agent-config` ConfigMap
 (`aiac-system`): `target-side` (the default) or `agent-side` (D29). The
 Controller reads it at start. An unknown value stops the Controller.
 
@@ -263,33 +263,60 @@ Controller reads it at start. An unknown value stops the Controller.
 The packages are described in
 [`pdp-policy-writer-opa.md` → What each side renders](../docs/specs/components/pdp-policy-writer-opa.md#what-each-side-renders).
 
-To switch, patch the ConfigMap and restart the Controller:
-
-```bash
-kubectl patch configmap aiac-agent-config -n aiac-system --type merge \
-  -p '{"data":{"AIAC_ENFORCEMENT_SIDE":"agent-side"}}'    # or "target-side"
-kubectl rollout restart deployment/aiac-agent -n aiac-system
-kubectl rollout status deployment/aiac-agent -n aiac-system --timeout=300s
-```
-
-At start, the Controller checks the combiner (check #4, D30). Then it runs the
-resync under the PCE lock (D28): `PUT /policy` writes the CR of every live
-managed service (in the IdP catalog and not disabled) in the new side, and
-deletes each other AIAC CR.
-Then it quarantines each disabled service that still has an SPM. Onboardings
-wait for the resync. So no CR of the old side stays.
+**The side is set at deploy time. A live switch is not supported.** Do not
+patch the side on a running AIAC and restart the Controller. To change the
+side, do a clean redeploy of AIAC. A clean redeploy deletes the Policy Model
+Store and every AIAC CR, so no CR or stored SPM of the old side stays. After it,
+no service is managed: onboard each service again.
 
 > **Do not change the side by hand-editing the CRs.** A partial change is open.
 > For example, a pass-through outbound on `github-agent` and a pass-through
 > inbound on `github-tool` check nothing.
 
-Under agent side, the onboarding checks (D30) run for agents only, and check #2
-also needs `mcp-parser` and `opa` in the outbound pipeline. The overlay of
+The clean redeploy (Kind; `enable.sh` automates
+[`aiac-deployment-guide.md`](aiac-deployment-guide.md)):
+
+```bash
+SIDE=agent-side    # or target-side
+
+# 1. Delete every AIAC CR. The combiner (D20) then denies each managed pod
+#    until it is onboarded again.
+kubectl delete authorizationpolicy -A -l app.kubernetes.io/managed-by=aiac-pdp-policy-writer
+
+# 2. Delete AIAC: the aiac-system namespace, with the Policy Model Store PVC.
+demo/use-cases/onboarding/teardown.sh --aiac-only --yes
+
+# 3. Deploy AIAC again: the stack, then the broker. The Controller init
+#    container waits for the broker.
+set -a; . .env; set +a
+demo/use-cases/onboarding/enable.sh --stack-only
+demo/use-cases/onboarding/enable.sh --broker-only
+
+# 4. Set the side. `k8s/agent-deployment.yaml` sets `target-side`, so set the
+#    side after step 3. The store is empty, so the Controller start writes no CR.
+kubectl patch configmap aiac-agent-config -n aiac-system --type merge \
+  -p "{\"data\":{\"AIAC_ENFORCEMENT_SIDE\":\"${SIDE}\"}}"
+kubectl rollout restart deployment/aiac-agent -n aiac-system
+kubectl rollout status deployment/aiac-agent -n aiac-system --timeout=300s
+```
+
+At start, the Controller checks the combiner (check #4, D30). Under agent side,
+the onboarding checks (D30) run for agents only, and check #2 also needs
+`mcp-parser` and `opa` in the outbound pipeline. The overlay of
 [Enable](#enable) has them.
+
+Then onboard each service again. A service whose Keycloak client exists gets no
+new registration event, so start its onboarding by hand
+(`POST /apply/service/{uuid}` on the AIAC Agent), or deploy it again. The system
+tests onboard their own services, so they need no extra step.
 
 Check the result:
 
 ```bash
+# the live side
+kubectl get configmap aiac-agent-config -n aiac-system \
+  -o jsonpath='{.data.AIAC_ENFORCEMENT_SIDE}'
+
 # every AIAC CR (one per managed service)
 kubectl get authorizationpolicy -A -l app.kubernetes.io/managed-by=aiac-pdp-policy-writer
 
@@ -298,9 +325,6 @@ kubectl get authorizationpolicy -A -l app.kubernetes.io/managed-by=aiac-pdp-poli
 kubectl get authorizationpolicy github-tool -n team1 \
   -o jsonpath='{.spec.policies[?(@.path=="inbound/request.rego")].content}'
 ```
-
-The pods load the new bundles at their next poll (10 s min, up to 120 s). Until
-every pod has polled, a pod can still use the bundle of the old side.
 
 ---
 

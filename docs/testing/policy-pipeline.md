@@ -220,7 +220,7 @@ github-tool's** (D20) — each with both request packages:
 | **agent side** | inbound: rules, agent-level; outbound: rules (per-tool checks + the MCP session rule) | inbound and outbound: pass-through (a pass-through CR, D24) |
 
 The UC-1 ladder asserts these CR shapes, the D20 deny of a service with no CR, the quarantine, the
-resync, and the side switch ([uc1-onboarding-pipeline.md](uc1-onboarding-pipeline.md), rungs 5–7).
+and the resync ([uc1-onboarding-pipeline.md](uc1-onboarding-pipeline.md), rungs 5–6).
 This test asserts only the enforced decisions. This fixture is **ALLOW-only** (see
 *[Further Notes](#further-notes)*): the single `policy.md` carries only positive fine-grained grants and
 no exclusivity / prohibition prose, and the entity/role descriptions stay deny-neutral, so the
@@ -299,9 +299,10 @@ set -a; . .env; set +a
 #   test_outbound[source-read-test-user] — expected deny, plugin allowed
 ```
 
-The run uses the live side (default `target-side`). To run it under agent side, change the side
-first: a ConfigMap patch and a Controller restart. At start the Controller's resync moves every CR to
-the new side (D28). Restore the side afterwards the same way.
+The run uses the live side (default `target-side`). To run it under agent side, do a clean redeploy
+of AIAC with `agent-side` first (a live switch is not supported; see
+[`opa-kind-runbook.md` → Set the enforcement side](../../k8s/opa-kind-runbook.md#set-the-enforcement-side)).
+Do a clean redeploy with `target-side` afterwards to restore it.
 
 ```bash
 kubectl -n aiac-system patch configmap aiac-agent-config --type merge \

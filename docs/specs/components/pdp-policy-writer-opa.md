@@ -188,7 +188,6 @@ The writer renders the packages of the side that the policy-model tag names. Eve
 
 - **Target side.** Each callee checks the access to itself in its own inbound OPA, from its own CR. The render input is the stored SPM of the callee. The writer selects the tool inbound or the agent inbound from `service_type`. The outbound of every service, tools included, is a pass-through: the callee decides.
 - **Agent side.** The agent CR is the legacy rendering: the agent inbound and the agent outbound, from the APM. Each managed tool gets a pass-through CR, because a pod that has no CR is denied (D20), also on its outbound.
-- A side change replaces both packages of every CR in one write (`spec.policies` is atomic; see [the CR](#authorizationpolicy-custom-resource-q6)).
 
 ### Pass-through package (D24)
 
@@ -609,7 +608,7 @@ These limits concern the writer, the Rego and the bundle:
 - **Agent side — `agent_role_scopes` has no target key.** The outbound subject maps are per target (LIM-02, see [The policy model](#the-policy-model-anypolicymodel-d18a)): a grant or a deny of two different scopes with the same bare tool name stays on its own target, and a grant or a deny of a shared scope decides only on the copy that it names, as under target side. The informational map `agent_role_scopes` (not used by `allow`) is still agent role → bare tool names, so in the debugging output the same bare name on two tools looks like one tool.
 - **Target side — no egress check.** The outbound of every service is a pass-through. Only the callee decides, so a call to a host that has no AIAC CR (for example, an external API) is not checked.
 - **C1 — `DELETE /policy`** has no AIAC caller. Under D20 it denies every managed pod.
-- **The poll delay.** A CR change takes effect at the next poll of the OPA plugin (`polling_min_delay` 10 s, `polling_max_delay` 120 s). So a side change does not reach all pods at the same time: until every pod has polled, a pod can still use the bundle of the old side.
+- **The poll delay.** A CR change takes effect at the next poll of the OPA plugin (`polling_min_delay` 10 s, `polling_max_delay` 120 s). So a CR change does not reach all pods at the same time: until every pod has polled, a pod can still use its old bundle.
 - **503 before the first bundle.** Until the OPA plugin loads its first bundle, it answers every request with `503`.
 - **A shared ServiceAccount.** Pods that share a ServiceAccount share one CR and one bundle.
 - **UC-1 tool discovery — the self-discovery rule.** `analyze_tool` sends `tools/list` through the tool's AuthBridge inbound, with a discovery token minted as the tool's own client (see [uc1-service-onboarding.md → Tool discovery and the bootstrap CR](aiac-agent/uc1-service-onboarding.md#tool-discovery-and-the-bootstrap-cr)). The PCE `bootstrap` writes the tool's CR before Provision, so the changed combiner (D20) does not deny the call at the first onboarding. Under target side, the self-discovery rule of the tool inbound allows the four session methods for the tool's own client, never `tools/call`. Under agent side, the tool's pass-through CR allows the call. So a holder of the tool's client secret (Keycloak, the tool pod, AIAC) can open an MCP session with the tool and list its tools, but cannot call a tool. The bootstrap CR takes effect at the next poll of the tool's OPA plugin.

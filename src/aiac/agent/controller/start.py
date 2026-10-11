@@ -3,9 +3,8 @@
 1. **The enforcement side (D29):** the PCE ``enforcement_side()`` reads ``AIAC_ENFORCEMENT_SIDE``
    (``target-side``, the default, or ``agent-side``). An unknown value raises ``ValueError`` (it
    names the variable and the value). The side in use is logged at INFO. Every later PCE operation
-   reads the same env, so the Controller serves one side until it restarts; a side change is a
-   ConfigMap patch and a Controller restart, and the resync (step 3) then moves every CR to the new
-   side.
+   reads the same env, so the Controller serves one side. The side is set at deploy time: a live
+   switch is not supported, and a side change is a clean redeploy of AIAC.
 2. **Start check #4 (D30):** the global combiner denies a pod that has no client CR. The check reads
    the ``AuthorizationPolicy`` named ``default`` in the bundle-service namespace
    (``AIAC_BUNDLE_SERVICE_NAMESPACE``, default ``rossoctl-system``). Its ``inbound/request.rego``
