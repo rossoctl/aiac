@@ -6,23 +6,27 @@ Two halves, both live here so a single module import serves every launcher:
   until ready, run some work, tear them down. Used by ``test/unit/pdp/policy/generate_rego.py`` (the
   standalone Rego-dump launcher, which is *not* under ``test/system/`` and is out of scope for
   the live-cluster rework). ``Service`` / ``start_service`` / ``wait_until_ready`` /
-  ``running_services`` / ``terminate`` / ``print_rego_dir`` / ``resolve_output_dir`` exist for it.
+  ``running_services`` / ``terminate`` / ``resolve_output_dir`` exist for it.
 
 * **Live-cluster half** — drive a real rossoctl/Kind cluster with the AuthBridge OPA pipeline wired
   in (see ``k8s/opa-kind-runbook.md``). ``kubectl`` wrappers + ``port_forward`` + ``resolve_pod``
-  onboard through the in-cluster Controller; ``mint_token`` / ``jwt_claim`` / ``inbound_probe`` /
-  ``outbound_probe`` / ``outbound_session_probe`` send **real HTTP requests through AuthBridge** and
+  onboard through the in-cluster Controller; ``mint_token`` / ``exchange_token`` / ``jwt_claim`` /
+  ``inbound_probe`` / ``outbound_probe`` / ``outbound_session_probe`` send **real HTTP requests through
+  AuthBridge** (and, for ``exchange_token``, one RFC 8693 token exchange straight to Keycloak) and
   classify the **real OPA plugin's** allow/deny; ``poll_until`` waits for ``bundle-service`` to reflect a CR change; and the
-  skip gates (``require_env_or_skip`` / ``require_pipeline`` / ``verify_subject_mapper``) make the
-  suite skip cleanly — never false-pass — when the cluster is not wired.
+  skip gates (``require_env_or_skip`` / ``require_pipeline`` / ``verify_login_subject``) make the
+  suite skip cleanly — never false-pass — when the cluster is not wired. ``require_pipeline`` also
+  skips when the global combiner (the ``default`` ``AuthorizationPolicy`` in the bundle-service
+  namespace) still allows a pod that has no client CR (D20, ``combiner_reason``).
 
 The evaluator is now the deployed plugin, not a standalone OPA-CLI run over dumped ``.rego``: there is
 deliberately no ``opa`` binary dependency and no ``.rego``-dump oracle here anymore (handoff 08).
 
-It imports only the standard library and ``requests`` — never ``aiac`` — so a launcher may import
-it *before* setting the environment variables the aiac libraries read at import time. ``pytest`` is
-imported lazily inside the skip gates (only the live suite uses them, and only under pytest) so the
-module stays importable in the standalone launchers.
+At import time it imports only the standard library and ``requests`` — never ``aiac`` — so a
+launcher may import it *before* setting the environment variables the aiac libraries read at import
+time. ``pytest`` is imported lazily inside the skip gates (only the live suite uses them, and only
+under pytest) so the module stays importable in the standalone launchers; the combiner gate
+(``combiner_reason``) imports the rules of start check #4 the same way.
 """
 
 from __future__ import annotations
@@ -33,6 +37,7 @@ import logging
 import os
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -111,17 +116,30 @@ def start_service(service: Service, *, src: Path) -> subprocess.Popen:
     )
 
 
-def wait_until_ready(base_url: str, *, timeout: float = 30.0) -> None:
-    """Poll ``GET {base_url}/health`` until it returns 200, or raise after ``timeout`` seconds."""
+def wait_until_ready(base_url: str, *, timeout: float = 30.0, proc: subprocess.Popen | None = None) -> None:
+    """Poll ``GET {base_url}/health`` until it returns 200, or raise after ``timeout`` seconds.
+
+    With ``proc`` (the spawned service), raise with its exit code if it has exited: before each
+    poll, after the 200, and at the deadline -- a crash at startup, or a failed bind. This does not
+    prove that the 200 came from ``proc``: a process that took the port can answer before ``proc``
+    tries to bind (``running_services`` checks the port before the spawn for that case)."""
+
+    def _require_alive() -> None:
+        if proc is not None and (code := proc.poll()) is not None:
+            raise RuntimeError(f"service for {base_url} exited (code {code}) before it was ready")
+
     deadline = time.time() + timeout
     last_err: Exception | None = None
     while time.time() < deadline:
+        _require_alive()
         try:
             if requests.get(f"{base_url}/health", timeout=1).status_code == 200:
+                _require_alive()
                 return
         except requests.RequestException as exc:
             last_err = exc
         time.sleep(0.3)
+    _require_alive()
     raise RuntimeError(f"service not ready at {base_url} within {timeout}s ({last_err})")
 
 
@@ -132,31 +150,53 @@ def terminate(proc: subprocess.Popen) -> None:
         proc.wait(timeout=5)
     except subprocess.TimeoutExpired:
         proc.kill()
+        try:
+            proc.wait(timeout=5)  # the port is free only when the process is gone (require_port_free)
+        except subprocess.TimeoutExpired:
+            # Do not raise: running_services calls this in ``finally`` for each proc in turn.
+            log.warning("pid %d did not exit after SIGKILL; its port can stay in use", proc.pid)
+
+
+def require_port_free(service: Service) -> None:
+    """Raise if a process already listens on ``service``'s host and port.
+
+    ``wait_until_ready`` accepts any process that answers ``/health`` on the port, so without this
+    check a stale service (e.g. from an interrupted run) would serve this run in place of the new
+    one, which cannot bind and exits: its old state (a store DB, a Rego dir) mixes into this run."""
+    try:
+        socket.create_connection((service.host, service.port), timeout=0.5).close()  # any address family
+    except ConnectionRefusedError:
+        return  # nothing listens
+    except OSError as exc:  # a host that does not resolve, a filtered port: not known to be free
+        raise RuntimeError(f"cannot check {service.host}:{service.port} for {service.module_app}: {exc}") from exc
+    raise RuntimeError(
+        f"{service.host}:{service.port} is already in use (a stale {service.module_app} from an "
+        f"earlier run?) -- stop that process, then run again"
+    )
 
 
 @contextmanager
 def running_services(services: list[Service], *, src: Path, timeout: float = 30.0) -> Iterator[None]:
     """Spawn every service, poll each ``/health``, yield, then terminate them all in ``finally``.
 
-    Every spawned subprocess is torn down even if a later spawn or health poll fails.
+    Every port must be free before the spawn (``require_port_free``), so the process that answers
+    ``/health`` is the new one, not a stale one. Each spawned process must stay alive through its
+    health poll (``wait_until_ready``'s ``proc``), so a crash at startup fails at once with its
+    exit code. Not covered: another process that takes a port in the short time between the check
+    and the bind. Every spawned subprocess is torn down even if a later spawn or health poll fails.
     """
+    for service in services:
+        require_port_free(service)
     procs: list[subprocess.Popen] = []
     try:
         for service in services:
             procs.append(start_service(service, src=src))
-        for service in services:
-            wait_until_ready(service.base_url, timeout=timeout)
+        for service, proc in zip(services, procs):
+            wait_until_ready(service.base_url, timeout=timeout, proc=proc)
         yield
     finally:
         for proc in procs:
             terminate(proc)
-
-
-def print_rego_dir(output_dir: Path) -> None:
-    """Print the output directory and the ``.rego`` files it contains (the launcher's result)."""
-    print(f"Rego written to: {output_dir}")
-    for path in sorted(output_dir.glob("*.rego")):
-        print(f"  {path.name}")
 
 
 # ======================================================================================
@@ -351,8 +391,8 @@ def mint_token(
     """Mint a user access token via the OIDC password grant.
 
     Requires Direct Access Grants enabled on ``client_id`` and the user's password set; a token whose
-    ``sub`` is the username further needs the realm's ``username -> sub`` mapper (see
-    ``verify_subject_mapper``). Raises ``requests.HTTPError`` on a non-2xx token response so the caller
+    ``sub`` is the username further needs the client scope ``aiac-username-sub`` linked to
+    ``client_id`` (see ``verify_login_subject``). Raises ``requests.HTTPError`` on a non-2xx token response so the caller
     can turn a mint failure into a skip."""
     resp = requests.post(
         f"{keycloak_url.rstrip('/')}/realms/{realm}/protocol/openid-connect/token",
@@ -366,6 +406,78 @@ def mint_token(
         timeout=timeout,
     )
     resp.raise_for_status()
+    return resp.json()["access_token"]
+
+
+# RFC 8693 token exchange — the request AuthBridge's ``token-exchange`` plugin sends on the outbound leg.
+TOKEN_EXCHANGE_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:token-exchange"
+ACCESS_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:access_token"
+
+# The answer of Keycloak when it refuses the client authentication of a token request (RFC 6749 §5.2):
+# HTTP 400 or 401 with one of these OAuth ``error`` codes.
+CLIENT_AUTH_REFUSED_STATUSES = frozenset({400, 401})
+CLIENT_AUTH_REFUSED_ERRORS = frozenset({"invalid_client", "unauthorized_client"})
+
+
+class TokenExchangeError(RuntimeError):
+    """Keycloak did not answer a token exchange (``exchange_token``) with a token. Carries the HTTP
+    ``status``, the raw ``body`` and the OAuth ``error`` code (``None`` when the body is not an OAuth
+    error document), so that a caller can tell a refused client authentication
+    (``client_auth_refused``) from every other failure."""
+
+    def __init__(self, status: int, body: str, error: str | None) -> None:
+        self.status = status
+        self.body = body
+        self.error = error
+        super().__init__(f"token exchange failed: HTTP {status}, error={error!r}, body={body[:500]!r}")
+
+    @property
+    def client_auth_refused(self) -> bool:
+        """True when Keycloak refused the client authentication of the request (HTTP 400/401 with
+        ``invalid_client`` / ``unauthorized_client``), not the exchange itself."""
+        return self.status in CLIENT_AUTH_REFUSED_STATUSES and self.error in CLIENT_AUTH_REFUSED_ERRORS
+
+
+def exchange_token(
+    subject_token: str,
+    *,
+    keycloak_url: str,
+    realm: str,
+    client_id: str,
+    client_secret: str,
+    audience: str,
+    scope: str,
+    timeout: float = 30.0,
+) -> str:
+    """Exchange ``subject_token`` for an access token to ``audience`` (RFC 8693, the Keycloak standard
+    token exchange) as the client ``client_id``, and return the new access token.
+
+    The same request that AuthBridge's ``token-exchange`` plugin sends on the agent's outbound leg
+    (``audience`` + ``scope`` from the route, ``subject_token_type`` and ``requested_token_type`` =
+    access token). The client authenticates with ``client_secret`` (form data, like ``mint_token``),
+    as AuthBridge does with the ``client-secret`` identity that ``k8s/opa-kind-enable.sh`` sets. Raises ``TokenExchangeError`` on a non-2xx answer;
+    its ``client_auth_refused`` tells a refused client authentication from every other failure."""
+    resp = requests.post(
+        f"{keycloak_url.rstrip('/')}/realms/{realm}/protocol/openid-connect/token",
+        data={
+            "grant_type": TOKEN_EXCHANGE_GRANT_TYPE,
+            "subject_token": subject_token,
+            "subject_token_type": ACCESS_TOKEN_TYPE,
+            "requested_token_type": ACCESS_TOKEN_TYPE,
+            "audience": audience,
+            "scope": scope,
+            "client_id": client_id,
+            "client_secret": client_secret,
+        },
+        timeout=timeout,
+    )
+    if not (200 <= resp.status_code < 300):
+        try:
+            doc = resp.json()
+        except ValueError:
+            doc = None
+        error = doc.get("error") if isinstance(doc, dict) else None
+        raise TokenExchangeError(resp.status_code, resp.text, error if isinstance(error, str) else None)
     return resp.json()["access_token"]
 
 
@@ -467,7 +579,8 @@ def outbound_probe(
 
     Invokes a **bare** tool (``params.name = tool_name``,
     e.g. ``source-read``) instead of ``tools/list``, so AuthBridge's ``mcp-parser`` surfaces
-    ``input.mcp.params.name`` and OPA's per-tool outbound gate is actually exercised. The agent app
+    ``input.mcp.params.name`` and OPA's per-tool check is actually exercised (github-tool's inbound
+    under target side, the agent's outbound under agent side). The agent app
     container has ``HTTP_PROXY=127.0.0.1:8081`` (the forward proxy) and ``python3``; ``token-exchange``
     uses the carried ``dev-user`` bearer as the RFC 8693 subject token. It is a one-frame
     :func:`outbound_session_probe`. Any exec failure returns ``(None, <message>)`` -> ``"error"``."""
@@ -499,8 +612,9 @@ def outbound_session_probe(
 
     The forward proxy is ``127.0.0.1:8081``, the user bearer is the token-exchange subject token, and
     the request carries the MCP ``Accept`` header. The frames are sent as given, so a method that
-    carries no tool name reaches the outbound OPA session rule; :func:`outbound_probe` sends one
-    ``tools/call`` frame. Each frame's output starts
+    carries no tool name reaches the MCP session rule of the tool check (github-tool's inbound under
+    target side, the agent's outbound under agent side); :func:`outbound_probe` sends one ``tools/call``
+    frame. Each frame's output starts
     with an ``AB_MSG:<i>`` line and carries the ``AB_HTTP:<n>`` / ``AB_ERR:<msg>`` markers that
     ``_parse_curl_output`` reads. An exec failure returns ``(None, <message>)`` for every frame."""
     script = (
@@ -581,13 +695,38 @@ def inbound_outcome(code: int | None) -> str:
     return "error"
 
 
+def is_opa_violation(doc: object) -> bool:
+    """True when ``doc`` (a parsed rejection body, or the ``error.data`` of a JSON-RPC error frame)
+    names the OPA plugin: ``plugin == "opa"`` or ``error == "policy.forbidden"`` (cortex
+    ``pipeline.Violation.Render`` / ``httpx.MarshalMCPRejectionBody``)."""
+    return isinstance(doc, dict) and (doc.get("plugin") == "opa" or doc.get("error") == "policy.forbidden")
+
+
+def _json_or_none(body: str) -> object:
+    """``json.loads(body)``, or ``None`` when the body is not JSON."""
+    try:
+        return json.loads(body)
+    except (ValueError, TypeError):
+        return None
+
+
 def outbound_outcome(code: int | None, body: str) -> str:
     """Classify an outbound probe by **body** (``k8s/opa-kind-runbook.md`` "Reading a decision").
 
-    On an MCP-shaped request (a ``method`` + ``id``) AuthBridge's forward proxy renders **any**
-    rejection as a JSON-RPC error frame **at HTTP 200** (``writeMCPRejection`` — the MCP client sees a
-    single failed tool call, not a transport break), so the frame's ``error.data`` — not the HTTP
-    status — carries the reason. The reason decides the class:
+    A denied ``tools/call`` has one of two shapes, by the enforcement side:
+
+      * **Target side** — the agent's outbound is a pass-through, and the **callee's inbound** OPA
+        (github-tool's reverse proxy) decides. The reverse proxy renders a rejection with
+        ``httpx.WriteRejection``: **HTTP 403** and a plain JSON body
+        (``{"error": "policy.forbidden", "message": …, "plugin": "opa"}``). The agent's forward proxy
+        relays that response as it is. A 403 whose body names OPA -> ``"deny"``. A 403 with any other
+        body -> ``"error"``: it is not an OPA verdict, so it must not stand in for one.
+      * **Agent side** — the agent's **outbound** OPA decides. On an MCP-shaped request (a ``method``
+        + ``id``) AuthBridge's forward proxy renders **any** rejection as a JSON-RPC error frame **at
+        HTTP 200** (``writeMCPRejection`` — the MCP client sees a single failed tool call, not a
+        transport break), so the frame's ``error.data`` — not the HTTP status — carries the reason.
+
+    The reason of a JSON-RPC error frame at HTTP 200 decides the class:
 
       * **OPA** blocked it — ``error.data.plugin == "opa"`` / ``error.data.error == "policy.forbidden"``
         -> ``"deny"``. This is the real outbound authorization verdict: token-exchange succeeded and the
@@ -603,20 +742,19 @@ def outbound_outcome(code: int | None, body: str) -> str:
         ``agent -> tool`` call and token-exchange would short-circuit here anyway — so this frame is
         not an expected verdict on any rung; it always signals a fault worth surfacing.
 
-    So: a plain ``403`` (non-MCP-shaped rejection fallback) -> ``"deny"``; HTTP 200 with an OPA error
-    frame -> ``"deny"``; HTTP 200 with a token-exchange error frame -> ``"error"``; HTTP 200 with any
-    other body (a ``result`` frame, or a tool-level error that means the call was *allowed* through) ->
-    ``"allow"``; ``None`` or any other non-200/403 (a transport break, or a non-MCP token-exchange
-    ``503``) -> ``"error"``. Classify by the frame, never the transport status."""
+    So: a plain ``403`` whose body names OPA (the callee's inbound, target side; or the agent's own
+    non-MCP-shaped rejection fallback) -> ``"deny"``; any other ``403`` -> ``"error"``; HTTP 200 with an
+    OPA error frame -> ``"deny"``; HTTP 200 with a token-exchange error frame -> ``"error"``; HTTP 200
+    with any other body (a ``result`` frame, or a tool-level error that means the call was *allowed*
+    through) -> ``"allow"``; ``None`` or any other status (a transport break, a 401 from the callee's
+    ``jwt-validation``, a 503 before the first bundle loads, or a non-MCP token-exchange ``503``) ->
+    ``"error"``. Classify by the body, never the transport status alone."""
     if code is None:
         return "error"
+    doc = _json_or_none(body)
     if code == 403:
-        return "deny"
-    if code != 200:
-        return "error"
-    try:
-        doc = json.loads(body)
-    except (ValueError, TypeError):
+        return "deny" if is_opa_violation(doc) else "error"
+    if code != 200 or doc is None:
         return "error"
     err = doc.get("error") if isinstance(doc, dict) else None
     if isinstance(err, dict):
@@ -627,9 +765,41 @@ def outbound_outcome(code: int | None, body: str) -> str:
             if data.get("plugin") == "token-exchange" or data.get("error") == "upstream.token-exchange-failed":
                 return "error"
             # A real OPA verdict — token-exchange succeeded and the request reached the policy.
-            if data.get("plugin") == "opa" or data.get("error") == "policy.forbidden":
+            if is_opa_violation(data):
                 return "deny"
     return "allow"
+
+
+# Where the deny of a ``tools/call`` comes from (``deny_origin``): the callee's own inbound OPA
+# (github-tool's reverse proxy; target side) or the agent's outbound OPA (agent side).
+DENY_ORIGIN_TOOL_INBOUND = "tool-inbound"
+DENY_ORIGIN_AGENT_OUTBOUND = "agent-outbound"
+
+
+def deny_origin(code: int | None, body: str) -> str | None:
+    """Where the raw response ``(code, body)`` of a **denied** ``tools/call`` (sent through the agent's
+    forward proxy) comes from. **Pure** — decides from the response only.
+
+      * HTTP 403 with a plain JSON body that names OPA (no ``jsonrpc`` member) ->
+        ``DENY_ORIGIN_TOOL_INBOUND``: github-tool's reverse proxy rejected the call
+        (``httpx.WriteRejection``), and the agent's outbound let it through and relayed the response.
+      * HTTP 200 with a JSON-RPC error frame whose ``error.data`` names OPA ->
+        ``DENY_ORIGIN_AGENT_OUTBOUND``: the agent's forward proxy rejected the MCP-shaped request
+        (``httpx.WriteRejectionForRequest``).
+      * Anything else (an allow, a token-exchange refusal, a transport error) -> ``None``.
+
+    Only a request frame (``tools/call`` with an ``id``) has two distinct shapes. A notification gets a
+    plain 403 from either side, so this helper does not apply to it."""
+    doc = _json_or_none(body)
+    if not isinstance(doc, dict):
+        return None
+    if code == 403 and "jsonrpc" not in doc and is_opa_violation(doc):
+        return DENY_ORIGIN_TOOL_INBOUND
+    if code == 200:
+        err = doc.get("error")
+        if isinstance(err, dict) and is_opa_violation(err.get("data")):
+            return DENY_ORIGIN_AGENT_OUTBOUND
+    return None
 
 
 def poll_until(predicate: Callable[[], bool], *, timeout: float, interval: float = 5.0) -> bool:
@@ -679,11 +849,40 @@ def _kubectl_try(*args: str, timeout: float = 30.0) -> tuple[bool, str, str]:
         return False, "", "kubectl timed out"
 
 
+# The bundle-service namespace — home of ``bundle-service`` and of the global ``default``
+# ``AuthorizationPolicy`` (the combiner). Same env name and default as the Controller's start check #4.
+BUNDLE_SERVICE_NAMESPACE = os.environ.get("AIAC_BUNDLE_SERVICE_NAMESPACE", "rossoctl-system")
+
+
+def combiner_reason(default_cr: dict | None, *, namespace: str = BUNDLE_SERVICE_NAMESPACE) -> str | None:
+    """Return ``None`` when the global combiner denies a pod that has no client CR (D20), else a skip
+    reason. **Pure** — decides from the already-read ``default`` ``AuthorizationPolicy`` object
+    (``None`` when it is missing), like ``event_path_reason``.
+
+    The rules are those of the Controller's start check #4 (``combiner_problems`` in
+    ``aiac.agent.controller.start``): each ``client_ok`` rule of every entry of the two request
+    packages must be a rule of the AIAC combiner. ``k8s/opa-kind-enable.sh`` applies the changed
+    ``default`` CR; a ``helm upgrade`` of the operator puts the stock fallback lines back. The import
+    is in the function, so this module still imports no ``aiac`` at import time."""
+    from aiac.agent.controller.start import combiner_problems
+
+    fix = "run k8s/opa-kind-enable.sh to apply the changed combiner (D20; a helm upgrade of the operator reverts it)"
+    if not default_cr:
+        return f"the global combiner (AuthorizationPolicy 'default' in {namespace}) is missing — {fix}"
+    problems = combiner_problems(default_cr)
+    if problems:
+        return (
+            f"the global combiner in {namespace} can allow a pod that has no client CR ({'; '.join(problems)}) — {fix}"
+        )
+    return None
+
+
 def pipeline_unwired_reason(*, namespace: str, workloads: list[str]) -> str | None:
     """Return ``None`` when the live AuthBridge OPA pipeline is fully wired for ``namespace``, else a
     human-readable reason the suite should skip. Checks (cheap -> specific): ``kubectl`` present, the
-    ``AuthorizationPolicy`` CRD served, ``bundle-service`` Running, the ``opa`` plugin on **both** legs
-    of ``namespace``'s AuthBridge runtime config, and each ``workloads`` pod Running."""
+    ``AuthorizationPolicy`` CRD served, ``bundle-service`` Running, the global combiner changed (D20,
+    ``combiner_reason``), the ``opa`` plugin on **both** legs of ``namespace``'s AuthBridge runtime
+    config, and each ``workloads`` pod Running."""
     if shutil.which("kubectl") is None:
         return "kubectl not on PATH"
 
@@ -691,20 +890,32 @@ def pipeline_unwired_reason(*, namespace: str, workloads: list[str]) -> str | No
     if not ok:
         return f"AuthorizationPolicy CRD not served / cluster unreachable ({err or 'no output'})"
 
+    ns = BUNDLE_SERVICE_NAMESPACE
     ok, out, err = _kubectl_try(
         "get",
         "pods",
         "-n",
-        "rossoctl-system",
+        ns,
         "-l",
         "app=bundle-service",
         "-o",
         "jsonpath={.items[*].status.phase}",
     )
     if not ok:
-        return f"cannot query bundle-service in rossoctl-system ({err})"
+        return f"cannot query bundle-service in {ns} ({err})"
     if "Running" not in out:
-        return "bundle-service is not Running in rossoctl-system"
+        return f"bundle-service is not Running in {ns}"
+
+    ok, out, err = _kubectl_try("get", "authorizationpolicy", "default", "-n", ns, "-o", "json", "--ignore-not-found")
+    if not ok:
+        return f"cannot read the global combiner (AuthorizationPolicy 'default') in {ns} ({err})"
+    try:
+        default_cr = json.loads(out) if out.strip() else None
+    except ValueError:
+        return f"cannot parse the global combiner (AuthorizationPolicy 'default') in {ns}"
+    reason = combiner_reason(default_cr, namespace=ns)
+    if reason:
+        return reason
 
     ok, out, err = _kubectl_try(
         "get",
@@ -761,7 +972,7 @@ def event_path_reason(*, broker_phase: str, realm_config: dict) -> str | None:
 
     The event path is: deploy -> operator registers a Keycloak client -> Keycloak emits the admin
     event ``CLIENT_CREATED`` -> the AIAC SPI (``aiac-event-listener``) publishes on NATS -> the agent
-    consumer runs ``onboard_service``. All three facts must hold or the trigger never fires."""
+    consumer runs ``onboard_and_apply``. All three facts must hold or the trigger never fires."""
     if "Running" not in (broker_phase or ""):
         return f"NATS event broker not Running (phase={broker_phase!r})"
     if "aiac-event-listener" not in (realm_config.get("eventsListeners") or []):
@@ -814,16 +1025,20 @@ def require_event_path(*, admin, realm: str) -> None:
         )
 
 
-def verify_subject_mapper(
+def verify_login_subject(
     *, keycloak_url: str, realm: str, user: str, password: str, client_id: str = KEYCLOAK_CLIENT_ID
 ) -> str:
-    """Mint a token for ``user`` and ``pytest.skip`` unless its ``sub`` equals ``user``.
+    """Mint a login token for ``user`` through ``client_id``; ``pytest.skip`` when it cannot be minted,
+    and ``pytest.fail`` unless its ``sub`` equals ``user``.
 
-    The live loop keys OPA decisions on ``input.identity.subject`` (the token ``sub``), which equals
-    the username only when the realm carries the ``username -> sub`` mapper and Direct Access Grants
-    are enabled on ``client_id`` — a one-time Keycloak prerequisite the fixture does **not** provision
-    (``demo/use-cases/onboarding/demo.md`` realm fix-up). Skipping here (rather than failing every decision) keeps a mis-provisioned
-    realm from masquerading as a policy bug. Returns the minted token on success."""
+    The live loop keys OPA decisions on ``input.identity.subject`` (the token ``sub``). To mint the
+    token, Direct Access Grants must be enabled on ``client_id`` — a one-time Keycloak prerequisite the
+    fixture does **not** provision (``demo/use-cases/onboarding/demo.md`` realm fix-up), so a mint
+    failure is a skip. The ``sub`` = username comes from the client scope ``aiac-username-sub``, which
+    the IdP Configuration Service links as a default scope to the login client (``client_id``, by
+    default ``rossoctl``) at its startup and at each onboarding (D31). That is an AIAC step, not a prerequisite, so a wrong ``sub`` fails.
+    ``uc1_onboard.require_subject_scope`` checks the links again after each onboarding. Returns the
+    minted token on success."""
     import pytest
 
     try:
@@ -836,8 +1051,9 @@ def verify_subject_mapper(
         )
     sub = jwt_claim(token, "sub")
     if sub != user:
-        pytest.skip(
-            f"token 'sub' is {sub!r}, not {user!r} — the realm's username->sub protocol mapper is "
-            "missing (see the realm fix-up in demo/use-cases/onboarding/demo.md)."
+        pytest.fail(
+            f"login token 'sub' is {sub!r}, not {user!r} — the login client {client_id!r} does not link the "
+            "client scope 'aiac-username-sub' as a default scope (D31). The IdP Configuration Service "
+            "(aiac-pdp-config) makes this link at startup: check its log, or restart it once Keycloak is ready."
         )
     return token

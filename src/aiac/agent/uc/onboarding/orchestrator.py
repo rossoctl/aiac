@@ -1,30 +1,49 @@
 """Service Onboarding Orchestrator (UC1).
 
-The only use case with an Orchestrator, because it is a **two-stage** pipeline. Invoked by
-the Controller for the ``aiac.apply.service.{id}`` / ``POST /apply/service/{service_id}``
-trigger, it sequences the two sub-agents and returns ``(list[PolicyRule], override=False, client_id)``
-(``client_id`` is the service's clientId, which the Controller passes to the PCE as ``focus_service``):
+The only use case with an Orchestrator, because it is a **two-stage** pipeline. The Controller
+route (``POST /apply/service/{service_id}``) and the NATS consumer (``aiac.apply.service.{id}``)
+call only :func:`onboard_and_apply`. It calls the PCE ``compute_and_apply`` itself and returns
+``None``: the Controller gets nothing back. :func:`_onboard` sequences the two sub-agents and returns
+an :class:`_Onboarded` (``rules``, ``client_id``, ``bootstrapped``). ``client_id`` is the service's
+clientId, which :func:`onboard_and_apply` gives to the PCE as ``focus_service``:
 
+    0. The precondition checks (D30, see ``preconditions``) — run FIRST, after the one IdP read
+       that resolves the clientId (a ``404`` on that read is the event-before-commit race: it is read
+       again for a bounded time, see ``CLIENT_WAIT``): the pod has the AuthBridge sidecar (#1),
+       the namespace pipeline has ``opa`` (and ``mcp-parser`` for a tool) inbound, and under agent
+       side also ``mcp-parser`` and ``opa`` outbound (#2), no app container has an ``httpGet`` probe
+       (#6). The scope depends on the enforcement side: every service under target side, agents only
+       under agent side (a tool then gets a pass-through CR, which needs no check; its pod type is
+       still read). A failed check raises ``EnforcementPreconditionError``.
+       Then, for an enabled TOOL only, the PCE ``bootstrap`` writes the tool's first CR (under
+       target side its rules-based CR, under agent side a pass-through CR), so that discovery
+       (``tools/list`` through the tool's own inbound) passes D20 (checkpoint B1).
     1. Service Provision  — classifies the service and writes its roles/scopes into the IdP,
        producing the discovered ``service_type`` and the **created-manifest** (exactly the
        roles/scopes it created on this run — see ``provision_service``).
     2. Service Policy Builder — reads the excluded-self IdP universe and builds the rules.
 
-There is **no Apply stage** here: the Controller makes the single
-``compute_and_apply(rules, override=False)`` (PCE) call. UC1 is incremental, so ``override``
-is always ``False`` (append; existing roles keep their other access).
+:func:`onboard_and_apply` is the whole UC1 for the Controller route and the NATS consumer: it runs
+:func:`_onboard` (the build), then the single
+``compute_and_apply(rules, override=False, focus_service=client_id)`` (PCE) call,
+which re-enables the client under the PCE lock after the apply succeeds, all inside the per-service
+lock. UC1 is incremental, so ``override`` is always ``False`` (append; existing roles keep their
+other access).
 
 **Replay safety (at-least-once delivery):** Provision IdP writes are idempotent and the PCE
 reconcile is idempotent, so a crash between stages simply re-runs the full pipeline to
 convergence on NATS redelivery. A build **failure**, however, triggers a **compensating
 rollback** (UC1-only) and then the PCE ``quarantine`` before the error propagates — see
-:func:`_rollback` and :func:`onboard_service`. The PCE owns the PDP: this module never imports
-``aiac.pdp.policy.library``.
+:func:`_rollback` and :func:`_onboard`. A failed precondition check is **not** a build
+failure: nothing changed yet, so it runs no rollback, no client disable and no quarantine
+(checkpoint O2). The PCE owns the PDP: this module never imports ``aiac.pdp.policy.library``.
 """
 
 import contextlib
+import functools
 import logging
 import threading
+from typing import NamedTuple
 
 from fastapi import HTTPException
 
@@ -35,12 +54,15 @@ from aiac.agent.policy_rules_builder.graph import (
     UnparseableLLMResponseError,
 )
 from aiac.agent.uc.onboarding.policy_builder.builder import ServicePolicyBuilder
+from aiac.agent.uc.onboarding.preconditions import check_preconditions
 from aiac.agent.uc.onboarding.provision.graph import build_provision_graph
+from aiac.agent.uc.onboarding.provision.nodes import WaitConfig, poll_until_ready, split_client_name
 from aiac.agent.uc.onboarding.provision.state import OnboardingProvisionState, Trigger
-from aiac.idp.configuration.api import Configuration
-from aiac.idp.configuration.models import ClientId, Service, ServiceUuid
-from aiac.policy.computation import quarantine
+from aiac.idp.configuration.api import Configuration, IdPHTTPError
+from aiac.idp.configuration.models import ClientId, Role, Scope, Service, ServiceType, ServiceUuid
+from aiac.policy.computation import bootstrap, compute_and_apply, drop_bootstrap, quarantine
 from aiac.policy.model.models import PolicyRule
+from aiac.shared.logging_config import loggable
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +71,9 @@ logger = logging.getLogger(__name__)
 # ``LLMAccessError``, ``UnparseableLLMResponseError``) all leave a provisioned-but-unusable
 # service, so each rolls back what Provision created. Any other exception (e.g. an
 # ``HTTPException`` from IdP focus resolution) propagates untouched — no teardown.
+# ``EnforcementPreconditionError`` is deliberately NOT here (checkpoint O2): the checks run before
+# Provision, so nothing exists that needs compensation. A first onboarding then has no CR, so D20
+# denies the service (fail closed); an onboarded service keeps its policy.
 _ROLLBACK_ERRORS = (
     PolicyConflictError,
     PolicyRulesBuilderError,
@@ -57,10 +82,35 @@ _ROLLBACK_ERRORS = (
 )
 
 
+class ServiceNotVisibleError(HTTPException):
+    """The IdP still answers ``404`` for the service after the bounded wait on the first read (see
+    :func:`_read_service`). It is an ``HTTPException(502)``, so the HTTP route answers ``502`` as
+    before, and the consumer can tell it from the other retryable failures."""
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(502, detail)
+
+
+# Event-before-commit race tolerance for the first IdP read (D33 in docs/specs/PRD.md). The Keycloak
+# SPI listener runs inside the admin request, so the ``CLIENT_CREATED`` event (and the
+# ``aiac.apply.service.{id}`` message) can come BEFORE Keycloak commits the new client: the first
+# ``get_service`` then gets ``404``. A ``404`` on that read is therefore a transient not-visible state,
+# read again before we give up with a 502; without the wait, the next try is the NATS redelivery after
+# ACK_WAIT (600 s). The SPI fix (publish after the commit) removes the race; this wait is defense in
+# depth. The wait runs inside ``_service_lock``, and the NATS consumer handles one message at a time,
+# so it blocks the other onboardings: keep the default short (≈30 s, as the label wait). Tests set it
+# fast. A 404 cannot tell a not-yet-committed client from one that does not exist, so an unknown or
+# deleted UUID (a manual POST, a phantom event) also waits the whole budget before its 502 (a known
+# limit of D33). The consumer gives ``wait_for_client=False`` only on the redelivery after a
+# not-visible nak: the nak delay already gave the client time to become visible, so that redelivery
+# reads once and does not block the consumer again.
+CLIENT_WAIT = WaitConfig("ONBOARD_CLIENT_WAIT_ATTEMPTS", "ONBOARD_CLIENT_WAIT_BACKOFF", 15, 2.0)
+
+
 # --------------------------------------------------------------------------- #
 # Per-service_id serialization                                                 #
 # --------------------------------------------------------------------------- #
-# ``onboard_service`` runs the full provision → build → rollback lifecycle. Two
+# ``onboard_and_apply`` runs the full provision → build → rollback lifecycle, then the apply. Two
 # concurrent runs for the SAME ``service_id`` (an overlapping ``POST /apply/service/{id}``
 # and an ``aiac.apply.service.{id}`` NATS delivery, say) each snapshot the existing
 # role/scope names before creating, so both can record the same resolved entity in their
@@ -132,11 +182,44 @@ def _config() -> Configuration:
     return Configuration.for_default_realm()
 
 
-def _loggable(value: object) -> str:
-    """Neutralize a value for single-line logging: coerce to ``str`` and drop CR/LF so a
-    user-controlled ``service_id`` or entity name cannot forge or inject extra log lines
-    (mitigates CodeQL ``py/log-injection``)."""
-    return str(value).replace("\r", "").replace("\n", "")
+def _read_service(config: Configuration, service_id: ServiceUuid, wait: bool = True) -> Service:
+    """The first IdP read of ``_onboard``: ``get_service(service_id)``, tolerant of the
+    event-before-commit race (see ``CLIENT_WAIT``).
+
+    A ``404`` (``IdPHTTPError`` with ``status == 404``) means that the new client is not visible
+    yet (or that it does not exist: the two look the same, so an unknown UUID also waits the whole
+    budget): the read is polled again, up to ``ONBOARD_CLIENT_WAIT_ATTEMPTS`` reads with
+    ``ONBOARD_CLIENT_WAIT_BACKOFF`` seconds between them. A ``404`` of a sub-read of ``get_service``
+    (the service roles, or the composites of a role deleted during the read) is polled again too, on
+    purpose: it is a read race that the next read fixes (see the tests of the real library). A
+    client that is still not visible after the budget raises :class:`ServiceNotVisibleError` (a
+    ``502``). Any other error (a ``5xx`` after the library retries, another ``4xx``, a
+    ``RuntimeError``) is a real failure, never the race: it raises ``HTTPException(502)`` at once.
+    With ``wait=False`` the read is made one time: a ``404`` raises :class:`ServiceNotVisibleError`
+    at once."""
+    last_not_found: IdPHTTPError | None = None
+    reads = 0
+
+    def _probe():
+        nonlocal last_not_found, reads
+        reads += 1
+        try:
+            return config.get_service(service_id)
+        except Exception as e:
+            if isinstance(e, IdPHTTPError) and e.status == 404:
+                last_not_found = e
+                return None
+            # The same boundary as Provision's classify_service: an IdP outage or a bad request is
+            # a 502, not a raw error that the Controller turns into a 500.
+            raise HTTPException(502, f"IdP config unavailable resolving service {service_id!r}: {e}") from e
+
+    service = poll_until_ready(_probe, CLIENT_WAIT) if wait else _probe()
+    if service is None:
+        raise ServiceNotVisibleError(
+            f"IdP config unavailable resolving service {service_id!r}: the client is not visible after "
+            f"{reads} reads (ONBOARD_CLIENT_WAIT_*): {last_not_found}"
+        ) from last_not_found
+    return service
 
 
 def _rollback(config: Configuration, service: Service, created_roles, created_scopes) -> None:
@@ -154,13 +237,13 @@ def _rollback(config: Configuration, service: Service, created_roles, created_sc
     was not created by it. The
     policy side of the teardown is the PCE's :func:`~aiac.policy.computation.quarantine`, which
     the caller runs next."""
-    safe_id = _loggable(service.id)
+    safe_id = loggable(service.id)
     for role in created_roles:
         config.delete_service_role(service, role)
-        logger.info("UC1 rollback: deleted role %r (service %s)", _loggable(getattr(role, "name", role)), safe_id)
+        logger.info("UC1 rollback: deleted role %r (service %s)", loggable(getattr(role, "name", role)), safe_id)
     for scope in created_scopes:
         config.delete_service_scope(service, scope)
-        logger.info("UC1 rollback: deleted scope %r (service %s)", _loggable(getattr(scope, "name", scope)), safe_id)
+        logger.info("UC1 rollback: deleted scope %r (service %s)", loggable(getattr(scope, "name", scope)), safe_id)
     config.set_service_enabled(service, False)
     logger.info("UC1 rollback: disabled client — failed-service marker (service %s)", safe_id)
 
@@ -168,76 +251,172 @@ def _rollback(config: Configuration, service: Service, created_roles, created_sc
 def reenable_service(service_id: ServiceUuid) -> None:
     """Re-enable the Keycloak client (UC1-only, idempotent), clearing any prior failed-disable marker.
 
-    The **caller** (Controller route or NATS consumer) invokes this AFTER a successful
-    ``compute_and_apply`` (PCE) call — deliberately post-apply. Re-enabling only after the policy
+    :func:`onboard_and_apply` gives it to ``compute_and_apply`` as ``on_applied``, so the PCE calls
+    it under its lock AFTER a successful run — deliberately post-apply. Re-enabling only after the policy
     is applied means a PCE failure leaves the client **disabled** (the failed-service marker set by
     a prior :func:`_rollback` stays in place), so a client is never enabled with no applied policy.
 
-    ``set_service_enabled(service, True)`` is idempotent, so a redelivery that re-enables an
-    already-enabled client is a no-op."""
-    config = _config()
-    config.set_service_enabled(config.get_service(service_id), True)
+    ``set_service_enabled_by_id(service_id, True)`` is idempotent, so a redelivery that re-enables an
+    already-enabled client is a no-op. It makes one IdP call and reads no ``Service``: it runs under
+    the PCE lock, so every other PCE operation waits for it."""
+    _config().set_service_enabled_by_id(service_id, True)
 
 
-def onboard_service(service_id: ServiceUuid) -> tuple[list[PolicyRule], bool, ClientId]:
-    """Sequence Provision → Policy Builder and return ``(rules, override=False, client_id)``.
+def onboard_and_apply(service_id: ServiceUuid, *, wait_for_client: bool = True) -> None:
+    """The whole UC1 for the Controller route and the NATS consumer: :func:`_onboard` (the build), then
+    ``compute_and_apply(rules, override=False, focus_service=client_id)`` with :func:`reenable_service` as
+    its ``on_applied``, all inside the per-service lock (:func:`_service_lock`).
+
+    The PCE calls the re-enable under its lock, after the apply succeeds: no other PCE operation can
+    read the catalog between the lift of a quarantine and the re-enable, so none takes the service
+    out of the CRs of its roles. A ``compute_and_apply`` failure propagates and the client stays
+    disabled (the failed-service marker), never enabled-with-no-policy. The per-service lock covers
+    the apply and the re-enable too, so a concurrent run of the same service (an HTTP onboarding and
+    a NATS redelivery) cannot quarantine the service between this run's apply and its re-enable.
+    ``wait_for_client`` is given to the first IdP read (see :func:`_read_service`)."""
+    with _service_lock(service_id):
+        built = _onboard(service_id, wait_for_client)
+        try:
+            compute_and_apply(
+                built.rules,
+                override=False,
+                focus_service=built.client_id,
+                on_applied=functools.partial(reenable_service, service_id),
+            )
+        except Exception:
+            # Only a tool that this run bootstrapped has a bootstrap CR to drop.
+            if built.bootstrapped:
+                _drop_bootstrap(built.client_id)
+            raise
+
+
+def _drop_bootstrap(client_id: ClientId) -> None:
+    """After a failure that runs no quarantine: the PCE ``drop_bootstrap`` deletes the bootstrap CR
+    of a service that is not managed (no SPM), so an agent-side pass-through CR does not stay open.
+    A failure here is logged, and the caller re-raises the original error: the next delivery tries
+    again."""
+    try:
+        drop_bootstrap(client_id)
+    except Exception:
+        logger.exception("UC1: the drop of the bootstrap CR failed (service %s)", loggable(client_id))
+
+
+class _Onboarded(NamedTuple):
+    """The result of :func:`_onboard`, for the ``compute_and_apply`` call of :func:`onboard_and_apply`."""
+
+    rules: list[PolicyRule]
+    """The rules of the Policy Builder."""
+    client_id: ClientId
+    """The clientId of the service (``Service.serviceId``): the ``focus_service`` of the apply."""
+    bootstrapped: bool
+    """True when this run wrote the bootstrap CR of a tool. Only then does a failed apply drop that CR."""
+
+
+def _onboard(service_id: ServiceUuid, wait_for_client: bool) -> _Onboarded:
+    """Sequence the precondition checks → (tool) bootstrap → Provision → Policy Builder and return
+    an :class:`_Onboarded` (``rules``, ``client_id``, ``bootstrapped``).
 
     ``service_id`` is the Keycloak internal client UUID that the trigger carries. The Orchestrator
     reads the ``Service`` from the IdP **once**, before Provision, and resolves its clientId
-    (``Service.serviceId``) — the only service id the PCE takes. The caller passes the returned
-    ``client_id`` to ``compute_and_apply`` as ``focus_service``, so it makes no second IdP read. If
-    the read fails, nothing exists yet that needs compensation: it raises ``HTTPException(502)``
-    (as Provision's ``classify_service`` does) before Provision.
+    (``Service.serviceId``) — the only service id the PCE takes. :func:`onboard_and_apply` passes the
+    returned ``client_id`` to ``compute_and_apply`` as ``focus_service``, so it makes no second IdP
+    read. The
+    SPI event can come before Keycloak commits the new client, so a ``404`` on this read is polled
+    again for a bounded time (``ONBOARD_CLIENT_WAIT_*``, default ≈30 s, see :func:`_read_service`).
+    If the read fails, nothing exists yet that needs compensation: it raises ``HTTPException(502)``
+    (as Provision's ``classify_service`` does) before Provision — ``ServiceNotVisibleError`` when
+    the client is still not visible after the wait, at once for any other error.
+
+    Then the precondition checks (D30, :func:`~aiac.agent.uc.onboarding.preconditions.check_preconditions`)
+    run, before Provision and the PRB. They read the enforcement side: under target side they check
+    every service, under agent side agents only (a tool's pass-through CR needs no check, but the
+    checks still return its pod type). A failed check raises ``EnforcementPreconditionError``,
+    which names each failed check; nothing changed yet, so there is no rollback, no client disable
+    and no quarantine (checkpoint O2). If the service is a tool (the type of its pod label) and its
+    client is enabled, the PCE ``bootstrap(client_id, ServiceType.TOOL)`` writes the tool's first CR
+    before Provision (of the current side: rules-based under target side, a pass-through under
+    agent side), so that discovery passes (checkpoint B1). A disabled tool gets no bootstrap:
+    it fails at the discovery-token mint anyway (C5). A bootstrap failure propagates (no rollback:
+    Provision has not run). Any other failure of Provision or the build (no quarantine) drops this
+    run's bootstrap CR (:func:`_drop_bootstrap`) and propagates.
 
     On any of the four typed build failures (see ``_ROLLBACK_ERRORS``, for agents and tools, on the
     first failure — also the retryable ``LLMAccessError``) the Orchestrator runs the compensating
     :func:`_rollback` (delete this run's created roles/scopes; disable the client last), then the
     PCE's ``quarantine(client_id, created_roles)`` (delete the SPM, remove the service's roles —
-    including the created roles the rollback deleted — from the other SPMs,
-    replace an agent's CR with a no-rules CR, re-derive the affected agents), and **re-raises** the
-    original error unchanged. The disable comes before the quarantine, so no run after the teardown
-    sees the service as enabled. The quarantine runs even when the rollback raises, so a failed
-    rollback never leaves a first onboarding fail-open. A rollback or quarantine failure
+    including the created roles the rollback deleted — from the other SPMs, delete the service's
+    CR, deploy the affected services), and **re-raises** the original error unchanged. The disable
+    comes before the quarantine, so no run after the teardown sees the service as enabled. The
+    quarantine runs even when the rollback raises, so a failed rollback never leaves a first
+    onboarding fail-open. A rollback or quarantine failure
     propagates in place of the build error (the build error stays on its ``__context__``): the
     compensation failure is not in the consumer's permanent set, so NATS redelivers and the next
     run tries the compensation again. If the build error won, a permanent build error would
     ``term()`` the message and leave the half-compensated service fail-open. The
     quarantine is lifted only by a successful re-onboarding. On
-    success it does **not** re-enable the client here: the client is re-enabled by the caller via
-    :func:`reenable_service`, but only AFTER the caller's ``compute_and_apply`` (PCE) call succeeds,
-    so a PCE failure leaves the client disabled rather than enabled-with-no-policy.
+    success it does **not** re-enable the client here: :func:`onboard_and_apply` re-enables it, but
+    only AFTER its ``compute_and_apply`` (PCE) call succeeds, so a PCE failure leaves the client
+    disabled rather than enabled-with-no-policy.
 
-    The full provision → build → rollback lifecycle is serialized per ``service_id`` (see
+    The caller (:func:`onboard_and_apply`) holds the per-service lock: the full checks → provision →
+    build → rollback lifecycle, and the apply after it, is serialized per ``service_id`` (see
     :func:`_service_lock`): a concurrent same-service run cannot corrupt the created-manifest
     or roll back a shared entity, while different service_ids run concurrently. The registry
     entry is reference-counted and evicted once the last run using it exits (issue 202), on
     both the success and failure paths, without breaking serialization. This is an in-process
     lock (one agent replica only); cross-replica serialization is out of scope."""
-    with _service_lock(service_id):
-        config = _config()
-        try:
-            service = config.get_service(service_id)
-        except Exception as e:
-            # The same boundary as Provision's classify_service: an IdP outage or an unknown UUID
-            # is a 502, not a raw error that the Controller turns into a 500.
-            raise HTTPException(502, f"IdP config unavailable resolving service {service_id!r}: {e}") from e
-        client_id = ClientId(service.serviceId)
+    config = _config()
+    # A 404 is the event-before-commit race: read again for a bounded time (ServiceNotVisibleError
+    # after the budget). Any other error is a 502 at once.
+    service = _read_service(config, service_id, wait_for_client)
+    client_id = ClientId(service.serviceId)
 
-        provision = build_provision_graph().invoke(OnboardingProvisionState(trigger=Trigger(entity_id=service_id)))
-        service_type = provision["service_type"]
+    # D30: the precondition checks run FIRST, before anything changes. A failed check raises
+    # EnforcementPreconditionError, which is NOT a rollback error (checkpoint O2): nothing was
+    # provisioned, so there is no rollback, no client disable and no quarantine. Under agent
+    # side a tool gets no check, but its pod type is still returned (for the bootstrap below).
+    pod_type = check_preconditions(service)  # the type from the pod label (no catalog type yet)
+    # Checkpoint B1: the first CR of a tool, before Provision, so that discovery (tools/list
+    # through the tool's own inbound) passes D20. Only for an enabled client: a disabled
+    # (quarantined) tool fails at the discovery-token mint anyway (C5), and its bootstrap CR
+    # would stay stale until the next resync. Agents get no bootstrap.
+    bootstrapped = pod_type is ServiceType.TOOL and service.enabled
+    if bootstrapped:
+        bootstrap(client_id, ServiceType.TOOL)
+
+    # A failure that runs no quarantine (a 502 from Provision, any error of the build that is not a
+    # rollback error) must not leave the bootstrap CR: under agent side it is a pass-through CR,
+    # which allows every request, for a service that is not managed. The PCE drops it if the store
+    # has no SPM. A rollback error runs the quarantine, which deletes the CR, so it drops nothing.
+    # Set before the ``try``: a rollback error from Provision must not become an UnboundLocalError
+    # in the handler, which would hide the error and skip the quarantine.
+    created_roles: list[Role] = []
+    created_scopes: list[Scope] = []
+    try:
+        # The checks already read the pods and their type label: Provision does not read them again.
+        namespace, workload_name = split_client_name(service_id, service.name)
+        state = OnboardingProvisionState(
+            trigger=Trigger(entity_id=service_id),
+            namespace=namespace,
+            workload_name=workload_name,
+            service_type=pod_type,
+        )
+        provision = build_provision_graph().invoke(state)
         created_roles = provision["created_roles"]
         created_scopes = provision["created_scopes"]
-
+        rules = ServicePolicyBuilder.build(service_id, provision["service_type"])
+    except _ROLLBACK_ERRORS:
         try:
-            rules = ServicePolicyBuilder.build(service_id, service_type)
-        except _ROLLBACK_ERRORS:
-            try:
-                _rollback(config, service, created_roles, created_scopes)
-            finally:
-                # A failed rollback must not leave a first onboarding fail-open.
-                # Pass the created roles: the rollback deleted them from the IdP, so the quarantine
-                # cannot find them in the catalog, but their grants can be on other SPMs.
-                quarantine(client_id, created_roles)
-            raise
+            _rollback(config, service, created_roles, created_scopes)
+        finally:
+            # A failed rollback must not leave a first onboarding fail-open.
+            # Pass the created roles: the rollback deleted them from the IdP, so the quarantine
+            # cannot find them in the catalog, but their grants can be on other SPMs.
+            quarantine(client_id, created_roles)
+        raise
+    except Exception:
+        if bootstrapped:
+            _drop_bootstrap(client_id)
+        raise
 
-        return rules, False, client_id
+    return _Onboarded(rules, client_id, bootstrapped)

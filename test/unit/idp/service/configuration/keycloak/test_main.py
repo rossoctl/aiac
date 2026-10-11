@@ -6,7 +6,7 @@ import os
 from unittest.mock import MagicMock, patch
 
 from fastapi.testclient import TestClient
-from keycloak.exceptions import KeycloakError
+from keycloak.exceptions import KeycloakError, KeycloakGetError
 
 from aiac.idp.service.configuration.keycloak.main import _cache, app, get_admin
 
@@ -197,12 +197,27 @@ class TestListServiceRoles:
         assert role["kind"] == "Agent"
         assert role["actorIds"] == ["github-agent"]
 
-    def test_returns_502_on_keycloak_error(self):
+    def test_returns_502_on_other_keycloak_error(self):
+        # A Keycloak 404 gives 404 (see TestKeycloakNotFoundProduces404); any other error is a 502.
         admin = MagicMock()
-        admin.get_client_roles.side_effect = KeycloakError(error_message="not found", response_code=404)
+        admin.get_client_roles.side_effect = KeycloakError(error_message="backend failure", response_code=500)
         resp = _make_client(admin).get(f"/services/svc-uuid/roles?realm={REALM}")
         assert resp.status_code == 502
         assert "error" in resp.json()
+
+    def test_missing_service_account_contributes_no_realm_roles(self):
+        # A Keycloak 404 on the service-account lookup means "the client has no service account":
+        # the client roles are returned. It is not the 404 of a missing client.
+        admin = MagicMock()
+        admin.get_client.return_value = {"id": "svc-uuid", "clientId": "github-agent"}
+        admin.get_client_roles.return_value = [{"id": "cr1", "name": "invoke", "containerId": "svc-uuid"}]
+        admin.get_client_service_account_user.side_effect = KeycloakGetError(
+            error_message="Service account not enabled for the client", response_code=404
+        )
+        resp = _make_client(admin).get(f"/services/svc-uuid/roles?realm={REALM}")
+        assert resp.status_code == 200
+        assert [r["id"] for r in resp.json()] == ["cr1"]
+        admin.get_realm_roles_of_user.assert_not_called()
 
     def test_returns_empty_list_when_client_has_no_client_roles(self):
         admin = MagicMock()
@@ -210,6 +225,41 @@ class TestListServiceRoles:
         resp = _make_client(admin).get(f"/services/svc-uuid/roles?realm={REALM}")
         assert resp.status_code == 200
         assert resp.json() == []
+
+    # The realm roles of the service account (the provisioning path of the Configuration library).
+    # ``get_realm_roles_of_user`` gives stubs with no attributes, so the endpoint reads each full role
+    # to find the aiac.managed marker.
+    _MANAGED = {"id": "r-managed", "name": "github-agent.source_operations", "attributes": {"aiac.managed": ["true"]}}
+    _BUILTIN = {"id": "r-builtin", "name": "offline_access", "attributes": {}}
+
+    def _realm_admin(self, *, client_roles=(), stubs=()):
+        admin = MagicMock()
+        admin.get_client.return_value = {"id": "svc-uuid", "clientId": "team1/github-agent"}
+        admin.get_client_roles.return_value = [dict(r) for r in client_roles]
+        admin.get_client_service_account_user.return_value = {"id": "sa-uid"}
+        admin.get_realm_roles_of_user.return_value = [dict(s) for s in stubs]
+        full = {r["id"]: r for r in (self._MANAGED, self._BUILTIN)}
+        admin.get_realm_role_by_id.side_effect = lambda role_id: dict(full[role_id])
+        return admin
+
+    def test_aiac_managed_realm_role_of_the_service_account_is_an_agent_role_of_the_service(self):
+        stubs = [{"id": r["id"], "name": r["name"]} for r in (self._MANAGED, self._BUILTIN)]
+        admin = self._realm_admin(stubs=stubs)
+
+        resp = _make_client(admin).get(f"/services/svc-uuid/roles?realm={REALM}")
+
+        assert resp.status_code == 200
+        # The full role, as an agent role of this service (its clientId); the unmarked built-in is not listed.
+        assert resp.json() == [{**self._MANAGED, "kind": "Agent", "actorIds": ["team1/github-agent"]}]
+
+    def test_a_realm_role_that_is_also_a_client_role_of_the_service_is_listed_once(self):
+        client_role = {"id": "r-managed", "name": "github-agent.source_operations", "containerId": "svc-uuid"}
+        admin = self._realm_admin(client_roles=[client_role], stubs=[{"id": "r-managed", "name": "x"}])
+
+        resp = _make_client(admin).get(f"/services/svc-uuid/roles?realm={REALM}")
+
+        assert [r["id"] for r in resp.json()] == ["r-managed"]
+        admin.get_realm_role_by_id.assert_not_called()
 
     def teardown_method(self):
         app.dependency_overrides.clear()
@@ -260,8 +310,8 @@ class TestCrossKindEnforcement:
 
 class TestListServiceScopes:
     def test_returns_json_array_with_owner_service_id(self):
-        # Scope.serviceId = the owning client (the service exposing the scope), resolved to the
-        # client's serviceId (clientId) — the single owner for a per-service scope listing.
+        # Scope.serviceId = the owner of this copy: the listed service, resolved to its serviceId
+        # (clientId). A scope that more clients link is listed for each (see TestSharedScopes).
         admin = MagicMock()
         admin.get_client_default_client_scopes.return_value = [
             {"id": "sc1", "name": "profile"},
@@ -282,9 +332,12 @@ class TestListServiceScopes:
         _make_client(admin).get(f"/services/svc-uuid/scopes?realm={REALM}")
         admin.get_client_default_client_scopes.assert_called_once_with("svc-uuid")
 
-    def test_returns_502_on_keycloak_error(self):
+    def test_returns_502_on_other_keycloak_error(self):
+        # A Keycloak 404 gives 404 (see TestKeycloakNotFoundProduces404); any other error is a 502.
         admin = MagicMock()
-        admin.get_client_default_client_scopes.side_effect = KeycloakError(error_message="not found", response_code=404)
+        admin.get_client_default_client_scopes.side_effect = KeycloakError(
+            error_message="backend failure", response_code=500
+        )
         resp = _make_client(admin).get(f"/services/svc-uuid/scopes?realm={REALM}")
         assert resp.status_code == 502
         assert "error" in resp.json()
@@ -294,46 +347,82 @@ class TestListServiceScopes:
 
 
 # ---------------------------------------------------------------------------
-# Assumption 2 (single scope owner) — fail loud (handoff 02)
+# Shared scopes (D32): one copy for each owner; delete at the last owner
 # ---------------------------------------------------------------------------
 
 
-class TestSingleScopeOwnerEnforcement:
-    _MANAGED = {"id": "aud-1", "name": "svc-a-aud", "attributes": {"aiac.managed": "true"}}
+class _FakeDefaultScopesAdmin:
+    """A small stateful stand-in for the Keycloak default-scope reads and writes, in the live shape:
+    each item of ``get_client_default_client_scopes`` has only ``id`` and ``name`` (Keycloak never
+    returns ``attributes`` there; live check on realm ``rossoctl``, 2026-10-06). ``links`` maps a
+    client UUID to the scope ids it links as default scopes; an unmap changes it, so a later read
+    sees the state after the unmap."""
 
-    def test_aiac_managed_scope_with_multiple_owners_returns_409(self):
-        # An AIAC-managed client scope must have exactly one owning client; if more than one
-        # client exposes it as a default scope, a single Scope.serviceId cannot represent it.
-        admin = MagicMock()
-        admin.get_client_default_client_scopes.return_value = [self._MANAGED]
-        admin.get_client.return_value = {"id": "svc-a", "clientId": "svc-a"}
-        admin.get_clients.return_value = [{"id": "svc-a"}, {"id": "svc-b"}]
-        resp = _make_client(admin).get(f"/services/svc-a/scopes?realm={REALM}")
-        assert resp.status_code == 409
-        assert "error" in resp.json()
+    _NAMES = {"sc-shared": "github-tool.source-read", "sc-own": "github-tool.issue-read", "sc-profile": "profile"}
 
-    def test_aiac_managed_scope_with_single_owner_is_ok(self):
-        admin = MagicMock()
-        admin.get_client.return_value = {"id": "svc-a", "clientId": "svc-a"}
-        admin.get_clients.return_value = [{"id": "svc-a"}, {"id": "svc-b"}]
+    def __init__(self, links: dict[str, list[str]]):
+        self.client_ids = {"uuid-1": "team1/github-tool", "uuid-2": "team2/github-tool"}
+        self.links = {uuid: list(scope_ids) for uuid, scope_ids in links.items()}
+        self.deleted: list[str] = []
 
-        def _defaults(client_id):
-            return [self._MANAGED] if client_id == "svc-a" else []
+    def get_clients(self):
+        return [{"id": uuid, "clientId": client_id} for uuid, client_id in self.client_ids.items()]
 
-        admin.get_client_default_client_scopes.side_effect = _defaults
-        resp = _make_client(admin).get(f"/services/svc-a/scopes?realm={REALM}")
-        assert resp.status_code == 200
-        assert resp.json()[0]["serviceId"] == "svc-a"
+    def get_client(self, uuid):
+        return {"id": uuid, "clientId": self.client_ids[uuid]}
 
-    def test_non_managed_scope_skips_owner_scan(self):
-        # Built-in / non-AIAC scopes are not subject to the single-owner invariant (Keycloak
-        # ships them assigned to many clients) — no cross-client scan runs for them.
-        admin = MagicMock()
-        admin.get_client_default_client_scopes.return_value = [{"id": "sc1", "name": "profile"}]
-        admin.get_client.return_value = {"id": "svc-a", "clientId": "svc-a"}
-        resp = _make_client(admin).get(f"/services/svc-a/scopes?realm={REALM}")
-        assert resp.status_code == 200
+    def get_client_default_client_scopes(self, uuid):
+        return [{"id": scope_id, "name": self._NAMES[scope_id]} for scope_id in self.links.get(uuid, [])]
+
+    def delete_client_default_client_scope(self, uuid, scope_id):
+        self.links[uuid].remove(scope_id)
+
+    def delete_client_scope(self, scope_id):
+        self.deleted.append(scope_id)
+
+
+class TestSharedScopes:
+    _BOTH = {"uuid-1": ["sc-profile", "sc-shared"], "uuid-2": ["sc-shared", "sc-own"]}
+
+    def test_scope_that_two_clients_link_is_listed_for_each_with_its_client_id(self):
+        # A shared scope is valid (D32). Each client's listing gives its own copy, with that client's
+        # clientId as serviceId, so each copy routes to its owner's SPM. No owner scan, no 409.
+        admin = MagicMock(wraps=_FakeDefaultScopesAdmin(self._BOTH))
+        client = _make_client(admin)
+        team1 = client.get(f"/services/uuid-1/scopes?realm={REALM}")
+        team2 = client.get(f"/services/uuid-2/scopes?realm={REALM}")
+        assert team1.status_code == 200 and team2.status_code == 200
+        assert team1.json() == [
+            {"id": "sc-profile", "name": "profile", "serviceId": "team1/github-tool"},
+            {"id": "sc-shared", "name": "github-tool.source-read", "serviceId": "team1/github-tool"},
+        ]
+        assert team2.json() == [
+            {"id": "sc-shared", "name": "github-tool.source-read", "serviceId": "team2/github-tool"},
+            {"id": "sc-own", "name": "github-tool.issue-read", "serviceId": "team2/github-tool"},
+        ]
         admin.get_clients.assert_not_called()
+
+    def test_delete_keeps_a_scope_that_another_client_links(self):
+        fake = _FakeDefaultScopesAdmin(self._BOTH)
+        resp = _make_client(fake).delete(f"/services/uuid-1/scopes/sc-shared?realm={REALM}")
+        assert resp.status_code == 200
+        assert fake.links == {"uuid-1": ["sc-profile"], "uuid-2": ["sc-shared", "sc-own"]}  # unmapped here only
+        assert fake.deleted == []
+
+    def test_delete_removes_a_scope_that_no_other_client_links(self):
+        fake = _FakeDefaultScopesAdmin(self._BOTH)
+        resp = _make_client(fake).delete(f"/services/uuid-2/scopes/sc-own?realm={REALM}")
+        assert resp.status_code == 200
+        assert fake.links == {"uuid-1": ["sc-profile", "sc-shared"], "uuid-2": ["sc-shared"]}
+        assert fake.deleted == ["sc-own"]
+
+    def test_delete_at_the_last_owner_removes_the_shared_scope(self):
+        fake = _FakeDefaultScopesAdmin(self._BOTH)
+        client = _make_client(fake)
+        client.delete(f"/services/uuid-1/scopes/sc-shared?realm={REALM}")
+        assert fake.deleted == []
+        client.delete(f"/services/uuid-2/scopes/sc-shared?realm={REALM}")
+        assert fake.deleted == ["sc-shared"]
 
     def teardown_method(self):
         app.dependency_overrides.clear()
@@ -352,6 +441,14 @@ class TestGetRoleComposites:
         assert resp.status_code == 200
         assert resp.json() == [{"id": "r2", "name": "viewer"}]
         admin.get_composite_realm_roles_of_role.assert_called_once_with(role_name="admin")
+
+    def test_a_role_name_with_a_slash_reaches_the_route(self):
+        # The library sends "%2F"; the server decodes it before routing.
+        admin = MagicMock()
+        admin.get_composite_realm_roles_of_role.return_value = []
+        resp = _make_client(admin).get(f"/roles/team%2Fa%3Fb/composites?realm={REALM}")
+        assert resp.status_code == 200
+        admin.get_composite_realm_roles_of_role.assert_called_once_with(role_name="team/a?b")
 
 
 # ---------------------------------------------------------------------------
@@ -529,9 +626,10 @@ class TestGetService:
         assert resp.json()["id"] == "svc-uuid"
         admin.get_client.assert_called_once_with("svc-uuid")
 
-    def test_returns_502_on_keycloak_error(self):
+    def test_returns_502_on_other_keycloak_error(self):
+        # A Keycloak 404 gives 404 (see TestKeycloakNotFoundProduces404); any other error is a 502.
         admin = MagicMock()
-        admin.get_client.side_effect = KeycloakError(error_message="not found", response_code=404)
+        admin.get_client.side_effect = KeycloakError(error_message="backend failure", response_code=500)
         resp = _make_client(admin).get(f"/services/svc-uuid?realm={REALM}")
         assert resp.status_code == 502
         assert "error" in resp.json()
@@ -622,10 +720,11 @@ class TestMintDiscoveryToken:
         assert resp.status_code == 502
         assert "iss" in resp.json()["error"]
 
-    def test_502_on_keycloak_error(self, monkeypatch):
+    def test_502_on_other_keycloak_error(self, monkeypatch):
+        # A Keycloak 404 gives 404 (see TestKeycloakNotFoundProduces404); any other error is a 502.
         monkeypatch.setenv("KEYCLOAK_URL", "http://kc-internal:8080")
         admin = MagicMock()
-        admin.get_client.side_effect = KeycloakError(error_message="not found", response_code=404)
+        admin.get_client.side_effect = KeycloakError(error_message="backend failure", response_code=500)
         resp = _make_client(admin).get(f"/services/svc-uuid/discovery-token?realm={REALM}")
         assert resp.status_code == 502
         assert "error" in resp.json()
@@ -845,6 +944,690 @@ class TestAssignScopeToService:
         resp = _make_client(admin).post(f"/services/svc-uuid/scopes/scope-id?realm={REALM}")
         assert resp.status_code == 502
         assert "error" in resp.json()
+
+    def teardown_method(self):
+        app.dependency_overrides.clear()
+
+
+# ---------------------------------------------------------------------------
+# POST /services/{service_id}/subject-scope (D31: sub = username on every leg)
+# ---------------------------------------------------------------------------
+
+_SUBJECT_SCOPE_ID = "subj-id"
+
+# The exact Keycloak representations the D31 contract fixes for the shared subject scope and its
+# mapper. The scope carries NO aiac.managed marker (it is linked to many clients).
+_SUBJECT_SCOPE_PAYLOAD = {
+    "name": "aiac-username-sub",
+    "description": "AIAC subject scope (D31): sets the token sub to the username",
+    "protocol": "openid-connect",
+    "attributes": {"include.in.token.scope": "false", "display.on.consent.screen": "false"},
+}
+_SUBJECT_MAPPER_PAYLOAD = {
+    "name": "username-to-sub",
+    "protocol": "openid-connect",
+    "protocolMapper": "oidc-usermodel-property-mapper",
+    "config": {
+        "user.attribute": "username",
+        "claim.name": "sub",
+        "jsonType.label": "String",
+        "access.token.claim": "true",
+        "id.token.claim": "true",
+        "userinfo.token.claim": "true",
+        "introspection.token.claim": "true",
+    },
+}
+
+# The correct mapper as Keycloak returns it: the representation plus its id.
+_SUBJECT_MAPPER_EXISTING = {**_SUBJECT_MAPPER_PAYLOAD, "id": "m1"}
+
+# Admin calls whose first argument is a Keycloak client id (the link side of the endpoint).
+_CLIENT_SCOPED_CALLS = {
+    "get_client_optional_client_scopes",
+    "delete_client_optional_client_scope",
+    "add_client_default_client_scope",
+    "add_client_optional_client_scope",
+    "delete_client_default_client_scope",
+    "get_client_default_client_scopes",
+    "update_client",
+}
+
+
+class _FakeSubjectScopeAdmin:
+    """A small stateful stand-in for the Keycloak admin API, so a test can call the endpoint more
+    than once and assert the converged state. It models the Keycloak behaviours the endpoint
+    relies on: a duplicate scope or mapper name is a 409, a client-scope link is skipped
+    with no error when the scope is already linked to that client as default OR optional, and a
+    mapper update (PUT) of an unknown mapper id is a 404 and replaces the type and the full config.
+    Each mapper write is recorded in ``mapper_writes``. ``clients`` maps the clientId of each
+    login client in the realm to its internal UUID (no login client by default)."""
+
+    def __init__(self, clients: dict[str, str] | None = None):
+        self.clients: dict[str, str] = dict(clients or {})  # clientId -> internal client UUID
+        self.scopes: dict[str, dict] = {}
+        self.mappers: dict[str, list[dict]] = {}
+        self.default_links: dict[str, list[str]] = {}
+        self.optional_links: dict[str, list[str]] = {}
+        self.mapper_writes: list[str] = []
+        self._next_mapper = 0
+
+    def get_client_id(self, client_id):
+        return self.clients.get(client_id)
+
+    def get_client_scopes(self):
+        return [dict(s) for s in self.scopes.values()]
+
+    def create_client_scope(self, payload):
+        if any(s["name"] == payload["name"] for s in self.scopes.values()):
+            raise KeycloakError(error_message="Conflict", response_code=409)
+        scope_id = f"scope-{len(self.scopes) + 1}"
+        self.scopes[scope_id] = {**json.loads(json.dumps(payload)), "id": scope_id}
+        self.mappers[scope_id] = []
+        return scope_id
+
+    def get_client_scope(self, scope_id):
+        return {**self.scopes[scope_id], "protocolMappers": list(self.mappers[scope_id])}
+
+    def get_mappers_from_client_scope(self, scope_id):
+        return list(self.mappers[scope_id])
+
+    def add_mapper_to_client_scope(self, scope_id, payload):
+        if any(m["name"] == payload["name"] for m in self.mappers[scope_id]):
+            raise KeycloakError(error_message="Conflict", response_code=409)
+        self.mapper_writes.append("add")
+        self._next_mapper += 1
+        self.mappers[scope_id].append({**json.loads(json.dumps(payload)), "id": f"mapper-{self._next_mapper}"})
+
+    def _mapper(self, scope_id, mapper_id):
+        mapper = next((m for m in self.mappers[scope_id] if m["id"] == mapper_id), None)
+        if mapper is None:
+            raise KeycloakError(error_message="Model not found", response_code=404)
+        return mapper
+
+    def update_mapper_in_client_scope(self, scope_id, mapper_id, payload):
+        mapper = self._mapper(scope_id, mapper_id)
+        if payload.get("id") != mapper_id:  # Keycloak 26.0 reads the mapper id from the payload
+            raise KeycloakError(error_message="mapping with id None does not exist", response_code=500)
+        self.mapper_writes.append("update")
+        mapper["protocolMapper"] = payload["protocolMapper"]
+        mapper["config"] = dict(payload["config"])  # Keycloak replaces the full config map
+
+    def delete_mapper_from_client_scope(self, scope_id, mapper_id):
+        self.mappers[scope_id].remove(self._mapper(scope_id, mapper_id))
+        self.mapper_writes.append("delete")
+
+    def get_client_optional_client_scopes(self, client_id):
+        return [self.scopes[sid] for sid in self.optional_links.get(client_id, [])]
+
+    def delete_client_optional_client_scope(self, client_id, scope_id):
+        self.optional_links[client_id].remove(scope_id)
+
+    def add_client_default_client_scope(self, client_id, scope_id, payload):
+        linked = self.default_links.get(client_id, []) + self.optional_links.get(client_id, [])
+        if scope_id not in linked:  # Keycloak skips an existing link with no error
+            self.default_links.setdefault(client_id, []).append(scope_id)
+
+
+class TestLinkSubjectScope:
+    _URL = f"/services/svc-uuid/subject-scope?realm={REALM}"
+
+    def _wire(self, admin, *, existing=None, mappers=(), optional=(), login_clients=None):
+        # Realm scopes: a built-in plus (optionally) an existing subject scope.
+        realm_scopes = [{"id": "sc-profile", "name": "profile"}]
+        if existing is not None:
+            realm_scopes.append(existing)
+        admin.get_client_scopes.return_value = realm_scopes
+        admin.create_client_scope.return_value = _SUBJECT_SCOPE_ID
+        admin.get_client_scope.return_value = {**_SUBJECT_SCOPE_PAYLOAD, "id": _SUBJECT_SCOPE_ID}
+        admin.get_mappers_from_client_scope.return_value = list(mappers)
+        admin.get_client_optional_client_scopes.return_value = list(optional)
+        # No login client by default: these tests are about the service link.
+        admin.get_client_id.side_effect = (login_clients or {}).get
+
+    @staticmethod
+    def _existing(attributes=None):
+        attrs = attributes if attributes is not None else dict(_SUBJECT_SCOPE_PAYLOAD["attributes"])
+        return {**_SUBJECT_SCOPE_PAYLOAD, "id": _SUBJECT_SCOPE_ID, "attributes": attrs}
+
+    def test_absent_scope_is_created_without_marker(self):
+        # The scope is created with its own, narrow payload — never through POST /scopes, which
+        # always stamps aiac.managed (a marked subject scope would become an own scope of each linked service).
+        admin = MagicMock()
+        self._wire(admin)
+        resp = _make_client(admin).post(self._URL)
+        assert resp.status_code == 200
+        admin.create_client_scope.assert_called_once()
+        payload = admin.create_client_scope.call_args[0][0]
+        assert payload["name"] == "aiac-username-sub"
+        assert payload["protocol"] == "openid-connect"
+        assert payload["attributes"]["include.in.token.scope"] == "false"
+        assert "aiac.managed" not in payload["attributes"]
+        assert payload == _SUBJECT_SCOPE_PAYLOAD
+
+    def test_create_does_not_use_skip_exists(self):
+        # python-keycloak 7.x fails on the missing Location header when skip_exists=True gets a 409,
+        # so the endpoint handles the 409 itself.
+        admin = MagicMock()
+        self._wire(admin)
+        _make_client(admin).post(self._URL)
+        assert "skip_exists" not in admin.create_client_scope.call_args.kwargs
+
+    def test_adds_username_to_sub_mapper_with_exact_config(self):
+        admin = MagicMock()
+        self._wire(admin)
+        _make_client(admin).post(self._URL)
+        admin.get_mappers_from_client_scope.assert_called_once_with(_SUBJECT_SCOPE_ID)
+        admin.add_mapper_to_client_scope.assert_called_once_with(_SUBJECT_SCOPE_ID, _SUBJECT_MAPPER_PAYLOAD)
+
+    def test_existing_scope_with_mapper_is_noop(self):
+        # Idempotent: the scope and its mapper exist, so nothing is created or added again.
+        admin = MagicMock()
+        self._wire(admin, existing=self._existing(), mappers=[_SUBJECT_MAPPER_EXISTING])
+        resp = _make_client(admin).post(self._URL)
+        assert resp.status_code == 200
+        admin.create_client_scope.assert_not_called()
+        admin.add_mapper_to_client_scope.assert_not_called()
+        admin.update_mapper_in_client_scope.assert_not_called()
+        admin.delete_mapper_from_client_scope.assert_not_called()
+
+    def test_existing_scope_without_mapper_gets_the_mapper(self):
+        # Self-healing: someone deleted the mapper, so the next onboarding adds it again.
+        admin = MagicMock()
+        self._wire(admin, existing=self._existing(), mappers=[{"id": "m9", "name": "other-mapper"}])
+        resp = _make_client(admin).post(self._URL)
+        assert resp.status_code == 200
+        admin.create_client_scope.assert_not_called()
+        admin.add_mapper_to_client_scope.assert_called_once_with(_SUBJECT_SCOPE_ID, _SUBJECT_MAPPER_PAYLOAD)
+
+    def test_existing_scope_without_attributes_is_accepted(self):
+        # An unmarked scope with no attributes map at all is not an invariant breach.
+        admin = MagicMock()
+        existing = {"id": _SUBJECT_SCOPE_ID, "name": "aiac-username-sub"}
+        self._wire(admin, existing=existing, mappers=[_SUBJECT_MAPPER_EXISTING])
+        resp = _make_client(admin).post(self._URL)
+        assert resp.status_code == 200
+        admin.add_client_default_client_scope.assert_called_once_with("svc-uuid", _SUBJECT_SCOPE_ID, {})
+
+    def test_creating_it_twice_is_a_noop(self):
+        # Against a stateful fake: two calls converge to exactly one scope, one mapper and one
+        # default link on the service's client.
+        admin = _FakeSubjectScopeAdmin()
+        client = _make_client(admin)
+        first = client.post(self._URL)
+        second = client.post(self._URL)
+        assert first.status_code == second.status_code == 200
+        assert first.json() == second.json()
+        assert [s["name"] for s in admin.scopes.values()] == ["aiac-username-sub"]
+        (scope_id,) = admin.scopes
+        assert [m["name"] for m in admin.mappers[scope_id]] == ["username-to-sub"]
+        assert admin.default_links == {"svc-uuid": [scope_id]}
+        assert "aiac.managed" not in admin.scopes[scope_id]["attributes"]
+
+    def test_second_service_reuses_the_shared_scope(self):
+        # Every managed client links the SAME scope: a second service gets a link, not a new scope.
+        admin = _FakeSubjectScopeAdmin()
+        client = _make_client(admin)
+        assert client.post(self._URL).status_code == 200
+        assert client.post(f"/services/svc-b/subject-scope?realm={REALM}").status_code == 200
+        (scope_id,) = admin.scopes
+        assert len(admin.mappers[scope_id]) == 1
+        assert admin.default_links == {"svc-uuid": [scope_id], "svc-b": [scope_id]}
+
+    def test_links_as_client_default_scope_only(self):
+        # The link is a default scope of THIS client and of the login client: never a realm
+        # default, never an optional scope, and no call touches any other client.
+        admin = MagicMock()
+        self._wire(admin, login_clients={"rossoctl": "rossoctl-uuid"})
+        _make_client(admin).post(self._URL)
+        assert admin.add_client_default_client_scope.call_args_list == [
+            (("svc-uuid", _SUBJECT_SCOPE_ID, {}),),
+            (("rossoctl-uuid", _SUBJECT_SCOPE_ID, {}),),
+        ]
+        admin.add_default_default_client_scope.assert_not_called()
+        admin.add_default_optional_client_scope.assert_not_called()
+        admin.add_client_optional_client_scope.assert_not_called()
+        admin.update_client.assert_not_called()
+        client_ids = {c.args[0] for c in admin.mock_calls if c[0] in _CLIENT_SCOPED_CALLS}
+        assert client_ids == {"svc-uuid", "rossoctl-uuid"}
+
+    def test_not_optional_link_is_not_deleted(self):
+        admin = MagicMock()
+        self._wire(admin, optional=[{"id": "sc-other", "name": "offline_access"}])
+        _make_client(admin).post(self._URL)
+        admin.get_client_optional_client_scopes.assert_called_once_with("svc-uuid")
+        admin.delete_client_optional_client_scope.assert_not_called()
+
+    def test_optional_link_is_moved_to_default(self):
+        # Keycloak skips a default link of a scope that is already linked as optional, and an
+        # optional scope's mapper runs only when the token request names it — so the endpoint
+        # removes the optional link FIRST, then adds the default link.
+        admin = MagicMock()
+        self._wire(
+            admin,
+            existing=self._existing(),
+            mappers=[_SUBJECT_MAPPER_EXISTING],
+            optional=[{"id": _SUBJECT_SCOPE_ID, "name": "aiac-username-sub"}],
+        )
+        resp = _make_client(admin).post(self._URL)
+        assert resp.status_code == 200
+        admin.delete_client_optional_client_scope.assert_called_once_with("svc-uuid", _SUBJECT_SCOPE_ID)
+        admin.add_client_default_client_scope.assert_called_once_with("svc-uuid", _SUBJECT_SCOPE_ID, {})
+        names = [c[0] for c in admin.mock_calls]
+        assert names.index("delete_client_optional_client_scope") < names.index("add_client_default_client_scope")
+
+    def test_optional_link_ends_as_default_against_fake(self):
+        # With the Keycloak skip modeled, a scope that starts as an optional link ends as a default
+        # link (and no longer optional) — an optional link would silently leave sub = user ID.
+        admin = _FakeSubjectScopeAdmin()
+        scope_id = admin.create_client_scope(_SUBJECT_SCOPE_PAYLOAD)
+        admin.optional_links["svc-uuid"] = [scope_id]
+        resp = _make_client(admin).post(self._URL)
+        assert resp.status_code == 200
+        assert admin.default_links == {"svc-uuid": [scope_id]}
+        assert admin.optional_links == {"svc-uuid": []}
+
+    def test_concurrent_create_409_finds_the_scope_by_name(self):
+        # Different services onboard concurrently: another onboarding created the scope between
+        # the read and the create. The 409 is success; the next read finds the scope by name.
+        admin = MagicMock()
+        self._wire(admin)
+        admin.get_client_scopes.side_effect = [
+            [{"id": "sc-profile", "name": "profile"}],
+            [{"id": "sc-profile", "name": "profile"}, self._existing()],
+        ]
+        admin.create_client_scope.side_effect = KeycloakError(error_message="Conflict", response_code=409)
+        resp = _make_client(admin).post(self._URL)
+        assert resp.status_code == 200
+        assert admin.get_client_scopes.call_count == 2
+        admin.add_client_default_client_scope.assert_called_once_with("svc-uuid", _SUBJECT_SCOPE_ID, {})
+
+    def test_concurrent_create_409_with_marked_scope_returns_409(self):
+        # The re-read after a 409 still applies the marker check.
+        admin = MagicMock()
+        self._wire(admin)
+        admin.get_client_scopes.side_effect = [[], [self._existing({"aiac.managed": "true"})]]
+        admin.create_client_scope.side_effect = KeycloakError(error_message="Conflict", response_code=409)
+        resp = _make_client(admin).post(self._URL)
+        assert resp.status_code == 409
+        admin.add_client_default_client_scope.assert_not_called()
+
+    def test_concurrent_mapper_add_409_is_success(self):
+        admin = MagicMock()
+        self._wire(admin, existing=self._existing())
+        admin.add_mapper_to_client_scope.side_effect = KeycloakError(error_message="Conflict", response_code=409)
+        resp = _make_client(admin).post(self._URL)
+        assert resp.status_code == 200
+        admin.add_client_default_client_scope.assert_called_once_with("svc-uuid", _SUBJECT_SCOPE_ID, {})
+
+    def test_marked_existing_scope_returns_409_and_does_not_link(self):
+        # A marked subject scope would become an own scope of every linked service (D31) — an
+        # invariant breach, surfaced as 409.
+        admin = MagicMock()
+        self._wire(admin, existing=self._existing({"aiac.managed": "true"}))
+        resp = _make_client(admin).post(self._URL)
+        assert resp.status_code == 409
+        error = resp.json()["error"]
+        assert "aiac-username-sub" in error
+        assert "D31" in error
+        assert "aiac.managed" in error
+        admin.add_mapper_to_client_scope.assert_not_called()
+        admin.delete_client_optional_client_scope.assert_not_called()
+        admin.add_client_default_client_scope.assert_not_called()
+
+    def test_returns_200_with_scope_json(self):
+        admin = MagicMock()
+        self._wire(admin)
+        resp = _make_client(admin).post(self._URL)
+        assert resp.status_code == 200
+        assert resp.json() == {**_SUBJECT_SCOPE_PAYLOAD, "id": _SUBJECT_SCOPE_ID}
+        admin.get_client_scope.assert_called_once_with(_SUBJECT_SCOPE_ID)
+
+    def test_returns_502_on_keycloak_error(self):
+        admin = MagicMock()
+        self._wire(admin)
+        admin.get_client_scopes.side_effect = KeycloakError(error_message="backend failure", response_code=500)
+        resp = _make_client(admin).post(self._URL)
+        assert resp.status_code == 502
+        assert "error" in resp.json()
+
+    def test_returns_404_for_an_unknown_service(self):
+        # Keycloak answers 404 for an unknown client UUID: pass it through, so the library (which
+        # retries a 5xx) does not try a bad UUID again as if Keycloak were down.
+        admin = MagicMock()
+        self._wire(admin)
+        admin.get_client_optional_client_scopes.side_effect = KeycloakError(
+            error_message="Could not find client", response_code=404
+        )
+        resp = _make_client(admin).post(self._URL)
+        assert resp.status_code == 404
+        assert "error" in resp.json()
+
+    def test_create_error_other_than_409_returns_502(self):
+        admin = MagicMock()
+        self._wire(admin)
+        admin.create_client_scope.side_effect = KeycloakError(error_message="backend failure", response_code=500)
+        resp = _make_client(admin).post(self._URL)
+        assert resp.status_code == 502
+        admin.add_client_default_client_scope.assert_not_called()
+
+    def test_mapper_error_other_than_409_returns_502(self):
+        admin = MagicMock()
+        self._wire(admin, existing=self._existing())
+        admin.add_mapper_to_client_scope.side_effect = KeycloakError(error_message="backend failure", response_code=500)
+        resp = _make_client(admin).post(self._URL)
+        assert resp.status_code == 502
+        admin.add_client_default_client_scope.assert_not_called()
+
+    def test_link_error_returns_502(self):
+        admin = MagicMock()
+        self._wire(admin)
+        admin.add_client_default_client_scope.side_effect = KeycloakError(
+            error_message="backend failure", response_code=500
+        )
+        resp = _make_client(admin).post(self._URL)
+        assert resp.status_code == 502
+        assert "error" in resp.json()
+
+    # -- convergence of an existing username-to-sub mapper (D31) --------------------------------
+
+    @staticmethod
+    def _seeded_fake(protocol_mapper="oidc-usermodel-property-mapper", **config_changes):
+        # A fake realm whose subject scope already has a mapper named username-to-sub with the
+        # given type and the expected config changed by ``config_changes``.
+        admin = _FakeSubjectScopeAdmin()
+        scope_id = admin.create_client_scope(_SUBJECT_SCOPE_PAYLOAD)
+        config = {**_SUBJECT_MAPPER_PAYLOAD["config"], **config_changes}
+        admin.mappers[scope_id].append(
+            {**_SUBJECT_MAPPER_PAYLOAD, "id": "m-old", "protocolMapper": protocol_mapper, "config": config}
+        )
+        return admin, scope_id
+
+    def test_wrong_claim_name_is_updated_to_exact_config(self):
+        # A mapper named username-to-sub that writes preferred_username leaves sub = user ID.
+        admin, scope_id = self._seeded_fake(**{"claim.name": "preferred_username"})
+        resp = _make_client(admin).post(self._URL)
+        assert resp.status_code == 200
+        assert admin.mapper_writes == ["update"]
+        (mapper,) = admin.mappers[scope_id]
+        assert mapper["id"] == "m-old"  # updated in place, not added again
+        assert mapper["protocolMapper"] == "oidc-usermodel-property-mapper"
+        assert mapper["config"] == _SUBJECT_MAPPER_PAYLOAD["config"]
+
+    def test_update_payload_is_the_representation_with_the_mapper_id(self):
+        admin = MagicMock()
+        wrong = {**_SUBJECT_MAPPER_EXISTING, "config": {**_SUBJECT_MAPPER_PAYLOAD["config"], "claim.name": "x"}}
+        self._wire(admin, existing=self._existing(), mappers=[wrong])
+        resp = _make_client(admin).post(self._URL)
+        assert resp.status_code == 200
+        admin.update_mapper_in_client_scope.assert_called_once_with(
+            _SUBJECT_SCOPE_ID, "m1", {**_SUBJECT_MAPPER_PAYLOAD, "id": "m1"}
+        )
+        admin.add_mapper_to_client_scope.assert_not_called()
+        admin.delete_mapper_from_client_scope.assert_not_called()
+
+    def test_wrong_token_claim_flag_is_updated(self):
+        # access.token.claim=false: the access token (the one AuthBridge reads) keeps sub = user ID.
+        admin, scope_id = self._seeded_fake(**{"access.token.claim": "false"})
+        assert _make_client(admin).post(self._URL).status_code == 200
+        assert admin.mapper_writes == ["update"]
+        assert admin.mappers[scope_id][0]["config"] == _SUBJECT_MAPPER_PAYLOAD["config"]
+
+    def test_missing_config_key_is_updated(self):
+        admin, scope_id = self._seeded_fake()
+        del admin.mappers[scope_id][0]["config"]["introspection.token.claim"]
+        assert _make_client(admin).post(self._URL).status_code == 200
+        assert admin.mapper_writes == ["update"]
+        assert admin.mappers[scope_id][0]["config"] == _SUBJECT_MAPPER_PAYLOAD["config"]
+
+    def test_extra_keycloak_config_keys_only_is_noop(self):
+        # Keycloak can add keys of its own (e.g. lightweight.claim): only OUR keys are compared.
+        admin, scope_id = self._seeded_fake(**{"lightweight.claim": "false"})
+        assert _make_client(admin).post(self._URL).status_code == 200
+        assert admin.mapper_writes == []
+        assert admin.mappers[scope_id][0]["config"]["lightweight.claim"] == "false"
+
+    def test_wrong_type_is_deleted_and_added_again(self):
+        # A different mapper type is not changed in place: delete the old mapper, add the right one.
+        admin, scope_id = self._seeded_fake(protocol_mapper="oidc-hardcoded-claim-mapper")
+        assert _make_client(admin).post(self._URL).status_code == 200
+        assert admin.mapper_writes == ["delete", "add"]
+        (mapper,) = admin.mappers[scope_id]
+        assert mapper["id"] != "m-old"
+        assert {k: v for k, v in mapper.items() if k != "id"} == _SUBJECT_MAPPER_PAYLOAD
+
+    def test_wrong_type_concurrent_delete_404_and_add_409_are_success(self):
+        # A concurrent onboarding fixed the type first: our delete gets 404 and our add gets 409.
+        admin = MagicMock()
+        wrong = {**_SUBJECT_MAPPER_EXISTING, "protocolMapper": "oidc-hardcoded-claim-mapper"}
+        self._wire(admin, existing=self._existing(), mappers=[wrong])
+        admin.delete_mapper_from_client_scope.side_effect = KeycloakError(error_message="Not found", response_code=404)
+        admin.add_mapper_to_client_scope.side_effect = KeycloakError(error_message="Conflict", response_code=409)
+        resp = _make_client(admin).post(self._URL)
+        assert resp.status_code == 200
+        admin.delete_mapper_from_client_scope.assert_called_once_with(_SUBJECT_SCOPE_ID, "m1")
+        admin.add_mapper_to_client_scope.assert_called_once_with(_SUBJECT_SCOPE_ID, _SUBJECT_MAPPER_PAYLOAD)
+        admin.update_mapper_in_client_scope.assert_not_called()
+
+    def test_wrong_type_delete_error_returns_502(self):
+        admin = MagicMock()
+        wrong = {**_SUBJECT_MAPPER_EXISTING, "protocolMapper": "oidc-hardcoded-claim-mapper"}
+        self._wire(admin, existing=self._existing(), mappers=[wrong])
+        admin.delete_mapper_from_client_scope.side_effect = KeycloakError(error_message="boom", response_code=500)
+        resp = _make_client(admin).post(self._URL)
+        assert resp.status_code == 502
+        admin.add_mapper_to_client_scope.assert_not_called()
+        admin.add_client_default_client_scope.assert_not_called()
+
+    def test_converged_mapper_second_call_makes_no_write(self):
+        admin, scope_id = self._seeded_fake(**{"claim.name": "preferred_username"})
+        client = _make_client(admin)
+        assert client.post(self._URL).status_code == 200
+        writes_after_first = list(admin.mapper_writes)
+        assert client.post(self._URL).status_code == 200
+        assert admin.mapper_writes == writes_after_first == ["update"]
+
+    def test_fresh_realm_second_call_makes_no_mapper_write(self):
+        admin = _FakeSubjectScopeAdmin()
+        client = _make_client(admin)
+        assert client.post(self._URL).status_code == 200
+        assert client.post(self._URL).status_code == 200
+        assert admin.mapper_writes == ["add"]
+
+    def test_update_error_returns_502(self):
+        admin = MagicMock()
+        wrong = {**_SUBJECT_MAPPER_EXISTING, "config": {**_SUBJECT_MAPPER_PAYLOAD["config"], "claim.name": "x"}}
+        self._wire(admin, existing=self._existing(), mappers=[wrong])
+        admin.update_mapper_in_client_scope.side_effect = KeycloakError(error_message="boom", response_code=500)
+        resp = _make_client(admin).post(self._URL)
+        assert resp.status_code == 502
+        assert "error" in resp.json()
+        admin.add_client_default_client_scope.assert_not_called()
+
+    def test_other_sub_mapper_is_left_alone(self):
+        # Another mapper (a different name) that also writes sub is not AIAC's: it is not changed,
+        # not deleted, and it does not fail the onboarding.
+        admin, scope_id = self._seeded_fake()
+        other = {
+            "id": "m-other",
+            "name": "operator-sub",
+            "protocol": "openid-connect",
+            "protocolMapper": "oidc-hardcoded-claim-mapper",
+            "config": {"claim.name": "sub", "claim.value": "x", "access.token.claim": "true"},
+        }
+        admin.mappers[scope_id].append(json.loads(json.dumps(other)))
+        assert _make_client(admin).post(self._URL).status_code == 200
+        assert admin.mapper_writes == []
+        assert admin.mappers[scope_id][1] == other
+
+    def test_missing_realm_returns_422(self):
+        app.dependency_overrides.clear()
+        resp = TestClient(app).post("/services/svc-uuid/subject-scope")
+        assert resp.status_code == 422
+
+    def teardown_method(self):
+        app.dependency_overrides.clear()
+
+
+class TestLinkSubjectScopeToLoginClients:
+    """The subject scope is the one source of ``sub`` = username, also in the login token (D31):
+    AIAC links it as a default scope to each platform login client (``PLATFORM_SOURCE_CLIENTS``,
+    default ``rossoctl``), at startup and at each ``POST /services/{id}/subject-scope``."""
+
+    _URL = f"/services/svc-uuid/subject-scope?realm={REALM}"
+
+    @staticmethod
+    def _fake(**clients):
+        return _FakeSubjectScopeAdmin(clients={"rossoctl": "rossoctl-uuid", **clients})
+
+    def test_endpoint_links_the_scope_to_the_login_client_as_default(self, monkeypatch):
+        monkeypatch.delenv("PLATFORM_SOURCE_CLIENTS", raising=False)
+        admin = self._fake()
+        resp = _make_client(admin).post(self._URL)
+        assert resp.status_code == 200
+        (scope_id,) = admin.scopes
+        assert admin.default_links == {"svc-uuid": [scope_id], "rossoctl-uuid": [scope_id]}
+
+    def test_endpoint_second_call_is_a_noop(self, monkeypatch):
+        monkeypatch.delenv("PLATFORM_SOURCE_CLIENTS", raising=False)
+        admin = self._fake()
+        client = _make_client(admin)
+        assert client.post(self._URL).status_code == 200
+        assert client.post(self._URL).status_code == 200
+        (scope_id,) = admin.scopes
+        assert admin.default_links == {"svc-uuid": [scope_id], "rossoctl-uuid": [scope_id]}
+        assert admin.mapper_writes == ["add"]
+
+    def test_endpoint_moves_an_optional_login_link_to_default(self, monkeypatch):
+        # An optional link would leave sub = the user ID in the login token.
+        monkeypatch.delenv("PLATFORM_SOURCE_CLIENTS", raising=False)
+        admin = self._fake()
+        scope_id = admin.create_client_scope(_SUBJECT_SCOPE_PAYLOAD)
+        admin.optional_links["rossoctl-uuid"] = [scope_id]
+        resp = _make_client(admin).post(self._URL)
+        assert resp.status_code == 200
+        assert admin.default_links["rossoctl-uuid"] == [scope_id]
+        assert admin.optional_links["rossoctl-uuid"] == []
+
+    def test_endpoint_with_a_missing_login_client_is_not_an_error(self, monkeypatch, caplog):
+        monkeypatch.delenv("PLATFORM_SOURCE_CLIENTS", raising=False)
+        admin = _FakeSubjectScopeAdmin()  # no rossoctl client in the realm
+        with caplog.at_level("WARNING"):
+            resp = _make_client(admin).post(self._URL)
+        assert resp.status_code == 200
+        (scope_id,) = admin.scopes
+        assert admin.default_links == {"svc-uuid": [scope_id]}
+        assert "rossoctl" in caplog.text
+
+    def test_endpoint_links_every_configured_login_client(self, monkeypatch):
+        monkeypatch.setenv("PLATFORM_SOURCE_CLIENTS", " rossoctl , ,other-ui ")
+        admin = self._fake(**{"other-ui": "other-uuid"})
+        resp = _make_client(admin).post(self._URL)
+        assert resp.status_code == 200
+        (scope_id,) = admin.scopes
+        assert admin.default_links == {
+            "svc-uuid": [scope_id],
+            "rossoctl-uuid": [scope_id],
+            "other-uuid": [scope_id],
+        }
+
+    def test_blank_setting_falls_back_to_rossoctl(self, monkeypatch):
+        monkeypatch.setenv("PLATFORM_SOURCE_CLIENTS", " , ")
+        admin = self._fake()
+        assert _make_client(admin).post(self._URL).status_code == 200
+        assert "rossoctl-uuid" in admin.default_links
+
+    def test_login_client_is_found_by_client_id(self, monkeypatch):
+        monkeypatch.delenv("PLATFORM_SOURCE_CLIENTS", raising=False)
+        admin = MagicMock()
+        TestLinkSubjectScope()._wire(admin, login_clients={"rossoctl": "rossoctl-uuid"})
+        _make_client(admin).post(self._URL)
+        admin.get_client_id.assert_called_once_with("rossoctl")
+
+    def test_no_client_mapper_and_no_realm_default(self, monkeypatch):
+        # The login client gets a scope link only: no client mapper, no client update, and the
+        # scope never becomes a realm default.
+        monkeypatch.delenv("PLATFORM_SOURCE_CLIENTS", raising=False)
+        admin = MagicMock()
+        TestLinkSubjectScope()._wire(admin, login_clients={"rossoctl": "rossoctl-uuid"})
+        _make_client(admin).post(self._URL)
+        admin.add_mapper_to_client.assert_not_called()
+        admin.update_client.assert_not_called()
+        admin.add_default_default_client_scope.assert_not_called()
+        admin.add_default_optional_client_scope.assert_not_called()
+
+    def test_login_link_error_returns_502(self, monkeypatch):
+        monkeypatch.delenv("PLATFORM_SOURCE_CLIENTS", raising=False)
+        admin = MagicMock()
+        TestLinkSubjectScope()._wire(admin, login_clients={"rossoctl": "rossoctl-uuid"})
+        admin.add_client_default_client_scope.side_effect = [
+            None,
+            KeycloakError(error_message="backend failure", response_code=500),
+        ]
+        resp = _make_client(admin).post(self._URL)
+        assert resp.status_code == 502
+
+    # -- at startup ------------------------------------------------------------------------------
+
+    def test_startup_links_the_scope_to_the_login_client(self, monkeypatch):
+        monkeypatch.setenv("KEYCLOAK_REALM", REALM)
+        monkeypatch.delenv("PLATFORM_SOURCE_CLIENTS", raising=False)
+        admin = self._fake()
+        with patch("aiac.idp.service.configuration.keycloak.main._get_or_create_admin", return_value=admin) as get:
+            with TestClient(app):
+                pass
+        get.assert_called_once_with(REALM)
+        (scope_id,) = admin.scopes
+        assert admin.default_links == {"rossoctl-uuid": [scope_id]}
+        assert [m["name"] for m in admin.mappers[scope_id]] == ["username-to-sub"]
+
+    def test_startup_is_idempotent(self, monkeypatch):
+        monkeypatch.setenv("KEYCLOAK_REALM", REALM)
+        monkeypatch.delenv("PLATFORM_SOURCE_CLIENTS", raising=False)
+        admin = self._fake()
+        with patch("aiac.idp.service.configuration.keycloak.main._get_or_create_admin", return_value=admin):
+            with TestClient(app):
+                pass
+            with TestClient(app):
+                pass
+        (scope_id,) = admin.scopes
+        assert admin.default_links == {"rossoctl-uuid": [scope_id]}
+        assert admin.mapper_writes == ["add"]
+
+    def test_startup_with_keycloak_not_ready_does_not_crash(self, monkeypatch, caplog):
+        monkeypatch.setenv("KEYCLOAK_REALM", REALM)
+        admin = MagicMock()
+        admin.get_client_scopes.side_effect = ConnectionError("connection refused")
+        with patch("aiac.idp.service.configuration.keycloak.main._get_or_create_admin", return_value=admin):
+            with caplog.at_level("WARNING"), TestClient(app) as client:
+                assert client.get("/docs").status_code == 200
+        assert "aiac-username-sub" in caplog.text
+
+    def test_startup_with_a_keycloak_error_does_not_crash(self, monkeypatch):
+        monkeypatch.setenv("KEYCLOAK_REALM", REALM)
+        with patch(
+            "aiac.idp.service.configuration.keycloak.main._get_or_create_admin",
+            side_effect=KeycloakError(error_message="unauthorized", response_code=401),
+        ):
+            with TestClient(app):
+                pass
+
+    def test_startup_with_a_missing_login_client_is_not_an_error(self, monkeypatch, caplog):
+        monkeypatch.setenv("KEYCLOAK_REALM", REALM)
+        monkeypatch.delenv("PLATFORM_SOURCE_CLIENTS", raising=False)
+        admin = _FakeSubjectScopeAdmin()
+        with patch("aiac.idp.service.configuration.keycloak.main._get_or_create_admin", return_value=admin):
+            with caplog.at_level("WARNING"), TestClient(app):
+                pass
+        assert admin.default_links == {}
+        assert "rossoctl" in caplog.text
+
+    def test_startup_without_a_realm_skips_the_link(self, monkeypatch, caplog):
+        monkeypatch.delenv("KEYCLOAK_REALM", raising=False)
+        with patch("aiac.idp.service.configuration.keycloak.main._get_or_create_admin") as get:
+            with caplog.at_level("WARNING"), TestClient(app):
+                pass
+        get.assert_not_called()
+        assert "KEYCLOAK_REALM" in caplog.text
 
     def teardown_method(self):
         app.dependency_overrides.clear()
@@ -1232,6 +2015,67 @@ class TestKeycloakErrorProduces502:
         admin = MagicMock()
         admin.get_client.side_effect = _keycloak_error()
         assert _make_client(admin).get(f"/services/s1/discovery-token?realm={REALM}").status_code == 502
+
+    def teardown_method(self):
+        app.dependency_overrides.clear()
+
+
+# ---------------------------------------------------------------------------
+# Keycloak 404 → 404 on the reads of one service (the onboarding read path, D33)
+# ---------------------------------------------------------------------------
+
+
+def _client_not_found():
+    # What python-keycloak raises when Keycloak does not find the client, for example a new client
+    # that a reader asks for before Keycloak commits it.
+    return KeycloakGetError(error_message="Could not find client", response_code=404)
+
+
+class TestKeycloakNotFoundProduces404:
+    """A Keycloak ``404`` on a read of one service gives ``404`` with ``{"error": ...}``, not
+    ``502``, so that the library and the onboarding can tell a client that is not there (or not
+    there yet) from an IdP outage. Every other ``KeycloakError`` stays ``502`` (per-route tests)."""
+
+    def test_get_service(self):
+        admin = MagicMock()
+        admin.get_client.side_effect = _client_not_found()
+        resp = _make_client(admin).get(f"/services/s1?realm={REALM}")
+        assert resp.status_code == 404
+        assert resp.json() == {"error": "404: Could not find client"}
+
+    def test_list_service_roles(self):
+        admin = MagicMock()
+        admin.get_client.side_effect = _client_not_found()
+        resp = _make_client(admin).get(f"/services/s1/roles?realm={REALM}")
+        assert resp.status_code == 404
+        assert resp.json() == {"error": "404: Could not find client"}
+
+    def test_list_service_scopes(self):
+        admin = MagicMock()
+        admin.get_client_default_client_scopes.side_effect = _client_not_found()
+        resp = _make_client(admin).get(f"/services/s1/scopes?realm={REALM}")
+        assert resp.status_code == 404
+        assert resp.json() == {"error": "404: Could not find client"}
+
+    def test_mint_discovery_token(self, monkeypatch):
+        monkeypatch.setenv("KEYCLOAK_URL", "http://kc-internal:8080")
+        admin = MagicMock()
+        admin.get_client.side_effect = _client_not_found()
+        resp = _make_client(admin).get(f"/services/s1/discovery-token?realm={REALM}")
+        assert resp.status_code == 404
+        assert resp.json() == {"error": "404: Could not find client"}
+
+    def test_list_role_composites(self):
+        # A sub-read of get_service: a composite role deleted between GET /roles and this read. A 404
+        # is not retried by the library, and the onboarding reads get_service again (the role is then
+        # not listed). A 502 would be retried for a failure that always repeats.
+        admin = MagicMock()
+        admin.get_composite_realm_roles_of_role.side_effect = KeycloakGetError(
+            error_message="Could not find role", response_code=404
+        )
+        resp = _make_client(admin).get(f"/roles/gone/composites?realm={REALM}")
+        assert resp.status_code == 404
+        assert resp.json() == {"error": "404: Could not find role"}
 
     def teardown_method(self):
         app.dependency_overrides.clear()

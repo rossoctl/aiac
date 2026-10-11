@@ -12,9 +12,10 @@ import org.keycloak.models.KeycloakSessionFactory;
 import java.io.IOException;
 
 /**
- * Keycloak factories are singletons; providers are created per-request. The NATS connection is
- * opened once here ({@link #postInit}) and shared across every {@link AiacEventListenerProvider}
- * instance this factory creates — never opened per request.
+ * Keycloak factories are singletons. Providers are not cached on the session: Keycloak's
+ * {@code AdminEventBuilder} calls {@link #create} for each builder it makes (in practice, one per
+ * admin request). The NATS connection is opened once here ({@link #postInit}) and shared across
+ * every {@link AiacEventListenerProvider} instance this factory creates — never opened per request.
  */
 public class AiacEventListenerProviderFactory implements EventListenerProviderFactory {
 
@@ -31,9 +32,16 @@ public class AiacEventListenerProviderFactory implements EventListenerProviderFa
         return PROVIDER_ID;
     }
 
+    /**
+     * The provider gets the connection lookup, not a connection: it resolves it at commit time,
+     * when it has something to publish. Keycloak creates a provider for every admin request of a
+     * realm that has this listener enabled, most of them with no matching event; resolving here
+     * would cost a NATS connect attempt per request while the Event Broker is down, and would
+     * hand the provider a connection that can close before the commit.
+     */
     @Override
     public EventListenerProvider create(KeycloakSession session) {
-        return new AiacEventListenerProvider(connection());
+        return new AiacEventListenerProvider(session, this::connection);
     }
 
     @Override
@@ -47,8 +55,8 @@ public class AiacEventListenerProviderFactory implements EventListenerProviderFa
     @Override
     public void postInit(KeycloakSessionFactory factory) {
         // Best-effort — never fail Keycloak startup over a missing/unreachable Event Broker.
-        // If this fails, connection() retries on the next request instead of leaving every
-        // future provider stuck with a permanently null connection.
+        // If this fails, connection() retries at the next commit that has events to publish,
+        // instead of leaving every future provider stuck with a permanently null connection.
         connection();
     }
 
@@ -57,8 +65,8 @@ public class AiacEventListenerProviderFactory implements EventListenerProviderFa
      * client itself moves to {@code CLOSED} once its own reconnect budget is exhausted — either
      * way {@code natsConnection} can go dead for good, and without this every later provider
      * would keep getting that dead connection and silently drop events until Keycloak is
-     * restarted. Providers are created per request, so that's a natural, bounded retry point;
-     * no background thread needed.
+     * restarted. Each provider calls this once per commit that has events to publish, so that's
+     * a natural, bounded retry point; no background thread needed.
      */
     private synchronized Connection connection() {
         if (natsConnection != null && natsConnection.getStatus() != Connection.Status.CLOSED) {

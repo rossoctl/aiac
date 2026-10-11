@@ -2,34 +2,45 @@
 
 Spec ``docs/testing/uc1-onboarding-pipeline.md`` (§ Failure path); plan
 ``docs/handoffs/04-uc1-onboarding-prb-failure-rollback-coverage.md``, with the assertions of handoff 11
-(Group 8 — its no-rules CR supersedes handoff 04's "no CR for a failed agent"). Rungs 1–3 prove the happy path;
-this rung proves what a build failure leaves behind. Service Provision succeeds and writes the service's
-roles/scopes, then ``ServicePolicyBuilder.build`` raises one of ``orchestrator._ROLLBACK_ERRORS``. The
-Orchestrator runs ``_rollback`` (delete only this run's roles/scopes, **keep** ``client.type``, disable
-the client last), then the PCE ``quarantine`` (delete the SPM, remove the service's roles from the other
-SPMs, replace an **agent's** CR with a **no-rules CR**, re-derive the affected agents), and re-raises.
-Under the event model there is no HTTP status to assert, so the rung asserts only observable end state:
-Keycloak, the ``AuthorizationPolicy`` CRs, the Policy Store, the Controller log, and real requests
-through AuthBridge + the deployed OPA plugin.
+(Group 8) as changed by handoff 12 (D20: the quarantine **deletes** the CR — there is no no-rules CR).
+Rungs 1–3 prove the happy path; this rung proves what a build failure leaves behind. Service Provision
+succeeds and writes the service's roles/scopes, then ``ServicePolicyBuilder.build`` raises one of
+``orchestrator._ROLLBACK_ERRORS``. The Orchestrator runs ``_rollback`` (delete only this run's
+roles/scopes, **keep** ``client.type``, disable the client last), then the PCE ``quarantine`` (delete
+the SPM, remove the service's roles from the other SPMs, **delete the service's CR** — agent or tool —
+and deploy the affected services of the live enforcement side), and re-raises. The changed global
+combiner denies a pod that has no client CR (D20), so a deleted CR means deny. Under the event model
+there is no HTTP status to assert, so the rung asserts only observable end state: Keycloak, the
+``AuthorizationPolicy`` CRs, the Policy Store, the Controller log, and real requests through
+AuthBridge + the deployed OPA plugin.
 
 One shared stack, four phases in order (``_run_phases``); each records what it observed and the tests
 assert on the record, so a failed phase reports its own facts and the later phases report "not reached":
 
 1. **Failed agent** — deploy the agent with the LLM seam broken. Assert: the client is disabled and its
-   ``client.type`` is kept; the ``github-agent.*`` roles/scopes Provision created are gone; the no-rules
-   CR is **present** (every grant binding empty, ``default allow := false`` — a deleted CR would open the
-   agent through the bundle-service allow-fallback); a real inbound ``dev-user`` request (allowed on the
-   happy path) is **denied**; no SPM; the failure and the dead-letter move are logged.
+   ``client.type`` is kept; the ``github-agent.*`` roles/scopes Provision created are gone; the shared
+   subject scope ``aiac-username-sub`` stays — it still exists and is still a default scope of the
+   disabled agent client (Provision linked it, and the link is not in the created-manifest, D31); the
+   agent has **no** CR (the quarantine deleted it; a 404 counts as success); a real inbound ``dev-user`` request
+   (allowed on the happy path) is **denied** — the agent never had a CR in this phase, so the deny comes
+   from the changed combiner: the live proof that a pod with no CR is denied (D20); no SPM; the failure
+   and the dead-letter move are logged.
 2. **Lift** — restore the seam and re-fire the trigger. Assert: the real CR (with grants) is back, the
    client is enabled, and ``dev-user`` inbound is allowed again.
 3. **Tool onboarded + MCP session** — deploy the tool on the happy path, prepare the outbound leg (Part
-   B), converge. Assert: one MCP session (``initialize``, ``notifications/initialized``, ``tools/list``,
-   ``tools/call``) through the agent's outbound is allowed for ``dev-user`` (a grant on some tool of the
-   target), and the session methods are denied for ``devops-user`` (no grant — the negative control that
-   keeps the session rule from passing as allow-all).
+   B), converge, and record the tool's CR and the agent's CR. Assert: one MCP session (``initialize``,
+   ``notifications/initialized``, ``tools/list``, ``tools/call``) is allowed for ``dev-user`` (a grant on
+   some tool of the target), and the session methods are denied for ``devops-user`` (no grant — the
+   negative control that keeps the session rule from passing as allow-all). Under target side
+   github-tool's inbound decides the session (D26) and the agent's outbound passes it through; under
+   agent side the agent's outbound decides it (the MCP session rule).
 4. **Failed tool** — break the seam again and re-fire the tool's trigger. Assert: the client is disabled
-   and ``Tool`` is kept; no CR for the tool; its SPM (written in phase 3) is gone; the agent's outbound
-   Rego lost every grant to it; the ``dev-user`` outbound call that phase 3 allowed is now blocked.
+   and ``Tool`` is kept; the tool's CR, which phase 3 recorded, is **deleted**; its SPM (written in phase
+   3) is gone; the agent's CR, by side (target side: unchanged since phase 3 — its inbound grants stay
+   and its outbound stays a pass-through; agent side: every outbound grant binding is empty and its
+   inbound grants stay); the shared subject scope ``aiac-username-sub`` stays — it still exists and is
+   still a default scope of the disabled tool client (phase 3 linked it, and the link is not in the
+   created-manifest, D31); the ``dev-user`` outbound call that phase 3 allowed is now blocked.
 
 **Failure injection — a permanent error, on purpose.** ``controller_llm_unusable`` points the in-cluster
 Controller's ``LLM_BASE_URL`` (an explicit container env over the ``aiac-agent-config`` ``envFrom``; the
@@ -56,11 +67,13 @@ So the tool phase runs last and the lift is proven on the agent. Failing an onbo
 stronger check: its SPM existed and ``dev-user``'s call to it was allowed, so "no SPM" and "blocked"
 are real transitions, not an empty start.
 
-**Outbound "blocked".** After the quarantine the agent's outbound Rego has no grant to the tool, so OPA
-denies (a JSON-RPC error frame, ``plugin: opa``). The tool's client is also disabled, so Keycloak may
-instead refuse the token exchange to its audience before OPA is consulted (a ``token-exchange`` error
-frame). Both mean the call never reaches the tool, so both count as blocked; the OPA-side proof is the
-CR assertion. Any other outcome (``allow``, a transport error) fails.
+**Outbound "blocked".** After the quarantine github-tool has no CR. Under target side the combiner
+denies the call on github-tool's inbound (D20; an HTTP 403 with an OPA body, relayed by the agent's
+pass-through outbound). Under agent side the agent's outbound Rego has no grant to the tool, so its OPA
+denies (a JSON-RPC error frame, ``plugin: opa``). Under both sides the tool's client is also disabled,
+so Keycloak may instead refuse the token exchange to its audience before OPA is consulted (a
+``token-exchange`` error frame). All of these mean the call never reaches the tool, so all count as
+blocked; the OPA-side proof is the CR assertion. Any other outcome (``allow``, a transport error) fails.
 
 Run (a live rossoctl/Kind cluster with the AIAC stack + AuthBridge OPA pipeline wired in — see
 ``k8s/opa-kind-runbook.md`` / ``k8s/opa-kind-enable.sh`` — the event path wired (NATS broker +
@@ -77,6 +90,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterator
 
@@ -138,11 +152,13 @@ def _poll_decision(decide: Callable[[], str], want: str, timeout: float = uc1.BU
     return seen["decision"]
 
 
-def _settle_failed(admin, workload: str, settled: Callable[[dict], bool]) -> dict:
+def _settle_failed(admin, workload: str, settled: Callable[[dict], bool], *, since: datetime | None = None) -> dict:
     """Wait for a failed onboarding of ``workload`` to reach its terminal state — the client disabled
     (the rollback's last step) AND ``settled(client)`` (the quarantine's observable end) — then give the
-    consumer a short window to log the dead-letter move. Returns ``{"settled", "client", "logs"}``, read
-    while the injected Controller pod (the one that holds the failure log) is still running."""
+    consumer a short window to log the dead-letter move. Returns ``{"settled", "client", "logs",
+    "race_hint"}``, read while the injected Controller pod (the one that holds the failure log) is still
+    running. ``race_hint`` is ``""``, or, when the state did not settle, the event-before-commit race hint
+    over the Controller log from ``since`` (the trigger; ``uc1.controller_commit_race_hint``, handoff 20)."""
     seen: dict = {"client": None}
 
     def _terminal() -> bool:
@@ -160,7 +176,8 @@ def _settle_failed(admin, workload: str, settled: Callable[[dict], bool]) -> dic
             return _dlq_line(uuid) in logs["text"]
 
         uc1.poll_until(_logged, timeout=60, interval=5)
-    return {"settled": done, "client": seen["client"], "logs": logs["text"]}
+    race_hint = "" if done else uc1.controller_commit_race_hint(since, admin=admin, workload=workload)
+    return {"settled": done, "client": seen["client"], "logs": logs["text"], "race_hint": race_hint}
 
 
 def _prefixed(admin, prefix: str) -> dict[str, list[str]]:
@@ -173,11 +190,11 @@ def _prefixed(admin, prefix: str) -> dict[str, list[str]]:
 
 
 def _outbound_block(ctx: dict, user: str, tool_bare: str) -> tuple[str, int | None, str]:
-    """One live outbound ``tools/call``; classify it as ``"deny"`` (OPA error frame), ``"refused"``
+    """One live outbound ``tools/call``; classify it as ``"deny"`` (an OPA verdict: github-tool's
+    inbound 403 under target side, the agent's outbound error frame under agent side), ``"refused"``
     (a token-exchange error frame — Keycloak refused the exchange before OPA, see the module
     docstring), ``"allow"``, or ``"error"``. Returns ``(class, http_code, body)``."""
-    token = uc1.mint_token(user, scn.USER_PASSWORD, keycloak_url=ctx["keycloak_url"], realm=ctx["realm"])
-    code, body = uc1.outbound_probe(token, tool_bare, namespace=ctx["namespace"], agent_pod=uc1.resolve_agent_pod())
+    code, body = uc1.outbound_raw(ctx, user, tool_bare)
     decision = uc1.outbound_outcome(code, body)
     if decision == "error" and code == 200:
         try:
@@ -191,8 +208,9 @@ def _outbound_block(ctx: dict, user: str, tool_bare: str) -> tuple[str, int | No
 
 def _poll_blocked(ctx: dict, user: str, tool_bare: str) -> tuple[str, int | None, str]:
     """Poll the outbound call until it is blocked (``deny`` / ``refused``) on two probes in a row — the
-    old bundle may still allow it until bundle-service + OPA pick up the re-derived CR, and two in a
-    row keeps a one-off exchange blip from ending the wait. Returns the last observation."""
+    old bundle may still allow it until bundle-service + OPA pick up the CR change (target side:
+    github-tool's deleted CR; agent side: the agent's re-derived CR), and two in a row keeps a one-off
+    exchange blip from ending the wait. Returns the last observation."""
     seen = {"last": ("unobserved", None, ""), "streak": 0}
 
     def _blocked() -> bool:
@@ -212,22 +230,28 @@ def _run_phases(ctx: dict, run: dict) -> None:
 
     # --- Phase 1 — a failed first onboarding of the agent ---------------------------------------
     with uc1.controller_llm_unusable():
-        uc1.deploy_workload(AGENT)  # fires CLIENT_CREATED -> onboard_service -> build raises
+        deployed_at = datetime.now(timezone.utc)  # the log window of the race hint (handoff 20)
+        uc1.deploy_workload(AGENT)  # fires CLIENT_CREATED -> onboard_and_apply -> build raises
         agent = _registered_client(admin, AGENT)
-        # Terminal: disabled (rollback) AND the no-rules CR written (the quarantine's agent step).
-        failed = _settle_failed(admin, AGENT, lambda _c: uc1.cr_has_no_grants(uc1.authpolicy_policies(AGENT)))
+        # Terminal: disabled (rollback) AND no CR (the quarantine deletes it; an agent gets no bootstrap
+        # CR, so it never had one in this phase). ``_settle_failed`` then waits for the dead-letter
+        # line, which the consumer logs only after the quarantine returned.
+        failed = _settle_failed(admin, AGENT, lambda _c: uc1.authpolicy_policies(AGENT) is None, since=deployed_at)
         failed.update(
             uuid=agent["id"],
             cr=uc1.authpolicy_policies(AGENT),
             spm=uc1.spm_present(agent["clientId"]),
             provisioned=_prefixed(admin, f"{AGENT}."),
+            # The shared subject scope after the rollback (D31): Provision linked it before the build
+            # failed, and the link is not in the created-manifest, so the scope and the link stay.
+            subject_scope=uc1.subject_scope_link_problems(admin, AGENT),
         )
         run["agent_failed"] = failed
-    # The CR is present; wait for bundle-service + OPA to enforce it (with no CR yet, the combiner
-    # allowed the pod, so dev-user inbound flips from allow to deny).
+    # No CR, so the changed combiner denies the agent pod (D20). Poll to wait out the 503 that the OPA
+    # sidecar gives before its first bundle loads.
     failed["inbound"] = _poll_decision(lambda: uc1.inbound_decision(ctx, "dev-user"), "deny")
     if not failed["settled"]:
-        run["stopped"] = "the failed agent onboarding did not settle (phase 1)"
+        run["stopped"] = uc1.append_hint("the failed agent onboarding did not settle (phase 1)", failed["race_hint"])
         return
 
     # --- Phase 2 — lift: the seam is restored (context exited); re-fire the agent's trigger ------
@@ -252,6 +276,7 @@ def _run_phases(ctx: dict, run: dict) -> None:
         return
 
     # --- Phase 3 — onboard the tool on the happy path, prepare Part B, then one MCP session -------
+    deployed_at = datetime.now(timezone.utc)
     uc1.deploy_workload(TOOL)
     tool = _registered_client(admin, TOOL)
     uc1.ensure_github_tool_route(uc1.NAMESPACE)
@@ -259,20 +284,29 @@ def _run_phases(ctx: dict, run: dict) -> None:
     uc1.restart_agent(uc1.NAMESPACE)
     outbound = _poll_decision(lambda: uc1.outbound_decision(ctx, "dev-user", PROBE_TOOL), "allow", LIFT_TIMEOUT)
     if outbound != "allow":
-        run["stopped"] = f"the tool did not converge on the happy path: dev-user outbound {PROBE_TOOL}={outbound!r}"
+        run["stopped"] = uc1.append_hint(
+            f"the tool did not converge on the happy path: dev-user outbound {PROBE_TOOL}={outbound!r}",
+            uc1.controller_commit_race_hint(deployed_at, admin=admin, workload=TOOL),
+        )
         return
+    run["tool_onboarded"] = {"tool_cr": uc1.authpolicy_policies(TOOL), "agent_cr": uc1.authpolicy_policies(AGENT)}
     run["session"] = {user: uc1.mcp_session_decisions(ctx, user, PROBE_TOOL) for user in ("dev-user", "devops-user")}
 
     # --- Phase 4 — a failed re-onboarding of the (onboarded) tool --------------------------------
     with uc1.controller_llm_unusable():
+        published_at = datetime.now(timezone.utc)
         uc1.publish_service_event(tool["id"])
         # Terminal: disabled (rollback) AND its phase-3 SPM gone (the quarantine's first step).
-        failed = _settle_failed(admin, TOOL, lambda c: not uc1.spm_present(c["clientId"]))
+        failed = _settle_failed(admin, TOOL, lambda c: not uc1.spm_present(c["clientId"]), since=published_at)
         failed.update(
             uuid=tool["id"],
             cr=uc1.authpolicy_policies(TOOL),
             spm=uc1.spm_present(tool["clientId"]),
-            agent_cr=uc1.authpolicy_policies(AGENT),  # re-derived in the quarantine, before it returns
+            agent_cr=uc1.authpolicy_policies(AGENT),  # after the quarantine deployed the affected services
+            # The shared subject scope after the rollback (D31): the phase-3 onboarding linked it, and the
+            # failed re-onboarding's Provision linked it again (the link is idempotent). The rollback
+            # deletes only the created-manifest, so the scope and the link stay.
+            subject_scope=uc1.subject_scope_link_problems(admin, TOOL),
         )
         run["tool_failed"] = failed
     failed["outbound"] = _poll_blocked(ctx, "dev-user", PROBE_TOOL)
@@ -290,7 +324,7 @@ def run() -> Iterator[dict]:
     harness restores the Controller's env on every exit path; teardown undeploys both workloads and
     scrubs every registration + CR back to pristine, verified."""
     with uc1.pristine_stack([AGENT, TOOL]) as ctx:
-        observed: dict = {}
+        observed: dict = {"side": ctx["side"]}  # the live enforcement side, for the side-aware asserts
         _run_phases(ctx, observed)
         yield observed
 
@@ -306,10 +340,11 @@ def _failed(run: dict, key: str) -> dict:
     """The record of a failed-onboarding phase, failing first if it never reached its terminal state."""
     obs = _phase(run, key)
     client = obs["client"] or {}
-    assert obs["settled"], (
+    assert obs["settled"], uc1.append_hint(
         f"{key}: no rolled-back + quarantined terminal state within {SETTLE_TIMEOUT:.0f}s — client "
         f"enabled={client.get('enabled')!r}. Did the injection reach the Controller (onboarding may have "
-        "succeeded), or did the build fail with an error outside _ROLLBACK_ERRORS?"
+        "succeeded), or did the build fail with an error outside _ROLLBACK_ERRORS?",
+        obs.get("race_hint", ""),
     )
     return obs
 
@@ -336,20 +371,34 @@ def test_failed_agent_provisioned_entities_removed(run: dict) -> None:
     assert left == {"roles": [], "scopes": []}, f"roles/scopes the rollback should have deleted: {left}"
 
 
-def test_failed_agent_has_no_rules_cr(run: dict) -> None:
-    """The agent's ``AuthorizationPolicy`` CR is PRESENT and is the no-rules CR: both packages keep
-    ``default allow := false`` and every grant binding is empty. Present, not deleted — the
-    bundle-service combiner allows a pod that has no CR."""
+def test_failed_agent_has_no_cr(run: dict) -> None:
+    """The failed agent has NO ``AuthorizationPolicy`` CR: the quarantine deletes the CR under both
+    sides (D20; a 404 counts as success). There is no no-rules CR any more — the changed combiner denies
+    a pod that has no client CR."""
     policies = _failed(run, "agent_failed")["cr"]
-    assert policies is not None, f"no AuthorizationPolicy CR {AGENT!r} — a missing CR opens the agent"
-    assert uc1.cr_has_no_grants(policies), f"the agent's CR still carries grants: {policies}"
+    assert policies is None, f"the quarantined agent still has an AuthorizationPolicy CR {AGENT!r}: {policies}"
 
 
 def test_failed_agent_inbound_denied(run: dict) -> None:
     """A real inbound request as ``dev-user`` (allowed on the happy path) through AuthBridge + the
-    deployed OPA plugin is denied once the no-rules CR is in force."""
+    deployed OPA plugin is denied. The agent has no CR, so the deny comes from the changed combiner: the
+    live proof that a pod with no CR is denied (D20). With the old combiner the same request would be
+    allowed (the skip gate makes sure the cluster has the changed one)."""
     decision = _failed(run, "agent_failed")["inbound"]
     assert decision == "deny", f"dev-user inbound to the quarantined agent: {decision!r} (want 'deny')"
+
+
+@pytest.mark.parametrize("key", ["agent_failed", "tool_failed"])
+def test_rollback_keeps_the_subject_scope(run: dict, key: str) -> None:
+    """The rollback of the failed service (the agent, then the tool) keeps the shared subject scope
+    (D31): ``aiac-username-sub`` still exists (with its mapper and no marker) and is still a **default**
+    scope of the disabled client. Provision linked it before the build failed (for the tool, its phase-3
+    onboarding linked it too), and the link is not in the created-manifest, so the rollback (which
+    deletes only the manifest) does not touch it — a shared scope is never deleted."""
+    problems = _failed(run, key)["subject_scope"]
+    assert not problems, (
+        f"the subject scope {uc1.SUBJECT_SCOPE!r} is not in place after the rollback of {key}: {problems}"
+    )
 
 
 @pytest.mark.parametrize("key", ["agent_failed", "tool_failed"])
@@ -374,8 +423,8 @@ def test_failure_logged_and_dead_lettered(run: dict, key: str) -> None:
 
 
 def test_reonboarding_lifts_agent_quarantine(run: dict) -> None:
-    """A successful re-onboarding (the seam restored, the trigger re-fired) writes the real CR over the
-    no-rules CR and re-enables the client, so ``dev-user`` reaches the agent again."""
+    """A successful re-onboarding (the seam restored, the trigger re-fired) writes the agent's CR again
+    (with grants) and re-enables the client, so ``dev-user`` reaches the agent again."""
     lifted = _phase(run, "agent_lifted")
     assert uc1.cr_has_grants(lifted["cr"]), f"the agent's CR has no grants after the lift: {lifted['cr']}"
     assert (lifted["client"] or {}).get("enabled") is True, "the agent's client was not re-enabled"
@@ -397,10 +446,10 @@ def _result(body: str) -> dict | None:
 
 
 def test_mcp_session_allowed_for_granted_user(run: dict) -> None:
-    """For ``dev-user`` (a grant on some tool of the target) the whole MCP session passes the agent's
-    outbound: ``initialize`` and ``tools/list`` return a ``result`` frame (``tools/list`` names every
-    tool), the ``notifications/initialized`` notification is accepted, and the ``tools/call`` reaches
-    the tool."""
+    """For ``dev-user`` (a grant on some tool of the target) the whole MCP session passes the tool check
+    (target side: github-tool's inbound, D26; agent side: the agent's outbound session rule):
+    ``initialize`` and ``tools/list`` return a ``result`` frame (``tools/list`` names every tool), the
+    ``notifications/initialized`` notification is accepted, and the ``tools/call`` reaches the tool."""
     session = _phase(run, "session")["dev-user"]
     for method in ("initialize", "notifications/initialized", "tools/list", "tools/call"):
         decision, code, body = session[method]
@@ -413,7 +462,8 @@ def test_mcp_session_allowed_for_granted_user(run: dict) -> None:
 
 def test_mcp_session_denied_for_ungranted_user(run: dict) -> None:
     """For ``devops-user`` (no grant on any tool) the session methods are denied: no tool of the target
-    passes the per-tool check, so the session rule does not fire (it is not an allow-all)."""
+    passes the per-tool check, so the session rule does not fire (it is not an allow-all). Under target
+    side the deny is github-tool's inbound 403; under agent side the agent's outbound error frame."""
     session = _phase(run, "session")["devops-user"]
     for method in ("initialize", "tools/list", "tools/call"):
         decision, code, body = session[method]
@@ -426,26 +476,46 @@ def test_mcp_session_denied_for_ungranted_user(run: dict) -> None:
 
 
 def test_failed_tool_has_no_cr(run: dict) -> None:
-    """A tool never has an ``AuthorizationPolicy`` CR, and the quarantine does not write one for it."""
-    assert _failed(run, "tool_failed")["cr"] is None, f"unexpected AuthorizationPolicy CR {TOOL!r}"
+    """The quarantine deletes the tool's CR (D20) under both sides. Phase 3 recorded the CR that the
+    tool's onboarding wrote (every managed service has a CR), so "no CR" is a real transition."""
+    onboarded = _phase(run, "tool_onboarded")["tool_cr"]
+    assert uc1.cr_has_request_packages(onboarded), f"phase 3: github-tool had no CR with both packages: {onboarded}"
+    policies = _failed(run, "tool_failed")["cr"]
+    assert policies is None, f"the quarantined tool still has an AuthorizationPolicy CR {TOOL!r}: {policies}"
 
 
-def test_failed_tool_removed_from_agent_outbound_cr(run: dict) -> None:
-    """The quarantine re-derives the agent that targeted the tool: its outbound Rego no longer grants
-    any user or the agent a tool of the failed tool (every outbound grant binding is empty — the tool
-    was its only target), while the agent's own inbound grants stay."""
+def test_failed_tool_agent_cr_by_side(run: dict) -> None:
+    """The agent's CR after the tool's quarantine, by the live enforcement side:
+
+    * **target side** — unchanged since phase 3 (order-agnostic: ``uc1.cr_canonical``; the order of a
+      list or of map keys is not a change). The tool owns no role, so the footprint purge changes
+      no other SPM and the agent is not affected: its inbound grants stay, and its outbound stays a
+      pass-through (the callee decides, D24).
+    * **agent side** — the quarantine re-derives the agent that targeted the tool: its outbound Rego no
+      longer grants any user or the agent a tool of the failed tool (every outbound grant binding is
+      empty — the tool was its only target), while its own inbound grants stay."""
     policies = _failed(run, "tool_failed")["agent_cr"]
     assert policies is not None, f"the agent's CR {AGENT!r} is missing"
-    outbound = policies.get(uc1.CR_OUTBOUND_PATH, "")
-    for var in uc1.OUTBOUND_GRANT_BINDINGS:
-        assert uc1.rego_binding_empty(outbound, var) is True, f"agent outbound {var} still grants: {outbound}"
     assert uc1.cr_has_grants(policies), "the agent lost its inbound grants in the tool's quarantine"
+    if run["side"] == uc1.AGENT_SIDE:
+        outbound = policies.get(uc1.CR_OUTBOUND_PATH, "")
+        for var in uc1.AGENT_SIDE_OUTBOUND_GRANT_BINDINGS:
+            assert uc1.rego_binding_empty(outbound, var) is True, f"agent outbound {var} still grants: {outbound}"
+        return
+    assert uc1.rego_is_pass_through(policies.get(uc1.CR_OUTBOUND_PATH)), (
+        f"target side: the agent's outbound is not a pass-through: {policies.get(uc1.CR_OUTBOUND_PATH)!r}"
+    )
+    before = _phase(run, "tool_onboarded")["agent_cr"]
+    assert uc1.cr_canonical(policies) == uc1.cr_canonical(before), (
+        "target side: the tool's quarantine changed the agent's CR (no agent SPM changed)"
+    )
 
 
 def test_failed_tool_outbound_call_denied(run: dict) -> None:
-    """The ``dev-user`` call to the tool that phase 3 allowed is now blocked through the agent's
-    outbound — an OPA deny, or a token-exchange refusal to the disabled tool's audience (module
-    docstring); never ``allow``, never a transport error."""
+    """The ``dev-user`` call to the tool that phase 3 allowed is now blocked — an OPA deny (target side:
+    github-tool has no CR, so the combiner denies on its inbound, D20; agent side: the agent's outbound),
+    or a token-exchange refusal to the disabled tool's audience (module docstring); never ``allow``,
+    never a transport error."""
     decision, code, body = _failed(run, "tool_failed")["outbound"]
     assert decision in ("deny", "refused"), (
         f"dev-user outbound {PROBE_TOOL} to the quarantined tool: {decision!r} (HTTP {code}, body={body[:300]!r})"

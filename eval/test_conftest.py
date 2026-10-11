@@ -8,9 +8,12 @@ per-suite branching worth protecting on its own. Unmarked, runs in the default f
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
-from eval.conftest import _scale_run_matches_fixed_100
+import eval.conftest as eval_conftest
+from eval.conftest import _scale_run_matches_fixed_100, _unscored_reason, _write_trend_log, pytest_runtest_logreport
 
 
 @pytest.fixture(autouse=True)
@@ -73,3 +76,103 @@ class TestScaleRunMatchesFixed100:
         assert not _scale_run_matches_fixed_100("scale_total_corpus_e2e")
         assert _scale_run_matches_fixed_100("scale_per_decision_prb")
         assert _scale_run_matches_fixed_100("scale_per_decision_e2e")
+
+
+class TestWriteTrendLogPartialScaleSuites:
+    """``_write_trend_log`` returns the Scale suites whose row it tagged "partial"; the report
+    header names exactly these, so the dashboard and the trend log agree."""
+
+    @pytest.fixture(autouse=True)
+    def rows(self, monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
+        """The ``(suite, run_type)`` of each row that ``_write_trend_log`` appends (no file write)."""
+        rows: list[tuple[str, str]] = []
+        monkeypatch.setattr(eval_conftest, "append_row", lambda suite, _m, run_type: rows.append((suite, run_type)))
+        monkeypatch.setattr(eval_conftest, "pool_scale_metrics", lambda entries: {})
+        monkeypatch.setattr(eval_conftest, "pool_correctness_metrics", lambda entries: {})
+        return rows
+
+    def _ran(self, monkeypatch: pytest.MonkeyPatch, *names: str) -> None:
+        reports = {}
+        for name in names:
+            nodeid = f"eval/test_policy_pipeline_scale.py::{name}"
+            props = [("structural_pass", True)] if "structural" in name else [("true_positives", 1)]
+            reports[nodeid] = SimpleNamespace(nodeid=nodeid, user_properties=props)
+        monkeypatch.setattr(eval_conftest, "_reports", reports)
+
+    def test_a_full_fixed_100_run_is_not_partial(
+        self, monkeypatch: pytest.MonkeyPatch, rows: list[tuple[str, str]]
+    ) -> None:
+        self._ran(monkeypatch, "test_scale_total_corpus_structural_prb", "test_scale_total_corpus_correctness_prb")
+        assert _write_trend_log() == []
+        assert rows == [("scale_total_corpus_prb", "regression")]
+
+    def test_a_reduced_size_run_is_partial(self, monkeypatch: pytest.MonkeyPatch, rows: list[tuple[str, str]]) -> None:
+        self._ran(monkeypatch, "test_scale_total_corpus_structural_prb", "test_scale_total_corpus_correctness_prb")
+        monkeypatch.setenv("SCALE_TOTAL_CORPUS_SIZE", "10")
+        partial = _write_trend_log()
+        assert partial == ["scale_total_corpus_prb"]
+        assert partial == sorted(suite for suite, run_type in rows if run_type == "partial")
+
+    def test_a_run_of_only_one_half_is_partial(
+        self, monkeypatch: pytest.MonkeyPatch, rows: list[tuple[str, str]]
+    ) -> None:
+        self._ran(monkeypatch, "test_scale_per_decision_correctness_e2e")
+        partial = _write_trend_log()
+        assert partial == ["scale_per_decision_e2e"]
+        assert partial == sorted(suite for suite, run_type in rows if run_type == "partial")
+
+    def test_a_skipped_suite_records_nothing_so_is_not_named(
+        self, monkeypatch: pytest.MonkeyPatch, rows: list[tuple[str, str]]
+    ) -> None:
+        nodeid = "eval/test_policy_pipeline_scale.py::test_scale_total_corpus_correctness_prb"
+        monkeypatch.setattr(eval_conftest, "_reports", {nodeid: SimpleNamespace(nodeid=nodeid, user_properties=[])})
+        monkeypatch.setenv("SCALE_TOTAL_CORPUS_SIZE", "10")
+        assert _write_trend_log() == []
+        assert rows == []
+
+    def test_a_count_mismatch_between_the_halves_is_partial(
+        self, monkeypatch: pytest.MonkeyPatch, rows: list[tuple[str, str]]
+    ) -> None:
+        # Two structural entries (as if the test were parametrized) against one correctness entry.
+        self._ran(
+            monkeypatch,
+            "test_scale_total_corpus_structural_prb[a]",
+            "test_scale_total_corpus_structural_prb[b]",
+            "test_scale_total_corpus_correctness_prb",
+        )
+        partial = _write_trend_log()
+        assert partial == ["scale_total_corpus_prb"]
+        assert partial == sorted(suite for suite, run_type in rows if run_type == "partial")
+
+
+class TestUnscoredReason:
+    @pytest.mark.parametrize(
+        ("when", "expected"),
+        [
+            ("setup", "a fixture failed before the test ran"),
+            ("call", "the test failed before scoring"),
+        ],
+    )
+    def test_names_only_what_the_phase_makes_sure(self, when: str, expected: str) -> None:
+        assert _unscored_reason(SimpleNamespace(when=when), detail=None) == expected
+
+    def test_points_at_failure_only_when_the_entry_has_one(self) -> None:
+        assert _unscored_reason(SimpleNamespace(when="call"), detail="boom").endswith(" (see Failure)")
+        assert not _unscored_reason(SimpleNamespace(when="call"), detail=None).endswith(" (see Failure)")
+
+
+class TestTeardownAfterAFailure:
+    @pytest.mark.parametrize("call_outcome", ["failed", "passed", "skipped"])
+    def test_a_teardown_failure_keeps_the_call_result(self, monkeypatch: pytest.MonkeyPatch, call_outcome: str) -> None:
+        monkeypatch.setattr(eval_conftest, "_reports", {})
+        monkeypatch.setattr(eval_conftest, "_teardown_failures", {})
+        nodeid = "eval/test_policy_pipeline_scale.py::test_scale_total_corpus_correctness_prb"
+        call = SimpleNamespace(nodeid=nodeid, when="call", outcome=call_outcome, longrepr=None)
+        crash = SimpleNamespace(reprcrash=SimpleNamespace(message="teardown boom"))
+        teardown = SimpleNamespace(nodeid=nodeid, when="teardown", outcome="failed", longrepr=crash)
+
+        pytest_runtest_logreport(call)
+        pytest_runtest_logreport(teardown)
+
+        assert eval_conftest._reports[nodeid] is call
+        assert eval_conftest._teardown_failures[nodeid] == "teardown boom"

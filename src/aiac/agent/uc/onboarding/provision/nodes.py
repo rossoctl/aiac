@@ -11,14 +11,15 @@ as an `HTTPException(502, ...)` whose message names the workload and the specifi
 missing/invalid label — actionable, never silent.
 """
 
-import os
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from fastapi import HTTPException
 
 from aiac.idp.configuration.api import Configuration
 from aiac.idp.configuration.models import ServiceType
+from aiac.shared.env import env_num
 from aiac.shared.upstream import run_upstream
 
 from .kube import list_agentcards, list_pods, read_service
@@ -30,11 +31,12 @@ _MCP_LABEL = "protocol.rossoctl.io/mcp"
 
 
 @dataclass(frozen=True)
-class _WaitConfig:
-    """A bounded deploy->onboard race-tolerance poll. ``attempts_env``/``backoff_env`` name the
+class WaitConfig:
+    """A bounded onboarding race-tolerance poll. ``attempts_env``/``backoff_env`` name the
     environment knobs (read at poll time, falling back to the defaults on an unset / non-numeric /
-    below-minimum value). Bundled so the two onboarding races below share one poll mechanic
-    (``_poll_until_ready``) instead of each repeating the read-env + range + backoff loop."""
+    non-finite / below-minimum value). Bundled so the onboarding races (the two below, and the orchestrator's
+    ``CLIENT_WAIT``) share one poll mechanic (``poll_until_ready``) instead of each repeating the
+    read-env + range + backoff loop."""
 
     attempts_env: str
     backoff_env: str
@@ -49,14 +51,14 @@ class _WaitConfig:
 # 30 attempts after a ~30s budget was observed losing this race by about a second: a tool's pod was
 # created at 14:28:17Z and the wait gave up at 14:28:46Z, because the operator had not yet reconciled
 # its AgentRuntime. Still well under the NATS ACK_WAIT; tests set fast.
-_LABEL_WAIT = _WaitConfig("ONBOARD_LABEL_WAIT_ATTEMPTS", "ONBOARD_LABEL_WAIT_BACKOFF", 30, 2.0)
+_LABEL_WAIT = WaitConfig("ONBOARD_LABEL_WAIT_ATTEMPTS", "ONBOARD_LABEL_WAIT_BACKOFF", 30, 2.0)
 
 # Deploy->onboard race tolerance for the AgentCard skill sync — a SECOND, later race than the label one
 # above. The operator syncs the fetched A2A card onto ``status.card.skills`` only AFTER the agent pod is
 # Ready, which lags the Keycloak-client registration that triggers onboarding. So ``analyze_agent`` can
 # run while ``status.card.skills`` is still empty. An absent card / empty skill list is therefore a
 # transient not-ready state, re-polled before we fall back to a default access scope. Same ≈30s slack.
-_CARD_WAIT = _WaitConfig("ONBOARD_CARD_WAIT_ATTEMPTS", "ONBOARD_CARD_WAIT_BACKOFF", 15, 2.0)
+_CARD_WAIT = WaitConfig("ONBOARD_CARD_WAIT_ATTEMPTS", "ONBOARD_CARD_WAIT_BACKOFF", 15, 2.0)
 
 # Deploy->onboard race tolerance for the tool's MCP manifest — the THIRD race. A tool can answer
 # ``tools/list`` with an EMPTY manifest while it is still starting, so an empty answer is re-polled
@@ -65,26 +67,16 @@ _CARD_WAIT = _WaitConfig("ONBOARD_CARD_WAIT_ATTEMPTS", "ONBOARD_CARD_WAIT_BACKOF
 # ``AIAC_MCP_DISCOVERY_READY_TIMEOUT``), and any failure it raises is final — nesting this poll around
 # that wait multiplied the worst case past the NATS ACK_WAIT. ≈60s of backoff, plus one quick call
 # per look; well under ACK_WAIT.
-_MCP_WAIT = _WaitConfig("ONBOARD_MCP_WAIT_ATTEMPTS", "ONBOARD_MCP_WAIT_BACKOFF", 30, 2.0)
+_MCP_WAIT = WaitConfig("ONBOARD_MCP_WAIT_ATTEMPTS", "ONBOARD_MCP_WAIT_BACKOFF", 30, 2.0)
 
 
-def _env_num(name: str, default, cast, minimum):
-    """Read ``name`` from the environment, tolerant of an unset / non-numeric / below-``minimum``
-    value — a bad value must not crash onboarding, it falls back to the default."""
-    try:
-        value = cast(os.environ[name])
-    except (KeyError, TypeError, ValueError):
-        return default
-    return value if value >= minimum else default
-
-
-def _poll_until_ready(probe, cfg: _WaitConfig):
+def poll_until_ready(probe, cfg: WaitConfig):
     """Re-poll ``probe`` up to ``cfg`` attempts, backing off between looks (skipped after the last).
     ``probe`` returns a non-``None`` 'ready' result to stop, or ``None`` to retry; it may raise to fail
     the whole wait immediately (a real error, never a race). Returns the ready result, or ``None`` once
     the attempt budget is exhausted — the caller then decides what an exhausted wait means."""
-    attempts = _env_num(cfg.attempts_env, cfg.default_attempts, int, minimum=1)
-    backoff = _env_num(cfg.backoff_env, cfg.default_backoff, float, minimum=0.0)
+    attempts = env_num(cfg.attempts_env, cfg.default_attempts, int, minimum=1)
+    backoff = env_num(cfg.backoff_env, cfg.default_backoff, float, minimum=0.0)
     for attempt in range(attempts):
         result = probe()
         if result is not None:
@@ -114,34 +106,35 @@ _MCP_TIMEOUT = (5, 30)
 # How long discovery waits for the tool's MCP endpoint to become ready. The operator registers the
 # tool's Keycloak client (which fires the onboarding event) while it still rolls the tool pod onto
 # the AuthBridge-injected template, so the Service can have no ready endpoint for some seconds
-# ("connection refused"), or the sidecar can answer 502/503/504 while the app starts. Failing here
-# is retryable, but the NATS redelivery comes only after ACK_WAIT (600 s), so discovery waits for
-# the endpoint instead. Read from the env at call time; keep it well below ACK_WAIT.
+# ("connection refused"), or the sidecar can answer 502/503/504 while the app starts. Also, the
+# tool's OPA loads the bootstrap CR (written just before Provision, checkpoint B1) only at its next
+# bundle poll (10 s to 120 s); until then the tool's inbound denies the discovery call with 403
+# (D20). This is so under both sides: under agent side the tool also has no CR until its OPA loads
+# the pass-through bootstrap CR. Failing here is retryable, but the NATS redelivery comes only after
+# ACK_WAIT (600 s), so discovery waits for the endpoint instead. The default covers the bundle poll.
+# Read from the env at call time; keep it well below ACK_WAIT.
 _MCP_READY_TIMEOUT_ENV = "AIAC_MCP_DISCOVERY_READY_TIMEOUT"
-_MCP_READY_TIMEOUT_DEFAULT = 120.0
+_MCP_READY_TIMEOUT_DEFAULT = 180.0
 _MCP_READY_INTERVAL = 3.0  # seconds between readiness attempts (patched in unit tests)
 
 
 def _mcp_ready_timeout() -> float:
-    """The discovery readiness budget in seconds; an unset, non-numeric or negative value falls
-    back to the default."""
-    try:
-        value = float(os.getenv(_MCP_READY_TIMEOUT_ENV, str(_MCP_READY_TIMEOUT_DEFAULT)))
-    except (TypeError, ValueError):
-        return _MCP_READY_TIMEOUT_DEFAULT
-    return value if value >= 0 else _MCP_READY_TIMEOUT_DEFAULT
+    """The discovery readiness budget in seconds; an unset, non-numeric, non-finite or negative
+    value falls back to the default."""
+    return env_num(_MCP_READY_TIMEOUT_ENV, _MCP_READY_TIMEOUT_DEFAULT, float, minimum=0.0)
 
 
 def _endpoint_not_ready(exc: Exception) -> bool:
     """True for the failures of an MCP endpoint that is not ready yet: a connection-level error
-    (refused, reset, connect timeout) or a 502/503/504 from the sidecar. A read timeout (the tool
-    accepted the connection and hangs) and any other status are not waited for."""
+    (refused, reset, connect timeout), a 502/503/504 from the sidecar, or a 403 from the tool's
+    inbound OPA before it loads the bootstrap CR. A read timeout (the tool accepted the connection
+    and hangs) and any other status are not waited for."""
     import requests
 
     if isinstance(exc, requests.ConnectionError):  # includes ConnectTimeout
         return True
     response = getattr(exc, "response", None)
-    return isinstance(exc, requests.HTTPError) and getattr(response, "status_code", None) in (502, 503, 504)
+    return isinstance(exc, requests.HTTPError) and getattr(response, "status_code", None) in (403, 502, 503, 504)
 
 
 def _mcp_tools_list(endpoint: str, token: str | None = None) -> list[dict]:
@@ -151,7 +144,7 @@ def _mcp_tools_list(endpoint: str, token: str | None = None) -> list[dict]:
     sidecar that validates inbound JWTs). Bounded transport retries are applied here so callers
     just map the final failure to a 502. Around them, an endpoint that is not ready yet (see
     ``_endpoint_not_ready``) is tried again every ``_MCP_READY_INTERVAL`` seconds until the
-    ``AIAC_MCP_DISCOVERY_READY_TIMEOUT`` budget ends (default 120 s)."""
+    ``AIAC_MCP_DISCOVERY_READY_TIMEOUT`` budget ends (default 180 s)."""
     import requests
 
     def _do():
@@ -177,16 +170,60 @@ def _mcp_tools_list(endpoint: str, token: str | None = None) -> list[dict]:
         time.sleep(_MCP_READY_INTERVAL)
 
 
-def _select_pod(pods, workload_name: str):
-    """The pod owned by ``workload_name``: a Deployment's ReplicaSet (name prefix
-    ``{workload}-``), or a StatefulSet / Sandbox whose name equals ``workload``."""
-    for pod in pods:
-        for owner in getattr(pod.metadata, "owner_references", None) or []:
-            if owner.kind == "ReplicaSet" and owner.name.startswith(f"{workload_name}-"):
-                return pod
-            if owner.kind in ("StatefulSet", "Sandbox") and owner.name == workload_name:
-                return pod
-    return None
+def _owned_by(pod, workload_name: str) -> bool:
+    """True if ``workload_name`` owns ``pod``: a Deployment's ReplicaSet (``{workload}-{hash}``: the
+    name before its last ``-`` equals ``workload``, so ``github-tool-5d8f9`` is not a ReplicaSet of
+    ``github``; the pod-template hash has no ``-``), or a StatefulSet / Sandbox whose name equals
+    ``workload``."""
+    for owner in getattr(pod.metadata, "owner_references", None) or []:
+        if owner.kind == "ReplicaSet" and owner.name.rsplit("-", 1)[0] == workload_name:
+            return True
+        if owner.kind in ("StatefulSet", "Sandbox") and owner.name == workload_name:
+            return True
+    return False
+
+
+def _owned_pods(pods, workload_name: str) -> list:
+    """Every pod owned by ``workload_name`` (see ``_owned_by``), in list order."""
+    return [pod for pod in pods if _owned_by(pod, workload_name)]
+
+
+def split_client_name(service_id: str, name: str | None) -> tuple[str, str]:
+    """``(namespace, workload_name)`` from the Keycloak ``client.name`` (``<namespace>/<workload>``).
+    A name with no ``/`` raises ``HTTPException(502)``: the pod of the service cannot be found."""
+    name = name or ""
+    if "/" not in name:
+        raise HTTPException(
+            502,
+            f"client.name {name!r} for service {service_id!r} has no '/': namespace/workload_name unrecoverable",
+        )
+    namespace, workload_name = name.split("/", 1)
+    return namespace, workload_name
+
+
+def _pod_service_type(pod, workload_name: str) -> ServiceType | None:
+    """The service type from the operator's ``rossoctl.io/type`` label of ``pod``, or ``None`` while
+    the label is absent (a deploy->onboard race). A label that is present with a value other than
+    ``agent``/``tool`` is a real misconfiguration that no wait can fix: ``HTTPException(502)`` now."""
+    label = (getattr(pod.metadata, "labels", None) or {}).get(_TYPE_LABEL)
+    if not label:
+        return None
+    try:
+        return ServiceType(label.capitalize())
+    except ValueError:
+        raise HTTPException(
+            502,
+            f"workload {workload_name!r}: {_TYPE_LABEL} label invalid (got {label!r}, expected 'agent' or 'tool')",
+        )
+
+
+def _label_missing_detail(workload_name: str, pod) -> str:
+    """The 502 detail of an exhausted wait for the ``rossoctl.io/type`` label of ``pod``."""
+    label = (getattr(pod.metadata, "labels", None) or {}).get(_TYPE_LABEL)
+    return (
+        f"workload {workload_name!r}: {_TYPE_LABEL} label missing or invalid "
+        f"(got {label!r}, expected 'agent' or 'tool')"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -194,23 +231,28 @@ def _select_pod(pods, workload_name: str):
 # --------------------------------------------------------------------------- #
 def classify_service(state: OnboardingProvisionState) -> dict:
     """Resolve identity and determine service type from the operator's `rossoctl.io/type`
-    pod label (authoritative — not the entity_id format)."""
+    pod label (authoritative — not the entity_id format).
+
+    The UC1 Orchestrator has already read the service and its pod label (the precondition checks run
+    first), and gives ``namespace``, ``workload_name`` and ``service_type`` in the state: then this
+    node makes no IdP read and no second pod wait."""
     service_id = state.trigger.entity_id
+    if state.service_type is not None and state.namespace and state.workload_name:
+        return {
+            "service_id": service_id,
+            "namespace": state.namespace,
+            "workload_name": state.workload_name,
+            "service_type": state.service_type,
+        }
 
     try:
         service = _config().get_service(service_id)
     except Exception as e:
         raise HTTPException(502, f"IdP config unavailable resolving service {service_id!r}: {e}")
 
-    name = service.name or ""
-    if "/" not in name:
-        raise HTTPException(
-            502,
-            f"client.name {name!r} for service {service_id!r} has no '/': namespace/workload_name unrecoverable",
-        )
-    namespace, workload_name = name.split("/", 1)
+    namespace, workload_name = split_client_name(service_id, service.name)
 
-    service_type = _await_service_type(namespace, workload_name)
+    service_type, _ = await_labelled_pods(namespace, workload_name)
 
     return {
         "service_id": service_id,
@@ -220,50 +262,52 @@ def classify_service(state: OnboardingProvisionState) -> dict:
     }
 
 
-def _await_service_type(namespace: str, workload_name: str) -> ServiceType:
-    """Resolve the service type from the operator's ``rossoctl.io/type`` pod label, tolerating the
-    deploy->onboard RACE (the label may not be patched yet — see the module knobs above).
+def await_labelled_pods(
+    namespace: str, workload_name: str, settled: Callable[[ServiceType, list], bool] | None = None
+) -> tuple[ServiceType, list]:
+    """The service type (from the operator's ``rossoctl.io/type`` pod label) and the live (not
+    terminating) pods of ``workload_name``, tolerating the deploy->onboard RACE (the pod or its label
+    may not be there yet — see the module knobs above).
 
     A briefly-absent label — or a not-yet-created pod — is a transient not-ready state, re-polled
     a bounded number of times. A label present with an INVALID value (not ``agent``/``tool``) is a
-    real misconfiguration that no wait can fix, so it fails immediately. Retries exhausted -> 502
-    naming the workload and the label (unchanged contract for a genuinely never-labelled workload)."""
+    real misconfiguration that no wait can fix, so it fails immediately. The poll ends at the first
+    look that finds a labelled pod for which ``settled(service_type, pods)`` is true (with no
+    ``settled``, at the first labelled pod). Retries exhausted -> the labelled ``(service_type,
+    pods)`` of the last look if it had one (the caller reports them), else 502 naming the workload
+    and the label (unchanged contract for a genuinely never-labelled workload). Provision's
+    ``classify_service`` and the UC1 precondition checks (D30) share this wait."""
     no_pod_detail = f"no pod owned by workload {workload_name!r} in namespace {namespace!r}"
     detail = no_pod_detail
+    last: tuple[ServiceType, list] | None = None
 
     def _probe():
-        nonlocal detail
-        # Re-derive per attempt so the exhausted-wait 502 reflects the LAST-seen state: a pod that
+        nonlocal detail, last
+        # Re-derive per attempt so the exhausted wait reflects the LAST-seen state: a pod that
         # disappears mid-poll must report "no pod", not a stale "label missing" from an earlier attempt.
-        detail = no_pod_detail
+        detail, last = no_pod_detail, None
         try:
-            pods = list_pods(namespace)
+            items = list_pods(namespace)
         except Exception as e:
             raise HTTPException(502, f"Kubernetes pod LIST failed in namespace {namespace!r}: {e}")
 
-        pod = _select_pod(pods, workload_name)
-        if pod is not None:
-            label = (getattr(pod.metadata, "labels", None) or {}).get(_TYPE_LABEL)
-            if label:
-                try:
-                    return ServiceType(label.capitalize())
-                except ValueError:
-                    # Present but not agent/tool: a real misconfiguration, never a race — fail now.
-                    raise HTTPException(
-                        502,
-                        f"workload {workload_name!r}: {_TYPE_LABEL} label invalid "
-                        f"(got {label!r}, expected 'agent' or 'tool')",
-                    )
-            detail = (
-                f"workload {workload_name!r}: {_TYPE_LABEL} label missing or invalid "
-                f"(got {label!r}, expected 'agent' or 'tool')"
-            )
-        return None
+        pods = [p for p in _owned_pods(items, workload_name) if getattr(p.metadata, "deletion_timestamp", None) is None]
+        if not pods:
+            return None
+        # Present but not agent/tool raises now: a real misconfiguration, never a race.
+        service_type = _pod_service_type(pods[0], workload_name)
+        if service_type is None:
+            detail = _label_missing_detail(workload_name, pods[0])
+            return None
+        last = (service_type, pods)
+        return last if settled is None or settled(service_type, pods) else None
 
-    service_type = _poll_until_ready(_probe, _LABEL_WAIT)
-    if service_type is None:
-        raise HTTPException(502, detail)
-    return service_type
+    ready = poll_until_ready(_probe, _LABEL_WAIT)
+    if ready is not None:
+        return ready
+    if last is not None:
+        return last
+    raise HTTPException(502, detail)
 
 
 def _await_agent_skills(namespace: str, workload: str):
@@ -298,7 +342,7 @@ def _await_agent_skills(namespace: str, workload: str):
         skills = (((last_card or {}).get("status") or {}).get("card") or {}).get("skills", [])
         return (last_card, skills) if skills else None
 
-    result = _poll_until_ready(_probe, _CARD_WAIT)
+    result = poll_until_ready(_probe, _CARD_WAIT)
     return result if result is not None else (last_card, [])
 
 
@@ -402,7 +446,7 @@ def analyze_tool(state: OnboardingProvisionState) -> dict:
         except Exception as e:
             raise HTTPException(502, f"MCP tools/list failed at {endpoint}: {e}")
 
-    tools = _poll_until_ready(_probe, _MCP_WAIT)
+    tools = poll_until_ready(_probe, _MCP_WAIT)
     if tools is None:
         raise HTTPException(
             502,
@@ -430,16 +474,24 @@ def analyze_tool(state: OnboardingProvisionState) -> dict:
 
 
 def provision_service(state: OnboardingProvisionState) -> dict:
-    """Write the derived roles + scopes into the IdP (idempotent create-or-get + map) and
-    persist the discovered service type onto the Keycloak client, via the idp-library.
+    """Write the derived roles + scopes into the IdP (idempotent create-or-get + map), link the
+    shared subject scope ``aiac-username-sub`` to the client (D31), and persist the discovered
+    service type onto the Keycloak client, via the idp-library.
+
+    The subject-scope link (``link_subject_scope``, idempotent) runs for agents and tools alike,
+    before ``set_service_type``. It makes an exchanged token have ``sub`` = username. A failure of
+    the link is a ``502`` and the type is then not set.
 
     Returns the `ServiceProvision` + `service_type` to the Orchestrator, plus the
     **created-manifest** (`created_roles` / `created_scopes`): exactly the entities this run
     *created*, not the ones it *reused by name*. The idempotent `create_service_role` /
-    `create_service_scope` return the resolved entity whether they created or reused it, so a
-    name is classified as created only when it was **absent** from the realm before this run
-    (snapshot taken before the create loop). The Orchestrator's compensating rollback deletes
-    only this manifest, so a role/scope another service already owns is never torn down."""
+    `create_service_scope` return `(entity, created)`, and an entity goes into the manifest only
+    when `created` is true. A reuse is not created: an entity that was there before this run, and
+    also one that a concurrent Provision of another service with the same workload name created
+    after this run's check (its create then answers `409`, and the library reuses the entity,
+    REJ-02). The Orchestrator's compensating rollback deletes only this manifest, so a role/scope
+    that another service created is never torn down. The subject scope is shared by all managed
+    clients, so it is never in the manifest."""
     config = _config()
     provision = state.service_provision
     service_id = state.service_id
@@ -447,17 +499,20 @@ def provision_service(state: OnboardingProvisionState) -> dict:
     created_roles = []
     created_scopes = []
     try:
-        existing_role_names = {r.name for r in config.get_roles()} if provision.roles else set()
         for role in provision.roles:
-            resolved = config.create_service_role(service_id, role)
-            if role.name not in existing_role_names:
-                created_roles.append(resolved)
-        existing_scope_names = {s.name for s in config.get_scopes()} if provision.scopes else set()
+            resolved_role, created = config.create_service_role(service_id, role)
+            if created:
+                created_roles.append(resolved_role)
         for scope in provision.scopes:
-            resolved = config.create_service_scope(service_id, scope)
-            if scope.name not in existing_scope_names:
-                created_scopes.append(resolved)
+            resolved_scope, created = config.create_service_scope(service_id, scope)
+            if created:
+                created_scopes.append(resolved_scope)
         service = config.get_service(service_id)
+        # D31: an exchanged token gets sub = username only from the scopes of the agent client
+        # (the requester), so every managed client links aiac-username-sub. Link it before
+        # set_service_type, so that every client with client.type has the link. The scope is
+        # shared by all managed clients, so it is never in the created-manifest.
+        config.link_subject_scope(service)
         config.set_service_type(service, state.service_type)
     except HTTPException:
         raise

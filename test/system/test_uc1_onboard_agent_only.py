@@ -4,7 +4,7 @@ The simplest rung (issue ``testing/5.4.1-uc1-onboard-agent-only.md``; spec
 ``docs/testing/uc1-onboarding-pipeline.md``): onboard **only** the ``github-agent`` **event-driven**,
 by deploying its workload (deploy → the rossoctl operator registers a Keycloak client → Keycloak
 emits ``CLIENT_CREATED`` → the AIAC SPI ``aiac-event-listener`` publishes on NATS → the agent's
-consumer runs ``onboard_service`` — the same handler the removed ``POST /apply`` once called). The
+consumer runs ``onboard_and_apply`` — the same handler the removed ``POST /apply`` once called). The
 ``github-tool`` is **not deployed** (deploying it would onboard it), so no tool is onboarded. Then
 assert the agent-side outcome by driving **real HTTP requests through AuthBridge** and reading the
 **real OPA plugin's** allow/deny (handoff 08; live loop shape in ``k8s/opa-kind-runbook.md``). Proves
@@ -15,11 +15,13 @@ tool onboarded there is no real ``user -> agent -> tool`` call to make, so an ou
 a pure counterfactual. On a tool-less rung token-exchange short-circuits (the agent client holds no
 ``github-tool`` audience grant, because the operator creates that ``*-aud`` scope only on **tool**
 deploy), so the call is refused **before OPA is ever consulted** — an outbound probe would observe a
-Keycloak audience refusal, not the AIAC OPA policy this rung exists to prove. The *emptiness* of the
-outbound user gate (no tool grants generated) is asserted where it is deterministic and real: at the
-unit level in ``test/unit/agent/uc/onboarding/test_uc1_grant_set_oracles.py`` (the grant-set oracle)
-and by ``test_no_tool_scopes_provisioned`` below (no ``github-tool.*`` scope in Keycloak). Rungs 2 & 3
-onboard the tool and so exercise the real outbound OPA gate.
+Keycloak audience refusal, not the AIAC OPA policy this rung exists to prove. With no tool onboarded
+there is no tool check: under target side (the default) the agent's outbound is a pass-through and no
+tool CR exists; under agent side the agent's outbound user gate is empty. That emptiness (no tool
+grants generated) is asserted where it is deterministic and real: at the unit level in
+``test/unit/agent/uc/onboarding/test_uc1_grant_set_oracles.py`` (the grant-set oracle) and by
+``test_no_tool_scopes_provisioned`` below (no ``github-tool.*`` scope in Keycloak). Rungs 2 & 3
+onboard the tool and so exercise the real tool check (github-tool's inbound under target side).
 
 Single live rossoctl/Kind cluster with the AuthBridge OPA pipeline wired into both legs, plus the
 event path (NATS broker + ``aiac-event-listener`` SPI); it skips cleanly when either is unwired. The

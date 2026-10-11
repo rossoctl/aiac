@@ -191,6 +191,25 @@ class TestGetServicePoliciesByRole:
 
 
 # ---------------------------------------------------------------------------
+# GET /policy/services  (no role — every SPM, C3)
+# ---------------------------------------------------------------------------
+
+
+class TestListAllServicePolicies:
+    def test_returns_every_spm_when_no_role_is_given(self, client):
+        _preload(_spm("svc-a", role_id="user-role"))
+        _preload(_spm("svc-b", role_id="other-role"))
+        resp = client.get("/policy/services")
+        assert resp.status_code == 200
+        assert sorted(s["service_id"] for s in resp.json()) == ["svc-a", "svc-b"]
+
+    def test_returns_empty_list_when_cache_empty(self, client):
+        resp = client.get("/policy/services")
+        assert resp.status_code == 200
+        assert resp.json() == []
+
+
+# ---------------------------------------------------------------------------
 # POST /policy/services/{service_id}  (upsert)
 # ---------------------------------------------------------------------------
 

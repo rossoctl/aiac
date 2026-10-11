@@ -16,11 +16,13 @@
 # Checks, mirroring the runbook 1:1:
 #   Preflight  kubectl present, cluster reachable, agent namespace present
 #   Verify 1   'name: opa' appears twice in authbridge-runtime-config (both legs)
-#   Verify 2   AuthorizationPolicy CRD established + global 'default' CR present
+#   Verify 2   AuthorizationPolicy CRD established + global 'default' CR present,
+#              and it is the changed combiner (D20): 0 request fallback rules (a
+#              pod with no client CR is denied), 2 response fallback rules
 #   Verify 3   bundle-service pod Running
 #   Verify 4   from a throwaway pod in the agent namespace: /readyz 200, /bundles 200
-#   Verify 5   every existing agent pod's authbridge-proxy runs IMAGE_TAG and is
-#              Ready (skipped when the namespace has no agent pods)
+#   Verify 5   every existing agent and tool pod's authbridge-proxy runs IMAGE_TAG
+#              and is Ready (skipped when the namespace has no such pods)
 #
 # Requires: kubectl (kind, only to re-export a stale kubeconfig).
 # Env vars (runbook defaults shown):
@@ -46,7 +48,7 @@ IMAGE_TAG="${IMAGE_TAG:-localhost/authbridge:local}"
 READY_SECS="${READY_SECS:-120}"
 KIND_CLUSTER="${KIND_CLUSTER:-rossoctl}"
 
-AGENT_LABEL="rossoctl.io/type=agent"
+WORKLOAD_LABEL='rossoctl.io/type in (agent,tool)'
 BUNDLE_URL="http://bundle-service.${SYS_NS}.svc.cluster.local:8080"
 
 # ── Output helpers ──────────────────────────────────────────────────────────
@@ -116,7 +118,7 @@ OPA_COUNT=$(kubectl get configmap authbridge-runtime-config -n "$NS" \
 pass "'name: opa' occurrences in authbridge-runtime-config: got '2' (expected '2')"
 
 # ── Verify 2 — CRD + global policy ───────────────────────────────────────────
-step "Verify 2 — AuthorizationPolicy CRD and the shipped global policy"
+step "Verify 2 — AuthorizationPolicy CRD and the changed global combiner (D20)"
 kubectl wait --for=condition=established --timeout=30s \
   crd/authorizationpolicies.agent.rossoctl.dev >/dev/null 2>&1 \
   || die "CRD authorizationpolicies.agent.rossoctl.dev is not established"
@@ -124,6 +126,19 @@ pass "CRD authorizationpolicies.agent.rossoctl.dev established"
 GLOBAL_SCOPE=$(kubectl get authorizationpolicy default -n "$SYS_NS" \
                  -o jsonpath='{.spec.scope}' 2>/dev/null || true)
 expect_eq "global AuthorizationPolicy 'default' scope in ${SYS_NS}" "${GLOBAL_SCOPE:-<none>}" "global"
+# The changed combiner (D20) drops `client_ok if not data.authbridge.client.<dir>.request`
+# from the two request packages and keeps it in the two response packages. The
+# AIAC Controller start check #4 (D30) makes the same check.
+COMBINER=$(kubectl get authorizationpolicy default -n "$SYS_NS" \
+             -o jsonpath='{.spec.policies[*].content}' 2>/dev/null || true)
+REQ_FALLBACK=$(printf '%s\n' "$COMBINER" \
+  | grep -cE 'client_ok if not data\.authbridge\.client\.(inbound|outbound)\.request' || true)
+RESP_FALLBACK=$(printf '%s\n' "$COMBINER" \
+  | grep -cE 'client_ok if not data\.authbridge\.client\.(inbound|outbound)\.response' || true)
+[ "$REQ_FALLBACK" = "0" ] \
+  || die "combiner request fallback rules: got '${REQ_FALLBACK}', expected '0' — the stock combiner allows a pod that has no client CR; run k8s/opa-kind-enable.sh"
+pass "combiner request fallback rules (changed combiner, D20): got '0' (expected '0')"
+expect_eq "combiner response fallback rules" "$RESP_FALLBACK" "2"
 
 # ── Verify 3 — bundle-service Running ────────────────────────────────────────
 step "Verify 3 — bundle-service pod Running"
@@ -149,15 +164,17 @@ while :; do
 done
 pass "GET /readyz -> 200, GET /bundles?spiffe=${TRUST_DOMAIN}/ns/${NS}/sa/opa-probe -> 200"
 
-# ── Verify 5 — existing agent sidecars run the built image ───────────────────
-step "Verify 5 — existing agent pods run the OPA-capable sidecar"
-PODS=$(kubectl get pods -n "$NS" -l "$AGENT_LABEL" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)
+# ── Verify 5 — existing agent and tool sidecars run the built image ──────────
+step "Verify 5 — existing agent and tool pods run the OPA-capable sidecar"
+# Tools too: with injectTools=true the webhook gives a tool pod the sidecar, and
+# the tool's inbound OPA decides each tool call under target side.
+PODS=$(kubectl get pods -n "$NS" -l "$WORKLOAD_LABEL" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)
 if [ -z "$PODS" ]; then
-  info "no pods labelled ${AGENT_LABEL} in ${NS} — nothing to check; workloads deployed later get the OPA pipeline from the operator webhook"
+  info "no pods labelled ${WORKLOAD_LABEL} in ${NS} — nothing to check; workloads deployed later get the OPA pipeline from the operator webhook"
 else
   for pod in $PODS; do
     kubectl wait --for=condition=ready pod -n "$NS" "$pod" --timeout=180s >/dev/null 2>&1 \
-      || die "agent pod ${pod} did not become Ready within 180s. Check: kubectl describe pod -n ${NS} ${pod}"
+      || die "pod ${pod} did not become Ready within 180s. Check: kubectl describe pod -n ${NS} ${pod}"
     IMG=$(kubectl get pod -n "$NS" "$pod" \
             -o jsonpath='{.spec.containers[?(@.name=="authbridge-proxy")].image}' 2>/dev/null || true)
     expect_eq "${pod} authbridge-proxy image" "${IMG:-<no authbridge-proxy container>}" "$IMAGE_TAG"

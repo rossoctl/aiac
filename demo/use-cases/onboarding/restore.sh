@@ -3,11 +3,11 @@
 # genuine first-time trigger again (not a no-op against clients that are still registered). Because
 # deploying the workloads for the first time *is* the point of this demo, restore must remove them
 # completely: Deployments, Services, ServiceAccounts, AgentRuntime CRs, their Keycloak clients and
-# credentials Secrets, and the AuthorizationPolicy CR AIAC wrote. It also reverts the outbound-leg
-# wiring driver.sh's WIRE phase added.
+# credentials Secrets, and the two AuthorizationPolicy CRs AIAC wrote (one per managed service, D20).
+# It also reverts the outbound-leg wiring driver.sh's WIRE phase added.
 #
 # Usage:
-#   ./restore.sh                   # the demo's own state (workloads, clients, CR, wiring)
+#   ./restore.sh                   # the demo's own state (workloads, clients, CRs, wiring)
 #   ./restore.sh --include-infra   # ALSO revert what enable.sh installed: the realm's
 #                                  # aiac-event-listener config and the Keycloak StatefulSet image
 #
@@ -143,8 +143,8 @@ else
   echo "    WARNING: could not obtain a Keycloak admin token — skipping leftover scope/role cleanup" >&2
 fi
 
-echo "==> 5. Deleting the AuthorizationPolicy CR AIAC wrote for github-agent"
-kubectl delete "$POLICY_CR" github-agent -n "$NS" --ignore-not-found
+echo "==> 5. Deleting the AuthorizationPolicy CRs AIAC wrote for github-agent and github-tool"
+kubectl delete "$POLICY_CR" github-agent github-tool -n "$NS" --ignore-not-found
 
 echo "==> 6. Deleting github-agent/github-tool workloads (Deployment/Service/ServiceAccount/AgentRuntime)"
 kubectl delete -f "$ASSETS_DIR/agents/github_agent/k8s/github-agent-deployment.yaml" -n "$NS" --ignore-not-found

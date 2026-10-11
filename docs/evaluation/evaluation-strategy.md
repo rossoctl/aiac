@@ -27,7 +27,8 @@ markers (`eval_extended`, `eval_correctness_prb`, `eval_correctness_e2e`, `eval_
 
 ## Clean-skip, never false-pass
 
-Every suite's parametrized test calls `require_env_or_skip(...)` first, so a missing
+Every suite calls `require_env_or_skip(...)` first (in the parametrized test, or in the shared
+`pipeline` fixture for `test_policy_pipeline_eval.py`), so a missing
 `LLM_*` / `KEYCLOAK_*` variable (or absent `opa`) **skips the suite cleanly** rather than failing
 deep into a run or silently passing.
 
@@ -41,4 +42,5 @@ See [README.md § Scripts](README.md#scripts) for the full table. In brief:
 | `test_policy_pipeline_correctness_prb.py` | PRB-direct (no Keycloak/OPA) | [policy-eval-correctness-prb.md](policy-eval-correctness-prb.md) |
 | `test_policy_pipeline_correctness_e2e.py` | Real Keycloak+PCE+OPA, one layer downstream of PRB | [policy-eval-correctness-e2e.md](policy-eval-correctness-e2e.md) |
 | `test_policy_pipeline_consistency.py` | PRB-direct, N-run grant-set equality | [policy-eval-robustness-consistency.md](policy-eval-robustness-consistency.md) |
-| `test_policy_pipeline_robustness.py` | PRB-direct, perturbation invariance | [policy-eval-robustness-consistency.md](policy-eval-robustness-consistency.md) |
+| `test_policy_pipeline_robustness.py` | PRB-direct, perturbation invariance and sensitivity (mechanical and semantic tiers) | [policy-eval-robustness-consistency.md](policy-eval-robustness-consistency.md) |
+| `test_policy_pipeline_faithfulness.py` | PRB-direct over a live digest of the source policy, zero-tolerance over-grant gate | none here (see [`../specs/digested-policy.md`](../specs/digested-policy.md)) |

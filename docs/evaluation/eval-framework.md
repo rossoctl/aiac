@@ -42,6 +42,8 @@ Every attribute in this framework is evaluated at **two levels**:
   truth. The only way to catch integration bugs between layers (merge logic,
   Rego rendering, OPA semantics) that a PRB-only check can't see.
 
+**Status: not built yet** — only Correctness has an end-to-end suite (`test_policy_pipeline_correctness_e2e.py`); Robustness and Consistency are PRB-level only, and Scale has no suite.
+
 ### 2.1 Backend pluggability (PRB-level only)
 
 The PRB-level harness supports **two interchangeable sources** for the
@@ -55,6 +57,8 @@ The PRB-level harness supports **two interchangeable sources** for the
   corpus only (not the full Robustness/Scale matrix). Its job is narrowly
   "confirm the synthetic fixtures still match what real Keycloak actually
   returns," not to re-derive the correctness signal a second time.
+
+**Status: not built yet** — no real-Keycloak fidelity check exists under `eval/`; every PRB-level suite uses the synthetic source (`eval/prb_direct.py`).
 
 The end-to-end level always uses real Keycloak + real OPA; there's no
 synthetic variant at that level, since its entire purpose is catching
@@ -132,6 +136,8 @@ Both families use **two perturbation tiers**:
 
 ## 5. Scale
 
+**Status: not built yet** — no Scale suite exists under `eval/` (`eval/conftest.py` reserves trend-log entries for the Scale tickets #2469-#2470).
+
 "Large number of agents, tools, entitlements" decomposes into two
 independent dimensions that stress different parts of the system, and both
 are measured on **both check types**, at **both levels** (§2):
@@ -161,7 +167,7 @@ nobody can hand-verify hundreds of entities.
   dimensions, both check types, both levels) intended as a stable regression
   guard once cadence is turned on (see §8). Anchored below the PRD's only
   documented scale target ("hundreds of services," per
-  `docs/specs/components/policy-model-store.md:171`) as a starting point;
+  `docs/specs/components/policy-model-store.md:177`) as a starting point;
   revisit upward as confidence grows.
 - **Exploratory breaking-point tier.** Geometric scale-up (e.g. 10 → 100 →
   1,000...) on both dimensions, **hard ceiling of 1,000 entities**, to find
@@ -203,6 +209,8 @@ model silently changed underneath it. A deliberate model upgrade is its own
 reviewed event: re-run the full suite against the new pinned version,
 diff old-vs-new, then move the pin forward.
 
+**Status: not built yet** — only trend-log rows record the model (`LLM_MODEL`, `eval/trend_log.py`); the per-run Markdown report does not.
+
 ### 7.1 Initial model selection run
 
 Before settling on the pinned model for routine use, run the **complete
@@ -229,6 +237,8 @@ evaluated. Its output is recorded in the structured trend log (§9) using a
 `run_type = "model_selection"` tag so it is clearly distinguished from
 routine regression runs.
 
+**Status: not built yet** — `eval/conftest.py` writes only `run_type` `"regression"` or `"partial"`; no path writes `"model_selection"`.
+
 ## 8. Cadence
 
 **Current state: everything is manual-only.** No suite is wired into CI to
@@ -252,15 +262,18 @@ Two artifacts, at different durability levels:
   extended to represent the new metric shapes (precision/recall breakdown,
   scale-dimension results, sensitivity/invariance split) rather than the
   legacy pass/fail-plus-`reasoning`-text shape alone.
-- **Structured trend log** (**committed to git**) — a small append-only
-  file (JSON or CSV) per suite, one row per run, holding model version,
-  timestamp, and key metrics only (over-grant rate, under-grant rate,
-  invariance rate, sensitivity rate, consistency agreement rate,
-  scale structural/correctness results) — not verbose per-cell reasoning
+- **Structured trend log** (**committed to git**) — one shared, append-only
+  JSON Lines file, `eval/trend_log.jsonl`, with one row per suite per run.
+  Each row holds `timestamp`, `suite`, `run_type`, `model`,
+  `scenarios_scored`, and that suite's key metrics only (`precision`,
+  `recall`, `denial_precision`; `invariance_rate` / `sensitivity_rate` for
+  Robustness; `agreement_rate` for Consistency) — not verbose per-cell reasoning
   text. Small enough to not bloat the repo; durable enough to actually plot
   drift over time across machines and contributors.
 
 ### 9.1 Actionable improvement feedback
+
+**Status: not built yet** — the Markdown report that `eval/conftest.py` writes has no "Improvement recommendations" section.
 
 The detailed per-cell report includes an **"Improvement recommendations"
 section** generated after every run. The section surfaces findings as

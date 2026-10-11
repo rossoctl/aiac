@@ -11,14 +11,14 @@ HTTP client module wrapping the PDP Policy Writer (OPA) REST API. These modules 
 src/aiac/pdp/policy/
 └── library/
     ├── __init__.py     # empty
-    └── api.py          # apply_policy, apply_agent_policy, delete_agent_policy, delete_policy
+    └── api.py          # apply_policy, replace_policy, delete_service_cr, delete_policy
 ```
 
 All `__init__.py` files are empty. Callers use explicit submodule paths:
 
 ```python
-from aiac.pdp.policy.library.api import apply_policy, apply_agent_policy, delete_agent_policy, delete_policy
-from aiac.policy.model.models import PolicyModel, AgentPolicyModel
+from aiac.pdp.policy.library.api import apply_policy, replace_policy, delete_service_cr, delete_policy
+from aiac.policy.model.models import PolicyModel, TargetSidePolicyModel, AgentSidePolicyModel
 ```
 
 ---
@@ -26,7 +26,7 @@ from aiac.policy.model.models import PolicyModel, AgentPolicyModel
 ## Submodule: `aiac.pdp.policy.library.api`
 
 ### Description
-HTTP client module wrapping the PDP Policy Writer REST API. Exposes four module-level functions. Service URL is read from the `AIAC_PDP_POLICY_URL` environment variable (default: `http://127.0.0.1:7072`). All functions raise `RuntimeError` on non-2xx response.
+HTTP client module wrapping the PDP Policy Writer REST API. Exposes four module-level functions. Service URL is read from the `AIAC_PDP_POLICY_URL` environment variable (default: `http://127.0.0.1:7072`). All functions raise `RuntimeError` on non-2xx response. Every request has a timeout (`AIAC_PDP_HTTP_TIMEOUT`, default 60 s), so a hung writer (for example a stuck Kubernetes API) cannot block the caller, which holds the PCE lock, for an unlimited time. A request that times out raises the `requests` timeout error.
 
 No `realm` parameter — the PDP Policy Writer operates on a Kubernetes CR, not a Keycloak realm.
 
@@ -43,41 +43,71 @@ python-dotenv
 
 ```python
 def apply_policy(model: PolicyModel) -> None
-    # POST /policy — upsert Rego packages for all agents in the partial model
+    # POST /policy — upsert one CR per entry of the (partial) policy model.
+    # No rollback on a partial failure.
 
-def apply_agent_policy(agent_id: str, model: AgentPolicyModel) -> None
-    # POST /policy/agents/{agent_id} — upsert Rego packages for a single agent
+def replace_policy(model: PolicyModel) -> None
+    # PUT /policy — replace: upsert one CR per entry of the full policy model,
+    # then delete every other CR that has the managed-by label.
 
-def delete_agent_policy(agent_id: str) -> None
-    # DELETE /policy/agents/{agent_id} — remove all Rego packages for agent (off-boarding)
+def delete_service_cr(service_id: str) -> None
+    # DELETE /policy/services/{service_id} — delete the CR of one service
+    # (agent or tool). A Kubernetes 404 counts as success.
 
 def delete_policy() -> None
-    # DELETE /policy — clear all Rego packages (rebuild pre-step)
+    # DELETE /policy — delete every CR that has the managed-by label.
 ```
+
+The `model` of `apply_policy` and `replace_policy` is a subclass of the policy model (D18a): a `TargetSidePolicyModel` or an `AgentSidePolicyModel`. The library sends it with its `enforcement_side` tag. The writer parses the body as `AnyPolicyModel` (a discriminated union on the tag) and dispatches the render on the subclass. The writer also rejects with **422** a body with a wrong or missing tag, a body that has an entry field of the other side, and an agent-side model that has an agent also in `pass_through` (see [`pdp-policy-writer-opa.md` → The policy model](pdp-policy-writer-opa.md#the-policy-model-anypolicymodel-d18a)). An **entry** is one CR: under target side, each `services[]` SPM; under agent side, each `agents[]` APM (the agent CR) and each `pass_through[]` clientId (a pass-through CR). See [`policy-model.md`](policy-model.md) and [`pdp-policy-writer-opa.md`](pdp-policy-writer-opa.md).
+
+`service_id` is the clientId (it can contain `/`). The library URL-encodes it into one safe path segment before it builds the URL. The writer takes the CR name and namespace from `identity_ref(service_id)`. The writer returns `204` on success, `422` for a bad body, and `502` for a Kubernetes API failure. A bad id (one that gives no CR identity) is not an error: each write route logs it and skips it (`POST` and `PUT` skip its entry, and `DELETE /policy/services/{service_id:path}` has nothing to delete). The library raises `RuntimeError` on every non-2xx response.
+
+### Routes and callers (D18c)
+
+| Function | Route | AIAC caller | When |
+|----------|-------|-------------|------|
+| `apply_policy` | `POST /policy` | the PCE | At the end of each `compute_and_apply` run, with the affected services (D23). In `quarantine` and `decommission`, to redeploy the affected services. In `rerender_role` (D32; the role-members event and `POST /apply/role-members/{role_id}`), to render the CRs that use the role again with its current holders, with no PRB call and no SPM write: under target side, the live stored SPMs that have an edge of the role; under agent side, the APMs of every live stored agent, derived again. No call when the set is empty (see [policy-computation-engine.md → Role re-render](policy-computation-engine.md#role-re-render-rerender_role)). In `bootstrap`, to write the focus tool's first CR before UC-1 Provision. |
+| `replace_policy` | `PUT /policy` | the PCE | In `resync()` at every Controller start (D28), with the full policy model of the current side. The UC-2b rebuild also ends with it, through the PCE (D28a). |
+| `delete_service_cr` | `DELETE /policy/services/{service_id}` | the PCE | In `quarantine` and `decommission` (D20), for an agent and for a tool. In `drop_bootstrap`, for a tool that has no stored SPM: it deletes the bootstrap CR after a failed onboarding that ran no quarantine. |
+| `delete_policy` | `DELETE /policy` | none (C1) | An operator tool only. |
+
+The retired routes `POST /policy/agents/{agent_id}` and `DELETE /policy/agents/{agent_id}` and their functions `apply_agent_policy` and `delete_agent_policy` are removed. There is no no-rules CR: the quarantine deletes the CR.
+
+**`delete_policy` has no AIAC caller (C1).** The UC-2b rebuild ends with `replace_policy`. It does not start with `delete_policy`, so there is no deny window (D28a). Under D20 the global combiner denies a pod that has no client CR, so `delete_policy` **denies every managed pod** until the next resync writes the CRs again.
+
+**Status: not built yet** — the UC-2b rebuild (`src/aiac/agent/uc/policy_update/rebuild.py`) is a stub that returns `([], True)`, so the rebuild does not call `replace_policy` yet.
+
+Known limits:
+
+- **The poll delay.** A `204` means that the CR is written, not that OPA enforces it. A CR change takes effect at the next poll of the OPA plugin in the pod (10 s min, up to 120 s). This applies to each upsert and each delete.
+- **One CR per ServiceAccount.** The CR name and namespace come from the ServiceAccount in the SPIFFE ID. Pods that share a ServiceAccount share one CR and one bundle.
 
 ### Configuration
 
-Read from `AIAC_PDP_POLICY_URL` environment variable (or `.env` file co-located with `api.py`). Falls back to the default if absent.
+Read from the environment (or `.env` file co-located with `api.py`). Falls back to the default if absent. `AIAC_PDP_HTTP_TIMEOUT` is read at each call. An unset, non-numeric, non-finite, zero or negative value falls back to `60`, so a bad value does not stop the Controller at import.
 
 | Variable | Default |
 |----------|---------|
 | `AIAC_PDP_POLICY_URL` | `http://127.0.0.1:7072` |
+| `AIAC_PDP_HTTP_TIMEOUT` | `60` (seconds, per request; longer than the store's `AIAC_HTTP_TIMEOUT`, because one `PUT /policy` writes every CR) |
 
 ### Usage
 
 ```python
-from aiac.pdp.policy.library.api import apply_policy, apply_agent_policy, delete_agent_policy, delete_policy
-from aiac.policy.model.models import PolicyModel, AgentPolicyModel
+from aiac.pdp.policy.library.api import apply_policy, replace_policy, delete_service_cr, delete_policy
+from aiac.policy.model.models import TargetSidePolicyModel
 
-# Single-agent update (called by Policy Computation Engine)
-apply_agent_policy("weather-agent", agent_model)
+# A run: upsert the CRs of the affected services (called by the PCE)
+apply_policy(TargetSidePolicyModel(services=[tool_spm, agent_spm]))
 
-# Full rebuild pre-step: clear all, then reapply
+# The resync at the Controller start: replace every AIAC CR (called by the PCE)
+replace_policy(TargetSidePolicyModel(services=every_stored_spm))
+
+# The quarantine or the decommission: delete the CR of one service (called by the PCE)
+delete_service_cr("team1/github-tool")
+
+# Operator tool only, no AIAC caller: delete every AIAC CR (under D20 this denies every managed pod)
 delete_policy()
-apply_policy(full_model)
-
-# Off-boarding
-delete_agent_policy("weather-agent")
 ```
 
 ---
@@ -86,14 +116,14 @@ delete_agent_policy("weather-agent")
 
 **Seam:** HTTP boundary — mock responses from `AIAC_PDP_POLICY_URL`.
 
-**Prior art:** `3.14-unit-tests-write-api.md` (mock PDP Policy Writer HTTP; cover module-level functions).
-
 Key behaviors to assert:
-- `apply_policy(model)` issues `POST /policy` with serialized `PolicyModel`.
-- `apply_agent_policy(id, model)` issues `POST /policy/agents/{id}` with serialized `AgentPolicyModel`.
-- `delete_agent_policy(id)` issues `DELETE /policy/agents/{id}`.
+- `apply_policy(model)` issues `POST /policy` with the serialized policy model, which carries its `enforcement_side` tag (for a `TargetSidePolicyModel` and for an `AgentSidePolicyModel`).
+- `replace_policy(model)` issues `PUT /policy` with the serialized policy model and its tag.
+- `delete_service_cr(id)` issues `DELETE /policy/services/{id}`, with a slash-bearing `id` encoded as one path segment.
 - `delete_policy()` issues `DELETE /policy`.
+- The module has no `apply_agent_policy` and no `delete_agent_policy`.
 - Any non-2xx response raises `RuntimeError`.
+- Every call sends the timeout (`AIAC_PDP_HTTP_TIMEOUT`).
 - `AIAC_PDP_POLICY_URL` is read from env; falls back to `http://127.0.0.1:7072`.
 
 ---
@@ -101,12 +131,14 @@ Key behaviors to assert:
 ## Out of Scope
 
 - **Keycloak interaction:** this library never calls Keycloak directly. All IdP operations go through `aiac.idp.configuration`.
-- **Policy computation:** translating `list[PolicyRule]` into `AgentPolicyModel` objects is the responsibility of `aiac.policy.computation`, not this library.
+- **Policy computation:** translating `list[PolicyRule]` into the policy model (and, under agent side, into `AgentPolicyModel` objects) is the responsibility of `aiac.policy.computation`, not this library.
+- **The side:** the library does not read `AIAC_ENFORCEMENT_SIDE`. The side is the subclass of the model that the caller passes.
 - **Policy persistence:** the Policy Model Store (`aiac.policy.model_store`) owns structured `ServicePolicyModel` durability (the `AgentPolicyModel` is a derived projection, never persisted). This library targets the OPA runtime only.
 
 ---
 
 ## Further Notes
 
-- The `aiac.pdp.library.policy` module (old path) is deprecated. All consumers must update imports to `aiac.pdp.policy.library.api`.
-- Models (`PolicyModel`, `AgentPolicyModel`) are imported from `aiac.policy.model.models`, not from the deprecated `aiac.pdp.library.models`.
+- The `aiac.pdp.library.policy` module (old path) has been removed. All consumers import from `aiac.pdp.policy.library.api`.
+- Models (`PolicyModel`, `TargetSidePolicyModel`, `AgentSidePolicyModel`) are imported from `aiac.policy.model.models`, not from the removed `aiac.pdp.library.models`.
+- The name `delete_service_cr` is different from the store library's `delete_service_policy` on purpose. The PCE calls both in the quarantine and the decommission: one deletes the CR, the other deletes the SPM. `drop_bootstrap` calls only `delete_service_cr`: the tool has no SPM.

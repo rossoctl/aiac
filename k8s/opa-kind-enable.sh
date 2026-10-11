@@ -4,14 +4,25 @@
 # Step 6 runs opa-kind-verify.sh, so a successful exit means the wiring was
 # checked, not just applied.
 #
-# Wires the OPA plugin into every agent's inbound AND outbound AuthBridge
-# pipeline on a Kind cluster, alongside the full parser set (a2a-parser,
-# mcp-parser, inference-parser) so OPA policies have input.a2a / input.mcp /
-# input.inference available on both legs, not just input.host.
+# Wires the OPA plugin into the inbound AND outbound AuthBridge pipeline of
+# every agent and tool on a Kind cluster, alongside the full parser set
+# (a2a-parser, mcp-parser, inference-parser) so OPA policies have input.a2a /
+# input.mcp / input.inference available on both legs, not just input.host.
 #
 # On the outbound leg OPA is placed AFTER token-exchange so policies can
 # read input.delegation (the target audience + scopes the agent's token was
 # exchanged for). See the overlay comment in Step 3 for the rationale.
+#
+# Step 1 applies the changed combiner of AIAC (D20,
+# k8s/aiac-combiner-default.yaml) as the global combiner (the `default`
+# AuthorizationPolicy in RELEASE_NAMESPACE), in place of the stock combiner of
+# the operator chart: a pod that has no client CR is denied on both request
+# legs. The script never applies the stock combiner, so a first run never has
+# it, and a re-run keeps the changed combiner the whole time. The operator chart
+# has no value for this yet, and a later install or upgrade of its bundle
+# service brings back the stock combiner (the AIAC Controller start check #4
+# then stops the Controller). Run this script again to apply the changed
+# combiner again.
 #
 # Does NOT modify charts/rossoctl/values.yaml on disk. The pipeline override
 # lives in a throwaway temp file merged on top of the real values.yaml via a
@@ -39,7 +50,7 @@
 #   CLUSTER_NAME        kind cluster name                 (default: rossoctl)
 #   RELEASE_NAME        helm release name                 (default: rossoctl)
 #   RELEASE_NAMESPACE   namespace the chart is installed in (default: rossoctl-system)
-#   AGENT_NAMESPACE     namespace to restart agent pods in (default: team1)
+#   AGENT_NAMESPACE     namespace to restart agent and tool pods in (default: team1)
 #   IMAGE_TAG           local tag for the authbridge proxy-sidecar image built
 #                       from cmd/cortex (default: localhost/authbridge:local).
 #                       The tag name stays "authbridge" because it feeds the
@@ -98,12 +109,21 @@ if [ -z "$ROSSOCTL_DIR" ] || [ ! -d "$ROSSOCTL_DIR" ]; then
   echo "ERROR: Set ROSSOCTL_DIR to point to your rossoctl/rossoctl repo clone" >&2
   exit 1
 fi
-if [ -z "$AUTHBRIDGE_DIR" ] || [ ! -f "$AUTHBRIDGE_DIR/cmd/cortex/Dockerfile" ]; then
+# The authbridge proxy-sidecar Dockerfile: cmd/cortex/ since cortex a86e6708
+# (a pure move), cmd/authbridge-proxy/ in an older clone.
+AUTHBRIDGE_DOCKERFILE=""
+for candidate in cmd/cortex/Dockerfile cmd/authbridge-proxy/Dockerfile; do
+  if [ -n "$AUTHBRIDGE_DIR" ] && [ -f "$AUTHBRIDGE_DIR/$candidate" ]; then
+    AUTHBRIDGE_DOCKERFILE="$candidate"
+    break
+  fi
+done
+if [ -z "$AUTHBRIDGE_DOCKERFILE" ]; then
   echo "ERROR: Set CORTEX_DIR to point to your rossoctl/cortex repo clone" >&2
   echo "       (Step 2 builds the authbridge proxy-sidecar image from" >&2
-  echo "        \$CORTEX_DIR/cmd/cortex/Dockerfile, which lives in the cortex" >&2
-  echo "        monorepo, not in this repo. Override AUTHBRIDGE_DIR if the Go module" >&2
-  echo "        root is not the clone root)" >&2
+  echo "        \$CORTEX_DIR/cmd/cortex/Dockerfile, or cmd/authbridge-proxy/Dockerfile" >&2
+  echo "        in an older clone, which lives in the cortex monorepo, not in this" >&2
+  echo "        repo. Override AUTHBRIDGE_DIR if the Go module root is not the clone root)" >&2
   if [ -n "$AUTHBRIDGE_DIR" ] \
     && [ -f "$AUTHBRIDGE_DIR/authbridge/cmd/authbridge-proxy/Dockerfile" ]; then
     echo "       (that clone predates authbridge/ being flattened into the repo root" >&2
@@ -128,6 +148,13 @@ case "${OPERATOR_IMAGE##*/}" in
     OPERATOR_IMAGE_TAG="latest"
     ;;
 esac
+
+# The changed global combiner (D20) that Step 1 applies.
+COMBINER_FILE="${SCRIPT_DIR}/aiac-combiner-default.yaml"
+if [ ! -f "$COMBINER_FILE" ]; then
+  echo "ERROR: ${COMBINER_FILE} not found (the changed combiner, D20)" >&2
+  exit 1
+fi
 
 VALUES_FILE="${ROSSOCTL_DIR}/charts/rossoctl/values.yaml"
 CHART_DIR="${ROSSOCTL_DIR}/charts/rossoctl"
@@ -167,10 +194,77 @@ load_image_to_kind() {
   fi
 }
 
+# Check the global combiner as the Controller start check #4 (D30) does: the
+# two request packages must not keep
+# `client_ok if not data.authbridge.client.<dir>.request`.
+# The same allowlist as the Controller's start check #4 (src/aiac/agent/controller/start.py): in each
+# request package, every client_ok rule (comments dropped, string text dropped, white-space runs as
+# one space) must be `client_ok if data.authbridge.client.<dir>.request.allow` or
+# `default client_ok := false`, and there must be at least one. A search for the stock fail-open line
+# only would pass a fail-open rule in another form, and the Controller would then stop at its start.
+# A rule start is each line that names client_ok and starts outside every bracket (a rule head can
+# span lines, so a line that is only `client_ok` there is a rule too); unbalanced brackets print the
+# whole content, which is not a safe rule. See `_client_ok_rules` in start.py.
+client_ok_rules() {
+  awk '
+    { text = text $0 "\n" }
+    END {
+      n = length(text); code = ""; depth = 0; bad = 0; raw = 0
+      for (i = 1; i <= n; i++) {
+        c = substr(text, i, 1)
+        if (raw) { if (c == "`") { raw = 0; code = code "``" } else if (c == "\n") code = code c; continue }
+        if (c == "`") { raw = 1; continue }
+        if (c == "#") { while (i < n && substr(text, i + 1, 1) != "\n") i++; continue }
+        if (c == "\"") {
+          for (i++; i <= n && substr(text, i, 1) != "\"" && substr(text, i, 1) != "\n"; i++)
+            if (substr(text, i, 1) == "\\") i++
+          code = code "\"\""
+          if (substr(text, i, 1) == "\n") i--
+          continue
+        }
+        code = code c
+      }
+      m = split(code, lines, "\n")
+      for (j = 1; j <= m; j++) {
+        line = lines[j]; gsub(/[ \t]+/, " ", line); sub(/^ /, "", line); sub(/ $/, "", line)
+        if (depth == 0 && line ~ /(^|[^A-Za-z0-9_])client_ok([^A-Za-z0-9_]|$)/) out[++k] = line
+        for (x = 1; x <= length(line); x++) {
+          c = substr(line, x, 1)
+          if (index("{[(", c)) depth++
+          else if (index("}])", c)) depth--
+          if (depth < 0) break
+        }
+        if (depth < 0) break
+      }
+      if (depth != 0) { gsub(/[ \t\n]+/, " ", text); print text; exit }
+      for (j = 1; j <= k; j++) print out[j]
+    }'
+}
+
+check_combiner() {
+  local dir content rules bad
+  for dir in inbound outbound; do
+    if ! content="$(kubectl get authorizationpolicy default -n "$RELEASE_NAMESPACE" \
+      -o jsonpath="{.spec.policies[?(@.path==\"${dir}/request.rego\")].content}")"; then
+      echo "ERROR: cannot read the default AuthorizationPolicy in ${RELEASE_NAMESPACE} to check the combiner" >&2
+      exit 1
+    fi
+    rules="$(printf '%s\n' "$content" | client_ok_rules)"
+    bad="$(printf '%s\n' "$rules" | grep -vxF \
+      -e "client_ok if data.authbridge.client.${dir}.request.allow" \
+      -e "default client_ok := false" || true)"
+    if [ -z "$rules" ] || [ -n "$bad" ]; then
+      echo "ERROR: the default AuthorizationPolicy in ${RELEASE_NAMESPACE} can allow a pod that has no client CR" \
+        "(${dir}/request.rego: ${bad:-no client_ok rule})" >&2
+      exit 1
+    fi
+  done
+}
+
 OVERLAY_FILE="$(mktemp "${TMPDIR:-/tmp}/opa-kind-enable-overlay.XXXXXX")"
 TMPFILES+=("$OVERLAY_FILE")
 
-echo "==> Step 1/6: deploying bundle-service from the operator clone (${OPERATOR_DIR}, image ${OPERATOR_IMAGE})"
+echo "==> Step 1/6: deploying bundle-service from the operator clone (${OPERATOR_DIR}, image ${OPERATOR_IMAGE}) + the changed combiner (D20)"
 # The bundle service is not its own image: one operator image carries
 # /manager, /bundle-service and /token-broker, and the manifests live as Helm
 # templates in charts/operator/templates/bundleservice/ gated on
@@ -188,13 +282,13 @@ echo "==> Step 1/6: deploying bundle-service from the operator clone (${OPERATOR
 # chart: templates/manager/manager.yaml and templates/rbac/role.yaml carry no
 # enabled flag, so installing it as its own release would stand up a duplicate
 # controller-manager and collide on the cluster-scoped operator ClusterRole.
-# Rendering only the five bundleservice templates keeps the installed operator
+# Rendering only four bundleservice templates keeps the installed operator
 # (from the pinned subchart) exactly as it is.
 ( cd "$OPERATOR_DIR/operator" \
   && "$CONTAINER_RUNTIME" build -t "$OPERATOR_IMAGE" -f Dockerfile . )
 load_image_to_kind "$OPERATOR_IMAGE"
-# The CRD must exist, and be established, before default-policy.yaml (an
-# AuthorizationPolicy CR) is applied in the same stream below.
+# The CRD must exist, and be established, before the changed combiner (an
+# AuthorizationPolicy CR) is applied below.
 kubectl apply -f "$OPERATOR_DIR/operator/config/crd/bases/agent.rossoctl.dev_authorizationpolicies.yaml"
 kubectl wait --for=condition=established --timeout=60s \
   crd/authorizationpolicies.agent.rossoctl.dev
@@ -221,6 +315,10 @@ fi
 # every AuthBridge bundle fetch. Kind's default CNI does not enforce it, so the
 # chart's own SECURITY note treats a kind cluster as having no access control
 # either way.
+#
+# default-policy.yaml (the stock global combiner) is NOT rendered either: the
+# changed combiner (D20) takes its place right after the other bundle-service
+# templates, so the cluster never has the stock combiner.
 helm template "$RELEASE_NAME" "$OPERATOR_DIR/charts/operator" \
   --namespace "$RELEASE_NAMESPACE" \
   --set bundleService.enabled=true \
@@ -231,8 +329,13 @@ helm template "$RELEASE_NAME" "$OPERATOR_DIR/charts/operator" \
   --show-only templates/bundleservice/rbac.yaml \
   --show-only templates/bundleservice/service.yaml \
   --show-only templates/bundleservice/deployment.yaml \
-  --show-only templates/bundleservice/default-policy.yaml \
   | kubectl apply -f -
+# The manifest uses the default namespace rossoctl-system; the bundle-service
+# watcher reads global-scope CRs only from its own namespace, so put the CR in
+# RELEASE_NAMESPACE. It replaces a stock `default` CR from an earlier install.
+sed "s/^  namespace: rossoctl-system\$/  namespace: ${RELEASE_NAMESPACE}/" "$COMBINER_FILE" \
+  | kubectl apply -f -
+check_combiner
 # OPERATOR_IMAGE is a fixed tag (localhost/operator:local), so on a re-run after rebuilding the
 # operator the rendered spec is byte-identical and `apply` changes nothing — with pullPolicy=Never
 # the running pod would keep the OLD binary. Force a new rollout so it picks up the image just loaded.
@@ -255,11 +358,13 @@ if [ -z "${GO_BUILD_TAGS:-}" ]; then
   fi
 fi
 echo "    GO_BUILD_TAGS=${GO_BUILD_TAGS}"
-( cd "$AUTHBRIDGE_DIR" && "$CONTAINER_RUNTIME" build -t "$IMAGE_TAG" -f cmd/cortex/Dockerfile \
+( cd "$AUTHBRIDGE_DIR" && "$CONTAINER_RUNTIME" build -t "$IMAGE_TAG" -f "$AUTHBRIDGE_DOCKERFILE" \
     --build-arg GO_BUILD_TAGS="$GO_BUILD_TAGS" . )
 load_image_to_kind "$IMAGE_TAG"
 
 echo "==> Step 3/6: writing throwaway pipeline overlay (${VALUES_FILE} stays untouched)"
+# The inbound leg has mcp-parser and opa: a tool needs both (the tool inbound
+# package checks input.mcp.params.name; onboarding check #2, D30).
 cat > "$OVERLAY_FILE" <<YAML
 # Throwaway overlay — merged on top of the real values.yaml at helm-upgrade
 # time, never written back to it. Adds OPA plus the full parser set
@@ -328,6 +433,10 @@ authBridge:
 YAML
 
 echo "==> Step 4/6: helm upgrade (base values.yaml + overlay — base file not modified)"
+# injectTools=true: the operator webhook also injects the AuthBridge sidecar
+# into tool pods (rossoctl.io/type=tool) and registers their Keycloak client.
+# The operator default is false; without it a tool has no sidecar, so no OPA,
+# and onboarding check #1 (D30) fails for the tool.
 ( cd "$CHART_DIR" && helm dependency build )
 helm upgrade "$RELEASE_NAME" "$CHART_DIR" -n "$RELEASE_NAMESPACE" \
   -f "$VALUES_FILE" \
@@ -337,10 +446,17 @@ helm upgrade "$RELEASE_NAME" "$CHART_DIR" -n "$RELEASE_NAMESPACE" \
   --set operator-chart.defaults.images.authbridge="$IMAGE_TAG" \
   --set operator-chart.featureGates.injectTools=true \
   --wait --timeout 5m
+# The operator subchart of the rossoctl chart does not render the bundle
+# service today. Check again, so that a chart that brings back the stock
+# combiner stops the script before the pods restart.
+check_combiner
 
-echo "==> Step 5/6: restarting authbridge pods in ${AGENT_NAMESPACE}"
-# --ignore-not-found so this no-ops cleanly when the namespace has no agent pods yet.
-kubectl delete pods -n "$AGENT_NAMESPACE" -l rossoctl.io/type=agent --ignore-not-found
+echo "==> Step 5/6: restarting the agent and tool pods in ${AGENT_NAMESPACE}"
+# The webhook injects the sidecar and copies the namespace pipeline only at pod
+# CREATE, so an existing pod keeps its old pipeline until it restarts. Tools
+# too: they get the sidecar (injectTools) and the inbound opa + mcp-parser.
+# --ignore-not-found so this no-ops cleanly when the namespace has no such pods yet.
+kubectl delete pods -n "$AGENT_NAMESPACE" -l 'rossoctl.io/type in (agent,tool)' --ignore-not-found
 
 echo "==> Step 6/6: verifying (opa-kind-verify.sh)"
 NS="$AGENT_NAMESPACE" SYS_NS="$RELEASE_NAMESPACE" IMAGE_TAG="$IMAGE_TAG" KIND_CLUSTER="$CLUSTER_NAME" \
@@ -349,8 +465,11 @@ NS="$AGENT_NAMESPACE" SYS_NS="$RELEASE_NAMESPACE" IMAGE_TAG="$IMAGE_TAG" KIND_CL
 cat <<EOF
 ==> Done.
 
+Under the changed combiner (D20) a pod that has no client CR is denied: AIAC
+writes a CR for each service it onboards.
+
 Re-check later with:
   ./k8s/opa-kind-verify.sh
-Restore the original pipeline with:
+Restore the original pipeline and the stock combiner with:
   ./k8s/opa-kind-restore.sh
 EOF

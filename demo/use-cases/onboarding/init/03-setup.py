@@ -74,7 +74,7 @@ def main() -> None:
     say("4", total, "Done")
     print(f"\nAgent service id: {agent_uuid}")
     print(f"Tool service id:  {tool_uuid}")
-    print("\nNext: make onboard-agent")
+    print("\nNext: make agent")
 
 
 if __name__ == "__main__":

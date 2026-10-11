@@ -15,11 +15,20 @@ by ``id`` (the Keycloak internal client UUID the ``/apply/service/{id}`` route a
 SPIFFE URI), so its own roles/scopes are id-bearing ``Role``/``Scope`` usable as PRB inputs
 and flattenable.
 
-Candidates are excluded/included by **ownership** (role id / ``scope.serviceId``), never by
-name: the focus service's own ``aiac.managed`` roles/scopes are never candidates; other
-services' ``aiac.managed`` roles carry ``kind=Agent``; realm roles held by at least one user
+Candidates come from the **other** services, selected by **owner service** (the service that
+holds the role / the ``scope.serviceId`` of the copy), never by name: other services'
+``aiac.managed`` roles carry ``kind=Agent``; realm roles held by at least one user
 (composite-expanded, and not owned by any service) carry ``kind=User``. This keeps
-``subject_roles``/``source_roles`` routing correct downstream in the PCE.
+``subject_roles``/``source_roles`` routing correct downstream in the PCE. A role or a scope that
+only the focus service has is never a candidate.
+
+A role or a scope that the focus shares with another service (D32: one realm-wide policy) is a
+candidate through that service: the scope-focal pass of an own scope can get a shared role that the
+focus holds, and the role-focal pass of a shared own role gets the scopes that its other holders
+own (the other owner's copy of a shared scope included). Such a pair, where a holder of the role
+owns the scope (a self-mapping), is allowed: the builder gives it to the PRB and keeps the PRB's
+rule on it (no filter). The PCE renders the current holders of the role (D32), so a grant on such
+a pair also lets that holder call its own scope.
 
 The focal-entity resolution itself (the own-scope / candidate-role / other-scope split, and
 the IdP-unreachable / unknown-service ``HTTPException(502/404)`` boundary) lives in the shared

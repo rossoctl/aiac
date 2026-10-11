@@ -1,6 +1,8 @@
+from collections.abc import Callable
 from enum import Enum
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 from aiac.idp.configuration.models import Role, Scope, ServiceType
 
@@ -55,6 +57,23 @@ class ServicePolicyModel(BaseModel):
     inbound_allow_rules: list[PolicyRule] = []
     inbound_deny_rules: list[PolicyRule] = []
 
+    def all_edges(self) -> list[PolicyRule]:
+        """Every inbound edge, in a new list: the ``Allow`` edges, then the ``Deny`` edges."""
+        return self.inbound_allow_rules + self.inbound_deny_rules
+
+    def prune_edges(self, prune: Callable[[list[PolicyRule]], list[PolicyRule]]) -> bool:
+        """Replace each inbound list (``Allow`` and ``Deny``, one at a time) with ``prune(list)``, the
+        edges of that list to keep. Each list is pruned on its own, so an edge of one list never
+        changes what is kept in the other list. Returns ``True`` iff an edge was removed."""
+        changed = False
+        for attr in ("inbound_allow_rules", "inbound_deny_rules"):
+            edges: list[PolicyRule] = getattr(self, attr)
+            kept = prune(edges)
+            if len(kept) != len(edges):
+                setattr(self, attr, kept)
+                changed = True
+        return changed
+
 
 class AgentPolicyModel(BaseModel):
     """Complete policy definition for a single agent (service).
@@ -100,7 +119,63 @@ class AgentPolicyModel(BaseModel):
     outbound_subject_deny_rules: list[PolicyRule] = []
 
 
+class EnforcementSide(str, Enum):
+    """Where the access to a callee is checked (D16).
+
+    Under ``target-side`` each callee (agent or tool) checks the access to itself in its own inbound
+    OPA, from its own CR. Under ``agent-side`` (the legacy method) each agent's outbound OPA checks
+    the agent's calls to tools. One global switch selects the side for every callee."""
+
+    TARGET_SIDE = "target-side"
+    AGENT_SIDE = "agent-side"
+
+
 class PolicyModel(BaseModel):
+    """The deploy input that the PCE gives to the PDP Policy Writer (D18a).
+
+    The base of the hierarchy, never sent on its own. ``enforcement_side`` is the tag: each subclass
+    fixes it as a ``Literal`` class constant with a default, so code never sets it by hand, and the
+    writer dispatches on the subclass that the tag parses into. A model that mixes the sides
+    cannot exist."""
+
     model_config = ConfigDict(extra="ignore")
 
+    enforcement_side: EnforcementSide
+
+
+class TargetSidePolicyModel(PolicyModel):
+    """The target-side policy model: the stored SPMs, one per callee.
+
+    Every edge that service X checks on its inbound is already on ``SPM(X)`` (a rule is stored on
+    the SPM of the service that owns its scope), so the stored SPM is the render input and the
+    writer does no join."""
+
+    enforcement_side: Literal[EnforcementSide.TARGET_SIDE] = EnforcementSide.TARGET_SIDE
+    services: list[ServicePolicyModel]
+
+
+class AgentSidePolicyModel(PolicyModel):
+    """The agent-side policy model: the APMs, which the PCE derives in memory at each deploy and
+    never stores, and the clientIds of the managed tools.
+
+    Each agent's CR has its inbound and its outbound tool checks (the outbound needs the edges on
+    the SPMs of the services it calls — the join that ``_derive`` does). Each ``pass_through`` tool
+    gets a pass-through CR (D24): a pod with no CR is denied (D20), also on its outbound."""
+
+    enforcement_side: Literal[EnforcementSide.AGENT_SIDE] = EnforcementSide.AGENT_SIDE
     agents: list[AgentPolicyModel]
+    pass_through: list[str] = []
+
+
+# The body of ``POST`` / ``PUT /policy``: every concrete policy model, told apart by its tag. The
+# discriminator makes the tag mandatory in a body, although each subclass has it as a default.
+AnyPolicyModel = Annotated[TargetSidePolicyModel | AgentSidePolicyModel, Field(discriminator="enforcement_side")]
+
+_policy_model_adapter: TypeAdapter[AnyPolicyModel] = TypeAdapter(AnyPolicyModel)
+
+
+def parse_policy_model(data: object) -> PolicyModel:
+    """Parse a policy-model body into its concrete subclass, by its ``enforcement_side`` tag.
+
+    Raises ``pydantic.ValidationError`` on a missing or unknown tag."""
+    return _policy_model_adapter.validate_python(data)

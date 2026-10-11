@@ -14,7 +14,7 @@
 #   their Keycloak clients      |  (authbridge-config, authproxy-routes)
 #   github-agent.*/github-tool.*|  the whole aiac-system namespace — AIAC stack, NATS broker,
 #     roles + client scopes     |    Policy Model Store PVC, aiac-agent-secret, aiac-policy CM
-#   the AuthorizationPolicy CR  |  the demo's Keycloak users (dev-user/test-user/devops-user)
+#   the AuthorizationPolicy CRs |  the demo's Keycloak users (dev-user/test-user/devops-user)
 #   credentials Secrets         |  the demo's Keycloak realm roles (developer/tester/devops)
 #   the outbound-leg wiring     |  the demo's ROPC client (aiac-demo-cli)
 #   the Keycloak SPI + image    |  optionally the OPA pipeline overlay (--include-opa)
@@ -23,9 +23,9 @@
 #   - the team1 namespace itself. The Rossoctl installer creates and owns it
 #     (demo/assets/INSTALL.md: "a precondition, not an output"); a fresh install gives you an EMPTY
 #     team1, not no team1. Deleting it would force an installer re-run.
-#   - the `rossoctl` client's Direct Access Grants + username->sub protocol mapper from demo.md's
-#     Prerequisites. One-time cluster-wide state that this demo and the system test suite
-#     both depend on, and which is harmless to leave.
+#   - the `rossoctl` client's Direct Access Grants from demo.md's realm fix-up. One-time
+#     cluster-wide state that this demo and the system test suite both depend on, and which is
+#     harmless to leave. (sub = username comes from AIAC's client scope aiac-username-sub, D31.)
 #   - the operator's `*-aud` audience client scopes, which it owns and recreates.
 #   - container images already loaded into the Kind node (inert; `docker image rm` them by hand).
 #     Consequence worth knowing: because these survive, a later `./enable.sh` finds the stack images
@@ -36,7 +36,8 @@
 #   ./teardown.sh --dry-run        # list everything that WOULD be removed; change nothing
 #   ./teardown.sh                  # tear down (prompts for confirmation)
 #   ./teardown.sh --yes            # tear down without prompting
-#   ./teardown.sh --include-opa    # also revert the OPA pipeline overlay (needs ROSSOCTL_DIR)
+#   ./teardown.sh --include-opa    # also revert the OPA pipeline overlay and the changed combiner
+#                                  # (needs ROSSOCTL_DIR and OPERATOR_DIR)
 #   ./teardown.sh --aiac-only      # uninstall ONLY AIAC: delete the aiac-system namespace and
 #                                  # nothing else (the inverse of ./enable.sh)
 #
@@ -56,6 +57,8 @@
 #   KC, REALM             Keycloak base URL + realm
 #   KIND_CLUSTER          Kind cluster name, for the kubeconfig refresh (default: rossoctl)
 #   ROSSOCTL_DIR          Helm chart clone, only for --include-opa      (default: ../../../../rossoctl)
+#   OPERATOR_DIR          operator clone, only for --include-opa: the stock combiner is rendered
+#                         from its chart                                (default: ../../../../operator)
 #   NS_WAIT_SECS          how long to wait for aiac-system to finalize  (default: 180)
 
 set -euo pipefail
@@ -217,7 +220,7 @@ if [ "$AIAC_ONLY" -eq 1 ]; then
 else
 step "Removing demo state + Keycloak SPI (restore.sh --include-infra)"
 # Delegated rather than duplicated: restore.sh already owns this teardown surface (workloads, their
-# Keycloak clients, provisioned roles/scopes, the AuthorizationPolicy CR, credentials Secrets, the
+# Keycloak clients, provisioned roles/scopes, the AuthorizationPolicy CRs, credentials Secrets, the
 # outbound wiring, the SPI listener and the Keycloak image).
 if [ "$DRY_RUN" -eq 1 ]; then
   info "[dry-run] would run: ${SCRIPT_DIR}/restore.sh --include-infra"
@@ -317,8 +320,9 @@ if [ "$DO_OPA" -eq 1 ]; then
     if [ "$DRY_RUN" -eq 1 ]; then
       info "[dry-run] would run: ${AIAC_DIR}/k8s/opa-kind-restore.sh"
     else
-      ROSSOCTL_DIR="${ROSSOCTL_DIR:-$AIAC_DIR/../rossoctl}" bash "$AIAC_DIR/k8s/opa-kind-restore.sh" \
-        || warn "opa-kind-restore.sh failed — it needs a ROSSOCTL_DIR chart clone and helm on PATH"
+      ROSSOCTL_DIR="${ROSSOCTL_DIR:-$AIAC_DIR/../rossoctl}" OPERATOR_DIR="${OPERATOR_DIR:-$AIAC_DIR/../operator}" \
+        bash "$AIAC_DIR/k8s/opa-kind-restore.sh" \
+        || warn "opa-kind-restore.sh failed — it needs the ROSSOCTL_DIR and OPERATOR_DIR clones and helm on PATH"
     fi
   else
     warn "k8s/opa-kind-restore.sh not found or not executable — skipping"
@@ -327,7 +331,7 @@ elif [ "$AIAC_ONLY" -eq 1 ]; then
   step "OPA pipeline overlay left wired (--aiac-only)"
 else
   step "OPA pipeline overlay left wired (pass --include-opa to revert it)"
-  info "it is a cluster-level change owned by k8s/, and reverting it needs the ROSSOCTL_DIR chart clone"
+  info "it is a cluster-level change owned by k8s/, and reverting it needs the ROSSOCTL_DIR and OPERATOR_DIR clones"
 fi
 
 # ── Report ────────────────────────────────────────────────────────────────────
@@ -365,7 +369,7 @@ Verify the demo is gone:
 
   kubectl get ns ${AIAC_NS}                                    # expect: NotFound
   kubectl get deployment,svc,sa -n ${NS} | grep github         # expect: no matches
-  kubectl get authorizationpolicies.agent.rossoctl.dev -n ${NS}  # expect: no github-agent
+  kubectl get authorizationpolicies.agent.rossoctl.dev -n ${NS}  # expect: no github-agent, no github-tool
   kubectl get ns ${NS}                                         # expect: still Active (installer-owned)
 
   # realm should hold none of the demo's users/roles/client:
@@ -381,8 +385,8 @@ Verify the demo is gone:
 Still in place, by design (platform state this demo does not own):
   - the ${NS} namespace itself — the Rossoctl installer owns it; a fresh install leaves it empty,
     not absent. Nothing of the demo remains inside it.
-  - the 'rossoctl' client's Direct Access Grants + username->sub mapper (demo.md Prerequisites).
-    This demo and the system test suite both rely on these.
+  - the 'rossoctl' client's Direct Access Grants (demo.md realm fix-up).
+    This demo and the system test suite both rely on it.
   - the operator's '*-aud' audience client scopes, which it owns and recreates.
   - container images in the Kind node (inert). Remove by hand if you want the disk back:
       docker image rm localhost/aiac-{pdp-config,pdp-policy-opa,policy-model-store,agent}:local \\

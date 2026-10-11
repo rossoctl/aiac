@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Drive test-user's intents through the demo: ROPC login, inbound gate, a real RFC 8693 token
-exchange, then the per-intent outbound gate — proving tester least-privilege end to end against
+exchange, then the per-intent tool-call gate — proving tester least-privilege end to end against
 ``generated/02-after-tool/``."""
 
 from __future__ import annotations

@@ -47,8 +47,9 @@ A scenario whose own *setup* fails (a Keycloak/PRB/PCE error, or an uncaught
 before ``score_scenario``/``_record_scoring`` ever ran) never gets those properties recorded at
 all. Such an entry still gets the crash detail *and* the same six-field metrics block, values
 marked ``unavailable`` with why -- identified by nodeid (``::test_prb_correctness[``/
-``::test_e2e_correctness[``/the three robustness test functions, see ``_CORRECTNESS_TEST_MARKERS``/
-``_ROBUSTNESS_SCORED_TEST_MARKERS``) since there are no properties to dispatch on -- rather than
+``::test_e2e_correctness[``/the robustness test functions/the Scale correctness test functions, see
+``_CORRECTNESS_TEST_MARKERS``/``_ROBUSTNESS_SCORED_TEST_MARKERS``/``_SCALE_CORRECTNESS_TEST_MARKERS``)
+since there are no properties to dispatch on -- rather than
 silently falling back to the generic docstring + crash-message rendering every other test in this
 suite gets.
 
@@ -135,6 +136,10 @@ load_dotenv(HERE.parent / ".env", override=False)
 
 _docstrings: dict[str, str] = {}
 _reports: dict[str, pytest.TestReport] = {}
+# The crash message of a teardown failure of a test. The earlier report (setup or call) stays in
+# _reports, as it holds the test's own result; the entry goes in the "error" bucket (pytest counts
+# a teardown failure as an error too) and shows this next to that result.
+_teardown_failures: dict[str, str] = {}
 
 # Every suite that carries `pytestmark = pytest.mark.eval` lives directly under `eval/` as a
 # `test_policy_pipeline_*.py` module (the scenarios/consistency/robustness/correctness-prb/
@@ -180,8 +185,12 @@ def pytest_runtest_logreport(report: pytest.TestReport) -> None:
         return
     if not _is_eval_suite_nodeid(report.nodeid):
         return
-    # A later phase (call) supersedes an earlier one (setup) for the same nodeid; a setup or
-    # teardown failure has no later phase to supersede it.
+    # A later phase (call) supersedes an earlier one (setup) for the same nodeid. A teardown
+    # failure never replaces the earlier report -- that holds the test's own result (passed,
+    # failed or skipped); see _teardown_failures.
+    if report.when == "teardown" and report.nodeid in _reports:
+        _teardown_failures[report.nodeid] = _detail(report, "error") or "teardown failed"
+        return
     _reports[report.nodeid] = report
 
 
@@ -344,6 +353,13 @@ _SCALE_TEST_MARKERS: dict[str, tuple[str, str]] = {
     "::test_scale_per_decision_correctness_e2e": ("scale_per_decision_e2e", "correctness"),
 }
 
+# The Scale correctness test functions (from _SCALE_TEST_MARKERS above). When one fails before it
+# records its scores, it gets the same "unavailable, here's why" metrics block as
+# _CORRECTNESS_TEST_MARKERS/_ROBUSTNESS_SCORED_TEST_MARKERS, not only a crash message.
+_SCALE_CORRECTNESS_TEST_MARKERS = tuple(
+    marker for marker, (_suite, check_type) in _SCALE_TEST_MARKERS.items() if check_type == "correctness"
+)
+
 # Full Correctness corpus size (eval.test_policy_pipeline_eval.SCENARIOS) -- kept as a plain
 # constant rather than imported, so this module (loaded for every eval/ run, marked or not) stays
 # free of that file's heavy Keycloak/launcher imports. A run that scores fewer scenarios than this
@@ -415,8 +431,9 @@ def _render_metrics_block(lines: list[str], props: dict, *, unavailable_reason: 
     ``test_prb_correctness``/``test_e2e_correctness`` record, and (the robustness suite only)
     ``_record_scoring``'s ``perturbation``/``expected_grants``/``actual_grants`` fields first, when
     present, so a reader sees what changed and what was expected/returned before the numbers.
-    When ``unavailable_reason`` is given (the scenario's own setup failed before scoring could run,
-    so ``props`` has none of this), render the same six metrics fields with a uniform placeholder
+    When ``unavailable_reason`` is given (the test failed before scoring could run -- a scenario
+    setup failure, a fixture error, or an error in the test body -- so ``props`` has none of this),
+    render the same six metrics fields with a uniform placeholder
     instead — so a reader always sees the same shape, pass or fail, setup-failed or scored."""
     if unavailable_reason is not None:
         for label in ("Precision", "Recall", "Denial precision", "Over-grants", "Under-grants", "Incorrectly denied"):
@@ -504,16 +521,26 @@ def _render_scale_block(lines: list[str], props: dict) -> None:
         )
 
 
+def _unscored_reason(report: pytest.TestReport, detail: str | None) -> str:
+    """Why a scored-suite entry has no scores, from the pytest phase of its report. Only the setup
+    phase is a sure sign of a fixture error (a teardown report never replaces an earlier one, see
+    pytest_runtest_logreport). A call-phase failure can be a test-body
+    error or a scenario setup failure (the 8-scenario suites report that in the call phase,
+    pytest.fail in _require_scenario), so say only what is sure; the Failure field gives the cause."""
+    reason = "a fixture failed before the test ran" if report.when == "setup" else "the test failed before scoring"
+    return reason + (" (see Failure)" if detail else "")
+
+
 def _render_entry(lines: list[str], nodeid: str, report: pytest.TestReport, category: str) -> None:
     """Per-cell tests (``test_inbound``/``test_outbound``) ``record_property`` a concrete
     description + expected/actual boolean + explanation; ``test_prb_correctness`` (correctness-prb)
     ``record_property``s precision/recall/denial-precision + the over-/under-grant/incorrect-denial
     pair breakdown; ``test_prb_consistent_across_repeats`` (consistency) ``record_property``s an
     ``inconsistent`` flag + ``mismatches`` detail; render each instead of the generic docstring +
-    crash/skip-reason fallback every other test in this suite gets. A correctness-suite scenario
-    whose *setup* failed (a pipeline error before ``score_scenario`` ever ran) gets the crash detail
-    *and* the same six-field metrics block, marked unavailable with why — not silently dropped to
-    the generic fallback."""
+    crash/skip-reason fallback every other test in this suite gets. A correctness-suite test that
+    failed before ``score_scenario`` ever ran (a scenario setup failure, a fixture error, or an
+    error in the test body) gets the crash detail *and* the same six-field metrics block, marked
+    unavailable — not silently dropped to the generic fallback."""
     lines.append(f"### `{nodeid}`")
     props = dict(report.user_properties)
     if "expected" in props and "output" in props:
@@ -538,7 +565,8 @@ def _render_entry(lines: list[str], nodeid: str, report: pytest.TestReport, cate
             lines.append(f"- **What it tests:** {description}")
         _render_scale_block(lines, props)
     elif category in ("failed", "error") and any(
-        marker in nodeid for marker in _CORRECTNESS_TEST_MARKERS + _ROBUSTNESS_SCORED_TEST_MARKERS
+        marker in nodeid
+        for marker in _CORRECTNESS_TEST_MARKERS + _ROBUSTNESS_SCORED_TEST_MARKERS + _SCALE_CORRECTNESS_TEST_MARKERS
     ):
         doc = _docstrings.get(nodeid)
         if doc:
@@ -546,7 +574,7 @@ def _render_entry(lines: list[str], nodeid: str, report: pytest.TestReport, cate
         detail = _detail(report, category)
         if detail:
             _render_field(lines, "Failure", detail)
-        _render_metrics_block(lines, props, unavailable_reason="scenario setup failed before scoring could run")
+        _render_metrics_block(lines, props, unavailable_reason=_unscored_reason(report, detail))
     else:
         doc = _docstrings.get(nodeid)
         if doc:
@@ -555,10 +583,12 @@ def _render_entry(lines: list[str], nodeid: str, report: pytest.TestReport, cate
         if detail:
             label = "Reason" if category in ("skipped", "xfailed") else "Failure"
             _render_field(lines, label, detail)
+    if nodeid in _teardown_failures:
+        _render_field(lines, "Teardown failure", _teardown_failures[nodeid])
     lines.append("")
 
 
-def _write_trend_log() -> None:
+def _write_trend_log() -> list[str]:
     """One committed trend-log row per Correctness suite present in this session (PRB-level
     and/or end-to-end), plus one per Robustness family x tier combination (invariance/sensitivity,
     mechanical/semantic) — spec: docs/evaluation/eval-framework.md §9. Pools every scenario's
@@ -586,7 +616,12 @@ def _write_trend_log() -> None:
 
     Always stamped in UTC, independent of ``EVAL_REPORT_TZ`` (that variable only controls the
     gitignored per-run Markdown report's timestamp/filename) — a committed file read by every
-    contributor and by downstream trend analysis must not carry a per-contributor UTC offset."""
+    contributor and by downstream trend analysis must not carry a per-contributor UTC offset.
+
+    Returns the Scale suites whose row this call tagged "partial" (sorted). The report header
+    names them, so ``eval/dashboard.py`` does not count them as full (a report has no ``run_type``
+    of its own) -- one decision, made here, for both the trend log and the dashboard."""
+    partial_scale_suites: list[str] = []
     by_suite: dict[str, list[dict]] = {}
     robustness_flags: dict[str, list[bool]] = {}
     robustness_entries: dict[str, list[dict]] = {}
@@ -665,19 +700,22 @@ def _write_trend_log() -> None:
         if correctness:
             scale_metrics.update(pool_correctness_metrics(correctness))
         # Both pooling functions above emit "scenarios_scored" (len(entries)) under the same key,
-        # so when both halves ran, the correctness update just silently overwrote the structural
-        # half's value with its own. Harmless only because this suite's own design guarantees at
-        # most one entry per half -- one structural test function, one correctness test function,
-        # neither parametrized -- so the two counts are always equal when both ran. Asserted here
-        # instead of relying on that invariant silently via dict-overwrite order, so a future
-        # change that breaks it (e.g. parametrizing either test) fails loudly instead of quietly
-        # reporting whichever count happened to be written last.
-        if structural and correctness:
-            assert len(structural) == len(correctness), (
-                f"{scale_suite}: structural scored {len(structural)} run(s) but correctness scored "
-                f"{len(correctness)} -- scenarios_scored would silently pick one over the other"
+        # so when both halves ran, the correctness update overwrote the structural half's value
+        # with its own. Harmless only while each half has exactly one entry (one structural test
+        # function, one correctness test function, neither parametrized). If a future change breaks
+        # that, tag the row "partial" and say so -- not an assert: this runs inside
+        # pytest_sessionfinish before the Markdown report is written, so an exception here would
+        # drop the remaining trend rows and the report of a long live-LLM run.
+        if structural and correctness and len(structural) != len(correctness):
+            print(
+                f"\n[eval trend log] {scale_suite}: structural scored {len(structural)} run(s) but "
+                f"correctness scored {len(correctness)} -- scenarios_scored is ambiguous, row tagged partial"
             )
+            run_type = "partial"
+        if run_type == "partial":
+            partial_scale_suites.append(scale_suite)
         append_row(scale_suite, scale_metrics, run_type=run_type)
+    return partial_scale_suites
 
 
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
@@ -691,12 +729,12 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     order = ["failed", "passed", "error", "xpassed", "xfailed", "skipped"]
     buckets: dict[str, list[tuple[str, pytest.TestReport]]] = {cat: [] for cat in order}
     for nodeid, report in _reports.items():
-        buckets[_categorize(report)].append((nodeid, report))
+        buckets["error" if nodeid in _teardown_failures else _categorize(report)].append((nodeid, report))
     for cat in buckets:
         buckets[cat].sort(key=lambda pair: pair[0])
 
     now = datetime.now(REPORT_TZ)
-    _write_trend_log()
+    partial_scale_suites = _write_trend_log()
     total = len(_reports)
     lines = [
         "# policy-eval-scenarios test report",
@@ -704,8 +742,10 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
         f"Run: {now.isoformat()}",
         f"Exit status: {exitstatus}",
         f"Total: {total} — " + ", ".join(f"{cat}={len(buckets[cat])}" for cat in order),
-        "",
     ]
+    if partial_scale_suites:
+        lines.append(f"Partial Scale suites: {', '.join(partial_scale_suites)}")
+    lines.append("")
     for cat in order:
         entries = buckets[cat]
         lines.append(f"## {cat} ({len(entries)})")

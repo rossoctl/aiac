@@ -1,8 +1,9 @@
 """HTTP client for the PDP Policy Writer (OPA) REST API.
 
-Module-level functions wrapping ``{AIAC_PDP_POLICY_URL}/policy...`` endpoints.
-The PDP Policy Writer operates on a Kubernetes CR, not a Keycloak realm, so
-none of these functions take or send a ``realm`` parameter.
+Module-level functions wrapping ``{AIAC_PDP_POLICY_URL}/policy...`` endpoints (D18c). The body
+of ``apply_policy`` / ``replace_policy`` is a tagged policy model; the writer upserts one CR per
+entry and reads the enforcement side from the tag. The PDP Policy Writer operates on Kubernetes
+CRs, not a Keycloak realm, so none of these functions take or send a ``realm`` parameter.
 """
 
 import os
@@ -13,7 +14,8 @@ from urllib.parse import quote
 import requests
 from dotenv import load_dotenv
 
-from aiac.policy.model.models import AgentPolicyModel, PolicyModel
+from aiac.policy.model.models import PolicyModel
+from aiac.shared.env import env_num
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
@@ -23,21 +25,34 @@ load_dotenv(Path(__file__).resolve().parent / ".env")
 # partial-SSRF vector). The fullmatch barrier is what CodeQL recognises; ``quote`` alone does not.
 _URL_SEGMENT_RE = re.compile(r"[A-Za-z0-9._~%-]+")
 
+# Per-request timeout (seconds) for every PDP Policy Writer call. Without it a hung writer (for
+# example a stuck Kubernetes API) would block the caller, which holds the PCE lock, indefinitely.
+# Longer than the store's: one ``PUT /policy`` server-side-applies every CR. Tunable via
+# ``AIAC_PDP_HTTP_TIMEOUT``.
+_HTTP_TIMEOUT_ENV = "AIAC_PDP_HTTP_TIMEOUT"
+_HTTP_TIMEOUT_DEFAULT = 60.0
+
+
+def _http_timeout() -> float:
+    """The timeout in seconds, read at call time. An unset, non-numeric, non-finite, zero or negative
+    value falls back to the default: a bad value must not stop the Controller at import."""
+    return env_num(_HTTP_TIMEOUT_ENV, _HTTP_TIMEOUT_DEFAULT, float, minimum=0.0, exclusive=True)
+
 
 def _base_url() -> str:
     return os.getenv("AIAC_PDP_POLICY_URL", "http://127.0.0.1:7072")
 
 
-def _agent_id_segment(agent_id: str) -> str:
-    """URL-encode ``agent_id`` as a single, validated path segment.
+def _service_id_segment(service_id: str) -> str:
+    """URL-encode ``service_id`` as a single, validated path segment.
 
-    ``agent_id`` is the Keycloak clientId (``{ns}/{name}`` or a SPIFFE URI), so it can carry
+    ``service_id`` is the Keycloak clientId (``{ns}/{name}`` or a SPIFFE URI), so it can carry
     slashes and other reserved characters; ``safe=""`` escapes them all. The fullmatch check
     then guarantees the result cannot alter the request target.
     """
-    segment = quote(agent_id, safe="")
+    segment = quote(service_id, safe="")
     if not _URL_SEGMENT_RE.fullmatch(segment):
-        raise ValueError(f"agent_id {agent_id!r} does not yield a safe URL path segment")
+        raise ValueError(f"service_id {service_id!r} does not yield a safe URL path segment")
     return segment
 
 
@@ -47,16 +62,21 @@ def _check(resp: requests.Response) -> None:
 
 
 def apply_policy(model: PolicyModel) -> None:
-    _check(requests.post(f"{_base_url()}/policy", json=model.model_dump()))
+    """``POST /policy`` — upsert one CR per entry of ``model``."""
+    _check(requests.post(f"{_base_url()}/policy", json=model.model_dump(mode="json"), timeout=_http_timeout()))
 
 
-def apply_agent_policy(agent_id: str, model: AgentPolicyModel) -> None:
-    _check(requests.post(f"{_base_url()}/policy/agents/{_agent_id_segment(agent_id)}", json=model.model_dump()))
+def replace_policy(model: PolicyModel) -> None:
+    """``PUT /policy`` — upsert every entry of ``model``, then delete every other AIAC CR."""
+    _check(requests.put(f"{_base_url()}/policy", json=model.model_dump(mode="json"), timeout=_http_timeout()))
 
 
-def delete_agent_policy(agent_id: str) -> None:
-    _check(requests.delete(f"{_base_url()}/policy/agents/{_agent_id_segment(agent_id)}"))
+def delete_service_cr(service_id: str) -> None:
+    """``DELETE /policy/services/{service_id}`` — delete the CR of one service (a missing CR is
+    success). Under D20 the service is then denied."""
+    _check(requests.delete(f"{_base_url()}/policy/services/{_service_id_segment(service_id)}", timeout=_http_timeout()))
 
 
 def delete_policy() -> None:
-    _check(requests.delete(f"{_base_url()}/policy"))
+    """``DELETE /policy`` — delete every AIAC CR. No AIAC code calls it (C1)."""
+    _check(requests.delete(f"{_base_url()}/policy", timeout=_http_timeout()))

@@ -4,21 +4,41 @@ Issue ``testing/5.4.2-uc1-onboard-agent-then-tool.md``; spec
 ``docs/testing/uc1-onboarding-pipeline.md``. Onboard **event-driven** by deploying the ``github-agent``
 workload **first** and the ``github-tool`` workload **second** (each deploy → operator registers a
 Keycloak client → ``CLIENT_CREATED`` → ``aiac-event-listener`` SPI → NATS → the agent consumer runs
-``onboard_service``), then assert the **full** truth table at the end by driving **real HTTP requests
+``onboard_and_apply``), then assert the **full** truth table at the end by driving **real HTTP requests
 through AuthBridge** and reading the **real OPA plugin's** allow/deny (handoff 08; live loop shape in
 ``k8s/opa-kind-runbook.md``).
 
-This rung proves the key reconciliation property: onboarding the tool **after** the agent
-retroactively completes the agent's outbound policy. When the agent is onboarded alone its outbound
-gate is empty (rung 1); when the tool is then onboarded, its Service Policy Builder pairs the tool's
-scopes against the existing role universe (agent role + user roles) and the PCE **routes** those
-``(role, tool-scope)`` rules onto the **tool's** persistent ``ServicePolicyModel`` via
-``compute_and_apply(override=False)``. Because the agent's role targets a tool scope, the agent is in
-the affected set, so its ``AgentPolicyModel`` is **re-derived from the SPMs** and its outbound
-``AuthorizationPolicy`` rule is (re)written with the full user→tool gate — which the live probes below
-observe as real allow/deny decisions once ``bundle-service`` recomposes the bundle.
+This rung proves the key reconciliation property: onboarding the tool **after** the agent completes
+the tool check. When the agent is onboarded alone there is no tool check (rung 1); when the tool is
+then onboarded, its Service Policy Builder pairs the tool's scopes against the existing role universe
+(agent roles + user roles) and the PCE **routes** those ``(role, tool-scope)`` rules onto the **tool's**
+persistent ``ServicePolicyModel`` via ``compute_and_apply(override=False)``. Then the PCE deploys the
+affected services of the live **enforcement side** (D23):
 
-There is **no agent re-onboard** and **no intermediate validation** — only the end state is checked.
+* **target side** (default) — the affected set is the ``changed`` set: only ``SPM(github-tool)``
+  changed, so the PCE writes **github-tool's own CR**, whose inbound has both gates (the user gate and
+  the calling-agent gate, D26). The agent's CR does not change; its outbound is a pass-through (D24).
+* **agent side** — the agent's role targets a tool scope, so the agent is affected: its
+  ``AgentPolicyModel`` is **re-derived from the SPMs** and its outbound package is (re)written with the
+  full user→tool gate; github-tool gets a pass-through CR.
+
+The live probes below observe the result as real allow/deny decisions once ``bundle-service``
+recomposes the bundles; the verdicts are the same under each side. Two side-aware nodes check where
+the deny of an ungranted call comes from (``deny_origin``) and the shape of both CRs
+(``cr_matches_side``).
+
+**The subject on every leg (D31).** The tool's inbound keys users by username, and it reads the
+subject from the ``sub`` of the token that the agent exchanged. Keycloak's standard token exchange
+builds that token from the agent client's scopes only, so AIAC links the client scope
+``aiac-username-sub`` to each onboarded client, and also to the login client ``rossoctl`` for the login
+token. ``test_subject_scope_linked`` checks this in Keycloak (the scope, its mapper, no marker, the three
+default links, no ``sub`` client mapper on ``rossoctl``, and the ``rossoctl`` login token), and ``test_exchanged_token_subject_is_username`` decodes a real exchanged token (as the
+agent client, with its client secret — the identity that ``k8s/opa-kind-enable.sh`` gives AuthBridge's
+``token-exchange``; it skips cleanly only when the agent client uses another authenticator). The shared fixture also fails fast when a link is missing
+(``require_subject_scope`` right after each workload converges).
+
+There is **no agent re-onboard** and **no intermediate validation** — only the end state is checked
+(apart from the subject-scope check of the fixture).
 This is order 1 of the order-independence pair; rung 3 (tool then agent) asserts its final live
 outbound matrix is **identical** to this rung's.
 
@@ -26,7 +46,7 @@ Reuses the shared harness (``uc1_onboard.py`` — config, Keycloak provisioning/
 deploy/undeploy trigger, Part-B outbound-leg prep, bundle convergence poll, per-rung fixture flow) and
 ``scenario_uc1.py`` (the truth tables — the oracle). The deployed OPA plugin is the evaluator (no
 ``.rego`` dump, no ``opa`` binary). The **only** rung-2-specific content here is the oracle (the full
-outbound gate, keyed on the **bare** runtime tool names) and the live assertions; the onboarding order
+tool check, keyed on the **bare** runtime tool names) and the live assertions; the onboarding order
 — ``[agent, tool]`` — is the deploy order passed to the shared fixture flow.
 
 Per-rung flow (spec § Per-rung flow): **pre-run no-workloads slate → provision realm/users →
@@ -77,9 +97,9 @@ TEST_REALM = uc1.TEST_REALM
 @pytest.fixture(scope="session")
 def onboarded() -> dict:
     """Onboard the agent **then** the tool — event-driven — by deploying them in that order via the
-    shared harness (order is this rung's identity — tool onboarding retroactively completes the agent's
-    outbound gate), and yield the live probe context (``admin`` handle, ``agent_pod``, Keycloak
-    URL/realm, ``tool_onboarded=True``). The harness starts from a no-workloads slate and, on teardown,
+    shared harness (order is this rung's identity — tool onboarding completes the tool check), and
+    yield the live probe context (``admin`` handle, ``agent_pod``, Keycloak URL/realm,
+    ``tool_onboarded=True``, the live ``side``). The harness starts from a no-workloads slate and, on teardown,
     tears both workloads + all their Keycloak registrations and ``AuthorizationPolicy`` CRs back down
     to pristine (spec § Per-rung flow). No agent re-onboard, no intermediate validation — only the end
     state is asserted below."""
@@ -138,11 +158,83 @@ def test_inbound(onboarded: dict, subject: str) -> None:
 @pytest.mark.parametrize("subject", list(scn.USERS))
 @pytest.mark.parametrize("tool_bare", scn.TOOL_REQUEST_NAMES)
 def test_outbound(onboarded: dict, subject: str, tool_bare: str) -> None:
-    """Outbound user gate — a real MCP ``tools/call`` for the **bare** tool through AuthBridge's
-    forward proxy (token-exchange → OPA) decides each ``(subject, tool)`` per the full
-    ``OUTBOUND_SUBJECT_BARE`` table — the gate tool onboarding completed on the agent. AuthBridge's
-    ``mcp-parser`` surfaces ``input.mcp.params.name`` (no hand-built input); the real OPA plugin
-    renders a denial as a JSON-RPC error frame the harness classifies."""
+    """Tool check — a real MCP ``tools/call`` for the **bare** tool through AuthBridge's forward proxy
+    (token-exchange → the tool check) decides each ``(subject, tool)`` per the full
+    ``OUTBOUND_SUBJECT_BARE`` table — the check tool onboarding completed. AuthBridge's ``mcp-parser``
+    surfaces ``input.mcp.params.name`` (no hand-built input). Under target side github-tool's inbound
+    OPA decides (a deny is its HTTP 403, relayed by the agent's pass-through outbound); under agent side
+    the agent's outbound OPA decides (a deny is a JSON-RPC error frame). The harness classifies both."""
     assert uc1.outbound_decision(onboarded, subject, tool_bare) == uc1.expected_outbound_decision(subject, tool_bare), (
         f"{subject} / {tool_bare}"
+    )
+
+
+def test_deny_comes_from_enforcement_point(onboarded: dict) -> None:
+    """The deny of an ungranted call (``test-user`` × ``source-read``) comes from the enforcement point
+    of the live side: from github-tool's inbound under target side — so the agent's outbound let the
+    call through and the tool check moved to the callee — and from the agent's outbound under agent
+    side (``deny_origin`` reads the raw response)."""
+    probe = uc1.outbound_deny_probe(onboarded, "test-user", "source-read")
+    want = uc1.SIDE_ENFORCEMENT_POINT[onboarded["side"]]
+    assert probe["decision"] == "deny" and probe["origin"] == want, (
+        f"{onboarded['side']}: test-user / source-read decision={probe['decision']!r} origin={probe['origin']!r} "
+        f"(want 'deny' from {want!r}); HTTP {probe['code']}, body={probe['body'][:300]!r}"
+    )
+
+
+def test_crs_match_live_side(onboarded: dict) -> None:
+    """github-agent's and github-tool's CRs both exist (every managed service has a CR, D20), each with
+    exactly the two request packages, in the shape of the live side (``cr_matches_side``): under target
+    side both inbounds are rules-based with grants and both outbounds are pass-throughs; under agent
+    side the agent's outbound is rules-based and github-tool has a pass-through CR."""
+    side = onboarded["side"]
+    problems = {
+        workload: uc1.cr_side_mismatches(uc1.authpolicy_policies(workload), kind, side)
+        for workload, kind in uc1.WORKLOAD_KIND.items()
+    }
+    assert not any(problems.values()), f"CRs do not match {side}: {problems}"
+
+
+# ======================================================================================
+# The subject on every leg (D31) — both sources of sub = username
+# ======================================================================================
+
+
+def test_subject_scope_linked(onboarded: dict) -> None:
+    """The one source of ``sub`` = username is in place (D31):
+
+    * ``aiac-username-sub`` exists with the ``username → sub`` mapper and no ``aiac.managed`` marker,
+      and the login client ``rossoctl``, github-agent and github-tool each link it as a **default**
+      scope (``subject_scope_link_problems``);
+    * ``rossoctl`` has no client mapper of its own that writes ``sub`` (no AIAC step adds one), and a
+      ``rossoctl`` password-grant token for ``dev-user`` has ``sub`` = ``dev-user``."""
+    admin = onboarded["admin"]
+    problems = uc1.subject_scope_link_problems(admin, [scn.AGENT_WORKLOAD, scn.TOOL_WORKLOAD])
+    assert not problems, f"the subject scope {uc1.SUBJECT_SCOPE!r} is not in place: {problems}"
+
+    login = uc1.login_client(admin)
+    assert login is not None, f"no login client {uc1.KEYCLOAK_CLIENT_ID!r} in realm {TEST_REALM!r}"
+    mappers = admin.get_mappers_from_client(login["id"])
+    assert not any(uc1.is_login_subject_mapper(m) for m in mappers), (
+        f"the login client {uc1.KEYCLOAK_CLIENT_ID!r} has a client mapper that writes sub (the scope "
+        f"{uc1.SUBJECT_SCOPE!r} must be the one source): "
+        f"{[(m.get('name'), (m.get('config') or {}).get('claim.name')) for m in mappers]}"
+    )
+    sub = uc1.login_subject(onboarded, "dev-user")
+    assert sub == "dev-user", f"a {uc1.KEYCLOAK_CLIENT_ID!r} login token for dev-user has sub={sub!r}"
+
+
+@pytest.mark.parametrize("subject", list(scn.USERS))
+def test_exchanged_token_subject_is_username(onboarded: dict, subject: str) -> None:
+    """A standard token exchange of ``subject``'s login token, as the agent client to the tool audience
+    (the request AuthBridge's route sends), gives a token with ``sub`` = the username — the subject
+    that the tool's inbound reads. It comes from the agent's default scope ``aiac-username-sub``: the
+    exchange applies only the agent client's scopes. The harness authenticates with the agent's client
+    secret; it skips cleanly only when the agent client uses another authenticator (for example a SPIFFE
+    JWT-SVID through ``federated-jwt``), and a refused secret is a failure. This is the one direct check
+    of the exchanged ``sub``: under agent side no one-hop decision reads it."""
+    sub = uc1.exchanged_subject(onboarded, subject)
+    assert sub == subject, (
+        f"the exchanged token for {subject!r} has sub={sub!r} (want the username) — is {uc1.SUBJECT_SCOPE!r} "
+        "a default scope of the agent client?"
     )

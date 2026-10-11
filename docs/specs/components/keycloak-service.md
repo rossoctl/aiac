@@ -1,10 +1,10 @@
 # ~~Component PRD: Keycloak Configuration Service~~
 
-> **Superseded.** This component's read endpoints have been replaced by the **IdP Configuration Service** — see [idp-configuration-service.md](idp-configuration-service.md).
+> **Superseded.** This component (all its endpoints, read and write) has been replaced by the **IdP Configuration Service**, and its code has been removed — see [idp-configuration-service.md](idp-configuration-service.md).
 >
 > The content below is retained for reference only.
 >
-> **SPM/APM note.** Under the SPM/APM redesign a user's role is a Keycloak **realm role** and an agent's role is surfaced as `kind = Agent` — sourced from the agent client's **client roles** *and* from the `aiac.managed` **realm roles assigned to its service account** (the provisioning path the `Configuration` library uses); the IdP Configuration Service populates `Role.kind`, `Role.actorIds`, and `Scope.serviceId` and fails loud on cross-kind roles (Assumption 1) and multi-owner AIAC-managed scopes (Assumption 2). See [idp-configuration-service.md](idp-configuration-service.md) for the authoritative, current description.
+> **SPM/APM note.** Under the SPM/APM redesign a user's role is a Keycloak **realm role** and an agent's role is surfaced as `kind = Agent` — sourced from the agent client's **client roles** *and* from the `aiac.managed` **realm roles assigned to its service account** (the provisioning path the `Configuration` library uses); the IdP Configuration Service populates `Role.kind`, `Role.actorIds`, and `Scope.serviceId` and fails loud on cross-kind roles (Assumption 1). A role or a scope that several services share is valid (D32: the former Assumption 2 and its multi-owner check are removed; each owner gets its own copy of a shared scope). See [idp-configuration-service.md](idp-configuration-service.md) for the authoritative, current description.
 
 ## Location
 `src/aiac/keycloak/service/`

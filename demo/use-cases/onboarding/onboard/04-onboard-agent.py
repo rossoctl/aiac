@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Onboard the ``github-agent`` workload: ``POST /apply/service/{uuid}`` behind a port-forward to
 the Controller, then capture the generated rego from the agent's ``AuthorizationPolicy`` CR into
-``generated/01-after-agent/`` — the first pause's evidence (before the tool exists, the agent's
-outbound gate is still empty)."""
+``generated/01-after-agent/`` — the first pause's evidence. The agent's inbound gate is populated.
+Under target side (the default) its outbound is a pass-through, and the tool has no CR yet (it is
+not onboarded, so the changed combiner, D20, denies it). Under agent side the agent's outbound gate
+is still empty."""
 
 from __future__ import annotations
 
@@ -52,7 +54,7 @@ def main() -> None:
         ok(f"{rego_dir / f}")
 
     print(f"\nAgent onboarded. Snapshot: {rego_dir}")
-    print("Next: make show   (or: make onboard-tool)")
+    print("Next: make show   (or: make tool)")
 
 
 if __name__ == "__main__":

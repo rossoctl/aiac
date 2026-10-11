@@ -77,6 +77,7 @@ _SUITE_BY_NODEID_MARKER = {
 }
 
 _RUN_RE = re.compile(r"^Run: (.+)$")
+_PARTIAL_SCALE_RE = re.compile(r"^Partial Scale suites: (.+)$")
 _HEADING_RE = re.compile(r"^## (\w+) \(\d+\)$")
 _ENTRY_RE = re.compile(r"^### `(.+)`$")
 _BULLET_RE = re.compile(r"^- \*\*(.+?):\*\*\s?(.*)$")
@@ -100,8 +101,9 @@ _FLOAT_FIELDS = {"precision", "recall", "denial_precision"}
 class ScenarioEntry:
     """One ``### \\`nodeid\\``` entry from a per-run Markdown report (``eval/conftest.py``'s
     ``_render_entry``). ``suite``/``scenario`` are ``None`` for a non-correctness-suite entry.
-    ``precision``/``recall``/``denial_precision`` are ``None`` when the scenario's own setup failed
-    before scoring ever ran (``_render_metrics_block``'s ``unavailable_reason`` branch)."""
+    ``precision``/``recall``/``denial_precision`` are ``None`` when the test failed before scoring
+    ever ran -- a fixture error, a scenario setup failure or a test-body error
+    (``_render_metrics_block``'s ``unavailable_reason`` branch)."""
 
     nodeid: str
     suite: str | None = None
@@ -122,6 +124,9 @@ class ParsedReport:
     path: Path
     run_at: datetime
     entries: list[ScenarioEntry] = field(default_factory=list)
+    # Scale suites whose trend-log row this run tagged "partial" (the report header's
+    # "Partial Scale suites:" line, from eval/conftest.py's _write_trend_log). Never full.
+    partial_suites: set[str] = field(default_factory=set)
 
 
 def _suite_for_nodeid(nodeid: str) -> str | None:
@@ -138,7 +143,7 @@ def _scenario_for_nodeid(nodeid: str) -> str | None:
 
 def _parse_metric(value: str) -> float | None:
     """``value`` is a float string (``"1.000"``) or the ``"unavailable — ..."`` placeholder
-    ``_render_metrics_block`` writes for a scenario whose setup failed before scoring ran."""
+    ``_render_metrics_block`` writes for a test that failed before scoring ran."""
     if value.startswith("unavailable"):
         return None
     return float(value)
@@ -159,6 +164,7 @@ def parse_report(path: Path) -> ParsedReport:
     mirroring ``eval/conftest.py``'s render logic in reverse (see module docstring)."""
     lines = path.read_text(encoding="utf-8").splitlines()
     run_at: datetime | None = None
+    partial_suites: set[str] = set()
     category = ""
     entries: list[ScenarioEntry] = []
     entry: ScenarioEntry | None = None
@@ -181,6 +187,8 @@ def parse_report(path: Path) -> ParsedReport:
 
         if run_m := _RUN_RE.match(line):
             run_at = datetime.fromisoformat(run_m.group(1))
+        elif partial_m := _PARTIAL_SCALE_RE.match(line):
+            partial_suites = {suite.strip() for suite in partial_m.group(1).split(",")}
         elif heading_m := _HEADING_RE.match(line):
             category = heading_m.group(1)
         elif entry_m := _ENTRY_RE.match(line):
@@ -207,7 +215,7 @@ def parse_report(path: Path) -> ParsedReport:
 
     if run_at is None:
         raise ValueError(f"{path}: no 'Run:' line found")
-    return ParsedReport(path=path, run_at=run_at, entries=entries)
+    return ParsedReport(path=path, run_at=run_at, entries=entries, partial_suites=partial_suites)
 
 
 def parse_reports(reports_dir: Path) -> list[ParsedReport]:
@@ -233,7 +241,8 @@ def parse_reports(reports_dir: Path) -> list[ParsedReport]:
 _EXPECTED_SCENARIO_COUNT = 8
 
 # Suites whose "full" scored-entry count isn't the shared 8-scenario corpus -- explicit overrides,
-# checked before the default above. The Scale suite's four correctness test functions (#2469) are
+# checked before the default above. A Scale run that the trend log tagged "partial" is not full
+# either -- see _full_suites. The Scale suite's four correctness test functions (#2469) are
 # each exactly one fixture-backed test case (one generated total-corpus/per-decision scenario per
 # dimension/level), never a sweep over multiple named scenarios, so "full" for them is 1, not 8 --
 # without this override _full_suites (and therefore render_scenario_table/_find_matching_report)
@@ -261,10 +270,17 @@ def _full_suites(report: ParsedReport) -> set[str]:
     partial -- matching by suite *presence* alone (the previous behavior) could link a genuine
     full-corpus chart point to a `-k`-filtered debug report that happens to fall within the match
     tolerance, landing the link on a section listing none of that suite's scenarios, or on no
-    section at all if every suite in that report is partial."""
+    section at all if every suite in that report is partial. A Scale suite that the report names
+    as partial (``ParsedReport.partial_suites`` -- a reduced size, another seed, only one of its
+    two halves run, ...) is never full, whatever its entry count: the trend log tagged the same run
+    "partial"."""
     scored = [e for e in report.entries if e.suite is not None and e.precision is not None]
     counts = Counter(e.suite for e in scored)
-    return {suite for suite, count in counts.items() if count >= _expected_count(suite)}
+    return {
+        suite
+        for suite, count in counts.items()
+        if count >= _expected_count(suite) and suite not in report.partial_suites
+    }
 
 
 # Both timestamps come from separate ``datetime.now()`` calls inside the same
@@ -303,35 +319,16 @@ def _report_anchor(report: ParsedReport) -> str:
 
 # Bookkeeping keys every trend-log row carries (eval/trend_log.py's `append_row`, plus
 # `scenarios_scored` that every pooling function adds) that are never themselves a plottable
-# metric -- everything else on a row *used* to be one, whatever the suite, back when every metric
-# any pooling function produced was naturally 0-1-bounded (a rate or a score). This chart hardcodes
-# a fixed 0-1 y-axis (see render_svg_chart) on exactly that assumption, so it breaks silently, not
-# loudly, for a metric that isn't: `pool_scale_metrics` (#2469) also emits `total_tokens` (raw token
-# counts, unbounded) and `mean_wall_clock_seconds` (raw seconds, unbounded) for latency/cost --
-# "reported and trended" per the Scale spec, meaning committed to `trend_log.jsonl` for the
-# record, not necessarily meant to share a 0-1 rate chart with precision/recall. Confirmed
-# empirically: without this exclusion, a real run's `total_tokens` line plotted at y ≈
-# -1.7 billion, wildly off-canvas. `structural_issue_count` (a raw count, unbounded on a failing
-# run) is excluded for the same reason -- `structural_pass_rate` is the 0-1-bounded signal that
-# actually belongs on this chart, mirroring how Consistency charts `agreement_rate`, never its own
-# raw `mismatches` count.
-_ROW_BOOKKEEPING_KEYS = {
-    "timestamp",
-    "suite",
-    "run_type",
-    "model",
-    "scenarios_scored",
-    "total_tokens",
-    "mean_wall_clock_seconds",
-    "structural_issue_count",
-}
+# metric.
+_ROW_BOOKKEEPING_KEYS = {"timestamp", "suite", "run_type", "model", "scenarios_scored"}
 
-# Belt-and-suspenders beyond the explicit names above: a future pooling function's metric name
-# ending in one of these unit/tally suffixes is unbounded by construction (a raw token count, a
-# wall-clock duration, an issue tally) and must never share this chart's fixed 0-1 y-axis with a
-# precision/recall/rate/coverage metric -- excluded by shape, not only by an exact name someone
-# remembered to add to _ROW_BOOKKEEPING_KEYS after the fact (that denylist-by-name is exactly how
-# `total_tokens` first plotted at y ≈ -1.7 billion before being named above).
+# This chart hardcodes a fixed 0-1 y-axis (see render_svg_chart), so a metric that is not a rate or
+# a score must never be plotted on it. A metric name ending in one of these unit/tally suffixes is
+# unbounded by construction -- `pool_scale_metrics` (#2469) emits `total_tokens` (raw token
+# counts), `mean_wall_clock_seconds` (raw seconds) and `structural_issue_count` (a raw tally); a
+# real run's `total_tokens` once plotted at y ≈ -1.7 billion. The rule is by shape, not by name,
+# so a future pooling function's unbounded metric is excluded too. `structural_pass_rate` is the
+# 0-1 signal that belongs on this chart, as Consistency charts `agreement_rate`, not `mismatches`.
 _UNBOUNDED_METRIC_SUFFIXES = ("_tokens", "_seconds", "_count")
 
 # Fixed palette metrics are assigned from, in first-seen order, so the same metric name gets the

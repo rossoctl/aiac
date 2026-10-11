@@ -25,7 +25,8 @@ class OnboardingProvisionState(BaseModel):
     service_provision: ServiceProvision | None = None
 
     # Created-manifest: exactly the roles/scopes provision_service CREATED on this run (not the
-    # ones it reused by name). Consumed by the UC1 compensating rollback so teardown removes only
+    # ones it reused by name, also after a 409 of a concurrent create, REJ-02: the library's
+    # `created` flag decides). Consumed by the UC1 compensating rollback so teardown removes only
     # what this run added. Empty on the non-UC1 / no-write paths.
     created_roles: list[Role] = []
     created_scopes: list[Scope] = []

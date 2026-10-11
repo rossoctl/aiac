@@ -137,9 +137,9 @@ Then **re-seed** (see below).
 ## Re-seed by re-onboarding
 
 The store is repopulated by **re-onboarding every managed service** through the
-stateless Controller. Each call runs the onboarding use-case → `(rules,
-override)` → PCE `compute_and_apply`, which writes fresh SPMs (now with
-`inbound_allow_rules` populated) and rebuilds all **derived** state — the
+stateless Controller. Each call runs the onboarding use-case (`onboard_and_apply`),
+which calls the PCE `compute_and_apply(rules, override=False, focus_service=client_id)`. The PCE
+writes fresh SPMs (now with `inbound_allow_rules` populated) and rebuilds all **derived** state — the
 per-agent `AgentPolicyModel`s and the generated OPA Rego — automatically. No
 separate PDP step is needed.
 

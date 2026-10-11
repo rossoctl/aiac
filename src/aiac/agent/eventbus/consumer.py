@@ -2,10 +2,25 @@
 
 Subscribes to the ``aiac-agent-consumer`` durable queue group and, on each
 message, calls the same use-case handler + ``compute_and_apply`` sequence the
-HTTP routes use, awaiting completion before acking. On handler failure, the
-message is left unacked (NATS redelivers) until ``num_delivered`` reaches
-``MAX_DELIVER``, at which point it is republished to the DLQ subject and
-terminated (stops redelivery on this consumer).
+HTTP routes use (UC1: only ``onboard_and_apply``, which makes the ``compute_and_apply`` call
+itself), awaiting completion before acking. A role-membership change
+(``aiac.apply.role-members.{role-id}``, D32) calls the PCE ``rerender_role`` instead, as the
+``POST /apply/role-members/{role_id}`` route does: no use-case handler (no PRB run) and no
+``compute_and_apply``. Before it subscribes, the start updates an existing durable consumer to the
+config of the code (``ensure_consumer``). On a **permanent** failure (see
+``_PERMANENT_ERRORS``: a policy conflict or contradiction, a PRB fault, an unparseable LLM
+response, or a failed UC1 precondition check) the message is republished to the DLQ subject and
+terminated at the FIRST delivery. On any other failure the message is left unacked (NATS
+redelivers after ``ACK_WAIT_SECONDS``) until ``num_delivered`` reaches ``MAX_DELIVER``, at which
+point it is republished to the DLQ subject and terminated (stops redelivery on this consumer). One
+retryable failure is nak'd instead of left unacked: ``ServiceNotVisibleError`` (the IdP does not show
+a new service yet, the event-before-commit race), so NATS redelivers it after a short delay
+(``AIAC_NOT_VISIBLE_NAK_DELAY_SECONDS``), not after ``ACK_WAIT_SECONDS``.
+
+Also owns the FastAPI ``lifespan``: it runs the Controller start sequence (the enforcement side,
+start check #4, then the PCE resync; see ``controller.start``) and starts the consumer only after
+it. A failed step (also an unknown ``AIAC_ENFORCEMENT_SIDE``) raises from the lifespan, so the
+Controller stops before it serves.
 """
 
 import asyncio
@@ -18,16 +33,17 @@ from urllib.parse import unquote
 import nats
 from fastapi import FastAPI
 from nats.aio.msg import Msg
-from nats.js.api import AckPolicy, ConsumerConfig
 
+from aiac.agent.controller.start import run_start_sequence
 from aiac.agent.eventbus.stream import (
-    ACK_WAIT_SECONDS,
     CONSUMER_FILTER_SUBJECTS,
     CONSUMER_NAME,
     DEFAULT_NATS_URL,
     DLQ_SUBJECT,
     MAX_DELIVER,
     STREAM_NAME,
+    consumer_config,
+    ensure_consumer,
     ensure_stream,
 )
 from aiac.agent.policy_rules_builder.conflict_detection import PolicyConflictError
@@ -37,12 +53,14 @@ from aiac.agent.policy_rules_builder.graph import (
     UnparseableLLMResponseError,
 )
 from aiac.agent.shared.error_logging import log_by_type
-from aiac.agent.uc.onboarding.orchestrator import onboard_service, reenable_service
+from aiac.agent.uc.onboarding.orchestrator import ServiceNotVisibleError, onboard_and_apply
+from aiac.agent.uc.onboarding.preconditions import EnforcementPreconditionError
 from aiac.agent.uc.policy_update.build import build_policy
 from aiac.agent.uc.role_update.role import update_role
-from aiac.idp.configuration.models import ClientId, ServiceUuid
-from aiac.policy.computation import compute_and_apply
+from aiac.idp.configuration.models import ServiceUuid
+from aiac.policy.computation import compute_and_apply, rerender_role
 from aiac.policy.model.models import PolicyRule
+from aiac.shared.env import env_num
 
 logger = logging.getLogger(__name__)
 
@@ -53,13 +71,17 @@ _START_RETRY_MAX_BACKOFF = 30.0
 
 _SERVICE_PREFIX = "aiac.apply.service."
 _ROLE_PREFIX = "aiac.apply.role."
+# Not a sub-prefix of _ROLE_PREFIX: "aiac.apply.role-members.x" does not start with "aiac.apply.role.".
+_ROLE_MEMBERS_PREFIX = "aiac.apply.role-members."
 _POLICY_BUILD_SUBJECT = "aiac.apply.policy.build"
 
 # PERMANENT failures: redelivery can never make them succeed (a real policy conflict /
-# contradiction, an unparseable LLM response, or a builder fault), so they are DLQ'd +
-# term()ed on the FIRST delivery. Everything else — LLMAccessError (a transient LLM
+# contradiction, an unparseable LLM response, a builder fault, or a failed UC1 precondition
+# check — that one needs a fix in the cluster first), so they are DLQ'd + term()ed on the
+# FIRST delivery. Everything else — LLMAccessError (a transient LLM
 # outage that may clear) and genuinely unknown/transient errors — is RETRYABLE: left
-# unacked to redeliver until MAX_DELIVER, then DLQ'd. LLMAccessError is a sibling of the
+# unacked to redeliver until MAX_DELIVER, then DLQ'd (ServiceNotVisibleError is nak'd with a
+# short delay instead; see _NOT_VISIBLE_NAK_DELAY_ENV below). LLMAccessError is a sibling of the
 # permanent PRB errors under PolicyRulesBuilderBaseError, so isinstance() below correctly
 # excludes it from the permanent set.
 _PERMANENT_ERRORS: tuple[type[Exception], ...] = (
@@ -67,24 +89,87 @@ _PERMANENT_ERRORS: tuple[type[Exception], ...] = (
     PolicyContradictionError,
     PolicyRulesBuilderError,
     UnparseableLLMResponseError,
+    EnforcementPreconditionError,
 )
 
+# The event-before-commit race (D33 in docs/specs/PRD.md): the IdP can still answer 404 for a new
+# service after the orchestrator's bounded wait (``ServiceNotVisibleError``). The client can become
+# visible in some seconds, so the consumer naks that message with this delay instead of leaving it
+# unacked: the redelivery then comes after the delay, not after ACK_WAIT (600 s). Each nak uses one of the
+# MAX_DELIVER deliveries. Only this error class is nak'd; ACK_WAIT stays sized for long LLM
+# onboardings (see stream.py). Read from the env at call time; keep it well below ACK_WAIT.
+_NOT_VISIBLE_NAK_DELAY_ENV = "AIAC_NOT_VISIBLE_NAK_DELAY_SECONDS"
+_NOT_VISIBLE_NAK_DELAY_DEFAULT = 30.0
 
-def _handle(subject: str) -> tuple[list[PolicyRule], bool, ClientId | None]:
-    """Dispatch ``subject`` to its use-case handler — the consumer's only subject switch. Returns
-    ``(rules, override, focus_service)``: ``focus_service`` is the onboarded service's clientId (from
-    ``onboard_service``), and ``None`` for every other subject."""
-    if subject.startswith(_SERVICE_PREFIX):
-        return onboard_service(ServiceUuid(subject[len(_SERVICE_PREFIX) :]))
+
+def _not_visible_nak_delay() -> float:
+    """The nak delay in seconds for a not-visible service; an unset, non-numeric, non-finite, zero
+    or negative value falls back to the default (nats-py sends a plain nak, with no delay, for 0)."""
+    return env_num(_NOT_VISIBLE_NAK_DELAY_ENV, _NOT_VISIBLE_NAK_DELAY_DEFAULT, float, minimum=0.0, exclusive=True)
+
+
+async def _nak_not_visible(msg: Msg) -> None:
+    """Nak ``msg`` with the not-visible delay (nats-py takes the delay in seconds). A failed nak (for
+    example a dropped connection) must not crash the callback: it is logged, and the message stays
+    unacked, so NATS redelivers it after ACK_WAIT."""
+    delay = _not_visible_nak_delay()
+    try:
+        await msg.nak(delay=delay)
+    except Exception:
+        logger.exception("nak of %s failed; NATS redelivers it after ACK_WAIT", msg.subject)
+        return
+    logger.info(
+        "nak'd %s (service not visible yet, delivery %d); redelivery in %.0fs",
+        msg.subject,
+        msg.metadata.num_delivered,
+        delay,
+    )
+
+
+def _handle(subject: str) -> tuple[list[PolicyRule], bool]:
+    """Dispatch ``subject`` to its use-case handler — the subject switch for every subject that goes
+    through the caller's ``compute_and_apply`` (``_process`` sends an onboarding subject to
+    ``onboard_and_apply`` and a role-membership subject to ``rerender_role`` first). Returns
+    ``(rules, override)``."""
     if subject.startswith(_ROLE_PREFIX):
         # Mirror image of the Keycloak SPI's SubjectMapper.encodeSubjectToken: role names may
         # contain '.', which NATS treats as a token separator, so the SPI percent-encodes them
         # into a single token before publishing. unquote() is the general-purpose inverse; safe
         # here because every literal '%' in the original name was itself escaped to "%25".
-        return *update_role(unquote(subject[len(_ROLE_PREFIX) :])), None
+        return update_role(unquote(subject[len(_ROLE_PREFIX) :]))
     if subject == _POLICY_BUILD_SUBJECT:
-        return *build_policy(), None
+        return build_policy()
     raise ValueError(f"no handler for subject {subject!r}")
+
+
+async def _process(subject: str, wait_for_client: bool = True) -> None:
+    """Do the work of one message, mirroring its ``/apply/*`` route. Raises on a failure; the ack
+    contract is ``_dispatch``'s. ``wait_for_client`` is given to an onboarding: ``False`` makes it
+    read its client one time, with no wait (``_dispatch`` gives ``False`` only after a not-visible
+    nak, whose delay already gave the client time to become visible)."""
+    # ``_handle`` and ``onboard_and_apply`` (the LLM-backed policy-rules builder) and
+    # ``compute_and_apply`` are SYNCHRONOUS and slow (tens of seconds); ``rerender_role`` is
+    # synchronous too (IdP, store and PDP calls). nats-py
+    # runs the consumer callback ON the event loop, so calling them inline froze the loop for the whole
+    # onboard — starving the FastAPI ``/health`` endpoint until the liveness probe killed the pod
+    # mid-onboard (then NATS redelivered the unacked message and the race repeated). Offload each to
+    # the default threadpool so the loop stays free to answer ``/health`` while onboarding runs.
+    loop = asyncio.get_running_loop()
+    if subject.startswith(_ROLE_MEMBERS_PREFIX):
+        # A role-membership change (D32) changes only who holds the role, not the policy: re-render the
+        # CRs that use the role with its current holders. No use-case handler (so no PRB run), no
+        # compute_and_apply, no re-enable. The role id is a UUID: one token, passed as it is (no decode).
+        await loop.run_in_executor(None, rerender_role, subject.removeprefix(_ROLE_MEMBERS_PREFIX))
+        return
+    if subject.startswith(_SERVICE_PREFIX):
+        # UC1, mirroring the HTTP route: onboard_and_apply makes the compute_and_apply call and
+        # re-enables the client under the PCE lock after the apply succeeds. The subject token is
+        # the client's Keycloak UUID.
+        uuid = ServiceUuid(subject.removeprefix(_SERVICE_PREFIX))
+        await loop.run_in_executor(None, functools.partial(onboard_and_apply, uuid, wait_for_client=wait_for_client))
+        return
+    rules, override = await loop.run_in_executor(None, _handle, subject)
+    await loop.run_in_executor(None, compute_and_apply, rules, override)
 
 
 class AiacEventConsumer:
@@ -92,6 +177,12 @@ class AiacEventConsumer:
         self._nats_url = nats_url
         self._nc: nats.aio.client.Client | None = None
         self._sub = None
+        # The stream sequence of each message that this consumer nak'd because its service was not
+        # visible yet (``ServiceNotVisibleError``). Only the redelivery of such a message reads the
+        # client with no wait: a redelivery after another failure (an LLM timeout, say) waits again,
+        # so it does not use up a MAX_DELIVER delivery on one IdP read. In memory: after a restart,
+        # a redelivery waits again (the safe side). An entry is removed at the next delivery.
+        self._not_visible_seqs: set[int] = set()
 
     async def start(self) -> None:
         # max_reconnect_attempts=-1: once connected, never give up on a dropped connection
@@ -101,6 +192,9 @@ class AiacEventConsumer:
         self._nc = await nats.connect(self._nats_url, max_reconnect_attempts=-1)
         js = self._nc.jetstream()
         await ensure_stream(js)
+        # subscribe() uses ``config`` only to create a missing durable consumer; it binds to an existing
+        # one with the config that the server has. So update an existing one to the code's config first.
+        await ensure_consumer(js)
         self._sub = await js.subscribe(
             subject="aiac.apply.>",
             queue=CONSUMER_NAME,
@@ -108,12 +202,7 @@ class AiacEventConsumer:
             stream=STREAM_NAME,
             manual_ack=True,
             cb=self._dispatch,
-            config=ConsumerConfig(
-                filter_subjects=CONSUMER_FILTER_SUBJECTS,
-                ack_policy=AckPolicy.EXPLICIT,
-                max_deliver=MAX_DELIVER,
-                ack_wait=ACK_WAIT_SECONDS,
-            ),
+            config=consumer_config(),
         )
         logger.info("aiac-agent-consumer subscribed to %s", CONSUMER_FILTER_SUBJECTS)
 
@@ -141,24 +230,11 @@ class AiacEventConsumer:
             await self._nc.close()
 
     async def _dispatch(self, msg: Msg) -> None:
+        seq = msg.metadata.sequence.stream
+        after_not_visible = seq in self._not_visible_seqs
+        self._not_visible_seqs.discard(seq)
         try:
-            # ``_handle`` (the LLM-backed policy-rules builder) and ``compute_and_apply`` are
-            # SYNCHRONOUS and slow (tens of seconds). nats-py runs this callback ON the event loop,
-            # so calling them inline froze the loop for the whole onboard — starving the FastAPI
-            # ``/health`` endpoint until the liveness probe killed the pod mid-onboard (then NATS
-            # redelivered the unacked message and the race repeated). Offload both to the default
-            # threadpool so the loop stays free to answer ``/health`` while onboarding runs.
-            loop = asyncio.get_running_loop()
-            # UC1 only: ``focus`` is the onboarded service's clientId, so the PCE routing guard keeps
-            # its rules while its client is still disabled (a re-onboarding of a quarantined service).
-            rules, override, focus = await loop.run_in_executor(None, _handle, msg.subject)
-            await loop.run_in_executor(None, functools.partial(compute_and_apply, rules, override, focus_service=focus))
-            # UC1 only (only an onboarding has a focus service): re-enable the client AFTER a
-            # successful compute_and_apply, mirroring the HTTP route. If compute_and_apply raised
-            # above, this is skipped and the client stays disabled (the failed-service marker), never
-            # enabled-with-no-policy. The re-enable is an IdP call, so it takes the subject's UUID.
-            if focus is not None:
-                reenable_service(ServiceUuid(msg.subject.removeprefix(_SERVICE_PREFIX)))
+            await _process(msg.subject, wait_for_client=not after_not_visible)
         except Exception as exc:
             # Log exactly once, routed by exception TYPE to its per-persona named logger.
             # FastAPI's exception handlers never fire on this path (there is no request), so
@@ -178,13 +254,22 @@ class AiacEventConsumer:
                     "permanent" if permanent else "retryable",
                     msg.metadata.num_delivered,
                 )
-            # Retryable + still under MAX_DELIVER: leave unacked so NATS redelivers.
+            elif isinstance(exc, ServiceNotVisibleError):
+                # Retryable + still under MAX_DELIVER, and the IdP does not show the new service yet:
+                # nak with a short delay, so the redelivery comes after the delay, not after ACK_WAIT.
+                self._not_visible_seqs.add(msg.metadata.sequence.stream)
+                await _nak_not_visible(msg)
+            # Any other retryable failure still under MAX_DELIVER: leave unacked so NATS redelivers.
             return
         await msg.ack()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # The Controller start sequence (the enforcement side, start check #4, then the resync) runs
+    # FIRST, before the NATS consumer starts and before uvicorn serves: a failure raises here, so
+    # uvicorn exits and the pod restarts. It is synchronous (k8s and PDP calls), so it runs in a thread.
+    await asyncio.to_thread(run_start_sequence)
     consumer = AiacEventConsumer()
     # Backgrounded so a slow NATS handshake never blocks /apply/* from becoming
     # available. Each individual message is still awaited to completion by

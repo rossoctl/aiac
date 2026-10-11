@@ -2,35 +2,36 @@
 
 ## Problem Statement
 
-The AIAC Agent's Policy Computation Engine produces and merges `ServicePolicyModel` (SPM) objects — one per service, keyed by `serviceId` — representing the inbound/outbound access control policy for each service. The PDP Policy Writer translates these into Rego packages and writes them to an `AuthorizationPolicy` Kubernetes CR — but this derived artifact cannot be reverse-engineered back into structured SPM data. Without a durable structured policy store:
+The AIAC Agent's Policy Computation Engine produces and merges `ServicePolicyModel` (SPM) objects — one per service, keyed by `serviceId` — representing the inbound access control policy (inbound edges) for each service. The PDP Policy Writer translates the policy model of the current enforcement side (the stored SPMs under target side, the derived `AgentPolicyModel`s under agent side) into Rego packages and writes one `AuthorizationPolicy` Kubernetes CR per managed service — but this derived artifact cannot be reverse-engineered back into structured SPM data. Without a durable structured policy store:
 
 - The Policy Computation Engine cannot read current policy state for additive merging — it must re-derive the full state from the PDP snapshot on every trigger.
 - Override-purge cannot find stale role→service mappings that the live IdP no longer reflects — there is no record of what was previously granted.
 - Pod restarts lose any in-flight policy construction context.
 
-The `AgentPolicyModel` (APM) is **derived and never persisted** — it is computed on demand from SPMs. The store therefore has no per-agent surface; it persists SPMs only.
+The `AgentPolicyModel` (APM) is **derived and never persisted** — it is computed on demand from SPMs. The store therefore has no per-agent surface; it persists SPMs only. This is true under both enforcement sides (D18): the store keeps only SPMs, and the policy model (target-side or agent-side) is never stored. The PCE builds it at each deploy. The stored SPMs are the **managed set** (D21): every service that has a stored SPM has a CR.
 
 ## Solution
 
 A dedicated **AIAC Policy Model Store** owns an in-memory cache of `ServicePolicyModel` rows (keyed by `serviceId`) backed by a SQLite database for durability. A companion library [`aiac.policy.model_store.library`](library-policy-model-store.md) exposes module-level typed functions matching the `aiac.pdp.policy.library` pattern, used by the Policy Computation Engine to read and write SPM state without any storage-layer boilerplate.
 
-The SPM is the **source of truth**. The PDP Policy Writer retains sole ownership of the `AuthorizationPolicy` CR (Rego packages) and has no dependency on the Policy Model Store. The two persistence artifacts serve distinct purposes and are owned by distinct services:
+The SPM is the **source of truth**. The PDP Policy Writer retains sole ownership of the `AuthorizationPolicy` CRs (Rego packages) and has no dependency on the Policy Model Store. The two persistence artifacts serve distinct purposes and are owned by distinct services:
 
 | Artifact | Owner | Contents |
 |---|---|---|
 | SQLite `service_policies` table | Policy Model Store | Structured `ServicePolicyModel`, keyed by `serviceId` — source of truth (cache-first, write-through) |
-| `AuthorizationPolicy` CR (one total) | PDP Policy Writer | Derived Rego packages — OPA runtime artifact |
+| `AuthorizationPolicy` CRs (one per managed service, agent or tool) | PDP Policy Writer | Rego packages rendered from the policy model — OPA runtime artifact |
 
 ---
 
 ## User Stories
 
 1. As the Policy Computation Engine, I want to read the current `ServicePolicyModel` for a specific service by id, so that I can additively append new rules without overwriting existing ones — receiving a fresh empty SPM the first time a service is seen.
-2. As the Policy Computation Engine, I want to resolve the single SPM that owns a given scope, so that I can attach outbound/inbound rules to the correct service.
+2. As the Policy Computation Engine, I want to resolve the SPM of the owner of a scope copy (`scope.serviceId`; a shared scope has one copy for each owner, D32), so that I can attach the inbound rule to the correct service.
 3. As the Policy Computation Engine, I want to list every SPM whose inbound rules reference a given role — including stale mappings the IdP no longer reflects — so that override-purge can remove access that should no longer exist.
 4. As the Policy Computation Engine, I want to upsert a `ServicePolicyModel`, so that the current policy state survives pod restarts.
 5. As a consumer of the Policy Model Store library, I want a typed Python library that returns `ServicePolicyModel` objects directly, so that I can work with structured policy data without writing storage client code.
 6. As an operator, I want the Policy Model Store deployed as its own single-replica StatefulSet with a dedicated PVC, so that its storage and restart lifecycle is decoupled from the stateless policy services.
+7. As the Policy Computation Engine, I want to list every stored SPM, so that the resync at the Controller start (D28) can write the CR of every live managed service (in the IdP catalog and not disabled) and delete every other AIAC CR.
 
 ---
 
@@ -46,7 +47,7 @@ The SPM is the **source of truth**. The PDP Policy Writer retains sole ownership
 
 **Deployment:** dedicated single-replica `StatefulSet` `aiac-policy-model-store`, with a `volumeClaimTemplate` PVC (1 Gi, `ReadWriteOnce`, cluster-default StorageClass) mounted at `/data`. Fronted by a headless Service for stable pod DNS plus the `aiac-policy-model-store-service:7074` ClusterIP for clients. Not co-located with IdP Configuration / PDP Policy Writer.
 
-**Framework:** FastAPI + uvicorn. **Base image:** `python:3.12-slim`.
+**Framework:** FastAPI + uvicorn. **Base image:** `python:3.13-slim` (digest-pinned).
 
 **Storage backend:** SQLite via `sqlite3` stdlib (zero extra dependency — `sqlite3` ships with the Python standard library). Database file: `SERVICEPOLICY_DB_PATH` (default `/data/policy_model.db`).
 
@@ -76,7 +77,9 @@ consistent.
 - Per-service upsert (`POST /policy/services/{service_id}`): `INSERT OR REPLACE INTO service_policies VALUES (?, ?)`.
 - Per-service delete (`DELETE /policy/services/{service_id}`): `DELETE FROM service_policies WHERE service_id = ?`; evict the cache entry.
 
-**By-role query:** `GET /policy/services?role={role_id}` scans the cache and returns every SPM whose `inbound_allow_rules` **or** `inbound_deny_rules` contains a rule referencing `role_id` (the scan covers **both** effect lists). **Why a store query and not an IdP lookup:** the SPM is the source of truth, so this must return *stored* rows — including stale role→service mappings that the live IdP no longer reflects, which override-purge depends on to remove access that should no longer exist. It may start as a full scan; a `role.id -> {service_id}` index can be added later behind the same route/signature without changing callers.
+**By-role query:** `GET /policy/services?role={role_id}` scans the cache and returns every SPM whose `inbound_allow_rules` **or** `inbound_deny_rules` contains a rule referencing `role_id` (the scan covers **both** effect lists). **Why a store query and not an IdP lookup:** the SPM is the source of truth, so this must return *stored* rows — including stale role→service mappings that the live IdP no longer reflects, which override-purge depends on to remove access that should no longer exist. The PCE also uses it (through `get_service_policies_by_role`) to find the SPMs that have an edge of a role: for the agent-side outbound derivation, the role re-render, the shared SPMs of a quarantine or a decommission, and the lift of a quarantine (D32; see [policy-computation-engine.md → Algorithm](policy-computation-engine.md#algorithm) step 3d). It may start as a full scan; a `role.id -> {service_id}` index can be added later behind the same route/signature without changing callers.
+
+**List all (C3):** `GET /policy/services` with **no** `role` returns every cached SPM. The stored SPMs are the managed set (D21), so this is the list of every service that must have a CR. The PCE resync (D28) calls it at every Controller start, through the library function `list_service_policies()`. It never 404s: an empty store gives `[]`.
 
 **Future normalization:** migrate to `service_policies` + `policy_rules(service_id, role, scope)` tables once `ServicePolicyModel`/rule schema stabilizes — a future observability UI (and a native by-role index) will benefit from queryable columns. JSON column in the current schema avoids migration churn during active development.
 
@@ -88,6 +91,7 @@ consistent.
 |---|---|---|---|
 | `GET` | `/policy/services/{service_id}` | — | `ServicePolicyModel` (from cache) |
 | `GET` | `/policy/services?role={role_id}` | — | `list[ServicePolicyModel]` (SPMs referencing the role) |
+| `GET` | `/policy/services` | — | `list[ServicePolicyModel]` (every SPM — the managed set; C3) |
 | `POST` | `/policy/services/{service_id}` | `ServicePolicyModel` | `204 No Content` (upsert) |
 | `DELETE` | `/policy/services/{service_id}` | — | `204 No Content` (off-board a single service) |
 | `DELETE` | `/policy/services` | — | `204 No Content` (clear all SPMs — rebuild / test-harness clean slate) |
@@ -105,22 +109,23 @@ segment).
 
 `DELETE /policy/services/{service_id}` removes a single SPM row (SQLite `DELETE` + cache eviction) so a service can be off-boarded when it is decommissioned. Deleting a service that is not present is a no-op (`204`). Override-purge still edits the SPM's `inbound_allow_rules` / `inbound_deny_rules` in place via the upsert; the delete route is for whole-service removal, not per-rule purging.
 
-`DELETE /policy/services` (no `service_id`) is the collection-root **clear-all**: it drops every SPM row and empties the cache, giving a clean slate for a full rebuild or a test harness. Always `204`.
+`DELETE /policy/services` (no `service_id`) is the collection-root **clear-all**: it drops every SPM row and empties the cache, giving a clean slate for a full rebuild or a test harness. Always `204`. The CRs in the cluster do not change. The next resync (D28) then deletes every AIAC CR, because the managed set is empty.
 
 **Error responses:**
-- `404 Not Found` with `{"error": "service {id} not found"}` when `GET /policy/services/{service_id}` finds no entry in cache. The library's `get_service_policy` catches this and returns a fresh empty SPM (per the "engine creates a fresh model on 404" convention); the by-role query never 404s (empty list on no match).
+- `404 Not Found` with `{"error": "service {id} not found"}` when `GET /policy/services/{service_id}` finds no entry in cache. The library's `get_service_policy` catches this and returns a fresh empty SPM (per the "engine creates a fresh model on 404" convention); the by-role query and the list-all call never 404 (empty list on no match or on an empty store).
+- `422 Unprocessable Entity` when the `POST` body's `service_id` does not match the decoded path `service_id`.
 - `502 Bad Gateway` with `{"error": "..."}` on SQLite write error for the write and delete endpoints.
 - `503 Service Unavailable` if `GET /health` cannot open or query the SQLite file.
 
 **`main.py` functions:**
 
-- `get_db() -> sqlite3.Connection` — open `SERVICEPOLICY_DB_PATH` with `check_same_thread=False` (FastAPI dependency); `_init_db` runs `CREATE TABLE IF NOT EXISTS` on first open.
-- `upsert_service_policy(service_id: str, model: ServicePolicyModel)` — `POST /policy/services/{service_id}`; under the write lock: `INSERT OR REPLACE INTO service_policies VALUES (?, ?)` with `model.model_dump_json()`, then update cache (DB + cache write as one locked critical section).
+- `get_db() -> sqlite3.Connection` — FastAPI dependency; returns the shared connection that `lifespan` opens at startup (`sqlite3.connect(SERVICEPOLICY_DB_PATH, check_same_thread=False, isolation_level=None)`). `lifespan` then runs `_init_db` (`CREATE TABLE IF NOT EXISTS`) and `_load_cache`.
+- `upsert_service_policy(service_id: str, body: ServicePolicyModel)` — `POST /policy/services/{service_id}`; decode `service_id`, reject a body/path `service_id` mismatch with `422`, then under the write lock: `INSERT OR REPLACE INTO service_policies VALUES (?, ?)` with `body.model_dump_json()`, then update cache (DB + cache write as one locked critical section).
 - `delete_service_policy(service_id: str)` — `DELETE /policy/services/{service_id}`; under the write lock: `DELETE FROM service_policies WHERE service_id = ?`, then evict the cache entry (no-op if absent) — DB + cache eviction as one locked critical section.
 - `clear_service_policies()` — `DELETE /policy/services`; under the write lock: `DELETE FROM service_policies` (all rows) and clear the cache — the collection-root clean slate.
 - `get_service_policy(service_id: str) -> ServicePolicyModel` — `GET /policy/services/{service_id}`; read from in-memory cache; raise `404` if absent.
-- `list_service_policies_by_role(role_id: str) -> list[ServicePolicyModel]` — `GET /policy/services?role={role_id}`; return every cached SPM whose `inbound_allow_rules` or `inbound_deny_rules` references `role_id`.
-- `_load_cache()` — on startup, load all rows from SQLite into the in-memory cache.
+- `list_service_policies(role: str | None = None) -> list[ServicePolicyModel]` — `GET /policy/services[?role={role_id}]`; with `role`, return every cached SPM whose `inbound_allow_rules` or `inbound_deny_rules` references `role_id`; with no `role`, return every cached SPM (C3).
+- `_load_cache(conn)` — called by `lifespan` on startup; load all rows from SQLite into the in-memory cache.
 
 **Configuration:**
 
@@ -130,7 +135,7 @@ segment).
 
 **Dependencies:** `fastapi`, `uvicorn[standard]`, `pydantic`. `sqlite3` is stdlib (no new dependency).
 
-**Imports:** `from aiac.policy.model.models import ServicePolicyModel, Scope, Role`
+**Imports:** `from aiac.policy.model.models import ServicePolicyModel`; `from aiac.policy.model_store.keying import decode_service_id`
 
 **File structure:**
 
@@ -161,6 +166,7 @@ Good tests assert external behavior at the system boundary — not internal impl
 Key behaviors to assert:
 - `GET /policy/services/{id}`: returns `ServicePolicyModel` deserialized from cache (hit); `404 {"error": "service {id} not found"}` when the service is not in cache (miss).
 - `GET /policy/services?role={role_id}`: returns every SPM whose `inbound_allow_rules` or `inbound_deny_rules` references the role; `[]` when none match; multiple when several match.
+- `GET /policy/services` with no `role`: returns every SPM in the cache, also an SPM with zero rules; `[]` on an empty store.
 - `POST /policy/services/{id}`: `spec` stored in SQLite; cache updated; `204` returned. Upsert round-trip: a second `POST` for the same id replaces the row.
 - `DELETE /policy/services/{id}`: row removed from SQLite; cache entry evicted; `204` returned. Deleting an absent service is a no-op (`204`).
 - SQLite write error on the write or delete endpoint → `502`.
@@ -173,8 +179,9 @@ See [library-policy-model-store.md](library-policy-model-store.md) for the compa
 ## Out of Scope
 
 - **APM persistence:** APMs are derived on demand and never stored; the store has no per-agent surface.
+- **Policy-model persistence:** the policy model of either enforcement side (D18) is built by the PCE at each deploy and never stored.
 - **Triggering Rego generation:** the Policy Model Store writes structured data only. Triggering Rego generation in the PDP Policy Writer is the responsibility of `aiac.pdp.policy.library` (called by `aiac.policy.computation`).
-- **Pagination:** the by-role query returns all matching SPMs without pagination. At target scale (hundreds of services), the full result fits within one query and one HTTP response.
+- **Pagination:** the by-role query and the list-all call return all matching SPMs without pagination. At target scale (hundreds of services), the full result fits within one query and one HTTP response.
 - **In-cluster mTLS between Policy Computation Engine and Policy Model Store:** secured by Kubernetes network policy; no application-layer auth.
 - **Multi-writer / replica scale-out:** the current design is single-writer (single-replica StatefulSet, RWO PVC, SQLite). Future migration to a shared DB (e.g. PostgreSQL) is a backend swap; the HTTP contract is unchanged.
 
@@ -183,6 +190,6 @@ See [library-policy-model-store.md](library-policy-model-store.md) for the compa
 ## Further Notes
 
 - The K8s manifests issue must create the `aiac-policy-model-store` StatefulSet, its `volumeClaimTemplate` PVC (1 Gi, `ReadWriteOnce`), and a headless Service. No CRD or RBAC is needed — the service does not touch the Kubernetes API.
-- `spec` fields use snake_case (matching Pydantic's `model_dump()`) — consistent with the `AuthorizationPolicy` CR convention. The JSON column avoids a translation layer.
-- `service_id` is the SQLite `PRIMARY KEY`. The `aiac.apply.service.{id}` naming convention (lowercase alphanumeric + hyphens) should be maintained for consistency with trigger events.
+- `spec` fields use snake_case (matching Pydantic's `model_dump()`). The JSON column avoids a translation layer.
+- `service_id` is the SQLite `PRIMARY KEY`. It is the Keycloak clientId (it can contain `/`; see the path-encoding note above), not the UUID that `aiac.apply.service.<uuid>` carries.
 - K8s resource names: StatefulSet `aiac-policy-model-store`, ClusterIP Service `aiac-policy-model-store-service:7074`, env var `AIAC_POLICY_MODEL_STORE_URL`.

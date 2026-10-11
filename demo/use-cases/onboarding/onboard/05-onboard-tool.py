@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Onboard the ``github-tool`` workload: ``POST /apply/service/{uuid}`` behind a port-forward to
-the Controller, then capture the agent's rego from its ``AuthorizationPolicy`` CR into
-``generated/02-after-tool/`` — the second pause's evidence. Onboarding the tool retroactively
-completes the agent's outbound gate (the tool is a pure target: no CR is emitted for it directly),
-so only the agent's CR is captured, into a directory separate from ``01-after-agent/`` — the
-before/after diff is the point."""
+the Controller, then capture the rego of the agent's and the tool's ``AuthorizationPolicy`` CRs into
+``generated/02-after-tool/`` — the second pause's evidence. Every managed service has a CR (D20).
+Under target side (the default) the tool's own inbound package now decides each tool call (the user
+gate and the calling-agent gate), and every outbound is a pass-through. Under agent side onboarding
+the tool completes the agent's outbound gate, and the tool gets a pass-through CR. The snapshot goes
+into a directory separate from ``01-after-agent/`` — the before/after diff is the point."""
 
 from __future__ import annotations
 
@@ -49,10 +50,12 @@ def main() -> None:
         onboard(cfg, base_url, service_id)
     ok("onboarding call returned 200")
 
-    say("3", "4", "Capture generated Rego (agent's, retroactively completed — from the CR)")
+    say("3", "4", "Capture generated Rego (the agent's and the tool's CRs)")
     rego_dir = GENERATED / "02-after-tool"
     capture_rego(cfg, rego_dir)
-    for f in (cfg.inbound_rego, cfg.outbound_rego):
+    for f in (cfg.inbound_rego, cfg.outbound_rego, cfg.tool_inbound_rego, cfg.tool_outbound_rego):
+        if not (rego_dir / f).is_file():
+            abort(f"no {f} in the snapshot — the onboarding did not write the {scn.TOOL_WORKLOAD} CR")
         ok(f"{rego_dir / f}")
 
     # The tool's ``*-aud`` audience client scope only exists once the tool is onboarded, so 03-setup.py

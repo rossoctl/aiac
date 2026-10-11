@@ -1,5 +1,7 @@
 # Component PRD: RAG Knowledge Base
 
+> **Status: not built yet** — no ChromaDB or RAG Pod is deployed. The AIAC Agent reads the policy text from `AIAC_POLICY_FILE` (`FilePolicySource`). The `PolicySource` protocol is the seam where a ChromaDB source will connect.
+
 ## Description
 A ChromaDB vector store that holds two named collections in a single instance: AIAC access control policies (`aiac-policies`) and org/business domain context (`aiac-domain-knowledge`). Deployed in a dedicated Kubernetes Pod alongside the RAG Ingest Service and the Policy Guardrails Agent. The AIAC Agent retrieves relevant chunks from both collections at runtime via similarity search. The Policy Guardrails Agent also reads from ChromaDB, for evaluation context, as part of its pre-flight verification of documents the RAG Ingest Service is about to write (see [policy-guardrails-agent.md](policy-guardrails-agent.md)).
 

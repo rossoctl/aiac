@@ -24,14 +24,14 @@ has been removed — requirements state what the system must do, not how.
 
 | ID | Functional requirement | PRD source |
 |----|------------------------|------------|
-| FR1 | Events must survive the Agent pod going down and be re-delivered when it restarts — no silent event loss on transient consumer failure | §5 arch decisions, §7.4 |
-| FR2 | Each event must be processed by exactly one Agent instance across competing replicas (work-queue semantics) | §7.4, §5 arch decisions |
-| FR3 | Failed event processing must be retried a bounded number of times, then moved to a dead-letter destination for operator inspection — a persistently broken event must not block the queue | §7.4, §9 |
-| FR4 | The broker must support per-entity event addressing: a new Keycloak client and a new role each produce distinct, independently routable events carrying the entity ID — the consumer must be able to subscribe to a wildcard that covers all entity-scoped events without inspecting message payloads | §7.4, §7.5, §7.8, §5 ("no business logic lives in the consumer") |
-| FR5 | The Agent (Python 3.12, FastAPI, asyncio) must be able to consume events asynchronously as a background task; processing must complete before the event is acknowledged | §7.5, §10 |
-| FR6 | The RAG Ingest Service (Python 3.12, FastAPI) must be able to publish events to the broker | §7.7 |
-| FR7 | The Keycloak SPI (Java) must be able to publish events to the broker | §7.8 |
-| FR8 | The broker must be deployable without authentication; Kubernetes ClusterIP network isolation is the intended access control boundary | §7.4, §10 |
+| FR1 | Events must survive the Agent pod going down and be re-delivered when it restarts — no silent event loss on transient consumer failure | §5 arch decisions, §7.6 |
+| FR2 | Each event must be processed by exactly one Agent instance across competing replicas (work-queue semantics) | §7.6, §5 arch decisions |
+| FR3 | Failed event processing must be retried a bounded number of times, then moved to a dead-letter destination for operator inspection — a persistently broken event must not block the queue | §7.6, §9 |
+| FR4 | The broker must support per-entity event addressing: a new Keycloak client and a new role each produce distinct, independently routable events carrying the entity identifier (the client UUID or the role name) — the consumer must be able to subscribe to a wildcard that covers all entity-scoped events without inspecting message payloads | §7.6, §7.7, §7.11, §5 ("no business logic lives in the consumer") |
+| FR5 | The Agent (Python 3.12, FastAPI, asyncio) must be able to consume events asynchronously as a background task; processing must complete before the event is acknowledged | §7.7, §10 |
+| FR6 | The RAG Ingest Service (Python 3.12, FastAPI) must be able to publish events to the broker. **Status: not built yet** — no RAG Ingest Service exists in this repo. | §7.9 |
+| FR7 | The Keycloak SPI (Java) must be able to publish events to the broker | §7.11 |
+| FR8 | The broker must be deployable without authentication; Kubernetes ClusterIP network isolation is the intended access control boundary | §7.6, §10 |
 | FR9 | The broker must run as a single Kubernetes pod with minimal configuration overhead; no Operator dependency | §8 |
 | FR10 | An init container must be able to provision required broker resources idempotently at startup and health-check the broker before the Agent container starts | §5 arch decisions, §9 |
 
@@ -102,10 +102,10 @@ FR3 and FR4 fail regardless of implementation approach:
 
 **FR3 — no native DLQ:** Building bounded retry with dead-lettering requires a separate retry
 consumer service, a retry topic, and a DLQ topic. This is application infrastructure, not broker
-configuration. The PRD (§7.4) treats dead-lettering as a broker-level property.
+configuration. The PRD (§7.6) treats dead-lettering as a broker-level property.
 
 **FR4 — static topics vs dynamic addressing:** The PRD's per-entity event addressing is a
-first-class routing feature. Collapsing `aiac.apply.role.{id}` to a static topic and
+first-class routing feature. Collapsing `aiac.apply.role.{name}` to a static topic and
 embedding the entity ID in the message payload changes the consumer contract and adds routing
 logic to what §5 explicitly defines as a thin adapter with no business logic. This is a
 PRD-level design change, not an implementation detail.
@@ -133,14 +133,14 @@ AMQ Broker as a routing mesh but cannot serve as the AIAC Event Broker independe
 
 | Requirement | PRD anchor | NATS JetStream | AMQ Broker | AMQ Streams | AMQ Interconnect |
 |-------------|------------|:--------------:|:----------:|:-----------:|:----------------:|
-| FR1 Durable replay on pod restart | §5, §7.4 | ✅ | ✅ | ✅ | ❌ |
-| FR2 Work-queue / competing consumers | §7.4, §5 | ✅ | ✅ | ⚠️ | ⚠️ |
-| FR3 DLQ after bounded retries | §7.4, §9 | ✅ | ✅ | ❌ | ❌ |
-| FR4 Per-entity dynamic addressing, wildcard consumer | §7.4, §7.5, §7.8, §5 | ✅ | ✅ | ❌ | ⚠️ |
-| FR5 Python asyncio consumer, ack-after-processing | §7.5, §10 | ✅ | ✅ | ✅ | ❌ |
-| FR6 Python publisher | §7.7 | ✅ | ✅ | ✅ | ✅ |
-| FR7 Java publisher (Keycloak SPI) | §7.8 | ✅ | ✅ | ✅ | ✅ |
-| FR8 No-auth viable | §7.4, §10 | ✅ | ✅ | ⚠️ | ✅ |
+| FR1 Durable replay on pod restart | §5, §7.6 | ✅ | ✅ | ✅ | ❌ |
+| FR2 Work-queue / competing consumers | §7.6, §5 | ✅ | ✅ | ⚠️ | ⚠️ |
+| FR3 DLQ after bounded retries | §7.6, §9 | ✅ | ✅ | ❌ | ❌ |
+| FR4 Per-entity dynamic addressing, wildcard consumer | §7.6, §7.7, §7.11, §5 | ✅ | ✅ | ❌ | ⚠️ |
+| FR5 Python asyncio consumer, ack-after-processing | §7.7, §10 | ✅ | ✅ | ✅ | ❌ |
+| FR6 Python publisher | §7.9 | ✅ | ✅ | ✅ | ✅ |
+| FR7 Java publisher (Keycloak SPI) | §7.11 | ✅ | ✅ | ✅ | ✅ |
+| FR8 No-auth viable | §7.6, §10 | ✅ | ✅ | ⚠️ | ✅ |
 | FR9 Single pod, no Operator, low footprint | §8 | ✅ | ⚠️ | ❌ | ✅ |
 | FR10 Init container idempotent provisioning | §5, §9 | ✅ | ✅ | ⚠️ | ❌ |
 
@@ -155,12 +155,12 @@ requirement. The decision reduces to operational fit.
 
 | Dimension | NATS JetStream | AMQ Broker (Artemis) |
 |-----------|----------------|----------------------|
-| FR1–FR3 delivery semantics | Native, zero-config | Native, `broker.xml` config |
+| FR1–FR3 delivery semantics | Native redelivery; `max_deliver` / `ack_wait` set on the consumer; the DLQ is an app-level republish to `aiac.apply.dlq` | Native, `broker.xml` config |
 | FR4 per-entity addressing | Hierarchical subjects, auto-routed | Hierarchical addresses, auto-create policy |
 | FR5 Python asyncio consumer | Idiomatic, well-documented | Functional, lower-level API |
 | FR7 Java publisher | NATS Java client | Artemis JMS / Qpid Proton Java |
 | FR8 no-auth | Default, no config needed | One XML element in `broker.xml` |
-| FR9 footprint | ~20 MB RAM, single flag | ~300 MB RAM, `broker.xml` ConfigMap |
+| FR9 footprint | ~20 MB RAM (manifest: 64Mi request / 256Mi limit), `-js` + `-sd` flags | ~300 MB RAM, `broker.xml` ConfigMap |
 | FR10 broker provisioning | Single API call, runtime | Declarative via `broker.xml` (no runtime call needed) |
 | Protocol lineage | Purpose-built for microservice pub/sub | Enterprise JMS / AMQP 1.0 interoperability |
 | Python ecosystem depth | Large community, extensive examples | Smaller community, sparser asyncio docs |

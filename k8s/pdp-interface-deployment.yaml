@@ -19,8 +19,10 @@ data:
   AIAC_PDP_CONFIG_URL: "http://aiac-pdp-config-service:7071"
   AIAC_PDP_POLICY_URL: "http://aiac-pdp-policy-service:7072"
   AIAC_POLICY_MODEL_STORE_URL: "http://aiac-policy-model-store-service:7074"
-  # PLATFORM_SOURCE_CLIENTS is the comma-separated list of platform bypass
-  # clients the inbound Rego admits without a user role.
+  # PLATFORM_SOURCE_CLIENTS is the comma-separated list of the platform login
+  # clients. The PDP policy writer: the bypass clients the inbound Rego admits
+  # without a user role. The IdP Configuration Service: the clients it links the
+  # client scope aiac-username-sub to, at startup and at each onboarding (D31).
   PLATFORM_SOURCE_CLIENTS: "rossoctl"
   # NATS_URL points the PDP services at the Event Broker (Phase 2, issue 4.19).
   NATS_URL: "nats://aiac-event-broker-service:4222"
@@ -36,8 +38,9 @@ data:
 
 ---
 # RBAC for the PDP Policy Writer (aiac-pdp-policy-opa container). The writer
-# server-side-applies per-agent AuthorizationPolicy CRs, so its pod needs a
-# dedicated ServiceAccount bound to a ClusterRole granting CR write access.
+# server-side-applies one AuthorizationPolicy CR per managed service (agent or
+# tool), so its pod needs a dedicated ServiceAccount bound to a ClusterRole
+# granting CR write access.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -156,8 +159,8 @@ spec:
             - name: tmp
               mountPath: /tmp
         # PDP Policy Writer (OPA): CR-backed writer. It server-side-applies
-        # per-agent AuthorizationPolicy CRs (agent.rossoctl.dev) to the
-        # Kubernetes API, authorized via the aiac-pdp-policy-writer
+        # one AuthorizationPolicy CR (agent.rossoctl.dev) per managed service
+        # (agent or tool) to the Kubernetes API, authorized via the aiac-pdp-policy-writer
         # ServiceAccount/RBAC (above). The .rego file dump is an optional debug
         # aid (POLICY_WRITER_DUMP_REGO) and is off here in production.
         - name: aiac-pdp-policy-opa

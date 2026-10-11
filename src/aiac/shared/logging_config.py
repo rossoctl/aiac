@@ -57,3 +57,10 @@ def configure_logging() -> None:
     # or another harness that configured it first) — and in that case it does not apply
     # ``level`` either. Set it explicitly so ``LOG_LEVEL`` is authoritative regardless.
     logging.getLogger().setLevel(level)
+
+
+def loggable(value: object) -> str:
+    """Neutralize a value for single-line logging: coerce to ``str`` and drop CR/LF so a
+    user-controlled ``service_id``, role id or entity name cannot forge or inject extra log lines
+    (mitigates CodeQL ``py/log-injection``)."""
+    return str(value).replace("\r", "").replace("\n", "")

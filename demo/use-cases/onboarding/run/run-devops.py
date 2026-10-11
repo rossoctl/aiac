@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Drive devops-user through the demo: ROPC login, then the inbound gate — where devops-user is
 denied. Stopping there is the intended story (devops-user has no realm role that sources any agent
-scope), not an error; the outbound gate and the RFC 8693 exchange are never reached for this user."""
+scope), not an error; the tool-call gate and the RFC 8693 exchange are never reached for this user."""
 
 from __future__ import annotations
 

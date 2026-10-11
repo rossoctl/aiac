@@ -15,8 +15,11 @@ public final class SubjectMapper {
         CLIENT,
         REALM_ROLE,
         CLIENT_ROLE,
+        REALM_ROLE_MAPPING,
         OTHER,
     }
+
+    private static final String ROLE_MEMBERS_SUBJECT_PREFIX = "aiac.apply.role-members.";
 
     private SubjectMapper() {
     }
@@ -26,7 +29,9 @@ public final class SubjectMapper {
      * @param operationType {@code org.keycloak.events.admin.OperationType} name, e.g. "CREATE"
      * @param resourcePath  e.g. {@code "clients/{uuid}"}, {@code "roles/{name}"}, or
      *                      {@code "clients/{uuid}/roles/{name}"}
-     * @return the AIAC subject to publish on, or empty if this event should be dropped
+     * @return the AIAC subject to publish on, or empty if this event should be dropped. A
+     *         {@link ResourceKind#REALM_ROLE_MAPPING} event is always empty here: its roles are in
+     *         the event representation, not in the path (see {@link #isUserRealmRoleMapping}).
      */
     public static Optional<String> subjectFor(ResourceKind kind, String operationType, String resourcePath) {
         if (resourcePath == null || kind == null) {
@@ -47,6 +52,52 @@ public final class SubjectMapper {
             default:
                 return Optional.empty();
         }
+    }
+
+    /**
+     * True when the event assigns realm roles to a user ({@code CREATE}) or unassigns them
+     * ({@code DELETE}): kind {@link ResourceKind#REALM_ROLE_MAPPING} on the path
+     * {@code users/{user-id}/role-mappings/realm}. An agent's service account is a user too, so its
+     * role mapping has the same path. The path does not name the roles: the caller reads their ids
+     * from the event representation and gives each one to {@link #roleMembersSubject}.
+     *
+     * <p>A group mapping ({@code groups/{group-id}/role-mappings/realm}) gives false: a role that a
+     * user holds through a group is not a holder for AIAC (known limit, see the README).
+     */
+    public static boolean isUserRealmRoleMapping(ResourceKind kind, String operationType, String resourcePath) {
+        if (kind != ResourceKind.REALM_ROLE_MAPPING || resourcePath == null) {
+            return false;
+        }
+        if (!"CREATE".equals(operationType) && !"DELETE".equals(operationType)) {
+            return false;
+        }
+        String[] parts = resourcePath.split("/");
+        return parts.length == 4
+                && "users".equals(parts[0])
+                && !parts[1].isEmpty()
+                && "role-mappings".equals(parts[2])
+                && "realm".equals(parts[3]);
+    }
+
+    /**
+     * The subject for a change of the members of one role: {@code aiac.apply.role-members.{role-id}}.
+     * A Keycloak role id is a UUID, so it is one NATS token and needs no encoding (unlike a role
+     * name, see {@code encodeSubjectToken}); the consumer uses it as it is. An id that is not one
+     * token (empty, or with {@code .}, {@code *}, {@code >} or whitespace) gives no subject:
+     * {@code aiac.apply.role-members.*} would not match it, and the publish could not read the id
+     * back from the last segment of the subject.
+     */
+    public static Optional<String> roleMembersSubject(String roleId) {
+        if (roleId == null || roleId.isEmpty()) {
+            return Optional.empty();
+        }
+        for (int i = 0; i < roleId.length(); i++) {
+            char c = roleId.charAt(i);
+            if (c == '.' || c == '*' || c == '>' || Character.isWhitespace(c)) {
+                return Optional.empty();
+            }
+        }
+        return Optional.of(ROLE_MEMBERS_SUBJECT_PREFIX + roleId);
     }
 
     /** Minimal JSON payload — the event is a trigger, not a data carrier (see event-broker.md). */

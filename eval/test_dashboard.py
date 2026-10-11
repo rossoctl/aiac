@@ -153,12 +153,12 @@ def test_parse_report_setup_failure_leaves_metrics_none(tmp_path: Path) -> None:
         "### `eval/test_policy_pipeline_correctness_prb.py::test_prb_correctness[wildcard_grant]`\n"
         "- **What it tests:** Some docstring.\n"
         "- **Failure:** setup crashed\n"
-        "- **Precision:** unavailable — scenario setup failed before scoring could run\n"
-        "- **Recall:** unavailable — scenario setup failed before scoring could run\n"
-        "- **Denial precision:** unavailable — scenario setup failed before scoring could run\n"
-        "- **Over-grants:** unavailable — scenario setup failed before scoring could run\n"
-        "- **Under-grants:** unavailable — scenario setup failed before scoring could run\n"
-        "- **Incorrectly denied:** unavailable — scenario setup failed before scoring could run\n\n"
+        "- **Precision:** unavailable — a fixture failed before the test ran (see Failure)\n"
+        "- **Recall:** unavailable — a fixture failed before the test ran (see Failure)\n"
+        "- **Denial precision:** unavailable — a fixture failed before the test ran (see Failure)\n"
+        "- **Over-grants:** unavailable — a fixture failed before the test ran (see Failure)\n"
+        "- **Under-grants:** unavailable — a fixture failed before the test ran (see Failure)\n"
+        "- **Incorrectly denied:** unavailable — a fixture failed before the test ran (see Failure)\n\n"
     )
     path = _write_report(tmp_path, body)
 
@@ -674,6 +674,40 @@ def test_find_matching_report_links_a_scale_suite_row_with_only_one_entry() -> N
     near = _report("2026-09-10T07:00:00+00:00", "scale_per_decision_e2e")
 
     assert _find_matching_report(row, [near]) is near
+
+
+def test_a_partial_scale_suite_is_never_full(tmp_path: Path) -> None:
+    """A Scale suite that the trend log tagged "partial" (the report header names it, from
+    ``eval/conftest.py``'s ``_write_trend_log``) is not a full suite here either, whatever its
+    entry count: no scenario-table row, no link from a fixed-100 trend row."""
+    path = tmp_path / "report_10_09_07_00_36.md"
+    path.write_text(
+        "# policy-eval-scenarios test report\n\n"
+        "Run: 2026-09-10T07:00:36+00:00\n"
+        "Exit status: 0\n"
+        "Total: 2 — passed=2\n"
+        "Partial Scale suites: scale_total_corpus_e2e, scale_total_corpus_prb\n\n"
+        "## passed (2)\n\n"
+        "### `eval/test_policy_pipeline_scale.py::test_scale_total_corpus_correctness_prb`\n"
+        "- **Precision:** 1.000\n"
+        "- **Recall:** 1.000\n"
+        "- **Denial precision:** 1.000\n\n"
+        "### `eval/test_policy_pipeline_scale.py::test_scale_per_decision_correctness_prb`\n"
+        "- **Precision:** 1.000\n"
+        "- **Recall:** 1.000\n"
+        "- **Denial precision:** 1.000\n\n"
+    )
+
+    report = parse_report(path)
+
+    assert report.partial_suites == {"scale_total_corpus_prb", "scale_total_corpus_e2e"}
+    assert _full_suites(report) == {"scale_per_decision_prb"}
+    row = {"suite": "scale_total_corpus_prb", "timestamp": "2026-09-10T07:00:36+00:00"}
+    assert _find_matching_report(row, [report]) is None
+
+
+def test_a_report_with_no_partial_scale_line_has_no_partial_suites(tmp_path: Path) -> None:
+    assert parse_report(_write_report(tmp_path, "## passed (0)\n\n_none_\n")).partial_suites == set()
 
 
 def test_render_scenario_table_drops_a_setup_failure_scale_run() -> None:

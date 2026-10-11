@@ -11,7 +11,8 @@
 #
 #   Phase DEPLOY          kubectl-apply github-agent/github-tool for the first time — THE trigger.
 #   Phase VERIFY-TRIGGER  poll Keycloak for the brand-new clients, aiac-agent logs for evidence it
-#                         consumed both over NATS, and the AuthorizationPolicy CR AIAC wrote.
+#                         consumed both over NATS, and the two AuthorizationPolicy CRs AIAC wrote
+#                         (one per managed service, D20: github-agent AND github-tool).
 #   Phase WIRE            wire AuthBridge's own outbound leg (authproxy-routes + optional
 #                         client-scope) — demo-owned wiring the platform runbook
 #                         (k8s/opa-kind-runbook.md) leaves out; AIAC's own onboarding does not do this.
@@ -22,6 +23,16 @@
 #                         clients via the Admin API and restarting the pods so the operator
 #                         re-registers them. Not part of a default run — DEPLOY is the real story;
 #                         this exists for when tearing the workloads down isn't worth it.
+#
+# The enforcement side (D16, D29) is read from the live aiac-agent-config ConfigMap
+# (AIAC_ENFORCEMENT_SIDE; absent = target-side, the default). It selects where a tool call is
+# checked, so it selects what VERIFY-TRIGGER waits for and where ENFORCE reads the decision logs:
+#   target-side  github-tool's inbound OPA decides each tool call (the github-tool CR carries the
+#                per-tool check); every outbound is a pass-through. A tool-call deny is an HTTP 403.
+#   agent-side   github-agent's outbound OPA decides it (the github-agent CR's outbound package);
+#                github-tool gets a pass-through CR. A tool-call deny is a JSON-RPC error frame.
+# The verdicts are the same under both sides. The side is set at deploy time; to change it, do a
+# clean redeploy of AIAC (k8s/opa-kind-runbook.md "Set the enforcement side").
 #
 # step()/pass()/warn()/die() style matches k8s/opa-kind-verify.sh: fails loudly and specifically the
 # moment an observed result doesn't match, rather than continuing silently.
@@ -43,11 +54,12 @@
 #   ROPC_CLIENT_ID        OIDC client the demo users log in through (default: rossoctl). Must be a
 #                         client AIAC's inbound rego accepts as the source (its source_ok allows the
 #                         "rossoctl" platform client) AND whose tokens carry the workload audiences +
-#                         a username->sub claim. The rossoctl platform client is provisioned with all
-#                         of that (username->sub mapper, agent-team1-github-{agent,tool}-aud default
-#                         scopes, Direct Access Grants) by the rossoctl installer; aiac-demo-cli (the
-#                         client this demo's own run-*.py scripts use) is NOT accepted by source_ok,
-#                         so inbound probes through it are denied with the wrong azp.
+#                         sub = username. sub = username comes from the client scope aiac-username-sub
+#                         (D31), which AIAC links as a default scope to each platform login client
+#                         (PLATFORM_SOURCE_CLIENTS, default rossoctl) — ENFORCE checks that link and
+#                         does not add a sub mapper by hand. aiac-demo-cli (the client this demo's own
+#                         run-*.py scripts use) is NOT accepted by source_ok, so inbound probes through
+#                         it are denied with the wrong azp.
 #   USER_PASSWORD         shared demo-user password (default: password) — see scenario.py
 #   POLL_SECS             max seconds a polling phase waits for trigger evidence / a bundle-service
 #                         poll (default: 720). Sized for the slowest convergence: the agent publishes
@@ -101,6 +113,10 @@ RUN_START_TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 AGENT_LABEL="app.kubernetes.io/name=github-agent"
 TOOL_LABEL="app=github-tool"
 POLICY_CR="authorizationpolicies.agent.rossoctl.dev"
+# The client scope that sets sub=<username> in the login and the exchanged token (D31).
+SUBJECT_SCOPE="aiac-username-sub"
+# The live enforcement side; read in preflight.
+SIDE=""
 
 DO_DEPLOY=1
 DO_WIRE=1
@@ -219,6 +235,46 @@ latest_pod() {
   kubectl get pod -n "$NS" -l "$1" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null
 }
 
+# scope_linked <admin> <client-uuid> <default|optional>  — read only (GET). Print "yes" when the
+# client links the client scope aiac-username-sub as that kind of scope, "no" when it does not, and
+# "error" when the admin API reply is not a list.
+scope_linked() {
+  local admin="$1" cid="$2" kind="$3" res
+  res=$(curl -s -H "Authorization: Bearer $admin" \
+          "${KC}/admin/realms/${REALM}/clients/${cid}/${kind}-client-scopes" \
+        | python3 -c 'import sys,json
+try: d=json.load(sys.stdin)
+except Exception: d=None
+if not isinstance(d,list): print("error")
+else: print("yes" if any(isinstance(s,dict) and s.get("name")==sys.argv[1] for s in d) else "no")' \
+            "$SUBJECT_SCOPE" 2>/dev/null || true)
+  printf '%s' "${res:-error}"
+}
+
+# check_subject_scope <label> <client-uuid> <cause>  — read only (D31). Pass when the client links
+# the client scope aiac-username-sub as a DEFAULT scope; else die at once with the cause and the fix.
+# The mapper of an optional scope runs only when the token request names that scope, and neither the
+# password grant nor the token exchange names it, so an optional link is not enough.
+check_subject_scope() {
+  local label="$1" cid="$2" cause="$3" admin def opt fix
+  admin="$(admin_token)"
+  def="$(scope_linked "$admin" "$cid" default)"
+  [ "$def" != "error" ] \
+    || die "could not read the default client scopes of the ${label} Keycloak client (${cid}) at ${KC}"
+  if [ "$def" = "yes" ]; then
+    pass "${label} links the client scope ${SUBJECT_SCOPE} as a default scope (D31)"
+    return 0
+  fi
+  opt="$(scope_linked "$admin" "$cid" optional)"
+  fix="Fix: AIAC makes this link at the start of the IdP Configuration Service (aiac-pdp-config) for each platform login client (restart the service once Keycloak is ready), and at each onboarding for the onboarded client (or POST /services/${cid}/subject-scope on svc/aiac-pdp-config-service:7071 in ${AIAC_NS}). Do not add a sub mapper by hand."
+  if [ "$opt" = "yes" ]; then
+    die "${label} links the client scope ${SUBJECT_SCOPE} only as an OPTIONAL scope, not as a default scope (D31). Thus ${cause}
+     ${fix}"
+  fi
+  die "${label} does not link the client scope ${SUBJECT_SCOPE} as a default scope (D31). Thus ${cause}
+     ${fix}"
+}
+
 # delete_client <uuid> <admin_token> — used only by the opt-in REPLAY-TRIGGER phase.
 delete_client() {
   local uuid="$1" admin="$2"
@@ -229,10 +285,11 @@ delete_client() {
 # ── Log collection (--collect-logs) ────────────────────────────────────────────
 # Dumps every component this demo touches into one per-run directory: the operator (client
 # registration), aiac-agent (onboarding pipeline), the NATS broker, Keycloak (SPI listener), and the
-# github-agent sidecar (the OPA allow/deny decisions) + app container + github-tool. Component logs
+# github-agent sidecar (the OPA allow/deny decisions) + app container + github-tool (its sidecar has
+# the tool-call decisions under target side). Component logs
 # are time-scoped to this run (COLLECT_SINCE / RUN_START_TS) so log volume can't push evidence out of
 # view — the same reasoning phase_verify_trigger uses for --since-time over --tail. Durable state
-# (the AuthorizationPolicy CR, the routing/runtime ConfigMaps, pod listings) is captured as
+# (the two AuthorizationPolicy CRs, the routing/runtime ConfigMaps, pod listings) is captured as
 # point-in-time snapshots. Every command is best-effort: a missing component leaves a note in its
 # file rather than aborting, so this is safe to call from die() mid-failure.
 collect_logs() {
@@ -277,6 +334,8 @@ collect_logs() {
   # Point-in-time snapshots of the durable artifacts (not time-scoped — current observed state).
   kubectl get "$POLICY_CR" github-agent -n "$NS" -o yaml \
     >"${dir}/authorizationpolicy-github-agent.yaml" 2>&1 || true
+  kubectl get "$POLICY_CR" github-tool -n "$NS" -o yaml \
+    >"${dir}/authorizationpolicy-github-tool.yaml" 2>&1 || true
   kubectl get configmap authproxy-routes -n "$NS" -o yaml \
     >"${dir}/cm-authproxy-routes.yaml" 2>&1 || true
   kubectl get configmap authbridge-runtime-config -n "$NS" -o yaml \
@@ -309,6 +368,19 @@ kubectl get deployment aiac-event-broker -n "$AIAC_NS" >/dev/null 2>&1 \
 OPA_COUNT=$(kubectl get configmap authbridge-runtime-config -n "$NS" \
               -o jsonpath='{.data.config\.yaml}' 2>/dev/null | grep -c 'name: opa' || true)
 [ "$OPA_COUNT" = "2" ] || die "OPA not wired into both AuthBridge legs (got ${OPA_COUNT}, expected 2) — run k8s/opa-kind-enable.sh first"
+# The changed combiner (D20): no request fallback rule, so a pod with no client CR is denied. The AIAC
+# Controller does not start without it (start check #4, D30).
+REQ_FALLBACK=$(kubectl get "$POLICY_CR" default -n "$SYS_NS" -o jsonpath='{.spec.policies[*].content}' 2>/dev/null \
+  | grep -cE 'client_ok if not data\.authbridge\.client\.(inbound|outbound)\.request' || true)
+[ "$REQ_FALLBACK" = "0" ] \
+  || die "the global combiner in ${SYS_NS} is not the changed combiner (D20): ${REQ_FALLBACK} request fallback rules, expected 0 — run k8s/opa-kind-enable.sh first"
+SIDE=$(kubectl get configmap aiac-agent-config -n "$AIAC_NS" \
+         -o jsonpath='{.data.AIAC_ENFORCEMENT_SIDE}' 2>/dev/null || true)
+SIDE="${SIDE:-target-side}"
+case "$SIDE" in
+  target-side|agent-side) info "enforcement side: ${SIDE} (AIAC_ENFORCEMENT_SIDE in configmap/aiac-agent-config)" ;;
+  *) die "unknown AIAC_ENFORCEMENT_SIDE='${SIDE}' in configmap/aiac-agent-config (${AIAC_NS}) — want target-side or agent-side" ;;
+esac
 ADMIN="$(admin_token)"
 [ -n "$ADMIN" ] || die "could not obtain a Keycloak master admin token"
 LISTENERS=$(curl -s -H "Authorization: Bearer ${ADMIN}" "${KC}/admin/realms/${REALM}/events/config" \
@@ -342,9 +414,11 @@ phase_deploy() {
   # instead of a fixed --tail count — see that phase's own comment for why.
   DEPLOY_START_TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-  step "Recording the current AuthorizationPolicy CR (baseline — expect none)"
+  step "Recording the current AuthorizationPolicy CRs (baseline — expect none)"
   BEFORE_RV=$(kubectl get "$POLICY_CR" github-agent -n "$NS" -o jsonpath='{.metadata.resourceVersion}' 2>/dev/null || echo "<none>")
+  BEFORE_TOOL_RV=$(kubectl get "$POLICY_CR" github-tool -n "$NS" -o jsonpath='{.metadata.resourceVersion}' 2>/dev/null || echo "<none>")
   info "github-agent AuthorizationPolicy resourceVersion (before): ${BEFORE_RV}"
+  info "github-tool AuthorizationPolicy resourceVersion (before):  ${BEFORE_TOOL_RV}"
 
   # demo/assets/ splits standing these workloads up into the two halves that matter to this demo's
   # claim: kind-load.sh is the *images precondition* (build + `kind load`, applies nothing, fires
@@ -367,6 +441,7 @@ phase_deploy() {
   pass "both workloads Ready"
 
   export ONBOARDING_BEFORE_RV="$BEFORE_RV"
+  export ONBOARDING_BEFORE_TOOL_RV="$BEFORE_TOOL_RV"
   export ONBOARDING_DEPLOY_START_TS="$DEPLOY_START_TS"
 }
 
@@ -433,14 +508,21 @@ print("yes" if os.environ["SCOPE"] in names else "")' 2>/dev/null || true)
     info "aiac-agent's verbose onboarding logs have since rotated; the provisioned scopes above are the durable proof of consumption"
   fi
 
-  step "Confirming a fresh AuthorizationPolicy CR for github-agent [polling up to ${POLL_SECS}s]"
-  local before_rv="${ONBOARDING_BEFORE_RV:-<none>}" cr_start=$SECONDS cr_deadline=$((SECONDS + POLL_SECS)) cr_next_info=$((SECONDS + 30))
+  step "Confirming fresh AuthorizationPolicy CRs for github-agent AND github-tool [polling up to ${POLL_SECS}s]"
+  # One CR per managed service (D20), under both sides: under target side the tool CR carries the
+  # per-tool check, under agent side it is a pass-through. Under the changed combiner a pod with no CR
+  # is denied, so both must exist.
+  local before_rv="${ONBOARDING_BEFORE_RV:-<none>}" before_tool_rv="${ONBOARDING_BEFORE_TOOL_RV:-<none>}"
+  local cr_start=$SECONDS cr_deadline=$((SECONDS + POLL_SECS)) cr_next_info=$((SECONDS + 30))
   AFTER_RV=""
+  AFTER_TOOL_RV=""
   while :; do
     AFTER_RV=$(kubectl get "$POLICY_CR" github-agent -n "$NS" -o jsonpath='{.metadata.resourceVersion}' 2>/dev/null || echo "")
-    if [ -n "$AFTER_RV" ] && [ "$AFTER_RV" != "$before_rv" ]; then break; fi
+    AFTER_TOOL_RV=$(kubectl get "$POLICY_CR" github-tool -n "$NS" -o jsonpath='{.metadata.resourceVersion}' 2>/dev/null || echo "")
+    if [ -n "$AFTER_RV" ] && [ "$AFTER_RV" != "$before_rv" ] \
+       && [ -n "$AFTER_TOOL_RV" ] && [ "$AFTER_TOOL_RV" != "$before_tool_rv" ]; then break; fi
     if [ "$SECONDS" -ge "$cr_deadline" ]; then
-      die "github-agent AuthorizationPolicy CR never appeared (still '${before_rv}') after ${POLL_SECS}s — AIAC may not have finished writing rules yet"
+      die "the AuthorizationPolicy CRs never both appeared after ${POLL_SECS}s (github-agent: '${AFTER_RV:-<none>}', github-tool: '${AFTER_TOOL_RV:-<none>}') — AIAC may not have finished writing rules yet"
     fi
     # Policy generation is a chain of LLM calls and routinely takes minutes — say so, so a long
     # quiet wait isn't mistaken for a hang.
@@ -451,39 +533,53 @@ print("yes" if os.environ["SCOPE"] in names else "")' 2>/dev/null || true)
     sleep 5
   done
   pass "github-agent AuthorizationPolicy CR written by AIAC: resourceVersion ${before_rv} -> ${AFTER_RV} (nobody hand-wrote this CR)"
+  pass "github-tool AuthorizationPolicy CR written by AIAC: resourceVersion ${before_tool_rv} -> ${AFTER_TOOL_RV}"
 
   # The CR EXISTING is not the same as the CR being COMPLETE. If the tool's onboarding failed (a
-  # deploy-race 502 in classify_service/analyze_tool) while the agent's succeeded, AIAC still writes a
-  # CR — but its outbound gate is all empty maps, and every outbound request then denies. That state
+  # deploy-race 502 in classify_service/analyze_tool) while the agent's succeeded, AIAC still writes
+  # CRs — but the per-tool check has all empty maps, and every tool call then denies. That state
   # passed this phase twice before this check existed, and only blew up later in ENFORCE, where the
-  # cause is much harder to see. So wait for the outbound gate to actually carry the tool's scopes:
-  # target_allow_scopes keyed by the tool's SPIFFE id is what "the tool was onboarded" looks like.
+  # cause is much harder to see. So wait for the per-tool check to actually carry the tool's scopes.
   # The wait matters because a failed onboard is REDELIVERED by JetStream (ACK_WAIT) and succeeds on a
   # later attempt — POLL_SECS is sized to outlast one such redelivery.
-  step "Confirming the outbound gate carries the tool's scopes (not just that the CR exists) [timeout ${POLL_SECS}s]"
+  #
+  # Where the per-tool check lives depends on the side:
+  #   target-side  github-tool's inbound package. `source_roles` (the calling-agent gate, keyed by
+  #                github-agent's SPIFFE id) is filled only when both services are onboarded.
+  #   agent-side   github-agent's outbound package. `target_allow_scopes` (keyed by github-tool's
+  #                SPIFFE id) is filled only when the tool is onboarded.
+  # The generator renders an empty map as `:= {}` on one line and a filled one as `:= {` followed by
+  # newline-separated entries — so the EMPTY LITERAL is the exact signal. Test for it first (`:= {`
+  # matches both forms), and require the key to be present at all.
+  local gate_cr gate_map gate_what
+  if [ "$SIDE" = "target-side" ]; then
+    gate_cr="github-tool"; gate_map="source_roles"
+    gate_what="github-tool's inbound gate (target side)"
+  else
+    gate_cr="github-agent"; gate_map="target_allow_scopes"
+    gate_what="github-agent's outbound gate (agent side)"
+  fi
+  step "Confirming ${gate_what} carries the tool's scopes (not just that the CR exists) [timeout ${POLL_SECS}s]"
   local gate_deadline=$((SECONDS + POLL_SECS)) cr_content=""
   while :; do
-    cr_content=$(kubectl get "$POLICY_CR" github-agent -n "$NS" -o jsonpath='{.spec.policies[*].content}' 2>/dev/null || true)
-    # `target_allow_scopes` appears ONLY in the outbound policy, so no section-splitting is needed.
-    # The generator renders it as `:= {}` on one line when the tool was never onboarded, and as `:= {`
-    # followed by newline-separated entries when it was — so the EMPTY LITERAL is the exact signal.
-    # Test for it first (`:= {` matches both forms), and require the key to be present at all, which
-    # guards against a CR that somehow carries no outbound policy.
-    if printf '%s' "$cr_content" | grep -q 'target_allow_scopes := {}'; then
-      : # key present but empty -> the tool has not been onboarded yet
-    elif printf '%s' "$cr_content" | grep -q 'target_allow_scopes := {'; then
+    cr_content=$(kubectl get "$POLICY_CR" "$gate_cr" -n "$NS" -o jsonpath='{.spec.policies[*].content}' 2>/dev/null || true)
+    if printf '%s' "$cr_content" | grep -q "${gate_map} := {}"; then
+      : # key present but empty -> not both onboarded yet
+    elif printf '%s' "$cr_content" | grep -q "${gate_map} := {"; then
       break
     fi
     if [ "$SECONDS" -ge "$gate_deadline" ]; then
-      die "github-agent's outbound gate still has an EMPTY target_allow_scopes after ${POLL_SECS}s — the agent onboarded but the tool did not, so every outbound request would deny. Check for a deploy-race 502 in: kubectl logs deployment/aiac-agent -n ${AIAC_NS} | grep -iE 'label missing|MCP tools/list'"
+      die "${gate_what} still has an EMPTY or absent ${gate_map} after ${POLL_SECS}s — one of the two onboardings did not finish, so every tool call would deny. Check for a deploy-race 502 in: kubectl logs deployment/aiac-agent -n ${AIAC_NS} | grep -iE 'label missing|MCP tools/list'"
     fi
-    info "outbound gate still empty (tool not onboarded yet) — retrying..."
+    info "${gate_map} still empty (not both onboarded yet) — retrying..."
     sleep 10
   done
-  pass "outbound gate populated: target_allow_scopes carries the tool's scopes"
+  pass "${gate_what} populated: ${gate_map} carries the tool's scopes"
 
-  info "content:"
+  info "github-agent CR content:"
   kubectl get "$POLICY_CR" github-agent -n "$NS" -o jsonpath='{.spec.policies[*].content}' | sed 's/^/    /'
+  info "github-tool CR content:"
+  kubectl get "$POLICY_CR" github-tool -n "$NS" -o jsonpath='{.spec.policies[*].content}' | sed 's/^/    /'
 }
 
 # ── Phase WIRE ────────────────────────────────────────────────────────────────
@@ -595,6 +691,37 @@ PY
   printf '%s\n' "$out" | sed -n 's/^VERDICT //p' | tail -1
 }
 
+# probe_tool_direct <user> <tool_name> — real tools/call straight to github-tool from a throwaway pod,
+# with the user's login token and NO agent (row 4 of #646's table). Echoes a VERDICT string like
+# probe_tool: ALLOWED_RESULT | DENIED_JSONRPC | "DENIED_HTTP <code>" | ERROR | UNEXPECTED.
+probe_tool_direct() {
+  local user="$1" tool="$2" tok out code body
+  tok="$(mint_token "$user")"
+  [ -n "$tok" ] || { echo "ERROR"; return 0; }
+  # $TOK and $TOOL are expanded by the sh in the probe pod (--env), not here.
+  # shellcheck disable=SC2016
+  out=$(kubectl run "probe-direct-${user}-$RANDOM" --rm -i --restart=Never --image=curlimages/curl:8.10.1 \
+    -n "$NS" --env="TOK=$tok" --env="TOOL=$tool" -- sh -c \
+    'curl -s -m 15 -w "\nHTTP_CODE:%{http_code}\n" -X POST "http://github-tool:9090/mcp" \
+       -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" \
+       -H "Authorization: Bearer $TOK" \
+       -d "{\"jsonrpc\":\"2.0\",\"id\":\"1\",\"method\":\"tools/call\",\"params\":{\"name\":\"$TOOL\",\"arguments\":{}}}"' \
+    2>/dev/null || true)
+  code=$(printf '%s' "$out" | grep -o 'HTTP_CODE:[0-9]*' | tail -1 | cut -d: -f2 || true)
+  body=$(printf '%s' "$out" | grep -vE 'HTTP_CODE:|deleted' | tr -d '\r' | grep -v '^$' | tail -1 || true)
+  case "$code" in
+    401|403|503) echo "DENIED_HTTP ${code}" ;;
+    200)
+      case "$body" in
+        *'"result"'*) echo "ALLOWED_RESULT" ;;
+        *'"error"'*) echo "DENIED_JSONRPC" ;;
+        *) echo "UNEXPECTED 200" ;;
+      esac ;;
+    "") echo "ERROR" ;;
+    *) echo "UNEXPECTED ${code}" ;;
+  esac
+}
+
 phase_enforce() {
   printf '\n%s%s====== Phase ENFORCE — live HTTP through the real OPA plugin ======%s\n' "$C_BLD" "$C_CYN" "$C_RST"
 
@@ -632,30 +759,31 @@ phase_enforce() {
     esac
   fi
 
-  step "Ensuring ${ROPC_CLIENT_ID} stamps the username into the token 'sub' claim"
-  # AuthBridge's jwt-validation sets input.identity.subject from the token 'sub'; AIAC's inbound
-  # rego keys subject_roles on the USERNAME ("dev-user"/"test-user"). Stock Keycloak 26 puts the
-  # user UUID in 'sub' (and only when the 'basic' client scope is assigned — otherwise 'sub' is
-  # absent entirely), so without a username->sub mapper every inbound probe is denied with an
-  # EMPTY subject. This is the realm's "username -> sub mapper" prerequisite that
-  # test/integration/launcher.py:verify_subject_mapper only *skips* on — provisioned here so the
-  # demo is self-sufficient. Idempotent: 201 created, 409 already present.
-  MAPPER_HTTP=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
-    -H "Authorization: Bearer ${ADMIN}" -H "Content-Type: application/json" \
-    "${KC}/admin/realms/${REALM}/clients/${ROPC_UUID}/protocol-mappers/models" \
-    -d '{"name":"username-to-sub","protocol":"openid-connect","protocolMapper":"oidc-usermodel-property-mapper","config":{"user.attribute":"username","claim.name":"sub","jsonType.label":"String","access.token.claim":"true","id.token.claim":"true","userinfo.token.claim":"true"}}')
-  case "$MAPPER_HTTP" in
-    201) pass "created 'username-to-sub' mapper on '${ROPC_CLIENT_ID}' (HTTP 201)" ;;
-    409) warn "'username-to-sub' mapper already present (HTTP 409) — idempotent, continuing" ;;
-    *) die "creating the username->sub mapper returned HTTP ${MAPPER_HTTP} (expected 201/409)" ;;
-  esac
+  step "Checking that the login and the exchanged tokens carry sub = username (D31)"
+  # AuthBridge's jwt-validation sets input.identity.subject from the token 'sub'; AIAC's rego keys
+  # subject_roles on the USERNAME ("dev-user"/"test-user"). Stock Keycloak 26 puts the user UUID in
+  # 'sub'. The one source of sub = username is the client scope aiac-username-sub, linked as a
+  # DEFAULT scope (D31). AIAC makes both links; this demo only checks them (read only), and never adds
+  # a sub mapper by hand:
+  #   - on ${ROPC_CLIENT_ID} (a platform login client), for the login token — else every inbound
+  #     probe is denied with a UUID subject;
+  #   - on github-agent (an onboarded client), for the token it exchanges for github-tool — the
+  #     Keycloak standard token exchange (V2) applies the scopes of the agent client. Under target
+  #     side github-tool's inbound keys users by that 'sub', so without the link every tool call is
+  #     denied.
+  check_subject_scope "${ROPC_CLIENT_ID}" "$ROPC_UUID" \
+    "the login token keeps sub = the Keycloak user ID, but the inbound rego keys users by username, so every inbound probe would be DENIED."
+  AGENT_UUID="$(client_uuid_by_name "${NS}/github-agent" "$ADMIN")"
+  [ -n "$AGENT_UUID" ] || die "could not resolve the Keycloak client uuid for ${NS}/github-agent"
+  check_subject_scope "github-agent" "$AGENT_UUID" \
+    "the token that github-agent exchanges for github-tool keeps sub = the Keycloak user ID, but github-tool's inbound keys users by username, so every tool call would be DENIED under target side."
 
   step "Inbound — dev-user and test-user allowed, devops-user denied [polling up to ${POLL_SECS}s]"
   probe_agent dev-user    200 "$POLL_SECS" "dev-user -> github-agent (inbound)"
   probe_agent test-user   200 "$POLL_SECS" "test-user -> github-agent (inbound)"
   probe_agent devops-user 403 "$POLL_SECS" "devops-user -> github-agent (inbound, expected denied)"
 
-  step "Outbound — per-tool matrix for dev-user and test-user (reported; source-read is a hard check)"
+  step "Tool calls through github-agent — per-tool matrix for dev-user and test-user (reported; source-read is a hard check)"
   local user tool verdict
   printf '     %-12s %-14s %s\n' "user" "tool" "verdict"
   for user in dev-user test-user; do
@@ -673,8 +801,8 @@ phase_enforce() {
     && pass "test-user -> source-read: ${TEST_SOURCE_READ} (correctly not ALLOWED_RESULT)" \
     || die "test-user -> source-read: got ALLOWED_RESULT, expected denied (testers don't touch source)"
 
-  step "Decision logs — one inbound allow/deny, one outbound allow/deny"
-  local pod
+  step "Decision logs — one inbound allow/deny, one tool-call allow/deny (${SIDE})"
+  local pod tool_pod tool_leg tool_path
   pod="$(latest_pod "$AGENT_LABEL")"
   info "inbound (dev-user, allowed):"
   kubectl logs -n "$NS" "$pod" -c authbridge-proxy --tail=500 2>/dev/null \
@@ -682,28 +810,40 @@ phase_enforce() {
   info "inbound (devops-user, denied):"
   kubectl logs -n "$NS" "$pod" -c authbridge-proxy --tail=500 2>/dev/null \
     | grep 'path=authbridge/inbound/request' | grep 'allow:false' | tail -1 | sed 's/^/    /'
-  info "outbound (dev-user -> source-read, allowed):"
-  kubectl logs -n "$NS" "$pod" -c authbridge-proxy --tail=500 2>/dev/null \
-    | grep 'path=authbridge/outbound/request' | grep 'allow:true' | tail -1 | sed 's/^/    /'
-  info "outbound (test-user -> source-read, denied):"
-  kubectl logs -n "$NS" "$pod" -c authbridge-proxy --tail=500 2>/dev/null \
-    | grep 'path=authbridge/outbound/request' | grep 'allow:false' | tail -1 | sed 's/^/    /'
+  # The tool-call decision is on github-tool's inbound under target side, on github-agent's
+  # outbound under agent side (the other one is a pass-through).
+  if [ "$SIDE" = "target-side" ]; then
+    tool_pod="$(latest_pod "$TOOL_LABEL")"; tool_leg="github-tool inbound"; tool_path="authbridge/inbound/request"
+  else
+    tool_pod="$pod"; tool_leg="github-agent outbound"; tool_path="authbridge/outbound/request"
+  fi
+  info "${tool_leg} (dev-user -> source-read, allowed):"
+  kubectl logs -n "$NS" "$tool_pod" -c authbridge-proxy --tail=500 2>/dev/null \
+    | grep "path=${tool_path}" | grep 'allow:true' | tail -1 | sed 's/^/    /'
+  info "${tool_leg} (test-user -> source-read, denied):"
+  kubectl logs -n "$NS" "$tool_pod" -c authbridge-proxy --tail=500 2>/dev/null \
+    | grep "path=${tool_path}" | grep 'allow:false' | tail -1 | sed 's/^/    /'
 
-  # Report what THIS cluster actually does rather than asserting the tool is unprotected: whether a
-  # sidecar fronts github-tool is the operator's choice (AgentRuntime + injection config), and with one
-  # injected the inbound leg does validate JWTs. Either way AIAC generates no tool-inbound policy — that
-  # is the real gap — so the row stays unprobed. See demo.md's 'Known gaps' section.
-  local tool_containers
-  tool_containers="$(kubectl get pod -n "$NS" -l "$TOOL_LABEL" \
-    -o jsonpath='{.items[0].spec.containers[*].name}' 2>/dev/null || true)"
-  case "$tool_containers" in
-    *authbridge-proxy*)
-      warn "known gap: 'direct dev-user -> github-tool, no agent' (row 4 of #646's table) is NOT enforced by the GENERATED policy — github-tool has an AuthBridge sidecar here (containers: ${tool_containers}), so its inbound leg validates JWTs, but AIAC writes an AuthorizationPolicy CR for github-agent only, so no policy derived from policy.md constrains it. Not probed here to avoid reporting a fabricated result." ;;
-    "")
-      warn "known gap: 'direct dev-user -> github-tool, no agent' (row 4 of #646's table) is NOT enforced, and the tool's containers could not be read to say how it is fronted. AIAC generates no tool-inbound policy either way. Not probed here to avoid reporting a fabricated result." ;;
-    *)
-      warn "known gap: 'direct dev-user -> github-tool, no agent' (row 4 of #646's table) is NOT enforced at all — github-tool has no AuthBridge sidecar in this deployment (containers: ${tool_containers}) and no auth of its own, so a direct in-cluster call succeeds unconditionally. Not probed here to avoid reporting a fabricated result." ;;
-  esac
+  # Row 4 of #646's table: dev-user calls github-tool DIRECTLY, with no agent. Under target side
+  # github-tool's inbound package has both gates, with no platform-client bypass (D26, D27): the
+  # login token's client_id (rossoctl) has no entry in source_roles, so the call is denied (403, or
+  # 401 from jwt-validation when the token has no github-tool audience). Under agent side github-tool
+  # has a pass-through CR, so nothing derived from policy.md constrains the path — report it, do not
+  # probe it. See demo.md's 'Known gaps' section.
+  if [ "$SIDE" = "target-side" ]; then
+    local direct
+    direct="$(probe_tool_direct dev-user source-read)"
+    case "$direct" in
+      ALLOWED_RESULT)
+        die "direct dev-user -> github-tool (no agent) -> source-read: ALLOWED_RESULT, expected denied — github-tool's inbound gate is open" ;;
+      "DENIED_HTTP 401"|"DENIED_HTTP 403"|DENIED_JSONRPC)
+        pass "direct dev-user -> github-tool (no agent) -> source-read: ${direct} (github-tool's inbound gate checks the calling agent)" ;;
+      *)
+        warn "direct dev-user -> github-tool (no agent) -> source-read: inconclusive (${direct:-<none>}) — check: kubectl logs -n ${NS} $(latest_pod "$TOOL_LABEL") -c authbridge-proxy | grep path=authbridge/inbound/request" ;;
+    esac
+  else
+    warn "known gap under agent side: 'direct dev-user -> github-tool, no agent' (row 4 of #646's table) is NOT enforced by the GENERATED policy — github-tool's CR is a pass-through, so no policy derived from policy.md constrains it. Not probed here to avoid reporting a fabricated result. Under target side github-tool's inbound gate denies it."
+  fi
 }
 
 # ── Phase REPLAY-TRIGGER (opt-in) ─────────────────────────────────────────────

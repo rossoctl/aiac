@@ -1,5 +1,7 @@
 # Component PRD: Policy Guardrails Agent
 
+> **Status: not built yet** — this is a design only. No service, image or k8s manifest exists.
+
 ## Description
 
 A FastAPI verification service co-located with ChromaDB and the RAG Ingest Service in the RAG Pod. It sits between the RAG Ingest Service and ChromaDB: before any document from an ingest request is written, the RAG Ingest Service calls the Policy Guardrails Agent to obtain a verdict on that document. It is reachable only on the RAG Pod's loopback network (`localhost:7075`) — it is not exposed on the `aiac-rag-service` ClusterIP Service, so the RAG Ingest Service is structurally the only caller.
