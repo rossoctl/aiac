@@ -1266,6 +1266,37 @@ class TestBootstrapOfATool:
 
         drop_bootstrap.assert_called_once_with(CLIENT_ID)
 
+    def test_a_failed_apply_of_an_agent_drops_nothing(self, pce, bootstrap, drop_bootstrap):
+        # An agent gets no bootstrap, so it has no bootstrap CR to drop.
+        pce.side_effect = RuntimeError("writer down")
+        with (
+            patch.object(orchestrator, "build_provision_graph", return_value=_graph()),
+            patch.object(orchestrator, "ServicePolicyBuilder") as spb,
+            patch.object(orchestrator, "_config", return_value=_config_returning(_service())),
+            pytest.raises(RuntimeError, match="writer down"),
+        ):
+            spb.build.return_value = []
+            orchestrator.onboard_and_apply(SERVICE_ID)
+
+        bootstrap.assert_not_called()
+        drop_bootstrap.assert_not_called()
+
+    def test_a_rollback_error_from_provision_still_quarantines(self, k8s, quarantine, drop_bootstrap):
+        # Provision sets no created roles or scopes before it raises: the handler must still run
+        # the rollback and the quarantine, and re-raise the original error.
+        k8s.list_namespaced_pod.return_value = kf.pod_list(kf.pod(type_label="tool"))
+        graph = _graph(service_type=ServiceType.TOOL)
+        graph.invoke.side_effect = PolicyRulesBuilderError("raised in Provision")
+        with (
+            patch.object(orchestrator, "build_provision_graph", return_value=graph),
+            patch.object(orchestrator, "_config", return_value=_config_returning(_service())),
+            pytest.raises(PolicyRulesBuilderError, match="raised in Provision"),
+        ):
+            _run_onboarding(SERVICE_ID)
+
+        quarantine.assert_called_once_with(CLIENT_ID, [])
+        drop_bootstrap.assert_not_called()
+
     def test_a_rollback_error_quarantines_and_does_not_drop_again(self, k8s, quarantine, drop_bootstrap):
         # The quarantine already deletes the CR.
         k8s.list_namespaced_pod.return_value = kf.pod_list(kf.pod(type_label="tool"))

@@ -56,7 +56,7 @@ from aiac.agent.uc.onboarding.provision.graph import build_provision_graph
 from aiac.agent.uc.onboarding.provision.nodes import WaitConfig, poll_until_ready, split_client_name
 from aiac.agent.uc.onboarding.provision.state import OnboardingProvisionState, Trigger
 from aiac.idp.configuration.api import Configuration, IdPHTTPError
-from aiac.idp.configuration.models import ClientId, Service, ServiceType, ServiceUuid
+from aiac.idp.configuration.models import ClientId, Role, Scope, Service, ServiceType, ServiceUuid
 from aiac.policy.computation import bootstrap, compute_and_apply, drop_bootstrap, quarantine
 from aiac.policy.model.models import PolicyRule
 
@@ -277,13 +277,15 @@ def onboard_and_apply(service_id: ServiceUuid, *, wait_for_client: bool = True) 
     a NATS redelivery) cannot quarantine the service between this run's apply and its re-enable.
     ``wait_for_client`` is given to the first IdP read (see :func:`_read_service`)."""
     with _service_lock(service_id):
-        rules, override, client_id = _onboard(service_id, wait_for_client)
+        rules, override, client_id, bootstrapped = _onboard(service_id, wait_for_client)
         try:
             compute_and_apply(
                 rules, override, focus_service=client_id, on_applied=functools.partial(reenable_service, service_id)
             )
         except Exception:
-            _drop_bootstrap(client_id)
+            # Only a bootstrapped tool has a bootstrap CR to drop.
+            if bootstrapped:
+                _drop_bootstrap(client_id)
             raise
 
 
@@ -298,9 +300,10 @@ def _drop_bootstrap(client_id: ClientId) -> None:
         logger.exception("UC1: the drop of the bootstrap CR failed (service %s)", _loggable(client_id))
 
 
-def _onboard(service_id: ServiceUuid, wait_for_client: bool) -> tuple[list[PolicyRule], bool, ClientId]:
+def _onboard(service_id: ServiceUuid, wait_for_client: bool) -> tuple[list[PolicyRule], bool, ClientId, bool]:
     """Sequence the precondition checks → (tool) bootstrap → Provision → Policy Builder and return
-    ``(rules, override=False, client_id)``.
+    ``(rules, override=False, client_id, bootstrapped)``. ``bootstrapped`` is true when this run
+    wrote the bootstrap CR of a tool: only then does a failed apply drop it.
 
     ``service_id`` is the Keycloak internal client UUID that the trigger carries. The Orchestrator
     reads the ``Service`` from the IdP **once**, before Provision, and resolves its clientId
@@ -373,6 +376,10 @@ def _onboard(service_id: ServiceUuid, wait_for_client: bool) -> tuple[list[Polic
     # rollback error) must not leave the bootstrap CR: under agent side it is a pass-through CR,
     # which allows every request, for a service that is not managed. The PCE drops it if the store
     # has no SPM. A rollback error runs the quarantine, which deletes the CR, so it drops nothing.
+    # Set before the ``try``: a rollback error from Provision must not become an UnboundLocalError
+    # in the handler, which would hide the error and skip the quarantine.
+    created_roles: list[Role] = []
+    created_scopes: list[Scope] = []
     try:
         # The checks already read the pods and their type label: Provision does not read them again.
         namespace, workload_name = split_client_name(service_id, service.name)
@@ -385,7 +392,6 @@ def _onboard(service_id: ServiceUuid, wait_for_client: bool) -> tuple[list[Polic
         provision = build_provision_graph().invoke(state)
         created_roles = provision["created_roles"]
         created_scopes = provision["created_scopes"]
-        # Only the PRB raises a rollback error, so Provision has set the created roles and scopes.
         rules = ServicePolicyBuilder.build(service_id, provision["service_type"])
     except _ROLLBACK_ERRORS:
         try:
@@ -401,4 +407,4 @@ def _onboard(service_id: ServiceUuid, wait_for_client: bool) -> tuple[list[Polic
             _drop_bootstrap(client_id)
         raise
 
-    return rules, False, client_id
+    return rules, False, client_id, bootstrapped

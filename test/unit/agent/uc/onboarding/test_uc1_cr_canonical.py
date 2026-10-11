@@ -60,9 +60,27 @@ def test_a_different_rule_is_a_change() -> None:
 def test_empty_bindings_and_pass_through_stay_as_they_are() -> None:
     rego = _package(_render_list("agent_scopes", []), _render_map("source_roles", {}))
     pass_through = "package authbridge.client.outbound.request\nimport rego.v1\n\nallow := true\n"
-    assert uc1.rego_canonical(rego) == uc1.rego_canonical(rego)
+    assert uc1.rego_canonical(rego) == rego.rstrip("\n")
     assert "agent_scopes := []" in uc1.rego_canonical(rego)
     assert uc1.rego_canonical(pass_through) == pass_through.rstrip("\n")
+
+
+def test_a_comma_in_a_string_value_is_a_change() -> None:
+    # Only the trailing comma of a map entry is removed, not a comma in a string.
+    for render in (
+        lambda v: _render_list("agent_scopes", [v]),
+        lambda v: _render_map("subject_roles", {"dev-user": [v]}),
+        lambda v: _render_nested_map("grants", {"u1": {"t1": [v]}}),
+    ):
+        assert uc1.rego_canonical(_package(render("p,]"))) != uc1.rego_canonical(_package(render("p]")))
+
+
+def test_a_binding_that_is_not_json_stays_as_it_is() -> None:
+    # A Rego set is not JSON: it is not sorted, so a format change of the renderer shows as a change.
+    a = _package('session_methods := {"tools/list", "initialize"}')
+    b = _package('session_methods := {"initialize", "tools/list"}')
+    assert uc1.rego_canonical(a) == a.rstrip("\n")
+    assert uc1.rego_canonical(a) != uc1.rego_canonical(b)
 
 
 def test_no_cr_stays_none() -> None:

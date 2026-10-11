@@ -68,7 +68,7 @@ The `model` of `apply_policy` and `replace_policy` is a subclass of the policy m
 |----------|-------|-------------|------|
 | `apply_policy` | `POST /policy` | the PCE | At the end of each `compute_and_apply` run, with the affected services (D23). In `quarantine` and `decommission`, to redeploy the affected services. In `rerender_role` (D32; the role-members event and `POST /apply/role-members/{role_id}`), to render the CRs that use the role again with its current holders, with no PRB call and no SPM write: under target side, the live stored SPMs that have an edge of the role; under agent side, the APMs of every live stored agent, derived again. No call when the set is empty (see [policy-computation-engine.md → Role re-render](policy-computation-engine.md#role-re-render-rerender_role)). In `bootstrap`, to write the focus tool's first CR before UC-1 Provision. |
 | `replace_policy` | `PUT /policy` | the PCE | In `resync()` at every Controller start (D28), with the full policy model of the current side. The UC-2b rebuild also ends with it, through the PCE (D28a). |
-| `delete_service_cr` | `DELETE /policy/services/{service_id}` | the PCE | In `quarantine` and `decommission` (D20), for an agent and for a tool. |
+| `delete_service_cr` | `DELETE /policy/services/{service_id}` | the PCE | In `quarantine` and `decommission` (D20), for an agent and for a tool. In `drop_bootstrap`, for a tool that has no stored SPM: it deletes the bootstrap CR after a failed onboarding that ran no quarantine. |
 | `delete_policy` | `DELETE /policy` | none (C1) | An operator tool only. |
 
 The retired routes `POST /policy/agents/{agent_id}` and `DELETE /policy/agents/{agent_id}` and their functions `apply_agent_policy` and `delete_agent_policy` are removed. There is no no-rules CR: the quarantine deletes the CR.
@@ -141,4 +141,4 @@ Key behaviors to assert:
 
 - The `aiac.pdp.library.policy` module (old path) has been removed. All consumers import from `aiac.pdp.policy.library.api`.
 - Models (`PolicyModel`, `TargetSidePolicyModel`, `AgentSidePolicyModel`) are imported from `aiac.policy.model.models`, not from the removed `aiac.pdp.library.models`.
-- The name `delete_service_cr` is different from the store library's `delete_service_policy` on purpose. The PCE calls both in the quarantine and the decommission: one deletes the CR, the other deletes the SPM.
+- The name `delete_service_cr` is different from the store library's `delete_service_policy` on purpose. The PCE calls both in the quarantine and the decommission: one deletes the CR, the other deletes the SPM. `drop_bootstrap` calls only `delete_service_cr`: the tool has no SPM.

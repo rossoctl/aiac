@@ -2180,6 +2180,37 @@ def test_agent_side_rerender_role_derives_from_the_listed_spms_with_no_by_role_q
     assert store.pushed_apm("github-agent").target_allow_scopes == {"github-tool": initial["github-tool"].owned_scopes}
 
 
+def test_agent_side_apm_rule_order_is_the_same_on_the_listed_and_the_by_role_paths(agent_side):
+    # The resync and rerender_role find the SPMs of a role in the listed SPMs (prime); the read
+    # model asks the store (get_service_policies_by_role). Both keep the order of the store, so the
+    # rule order of the APM is the same on each path. The store order (tool-b first) is not the
+    # sorted order, so a path that sorts gives a different order.
+    AR = _agent_role("r-agent-src", "agent-source", owner="github-agent")
+    UR = _user_role("r-user-dev", "developer", users=["dev-user"])
+    AS = _scope("s-agent-inbound", "agent-inbound", service_id="github-agent")
+    BS = _scope("s-b-read", "b-read", service_id="tool-b")
+    CS = _scope("s-a-read", "a-read", service_id="tool-a")
+    initial = {
+        "tool-b": _spm("tool-b", type=ServiceType.TOOL, owned_scopes=[BS], inbound=[_rule(AR, BS), _rule(UR, BS)]),
+        "github-agent": _spm("github-agent", owned_roles=[AR], owned_scopes=[AS], inbound=[_rule(UR, AS)]),
+        "tool-a": _spm("tool-a", type=ServiceType.TOOL, owned_scopes=[CS], inbound=[_rule(AR, CS), _rule(UR, CS)]),
+    }
+    catalog = [
+        _agent("github-agent", roles=[AR], scopes=[AS]),
+        _tool("tool-b", scopes=[BS]),
+        _tool("tool-a", scopes=[CS]),
+    ]
+
+    (read,) = _read_model("github-agent", store=FakeStore(initial), catalog=catalog).agents
+    (resynced,) = run_resync(catalog=catalog, store=FakeStore(initial)).policy_replaces[0].agents
+    rerendered = run_rerender("r-agent-src", catalog=catalog, store=FakeStore(initial)).pushed_apm("github-agent")
+
+    assert [r.scope.id for r in read.outbound_target_allow_rules] == ["s-b-read", "s-a-read"]
+    assert [r.scope.id for r in read.outbound_subject_allow_rules] == ["s-b-read", "s-a-read"]
+    assert resynced == read
+    assert rerendered == read
+
+
 def test_agent_side_resync_replaces_every_cr_with_the_apms_and_the_pass_throughs(agent_side):
     # The PUT carries the APM of each live stored agent and the pass-through of each live stored
     # tool. The disabled agent and the absent one are not in it.
@@ -2446,6 +2477,16 @@ def test_drop_bootstrap_keeps_the_cr_of_a_managed_service():
         drop_bootstrap("github-tool")
 
     assert store.cr_deletes == []
+
+
+def test_drop_bootstrap_holds_the_pce_lock():
+    store = FakeStore()
+    with engine_env([], store):
+        from aiac.policy.computation import drop_bootstrap
+
+        _blocks_while_pce_lock_held(lambda: drop_bootstrap("new-tool"))
+
+    assert store.cr_deletes == ["new-tool"]
 
 
 def test_agent_side_bootstrap_of_a_tool_makes_no_idp_read(agent_side):

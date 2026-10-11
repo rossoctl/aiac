@@ -542,6 +542,12 @@ first.
    `SPM(github-tool)`. Assert: github-tool's CR is back with the same `spec.policies` as in phase 1, and
    the `dev-user` `source-read` call is allowed again.
 
+The compare of `spec.policies` ignores the order of lists and of map keys (`cr_canonical`): the renderer
+keeps the order that the IdP gives, and that order has no effect on a decision. A different item or a
+different rule line is a change. The unit lane pins the rule order of the PCE paths
+(`test/unit/policy/computation/test_engine.py`) and the compare itself
+(`test/unit/agent/uc/onboarding/test_uc1_cr_canonical.py`).
+
 ## The enforcement-side switch (rung 7)
 
 Rung 7 (`test/system/test_uc1_onboard_side_switch.py`) proves the switch (D16, D29). A side change is
@@ -561,8 +567,9 @@ phases in order. It skips cleanly in the same way as rung 6.
    bundles (a CR change takes effect at the next poll of the OPA plugin, up to 120 s). Then assert the
    full matrix again: the same verdicts as in phase 1.
 5. **Switch back.** Exit the context: it restores the start value and restarts the Controller. Poll
-   until every AIAC CR matches `S` again and `deny_origin` gives the enforcement point of `S`. The
-   context restores `S` on every exit path, also on a failure, so later rungs run under `S`.
+   until every AIAC CR matches `S` again and `deny_origin` gives the enforcement point of `S`. Assert:
+   the CRs of github-agent and github-tool have the same `spec.policies` as in phase 1 (the compare
+   ignores the order of lists and of map keys, as in rung 6). The context restores `S` on every exit path, also on a failure, so later rungs run under `S`.
 
 The rung needs no second run of the lane to cover both sides, but the whole lane can also run under
 either side (see *[Runbook](#runbook)*).

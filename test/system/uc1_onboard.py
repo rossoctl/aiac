@@ -1777,7 +1777,9 @@ def rego_canonical(rego: str) -> str:
             text = "\n".join(["{", *lines[i + 1 : end + 1]])
         try:
             # The renderers end each map entry with a comma; JSON does not accept a trailing comma.
-            value = json.loads(re.sub(r",(\s*[}\]])", r"\1", text))
+            # Remove only a comma at the end of a line: json.dumps escapes a newline in a string,
+            # so a comma in a string value stays.
+            value = json.loads(re.sub(r",\n(\s*[}\]])", "\n\\1", text))
         except json.JSONDecodeError:
             out.extend(lines[i : end + 1])
         else:
