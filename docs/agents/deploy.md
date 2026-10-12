@@ -29,3 +29,7 @@ Usage: `/deploy ac-side=agent`, `/deploy agent-side`.
   side change). Else the restart starts the Controller under the other side.
 - **Precondition:** the AIAC global combiner must exist (`k8s/opa-kind-enable.sh`
   applies it), or the Controller does not start.
+- **Precondition (both sides):** each tool pod needs the AuthBridge sidecar
+  (`injectTools=true`) and the namespace inbound pipeline needs `jwt-validation`
+  (`k8s/opa-kind-enable.sh` sets both), or the onboarding of the tool fails
+  with `409` (check #1 or #2, D30).

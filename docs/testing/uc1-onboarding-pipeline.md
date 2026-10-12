@@ -195,8 +195,9 @@ cleanly** when any of it is absent (they never stand it up, and never false-pass
   change; run the script again.
 - **Tool pods with the sidecar.** The script sets `injectTools=true`. It restarts the
   `rossoctl.io/type=tool` pods as well as the `rossoctl.io/type=agent` pods, because the webhook
-  injects the sidecar only on pod CREATE. The namespace inbound pipeline has `mcp-parser` and `opa`
-  (the onboarding check #2 for a tool under target side). The fixture deploys fresh workload pods, so
+  injects the sidecar only on pod CREATE. The namespace inbound pipeline has `jwt-validation`, `mcp-parser` and
+  `opa` (the onboarding check #2 for a tool under target side; under agent side a tool needs only
+  `jwt-validation`). The fixture deploys fresh workload pods, so
   github-agent and github-tool both get the sidecar at CREATE.
 - **The enforcement side.** `AIAC_ENFORCEMENT_SIDE` in the `aiac-agent-config` ConfigMap selects the
   side (default `target-side`; the other value is `agent-side`). The suite runs under the live side,
@@ -781,7 +782,9 @@ Rung 6 restarts the Controller twice, so it takes several minutes.
   - `test/unit/agent/` — the start sequence (an unknown side, a failed start check #4, or a failed
     resync stops the Controller before it serves), the onboarding checks #1, #2 and
     #6 (each gives 409, is permanent in the NATS consumer, runs no rollback and no quarantine, and runs
-    before the bootstrap, Provision and the PRB, D30), the bootstrap of a tool before Provision, the
+    before the bootstrap, Provision and the PRB, D30; #2 needs `jwt-validation` inbound, and under agent
+    side a tool gets #1 and #2 and no #6), the login-client audience warning (agent side only, after the
+    build of a tool and after the resync at start; a failure stops neither), the bootstrap of a tool before Provision, the
     drop of the bootstrap CR (a failure that runs no quarantine, and a failed `compute_and_apply`,
     call `drop_bootstrap` only for a tool that this run bootstrapped; a failed drop does not hide
     the original error), and the read-only route `GET /policy/services/{service_id:path}` (D18). For D31: Provision links the

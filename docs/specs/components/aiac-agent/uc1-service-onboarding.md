@@ -64,6 +64,7 @@ flowchart TD
 1b. For an enabled tool only, call the PCE `bootstrap(client_id, ServiceType.TOOL)`. A disabled (quarantined) tool gets no bootstrap: its discovery fails at the token mint anyway (C5), and the CR would stay until the next resync (see [Tool discovery and the bootstrap CR](#tool-discovery-and-the-bootstrap-cr)). It writes the tool's CR before Provision, so that discovery passes D20. The type comes from the pod label that the checks read. An agent gets no bootstrap.
 2. Call `build_provision_graph().invoke(...)` → get back `service_type` and the created-manifest (`created_roles`, `created_scopes`).
 3. Call `ServicePolicyBuilder.build(service_id, service_type)` → get back `list[PolicyRule]`. Service Policy Builder re-resolves the focus service from the IdP catalog by its internal client UUID (`service_id`; Provision has already persisted its roles/scopes), so it needs only the id, not the `ServiceProvision`.
+3b. For a tool only, run the [login-client audience warning](#the-login-client-audience-warning-agent-side) (`warn_platform_tool_audiences(config, client_id)`). It does something only under agent side. It never raises.
 4. Return an `_Onboarded` (a `NamedTuple`: `rules: list[PolicyRule]`, `client_id`, `bootstrapped`). The build (the private `_onboard`, steps 0–4) returns it to `onboard_and_apply`. `bootstrapped` is true only when this run wrote the bootstrap CR of a tool (step 1b). The build takes no default-effect argument: a pair that no rule mentions is always DENY.
 5. Call `compute_and_apply(rules, override=False, focus_service=client_id, on_applied=partial(reenable_service, service_id))`. `client_id` is the PCE `focus_service`, so the PCE makes no second IdP read for it. UC1 is incremental, so `onboard_and_apply` gives `override=False` here. The PCE calls the re-enable under its lock, after a successful run (see [Failure & Rollback](#failure--rollback)). If `compute_and_apply` raises, `onboard_and_apply` calls `drop_bootstrap(client_id)` only when `bootstrapped` is true (a tool that this run bootstrapped), then re-raises the error (see [Tool discovery and the bootstrap CR](#tool-discovery-and-the-bootstrap-cr)).
 
@@ -114,18 +115,27 @@ The Orchestrator runs these checks **first**: after it reads the `Service` (step
 | Check | Reads | Passes when |
 |---|---|---|
 | #1 — the sidecar | the live pods of the service | Every live pod has the AuthBridge sidecar container `authbridge-proxy`. Without it, no OPA is in front of the service, and its CR has no effect. |
-| #2 — the pipeline | the ConfigMap `authbridge-runtime-config` in the service namespace (key `config.yaml`, `pipeline.inbound.plugins[].name`) | `opa` is in the inbound pipeline. For a tool, `mcp-parser` is also in it, because the tool's inbound package checks `input.mcp.params.name` (D26). Under agent side, `mcp-parser` and `opa` are also in the outbound pipeline (`pipeline.outbound.plugins[].name`), because the agent outbound package reads `input.mcp.method` and `input.mcp.params.name`. A missing ConfigMap fails the check. |
-| #6 — the probes | the live pods of the service | In every live pod, no app container (every container except `authbridge-proxy`) has an `httpGet` readiness, liveness or startup probe. A kubelet probe carries no identity. No request without identity passes a rules-based inbound package (D27), so an `httpGet` probe through the proxy fails. |
+| #2 — the pipeline | the ConfigMap `authbridge-runtime-config` in the service namespace (key `config.yaml`, `pipeline.inbound.plugins[].name`) | `jwt-validation` is in the inbound pipeline of every service, and `opa` is in the inbound pipeline of every agent and of a tool under target side. `jwt-validation` is the only plugin that validates the token and sets `input.identity`: without it, every rules-based package denies (D27), and under agent side a tool is open to every caller. For a tool under target side, `mcp-parser` is also in it, because the tool's inbound package checks `input.mcp.params.name` (D26). Under agent side, a tool needs only `jwt-validation` (its pass-through CR, D24, needs no `opa` and no `mcp-parser`). For an agent under agent side, `mcp-parser` and `opa` are also in the outbound pipeline (`pipeline.outbound.plugins[].name`), because the agent outbound package reads `input.mcp.method` and `input.mcp.params.name`. A tool needs no outbound plugin. A required plugin counts only when its entry enforces: `on_error: off` (cortex does not run the plugin) or `on_error: observe` (cortex ignores its Reject) fails the check. A missing ConfigMap fails the check. |
+| #6 — the probes | the live pods of the service | In every live pod, no app container (every container except `authbridge-proxy`) has an `httpGet` readiness, liveness or startup probe. A kubelet probe carries no identity. No request without identity passes a rules-based inbound package (D27), so an `httpGet` probe through the proxy fails. Not for a tool under agent side. |
 
-**Scope for each side.** Under target side, the checks run for every service, agent or tool. Under agent side, they run for agents only: a tool gets a pass-through CR, which needs no check (D24).
+**Scope for each side.**
 
-**The pods and the type.** The checks find the pods of the service, and its type (agent or tool), as `classify_service` does: the `client.name` split, the pod selection by `ownerReferences`, the `rossoctl.io/type` label, and the same bounded re-poll (`ONBOARD_LABEL_WAIT_*`). A pod or a label that is not there yet is a deploy→onboard race, not a failed check. A terminating pod (one with a `deletionTimestamp`) does not count. When the checks apply, a pod that fails #1 or #6 is also polled again in the same `ONBOARD_LABEL_WAIT_*` window, because the operator can still roll the pod onto the AuthBridge-injected template. When the budget ends, #1 and #6 report the labelled pods of the last look. If that look found no labelled pod, the result is a `502`, as in `classify_service`. A Kubernetes API failure is a `502`, as in Provision.
+| Side | Service | #1 sidecar | #2 inbound | #2 outbound | #6 probes |
+|---|---|---|---|---|---|
+| target side | agent | yes | `jwt-validation`, `opa` | none | yes |
+| target side | tool | yes | `jwt-validation`, `mcp-parser`, `opa` | none | yes |
+| agent side | agent | yes | `jwt-validation`, `opa` | `mcp-parser`, `opa` | yes |
+| agent side | tool | yes | `jwt-validation` | none | no |
+
+Under agent side a tool gets a pass-through CR (D24). Without the sidecar (#1) or without `jwt-validation` (#2), nothing checks the token, so the tool is open to every caller. #6 does not apply: the pass-through CR needs no identity, so a kubelet probe opens nothing (a probe on a path that `jwt-validation` does not bypass only keeps the pod not ready).
+
+**The pods and the type.** The checks find the pods of the service, and its type (agent or tool), as `classify_service` does: the `client.name` split, the pod selection by `ownerReferences`, the `rossoctl.io/type` label, and the same bounded re-poll (`ONBOARD_LABEL_WAIT_*`). A pod or a label that is not there yet is a deploy→onboard race, not a failed check. A terminating pod (one with a `deletionTimestamp`) does not count. A pod that fails #1, or #6 where it applies, is also polled again in the same `ONBOARD_LABEL_WAIT_*` window, because the operator can still roll the pod onto the AuthBridge-injected template. When the budget ends, #1 and #6 report the labelled pods of the last look. If that look found no labelled pod, the result is a `502`, as in `classify_service`. A Kubernetes API failure is a `502`, as in Provision.
 
 **A failed check.** The Orchestrator runs every check, then raises `EnforcementPreconditionError(failures)` if one or more checks failed. Each item of `failures` names one failed check. The error has these effects:
 
 - The Controller maps it to **HTTP 409**, with the body `{"detail": "…", "failed_checks": [...]}` (see [aiac-agent.md → Error Handling](../aiac-agent.md#error-handling)).
 - The NATS consumer treats it as **permanent**: it routes the message to the DLQ and calls `term()` at the first delivery (see [aiac-agent.md → Ack contract](../aiac-agent.md#ack-contract)).
-- It is **not** a rollback error. The checks run first, so nothing has changed yet: there is no rollback, no client disable and no quarantine. At a first onboarding the service then has no CR, so D20 denies it (fail closed). An onboarded service keeps its SPM and its CR, so it keeps its policy.
+- It is **not** a rollback error. The checks run first, so nothing has changed yet: there is no rollback, no client disable and no quarantine. At a first onboarding the service then has no CR, so D20 denies it (fail closed) where its inbound pipeline has `opa` (a tool under agent side can have no `opa`, see [PRD §6 → Known limits (enforcement)](../../PRD.md#6-rossoctl--keycloak--opa-interfaces)). An onboarded service keeps its SPM and its CR, so it keeps its policy.
 
 After a fix in the cluster, the operator starts the onboarding again (for example, `POST /apply/service/{service_id}`). The client stays enabled, so this works for an agent and for a tool (the known limit C5 applies only to a quarantined tool; see [Failure & Rollback](#failure--rollback)).
 
@@ -140,6 +150,16 @@ After a fix in the cluster, the operator starts the onboarding again (for exampl
 **Known limit — the probes and the open paths (D27).** Callees must use `tcpSocket` or `exec` probes (#6). Through the proxy, the A2A agent card and `/metrics` are also denied, because these requests carry no identity.
 
 **Known limit — #2 reads the namespace ConfigMap, not the pod.** The webhook copies the namespace pipeline into the pod configuration at pod CREATE only. A pod that was created before a change of `authbridge-runtime-config` can run an older pipeline, and #2 does not see this. Restart the pods after a pipeline change.
+
+### The login-client audience warning (agent side)
+
+Under agent side, a tool has a pass-through CR, so AIAC checks nothing on its inbound, and only `jwt-validation` (signature, issuer, `aud` = the tool's clientId) protects it. The operator links the scope `agent-<ns>-<workload>-aud` as a default scope to each client in its `PLATFORM_CLIENT_IDS` (default `rossoctl`). So a user token of such a login client has the tool's clientId in `aud`, passes the tool's `jwt-validation`, and gets to the tool with no AIAC check (a known limit, see [PRD §6 → Known limits (enforcement)](../../PRD.md#6-rossoctl--keycloak--opa-interfaces)).
+
+`warn_platform_tool_audiences` (`onboarding/platform_audience.py`) makes this visible. It calls `Configuration.get_platform_tool_audiences` (`GET /platform-clients/tool-audiences` of the IdP Configuration Service). That endpoint reads, for each login client of `PLATFORM_SOURCE_CLIENTS` (the same list as the D31 link), its default and optional client scopes and the mappers on the client itself. It lists each `oidc-audience-mapper` whose `included.client.audience` or `included.custom.audience` is the clientId of a managed tool (`client.type` = `Tool`) and that adds to the access token. The match uses the mapper config, not the scope name. The helper logs one WARNING for each item. The text names the login client, the scope (or "a protocol mapper on its own client"), the mapper and the tool, and tells that target side closes this. It also tells that a link removed by hand comes back at the next operator reconcile.
+
+- **Where it runs.** At a tool's onboarding, after the build (step 3b), for that tool only. At each Controller start, after the resync, for every tool (see [aiac-agent.md → Start sequence](../aiac-agent.md#start-sequence)). The start run catches a link that came after the onboarding.
+- **Only under agent side.** Under target side the helper does nothing (no IdP read). The tool inbound OPA has no platform-client bypass and needs both the user gate and the calling-agent gate, so the link grants nothing. The operator makes the link for every tool when its `PLATFORM_CLIENT_IDS` names the login client, so a warning there is only noise.
+- **Best effort.** A failure (an IdP error after the retries, an unset `KEYCLOAK_REALM`, an unknown side) is logged as one WARNING ("cannot read the audience scopes …"). It never fails the onboarding or the start, it is not in `failed_checks`, and it does not drop the bootstrap CR. The warning refuses nothing.
 
 ## Tool discovery and the bootstrap CR
 
@@ -417,6 +437,7 @@ src/aiac/agent/uc/
     ├── __init__.py
     ├── orchestrator.py
     ├── preconditions.py  ← check_preconditions(service) → ServiceType (D30: #1, #2, #6); EnforcementPreconditionError
+    ├── platform_audience.py  ← warn_platform_tool_audiences (the login-client audience warning, D30, agent side, log only)
     ├── provision/
     │   ├── __init__.py
     │   ├── graph.py      ← build_provision_graph() (non-LLM StateGraph)

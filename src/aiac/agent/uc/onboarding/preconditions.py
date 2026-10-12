@@ -7,22 +7,30 @@ focus service can enforce its CR:
 - **#1 — the sidecar:** every pod of the service has the AuthBridge sidecar container
   ``authbridge-proxy``. Without it, no OPA is in front of the service, and its CR has no effect.
 - **#2 — the pipeline:** the namespace ConfigMap ``authbridge-runtime-config`` (key
-  ``config.yaml``, ``pipeline.inbound.plugins[].name``) has ``opa`` in the inbound pipeline, and
-  also ``mcp-parser`` for a tool (the tool's inbound package checks ``input.mcp.params.name``).
-  Under agent side, ``mcp-parser`` and ``opa`` must also be in the outbound pipeline
-  (``pipeline.outbound.plugins[].name``), because the agent's outbound checks its calls to tools
-  (its package reads ``input.mcp.method`` and ``input.mcp.params.name``).
-  A missing ConfigMap fails the check. One #2 failure names each missing plugin.
+  ``config.yaml``, ``pipeline.inbound.plugins[].name``) has ``jwt-validation`` in the inbound
+  pipeline of every service (it is the only plugin that validates the token and sets
+  ``input.identity``), ``opa`` in the inbound pipeline of every agent and of a tool under target
+  side, and also ``mcp-parser`` for a tool under target side (the tool's inbound package checks
+  ``input.mcp.params.name``). Under agent side a tool needs only
+  ``jwt-validation`` (its pass-through CR, D24, needs no ``opa`` and no ``mcp-parser``, but without
+  ``jwt-validation`` the tool is open to every caller). Under agent side, ``mcp-parser`` and ``opa``
+  must also be in the outbound pipeline of an agent (``pipeline.outbound.plugins[].name``), because
+  the agent's outbound checks its calls to tools (its package reads ``input.mcp.method`` and
+  ``input.mcp.params.name``). A required plugin counts only if its entry enforces: an entry with
+  ``on_error: off`` (cortex takes the plugin out of the running pipeline) or ``on_error: observe``
+  (cortex turns its Reject into a pass-through) fails the check. A missing ConfigMap fails the
+  check. One #2 failure names each missing or not-enforcing plugin.
 - **#6 — the probes:** no app container (every container except ``authbridge-proxy``) has an
   ``httpGet`` readiness, liveness or startup probe. A kubelet probe carries no identity, and no
   request without identity passes a rules-based inbound package (D27).
 
 **Scope for each side (D30).** The checks read the enforcement side with the PCE
-``enforcement_side()``, once per onboarding. Under target side they run for every service, agent or
-tool. Under agent side they run for agents only: a tool gets a pass-through CR (D24), which needs no
-check, so a tool gets no #1, #2 or #6 failure (and its pipeline ConfigMap is not read). The type of
-a tool is still read from its pod label, because the Orchestrator needs it for the bootstrap of the
-tool's CR (the catalog type is not set before Provision).
+``enforcement_side()``, once per onboarding. #1 and #2 run for every service, agent or tool, under
+both sides (#2 needs other plugins for each side and type, see above). #6 runs for every service
+under target side, and for agents only under agent side: a tool then gets a pass-through CR (D24),
+which needs no identity, so a kubelet probe opens nothing. The type is read from the pod label,
+because the Orchestrator needs it for the bootstrap of a tool's CR (the catalog type is not set
+before Provision).
 
 The checks find the pods of the service and its type as Provision's ``classify_service`` does: the
 ``client.name`` split, the pod selection by ``ownerReferences``, the ``rossoctl.io/type`` label and
@@ -30,8 +38,7 @@ the same bounded re-poll (``ONBOARD_LABEL_WAIT_*``). A pod or a label that is no
 deploy->onboard race, not a failed check: an exhausted wait is ``HTTPException(502)``, as in
 Provision. A pod that fails #1 or #6 is re-polled in the same window too, because the operator can
 still roll the workload onto the AuthBridge-injected template (an old pod without the sidecar is
-then still there); a terminating pod is not checked. When the checks do not apply (a tool under
-agent side), the first labelled pod ends the poll. A Kubernetes API failure is a ``502``.
+then still there); a terminating pod is not checked. A Kubernetes API failure is a ``502``.
 
 A failed check raises :class:`EnforcementPreconditionError`, which names each failed check.
 """
@@ -70,30 +77,29 @@ class EnforcementPreconditionError(Exception):
 def check_preconditions(service: Service) -> ServiceType:
     """Run the checks #1, #2 and #6 on ``service`` and return its type (from the pod label).
 
-    The side is read once (``enforcement_side()``; an unknown value raises ``ValueError``). Under
-    agent side a tool gets no check (its pass-through CR needs none), but its type is still read.
-    Every check that applies runs; if one or more fail, raise one
+    The side is read once (``enforcement_side()``; an unknown value raises ``ValueError``). #1 and
+    #2 run for every service; #6 only where it applies (:func:`_probes_apply`: not for a tool under
+    agent side). Every check that applies runs; if one or more fail, raise one
     :class:`EnforcementPreconditionError` that names each failed check (in the order #1, #2, #6).
     The type is returned because the caller needs it before Provision (the catalog type is not set
     yet)."""
     side = enforcement_side()
     namespace, workload = split_client_name(service.id, service.name)
     service_type, pods = _await_pods(namespace, workload, side)
-    if not _checks_apply(side, service_type):
-        return service_type
     failures = [
         *_check_sidecar(pods, namespace),
         *_check_pipeline(namespace, service_type, side),
-        *_check_probes(pods),
+        *(_check_probes(pods) if _probes_apply(side, service_type) else []),
     ]
     if failures:
         raise EnforcementPreconditionError(failures)
     return service_type
 
 
-def _checks_apply(side: EnforcementSide, service_type: ServiceType) -> bool:
-    """The scope of the checks (D30): every service under target side, agents only under agent side
-    (a tool gets a pass-through CR, which needs no check)."""
+def _probes_apply(side: EnforcementSide, service_type: ServiceType) -> bool:
+    """#6 applies to every service under target side, and to agents only under agent side. A tool then
+    has a pass-through CR (D24), which needs no identity, so a probe opens nothing; a probe on a path
+    that ``jwt-validation`` does not bypass only keeps the pod not ready."""
     return side is EnforcementSide.TARGET_SIDE or service_type is ServiceType.AGENT
 
 
@@ -101,13 +107,13 @@ def _await_pods(namespace: str, workload: str, side: EnforcementSide) -> tuple[S
     """The type and the live (not terminating) pods of ``workload``, with Provision's bounded
     re-poll (:func:`await_labelled_pods`).
 
-    The poll ends early when a labelled pod is there and, if the checks apply to the type (see
-    :func:`_checks_apply`), every pod passes #1 and #6. When the budget ends, the last-seen pods are
+    The poll ends early when a labelled pod is there and every pod passes #1 and, where it applies
+    (:func:`_probes_apply`), #6. When the budget ends, the last-seen pods are
     returned (so #1 / #6 report them), or, if no labelled pod was seen at the last look,
     ``HTTPException(502)`` (as ``classify_service``)."""
 
     def _settled(service_type: ServiceType, pods: list) -> bool:
-        return not _checks_apply(side, service_type) or not (_check_sidecar(pods, namespace) or _check_probes(pods))
+        return not (_check_sidecar(pods, namespace) or (_probes_apply(side, service_type) and _check_probes(pods)))
 
     return await_labelled_pods(namespace, workload, _settled)
 
@@ -142,32 +148,63 @@ def _check_probes(pods) -> list[str]:
     return [f"#6 probes: httpGet probes on app containers: {'; '.join(found)} (use tcpSocket or exec probes)"]
 
 
-def _required_inbound_plugins(service_type: ServiceType) -> list[str]:
-    """The plugins #2 needs in the inbound pipeline: ``opa``, and also ``mcp-parser`` for a tool."""
-    return ["mcp-parser", "opa"] if service_type is ServiceType.TOOL else ["opa"]
+def _required_inbound_plugins(service_type: ServiceType, side: EnforcementSide) -> list[str]:
+    """The plugins #2 needs in the inbound pipeline. Every service needs ``jwt-validation``: it is the only
+    plugin that validates the token and sets ``input.identity``. Without it, every rules-based package
+    denies (D27), and under agent side a tool (pass-through CR) is open to every caller. ``opa`` for
+    every service except a tool under agent side (its pass-through CR, D24), and also ``mcp-parser`` for
+    a tool under target side (the tool's inbound package checks ``input.mcp.params.name``)."""
+    if service_type is ServiceType.AGENT:
+        return ["jwt-validation", "opa"]
+    if side is EnforcementSide.AGENT_SIDE:
+        return ["jwt-validation"]
+    return ["jwt-validation", "mcp-parser", "opa"]
 
 
-def _required_outbound_plugins(side: EnforcementSide) -> list[str]:
-    """The plugins #2 needs in the outbound pipeline: ``mcp-parser`` and ``opa`` under agent side (the
-    agent's outbound checks its calls to tools, and its Rego reads ``input.mcp.method`` and
+def _required_outbound_plugins(service_type: ServiceType, side: EnforcementSide) -> list[str]:
+    """The plugins #2 needs in the outbound pipeline: ``mcp-parser`` and ``opa`` for an agent under agent
+    side (the agent's outbound checks its calls to tools, and its Rego reads ``input.mcp.method`` and
     ``input.mcp.params.name``, which ``mcp-parser`` sets), none under target side (every outbound is
-    a pass-through, D24)."""
-    return ["mcp-parser", "opa"] if side is EnforcementSide.AGENT_SIDE else []
+    a pass-through, D24), and none for a tool (its outbound is a pass-through under both sides, D24)."""
+    return ["mcp-parser", "opa"] if side is EnforcementSide.AGENT_SIDE and service_type is ServiceType.AGENT else []
 
 
-def _plugin_names(config, direction: str) -> set | None:
-    """The plugin names of ``pipeline.<direction>.plugins`` in ``config``, or ``None`` if that list
-    cannot be read."""
+def _on_error(entry: dict) -> str:
+    """The ``on_error`` (cortex ErrorPolicy) of a plugin entry, with the default ``enforce``. An
+    unquoted ``off`` is YAML 1.1 false for PyYAML, but cortex (yaml.v3) reads it as ``off``."""
+    value = entry.get("on_error")
+    if value is None or value == "":
+        return "enforce"
+    if value is False:
+        return "off"
+    return str(value)
+
+
+def _plugin_policies(config, direction: str) -> dict[str, str] | None:
+    """The plugins of ``pipeline.<direction>.plugins`` in ``config``, as name -> ``on_error``, or
+    ``None`` if that list cannot be read. An entry is a map or a bare name (cortex reads a bare name
+    as ``{name: <name>}``, so ``enforce``). If a name has more than one entry, an ``enforce`` one wins."""
     try:
         plugins = config["pipeline"][direction]["plugins"] or []
-        return {p.get("name") for p in plugins if isinstance(p, dict)}
+        policies: dict[str, str] = {}
+        for p in plugins:
+            if isinstance(p, str):
+                name, policy = p, "enforce"
+            elif isinstance(p, dict) and isinstance(p.get("name"), str):
+                name, policy = p["name"], _on_error(p)
+            else:
+                continue
+            if policies.get(name) != "enforce":
+                policies[name] = policy
+        return policies
     except (KeyError, TypeError, AttributeError):
         return None
 
 
 def _check_pipeline(namespace: str, service_type: ServiceType, side: EnforcementSide) -> list[str]:
     """#2: the namespace pipeline (``authbridge-runtime-config``) has the required inbound plugins,
-    and under agent side also the required outbound plugins. One failure names every problem."""
+    and for an agent under agent side also the required outbound plugins, each with an enforcing
+    ``on_error``. One failure names every problem."""
     where = f"ConfigMap {PIPELINE_CONFIGMAP!r} in namespace {namespace!r}"
     try:
         configmap = read_configmap(PIPELINE_CONFIGMAP, namespace)
@@ -180,21 +217,29 @@ def _check_pipeline(namespace: str, service_type: ServiceType, side: Enforcement
     except (yaml.YAMLError, AttributeError):
         config = None
     kind = "an agent" if service_type is ServiceType.AGENT else "a tool"
+    reason = f"needed for {kind} under {side.value.replace('-', ' ')}"
     required = {
-        "inbound": (_required_inbound_plugins(service_type), f"needed for {kind}"),
-        "outbound": (_required_outbound_plugins(side), f"needed for {kind} under agent side"),
+        "inbound": _required_inbound_plugins(service_type, side),
+        "outbound": _required_outbound_plugins(service_type, side),
     }
     problems = []
-    for direction, (plugins, reason) in required.items():
+    for direction, plugins in required.items():
         if not plugins:
             continue
-        names = _plugin_names(config, direction)
-        if names is None:
+        policies = _plugin_policies(config, direction)
+        if policies is None:
             problems.append(f"no readable pipeline.{direction}.plugins in {PIPELINE_CONFIG_KEY!r}")
             continue
-        missing = [name for name in plugins if name not in names]
+        missing = [name for name in plugins if name not in policies]
         if missing:
             problems.append(f"the {direction} pipeline has no {', '.join(repr(n) for n in missing)} plugin ({reason})")
+        # `off` takes the plugin out of the running pipeline, and `observe` turns its Reject into a
+        # pass-through: such an entry is there, but it does not enforce.
+        problems += [
+            f"the {direction} plugin {name!r} has on_error={policies[name]!r}, so it does not enforce ({reason})"
+            for name in plugins
+            if name in policies and policies[name] != "enforce"
+        ]
     if not problems:
         return []
     return [f"#2 pipeline: {where}: " + "; ".join(problems)]
