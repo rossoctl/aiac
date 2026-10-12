@@ -325,8 +325,10 @@ the onboarding checks #1 and #2 (D30) run for every service (a tool needs only
 `mcp-parser` and `opa` in the outbound pipeline of an agent. The overlay of
 [Enable](#enable) has them. Under agent side the Controller also logs a warning
 for each tool whose audience scope a platform login client holds, at the
-tool's onboarding and at each start. The operator makes this link by default,
-so expect one warning for each tool (see the PRD known limits).
+tool's onboarding and at each start. The operator makes this link for every
+tool only when its `PLATFORM_CLIENT_IDS` names the login client. On the Kind
+setup it is unset, so expect no warning; with it set, expect one warning for
+each tool (see the PRD known limits).
 
 Then onboard each service again. A service whose Keycloak client exists gets no
 new registration event, so start its onboarding by hand
