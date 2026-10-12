@@ -15,7 +15,8 @@ Controller start (after the resync).
 
 Under target side it does nothing: the tool's inbound OPA has no platform-client bypass and needs
 both the user gate and the calling-agent gate, so such a link grants nothing there. The operator
-makes the link for every tool by default, so a warning under target side would only be noise.
+makes the link for every tool when its ``PLATFORM_CLIENT_IDS`` names the login client, so a warning
+under target side would only be noise.
 
 Best effort: a failure (the IdP, an unset realm, an unknown side) is logged as one WARNING and is
 never raised, so it cannot fail the onboarding or the start. It refuses nothing.
