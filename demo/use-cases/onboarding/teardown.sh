@@ -356,7 +356,7 @@ Everything else is untouched, by design — this was an uninstall of AIAC, not a
   - the Keycloak SPI listener + derived image are still installed
   - the OPA pipeline overlay is still wired
 
-Reinstall AIAC with: ./enable.sh        (demo.md Part 1)
+Reinstall AIAC with: ./enable.sh        (demo.md Part 2)
 Full post-install reset instead:  ./teardown.sh
 EOF
   exit 0
@@ -395,7 +395,7 @@ Still in place, by design (platform state this demo does not own):
     these — so any source change you made since would not reach the cluster. Use --rebuild below.
 $([ "$DO_OPA" -eq 0 ] && printf '%s' "  - the OPA pipeline overlay in ${NS} — re-run with --include-opa to revert it.")
 
-To stand the demo back up: see demo.md, Part 1.
+To stand the demo back up: see demo.md, Part 2 (Part 1 first if you passed --include-opa).
   ./enable.sh --rebuild     # rebuild the four stack images from current source, then install
   ./enable.sh               # reuse the images already built (faster; no source change since)
 EOF

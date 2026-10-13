@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# enable.sh — Part 1 of demo.md: turn on the infra this demo needs before the live trigger can fire:
+# enable.sh — Part 2 of demo.md (after `make opa`): turn on the infra this demo needs before the live trigger can fire:
 #   1. the AIAC stack itself (aiac-agent, aiac-interface, policy-model-store, pdp-interface)
 #   2. the NATS event broker
 #   3. the Keycloak Event-Listener SPI (built + installed into the live Keycloak pod)
@@ -180,7 +180,7 @@ step_stack() {
   #
   # `make users` (init/03-setup.py's ensure_agent_policy) writes the same ConfigMap from the same
   # constant. The overlap is deliberate and cannot drift: both are idempotent and both read
-  # lib/scenario.py. This script keeps doing it so Part 1 stands alone, before any make target runs.
+  # lib/scenario.py. This script keeps doing it so Part 2 stands alone, before any make target runs.
   echo "==> [stack] Provisioning scenario policy ConfigMap '${POLICY_CONFIGMAP}' (policy.md)"
   local scenario_lib="$SCRIPT_DIR/lib" policy_md
   policy_md="$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import scenario; sys.stdout.write(scenario.POLICY_ABSTRACT)' "$scenario_lib")"
@@ -210,7 +210,7 @@ step_stack() {
 # Split out of step_stack on purpose. aiac-agent's `aiac-init` container waits for NATS at
 # aiac-event-broker-service:4222, which step_broker only deploys afterwards — so waiting inside
 # step_stack could never succeed on a clean install, and `set -e` turned that timeout into an
-# abort that skipped the broker AND the SPI, leaving Part 1 a third done. Waiting here, after
+# abort that skipped the broker AND the SPI, leaving Part 2 a third done. Waiting here, after
 # the broker, matches the real dependency order.
 step_wait_agent() {
   # --stack-only skips step_broker, so the broker may legitimately not exist yet. Waiting then would

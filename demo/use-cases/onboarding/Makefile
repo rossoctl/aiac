@@ -121,12 +121,12 @@ demo: init onboard run  ## Full narrated walkthrough: init -> onboard -> run
 # (`make opa`, a one-time cluster change owned by k8s/, not by this demo) between `enable` and
 # `e2e`, and driver.sh's preflight fails loudly with that exact instruction if it isn't.
 
-enable:  ## Part 1: install the AIAC stack + NATS broker + Keycloak SPI listener
+enable:  ## Part 2: install the AIAC stack + NATS broker + Keycloak SPI listener
 	./enable.sh
 
 # The k8s/ scripts resolve OPERATOR_DIR / ROSSOCTL_DIR / CORTEX_DIR from their own location
 # (sibling clones of aiac/), so running them from here needs no cd; exported overrides pass through.
-opa:  ## Part 2: wire the OPA plugin + parsers into both AuthBridge legs (k8s/opa-kind-enable.sh)
+opa:  ## Part 1: wire the OPA plugin + parsers into both AuthBridge legs (k8s/opa-kind-enable.sh)
 	$(AIAC_ROOT)/k8s/opa-kind-enable.sh
 
 opa-restore:  ## Revert `make opa`: restore the original AuthBridge pipeline (k8s/opa-kind-restore.sh)
