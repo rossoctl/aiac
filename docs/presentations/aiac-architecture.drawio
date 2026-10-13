@@ -1,0 +1,133 @@
+<mxfile host="app.diagrams.net">
+  <diagram id="aiac-architecture" name="AIAC architecture">
+    <mxGraphModel dx="2416" dy="938" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1100" pageHeight="1100" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="t1bg" parent="1" style="rounded=1;arcSize=6;html=1;fillColor=#fff5f5;strokeColor=#7f1d1d;strokeWidth=2.5;" value="" vertex="1">
+          <mxGeometry height="560" width="614" x="16" y="44" as="geometry" />
+        </mxCell>
+        <mxCell id="t1title" parent="1" style="text;html=1;align=center;verticalAlign=middle;fontSize=14;fontStyle=1;fontColor=#7f1d1d;" value="Translation time — on each change of the policy, a role, or the set of workloads" vertex="1">
+          <mxGeometry height="24" width="848" x="16" y="16" as="geometry" />
+        </mxCell>
+        <mxCell id="t2bg" parent="1" style="rounded=1;arcSize=6;html=1;fillColor=#fff5f5;strokeColor=#7f1d1d;strokeWidth=2.5;" value="" vertex="1">
+          <mxGeometry height="234" width="848" x="16" y="660" as="geometry" />
+        </mxCell>
+        <mxCell id="t2title" parent="1" style="text;html=1;align=center;verticalAlign=middle;fontSize=14;fontStyle=1;fontColor=#7f1d1d;" value="Request time — on each call. No model runs here." vertex="1">
+          <mxGeometry height="24" width="848" x="16" y="632" as="geometry" />
+        </mxCell>
+        <mxCell id="kcapi" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fee2e2;strokeColor=#ef4444;fontColor=#7f1d1d;fontSize=11;" value="&lt;b&gt;Keycloak Admin API&lt;/b&gt;&lt;br&gt;&lt;font style=&#39;font-size:9px&#39;&gt;users · roles · clients&lt;/font&gt;" vertex="1">
+          <mxGeometry height="54" width="176" x="190" y="58" as="geometry" />
+        </mxCell>
+        <mxCell id="k8sapi" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fee2e2;strokeColor=#ef4444;fontColor=#7f1d1d;fontSize=11;" value="&lt;b&gt;Kubernetes API&lt;/b&gt;&lt;br&gt;&lt;font style=&#39;font-size:9px&#39;&gt;AuthorizationPolicy CR&lt;/font&gt;" vertex="1">
+          <mxGeometry height="54" width="208" x="700" y="58" as="geometry" />
+        </mxCell>
+        <mxCell id="spi" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fee2e2;strokeColor=#ef4444;fontColor=#7f1d1d;fontSize=10;" value="&lt;b&gt;Keycloak SPI listener&lt;/b&gt;&lt;br&gt;&lt;font style=&#39;font-size:9px&#39;&gt;publishes on change&lt;/font&gt;" vertex="1">
+          <mxGeometry height="54" width="160" x="50" y="58" as="geometry" />
+        </mxCell>
+        <mxCell id="brokerpod" parent="1" style="rounded=1;arcSize=8;html=1;dashed=1;dashPattern=5 4;fillColor=#ffffff;strokeColor=#b91c1c;fontColor=#991b1b;fontSize=10;fontStyle=1;verticalAlign=top;container=1;collapsible=0;" value="Event Broker Pod" vertex="1">
+          <mxGeometry height="96" width="160" x="36" y="246" as="geometry" />
+        </mxCell>
+        <mxCell id="nats" parent="brokerpod" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fee2e2;strokeColor=#ef4444;fontColor=#7f1d1d;fontSize=9;" value="&lt;b&gt;NATS JetStream&lt;/b&gt;&lt;br&gt;&lt;font style=&#39;font-size:9px&#39;&gt;aiac.apply.&amp;gt;&lt;/font&gt;" vertex="1">
+          <mxGeometry height="52" width="132" x="14" y="30" as="geometry" />
+        </mxCell>
+        <mxCell id="cfgmap" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fee2e2;strokeColor=#ef4444;fontColor=#7f1d1d;fontSize=10;" value="&lt;b&gt;aiac-policy&lt;br&gt;ConfigMap&lt;/b&gt;&lt;br&gt;&lt;font style=&#39;font-size:9px&#39;&gt;/etc/aiac/policy.md&lt;/font&gt;&lt;br&gt;&lt;i&gt;&lt;font style=&#39;font-size:8px&#39;&gt;read whole, each time&lt;/font&gt;&lt;/i&gt;" vertex="1">
+          <mxGeometry height="84" width="160" x="36" y="372" as="geometry" />
+        </mxCell>
+        <mxCell id="ifacepod" parent="1" style="rounded=1;arcSize=8;html=1;dashed=1;dashPattern=5 4;fillColor=#ffffff;strokeColor=#b91c1c;fontColor=#991b1b;fontSize=12;fontStyle=1;verticalAlign=top;container=1;collapsible=0;" value="Rossoctl Interface Pod" vertex="1">
+          <mxGeometry height="120" width="400" x="220" y="152" as="geometry" />
+        </mxCell>
+        <mxCell id="idp" parent="ifacepod" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fee2e2;strokeColor=#ef4444;fontColor=#7f1d1d;fontSize=10;" value="&lt;b&gt;IdP Configuration&lt;br&gt;Service :7071&lt;/b&gt;&lt;br&gt;&lt;font style=&#39;font-size:8px&#39;&gt;roles · scopes · clients&lt;/font&gt;" vertex="1">
+          <mxGeometry height="70" width="170" x="14" y="36" as="geometry" />
+        </mxCell>
+        <mxCell id="pdp" parent="ifacepod" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fee2e2;strokeColor=#ef4444;fontColor=#7f1d1d;fontSize=10;" value="&lt;b&gt;PDP Policy Writer&lt;br&gt;(OPA) :7072&lt;/b&gt;&lt;br&gt;&lt;font style=&#39;font-size:8px&#39;&gt;renders the Rego&lt;/font&gt;" vertex="1">
+          <mxGeometry height="70" width="170" x="216" y="36" as="geometry" />
+        </mxCell>
+        <mxCell id="agentpod" parent="1" style="rounded=1;arcSize=8;html=1;dashed=1;dashPattern=5 4;fillColor=#ffffff;strokeColor=#b91c1c;fontColor=#991b1b;fontSize=12;fontStyle=1;verticalAlign=top;container=1;collapsible=0;" value="Agent Pod" vertex="1">
+          <mxGeometry height="186" width="400" x="220" y="302" as="geometry" />
+        </mxCell>
+        <mxCell id="aiacagent" parent="agentpod" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#991b1b;strokeColor=none;fontColor=#ffffff;fontSize=12;" value="&lt;b&gt;AIAC Agent&lt;/b&gt;&lt;br&gt;&lt;font color=&#39;#ffe4e6&#39; style=&#39;font-size:9px&#39;&gt;├ whole policy file&lt;br&gt;├ roles + scopes&lt;br&gt;├ model proposes&lt;br&gt;└ 2nd pass audits&lt;br&gt;&lt;i&gt;conflict → 422, nothing changes&lt;/i&gt;&lt;/font&gt;" vertex="1">
+          <mxGeometry height="132" width="170" x="14" y="36" as="geometry" />
+        </mxCell>
+        <mxCell id="pce" parent="agentpod" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fee2e2;strokeColor=#ef4444;fontColor=#7f1d1d;fontSize=10;" value="&lt;b&gt;Policy Computation Engine&lt;/b&gt;&lt;br&gt;&lt;font style=&#39;font-size:9px&#39;&gt;library, in-process&lt;br&gt;merges the rules into the model&lt;br&gt;&lt;i&gt;no pod of its own&lt;/i&gt;&lt;/font&gt;" vertex="1">
+          <mxGeometry height="132" width="170" x="216" y="36" as="geometry" />
+        </mxCell>
+        <mxCell id="llm" parent="1" style="rounded=1;arcSize=10;whiteSpace=wrap;html=1;fillColor=#fca5a5;strokeColor=#b91c1c;strokeWidth=2;fontColor=#7f1d1d;fontSize=11;" value="&lt;b&gt;LLM endpoint&lt;/b&gt;&lt;br&gt;&lt;font style=&#39;font-size:9px&#39;&gt;OpenAI-compatible&lt;/font&gt;&lt;br&gt;&lt;i&gt;&lt;font style=&#39;font-size:9px&#39;&gt;propose · audit&lt;/font&gt;&lt;/i&gt;" vertex="1">
+          <mxGeometry height="76" width="170" x="234" y="516" as="geometry" />
+        </mxCell>
+        <mxCell id="pmspod" parent="1" style="rounded=1;arcSize=8;html=1;dashed=1;dashPattern=5 4;fillColor=#ffffff;strokeColor=#b91c1c;fontColor=#991b1b;fontSize=9;fontStyle=1;verticalAlign=top;container=1;collapsible=0;" value="Policy Model Store Pod" vertex="1">
+          <mxGeometry height="80" width="170" x="436" y="516" as="geometry" />
+        </mxCell>
+        <mxCell id="pms" parent="pmspod" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fee2e2;strokeColor=#ef4444;fontColor=#7f1d1d;fontSize=9;" value="&lt;b&gt;Policy Model Store&lt;/b&gt;&lt;br&gt;&lt;font style=&#39;font-size:8px&#39;&gt;SQLite policy.db&lt;/font&gt;" vertex="1">
+          <mxGeometry height="46" width="146" x="12" y="26" as="geometry" />
+        </mxCell>
+        <mxCell id="bundle" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fee2e2;strokeColor=#ef4444;fontColor=#7f1d1d;fontSize=12;" value="&lt;b&gt;bundle-service&lt;/b&gt;&lt;br&gt;&lt;font style=&#39;font-size:9px&#39;&gt;composes one bundle per pod&lt;/font&gt;" vertex="1">
+          <mxGeometry height="80" width="208" x="700" y="302" as="geometry" />
+        </mxCell>
+        <mxCell id="caller" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fee2e2;strokeColor=#ef4444;fontColor=#7f1d1d;fontSize=13;" value="&lt;b&gt;caller&lt;/b&gt;&lt;br&gt;&lt;font style=&#39;font-size:10px&#39;&gt;(user or agent)&lt;/font&gt;" vertex="1">
+          <mxGeometry height="64" width="136" x="36" y="750" as="geometry" />
+        </mxCell>
+        <mxCell id="gatepod" parent="1" style="rounded=1;arcSize=8;html=1;dashed=1;dashPattern=5 4;fillColor=#ffffff;strokeColor=#b91c1c;fontColor=#991b1b;fontSize=13;fontStyle=1;verticalAlign=top;container=1;collapsible=0;" value="agent pod — AuthBridge gate" vertex="1">
+          <mxGeometry height="190" width="330" x="196" y="684" as="geometry" />
+        </mxCell>
+        <mxCell id="opaplugin" parent="gatepod" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#991b1b;strokeColor=none;fontColor=#ffffff;fontSize=13;" value="&lt;b&gt;opa plugin&lt;/b&gt;&lt;br&gt;&lt;font color=&#39;#ffe4e6&#39; style=&#39;font-size:10px&#39;&gt;inbound chain + outbound chain&lt;/font&gt;" vertex="1">
+          <mxGeometry height="64" width="282" x="24" y="40" as="geometry" />
+        </mxCell>
+        <mxCell id="agentcontainer" parent="gatepod" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fee2e2;strokeColor=#ef4444;fontColor=#7f1d1d;fontSize=12;" value="&lt;b&gt;agent container (your code)&lt;/b&gt;" vertex="1">
+          <mxGeometry height="52" width="282" x="24" y="124" as="geometry" />
+        </mxCell>
+        <mxCell id="opa" parent="1" style="rounded=1;arcSize=10;whiteSpace=wrap;html=1;fillColor=#fca5a5;strokeColor=#b91c1c;strokeWidth=2;fontColor=#7f1d1d;" value="&lt;b&gt;&lt;font style=&#39;font-size:15px&#39;&gt;OPA&lt;/font&gt;&lt;/b&gt;&lt;br&gt;&lt;font style=&#39;font-size:11px&#39;&gt;evaluates the Rego bundle&lt;/font&gt;&lt;br&gt;&lt;i&gt;&lt;font style=&#39;font-size:10px&#39;&gt;allow, or 403 policy.forbidden&lt;/font&gt;&lt;/i&gt;" vertex="1">
+          <mxGeometry height="92" width="280" x="566" y="704" as="geometry" />
+        </mxCell>
+        <mxCell id="e1" edge="1" parent="1" source="spi" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#b91c1c;strokeWidth=2;endArrow=block;endFill=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" target="nats">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e2" edge="1" parent="1" source="nats" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#b91c1c;strokeWidth=2;endArrow=block;endFill=1;fontColor=#7f1d1d;fontSize=9;exitX=1;exitY=0.5;entryX=0;entryY=0.25;" target="aiacagent" value="event">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e3" edge="1" parent="1" source="cfgmap" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#b91c1c;strokeWidth=2;endArrow=block;endFill=1;fontColor=#7f1d1d;fontSize=9;exitX=1;exitY=0.5;entryX=0;entryY=0.6;" target="aiacagent" value="policy">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e4" edge="1" parent="1" source="aiacagent" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#b91c1c;strokeWidth=2;endArrow=block;endFill=1;fontColor=#7f1d1d;fontSize=9;exitX=0.5;exitY=0;entryX=0.5;entryY=1;" target="idp" value="reads">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e5" edge="1" parent="1" source="pce" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#b91c1c;strokeWidth=2;endArrow=block;endFill=1;fontColor=#7f1d1d;fontSize=9;exitX=0.5;exitY=0;entryX=0.5;entryY=1;" target="pdp" value="applies">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e6" edge="1" parent="1" source="idp" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#b91c1c;strokeWidth=2;endArrow=block;endFill=1;fontColor=#7f1d1d;fontSize=8;exitX=0.5;exitY=0;entryX=0.5;entryY=1;" target="kcapi" value="admin REST">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e7" edge="1" parent="1" source="pdp" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#b91c1c;strokeWidth=2;endArrow=block;endFill=1;fontColor=#7f1d1d;fontSize=8;exitX=0.5;exitY=0;entryX=0.5;entryY=1;" target="k8sapi" value="writes the CR">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e8" edge="1" parent="1" source="aiacagent" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#b91c1c;strokeWidth=2;endArrow=block;endFill=1;exitX=0.4;exitY=1;entryX=0.4;entryY=0;" target="llm">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e9" edge="1" parent="1" source="llm" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#b91c1c;strokeWidth=2;endArrow=block;endFill=1;dashed=1;dashPattern=6 4;exitX=0.6;exitY=0;entryX=0.6;entryY=1;" target="aiacagent">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e10" edge="1" parent="1" source="pce" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#b91c1c;strokeWidth=2;endArrow=block;endFill=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" target="pms">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e11" edge="1" parent="1" source="k8sapi" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#b91c1c;strokeWidth=2;endArrow=block;endFill=1;fontColor=#7f1d1d;fontSize=9;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" target="bundle" value="reads the Rego">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e12" edge="1" parent="1" source="bundle" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#b91c1c;strokeWidth=2;endArrow=block;endFill=1;fontColor=#7f1d1d;fontSize=9;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" target="opa" value="polls the bundle">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e13" edge="1" parent="1" source="caller" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#b91c1c;strokeWidth=2;endArrow=block;endFill=1;fontColor=#7f1d1d;fontSize=9;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" target="opaplugin" value="call">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e14" edge="1" parent="1" source="opaplugin" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#b91c1c;strokeWidth=2;endArrow=block;endFill=1;fontColor=#7f1d1d;fontSize=9;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" target="agentcontainer" value="allow">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e15" edge="1" parent="1" source="opaplugin" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#b91c1c;strokeWidth=2;endArrow=block;endFill=1;fontColor=#7f1d1d;fontSize=9;exitX=1;exitY=0.25;entryX=0;entryY=0.3;" target="opa" value="ask">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e16" edge="1" parent="1" source="opa" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#b91c1c;strokeWidth=2;endArrow=block;endFill=1;dashed=1;dashPattern=6 4;fontColor=#7f1d1d;fontSize=9;exitX=0;exitY=0.7;entryX=1;entryY=0.75;" target="opaplugin" value="answer">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
