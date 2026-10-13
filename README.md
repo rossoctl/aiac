@@ -101,14 +101,18 @@ proves two claims:
 Prerequisites: a Kind cluster named `rossoctl` with the rossoctl platform (SPIRE, Keycloak, the
 operator), the `team1` namespace, sibling clones of `rossoctl/operator`, `rossoctl/rossoctl` and
 `rossoctl/cortex`, and two secrets (`team1/openai-secret` and `aiac-system/keycloak-admin-secret`).
-Then, from that directory:
+Then, from that directory, in this order — the AIAC Controller does not start until `make opa` has
+applied the changed combiner:
 
 ```bash
+make opa        # wire the OPA plugin into both AuthBridge legs, apply the combiner (one-time)
 make enable     # install the AIAC stack, NATS broker, Keycloak SPI listener
-make opa        # wire the OPA plugin into both AuthBridge legs (one-time)
 make users      # create the demo users and roles, mount policy.md
 make e2e        # deploy the workloads (the trigger), then probe the live OPA plugin
 ```
+
+The agent ships with its outbound route to `github-tool` already set, so no extra wiring step is
+needed between the deploy and the probe.
 
 `make demo` walks the same scenario step by step for inspection; `make restore` / `make teardown`
 clean up; `make help` lists every target. The full narrative, verification and troubleshooting are
