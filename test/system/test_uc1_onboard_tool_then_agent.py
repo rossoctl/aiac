@@ -48,8 +48,8 @@ restores the cluster to its pre-test state.
 
 Run (needs a live rossoctl/Kind cluster with the AuthBridge OPA pipeline wired in — see
 ``k8s/opa-kind-runbook.md`` / ``k8s/opa-kind-enable.sh`` — the event path wired (NATS broker +
-``aiac-event-listener`` SPI) and the demo images built + ``kind load``ed (``demo/assets/kind-load.sh``;
-the fixture deploys the workloads itself), a real LLM in-pod, and ``.env`` sourced):
+``aiac-event-listener`` SPI), a real LLM in-pod, and ``.env`` sourced; the fixture itself builds +
+``kind load``s the demo images (``demo/assets/kind-load.sh``) and deploys the workloads):
 
     .venv/bin/pytest test/system/test_uc1_onboard_tool_then_agent.py -m system -v
 

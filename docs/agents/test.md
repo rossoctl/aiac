@@ -94,11 +94,18 @@ assert the allow/deny of the **deployed OPA plugin**. They do not use
 
 Preconditions:
 
-- A rossoctl/Kind cluster with the AuthBridge OPA pipeline wired into both legs,
-  and the demo `github-agent` / `github-tool` deployed and registered.
+- A rossoctl/Kind cluster with the AuthBridge OPA pipeline wired into both legs.
 - The AIAC global combiner. It denies a pod that has no `AuthorizationPolicy`
   CR, and the Controller does not start without it.
 - `k8s/opa-kind-enable.sh` does both steps (run it one time).
+- The event path wired: the NATS broker and the `aiac-event-listener` Keycloak
+  SPI (see `docs/testing/uc1-onboarding-pipeline.md`, "Preconditions").
+
+Do **not** deploy the demo `github-agent` / `github-tool` yourself. The session
+fixture (`onboarded_stack` in `test/system/uc1_onboard.py`) builds and loads the
+demo images (`demo/assets/kind-load.sh`), removes any demo workloads and their
+registrations, deploys the workloads as the onboarding trigger, and removes them
+again at teardown.
 
 The lane runs under the enforcement side that `AIAC_ENFORCEMENT_SIDE` sets in the
 `aiac-agent-config` ConfigMap (default `target-side`: each callee, the tool
