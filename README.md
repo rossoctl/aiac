@@ -7,64 +7,10 @@ concrete permission rules on the active Policy Decision Point (OPA), using an id
 
 ## Architecture
 
-The source diagram is [docs/presentations/aiac-architecture.drawio](docs/presentations/aiac-architecture.drawio)
-(open it in [draw.io](https://app.diagrams.net/)). The drawing below follows it:
+![AIAC Architecture image](docs/presentations/aiac-architecture.drawio.png)
 
-```mermaid
-flowchart TB
-    subgraph T1["Translation time — on each change of the policy, a role, or the set of workloads"]
-        direction LR
-        spi["Keycloak SPI listener<br/>publishes on change"]
-        cfgmap["aiac-policy ConfigMap<br/>/etc/aiac/policy.md"]
-        subgraph brokerpod["Event Broker Pod"]
-            nats["NATS JetStream<br/>aiac.apply.&gt;"]
-        end
-        subgraph agentpod["Agent Pod"]
-            aiacagent["AIAC Agent<br/>model proposes · 2nd pass audits"]
-            pce["Policy Computation Engine<br/>(in-process library)"]
-        end
-        llm["LLM endpoint<br/>OpenAI-compatible"]
-        subgraph pmspod["Policy Model Store Pod"]
-            pms[("Policy Model Store<br/>SQLite policy.db")]
-        end
-        subgraph ifacepod["Rossoctl Interface Pod"]
-            idp["IdP Configuration Service :7071<br/>roles · scopes · clients"]
-            pdp["PDP Policy Writer (OPA) :7072<br/>renders the Rego"]
-        end
-        kcapi["Keycloak Admin API<br/>users · roles · clients"]
-        k8sapi["Kubernetes API<br/>AuthorizationPolicy CR"]
-
-        spi --> nats
-        nats -- event --> aiacagent
-        cfgmap -- policy --> aiacagent
-        aiacagent <-- "propose · audit" --> llm
-        aiacagent -- reads --> idp
-        idp -- admin REST --> kcapi
-        aiacagent --> pce
-        pce --> pms
-        pce -- applies --> pdp
-        pdp -- writes the CR --> k8sapi
-    end
-
-    subgraph T2["Request time — on each call. No model runs here."]
-        direction LR
-        bundle["bundle-service<br/>one bundle per pod"]
-        opa["OPA<br/>allow, or 403 policy.forbidden"]
-        caller(["caller<br/>(user or agent)"])
-        subgraph gatepod["agent pod — AuthBridge gate"]
-            opaplugin["opa plugin<br/>inbound + outbound chain"]
-            agentcontainer["agent container<br/>(your code)"]
-        end
-
-        bundle -- polls the bundle --> opa
-        caller -- call --> opaplugin
-        opaplugin -- ask --> opa
-        opa -- answer --> opaplugin
-        opaplugin -- allow --> agentcontainer
-    end
-
-    k8sapi -- reads the Rego --> bundle
-```
+Source: [docs/presentations/aiac-architecture.drawio](docs/presentations/aiac-architecture.drawio)
+(open it in [draw.io](https://app.diagrams.net/)).
 
 AIAC enforces a strict three-layer model:
 
