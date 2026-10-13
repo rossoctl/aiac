@@ -23,6 +23,9 @@ events — new services, role changes, policy updates — by consulting a Policy
 (policy model + Policy Computation Engine). Policy intent lives entirely in the PDP, never in
 per-pod configuration.
 
+Each trigger maps to a use case under `src/aiac/agent/uc/`: service onboarding, policy update,
+role update and offboarding (specs in [docs/specs/components/aiac-agent/](docs/specs/components/aiac-agent/)).
+
 ## Repository layout
 
 Discover the current concrete layout live rather than relying on this snapshot:
@@ -46,41 +49,84 @@ Always use `.venv` for Python execution, tests, and dependency checks (`.venv/bi
 
 ## Running tests
 
-```bash
-.venv/bin/pytest test/
-```
-
-Bare `pytest` runs unit tests only — `pyproject.toml` excludes `integration`,
-`eval_extended`, `eval_consistency`, `eval_robustness`, `eval_correctness_prb`, and
-`eval_correctness_e2e` by default. `llm` is not itself excluded: the live-LLM
-Policy Rules Builder suite is marked both `integration` and `llm`, so it's deselected
-via `not integration`, not because `llm` is excluded. Opt into a marker explicitly to
-run it, e.g.:
+`pytest` collects both `test/` and `eval/`. Selection is **marker-only** — never pass a path. A
+bare run is the offline unit lane (the default `addopts` deselects `integration`, `system`, `llm`
+and `eval`); a command-line `-m` opts into another lane:
 
 ```bash
-set -a; . .env; set +a          # LLM_BASE_URL / LLM_MODEL / LLM_API_KEY
-.venv/bin/pytest test/ -m llm   # live-LLM Policy Rules Builder suite, no cluster needed
+.venv/bin/pytest                    # unit lane — offline, needs nothing
+.venv/bin/pytest -m integration     # several AIAC units in one process — offline, needs nothing
+
+set -a; . .env; set +a              # LLM_* / KEYCLOAK_* for the live lanes
+.venv/bin/pytest -m llm             # live-LLM Policy Rules Builder suite — LLM endpoint only
+.venv/bin/pytest -m system          # real OPA loop through AuthBridge — wired Kind cluster
+.venv/bin/pytest -m eval            # policy-pipeline evaluation suite under eval/
 ```
 
-Integration tests additionally need a live rossoctl/Kind cluster with the AuthBridge OPA pipeline
-wired in, plus Keycloak admin creds. Stand it up with `k8s/opa-kind-enable.sh` — see
-[k8s/opa-kind-runbook.md](k8s/opa-kind-runbook.md) for prerequisites and verification.
+| Lane | Needs |
+|---|---|
+| unit | Nothing |
+| integration | Nothing (fakes stand in for Keycloak, the Policy Model Store and the Kubernetes API) |
+| llm | `LLM_BASE_URL` / `LLM_MODEL` / `LLM_API_KEY` |
+| system | A rossoctl/Kind cluster wired by `k8s/opa-kind-enable.sh`, Keycloak admin creds, an LLM endpoint |
+| eval | Keycloak, an LLM endpoint, `opa` on `PATH` for the e2e level |
+
+Live lanes skip cleanly when their env or cluster is missing — a skip is not a pass. Full lane
+contract: [docs/agents/test.md](docs/agents/test.md); where to put a new test:
+[docs/testing/testing-strategy.md](docs/testing/testing-strategy.md).
 
 ## Deploying to Kubernetes
 
 Build/load the per-service images and apply the manifests under [k8s/](k8s/); full instructions
-are in [k8s/aiac-deployment-guide.md](k8s/aiac-deployment-guide.md).
+are in [k8s/aiac-deployment-guide.md](k8s/aiac-deployment-guide.md). To wire the AuthBridge OPA
+plugin and the AIAC global combiner into Kind, see [k8s/opa-kind-runbook.md](k8s/opa-kind-runbook.md).
 
-To try the end-to-end onboarding flow against a demo agent/tool, see
-[demo/assets/INSTALL.md](demo/assets/INSTALL.md).
+The enforcement side is a deploy-time setting — `AIAC_ENFORCEMENT_SIDE` in the
+`aiac-agent-config` ConfigMap (`target-side`, the default: each callee checks its own inbound; or
+`agent-side`: the agent checks its outbound calls). There is no live switch; changing it is a clean
+redeploy. See [docs/agents/deploy.md](docs/agents/deploy.md).
+
+## Demo — onboarding an agent and a tool
+
+[demo/use-cases/onboarding/](demo/use-cases/onboarding/) is a fully live, end-to-end demo: AIAC
+discovers a `github-agent` and a `github-tool` deployed into `team1`, reads a two-line
+plain-English policy, and writes one `AuthorizationPolicy` CR per service. Real HTTP requests
+through the deployed AuthBridge OPA plugin are then allowed or denied by that generated Rego. It
+proves two claims:
+
+- **Deploying the workload is the trigger** — no one runs an onboarding command.
+- **The generated policy is what enforces** — verdicts come from the live OPA plugin, not from
+  evaluating a file on the side.
+
+Prerequisites: a Kind cluster named `rossoctl` with the rossoctl platform (SPIRE, Keycloak, the
+operator), the `team1` namespace, sibling clones of `rossoctl/operator`, `rossoctl/rossoctl` and
+`rossoctl/cortex`, and two secrets (`team1/openai-secret` and `aiac-system/keycloak-admin-secret`).
+Then, from that directory:
+
+```bash
+make enable     # install the AIAC stack, NATS broker, Keycloak SPI listener
+make opa        # wire the OPA plugin into both AuthBridge legs (one-time)
+make users      # create the demo users and roles, mount policy.md
+make e2e        # deploy the workloads (the trigger), then probe the live OPA plugin
+```
+
+`make demo` walks the same scenario step by step for inspection; `make restore` / `make teardown`
+clean up; `make help` lists every target. The full narrative, verification and troubleshooting are
+in [demo/use-cases/onboarding/demo.md](demo/use-cases/onboarding/demo.md). The demo workloads live
+under [demo/assets/](demo/assets/) — see [demo/assets/INSTALL.md](demo/assets/INSTALL.md) and their
+specs in [docs/specs/demo/](docs/specs/demo/).
 
 ## Documentation
 
 - [docs/specs/PRD.md](docs/specs/PRD.md) — master PRD
 - [docs/specs/components/](docs/specs/components/) — per-component specs (design decisions live embedded here)
 - [CONTEXT.md](CONTEXT.md) — domain glossary
+- [demo/use-cases/onboarding/demo.md](demo/use-cases/onboarding/demo.md) — end-to-end onboarding demo
 - [k8s/aiac-deployment-guide.md](k8s/aiac-deployment-guide.md) — Kubernetes install guide
 - [k8s/opa-kind-runbook.md](k8s/opa-kind-runbook.md) — local OPA/Kind integration setup
+- [docs/agents/](docs/agents/) — test lanes, deploy parameters, issue tracker
+- [docs/testing/](docs/testing/) — testing strategy and per-pipeline test docs
+- [docs/evaluation/](docs/evaluation/) — policy-pipeline evaluation framework
 
 ## Contributing
 
