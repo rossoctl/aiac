@@ -77,8 +77,8 @@ blocked; the OPA-side proof is the CR assertion. Any other outcome (``allow``, a
 
 Run (a live rossoctl/Kind cluster with the AIAC stack + AuthBridge OPA pipeline wired in — see
 ``k8s/opa-kind-runbook.md`` / ``k8s/opa-kind-enable.sh`` — the event path wired (NATS broker +
-``aiac-event-listener`` SPI), the demo images built + ``kind load``ed, a real LLM in-pod for phases 2–3,
-and ``.env`` sourced). The flow rolls the Controller four times and takes tens of minutes:
+``aiac-event-listener`` SPI), a real LLM in-pod for phases 2–3, and ``.env`` sourced; the fixture
+builds + ``kind load``s the demo images itself). The flow rolls the Controller four times and takes tens of minutes:
 
     .venv/bin/pytest -m system -k failure_rollback -v
 
