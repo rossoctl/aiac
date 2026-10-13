@@ -13,9 +13,6 @@
 #   Phase VERIFY-TRIGGER  poll Keycloak for the brand-new clients, aiac-agent logs for evidence it
 #                         consumed both over NATS, and the two AuthorizationPolicy CRs AIAC wrote
 #                         (one per managed service, D20: github-agent AND github-tool).
-#   Phase WIRE            wire AuthBridge's own outbound leg (authproxy-routes + optional
-#                         client-scope) — demo-owned wiring the platform runbook
-#                         (k8s/opa-kind-runbook.md) leaves out; AIAC's own onboarding does not do this.
 #   Phase ENFORCE         real HTTP probes through the live AuthBridge OPA plugin, reproducing
 #                         #646's acceptance table.
 #   Phase REPLAY-TRIGGER  opt-in only (--only-replay-trigger): re-prove the trigger on a cluster
@@ -38,9 +35,8 @@
 # moment an observed result doesn't match, rather than continuing silently.
 #
 # Usage:
-#   ./driver.sh                    # deploy -> verify-trigger -> wire -> enforce
+#   ./driver.sh                    # deploy -> verify-trigger -> enforce
 #   ./driver.sh --only-deploy
-#   ./driver.sh --only-wire-outbound
 #   ./driver.sh --only-enforce
 #   ./driver.sh --only-replay-trigger      # forced replay (workloads must already be deployed)
 #   ./driver.sh --collect-logs     # (composes with any of the above) dump every component's logs
@@ -119,7 +115,6 @@ SUBJECT_SCOPE="aiac-username-sub"
 SIDE=""
 
 DO_DEPLOY=1
-DO_WIRE=1
 DO_ENFORCE=1
 # Opt-in only: REPLAY-TRIGGER is never part of a default run. DEPLOY is this demo's real trigger
 # story; the replay exists for a cluster where the workloads are already deployed.
@@ -140,13 +135,12 @@ for arg in "$@"; do
       ;;
   esac
   case "$arg" in
-    --only-deploy) DO_WIRE=0; DO_ENFORCE=0 ;;
-    --only-wire-outbound) DO_DEPLOY=0; DO_ENFORCE=0 ;;
-    --only-enforce) DO_DEPLOY=0; DO_WIRE=0 ;;
-    --only-replay-trigger) DO_DEPLOY=0; DO_WIRE=0; DO_ENFORCE=0; DO_REPLAY=1 ;;
+    --only-deploy) DO_ENFORCE=0 ;;
+    --only-enforce) DO_DEPLOY=0 ;;
+    --only-replay-trigger) DO_DEPLOY=0; DO_ENFORCE=0; DO_REPLAY=1 ;;
     --collect-logs) DO_COLLECT=1 ;;
     "") ;;
-    *) echo "Usage: $0 [--only-deploy|--only-wire-outbound|--only-enforce|--only-replay-trigger] [--collect-logs]" >&2; exit 1 ;;
+    *) echo "Usage: $0 [--only-deploy|--only-enforce|--only-replay-trigger] [--collect-logs]" >&2; exit 1 ;;
   esac
 done
 # Fix the destination once, so the end-of-run and die()-path collections write to the same directory.
@@ -391,7 +385,7 @@ case "$LISTENERS" in
 esac
 if [ "$DO_DEPLOY" -eq 1 ]; then
   if kubectl get deployment github-agent -n "$NS" >/dev/null 2>&1 || kubectl get deployment github-tool -n "$NS" >/dev/null 2>&1; then
-    die "github-agent and/or github-tool already deployed in '${NS}' — deploying them now would not be a genuine first-time trigger. Run ./restore.sh first, or re-run with --only-replay-trigger (forced replay against the deployed workloads) / --only-wire-outbound / --only-enforce."
+    die "github-agent and/or github-tool already deployed in '${NS}' — deploying them now would not be a genuine first-time trigger. Run ./restore.sh first, or re-run with --only-replay-trigger (forced replay against the deployed workloads) / --only-enforce."
   fi
   pass "preflight: infra present, github-agent/github-tool NOT yet deployed (deploy will be a genuine first trigger)"
 elif [ "$DO_REPLAY" -eq 1 ]; then
@@ -580,44 +574,6 @@ print("yes" if os.environ["SCOPE"] in names else "")' 2>/dev/null || true)
   kubectl get "$POLICY_CR" github-agent -n "$NS" -o jsonpath='{.spec.policies[*].content}' | sed 's/^/    /'
   info "github-tool CR content:"
   kubectl get "$POLICY_CR" github-tool -n "$NS" -o jsonpath='{.spec.policies[*].content}' | sed 's/^/    /'
-}
-
-# ── Phase WIRE ────────────────────────────────────────────────────────────────
-phase_wire_outbound() {
-  printf '\n%s%s====== Phase WIRE — AuthBridge outbound leg (authproxy-routes + optional scope) ======%s\n' "$C_BLD" "$C_CYN" "$C_RST"
-
-  step "Adding the github-tool outbound route to authproxy-routes"
-  kubectl patch configmap authproxy-routes -n "$NS" --type merge -p "$(NS="$NS" python3 -c '
-import json, os
-ns = os.environ["NS"]
-print(json.dumps({"data":{"routes.yaml":
-f"""- host: \"github-tool\"
-  target_audience: \"spiffe://localtest.me/ns/{ns}/sa/github-tool\"
-  token_scopes: \"openid agent-{ns}-github-tool-aud\"
-"""}}))')" || die "failed to patch authproxy-routes"
-  pass "authproxy-routes carries the github-tool route"
-
-  step "Granting github-agent the exchange scope on its Keycloak client (expect HTTP 204)"
-  ADMIN="$(admin_token)"
-  [ -n "$ADMIN" ] || die "could not obtain a Keycloak master admin token"
-  AGENT_UUID="$(client_uuid_by_name "${NS}/github-agent" "$ADMIN")"
-  [ -n "$AGENT_UUID" ] || die "could not resolve the Keycloak client uuid for ${NS}/github-agent"
-  local tool_aud="agent-${NS}-github-tool-aud"
-  SCOPE_ID="$(scope_id_by_name "$tool_aud" "$ADMIN")"
-  [ -n "$SCOPE_ID" ] || die "client-scope '${tool_aud}' not found — has github-tool onboarded yet?"
-  SCOPE_HTTP=$(curl -s -o /dev/null -w "%{http_code}" -X PUT -H "Authorization: Bearer ${ADMIN}" \
-    "${KC}/admin/realms/${REALM}/clients/${AGENT_UUID}/optional-client-scopes/${SCOPE_ID}")
-  case "$SCOPE_HTTP" in
-    204) pass "assigned optional client-scope: HTTP 204" ;;
-    409) warn "optional client-scope already assigned (HTTP 409) — idempotent, continuing" ;;
-    *) die "assigning the optional client-scope returned HTTP ${SCOPE_HTTP} (expected 204)" ;;
-  esac
-
-  step "Restarting github-agent to load the route"
-  kubectl delete pod -n "$NS" -l "$AGENT_LABEL" || die "failed to delete github-agent pod"
-  kubectl wait --for=condition=ready pod -n "$NS" -l "$AGENT_LABEL" --timeout=120s \
-    || die "github-agent did not become Ready after the route-load restart"
-  pass "github-agent restarted and Ready"
 }
 
 # ── Phase ENFORCE ─────────────────────────────────────────────────────────────
@@ -961,7 +917,6 @@ if [ "$DO_DEPLOY" -eq 1 ]; then
   phase_verify_trigger
 fi
 [ "$DO_REPLAY" -eq 1 ] && phase_replay_trigger
-[ "$DO_WIRE" -eq 1 ] && phase_wire_outbound
 [ "$DO_ENFORCE" -eq 1 ] && phase_enforce
 
 [ "$DO_COLLECT" -eq 1 ] && collect_logs "$COLLECT_DIR"

@@ -58,7 +58,7 @@ help:  ## Show this menu
 	@printf "  \033[1mmake enable\033[0m   (AIAC stack + NATS broker + Keycloak SPI)\n"
 	@printf "  \033[1mmake opa\033[0m      (wire the OPA plugin into both AuthBridge legs — one-time, cluster-level)\n"
 	@printf "  \033[1mmake users\033[0m    (users/roles/policy — before the deploy that triggers onboarding)\n"
-	@printf "  \033[1mmake e2e\033[0m      (deploy -> verify trigger -> wire -> live enforce)\n\n"
+	@printf "  \033[1mmake e2e\033[0m      (deploy -> verify trigger -> live enforce)\n\n"
 	@printf "Narrated walkthrough (demo.md Part 6) — manual onboarding + offline opa eval:\n"
 	@printf "  \033[1mmake demo\033[0m     (init 00-03 -> onboard 04-05 -> run)\n"
 	@printf "  \033[1mmake init / make onboard / make run\033[0m   (one phase at a time)\n"
@@ -132,14 +132,13 @@ opa:  ## Part 1: wire the OPA plugin + parsers into both AuthBridge legs (k8s/op
 opa-restore:  ## Revert `make opa`: restore the original AuthBridge pipeline (k8s/opa-kind-restore.sh)
 	$(AIAC_ROOT)/k8s/opa-kind-restore.sh
 
-e2e:  ## Parts 4-5: deploy (the trigger) -> verify trigger -> wire outbound -> live enforce
+e2e:  ## Parts 4-5: deploy (the trigger) -> verify trigger -> live enforce
 	./driver.sh
 
 trigger:  ## Part 4 alone: deploy the workloads and verify the live trigger fired
 	./driver.sh --only-deploy
 
-enforce:  ## Part 5 alone: wire the outbound leg, then probe the live OPA plugin
-	./driver.sh --only-wire-outbound
+enforce:  ## Part 5 alone: probe the live OPA plugin
 	./driver.sh --only-enforce
 
 replay:  ## Optional: re-prove the trigger against ALREADY-deployed workloads (forced replay)

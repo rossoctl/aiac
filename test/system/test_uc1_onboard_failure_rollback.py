@@ -279,7 +279,6 @@ def _run_phases(ctx: dict, run: dict) -> None:
     deployed_at = datetime.now(timezone.utc)
     uc1.deploy_workload(TOOL)
     tool = _registered_client(admin, TOOL)
-    uc1.ensure_github_tool_route(uc1.NAMESPACE)
     uc1.grant_exchange_scope(admin)
     uc1.restart_agent(uc1.NAMESPACE)
     outbound = _poll_decision(lambda: uc1.outbound_decision(ctx, "dev-user", PROBE_TOOL), "allow", LIFT_TIMEOUT)

@@ -215,12 +215,16 @@ Manifests live under `demo/assets/agents/github_agent/k8s/`, adapted from the gi
     `rossoctl.io/type=agent`, registers a Keycloak client, injects the AuthBridge sidecar).
   - Image `localhost/github-agent:latest`, `imagePullPolicy: IfNotPresent` (kind-load; name is a documented knob).
 - **`configmaps.yaml`** — `authbridge-config` (Keycloak URL/realm/issuer) + `authproxy-routes` with the
-  outbound token-exchange route:
+  outbound token-exchange route to the demo's stand-in tool (`demo/assets/tools/github_tool/`, Service
+  `github-tool`), the tool the onboarding demo deploys and enforces against:
   ```yaml
-  - host: "github-tool-mcp"
-    target_audience: "github-tool"
-    token_scopes: "openid github-tool-aud github-full-access"
+  - host: "github-tool"
+    target_audience: "spiffe://localtest.me/ns/team1/sa/github-tool"
+    token_scopes: "openid agent-team1-github-tool-aud"
   ```
+  The operator creates `agent-team1-github-tool-aud` when it registers `github-tool` and makes it a
+  realm default scope, so `github-agent`'s client has it when it is created after the tool (the order
+  `demo/assets/deploy.sh` uses).
 - **Prerequisite (reused, not created here):** the existing **production** `github-tool` Deployment/Service
   (`authbridge/demos/github-issue/k8s/github-tool-deployment.yaml`, Service name `github-tool-mcp`) +
   `github-tool-secrets`, a running rossoctl cluster (Keycloak realm `rossoctl`, namespace `team1` —
@@ -228,8 +232,10 @@ Manifests live under `demo/assets/agents/github_agent/k8s/`, adapted from the gi
   The sibling UC-1 stub at `demo/assets/tools/github_tool/` (Service `github-tool`) is a separate deployment
   for AIAC onboarding discovery and is **not** a runtime dependency of this agent.
 
-**Wiring invariant:** agent `MCP_URL` host (`github-tool-mcp`) == `authproxy-routes` host == tool
-Service name; exchanged audience (`github-tool`) == tool `AUDIENCE`.
+**Wiring invariant:** `authproxy-routes` host == the stand-in tool's Service name (`github-tool`);
+exchanged audience == the tool's SPIFFE ID. The agent's `MCP_URL` still names the production
+`github-tool-mcp`, so the route does not cover the agent's own MCP calls (a known gap of the onboarding
+demo, which probes the tool through the sidecar's forward proxy instead).
 
 ---
 

@@ -29,7 +29,7 @@ target.
 | [2](#step-2--install-aiac) | `make enable` | Install the AIAC stack, NATS broker, Keycloak SPI listener |
 | [3](#step-3--provision-users-roles-and-the-policy) | `make users` | Create the three demo users + roles, mount `policy.md` |
 | [4](#step-4--deploy-the-workloads-this-is-the-trigger) | `make trigger` | Deploy `github-agent`/`github-tool` and verify onboarding fired |
-| [5](#step-5--enforce-live) | `make enforce` | Wire the outbound leg, then probe the live OPA plugin |
+| [5](#step-5--enforce-live) | `make enforce` | Probe the live OPA plugin |
 | [6](#step-6--inspect-what-was-generated-optional) | `make demo` | Optional: walk the same scenario in small steps |
 
 Steps 4 and 5 together: **`make e2e`**.
@@ -533,19 +533,7 @@ make enforce
 
 ### What happens
 
-**WIRE** configures AuthBridge's own outbound leg — the two things AIAC's onboarding does not do:
 
-1. Adds the `github-tool` route to the `authproxy-routes` ConfigMap. Its `host` decides whether
-   token-exchange fires at all. Its `target_audience` is the audience of the exchanged token that
-   `github-tool`'s inbound validates (target side), and it becomes `input.identity.service_id` on
-   the agent's outbound leg, the key that the agent-side policy looks up in `target_allow_scopes`.
-2. Ensures `github-agent`'s Keycloak client may request the `agent-team1-github-tool-aud` audience.
-3. Restarts the agent pod, because the route is read at sidecar start.
-
-> The demo's own `configmaps.yaml` ships a route for the **production** tool
-> (`host: github-tool-mcp`), which this install path deliberately does not deploy. WIRE retargets it
-> at the demo's stand-in tool (`host: github-tool`). That is why the deployed ConfigMap differs from
-> the file on disk, and why anything that re-applies the file needs WIRE re-run after it.
 
 **ENFORCE** first checks (read only) that the login client `rossoctl` and `github-agent` link the
 client scope `aiac-username-sub` as a default scope (D31, see the
@@ -715,7 +703,7 @@ package is a pass-through (`allow := true` and no other rule), the side is targe
 
 | Symptom | Cause / fix |
 |---|---|
-| **Every tool call denies, for every user** | Usually the outbound route is missing — run `make enforce`, which includes WIRE, rather than the enforce half alone. Otherwise one of the two onboardings did not finish, leaving the per-tool maps empty: `kubectl logs deployment/aiac-agent -n aiac-system \| grep -iE 'label missing\|MCP tools/list'`. JetStream redelivers after `ACK_WAIT` (600 s) and usually succeeds, so waiting then re-running `make enforce` often cures it. |
+| **Every tool call denies, for every user** | Usually `github-agent`'s client lacks the `agent-team1-github-tool-aud` scope: its client was created before `github-tool` registered (the operator makes that scope a realm default only then). `make restore` and `make e2e` again, which deploys the tool first. Otherwise one of the two onboardings did not finish, leaving the per-tool maps empty: `kubectl logs deployment/aiac-agent -n aiac-system \| grep -iE 'label missing\|MCP tools/list'`. JetStream redelivers after `ACK_WAIT` (600 s) and usually succeeds, so waiting then re-running `make enforce` often cures it. |
 | **ENFORCE stops: a client does not link `aiac-username-sub` as a default scope** | The token keeps `sub` = the Keycloak user ID, so the rego cannot find the user (D31). For `rossoctl`, restart the IdP Configuration Service once Keycloak is ready: `kubectl rollout restart deployment/aiac-interface -n aiac-system`. For `github-agent`, let AIAC onboard it again. Do not add a `sub` mapper by hand. |
 | **The AIAC Controller does not start (start check #4)** | The log says either that the `default` AuthorizationPolicy is *missing*, or that the global combiner *allows a pod that has no client CR*. Missing: `make opa` never ran on this cluster — it must run before `make enable` (see [step 2](#step-2--install-aiac)). Allows: the combiner is the stock one, brought back by a `make opa-restore` or another bundle-service install. Either way, run `make opa`, then `kubectl rollout restart deployment/aiac-agent -n aiac-system`. |
 | **Onboarding fails with a `401` from the LLM** | `enable.sh` defaulted to OpenAI. Patch `aiac-agent-config` and `rollout restart` — see [step 2](#change-llm). The values come in via `envFrom`, so a patch without a restart does nothing. |

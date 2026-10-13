@@ -52,7 +52,18 @@ data:
 # This allows the agent to call LLM APIs, telemetry endpoints, and other
 # services without interference from the token exchange proxy.
 #
-# Update the host pattern if the github-tool service name or namespace changes.
+# The route targets the demo's stand-in tool (Service "github-tool" in team1),
+# not the production github-tool-mcp, which this install path does not deploy:
+#   host             the tool's Service name; decides whether token exchange fires.
+#   target_audience  the tool's SPIFFE ID, the audience its inbound validates
+#                    (target side) and input.identity.service_id on the agent's
+#                    outbound leg (agent side).
+#   token_scopes     agent-team1-github-tool-aud is the audience scope the operator
+#                    creates when it registers github-tool and makes a realm default
+#                    scope, so a github-agent client created after that has it.
+#                    deploy.sh deploys the tool before the agent for this reason.
+# The sidecar reads this at start, so apply it before the agent Deployment.
+# Update all three if the tool's service name or namespace changes.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -60,6 +71,6 @@ metadata:
   namespace: team1
 data:
   routes.yaml: |
-    - host: "github-tool-mcp"
-      target_audience: "github-tool"
-      token_scopes: "openid github-tool-aud github-full-access"
+    - host: "github-tool"
+      target_audience: "spiffe://localtest.me/ns/team1/sa/github-tool"
+      token_scopes: "openid agent-team1-github-tool-aud"

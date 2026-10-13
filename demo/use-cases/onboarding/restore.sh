@@ -4,10 +4,9 @@
 # deploying the workloads for the first time *is* the point of this demo, restore must remove them
 # completely: Deployments, Services, ServiceAccounts, AgentRuntime CRs, their Keycloak clients and
 # credentials Secrets, and the two AuthorizationPolicy CRs AIAC wrote (one per managed service, D20).
-# It also reverts the outbound-leg wiring driver.sh's WIRE phase added.
 #
 # Usage:
-#   ./restore.sh                   # the demo's own state (workloads, clients, CRs, wiring)
+#   ./restore.sh                   # the demo's own state (workloads, clients, CRs)
 #   ./restore.sh --include-infra   # ALSO revert what enable.sh installed: the realm's
 #                                  # aiac-event-listener config and the Keycloak StatefulSet image
 #
@@ -82,26 +81,9 @@ client_uuid_by_name() {
     | CLIENT_NAME="$1" json_eval 'next((c["id"] for c in d if c.get("name") == os.environ["CLIENT_NAME"]), "")'
 }
 
-echo "==> 1. Reverting authproxy-routes (dropping the github-tool route)"
-kubectl patch configmap authproxy-routes -n "$NS" --type merge -p "$(python3 -c '
-import json
-print(json.dumps({"data":{"routes.yaml": ""}}))')" || true
-
-echo "==> 2. Removing the optional client-scope from github-agent (if present)"
 ADMIN="$(admin_token)"
 if [ -n "$ADMIN" ]; then
-  AGENT_UUID="$(client_uuid_by_name "${NS}/github-agent")"
-  SCOPE_ID=$(curl -s -H "Authorization: Bearer ${ADMIN}" "${KC}/admin/realms/${REALM}/client-scopes" \
-    | SCOPE_NAME="agent-${NS}-github-tool-aud" json_eval 'next((s["id"] for s in d if s.get("name") == os.environ["SCOPE_NAME"]), "")')
-  if [ -n "$AGENT_UUID" ] && [ -n "$SCOPE_ID" ]; then
-    curl -s -o /dev/null -w "    remove scope HTTP %{http_code}\n" -X DELETE \
-      -H "Authorization: Bearer ${ADMIN}" \
-      "${KC}/admin/realms/${REALM}/clients/${AGENT_UUID}/optional-client-scopes/${SCOPE_ID}"
-  else
-    echo "    (client or scope not found — nothing to remove)"
-  fi
-
-  echo "==> 3. Deleting the Keycloak clients ${NS}/github-agent, ${NS}/github-tool"
+  echo "==> 1. Deleting the Keycloak clients ${NS}/github-agent, ${NS}/github-tool"
   for name in "${NS}/github-agent" "${NS}/github-tool"; do
     UUID="$(client_uuid_by_name "$name")"
     if [ -n "$UUID" ]; then
@@ -112,10 +94,10 @@ if [ -n "$ADMIN" ]; then
     fi
   done
 else
-  echo "    WARNING: could not obtain a Keycloak admin token — skipping steps 2-3" >&2
+  echo "    WARNING: could not obtain a Keycloak admin token — skipping step 1" >&2
 fi
 
-echo "==> 4. Deleting leftover client-scopes and realm roles for github-agent/github-tool"
+echo "==> 2. Deleting leftover client-scopes and realm roles for github-agent/github-tool"
 echo "    (AIAC's Policy Rules Builder creates these via blind POSTs with no existence check —"
 echo "     see aiac/src/aiac/idp/service/configuration/keycloak/main.py's create_scope/create_role —"
 echo "     so a stale scope/role from a prior onboarding cycle causes a 409/502 on the next one.)"
@@ -143,14 +125,14 @@ else
   echo "    WARNING: could not obtain a Keycloak admin token — skipping leftover scope/role cleanup" >&2
 fi
 
-echo "==> 5. Deleting the AuthorizationPolicy CRs AIAC wrote for github-agent and github-tool"
+echo "==> 3. Deleting the AuthorizationPolicy CRs AIAC wrote for github-agent and github-tool"
 kubectl delete "$POLICY_CR" github-agent github-tool -n "$NS" --ignore-not-found
 
-echo "==> 6. Deleting github-agent/github-tool workloads (Deployment/Service/ServiceAccount/AgentRuntime)"
+echo "==> 4. Deleting github-agent/github-tool workloads (Deployment/Service/ServiceAccount/AgentRuntime)"
 kubectl delete -f "$ASSETS_DIR/agents/github_agent/k8s/github-agent-deployment.yaml" -n "$NS" --ignore-not-found
 kubectl delete -f "$ASSETS_DIR/tools/github_tool/k8s/github-tool-deployment.yaml" -n "$NS" --ignore-not-found
 
-echo "==> 7. Deleting the github-agent/github-tool client-credentials Secrets in '${NS}'"
+echo "==> 5. Deleting the github-agent/github-tool client-credentials Secrets in '${NS}'"
 # Only the demo's two Secrets, not every rossoctl-keycloak-client-credentials-* in the namespace
 # (other workloads have theirs there too). The operator names them deterministically from
 # (namespace, workload) — mirror of clientreg.KeycloakClientCredentialsSecretName in rossoctl/operator.
@@ -164,7 +146,7 @@ done
 
 # ── --include-infra: reverse enable.sh's Keycloak-side changes ────────────────
 if [ "$DO_INFRA" -eq 1 ]; then
-  echo "==> 8. Disabling the aiac-event-listener on realm '${REALM}' (reverses enable.sh --spi-only)"
+  echo "==> 6. Disabling the aiac-event-listener on realm '${REALM}' (reverses enable.sh --spi-only)"
   if [ -n "$ADMIN" ]; then
     curl -s -o /dev/null -w "    events/config HTTP %{http_code}\n" -X PUT \
       -H "Authorization: Bearer ${ADMIN}" -H "Content-Type: application/json" \
@@ -174,7 +156,7 @@ if [ "$DO_INFRA" -eq 1 ]; then
     echo "    WARNING: no Keycloak admin token — skipping listener revert" >&2
   fi
 
-  echo "==> 9. Reverting statefulset/${KEYCLOAK_STATEFULSET} to ${ORIGINAL_KEYCLOAK_IMAGE}"
+  echo "==> 7. Reverting statefulset/${KEYCLOAK_STATEFULSET} to ${ORIGINAL_KEYCLOAK_IMAGE}"
   # enable.sh patched this live (kubectl set image), not via the chart, so this puts it back.
   kubectl set image "statefulset/${KEYCLOAK_STATEFULSET}" -n "$KEYCLOAK_NAMESPACE" \
     "${KEYCLOAK_STATEFULSET}=${ORIGINAL_KEYCLOAK_IMAGE}"
