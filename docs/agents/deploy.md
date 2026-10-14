@@ -1,8 +1,25 @@
-# Deploy parameters
+# Deploy parameters and preconditions
 
-Names the deploy-time parameters of this repo for the `deploy` skill. The deploy
-flow is in `k8s/aiac-deployment-guide.md`. The commands for each parameter are in
-the linked doc — this file copies none of them.
+Names the deploy-time parameters and preconditions of this repo for the `deploy`
+skill. The deploy flow is in `k8s/aiac-deployment-guide.md`. The commands for each
+parameter are in the linked doc — this file copies none of them.
+
+## Precondition: OPA on the Kind platform
+
+AIAC needs OPA in the AuthBridge pipeline, `bundle-service`, and the changed
+global combiner (D20). Without them the AIAC Controller does not start.
+
+| | |
+|---|---|
+| Applies to | Every deploy of an AIAC unit in `aiac-system`, and a parameter-only deploy |
+| Check | `./k8s/opa-kind-verify.sh` (read-only, exits non-zero on the first failed check) |
+| Install | `OPERATOR_DIR=… ROSSOCTL_DIR=… CORTEX_DIR=… ./k8s/opa-kind-enable.sh`, from the repo root. Details: `k8s/opa-kind-runbook.md` → Enable |
+| Install warning | Two image builds (a few minutes). It runs `helm upgrade` on the rossoctl chart and restarts the agent and tool pods in `team1`. |
+| Inputs | Sibling clones `operator`, `rossoctl`, `cortex`. Defaults are `../operator`, `../rossoctl`, `../cortex`, relative to the repo root. If one is missing, stop and ask for its path. |
+| Re-check | After any `kubectl apply` of a platform manifest or an operator-chart upgrade. The check also fails when the stock combiner is back. |
+
+Enable runs the verify script as its last step, so after an install the check
+has already passed once.
 
 ## `ac-side` — access-control scheme (enforcement side)
 
