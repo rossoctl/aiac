@@ -30,7 +30,8 @@ pipeline wired into both legs:
       → drive REAL HTTP requests through AuthBridge and assert the real plugin's allow/deny
       → capture every AIAC CR + the global combiner to the pytest host (``teardown``) — the first
         teardown step, on the success and the failure path, best-effort (it never raises)
-      → teardown full-to-pristine (undeploy + delete all registrations + delete CRs, verified)
+      → teardown full-to-pristine (undeploy + delete all registrations + delete CRs, verified); the
+        realm users, roles and Direct Access Grants on the login client stay (leave-in-place)
 
 The only thing that differs between rungs is *which workloads are onboarded and in what order*, so
 all the machinery lives here and each ``test_uc1_onboard_*.py`` supplies just its own oracle
@@ -39,7 +40,8 @@ all the machinery lives here and each ``test_uc1_onboard_*.py`` supplies just it
 This module owns:
 
 * **Config** (env, spec § Configuration) — single stack, no variants.
-* **Keycloak** — ``connect_admin`` / ``provision_realm_and_users`` (the fixture UC-1 does *not* do) /
+* **Keycloak** — ``connect_admin`` / ``provision_realm_and_users`` (the fixture UC-1 does *not* do,
+  with ``ensure_direct_access_grants`` on the login client) /
   ``cleanup_provisioned`` / ``delete_workload_registrations`` (teardown).
 * **CRs** — ``delete_workload_crs`` (the agent's and the tool's CR) / ``sweep_authpolicies`` (every
   other CR in the namespace) / ``delete_authpolicy`` (one CR, raising).
@@ -329,8 +331,10 @@ def provision_realm_and_users(admin, realm: str) -> None:
     """Idempotently ensure ``realm`` holds ``scenario_uc1``'s users + realm roles with the
     descriptions the PRB reads. Realm roles carry the ``aiac.managed`` marker so the IdP populates
     each role's ``actorIds`` (member usernames) — the PCE needs them to build the ``subject_roles``
-    map the inbound/outbound gates key on. Never deletes/recreates — reruns converge (spec: shared
-    realm, leave-in-place)."""
+    map the inbound/outbound gates key on. Also turns on Direct Access Grants on the login client
+    (``ensure_direct_access_grants``), so that ``verify_login_subject`` and ``mint_token`` can use the
+    password grant. Never deletes/recreates — reruns converge (spec: shared realm, leave-in-place: the
+    users, the roles and the grant stay after the run)."""
     from keycloak.exceptions import KeycloakError
 
     try:
@@ -350,6 +354,8 @@ def provision_realm_and_users(admin, realm: str) -> None:
         _complete_user_profile(admin, user_id, profile)
         admin.set_user_password(user_id, scn.USER_PASSWORD, temporary=False)
         admin.assign_realm_roles(user_id, [admin.get_realm_role(role_name)])
+
+    ensure_direct_access_grants(admin, realm)
 
 
 def _user_profile(username: str) -> dict:
@@ -1034,17 +1040,41 @@ def login_client(admin) -> dict | None:
     return next((c for c in admin.get_clients() if c.get("clientId") == KEYCLOAK_CLIENT_ID), None)
 
 
-def ensure_direct_access_grants(admin) -> bool:
-    """Enable Direct Access Grants on the login client (``KEYCLOAK_CLIENT_ID``) of ``TEST_REALM``, so
-    that ``mint_token`` can use the password grant. Idempotent: a client that has it already is not
-    written. Returns ``True`` if the client exists and has the grant on, ``False`` if the client is
-    absent (nothing is created: the realm owns its login client)."""
-    client = login_client(admin)
+def ensure_direct_access_grants(admin, realm: str) -> None:
+    """Turn on Direct Access Grants on the login client (``KEYCLOAK_CLIENT_ID``) of ``realm``, so that
+    ``mint_token`` can use the password grant. ``provision_realm_and_users`` calls it, so each setup path
+    that provisions the users also gets the grant.
+
+    Idempotent: a client that has the grant already is not written. The write is a partial update (only
+    ``directAccessGrantsEnabled``), so it does not write back a stale copy of the client over a change
+    that the IdP Configuration Service made (for example its D31 scope link). The grant stays after the
+    run (leave-in-place, like the users); the change is logged, so the owner of a realm that had it off
+    on purpose can see it.
+
+    Raises ``RuntimeError`` when the login client does not exist: the realm owns its login client, so
+    nothing is created, and a missing login client is a failure (``require_subject_scope``), not a skip.
+    A ``KeycloakError`` from the update (for example the admin cannot manage clients) is logged, not
+    raised: ``verify_login_subject`` then cannot mint the token and skips with the cause."""
+    from keycloak.exceptions import KeycloakError
+
+    admin.change_current_realm(realm)
+    client = next((c for c in admin.get_clients() if c.get("clientId") == KEYCLOAK_CLIENT_ID), None)
     if client is None:
-        return False
-    if not client.get("directAccessGrantsEnabled"):
-        admin.update_client(client["id"], {**client, "directAccessGrantsEnabled": True})
-    return True
+        raise RuntimeError(
+            f"the login client {KEYCLOAK_CLIENT_ID!r} does not exist in realm {realm!r}, so the harness cannot "
+            "mint a user token through it (the realm owns its login client; the harness does not create it)"
+        )
+    if client.get("directAccessGrantsEnabled"):
+        return
+    try:
+        admin.update_client(client["id"], {"directAccessGrantsEnabled": True})
+        log.warning(
+            "enabled Direct Access Grants on the login client %r in realm %r (left on after the run)",
+            KEYCLOAK_CLIENT_ID,
+            realm,
+        )
+    except KeycloakError as exc:
+        log.warning("cannot enable Direct Access Grants on the login client %r: %s", KEYCLOAK_CLIENT_ID, exc)
 
 
 def _workload_list(workloads: str | Sequence[str]) -> list[str]:
@@ -1373,8 +1403,10 @@ def onboarded_stack(
     Teardown first captures every AIAC CR and the global combiner to the pytest host
     (``capture_aiac_crs``, phase ``teardown``; best-effort, it never masks a failure), then is
     **full-to-pristine** — the workloads and every registration are removed and the removal is
-    verified. The capture directories are named for the test module that started the stack. The
-    workload order is the rung's identity — e.g. rung 2 passes ``[agent, tool]`` so tool onboarding
+    verified. The realm setup of ``provision_realm_and_users`` (the users, the roles and Direct Access
+    Grants on the login client) is shared realm state and stays. The capture directories are named for
+    the test module that started the stack. The workload order is the rung's identity — e.g. rung 2
+    passes ``[agent, tool]`` so tool onboarding
     completes the tool check (under target side it writes github-tool's own CR with both gates; under
     agent side it completes the agent's outbound gate); rung 3 passes ``[tool, agent]`` and must
     converge to the same live decisions.
@@ -1429,12 +1461,11 @@ def onboarded_stack(
         )
 
     provision_realm_and_users(admin, TEST_REALM)  # BEFORE deploying (PRB reads the role universe when the event fires)
-    # The fixture enables Direct Access Grants on the login client (the password grant of ``mint_token``
-    # needs it), then skips if a token still can't be minted. The login token's ``sub`` comes from
-    # ``aiac-username-sub``, which the IdP Configuration Service links to the login client at startup
-    # (D31): fail if it isn't the username. ``require_subject_scope`` below checks the links again after
-    # each onboarding.
-    ensure_direct_access_grants(admin)
+    # ``provision_realm_and_users`` also enables Direct Access Grants on the login client (the password
+    # grant of ``mint_token`` needs it); skip if a token still can't be minted. The login token's ``sub``
+    # comes from ``aiac-username-sub``, which the IdP Configuration Service links to the login client at
+    # startup (D31): fail if it isn't the username. ``require_subject_scope`` below checks the links again
+    # after each onboarding.
     verify_login_subject(keycloak_url=keycloak_url, realm=TEST_REALM, user="dev-user", password=scn.USER_PASSWORD)
 
     tool_onboarded = scn.TOOL_WORKLOAD in workloads
@@ -2393,9 +2424,10 @@ def pristine_stack(workloads: Sequence[str], *, policy_md: str = scn.POLICY_ABST
 
     Same skip gates (pipeline wiring, env, event path — before any mutation), same no-workloads slate
     (a ``pre-run-slate`` CR capture, then undeploy + ``_scrub_to_pristine`` +
-    ``reenable_provisioned_clients`` + clients-gone poll), same realm/users provisioning + ``sub``
-    mapper gate, ``policy.md`` mount and image load for ``workloads``; and the same teardown: a
-    ``teardown`` CR capture first, then full-to-pristine, verified (clients gone, no CR left)."""
+    ``reenable_provisioned_clients`` + clients-gone poll), same realm/users provisioning (with Direct
+    Access Grants on the login client) + ``sub`` mapper gate, ``policy.md`` mount and image load for
+    ``workloads``; and the same teardown: a ``teardown`` CR capture first, then full-to-pristine,
+    verified (clients gone, no CR left)."""
     require_pipeline(namespace=NAMESPACE, workloads=[])
     creds = require_env_or_skip("KEYCLOAK_URL", "KEYCLOAK_ADMIN_USERNAME", "KEYCLOAK_ADMIN_PASSWORD")
     keycloak_url = creds["KEYCLOAK_URL"]

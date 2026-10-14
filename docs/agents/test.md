@@ -114,8 +114,10 @@ test both sides, run the lane, do a clean redeploy with the other side (see
 `docs/agents/deploy.md`), and run the lane again.
 
 The platform prerequisites, wiring, verification and the setting of the side:
-`k8s/opa-kind-runbook.md`. The session fixture enables Direct Access Grants on the
-login client `rossoctl` itself, so the lane needs no manual realm step. The per-loop
+`k8s/opa-kind-runbook.md`. The fixture enables Direct Access Grants on the login
+client `rossoctl` itself and leaves it on, so the lane needs no manual realm step. A
+manual probe with the password grant outside the lane needs the grant set by hand:
+see the runbook section "Direct Access Grants on the login client". The per-loop
 shape: `test/system/uc1_onboard.py`.
 
 ```bash

@@ -221,6 +221,32 @@ such pods, it skips this check.
 
 ---
 
+## Direct Access Grants on the login client
+
+A manual probe that mints a user token with the password grant through the
+login client `rossoctl` needs Direct Access Grants on that client. In a fresh
+realm it is off, and the mint fails with `unauthorized_client`. The system
+tests do not need this step: their fixture enables the grant itself
+(`ensure_direct_access_grants` in `test/system/uc1_onboard.py`). To enable it by
+hand (a partial update: only this field changes):
+
+```bash
+KC=http://keycloak.localtest.me:8080
+ADMIN=$(curl -s -X POST "$KC/realms/master/protocol/openid-connect/token" \
+  -d client_id=admin-cli -d username=admin -d password=admin -d grant_type=password \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')
+CID=$(curl -s -H "Authorization: Bearer $ADMIN" "$KC/admin/realms/rossoctl/clients?clientId=rossoctl" \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)[0]["id"])')
+curl -s -o /dev/null -w "enable DAG HTTP %{http_code}\n" -X PUT \
+  -H "Authorization: Bearer $ADMIN" -H "Content-Type: application/json" \
+  "$KC/admin/realms/rossoctl/clients/$CID" -d '{"directAccessGrantsEnabled": true}'
+```
+
+Expect `enable DAG HTTP 204`. The grant stays on; set the field to `false` the
+same way to turn it off again.
+
+---
+
 ## Restore
 
 ```bash

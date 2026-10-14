@@ -817,8 +817,8 @@ make teardown ARGS=--include-opa   # also revert step 2's overlay and combiner (
 - **the `team1` namespace itself** — the installer owns it
   ([`INSTALL.md`](../../assets/INSTALL.md): "a precondition, not an output"). A fresh install gives
   you an *empty* `team1`, so emptying it *is* the post-install state.
-- **the realm fix-up** (Direct Access Grants) — one-time cluster state that this demo and the
-  `-m system` suite both depend on. The client scope `aiac-username-sub` and its links (D31) are
+- **the realm fix-up** (Direct Access Grants) — one-time cluster state that this demo depends on.
+  (The `-m system` suite enables the grant itself.) The client scope `aiac-username-sub` and its links (D31) are
   AIAC's; AIAC makes them again at its next start and onboarding.
 - **the operator's `*-aud` audience client scopes**, which it owns and recreates.
 - **step 2's OPA overlay**, unless you pass `--include-opa`.

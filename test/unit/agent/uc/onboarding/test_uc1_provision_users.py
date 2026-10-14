@@ -38,6 +38,9 @@ def _admin(existing: dict[str, dict] | None = None) -> MagicMock:
 
     admin.create_user.side_effect = create_user
     admin.get_user.side_effect = lambda user_id: {**(existing.get(user_id[3:]) or created[user_id[3:]])}
+    # The login client, with Direct Access Grants on (``test_uc1_login_client.py`` covers that step).
+    login = {"clientId": uc1.KEYCLOAK_CLIENT_ID, "id": "c", "directAccessGrantsEnabled": True}
+    admin.get_clients.return_value = [login]
     return admin
 
 
@@ -78,30 +81,3 @@ def test_an_existing_full_profile_is_not_changed() -> None:
     admin = _admin(profiles)
     uc1.provision_realm_and_users(admin, "rossoctl")
     admin.update_user.assert_not_called()
-
-
-def _login_admin(client: dict | None) -> MagicMock:
-    admin = MagicMock(name="KeycloakAdmin")
-    admin.get_clients.return_value = [] if client is None else [{"clientId": "other", "id": "x"}, client]
-    return admin
-
-
-def test_direct_access_grants_is_enabled_on_the_login_client() -> None:
-    admin = _login_admin({"clientId": "rossoctl", "id": "uuid-1", "directAccessGrantsEnabled": False})
-    assert uc1.ensure_direct_access_grants(admin) is True
-    ((client_uuid, payload),) = [c.args for c in admin.update_client.call_args_list]
-    assert client_uuid == "uuid-1"
-    assert payload["directAccessGrantsEnabled"] is True and payload["clientId"] == "rossoctl"
-
-
-def test_direct_access_grants_already_on_is_not_written() -> None:
-    admin = _login_admin({"clientId": "rossoctl", "id": "uuid-1", "directAccessGrantsEnabled": True})
-    assert uc1.ensure_direct_access_grants(admin) is True
-    admin.update_client.assert_not_called()
-
-
-def test_a_missing_login_client_is_not_created() -> None:
-    admin = _login_admin(None)
-    assert uc1.ensure_direct_access_grants(admin) is False
-    admin.update_client.assert_not_called()
-    admin.create_client.assert_not_called()

@@ -1033,10 +1033,11 @@ def verify_login_subject(
 
     The live loop keys OPA decisions on ``input.identity.subject`` (the token ``sub``). To mint the
     token, Direct Access Grants must be enabled on ``client_id``. The fixture enables it before this call
-    (``uc1_onboard.ensure_direct_access_grants``), so a mint failure here means the login client is
-    absent or the user cannot log in, and it is a skip. The ``sub`` = username comes from the client scope ``aiac-username-sub``, which
-    the IdP Configuration Service links as a default scope to the login client (``client_id``, by
-    default ``rossoctl``) at its startup and at each onboarding (D31). That is an AIAC step, not a prerequisite, so a wrong ``sub`` fails.
+    (``uc1_onboard.provision_realm_and_users`` -> ``ensure_direct_access_grants``, which fails on a missing
+    login client), so a mint failure here means the grant could not be written (the admin cannot manage
+    clients) or the user cannot log in, and it is a skip. The ``sub`` = username comes from the client
+    scope ``aiac-username-sub``, which the IdP Configuration Service links as a default scope to the
+    login client (``client_id``, by default ``rossoctl``) at its startup and at each onboarding (D31). That is an AIAC step, not a prerequisite, so a wrong ``sub`` fails.
     ``uc1_onboard.require_subject_scope`` checks the links again after each onboarding. Returns the
     minted token on success."""
     import pytest
@@ -1046,8 +1047,8 @@ def verify_login_subject(
     except Exception as exc:  # noqa: BLE001 — any mint failure is a skippable prerequisite gap
         pytest.skip(
             f"cannot mint a {user!r} token in realm {realm!r} via client {client_id!r}: {exc}. "
-            "Check that the login client exists in the realm, has Direct Access Grants on, and that "
-            "the user has a password and a full profile."
+            "Check that the login client has Direct Access Grants on (the fixture logs a warning if it "
+            "cannot enable it), and that the user has a password and a full profile."
         )
     sub = jwt_claim(token, "sub")
     if sub != user:
