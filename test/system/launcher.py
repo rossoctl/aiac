@@ -1032,9 +1032,9 @@ def verify_login_subject(
     and ``pytest.fail`` unless its ``sub`` equals ``user``.
 
     The live loop keys OPA decisions on ``input.identity.subject`` (the token ``sub``). To mint the
-    token, Direct Access Grants must be enabled on ``client_id`` — a one-time Keycloak prerequisite the
-    fixture does **not** provision (``demo/use-cases/onboarding/demo.md`` realm fix-up), so a mint
-    failure is a skip. The ``sub`` = username comes from the client scope ``aiac-username-sub``, which
+    token, Direct Access Grants must be enabled on ``client_id``. The fixture enables it before this call
+    (``uc1_onboard.ensure_direct_access_grants``), so a mint failure here means the login client is
+    absent or the user cannot log in, and it is a skip. The ``sub`` = username comes from the client scope ``aiac-username-sub``, which
     the IdP Configuration Service links as a default scope to the login client (``client_id``, by
     default ``rossoctl``) at its startup and at each onboarding (D31). That is an AIAC step, not a prerequisite, so a wrong ``sub`` fails.
     ``uc1_onboard.require_subject_scope`` checks the links again after each onboarding. Returns the
@@ -1046,8 +1046,8 @@ def verify_login_subject(
     except Exception as exc:  # noqa: BLE001 — any mint failure is a skippable prerequisite gap
         pytest.skip(
             f"cannot mint a {user!r} token in realm {realm!r} via client {client_id!r}: {exc}. "
-            "Enable Direct Access Grants on the client and set the user's password "
-            "(see the realm fix-up in demo/use-cases/onboarding/demo.md)."
+            "Check that the login client exists in the realm, has Direct Access Grants on, and that "
+            "the user has a password and a full profile."
         )
     sub = jwt_claim(token, "sub")
     if sub != user:

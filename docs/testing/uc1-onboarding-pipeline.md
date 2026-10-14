@@ -224,8 +224,9 @@ cleanly** when any of it is absent (they never stand it up, and never false-pass
   *[Scenario](#scenario)* — via `KeycloakAdmin` into `AIAC_TEST_REALM`, **before** deploying (the PRB
   reads the realm role universe when the event fires `onboard_and_apply`); idempotent; left in place.
   `verify_login_subject` mints a login token through the login client `rossoctl` and checks that its
-  `sub` is the username. It skips when it cannot mint the token (Direct Access Grants is a
-  prerequisite), and fails when `sub` is not the username. The `sub` comes from the client scope
+  `sub` is the username. The fixture first enables Direct Access Grants on `rossoctl`
+  (`ensure_direct_access_grants`). It skips when it still cannot mint the token (for example the
+  login client is absent), and fails when `sub` is not the username. The `sub` comes from the client scope
   `aiac-username-sub`, the one source of the rule (D31). The IdP Configuration Service links it to
   `rossoctl` at its startup and at each onboarding, so the link is an AIAC step, not a
   prerequisite. There is no `sub` client mapper on `rossoctl`. The exchanged token gets the same

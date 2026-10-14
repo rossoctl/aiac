@@ -1034,6 +1034,19 @@ def login_client(admin) -> dict | None:
     return next((c for c in admin.get_clients() if c.get("clientId") == KEYCLOAK_CLIENT_ID), None)
 
 
+def ensure_direct_access_grants(admin) -> bool:
+    """Enable Direct Access Grants on the login client (``KEYCLOAK_CLIENT_ID``) of ``TEST_REALM``, so
+    that ``mint_token`` can use the password grant. Idempotent: a client that has it already is not
+    written. Returns ``True`` if the client exists and has the grant on, ``False`` if the client is
+    absent (nothing is created: the realm owns its login client)."""
+    client = login_client(admin)
+    if client is None:
+        return False
+    if not client.get("directAccessGrantsEnabled"):
+        admin.update_client(client["id"], {**client, "directAccessGrantsEnabled": True})
+    return True
+
+
 def _workload_list(workloads: str | Sequence[str]) -> list[str]:
     """One workload name or a sequence of them, as a list."""
     return [workloads] if isinstance(workloads, str) else list(workloads)
@@ -1416,10 +1429,12 @@ def onboarded_stack(
         )
 
     provision_realm_and_users(admin, TEST_REALM)  # BEFORE deploying (PRB reads the role universe when the event fires)
-    # Direct Access Grants on the login client is a one-time realm prereq the fixture does NOT provision:
-    # skip if a token can't be minted. The login token's ``sub`` comes from ``aiac-username-sub``, which
-    # the IdP Configuration Service links to the login client at startup (D31): fail if it isn't the
-    # username. ``require_subject_scope`` below checks the links again after each onboarding.
+    # The fixture enables Direct Access Grants on the login client (the password grant of ``mint_token``
+    # needs it), then skips if a token still can't be minted. The login token's ``sub`` comes from
+    # ``aiac-username-sub``, which the IdP Configuration Service links to the login client at startup
+    # (D31): fail if it isn't the username. ``require_subject_scope`` below checks the links again after
+    # each onboarding.
+    ensure_direct_access_grants(admin)
     verify_login_subject(keycloak_url=keycloak_url, realm=TEST_REALM, user="dev-user", password=scn.USER_PASSWORD)
 
     tool_onboarded = scn.TOOL_WORKLOAD in workloads
