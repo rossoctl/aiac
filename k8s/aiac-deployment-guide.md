@@ -118,6 +118,33 @@ kubectl patch configmap aiac-agent-config -n aiac-system --type merge \
 Both are read by the Agent at startup, so a change to either takes effect on the next (re)start:
 `kubectl rollout restart deployment/aiac-agent -n aiac-system`.
 
+### Check or change the API key
+
+The Agent reads the key only from the Secret `aiac-agent-secret`. It does not read `.env`. Thus a new
+key in `.env` (for example after a rotation) does not reach the Agent until you update the Secret.
+
+Check that the endpoint accepts the key. HTTP `200` means that it accepts the key:
+
+```bash
+set -a; . .env; set +a
+curl -s -o /dev/null -w '%{http_code}\n' -H "Authorization: Bearer $LLM_API_KEY" "$LLM_BASE_URL/models"
+```
+
+Change the key, then restart the Agent:
+
+```bash
+kubectl create secret generic aiac-agent-secret -n aiac-system \
+  --from-literal=LLM_API_KEY="$LLM_API_KEY" --dry-run=client -o yaml | kubectl apply -f -
+kubectl rollout restart deployment/aiac-agent -n aiac-system
+kubectl rollout status deployment/aiac-agent -n aiac-system
+```
+
+If the endpoint refuses the key (HTTP `401` or `403`), each onboarding fails. The Agent logs
+`LLMCredentialsError` (logger `aiac.onboarding.llm_credentials`), rolls the onboarding back,
+quarantines the service and moves the event to `aiac.apply.dlq`. The service has no CR, so the
+combiner denies it (D20). After you fix the key, onboard each failed service again (see
+[UC1 → Failure & Rollback](../docs/specs/components/aiac-agent/uc1-service-onboarding.md#failure--rollback)).
+
 ## 4 — Configure the environment
 
 Edit the `aiac-pdp-config` ConfigMap in `pdp-interface-deployment.yaml` to match your environment:
@@ -353,8 +380,8 @@ kubectl rollout status deployment/aiac-agent -n aiac-system
   side, see `docs/agents/deploy.md`, `ac-side`.
 - `.env` must have `LLM_BASE_URL` and `LLM_MODEL`. If one is missing, the `:?` check stops the
   block before the apply. Then stop and ask. Do not leave the placeholder in the ConfigMap.
-- The Secret `aiac-agent-secret` (`LLM_API_KEY`) is not changed by this flow. To change it, see
-  step 3b.
+- The Secret `aiac-agent-secret` (`LLM_API_KEY`) is not changed by this flow, also when the key in
+  `.env` changed. To check or change the key, see step 3b, "Check or change the API key".
 
 ---
 

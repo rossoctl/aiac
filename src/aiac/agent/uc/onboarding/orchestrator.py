@@ -50,6 +50,7 @@ from fastapi import HTTPException
 from aiac.agent.policy_rules_builder.conflict_detection import PolicyConflictError
 from aiac.agent.policy_rules_builder.graph import (
     LLMAccessError,
+    LLMCredentialsError,
     PolicyRulesBuilderError,
     UnparseableLLMResponseError,
 )
@@ -67,9 +68,9 @@ from aiac.shared.logging_config import loggable
 logger = logging.getLogger(__name__)
 
 # The build failures that trigger the UC1 compensating rollback. A conflict finding
-# (``PolicyConflictError``) and the three hard PRB faults (``PolicyRulesBuilderError``,
-# ``LLMAccessError``, ``UnparseableLLMResponseError``) all leave a provisioned-but-unusable
-# service, so each rolls back what Provision created. Any other exception (e.g. an
+# (``PolicyConflictError``) and the four hard PRB faults (``PolicyRulesBuilderError``,
+# ``LLMAccessError``, ``UnparseableLLMResponseError``, ``LLMCredentialsError``) all leave a
+# provisioned-but-unusable service, so each rolls back what Provision created. Any other exception (e.g. an
 # ``HTTPException`` from IdP focus resolution) propagates untouched — no teardown.
 # ``EnforcementPreconditionError`` is deliberately NOT here (checkpoint O2): the checks run before
 # Provision, so nothing exists that needs compensation. A first onboarding then has no CR, so D20
@@ -79,6 +80,7 @@ _ROLLBACK_ERRORS = (
     PolicyRulesBuilderError,
     LLMAccessError,
     UnparseableLLMResponseError,
+    LLMCredentialsError,
 )
 
 

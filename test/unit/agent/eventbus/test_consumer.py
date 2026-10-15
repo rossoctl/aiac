@@ -36,6 +36,7 @@ from aiac.agent.policy_rules_builder.conflict_detection import PolicyConflictErr
 from aiac.agent.policy_rules_builder.diagnostic_models import ConflictReport, ConflictStatus
 from aiac.agent.policy_rules_builder.graph import (
     LLMAccessError,
+    LLMCredentialsError,
     PolicyContradictionError,
     PolicyRulesBuilderError,
     UnparseableLLMResponseError,
@@ -353,6 +354,8 @@ _PERMANENT_EXCEPTIONS = [
     PolicyContradictionError("scope:read", []),
     PolicyRulesBuilderError("builder blew up"),
     UnparseableLLMResponseError("cannot parse"),
+    # A refused LLM key needs a new key in the cluster first: no redelivery helps.
+    LLMCredentialsError("key refused"),
     # A failed onboarding precondition check (D30) needs a fix in the cluster first: no retry helps.
     EnforcementPreconditionError(["#1 sidecar: no authbridge-proxy container"]),
 ]

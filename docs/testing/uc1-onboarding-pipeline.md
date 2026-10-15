@@ -485,8 +485,10 @@ changed combiner denies a pod that has no client CR, so a deleted CR means deny.
     scope of the disabled agent client (`test_rollback_keeps_the_subject_scope`). Provision keeps the
     link out of the created-manifest, so the rollback does not delete it (D31);
   - the agent has **no SPM** in the policy store;
-  - the Controller log shows the injected error (`UnparseableLLMResponseError`) and the move of the event
-    to the dead-letter subject `aiac.apply.dlq`.
+  - the Controller log shows the PRB's chat-completions request to the injected URL and its `404`, the
+    injected error (`UnparseableLLMResponseError`) and the move of the event to the dead-letter subject
+    `aiac.apply.dlq`. The `404` line proves that the injection caused the failure: other LLM faults
+    (for example a schema-invalid response) raise the same error type.
 - **Failed tool:**
   - the tool's CR, which its phase-3 onboarding wrote, is **deleted** (phase 3 records the CR as present,
     so "no CR" is a real transition), and the tool has **no SPM**;

@@ -100,6 +100,12 @@ Preconditions:
 - `k8s/opa-kind-enable.sh` does both steps (run it one time).
 - The event path wired: the NATS broker and the `aiac-event-listener` Keycloak
   SPI (see `docs/testing/uc1-onboarding-pipeline.md`, "Preconditions").
+- An LLM key that the endpoint accepts, in the Controller's Secret
+  `aiac-system/aiac-agent-secret`. The in-cluster Controller does not read
+  `.env`. If the endpoint refuses the key, each onboarding rolls back, and the
+  fixtures time out with "agent did not converge" or "tool did not converge".
+  The Controller log then shows `LLMCredentialsError`. To check or change the
+  key: `k8s/aiac-deployment-guide.md`, step 3b, "Check or change the API key".
 
 Do **not** deploy the demo `github-agent` / `github-tool` yourself. The session
 fixture (`onboarded_stack` in `test/system/uc1_onboard.py`) builds and loads the

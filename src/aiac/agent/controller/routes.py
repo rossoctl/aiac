@@ -36,6 +36,7 @@ from aiac.agent.policy_rules_builder.conflict_detection import (
 )
 from aiac.agent.policy_rules_builder.graph import (
     LLMAccessError,
+    LLMCredentialsError,
     PolicyContradictionError,
     PolicyRulesBuilderBaseError,
     PolicyRulesBuilderError,
@@ -90,6 +91,13 @@ def _llm_access_error(_request: Request, exc: LLMAccessError) -> JSONResponse:
 @app.exception_handler(UnparseableLLMResponseError)
 def _unparseable_llm_response_error(_request: Request, exc: UnparseableLLMResponseError) -> JSONResponse:
     return _sanitized(exc, 502, "The policy language model returned an unusable response.")
+
+
+# The LLM endpoint refused the Controller's credentials (HTTP 401 / 403, e.g. a revoked API key):
+# an upstream fault the Controller cannot recover from until the key is fixed, so 502.
+@app.exception_handler(LLMCredentialsError)
+def _llm_credentials_error(_request: Request, exc: LLMCredentialsError) -> JSONResponse:
+    return _sanitized(exc, 502, "The policy language model endpoint rejected the Controller's credentials.")
 
 
 # The two grant/deny conflict mechanisms both surface as a 422 whose body IS a structured

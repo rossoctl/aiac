@@ -14,10 +14,13 @@ from __future__ import annotations
 from dataclasses import replace
 from unittest.mock import MagicMock, patch
 
+import httpx
+import openai
 import pytest
 
 from aiac.agent.llm import (
     LLMAccessError,
+    LLMCredentialsError,
     LLMSettings,
     UnparseableLLMResponseError,
     build_llm,
@@ -184,3 +187,36 @@ def test_raise_sanitized_uses_caller_supplied_error_types() -> None:
 
     with pytest.raises(MyAccess):
         raise_sanitized(TimeoutError("x"), access_error=MyAccess)
+
+
+def _openai_status_error(cls: type[openai.APIStatusError], status: int) -> openai.APIStatusError:
+    response = httpx.Response(status, request=httpx.Request("POST", "http://llm.example/v1/chat/completions"))
+    return cls(_POISON, response=response, body=None)
+
+
+@pytest.mark.parametrize(
+    ("cls", "status"),
+    [(openai.AuthenticationError, 401), (openai.PermissionDeniedError, 403)],
+    ids=["401", "403"],
+)
+def test_raise_sanitized_rejected_credentials_give_credentials_error(cls, status) -> None:
+    # The LLM proxy refuses the API key (401) or its permissions (403): not an unparseable response.
+    cause = _openai_status_error(cls, status)
+    with pytest.raises(LLMCredentialsError) as ei:
+        raise_sanitized(cause)
+    assert not isinstance(ei.value, UnparseableLLMResponseError)
+    assert _POISON not in str(ei.value)
+    assert ei.value.__cause__ is cause
+
+
+def test_raise_sanitized_other_4xx_stays_unparseable_error() -> None:
+    # A 404 (e.g. a wrong base URL path) keeps its old classification.
+    with pytest.raises(UnparseableLLMResponseError):
+        raise_sanitized(_openai_status_error(openai.NotFoundError, 404))
+
+
+def test_raise_sanitized_uses_caller_supplied_credentials_error_type() -> None:
+    class MyCredentials(LLMCredentialsError): ...
+
+    with pytest.raises(MyCredentials):
+        raise_sanitized(_openai_status_error(openai.AuthenticationError, 401), credentials_error=MyCredentials)

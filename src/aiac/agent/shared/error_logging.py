@@ -20,6 +20,7 @@ import logging
 from aiac.agent.policy_rules_builder.conflict_detection import PolicyConflictError
 from aiac.agent.policy_rules_builder.graph import (
     LLMAccessError,
+    LLMCredentialsError,
     PolicyContradictionError,
     PolicyRulesBuilderError,
     UnparseableLLMResponseError,
@@ -32,6 +33,7 @@ from aiac.agent.policy_rules_builder.graph import (
 _LOGGER_BY_TYPE: dict[type[BaseException], str] = {
     LLMAccessError: "aiac.onboarding.llm_access",
     UnparseableLLMResponseError: "aiac.onboarding.llm_response",
+    LLMCredentialsError: "aiac.onboarding.llm_credentials",
     PolicyContradictionError: "aiac.onboarding.contradiction",
     PolicyConflictError: "aiac.onboarding.contradiction",
     PolicyRulesBuilderError: "aiac.onboarding.builder",
