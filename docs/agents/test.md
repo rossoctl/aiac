@@ -94,12 +94,16 @@ assert the allow/deny of the **deployed OPA plugin**. They do not use
 
 Preconditions:
 
-- A rossoctl/Kind cluster with the AuthBridge OPA pipeline wired into both legs.
-- The AIAC global combiner. It denies a pod that has no `AuthorizationPolicy`
-  CR, and the Controller does not start without it.
-- `k8s/opa-kind-enable.sh` does both steps (run it one time).
-- The event path wired: the NATS broker and the `aiac-event-listener` Keycloak
-  SPI (see `docs/testing/uc1-onboarding-pipeline.md`, "Preconditions").
+- AIAC deployed on a rossoctl/Kind cluster that meets the platform
+  preconditions in `k8s/aiac-deployment-guide.md` → Platform preconditions: OPA
+  on the Kind platform (with the AIAC global combiner, which denies a pod that
+  has no `AuthorizationPolicy` CR) and the Keycloak event-listener SPI.
+- An LLM key that the endpoint accepts, in the Controller's Secret
+  `aiac-system/aiac-agent-secret`. The in-cluster Controller does not read
+  `.env`. If the endpoint refuses the key, each onboarding rolls back, and the
+  fixtures time out with "agent did not converge" or "tool did not converge".
+  The Controller log then shows `LLMCredentialsError`. To check or change the
+  key: `k8s/aiac-deployment-guide.md`, step 3b, "Check or change the API key".
 
 Do **not** deploy the demo `github-agent` / `github-tool` yourself. The session
 fixture (`onboarded_stack` in `test/system/uc1_onboard.py`) builds and loads the
@@ -114,12 +118,17 @@ test both sides, run the lane, do a clean redeploy with the other side (see
 `docs/agents/deploy.md`), and run the lane again.
 
 The platform prerequisites, wiring, verification and the setting of the side:
-`k8s/opa-kind-runbook.md`. The realm fix-up (Direct Access Grants) and the manual
-probes of the scenario: `demo/use-cases/onboarding/demo.md`. The per-loop shape:
-`test/system/uc1_onboard.py`.
+`k8s/opa-kind-runbook.md`. The fixture enables Direct Access Grants on the login
+client `rossoctl` itself, once per session, and turns it off again at session end
+if it turned it on, so the lane needs no manual realm step. A client attribute
+records that the harness turned it on, so a run that is killed is undone by the
+next run. A
+manual probe with the password grant outside the lane needs the grant set by hand:
+see the runbook section "Direct Access Grants on the login client". The per-loop
+shape: `test/system/uc1_onboard.py`.
 
 ```bash
-k8s/opa-kind-enable.sh          # one time: wire the OPA plugin and the AIAC combiner into Kind
+k8s/opa-kind-verify.sh && k8s/keycloak-spi-verify.sh   # the platform preconditions
 set -a; . .env; set +a
 .venv/bin/pytest -m system
 ```

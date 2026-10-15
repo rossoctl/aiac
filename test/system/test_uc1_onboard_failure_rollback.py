@@ -54,6 +54,10 @@ consumer leaves un-acked (no ``nak``), so each of the ``MAX_DELIVER=5`` redelive
 the onboarding after the seam is restored, racing the lift (and the teardown). The 404 is also
 independent of the real LLM provider (no bad-key / bad-model behaviour to depend on). The rest of the
 path is the same: both errors are in ``_ROLLBACK_ERRORS``, so the rollback and quarantine are identical.
+The error type alone does not prove that the injection caused the failure: every LLM fault that is not
+transient and not a refused credential (a schema-invalid response, another 4xx) also raises
+``UnparseableLLMResponseError``. So the log check also asks for the PRB's chat-completions request to
+``UNUSABLE_LLM_BASE_URL`` and its 404 (``_injected_request_line``).
 
 **Re-onboarding trigger — the NATS subject.** ``publish_service_event`` publishes
 ``aiac.apply.service.<uuid>`` (the subject + payload the ``aiac-event-listener`` SPI emits on
@@ -117,6 +121,13 @@ LIFT_TIMEOUT = float(os.environ.get("AIAC_ROLLBACK_LIFT_TIMEOUT", "600"))
 # What the injection makes the consumer log (``log_by_type`` + the dead-letter move, both at ERROR).
 INJECTED_ERROR = "UnparseableLLMResponseError"
 DLQ_SUBJECT = "aiac.apply.dlq"
+
+
+def _injected_request_line() -> str:
+    """The Controller's httpx log line for the PRB call that the injection answers: the chat-completions
+    request to ``uc1.UNUSABLE_LLM_BASE_URL``, answered 404. Up to the status code, so the reason phrase
+    does not matter."""
+    return f'HTTP Request: POST {uc1.UNUSABLE_LLM_BASE_URL.rstrip("/")}/chat/completions "HTTP/1.1 404'
 
 
 def _dlq_line(uuid: str) -> str:
@@ -411,8 +422,14 @@ def test_failed_service_has_no_spm(run: dict, key: str) -> None:
 @pytest.mark.parametrize("key", ["agent_failed", "tool_failed"])
 def test_failure_logged_and_dead_lettered(run: dict, key: str) -> None:
     """The Controller logs the build failure (its type) and moves the event to the DLQ as a
-    **permanent** failure on the first delivery — the injection's error, never a redelivery loop."""
+    **permanent** failure on the first delivery — the injection's error, never a redelivery loop. The
+    PRB's request to the injected URL and its 404 prove that the injection caused the failure, not
+    another LLM fault of the same type (module docstring)."""
     obs = _failed(run, key)
+    assert _injected_request_line() in obs["logs"], (
+        f"{key}: no {_injected_request_line()!r} in the Controller log — the build failed, but not on the "
+        "injected 404. Did the injection reach the Controller?"
+    )
     assert INJECTED_ERROR in obs["logs"], f"{key}: no {INJECTED_ERROR!r} in the Controller log"
     assert _dlq_line(obs["uuid"]) in obs["logs"], f"{key}: no dead-letter line {_dlq_line(obs['uuid'])!r}"
 

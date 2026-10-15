@@ -224,8 +224,12 @@ cleanly** when any of it is absent (they never stand it up, and never false-pass
   *[Scenario](#scenario)* — via `KeycloakAdmin` into `AIAC_TEST_REALM`, **before** deploying (the PRB
   reads the realm role universe when the event fires `onboard_and_apply`); idempotent; left in place.
   `verify_login_subject` mints a login token through the login client `rossoctl` and checks that its
-  `sub` is the username. It skips when it cannot mint the token (Direct Access Grants is a
-  prerequisite), and fails when `sub` is not the username. The `sub` comes from the client scope
+  `sub` is the username. Before the pre-run slate, the fixture enables Direct Access Grants on
+  `rossoctl` (`hold_direct_access_grants`, once per session; the session end turns it off again if the
+  harness turned it on, and the client attribute `aiac.test.direct-access-grants-by-harness` records
+  that, so the next run undoes a killed run) and skips with the cause if the realm or `rossoctl` is
+  absent or the admin cannot manage clients. It skips when it
+  still cannot mint the token, and fails when `sub` is not the username. The `sub` comes from the client scope
   `aiac-username-sub`, the one source of the rule (D31). The IdP Configuration Service links it to
   `rossoctl` at its startup and at each onboarding, so the link is an AIAC step, not a
   prerequisite. There is no `sub` client mapper on `rossoctl`. The exchanged token gets the same
@@ -481,8 +485,10 @@ changed combiner denies a pod that has no client CR, so a deleted CR means deny.
     scope of the disabled agent client (`test_rollback_keeps_the_subject_scope`). Provision keeps the
     link out of the created-manifest, so the rollback does not delete it (D31);
   - the agent has **no SPM** in the policy store;
-  - the Controller log shows the injected error (`UnparseableLLMResponseError`) and the move of the event
-    to the dead-letter subject `aiac.apply.dlq`.
+  - the Controller log shows the PRB's chat-completions request to the injected URL and its `404`, the
+    injected error (`UnparseableLLMResponseError`) and the move of the event to the dead-letter subject
+    `aiac.apply.dlq`. The `404` line proves that the injection caused the failure: other LLM faults
+    (for example a schema-invalid response) raise the same error type.
 - **Failed tool:**
   - the tool's CR, which its phase-3 onboarding wrote, is **deleted** (phase 3 records the CR as present,
     so "no CR" is a real transition), and the tool has **no SPM**;

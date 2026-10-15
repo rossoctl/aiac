@@ -17,6 +17,49 @@ This guide covers the full AIAC deployment in the `aiac-system` namespace.
 - Keycloak reachable from within the cluster (default: `http://keycloak-service.keycloak.svc:8080`).
 - For local Kind clusters: `kind` CLI and `docker`.
 
+## Platform preconditions
+
+Two platform preconditions apply to every deploy of an AIAC unit in `aiac-system`, also to a
+deploy that changes only a parameter. Check both before you deploy, in this order. If a check
+fails, install that precondition, then deploy.
+
+### OPA on the Kind platform
+
+AIAC needs OPA in the AuthBridge pipeline, `bundle-service`, and the changed global combiner
+(D20). Without them the AIAC Controller does not start.
+
+| | |
+|---|---|
+| Check | `./k8s/opa-kind-verify.sh` (read-only, exits non-zero on the first failed check) |
+| Install | `OPERATOR_DIR=… ROSSOCTL_DIR=… CORTEX_DIR=… ./k8s/opa-kind-enable.sh`, from the repo root. Details: [`opa-kind-runbook.md` → Enable](opa-kind-runbook.md#enable) |
+| Install warning | Two image builds (a few minutes). It runs `helm upgrade` on the rossoctl chart and restarts the agent and tool pods in `team1`. |
+| Inputs | Sibling clones `operator`, `rossoctl`, `cortex`. Defaults are `../operator`, `../rossoctl`, `../cortex`, relative to the repo root. If one is missing, stop and ask for its path. |
+| Re-check | After any `kubectl apply` of a platform manifest or an operator-chart upgrade. The check also fails when the stock combiner is back. |
+
+The install runs the verify script as its last step, so after an install the check has already
+passed once.
+
+`k8s/opa-kind-enable.sh` and `k8s/opa-kind-restore.sh` run `helm upgrade` on the rossoctl chart.
+This can put the stock Keycloak image back. After either script, do the Keycloak SPI check below.
+
+### Keycloak event-listener SPI
+
+AIAC learns of a new Keycloak client from the `aiac-event-listener` SPI, which publishes to the
+NATS broker. Without it no registration event reaches the Controller, and the onboarding path
+(and the system test lane) does not work.
+
+| | |
+|---|---|
+| Check | `./k8s/keycloak-spi-verify.sh` (read-only, exits non-zero on the first failed check) |
+| Install | `./k8s/keycloak-spi-install.sh`, from the repo root |
+| Install warning | One image build (maven container, then a derived Keycloak image). It restarts the Keycloak StatefulSet once, so Keycloak is down for a short time. On the realm it adds `aiac-event-listener` to the event listeners and turns on admin events. The other event settings stay. |
+| Inputs | The OPA precondition above first (the platform must be on Kind). A broker in `aiac-system` is not needed to install, but the listener drops events until `aiac-event-broker` runs. Both scripts read `KEYCLOAK_ADMIN_USERNAME` / `KEYCLOAK_ADMIN_PASSWORD` from the environment, else from `.env`, else from secret `aiac-system/keycloak-admin-secret`, else use `admin`. |
+| Re-install | The install records the stock Keycloak image in the StatefulSet annotation `aiac.rossoctl.dev/keycloak-base-image`, so a re-run derives from the same image. If the live image is the derived one and the annotation is missing (an install by an older script), the install stops: set `KEYCLOAK_IMAGE_BASE` to the stock image. |
+| Re-check | After any change of the Keycloak StatefulSet. It can put the stock Keycloak image back. |
+
+The install runs the verify script as its last step, so after an install the check has already
+passed once.
+
 ## 1 — Build the images
 
 Run from the repo root:
@@ -117,6 +160,36 @@ kubectl patch configmap aiac-agent-config -n aiac-system --type merge \
 
 Both are read by the Agent at startup, so a change to either takes effect on the next (re)start:
 `kubectl rollout restart deployment/aiac-agent -n aiac-system`.
+
+### Check or change the API key
+
+The Agent reads the key only from the Secret `aiac-agent-secret`. It does not read `.env`. Thus a new
+key in `.env` (for example after a rotation) does not reach the Agent until you update the Secret.
+The rebuild flow ("Rebuilding the AIAC Agent: always reload its LLM configuration") updates it
+from `.env` together with the endpoint and the model. Use the commands below to change only the
+key, without a rebuild.
+
+Check that the endpoint accepts the key. HTTP `200` means that it accepts the key:
+
+```bash
+set -a; . .env; set +a
+curl -s -o /dev/null -w '%{http_code}\n' -H "Authorization: Bearer $LLM_API_KEY" "$LLM_BASE_URL/models"
+```
+
+Change the key, then restart the Agent:
+
+```bash
+kubectl create secret generic aiac-agent-secret -n aiac-system \
+  --from-literal=LLM_API_KEY="$LLM_API_KEY" --dry-run=client -o yaml | kubectl apply -f -
+kubectl rollout restart deployment/aiac-agent -n aiac-system
+kubectl rollout status deployment/aiac-agent -n aiac-system
+```
+
+If the endpoint refuses the key (HTTP `401` or `403`), each onboarding fails. The Agent logs
+`LLMCredentialsError` (logger `aiac.onboarding.llm_credentials`), rolls the onboarding back,
+quarantines the service and moves the event to `aiac.apply.dlq`. The service has no CR, so the
+combiner denies it (D20). After you fix the key, onboard each failed service again (see
+[UC1 → Failure & Rollback](../docs/specs/components/aiac-agent/uc1-service-onboarding.md#failure--rollback)).
 
 ## 4 — Configure the environment
 
@@ -312,6 +385,70 @@ kind load docker-image localhost/aiac-pdp-config:local --name <cluster-name>
 # Restart the affected deployment:
 kubectl rollout restart deployment/aiac-interface -n aiac-system
 ```
+
+### Rebuilding the AIAC Agent: always reload its LLM configuration
+
+Every time you rebuild `localhost/aiac-agent:local`, also reload the LLM configuration: the
+endpoint and the model into the `aiac-agent-config` ConfigMap, and the key into the
+`aiac-agent-secret` Secret. Do not skip it, also when only code changed. It makes sure the Agent
+runs with the LLM endpoint, model **and key** of the repo-root `.env`, as one set. If you swap the
+LLM in `.env` (another endpoint with its own key), the next rebuild moves all three together. An
+endpoint from `.env` with an older key in the cluster gives HTTP `401` on each onboarding.
+
+```bash
+docker build -f src/aiac/agent/controller/Dockerfile -t localhost/aiac-agent:local src/
+kind load docker-image localhost/aiac-agent:local --name <cluster-name>
+
+# Reload the LLM configuration: the apply writes the manifest value of each ConfigMap key (the LLM
+# keys are placeholders). The patch puts every live key back and then the real LLM values from
+# .env (step 3b). The Secret gets the key from the same .env. A subshell: a failed check or step
+# stops the rest of the block, not your shell.
+( set -eo pipefail
+set -a; . .env; set +a
+: "${LLM_BASE_URL:?missing in .env}" "${LLM_MODEL:?missing in .env}" "${LLM_API_KEY:?missing in .env}"
+# Check the .env set BEFORE any change: the endpoint must accept the key. If not, the block stops
+# and the running Agent keeps its configuration.
+RESP=$(curl -s -w '\n%{http_code}' -H "Authorization: Bearer $LLM_API_KEY" "$LLM_BASE_URL/models" || true)
+CODE=${RESP##*$'\n'}
+[ "$CODE" = 200 ] || { echo "ERROR: $LLM_BASE_URL/models answered HTTP $CODE to the .env key. Fix .env first." >&2; exit 1; }
+printf '%s' "${RESP%$'\n'*}" | jq -e --arg m "$LLM_MODEL" 'any(.data[]?; .id == $m)' >/dev/null \
+  || echo "WARNING: $LLM_MODEL is not in the model list of $LLM_BASE_URL. Check LLM_MODEL in .env." >&2
+# Read ALL live keys BEFORE the apply: the apply resets each key to its manifest value.
+LIVE=$(kubectl get configmap aiac-agent-config -n aiac-system -o json | jq -c '.data // {}')
+kubectl apply -f k8s/agent-deployment.yaml
+# Live keys first, the .env LLM values on top. jq builds the JSON, so a quote or a backslash in
+# a value cannot break the patch.
+kubectl patch configmap aiac-agent-config -n aiac-system --type merge -p "$(jq -n \
+  --argjson live "$LIVE" --arg url "$LLM_BASE_URL" --arg model "$LLM_MODEL" \
+  '{data: ($live + {LLM_BASE_URL: $url, LLM_MODEL: $model})}')"
+# The key, from the same .env. The Secret holds only LLM_API_KEY, so a full replace is safe.
+kubectl create secret generic aiac-agent-secret -n aiac-system \
+  --from-literal=LLM_API_KEY="$LLM_API_KEY" --dry-run=client -o yaml | kubectl apply -f -
+
+# Restart AFTER the patch and the Secret. The Agent reads both at start only.
+kubectl rollout restart deployment/aiac-agent -n aiac-system
+kubectl rollout status deployment/aiac-agent -n aiac-system
+)
+```
+
+- The apply writes the manifest value of each key, for example `AIAC_ENFORCEMENT_SIDE`
+  (`target-side`), `LOG_LEVEL` (`INFO`) and `LLM_REQUEST_TIMEOUT` (`120`). The block reads all
+  live keys before the apply and patches them back before the restart. Thus an `agent-side`
+  deployment stays `agent-side`, and a tuned key (for example `LLM_MAX_RETRIES` or
+  `LLM_RETRY_BACKOFF_MAX`) keeps its live value. Only a key that is new in the manifest gets its
+  manifest value. To set a key back to its manifest default, patch it by hand. To change the
+  side, see `docs/agents/deploy.md`, `ac-side`.
+- `.env` must have `LLM_BASE_URL`, `LLM_MODEL` and `LLM_API_KEY`. If one is missing, the `:?`
+  check stops the block before the apply. Then stop and ask. Do not leave the placeholder in the
+  ConfigMap.
+- The block checks the `.env` set before it changes anything: `GET $LLM_BASE_URL/models` with the
+  `.env` key must answer HTTP `200`. Any other answer (`401`: the endpoint does not know the key;
+  `000`: the endpoint is unreachable) stops the block, and the cluster keeps its configuration.
+  If the model list does not contain `LLM_MODEL`, the block only warns, because an endpoint can
+  serve a model that it does not list.
+- The AIAC procedures write the key only from `.env`: this block, step 3b and the clean redeploy
+  in `opa-kind-runbook.md`. A script that writes `aiac-agent-secret` from another source can put
+  back a key that does not match the `.env` endpoint. Run this block after such a script.
 
 ---
 

@@ -9,6 +9,8 @@ retries (slice 9) patch graph._build_llm + time.sleep instead.
 from contextlib import ExitStack
 from unittest.mock import MagicMock, patch
 
+import httpx
+import openai
 import pytest
 from openai import APIConnectionError, APITimeoutError
 
@@ -16,6 +18,7 @@ from aiac.agent.policy_rules_builder.graph import (
     AuditVerdict,
     Contradiction,
     LLMAccessError,
+    LLMCredentialsError,
     PolicyContradictionError,
     PolicyRulesBuilderBaseError,
     PolicyRulesBuilderError,
@@ -350,6 +353,21 @@ def test_parse_error_raises_sanitized_unparseable_response_error(monkeypatch):
     message = str(raised)
     for secret in _LEAK_SUBSTRINGS:
         assert secret not in message  # message is sanitized -- no endpoint/host/key leak
+
+
+def test_rejected_api_key_raises_sanitized_credentials_error_without_retry(monkeypatch):
+    # The LLM proxy answers 401 (a refused API key): not transient, so not retried, and typed as
+    # LLMCredentialsError -- not UnparseableLLMResponseError, which hid the cause in the logs.
+    response = httpx.Response(401, request=httpx.Request("POST", _FAKE_ENDPOINT))
+    leaky = openai.AuthenticationError(f"Invalid proxy server token key={_FAKE_KEY}", response=response, body=None)
+    raised = _run_with_failing_invoke(leaky, monkeypatch)
+
+    assert type(raised) is LLMCredentialsError
+    assert isinstance(raised, PolicyRulesBuilderBaseError)  # shares the PRB base hierarchy
+    assert raised.__cause__ is leaky
+    message = str(raised)
+    for secret in _LEAK_SUBSTRINGS:
+        assert secret not in message
 
 
 # =========================================================================== #

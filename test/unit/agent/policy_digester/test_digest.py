@@ -10,10 +10,12 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+import httpx
+import openai
 import pytest
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from aiac.agent.llm import LLMAccessError, UnparseableLLMResponseError
+from aiac.agent.llm import LLMAccessError, LLMCredentialsError, UnparseableLLMResponseError
 from aiac.agent.policy_digester import digest_policy
 
 _SRC = "Developers may read the source repository. Testers may not write issues."
@@ -84,4 +86,17 @@ def test_digest_call_sanitizes_permanent_as_unparseable_error() -> None:
         patch("aiac.agent.policy_digester.digest.call_with_retry", side_effect=ValueError("bad")),
     ):
         with pytest.raises(UnparseableLLMResponseError):
+            digest_policy(_SRC)
+
+
+def test_digest_call_sanitizes_rejected_key_as_credentials_error() -> None:
+    response = httpx.Response(401, request=httpx.Request("POST", "http://llm.example/v1/chat/completions"))
+    with (
+        patch("aiac.agent.policy_digester.digest.build_llm", return_value=MagicMock()),
+        patch(
+            "aiac.agent.policy_digester.digest.call_with_retry",
+            side_effect=openai.AuthenticationError("bad key", response=response, body=None),
+        ),
+    ):
+        with pytest.raises(LLMCredentialsError):
             digest_policy(_SRC)

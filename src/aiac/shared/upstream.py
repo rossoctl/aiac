@@ -35,7 +35,7 @@ def max_retries() -> int:
     return value if value > 0 else _DEFAULT_MAX_RETRIES
 
 
-def _status_code(exc: BaseException) -> int | None:
+def http_status(exc: BaseException) -> int | None:
     """Best-effort HTTP status of an exception: ``requests`` HTTPError carries it on
     ``.response.status_code``; a Kubernetes ``ApiException`` and the IdP library's ``IdPHTTPError``
     carry it on ``.status``. Only an ``int`` or a numeric ``str`` is a status: any other value (also
@@ -79,7 +79,7 @@ def is_transient(exc: BaseException) -> bool:
     # permanent, dead-lettering an onboard on a transient LLM blip.
     if any(base.__name__ in transient_names for base in type(exc).__mro__):
         return True
-    status = _status_code(exc)
+    status = http_status(exc)
     return status is not None and status >= 500
 
 

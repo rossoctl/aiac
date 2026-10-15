@@ -172,6 +172,9 @@ def test_cross_service_conflict_is_surfaced_as_422_conflict_report() -> None:
         uc1.cleanup_provisioned(admin, TEST_REALM)  # clean slate (Keycloak)
         uc1.clear_policy_store()  # clean slate ONCE — NOT between phases (the agent must see the tool's rule)
         uc1.provision_realm_and_users(admin, TEST_REALM)  # PRB reads the role universe
+        # After the provisioning: it creates the realm, so a missing login client is the true skip cause.
+        # Turned off again at session end if the harness turned it on.
+        uc1.hold_direct_access_grants(admin, TEST_REALM)
         uc1.verify_login_subject(
             keycloak_url=keycloak_url, realm=TEST_REALM, user="test-user", password=scn.USER_PASSWORD
         )

@@ -13,6 +13,7 @@ from aiac.agent.policy_rules_builder.diagnostic_models import ConflictReport
 from aiac.agent.policy_rules_builder.graph import (
     Contradiction,
     LLMAccessError,
+    LLMCredentialsError,
     PolicyContradictionError,
     PolicyRulesBuilderError,
     UnparseableLLMResponseError,
@@ -60,6 +61,19 @@ def test_unparseable_llm_response_error_routes_to_llm_response_logger(caplog):
     records = _onboarding_records(caplog)
     assert len(records) == 1
     assert records[0].name == "aiac.onboarding.llm_response"
+    assert records[0].levelno == logging.ERROR
+
+
+def test_llm_credentials_error_routes_to_llm_credentials_logger(caplog):
+    with caplog.at_level(logging.DEBUG):
+        try:
+            raise LLMCredentialsError("LLM endpoint rejected the credentials")
+        except LLMCredentialsError as exc:
+            log_by_type(exc)
+
+    records = _onboarding_records(caplog)
+    assert len(records) == 1
+    assert records[0].name == "aiac.onboarding.llm_credentials"
     assert records[0].levelno == logging.ERROR
 
 

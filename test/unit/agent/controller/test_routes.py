@@ -19,6 +19,7 @@ from aiac.agent.policy_rules_builder.diagnostic_models import ConflictStatus, Fo
 from aiac.agent.policy_rules_builder.graph import (
     Contradiction,
     LLMAccessError,
+    LLMCredentialsError,
     PolicyContradictionError,
     PolicyRulesBuilderBaseError,
     PolicyRulesBuilderError,
@@ -411,6 +412,19 @@ def test_llm_access_error_surfaces_502_with_sanitized_body_and_no_leak():
 def test_unparseable_llm_response_error_surfaces_502_with_sanitized_body_and_no_leak():
     # A reachable-but-unparseable LLM response is likewise an upstream fault (502), sanitized.
     err = UnparseableLLMResponseError(_POISON)
+    with (
+        patch("aiac.agent.controller.routes.onboard_and_apply", side_effect=err),
+        patch("aiac.agent.controller.routes.compute_and_apply") as pce,
+    ):
+        resp = client.post("/apply/service/svc-llm")
+
+    _assert_sanitized(resp, 502)
+    pce.assert_not_called()
+
+
+def test_llm_credentials_error_surfaces_502_with_sanitized_body_and_no_leak():
+    # The LLM endpoint refused the Controller's API key: an upstream fault (502), sanitized.
+    err = LLMCredentialsError(_POISON)
     with (
         patch("aiac.agent.controller.routes.onboard_and_apply", side_effect=err),
         patch("aiac.agent.controller.routes.compute_and_apply") as pce,
