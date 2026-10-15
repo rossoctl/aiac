@@ -8,11 +8,13 @@ root cause (via ``exc_info``) — to **stdout** through the stdlib ``logging`` m
 are no per-exception files: the container rootfs is read-only and ``/tmp`` is ephemeral, so
 persistence is the log pipeline's job, not this router's.
 
-The four PRB errors share a base but are siblings (none inherits from another); the
-report-carrying ``PolicyConflictError`` is a separate class. Both grant/deny findings
-(``PolicyContradictionError`` intra-pass, ``PolicyConflictError`` cross-pass) aggregate on
-the same ``aiac.onboarding.contradiction`` logger. The type→logger mapping is the authority
-here — it does not recompute anything the callers do.
+The five PRB errors (``PolicyRulesBuilderError``, ``LLMAccessError``,
+``UnparseableLLMResponseError``, ``LLMCredentialsError``, ``PolicyContradictionError``) share a
+base but are siblings (none inherits from another); the report-carrying ``PolicyConflictError``
+is a separate class. Both grant/deny findings (``PolicyContradictionError`` intra-pass,
+``PolicyConflictError`` cross-pass) aggregate on the same ``aiac.onboarding.contradiction``
+logger. The type→logger mapping is the authority here — it does not recompute anything the
+callers do.
 """
 
 import logging

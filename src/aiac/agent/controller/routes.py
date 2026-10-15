@@ -142,8 +142,9 @@ def _enforcement_precondition_error(_request: Request, exc: EnforcementPrecondit
 # sanitized the same way (never leaks, full detail logged). Registering the base-class net after
 # the specific handlers keeps the intent explicit; resolution itself is by specificity, not order —
 # Starlette walks the exception's MRO and picks the most-specific REGISTERED handler, so a mapped
-# subclass (``LLMAccessError``, ``UnparseableLLMResponseError``, ``PolicyRulesBuilderError``,
-# ``PolicyContradictionError``) always wins over this base handler and never falls through to 500.
+# subclass (``LLMAccessError``, ``UnparseableLLMResponseError``, ``LLMCredentialsError``,
+# ``PolicyRulesBuilderError``, ``PolicyContradictionError``) always wins over this base handler
+# and never falls through to 500.
 @app.exception_handler(PolicyRulesBuilderBaseError)
 def _policy_builder_base_error(_request: Request, exc: PolicyRulesBuilderBaseError) -> JSONResponse:
     return _sanitized(exc, 500, "The policy build failed unexpectedly.")

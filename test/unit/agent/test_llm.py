@@ -209,6 +209,41 @@ def test_raise_sanitized_rejected_credentials_give_credentials_error(cls, status
     assert ei.value.__cause__ is cause
 
 
+def _status_error(status: int) -> openai.APIStatusError:
+    """The openai error for ``status``: ``RateLimitError`` for 429, the generic ``APIStatusError`` else."""
+    return _openai_status_error(openai.RateLimitError if status == 429 else openai.APIStatusError, status)
+
+
+@pytest.mark.parametrize("status", [408, 429], ids=["408", "429"])
+def test_call_with_retry_retries_request_timeout_and_rate_limit(monkeypatch: pytest.MonkeyPatch, status: int) -> None:
+    # A rate limit (429) or a request timeout (408) can clear on the next attempt: it is retried.
+    monkeypatch.setattr("time.sleep", lambda _s: None)  # no real backoff in a unit test
+    runnable = MagicMock()
+    runnable.invoke.side_effect = [_status_error(status), "ok"]
+    assert call_with_retry(runnable, ["msg"], settings=_SETTINGS) == "ok"
+    assert runnable.invoke.call_count == 2
+
+
+@pytest.mark.parametrize("status", [408, 429], ids=["408", "429"])
+def test_exhausted_request_timeout_and_rate_limit_give_access_error(
+    monkeypatch: pytest.MonkeyPatch, status: int
+) -> None:
+    # When the retries are exhausted, the error is an access error (as for a 5xx), not an unparseable one.
+    monkeypatch.setattr("time.sleep", lambda _s: None)
+    cause = _status_error(status)
+    runnable = MagicMock()
+    runnable.invoke.side_effect = cause
+    with pytest.raises(openai.APIStatusError) as raw:
+        call_with_retry(runnable, ["msg"], settings=replace(_SETTINGS, max_retries=3))
+    assert raw.value is cause
+    assert runnable.invoke.call_count == 3
+    with pytest.raises(LLMAccessError) as ei:
+        raise_sanitized(raw.value)
+    assert not isinstance(ei.value, UnparseableLLMResponseError)
+    assert _POISON not in str(ei.value)
+    assert ei.value.__cause__ is cause
+
+
 def test_raise_sanitized_other_4xx_stays_unparseable_error() -> None:
     # A 404 (e.g. a wrong base URL path) keeps its old classification.
     with pytest.raises(UnparseableLLMResponseError):
