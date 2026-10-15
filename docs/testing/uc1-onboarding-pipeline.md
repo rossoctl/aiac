@@ -225,9 +225,9 @@ cleanly** when any of it is absent (they never stand it up, and never false-pass
   reads the realm role universe when the event fires `onboard_and_apply`); idempotent; left in place.
   `verify_login_subject` mints a login token through the login client `rossoctl` and checks that its
   `sub` is the username. `provision_realm_and_users` first enables Direct Access Grants on
-  `rossoctl` (`ensure_direct_access_grants`, left on) and fails if `rossoctl` is absent. It skips
-  when it still cannot mint the token (for example the admin cannot manage clients), and fails when
-  `sub` is not the username. The `sub` comes from the client scope
+  `rossoctl` (`ensure_direct_access_grants`; the teardown turns it off again if it was off) and
+  skips with the cause if `rossoctl` is absent or the admin cannot manage clients. It skips when it
+  still cannot mint the token, and fails when `sub` is not the username. The `sub` comes from the client scope
   `aiac-username-sub`, the one source of the rule (D31). The IdP Configuration Service links it to
   `rossoctl` at its startup and at each onboarding, so the link is an AIAC step, not a
   prerequisite. There is no `sub` client mapper on `rossoctl`. The exchanged token gets the same

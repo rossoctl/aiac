@@ -167,11 +167,12 @@ def test_cross_service_conflict_is_surfaced_as_422_conflict_report() -> None:
     # Open the cleanup guard BEFORE the first shared-state mutation: the clean-slate steps below
     # (Agent CR delete, Keycloak cleanup, Policy Store clear, provisioning) already mutate shared
     # cluster state, so a failure mid-setup must still hit the ``finally`` teardown.
+    grant_enabled = False
     try:
         uc1.delete_workload_crs()  # clean policy slate (drop any prior run's CRs)
         uc1.cleanup_provisioned(admin, TEST_REALM)  # clean slate (Keycloak)
         uc1.clear_policy_store()  # clean slate ONCE — NOT between phases (the agent must see the tool's rule)
-        uc1.provision_realm_and_users(admin, TEST_REALM)  # PRB reads the role universe
+        grant_enabled = uc1.provision_realm_and_users(admin, TEST_REALM)  # PRB reads the role universe
         uc1.verify_login_subject(
             keycloak_url=keycloak_url, realm=TEST_REALM, user="test-user", password=scn.USER_PASSWORD
         )
@@ -187,6 +188,8 @@ def test_cross_service_conflict_is_surfaced_as_422_conflict_report() -> None:
     finally:
         uc1.delete_workload_crs()  # after — drop any CR (there should be none on the raising path)
         uc1.cleanup_provisioned(admin, TEST_REALM)  # restore the pre-run Keycloak state
+        if grant_enabled:
+            uc1.restore_direct_access_grants(admin, TEST_REALM)
         # Phase 1 persisted a tool-side deny; clear it so later integration tests don't read stale
         # inbound rules and become order-dependent.
         uc1.clear_policy_store()

@@ -324,23 +324,33 @@ docker build -f src/aiac/agent/controller/Dockerfile -t localhost/aiac-agent:loc
 kind load docker-image localhost/aiac-agent:local --name <cluster-name>
 
 # Reload the ConfigMap: the apply writes the manifest values (placeholders), the patch
-# puts the real LLM values from .env back (step 3b).
+# puts the real LLM values from .env back (step 3b). A subshell: a failed check or step
+# stops the rest of the block, not your shell.
+( set -e
 set -a; . .env; set +a
+: "${LLM_BASE_URL:?missing in .env}" "${LLM_MODEL:?missing in .env}"
+# Read the live side and log level BEFORE the apply: the apply resets them to the manifest values.
+SIDE=$(kubectl get configmap aiac-agent-config -n aiac-system -o jsonpath='{.data.AIAC_ENFORCEMENT_SIDE}')
+LEVEL=$(kubectl get configmap aiac-agent-config -n aiac-system -o jsonpath='{.data.LOG_LEVEL}')
 kubectl apply -f k8s/agent-deployment.yaml
-kubectl patch configmap aiac-agent-config -n aiac-system --type merge \
-  -p "{\"data\":{\"LLM_BASE_URL\":\"${LLM_BASE_URL}\",\"LLM_MODEL\":\"${LLM_MODEL}\"}}"
+# jq builds the JSON, so a quote or a backslash in a value cannot break the patch.
+kubectl patch configmap aiac-agent-config -n aiac-system --type merge -p "$(jq -n \
+  --arg url "$LLM_BASE_URL" --arg model "$LLM_MODEL" \
+  --arg side "${SIDE:-target-side}" --arg level "${LEVEL:-INFO}" \
+  '{data: {LLM_BASE_URL: $url, LLM_MODEL: $model, AIAC_ENFORCEMENT_SIDE: $side, LOG_LEVEL: $level}}')"
 
 # Restart AFTER the patch. The Agent reads the ConfigMap at start only.
 kubectl rollout restart deployment/aiac-agent -n aiac-system
 kubectl rollout status deployment/aiac-agent -n aiac-system
+)
 ```
 
 - The apply also writes the manifest values of `AIAC_ENFORCEMENT_SIDE` (`target-side`) and
-  `LOG_LEVEL` (`INFO`). On an `agent-side` deployment, patch `AIAC_ENFORCEMENT_SIDE` back
-  **before** the restart. See `docs/agents/deploy.md`, `ac-side`. Patch `LOG_LEVEL` again if you
-  had raised it.
-- `.env` must have `LLM_BASE_URL` and `LLM_MODEL`. If one is missing, stop and ask. Do not leave
-  the placeholder in the ConfigMap.
+  `LOG_LEVEL` (`INFO`). The block reads the live values before the apply and patches them back
+  before the restart, so an `agent-side` deployment stays `agent-side`. To change the side, see
+  `docs/agents/deploy.md`, `ac-side`.
+- `.env` must have `LLM_BASE_URL` and `LLM_MODEL`. If one is missing, the `:?` check stops the
+  block before the apply. Then stop and ask. Do not leave the placeholder in the ConfigMap.
 - The Secret `aiac-agent-secret` (`LLM_API_KEY`) is not changed by this flow. To change it, see
   step 3b.
 

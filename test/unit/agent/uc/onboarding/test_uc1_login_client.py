@@ -1,9 +1,11 @@
-"""``uc1_onboard.ensure_direct_access_grants`` turns on the password grant of the login client — pure
-unit tests.
+"""``uc1_onboard.ensure_direct_access_grants`` turns on the password grant of the login client, and
+``restore_direct_access_grants`` turns it off again — pure unit tests.
 
 The harness mints user tokens through the login client ``rossoctl`` with the password grant, so the
 client needs Direct Access Grants on. ``provision_realm_and_users`` turns it on, so each setup path
-(``onboarded_stack``, ``pristine_stack`` and the disabled cross-service test) gets it. These tests use a
+(``onboarded_stack``, ``pristine_stack`` and the disabled cross-service test) gets it, and each
+teardown turns it off again when the setup turned it on. A grant that cannot be written is a skip with
+the cause. These tests use a
 ``MagicMock`` admin (no Keycloak). They import the system harness like ``test_uc1_subject_scope.py``
 does.
 """
@@ -36,35 +38,63 @@ def _login(enabled: bool) -> dict:
 
 def test_the_grant_is_enabled_with_a_partial_update() -> None:
     admin = _admin(_login(False))
-    uc1.ensure_direct_access_grants(admin, "rossoctl")
+    assert uc1.ensure_direct_access_grants(admin, "rossoctl") is True
     admin.change_current_realm.assert_called_with("rossoctl")
     admin.update_client.assert_called_once_with("uuid-1", {"directAccessGrantsEnabled": True})
 
 
 def test_a_grant_that_is_on_is_not_written() -> None:
     admin = _admin(_login(True))
-    uc1.ensure_direct_access_grants(admin, "rossoctl")
+    assert uc1.ensure_direct_access_grants(admin, "rossoctl") is False
     admin.update_client.assert_not_called()
 
 
-def test_a_missing_login_client_fails_and_is_not_created() -> None:
+def test_a_missing_login_client_skips_and_is_not_created() -> None:
     admin = _admin(None)
-    with pytest.raises(RuntimeError, match=uc1.KEYCLOAK_CLIENT_ID):
+    with pytest.raises(pytest.skip.Exception, match=uc1.KEYCLOAK_CLIENT_ID):
         uc1.ensure_direct_access_grants(admin, "rossoctl")
     admin.update_client.assert_not_called()
     admin.create_client.assert_not_called()
 
 
-def test_a_refused_update_is_logged_not_raised(caplog: pytest.LogCaptureFixture) -> None:
+def test_a_refused_read_skips_with_the_cause() -> None:
+    admin = _admin(_login(False))
+    admin.get_clients.side_effect = KeycloakError(error_message="forbidden", response_code=403)
+    with pytest.raises(pytest.skip.Exception, match="cannot read the login client.*forbidden"):
+        uc1.ensure_direct_access_grants(admin, "rossoctl")
+    admin.update_client.assert_not_called()
+
+
+def test_a_refused_update_skips_with_the_cause() -> None:
     admin = _admin(_login(False))
     admin.update_client.side_effect = KeycloakError(error_message="forbidden", response_code=403)
-    uc1.ensure_direct_access_grants(admin, "rossoctl")  # verify_login_subject then skips with the cause
-    assert "cannot enable Direct Access Grants" in caplog.text
+    with pytest.raises(pytest.skip.Exception, match="cannot enable Direct Access Grants.*forbidden"):
+        uc1.ensure_direct_access_grants(admin, "rossoctl")
 
 
 def test_provision_realm_and_users_enables_the_grant() -> None:
     admin = _admin(_login(False))
     admin.create_user.side_effect = lambda payload, exist_ok=False: f"id-{payload['username']}"
     admin.get_user.return_value = {"email": "e", "firstName": "f", "lastName": "l"}
-    uc1.provision_realm_and_users(admin, "rossoctl")
+    assert uc1.provision_realm_and_users(admin, "rossoctl") is True
     admin.update_client.assert_called_once_with("uuid-1", {"directAccessGrantsEnabled": True})
+
+
+def test_the_restore_turns_the_grant_off_with_a_partial_update() -> None:
+    admin = _admin(_login(True))
+    uc1.restore_direct_access_grants(admin, "rossoctl")
+    admin.change_current_realm.assert_called_with("rossoctl")
+    admin.update_client.assert_called_once_with("uuid-1", {"directAccessGrantsEnabled": False})
+
+
+def test_a_refused_restore_is_logged_not_raised(caplog: pytest.LogCaptureFixture) -> None:
+    admin = _admin(_login(True))
+    admin.update_client.side_effect = KeycloakError(error_message="forbidden", response_code=403)
+    uc1.restore_direct_access_grants(admin, "rossoctl")  # never masks a teardown failure
+    assert "cannot turn Direct Access Grants off again" in caplog.text
+
+
+def test_the_restore_of_a_missing_login_client_writes_nothing() -> None:
+    admin = _admin(None)
+    uc1.restore_direct_access_grants(admin, "rossoctl")
+    admin.update_client.assert_not_called()
