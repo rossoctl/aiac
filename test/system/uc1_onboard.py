@@ -1086,7 +1086,8 @@ def hold_direct_access_grants(admin, realm: str, client_id: str = KEYCLOAK_CLIEN
     * A grant that is on with no marker (``DAG_MARKER_ATTRIBUTE``) is the realm's own setting: it is not
       written, and it is not turned off later.
     * A grant that is off is turned on, with the marker, in one partial update (``_update_client``).
-    * A marker from an earlier run that did not finish: this session takes the grant over.
+    * A marker from an earlier run that did not finish: this session takes the grant over. If the grant
+      is off with the marker on, it is turned on again (the marker stays).
 
     In the last two cases ``release_direct_access_grants`` turns the grant off at session end.
 
@@ -1121,7 +1122,10 @@ def hold_direct_access_grants(admin, realm: str, client_id: str = KEYCLOAK_CLIEN
             client_id,
             realm,
         )
-        return
+        if client.get("directAccessGrantsEnabled"):
+            return
+        # The marker stays but the grant is off (an operator turned it off, a realm re-import, or a
+        # release that wrote only part of its update): turn the grant on again below.
     try:
         _update_client(
             admin,

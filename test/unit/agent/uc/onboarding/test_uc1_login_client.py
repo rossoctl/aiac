@@ -134,6 +134,23 @@ def test_a_marker_left_by_a_killed_run_is_taken_over_and_released() -> None:
     assert MARKER not in admin.stored["attributes"]
 
 
+def test_a_marker_with_the_grant_off_turns_the_grant_on_and_is_released() -> None:
+    """The case of the review: the marker is on the client but the grant is off (an operator turned it
+    off, a realm re-import, or a partial release). The session turns the grant on again, keeps the marker,
+    and turns the grant off at its end."""
+    admin = _admin(_login(False, marked=True))
+    uc1.hold_direct_access_grants(admin, "rossoctl")
+    admin.update_client.assert_called_once_with(
+        LOGIN_UUID, {"directAccessGrantsEnabled": True, "attributes": {MARKER: "true"}}
+    )
+    assert admin.stored["directAccessGrantsEnabled"] is True
+    assert admin.stored["attributes"][MARKER] == "true"
+    assert ("rossoctl", uc1.KEYCLOAK_CLIENT_ID) in uc1._dag_holds
+    uc1.release_direct_access_grants()
+    assert admin.stored["directAccessGrantsEnabled"] is False
+    assert MARKER not in admin.stored["attributes"]
+
+
 def test_a_missing_login_client_skips_and_is_not_created() -> None:
     admin = _admin(None)
     with pytest.raises(pytest.skip.Exception, match=uc1.KEYCLOAK_CLIENT_ID):
