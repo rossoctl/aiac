@@ -313,6 +313,37 @@ kind load docker-image localhost/aiac-pdp-config:local --name <cluster-name>
 kubectl rollout restart deployment/aiac-interface -n aiac-system
 ```
 
+### Rebuilding the AIAC Agent: always reload its ConfigMap
+
+Every time you rebuild `localhost/aiac-agent:local`, also reload the `aiac-agent-config`
+ConfigMap. Do not skip it, also when only code changed. It makes sure the Agent runs with the
+LLM endpoint and model of the repo-root `.env`, and not with an older value in the cluster.
+
+```bash
+docker build -f src/aiac/agent/controller/Dockerfile -t localhost/aiac-agent:local src/
+kind load docker-image localhost/aiac-agent:local --name <cluster-name>
+
+# Reload the ConfigMap: the apply writes the manifest values (placeholders), the patch
+# puts the real LLM values from .env back (step 3b).
+set -a; . .env; set +a
+kubectl apply -f k8s/agent-deployment.yaml
+kubectl patch configmap aiac-agent-config -n aiac-system --type merge \
+  -p "{\"data\":{\"LLM_BASE_URL\":\"${LLM_BASE_URL}\",\"LLM_MODEL\":\"${LLM_MODEL}\"}}"
+
+# Restart AFTER the patch. The Agent reads the ConfigMap at start only.
+kubectl rollout restart deployment/aiac-agent -n aiac-system
+kubectl rollout status deployment/aiac-agent -n aiac-system
+```
+
+- The apply also writes the manifest values of `AIAC_ENFORCEMENT_SIDE` (`target-side`) and
+  `LOG_LEVEL` (`INFO`). On an `agent-side` deployment, patch `AIAC_ENFORCEMENT_SIDE` back
+  **before** the restart. See `docs/agents/deploy.md`, `ac-side`. Patch `LOG_LEVEL` again if you
+  had raised it.
+- `.env` must have `LLM_BASE_URL` and `LLM_MODEL`. If one is missing, stop and ask. Do not leave
+  the placeholder in the ConfigMap.
+- The Secret `aiac-agent-secret` (`LLM_API_KEY`) is not changed by this flow. To change it, see
+  step 3b.
+
 ---
 
 ## Phase 2: Upgrading the OPA PDP Policy Writer to the CR-backed implementation
