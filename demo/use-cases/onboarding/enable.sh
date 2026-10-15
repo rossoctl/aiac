@@ -40,6 +40,7 @@
 #   KEYCLOAK_NAMESPACE   namespace Keycloak runs in                  (default: keycloak)
 #   KEYCLOAK_STATEFULSET name of the Keycloak StatefulSet             (default: keycloak)
 #   KEYCLOAK_IMAGE_BASE  base image to derive the SPI image from     (default: read live, fallback quay.io/keycloak/keycloak:26.5.2)
+#   COMBINER_NAMESPACE   namespace of the `default` AuthorizationPolicy (default: rossoctl-system)
 
 set -euo pipefail
 
@@ -52,6 +53,8 @@ AIAC_NAMESPACE="${AIAC_NAMESPACE:-aiac-system}"
 # script provisions it (see step_stack) rather than depending on a leftover from an earlier run of
 # this demo, which may hold a stale/incomplete policy.
 POLICY_CONFIGMAP="${POLICY_CONFIGMAP:-aiac-policy}"
+# Where `make opa` (k8s/opa-kind-enable.sh, RELEASE_NAMESPACE) puts the combiner's `default` CR.
+COMBINER_NAMESPACE="${COMBINER_NAMESPACE:-rossoctl-system}"
 OPENAI_SECRET_NS="${OPENAI_SECRET_NS:-team1}"
 OPENAI_SECRET_NAME="${OPENAI_SECRET_NAME:-openai-secret}"
 LLM_BASE_URL="${LLM_BASE_URL:-https://api.openai.com/v1}"
@@ -140,6 +143,16 @@ except Exception: print("")'
 
 # ── Step 1 — The AIAC stack ─────────────────────────────────────────────────
 step_stack() {
+  # The Controller's start check #4 (D30) needs the changed combiner (D20), which `make opa` applies
+  # as the `default` AuthorizationPolicy. Without it aiac-agent never becomes Available and
+  # step_wait_agent only times out, so fail here with the fix instead.
+  echo "==> [stack] Checking that 'make opa' ran (AuthorizationPolicy 'default' in ${COMBINER_NAMESPACE})"
+  if ! kubectl get authorizationpolicy default -n "$COMBINER_NAMESPACE" >/dev/null 2>&1; then
+    echo "ERROR: AuthorizationPolicy 'default' is missing in ${COMBINER_NAMESPACE}, so the AIAC Controller cannot start (start check #4)." >&2
+    echo "       Run 'make opa' (demo.md step 1) first, then re-run this script." >&2
+    exit 1
+  fi
+
   echo "==> [stack] Ensuring namespace '${AIAC_NAMESPACE}' exists"
   kubectl create namespace "$AIAC_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
 

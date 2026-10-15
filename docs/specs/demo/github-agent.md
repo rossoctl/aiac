@@ -214,17 +214,23 @@ Manifests live under `demo/assets/agents/github_agent/k8s/`, adapted from the gi
   - `AgentRuntime{ type: agent, targetRef: this Deployment }` — enrolls the workload (operator applies
     `rossoctl.io/type=agent`, registers a Keycloak client, injects the AuthBridge sidecar).
   - Image `localhost/github-agent:latest`, `imagePullPolicy: IfNotPresent` (kind-load; name is a documented knob).
-- **`configmaps.yaml`** — `authbridge-config` (Keycloak URL/realm/issuer) + `authproxy-routes` with the
-  outbound token-exchange route to the demo's stand-in tool (`demo/assets/tools/github_tool/`, Service
+- **`configmaps.yaml`** — `authbridge-config` (Keycloak URL/realm/issuer) + `authproxy-routes` with two
+  outbound token-exchange routes: one to the production tool (`github-tool-mcp`, which `MCP_URL`
+  targets), and one to the demo's stand-in tool (`demo/assets/tools/github_tool/`, Service
   `github-tool`), the tool the onboarding demo deploys and enforces against:
   ```yaml
+  - host: "github-tool-mcp"
+    target_audience: "github-tool"
+    token_scopes: "openid github-tool-aud github-full-access"
   - host: "github-tool"
     target_audience: "spiffe://localtest.me/ns/team1/sa/github-tool"
     token_scopes: "openid agent-team1-github-tool-aud"
   ```
-  The operator creates `agent-team1-github-tool-aud` when it registers `github-tool` and makes it a
-  realm default scope, so `github-agent`'s client has it when it is created after the tool (the order
-  `demo/assets/deploy.sh` uses).
+  The stand-in route is static, so it is fixed to namespace `team1` and trust domain `localtest.me`.
+  The operator creates `agent-team1-github-tool-aud` when it registers `github-tool`. Its realm-default
+  PUT is best-effort, and `demo/assets/deploy.sh` does not wait for the tool's registration before
+  applying the agent, so the onboarding demo's `driver.sh` (phase PREP) and the system tests
+  (`grant_exchange_scope`) grant it to `github-agent`'s client explicitly.
 - **Prerequisite (reused, not created here):** the existing **production** `github-tool` Deployment/Service
   (`authbridge/demos/github-issue/k8s/github-tool-deployment.yaml`, Service name `github-tool-mcp`) +
   `github-tool-secrets`, a running rossoctl cluster (Keycloak realm `rossoctl`, namespace `team1` —
@@ -232,10 +238,11 @@ Manifests live under `demo/assets/agents/github_agent/k8s/`, adapted from the gi
   The sibling UC-1 stub at `demo/assets/tools/github_tool/` (Service `github-tool`) is a separate deployment
   for AIAC onboarding discovery and is **not** a runtime dependency of this agent.
 
-**Wiring invariant:** `authproxy-routes` host == the stand-in tool's Service name (`github-tool`);
-exchanged audience == the tool's SPIFFE ID. The agent's `MCP_URL` still names the production
-`github-tool-mcp`, so the route does not cover the agent's own MCP calls (a known gap of the onboarding
-demo, which probes the tool through the sidecar's forward proxy instead).
+**Wiring invariant:** each `authproxy-routes` host == a tool's Service name. `github-tool-mcp` matches
+`MCP_URL`, so the agent's own MCP calls are exchanged. `github-tool` matches the stand-in tool, and its
+exchanged audience == the stand-in's SPIFFE ID. The onboarding demo does not deploy `github-tool-mcp`,
+so it probes the stand-in through the sidecar's forward proxy instead (a known gap: the agent
+autonomously calling a tool is not exercised there).
 
 ---
 

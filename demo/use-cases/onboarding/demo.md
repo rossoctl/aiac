@@ -533,7 +533,12 @@ make enforce
 
 ### What happens
 
-
+**PREP** grants `github-agent`'s Keycloak client the tool's audience scope
+`agent-team1-github-tool-aud` (HTTP 204, or 409 when already linked), then restarts the agent so its
+OPA sidecar loads the bundle AIAC recomposed. The outbound route to `github-tool` already ships in the
+agent's `configmaps.yaml`. The operator also makes that scope a realm default when `github-tool`
+registers, but that is best-effort and can lose the race with the agent's own registration, so PREP
+grants it explicitly. PREP is idempotent and runs before every ENFORCE.
 
 **ENFORCE** first checks (read only) that the login client `rossoctl` and `github-agent` link the
 client scope `aiac-username-sub` as a default scope (D31, see the
@@ -703,7 +708,7 @@ package is a pass-through (`allow := true` and no other rule), the side is targe
 
 | Symptom | Cause / fix |
 |---|---|
-| **Every tool call denies, for every user** | Usually `github-agent`'s client lacks the `agent-team1-github-tool-aud` scope: its client was created before `github-tool` registered (the operator makes that scope a realm default only then). `make restore` and `make e2e` again, which deploys the tool first. Otherwise one of the two onboardings did not finish, leaving the per-tool maps empty: `kubectl logs deployment/aiac-agent -n aiac-system \| grep -iE 'label missing\|MCP tools/list'`. JetStream redelivers after `ACK_WAIT` (600 s) and usually succeeds, so waiting then re-running `make enforce` often cures it. |
+| **Every tool call denies, for every user** | Check that PREP passed: it grants `github-agent`'s client the `agent-team1-github-tool-aud` scope, and `make enforce` re-runs it. Then check the route: `kubectl get configmap authproxy-routes -n team1 -o yaml` must list `host: "github-tool"`. A cluster deployed before the route moved into `configmaps.yaml` still has only `github-tool-mcp`; re-apply it with `kubectl apply -n team1 -f demo/assets/agents/github_agent/k8s/configmaps.yaml` and run `make enforce` (PREP restarts the agent, which loads it). Otherwise one of the two onboardings did not finish, leaving the per-tool maps empty: `kubectl logs deployment/aiac-agent -n aiac-system \| grep -iE 'label missing\|MCP tools/list'`. JetStream redelivers after `ACK_WAIT` (600 s) and usually succeeds, so waiting then re-running `make enforce` often cures it. |
 | **ENFORCE stops: a client does not link `aiac-username-sub` as a default scope** | The token keeps `sub` = the Keycloak user ID, so the rego cannot find the user (D31). For `rossoctl`, restart the IdP Configuration Service once Keycloak is ready: `kubectl rollout restart deployment/aiac-interface -n aiac-system`. For `github-agent`, let AIAC onboard it again. Do not add a `sub` mapper by hand. |
 | **The AIAC Controller does not start (start check #4)** | The log says either that the `default` AuthorizationPolicy is *missing*, or that the global combiner *allows a pod that has no client CR*. Missing: `make opa` never ran on this cluster — it must run before `make enable` (see [step 2](#step-2--install-aiac)). Allows: the combiner is the stock one, brought back by a `make opa-restore` or another bundle-service install. Either way, run `make opa`, then `kubectl rollout restart deployment/aiac-agent -n aiac-system`. |
 | **Onboarding fails with a `401` from the LLM** | `enable.sh` defaulted to OpenAI. Patch `aiac-agent-config` and `rollout restart` — see [step 2](#change-llm). The values come in via `envFrom`, so a patch without a restart does nothing. |
@@ -781,7 +786,7 @@ lists every deletion without performing one.
 
 Removes `github-agent`/`github-tool` **completely** — Deployments, Services, ServiceAccounts,
 `AgentRuntime` CRs, their Keycloak clients, credentials Secrets, leftover client-scopes and realm
-roles, and both `AuthorizationPolicy` CRs — and reverts step 5's outbound wiring. That completeness is
+roles, and both `AuthorizationPolicy` CRs. That completeness is
 the point: the next DEPLOY must be a genuine first-time trigger, not a no-op against clients that
 are still registered.
 

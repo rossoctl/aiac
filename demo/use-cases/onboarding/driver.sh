@@ -13,7 +13,10 @@
 #   Phase VERIFY-TRIGGER  poll Keycloak for the brand-new clients, aiac-agent logs for evidence it
 #                         consumed both over NATS, and the two AuthorizationPolicy CRs AIAC wrote
 #                         (one per managed service, D20: github-agent AND github-tool).
-#   Phase ENFORCE         real HTTP probes through the live AuthBridge OPA plugin, reproducing
+#   Phase PREP            grant github-agent's client the tool's audience scope (closes the race
+#                         with the operator's realm default) and restart the agent so its OPA sidecar
+#                         loads the recomposed bundle. Runs before every ENFORCE; idempotent.
+#   Phase ENFORCE        real HTTP probes through the live AuthBridge OPA plugin, reproducing
 #                         #646's acceptance table.
 #   Phase REPLAY-TRIGGER  opt-in only (--only-replay-trigger): re-prove the trigger on a cluster
 #                         where the workloads are ALREADY deployed, by deleting their Keycloak
@@ -35,9 +38,9 @@
 # moment an observed result doesn't match, rather than continuing silently.
 #
 # Usage:
-#   ./driver.sh                    # deploy -> verify-trigger -> enforce
+#   ./driver.sh                    # deploy -> verify-trigger -> prep -> enforce
 #   ./driver.sh --only-deploy
-#   ./driver.sh --only-enforce
+#   ./driver.sh --only-enforce     # prep -> enforce
 #   ./driver.sh --only-replay-trigger      # forced replay (workloads must already be deployed)
 #   ./driver.sh --collect-logs     # (composes with any of the above) dump every component's logs
 #                                  # into a per-run directory at the end, AND on any die() failure
@@ -576,6 +579,41 @@ print("yes" if os.environ["SCOPE"] in names else "")' 2>/dev/null || true)
   kubectl get "$POLICY_CR" github-tool -n "$NS" -o jsonpath='{.spec.policies[*].content}' | sed 's/^/    /'
 }
 
+# ── Phase PREP ────────────────────────────────────────────────────────────────
+# The outbound route ships in configmaps.yaml, but two things still need doing before ENFORCE:
+#   1. github-agent's client needs the tool's audience scope. The operator makes it a realm default
+#      when github-tool registers, but that PUT is best-effort and deploy.sh does not wait for the
+#      tool's registration before applying the agent, so the agent's client can predate the scope.
+#      Granting it here (204, or 409 when already linked) closes that race.
+#   2. The agent's OPA sidecar must load the bundle AIAC recomposed after the pod started, and the
+#      sidecar re-reads routes.yaml, so the restart also picks up a re-applied configmaps.yaml.
+# Idempotent, so it runs before every ENFORCE, --only-enforce included.
+phase_prep() {
+  printf '\n%s%s====== Phase PREP — exchange scope + agent restart ======%s\n' "$C_BLD" "$C_CYN" "$C_RST"
+
+  step "Granting github-agent the exchange scope on its Keycloak client (expect HTTP 204 or 409)"
+  local admin agent_uuid scope_id scope_http tool_aud="agent-${NS}-github-tool-aud"
+  admin="$(admin_token)"
+  [ -n "$admin" ] || die "could not obtain a Keycloak master admin token"
+  agent_uuid="$(client_uuid_by_name "${NS}/github-agent" "$admin")"
+  [ -n "$agent_uuid" ] || die "could not resolve the Keycloak client uuid for ${NS}/github-agent"
+  scope_id="$(scope_id_by_name "$tool_aud" "$admin")"
+  [ -n "$scope_id" ] || die "client-scope '${tool_aud}' not found — has github-tool onboarded yet?"
+  scope_http=$(curl -s -o /dev/null -w "%{http_code}" -X PUT -H "Authorization: Bearer ${admin}" \
+    "${KC}/admin/realms/${REALM}/clients/${agent_uuid}/optional-client-scopes/${scope_id}")
+  case "$scope_http" in
+    204) pass "assigned optional client-scope: HTTP 204" ;;
+    409) pass "client-scope already linked (HTTP 409) — idempotent" ;;
+    *) die "assigning the optional client-scope returned HTTP ${scope_http} (expected 204 or 409)" ;;
+  esac
+
+  step "Restarting github-agent so its OPA sidecar loads the recomposed bundle"
+  kubectl delete pod -n "$NS" -l "$AGENT_LABEL" || die "failed to delete github-agent pod"
+  kubectl wait --for=condition=ready pod -n "$NS" -l "$AGENT_LABEL" --timeout=120s \
+    || die "github-agent did not become Ready after the restart"
+  pass "github-agent restarted and Ready"
+}
+
 # ── Phase ENFORCE ─────────────────────────────────────────────────────────────
 
 probe_agent() {
@@ -917,7 +955,10 @@ if [ "$DO_DEPLOY" -eq 1 ]; then
   phase_verify_trigger
 fi
 [ "$DO_REPLAY" -eq 1 ] && phase_replay_trigger
-[ "$DO_ENFORCE" -eq 1 ] && phase_enforce
+if [ "$DO_ENFORCE" -eq 1 ]; then
+  phase_prep
+  phase_enforce
+fi
 
 [ "$DO_COLLECT" -eq 1 ] && collect_logs "$COLLECT_DIR"
 
