@@ -94,12 +94,10 @@ assert the allow/deny of the **deployed OPA plugin**. They do not use
 
 Preconditions:
 
-- A rossoctl/Kind cluster with the AuthBridge OPA pipeline wired into both legs.
-- The AIAC global combiner. It denies a pod that has no `AuthorizationPolicy`
-  CR, and the Controller does not start without it.
-- `k8s/opa-kind-enable.sh` does both steps (run it one time).
-- The event path wired: the NATS broker and the `aiac-event-listener` Keycloak
-  SPI (see `docs/testing/uc1-onboarding-pipeline.md`, "Preconditions").
+- AIAC deployed on a rossoctl/Kind cluster that meets the platform
+  preconditions in `k8s/aiac-deployment-guide.md` → Platform preconditions: OPA
+  on the Kind platform (with the AIAC global combiner, which denies a pod that
+  has no `AuthorizationPolicy` CR) and the Keycloak event-listener SPI.
 - An LLM key that the endpoint accepts, in the Controller's Secret
   `aiac-system/aiac-agent-secret`. The in-cluster Controller does not read
   `.env`. If the endpoint refuses the key, each onboarding rolls back, and the
@@ -130,7 +128,7 @@ see the runbook section "Direct Access Grants on the login client". The per-loop
 shape: `test/system/uc1_onboard.py`.
 
 ```bash
-k8s/opa-kind-enable.sh          # one time: wire the OPA plugin and the AIAC combiner into Kind
+k8s/opa-kind-verify.sh && k8s/keycloak-spi-verify.sh   # the platform preconditions
 set -a; . .env; set +a
 .venv/bin/pytest -m system
 ```

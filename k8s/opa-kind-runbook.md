@@ -326,46 +326,70 @@ no service is managed: onboard each service again.
 > For example, a pass-through outbound on `github-agent` and a pass-through
 > inbound on `github-tool` check nothing.
 
-The clean redeploy (Kind; `enable.sh` automates
-[`aiac-deployment-guide.md`](aiac-deployment-guide.md)).
+The clean redeploy (Kind). It deletes AIAC and installs it again with the AIAC
+manifests, as [`aiac-deployment-guide.md`](aiac-deployment-guide.md) steps 3–5
+say. It does not touch Keycloak, so the `aiac-event-listener` SPI stays.
 
-Precondition: the LLM key Secret `team1/openai-secret` (data key `apikey`)
-exists. `enable.sh` reads it, and stops if it is missing. The teardown does not
-delete it. To make it:
-`kubectl create secret generic openai-secret -n team1 --from-literal=apikey="$LLM_API_KEY"`
-(see [`demo.md` → Two secrets to create first](../demo/use-cases/onboarding/demo.md#two-secrets-to-create-first)).
+Preconditions:
+
+- Run it from the repo root. The repo-root `.env` has `KEYCLOAK_ADMIN_USERNAME`,
+  `KEYCLOAK_ADMIN_PASSWORD`, `LLM_BASE_URL`, `LLM_MODEL` and `LLM_API_KEY`. All
+  AIAC configuration comes from `.env`. The LLM endpoint, model and key come
+  from it as one set.
+- The four AIAC images are in Kind. A namespace delete does not remove them. If
+  an image changed or is not loaded, do guide steps 1–2 (build and load) first.
 
 ```bash
+# A subshell: a failed check or step stops the rest of the block, not your shell.
+( set -eo pipefail
 SIDE=agent-side    # or target-side
+set -a; . .env; set +a
+: "${KEYCLOAK_ADMIN_USERNAME:?missing in .env}" "${KEYCLOAK_ADMIN_PASSWORD:?missing in .env}"
+: "${LLM_BASE_URL:?missing in .env}" "${LLM_MODEL:?missing in .env}" "${LLM_API_KEY:?missing in .env}"
+
+# 0. Check the LLM set of .env BEFORE any change: the endpoint must accept the
+#    key (guide, "Rebuilding the AIAC Agent: always reload its LLM configuration").
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $LLM_API_KEY" "$LLM_BASE_URL/models" || true)
+[ "$CODE" = 200 ] || { echo "ERROR: $LLM_BASE_URL/models answered HTTP $CODE to the .env key. Fix .env first." >&2; exit 1; }
 
 # 1. Delete every AIAC CR. The combiner (D20) then denies each managed pod
 #    until it is onboarded again.
 kubectl delete authorizationpolicy -A -l app.kubernetes.io/managed-by=aiac-pdp-policy-writer
 
 # 2. Delete AIAC: the aiac-system namespace, with the Policy Model Store PVC
-#    and the keycloak-admin-secret.
-demo/use-cases/onboarding/teardown.sh --aiac-only --yes
+#    and every AIAC Secret.
+kubectl delete namespace aiac-system --ignore-not-found --timeout=300s
 
-# 3. Make the namespace and the Keycloak admin Secret again. `enable.sh` does
-#    not make the Secret, and without it aiac-interface stays in
-#    ContainerCreating.
-set -a; . .env; set +a
+# 3. The namespace and the two Secrets (guide steps 3 and 3b). Without
+#    keycloak-admin-secret, aiac-interface stays in ContainerCreating.
 kubectl create namespace aiac-system
 kubectl create secret generic keycloak-admin-secret -n aiac-system \
   --from-literal=KEYCLOAK_ADMIN_USERNAME="$KEYCLOAK_ADMIN_USERNAME" \
   --from-literal=KEYCLOAK_ADMIN_PASSWORD="$KEYCLOAK_ADMIN_PASSWORD"
+kubectl create secret generic aiac-agent-secret -n aiac-system \
+  --from-literal=LLM_API_KEY="$LLM_API_KEY"
 
-# 4. Deploy AIAC again: the stack, then the broker. The Controller init
-#    container waits for the broker.
-demo/use-cases/onboarding/enable.sh --stack-only
-demo/use-cases/onboarding/enable.sh --broker-only
+# 4. Deploy, in the order of guide step 5. The Controller init container
+#    waits for the broker.
+kubectl apply -f k8s/pdp-interface-deployment.yaml
+kubectl apply -f k8s/event-broker-deployment.yaml
+kubectl apply -f k8s/policy-model-store-statefulset.yaml
+kubectl apply -f k8s/agent-deployment.yaml
 
-# 5. Set the side. `k8s/agent-deployment.yaml` sets `target-side`, so set the
-#    side after step 4. The store is empty, so the Controller start writes no CR.
-kubectl patch configmap aiac-agent-config -n aiac-system --type merge \
-  -p "{\"data\":{\"AIAC_ENFORCEMENT_SIDE\":\"${SIDE}\"}}"
+# 5. The LLM endpoint and model (guide step 3b) and the side. The manifest has
+#    LLM placeholders and `target-side`, so patch them after step 4, then
+#    restart. The store is empty, so the Controller start writes no CR.
+kubectl patch configmap aiac-agent-config -n aiac-system --type merge -p "$(jq -n \
+  --arg url "$LLM_BASE_URL" --arg model "$LLM_MODEL" --arg side "$SIDE" \
+  '{data: {LLM_BASE_URL: $url, LLM_MODEL: $model, AIAC_ENFORCEMENT_SIDE: $side}}')"
 kubectl rollout restart deployment/aiac-agent -n aiac-system
+
+# 6. Wait for all of AIAC (guide step 5).
+kubectl wait deployment/aiac-interface -n aiac-system --for=condition=Available --timeout=180s
+kubectl wait deployment/aiac-event-broker -n aiac-system --for=condition=Available --timeout=180s
+kubectl wait statefulset/aiac-policy-model-store -n aiac-system --for=jsonpath='{.status.readyReplicas}'=1 --timeout=180s
 kubectl rollout status deployment/aiac-agent -n aiac-system --timeout=300s
+)
 ```
 
 At start, the Controller checks the combiner (check #4, D30). Under agent side,
