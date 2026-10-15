@@ -55,10 +55,10 @@ KC_ENV := . init/00-discover-keycloak.sh &&
 help:  ## Show this menu
 	@printf "\nonboarding demo — live AIAC onboarding of a real agent + tool. Full narrative: demo.md\n\n"
 	@printf "Live path (demo.md Parts 1-5) — deploying IS the trigger, real OPA enforces:\n"
-	@printf "  \033[1mmake enable\033[0m   (AIAC stack + NATS broker + Keycloak SPI)\n"
 	@printf "  \033[1mmake opa\033[0m      (wire the OPA plugin into both AuthBridge legs — one-time, cluster-level)\n"
+	@printf "  \033[1mmake enable\033[0m   (AIAC stack + NATS broker + Keycloak SPI)\n"
 	@printf "  \033[1mmake users\033[0m    (users/roles/policy — before the deploy that triggers onboarding)\n"
-	@printf "  \033[1mmake e2e\033[0m      (deploy -> verify trigger -> wire -> live enforce)\n\n"
+	@printf "  \033[1mmake e2e\033[0m      (deploy -> verify trigger -> prep -> live enforce)\n\n"
 	@printf "Narrated walkthrough (demo.md Part 6) — manual onboarding + offline opa eval:\n"
 	@printf "  \033[1mmake demo\033[0m     (init 00-03 -> onboard 04-05 -> run)\n"
 	@printf "  \033[1mmake init / make onboard / make run\033[0m   (one phase at a time)\n"
@@ -118,28 +118,28 @@ demo: init onboard run  ## Full narrated walkthrough: init -> onboard -> run
 # --- the live path (demo.md Parts 1-5) --------------------------------------------------------
 # Thin wrappers over the scripts, so `make help` lists the whole demo in one place. These are NOT
 # aggregated into a single target on purpose: OPA must be wired into both AuthBridge legs
-# (`make opa`, a one-time cluster change owned by k8s/, not by this demo) between `enable` and
-# `e2e`, and driver.sh's preflight fails loudly with that exact instruction if it isn't.
+# (`make opa`, a one-time cluster change owned by k8s/, not by this demo) before `enable` — the
+# AIAC Controller's start check #4 needs the combiner it applies — and driver.sh's preflight fails
+# loudly with that exact instruction if it isn't.
 
-enable:  ## Part 1: install the AIAC stack + NATS broker + Keycloak SPI listener
+enable:  ## Part 2: install the AIAC stack + NATS broker + Keycloak SPI listener
 	./enable.sh
 
 # The k8s/ scripts resolve OPERATOR_DIR / ROSSOCTL_DIR / CORTEX_DIR from their own location
 # (sibling clones of aiac/), so running them from here needs no cd; exported overrides pass through.
-opa:  ## Part 2: wire the OPA plugin + parsers into both AuthBridge legs (k8s/opa-kind-enable.sh)
+opa:  ## Part 1: wire the OPA plugin + parsers into both AuthBridge legs (k8s/opa-kind-enable.sh)
 	$(AIAC_ROOT)/k8s/opa-kind-enable.sh
 
 opa-restore:  ## Revert `make opa`: restore the original AuthBridge pipeline (k8s/opa-kind-restore.sh)
 	$(AIAC_ROOT)/k8s/opa-kind-restore.sh
 
-e2e:  ## Parts 4-5: deploy (the trigger) -> verify trigger -> wire outbound -> live enforce
+e2e:  ## Parts 4-5: deploy (the trigger) -> verify trigger -> prep -> live enforce
 	./driver.sh
 
 trigger:  ## Part 4 alone: deploy the workloads and verify the live trigger fired
 	./driver.sh --only-deploy
 
-enforce:  ## Part 5 alone: wire the outbound leg, then probe the live OPA plugin
-	./driver.sh --only-wire-outbound
+enforce:  ## Part 5 alone: grant the exchange scope + restart the agent, then probe the live OPA plugin
 	./driver.sh --only-enforce
 
 replay:  ## Optional: re-prove the trigger against ALREADY-deployed workloads (forced replay)

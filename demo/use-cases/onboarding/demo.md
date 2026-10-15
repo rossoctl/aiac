@@ -25,20 +25,21 @@ target.
 
 | Step | Command | What it does |
 |---|---|---|
-| [1](#step-1--install-aiac) | `make enable` | Install the AIAC stack, NATS broker, Keycloak SPI listener |
-| [2](#step-2--wire-opa-into-both-authbridge-legs) | `make opa` | Turn on the OPA plugin in both AuthBridge legs (cluster-level, one-time) |
+| [1](#step-1--wire-opa-into-both-authbridge-legs) | `make opa` | Turn on the OPA plugin in both AuthBridge legs and apply the changed combiner (cluster-level, one-time) |
+| [2](#step-2--install-aiac) | `make enable` | Install the AIAC stack, NATS broker, Keycloak SPI listener |
 | [3](#step-3--provision-users-roles-and-the-policy) | `make users` | Create the three demo users + roles, mount `policy.md` |
 | [4](#step-4--deploy-the-workloads-this-is-the-trigger) | `make trigger` | Deploy `github-agent`/`github-tool` and verify onboarding fired |
-| [5](#step-5--enforce-live) | `make enforce` | Wire the outbound leg, then probe the live OPA plugin |
+| [5](#step-5--enforce-live) | `make enforce` | Probe the live OPA plugin |
 | [6](#step-6--inspect-what-was-generated-optional) | `make demo` | Optional: walk the same scenario in small steps |
 
 Steps 4 and 5 together: **`make e2e`**.
 
-First run, in full:
+First run, in full. The order matters: the AIAC Controller does not start until step 1 has applied
+the changed combiner.
 
 ```bash
-make enable
 make opa
+make enable
 make users
 make e2e
 ```
@@ -158,7 +159,7 @@ that leg. On the tool's inbound leg, `input.identity` comes from the exchanged t
 `client_id` is the calling agent, and `subject` is the user (D31, see the
 [realm fix-up](#one-time-keycloak-realm-fix-up)).
 
-Under the changed combiner (D20) that step 2 applies, a pod that has no CR is **denied**. That is
+Under the changed combiner (D20) that step 1 applies, a pod that has no CR is **denied**. That is
 why AIAC writes a CR for every managed service, a pass-through where it has no rules.
 
 ---
@@ -170,7 +171,7 @@ and the rossoctl operator. Namespace `team1` must exist;
 
 **Tools.** `kubectl`, `helm`, `kind`, `curl`, `python3`, and `docker` or `podman` on `PATH`.
 
-**Three sibling repo clones**, needed by step 2. Each is auto-detected from the script's own
+**Three sibling repo clones**, needed by step 1. Each is auto-detected from the script's own
 location. Override only if a clone lives elsewhere, and then use an **absolute** path
  — a relative one resolves against your shell's cwd, not the script's.
 
@@ -267,7 +268,68 @@ curl -s -H "Authorization: Bearer $ADMIN" "$KC/admin/realms/rossoctl/clients/$CI
 
 ---
 
-## Step 1 — Install AIAC
+## Step 1 — Wire OPA into both AuthBridge legs
+
+Confirm OPA is **NOT** configured in any authbridge leg  — expect `0`:
+
+```bash
+kubectl get configmap authbridge-runtime-config -n team1 \
+  -o jsonpath='{.data.config\.yaml}' | grep -c 'name: opa'
+```
+
+Now insert opa in both inbound and outbound legs of AuthBridge
+```bash
+make opa
+```
+
+This is a **cluster-level, one-time** change owned by `k8s/`.
+
+### What happens
+
+Enforcement is an opt-in AuthBridge pipeline plugin. The script rebuilds the AuthBridge
+proxy-sidecar image from your `cortex` clone, loads it into Kind, and `helm upgrade`s the chart with
+a **temporary overlay** that inserts `opa` — after `token-exchange` on the outbound leg — plus the
+parser set into the `team1` pipeline of every agent **and tool** (`injectTools=true` gives tool pods
+the sidecar). It does not modify `charts/rossoctl/values.yaml` on disk.
+
+It also applies the **changed combiner** of AIAC (D20) as the global `default` policy, in place of
+the stock one: a pod that has no client CR is denied. The AIAC Controller checks this at every start
+and does not start without it. A fresh cluster has no `default` policy at all (no bundle service is
+deployed until this step), which is why this step comes before installing AIAC. It does not need
+AIAC installed.
+
+AuthBridge plugins are opt-in build tags, so the build passes `GO_BUILD_TAGS` resolved from the
+`full` profile in `cortex/scripts/profile-tags` — one of only two profiles carrying `opa`. Tags are
+resolved in a `golang` container when the host has no `go`; override with `AUTHBRIDGE_PROFILE` or an
+explicit `GO_BUILD_TAGS`.
+
+Expect two container image builds, so give it a few minutes.
+
+### Verify
+
+Confirm OPA landed in **both** legs — expect `2`:
+
+```bash
+kubectl get configmap authbridge-runtime-config -n team1 \
+  -o jsonpath='{.data.config\.yaml}' | grep -c 'name: opa'
+```
+
+`make opa` finishes with `k8s/opa-kind-verify.sh`, which also checks the changed combiner.
+`driver.sh`'s preflight checks both again and refuses to run without them, so steps 4–5 cannot
+silently proceed unwired. Full background, including the exact `input` document the plugin builds
+on each leg, is in [`k8s/opa-kind-runbook.md`](../../../k8s/opa-kind-runbook.md). Revert with
+`make opa-restore` (wraps `k8s/opa-kind-restore.sh`; it puts back the stock combiner, so the AIAC
+Controller does not start again until `make opa` runs again).
+
+---
+
+## Step 2 — Install AIAC
+
+> **[Step 1](#step-1--wire-opa-into-both-authbridge-legs) must have run.** The AIAC Controller does
+> not start without the changed combiner that step 1 applies (start check #4), so `make enable`
+> times out waiting for `aiac-agent`, and its log ends with `start check #4 failed: the
+> AuthorizationPolicy 'default' in namespace 'rossoctl-system' is missing`. If you hit this, run
+> `make opa`, then `kubectl rollout restart deployment/aiac-agent -n aiac-system`.
 
 > **`make enable` defaults to `LLM_BASE_URL=https://api.openai.com/v1` and `LLM_MODEL=gpt-4o-mini`.**
 
@@ -363,59 +425,6 @@ of the `rossoctl` release reverts it. Undo it deliberately with `make restore AR
 
 ---
 
-## Step 2 — Wire OPA into both AuthBridge legs
-
-Confirm OPA is **NOT** configured in any authbridge leg  — expect `0`:
-
-```bash
-kubectl get configmap authbridge-runtime-config -n team1 \
-  -o jsonpath='{.data.config\.yaml}' | grep -c 'name: opa'
-```
-
-Now insert opa in both inbound and outbound legs of AuthBridge
-```bash
-make opa
-```
-
-This is a **cluster-level, one-time** change owned by `k8s/`.
-
-### What happens
-
-Enforcement is an opt-in AuthBridge pipeline plugin. The script rebuilds the AuthBridge
-proxy-sidecar image from your `cortex` clone, loads it into Kind, and `helm upgrade`s the chart with
-a **temporary overlay** that inserts `opa` — after `token-exchange` on the outbound leg — plus the
-parser set into the `team1` pipeline of every agent **and tool** (`injectTools=true` gives tool pods
-the sidecar). It does not modify `charts/rossoctl/values.yaml` on disk.
-
-It also applies the **changed combiner** of AIAC (D20) as the global `default` policy, in place of
-the stock one: a pod that has no client CR is denied. The AIAC Controller checks this at every start
-and does not start without it.
-
-AuthBridge plugins are opt-in build tags, so the build passes `GO_BUILD_TAGS` resolved from the
-`full` profile in `cortex/scripts/profile-tags` — one of only two profiles carrying `opa`. Tags are
-resolved in a `golang` container when the host has no `go`; override with `AUTHBRIDGE_PROFILE` or an
-explicit `GO_BUILD_TAGS`.
-
-Expect two container image builds, so give it a few minutes.
-
-### Verify
-
-Confirm OPA landed in **both** legs — expect `2`:
-
-```bash
-kubectl get configmap authbridge-runtime-config -n team1 \
-  -o jsonpath='{.data.config\.yaml}' | grep -c 'name: opa'
-```
-
-`make opa` finishes with `k8s/opa-kind-verify.sh`, which also checks the changed combiner.
-`driver.sh`'s preflight checks both again and refuses to run without them, so steps 4–5 cannot
-silently proceed unwired. Full background, including the exact `input` document the plugin builds
-on each leg, is in [`k8s/opa-kind-runbook.md`](../../../k8s/opa-kind-runbook.md). Revert with
-`make opa-restore` (wraps `k8s/opa-kind-restore.sh`; it puts back the stock combiner, so the AIAC
-Controller does not start again until `make opa` runs again).
-
----
-
 ## Step 3 — Provision users, roles and the policy
 
 ```bash
@@ -477,7 +486,7 @@ unmodified, exactly as the `-m system` suite uses them.
 onto a Deployment's pod-template labels the first time its `AgentRuntime` CR resolves. That label is
 what `ClientRegistrationReconciler`'s watch predicate keys on, and that calls
 `RegisterOrFetchClientWithToken` — producing a genuine Keycloak `CLIENT_CREATE` admin event. The SPI
-listener from step 1 publishes it on NATS as `aiac.apply.service.<uuid>`, and `aiac-agent`'s
+listener from step 2 publishes it on NATS as `aiac.apply.service.<uuid>`, and `aiac-agent`'s
 consumer runs `onboard_and_apply`. There is no `POST /apply/service/{id}` call anywhere in this path.
 
 VERIFY-TRIGGER polls until each of these is true, in order:
@@ -524,19 +533,12 @@ make enforce
 
 ### What happens
 
-**WIRE** configures AuthBridge's own outbound leg — the two things AIAC's onboarding does not do:
-
-1. Adds the `github-tool` route to the `authproxy-routes` ConfigMap. Its `host` decides whether
-   token-exchange fires at all. Its `target_audience` is the audience of the exchanged token that
-   `github-tool`'s inbound validates (target side), and it becomes `input.identity.service_id` on
-   the agent's outbound leg, the key that the agent-side policy looks up in `target_allow_scopes`.
-2. Ensures `github-agent`'s Keycloak client may request the `agent-team1-github-tool-aud` audience.
-3. Restarts the agent pod, because the route is read at sidecar start.
-
-> The demo's own `configmaps.yaml` ships a route for the **production** tool
-> (`host: github-tool-mcp`), which this install path deliberately does not deploy. WIRE retargets it
-> at the demo's stand-in tool (`host: github-tool`). That is why the deployed ConfigMap differs from
-> the file on disk, and why anything that re-applies the file needs WIRE re-run after it.
+**PREP** grants `github-agent`'s Keycloak client the tool's audience scope
+`agent-team1-github-tool-aud` (HTTP 204, or 409 when already linked), then restarts the agent so its
+OPA sidecar loads the bundle AIAC recomposed. The outbound route to `github-tool` already ships in the
+agent's `configmaps.yaml`. The operator also makes that scope a realm default when `github-tool`
+registers, but that is best-effort and can lose the race with the agent's own registration, so PREP
+grants it explicitly. PREP is idempotent and runs before every ENFORCE.
 
 **ENFORCE** first checks (read only) that the login client `rossoctl` and `github-agent` link the
 client scope `aiac-username-sub` as a default scope (D31, see the
@@ -706,14 +708,14 @@ package is a pass-through (`allow := true` and no other rule), the side is targe
 
 | Symptom | Cause / fix |
 |---|---|
-| **Every tool call denies, for every user** | Usually the outbound route is missing — run `make enforce`, which includes WIRE, rather than the enforce half alone. Otherwise one of the two onboardings did not finish, leaving the per-tool maps empty: `kubectl logs deployment/aiac-agent -n aiac-system \| grep -iE 'label missing\|MCP tools/list'`. JetStream redelivers after `ACK_WAIT` (600 s) and usually succeeds, so waiting then re-running `make enforce` often cures it. |
+| **Every tool call denies, for every user** | Check that PREP passed: it grants `github-agent`'s client the `agent-team1-github-tool-aud` scope, and `make enforce` re-runs it. Then check the route: `kubectl get configmap authproxy-routes -n team1 -o yaml` must list `host: "github-tool"`. A cluster deployed before the route moved into `configmaps.yaml` still has only `github-tool-mcp`; re-apply it with `kubectl apply -n team1 -f demo/assets/agents/github_agent/k8s/configmaps.yaml` and run `make enforce` (PREP restarts the agent, which loads it). Otherwise one of the two onboardings did not finish, leaving the per-tool maps empty: `kubectl logs deployment/aiac-agent -n aiac-system \| grep -iE 'label missing\|MCP tools/list'`. JetStream redelivers after `ACK_WAIT` (600 s) and usually succeeds, so waiting then re-running `make enforce` often cures it. |
 | **ENFORCE stops: a client does not link `aiac-username-sub` as a default scope** | The token keeps `sub` = the Keycloak user ID, so the rego cannot find the user (D31). For `rossoctl`, restart the IdP Configuration Service once Keycloak is ready: `kubectl rollout restart deployment/aiac-interface -n aiac-system`. For `github-agent`, let AIAC onboard it again. Do not add a `sub` mapper by hand. |
-| **The AIAC Controller does not start (start check #4)** | The global combiner is the stock one, which allows a pod that has no client CR. A `make opa-restore` or another bundle-service install brought it back. Run `make opa` again. |
-| **Onboarding fails with a `401` from the LLM** | `enable.sh` defaulted to OpenAI. Patch `aiac-agent-config` and `rollout restart` — see [step 1](#point-it-at-your-llm). The values come in via `envFrom`, so a patch without a restart does nothing. |
+| **The AIAC Controller does not start (start check #4)** | The log says either that the `default` AuthorizationPolicy is *missing*, or that the global combiner *allows a pod that has no client CR*. Missing: `make opa` never ran on this cluster — it must run before `make enable` (see [step 2](#step-2--install-aiac)). Allows: the combiner is the stock one, brought back by a `make opa-restore` or another bundle-service install. Either way, run `make opa`, then `kubectl rollout restart deployment/aiac-agent -n aiac-system`. |
+| **Onboarding fails with a `401` from the LLM** | `enable.sh` defaulted to OpenAI. Patch `aiac-agent-config` and `rollout restart` — see [step 2](#change-llm). The values come in via `envFrom`, so a patch without a restart does nothing. |
 | **`driver.sh` refuses DEPLOY: workloads already exist** | The guard preventing a silent degrade into a replay. `make restore` first, or use `make replay` if you meant the replay. |
 | **`make replay` refuses: workloads aren't deployed** | Mirror of the same guard. Run `make e2e` — its DEPLOY phase is the real trigger. |
 | **Keycloak never registers the new clients** | Check the operator reconciled the `AgentRuntime` CRs (`kubectl logs deployment/rossoctl-controller-manager -n rossoctl-system`) and that the label landed: `kubectl get deployment github-agent -n team1 -o jsonpath='{.spec.template.metadata.labels}'`. |
-| **`aiac-agent` never logs the consumed event** | Check the SPI attached (`kubectl logs statefulset/keycloak -n keycloak \| grep -i aiac-event-listener`) and that the realm's admin-events config still lists it. A `helm upgrade` or Keycloak restart since step 1 needs `./enable.sh --spi-only` re-run. |
+| **`aiac-agent` never logs the consumed event** | Check the SPI attached (`kubectl logs statefulset/keycloak -n keycloak \| grep -i aiac-event-listener`) and that the realm's admin-events config still lists it. A `helm upgrade` or Keycloak restart since step 2 needs `./enable.sh --spi-only` re-run. |
 | **An inbound probe is denied that should be allowed** | The generated inbound gate admits the `rossoctl` platform client as a source. `driver.sh` logs users in through `ROPC_CLIENT_ID` (default `rossoctl`) for that reason; `aiac-demo-cli`, used by step 6's `run-*.py`, is not an accepted source, so probing through it is denied on `azp`. |
 | **An outbound probe returns a stale verdict** | The OPA SDK's bundle poller can take ~120 s to pick up a fresh CR write. The driver retries within `POLL_SECS`; by hand, wait and retry before concluding anything. |
 | **`make agent` / `make tool` times out** | Onboarding drives real LLM calls and can take minutes. Raise `AIAC_ONBOARD_TIMEOUT`. |
@@ -774,7 +776,7 @@ Four levels, narrowest first. Each is idempotent and safe to re-run.
 |---|---|---|
 | Re-run step 6 from a clean baseline | `make clear` | everything deployed; resets generated roles/scopes, the Policy Store, both CRs, and `generated/` |
 | Re-run the live path so DEPLOY is a genuine first trigger again | `make restore` | the AIAC stack, NATS broker, Keycloak SPI, demo users/roles |
-| Uninstall **just AIAC** — the inverse of step 1 | `make uninstall-aiac` | everything except `aiac-system` |
+| Uninstall **just AIAC** — the inverse of step 2 | `make uninstall-aiac` | everything except `aiac-system` |
 | Remove the demo entirely — back to the **post-install state** | `make teardown` | only platform state (see below) |
 
 Preview any teardown first: `make teardown ARGS=--dry-run` surveys what is actually present and
@@ -784,11 +786,11 @@ lists every deletion without performing one.
 
 Removes `github-agent`/`github-tool` **completely** — Deployments, Services, ServiceAccounts,
 `AgentRuntime` CRs, their Keycloak clients, credentials Secrets, leftover client-scopes and realm
-roles, and both `AuthorizationPolicy` CRs — and reverts step 5's outbound wiring. That completeness is
+roles, and both `AuthorizationPolicy` CRs. That completeness is
 the point: the next DEPLOY must be a genuine first-time trigger, not a no-op against clients that
 are still registered.
 
-To also reverse step 1's Keycloak-side changes (the realm's `aiac-event-listener` config and the
+To also reverse step 2's Keycloak-side changes (the realm's `aiac-event-listener` config and the
 Keycloak StatefulSet image):
 
 ```bash
@@ -809,7 +811,7 @@ overlapping surface to `restore.sh --include-infra`, then additionally removes:
 ```bash
 make teardown ARGS=--dry-run       # list everything; change nothing
 make teardown                      # tear down (prompts; ARGS=--yes skips)
-make teardown ARGS=--include-opa   # also revert step 2's overlay and combiner (needs the chart and operator clones)
+make teardown ARGS=--include-opa   # also revert step 1's overlay and combiner (needs the chart and operator clones)
 ```
 
 **What it deliberately leaves**, because the demo does not own it:
@@ -821,7 +823,7 @@ make teardown ARGS=--include-opa   # also revert step 2's overlay and combiner (
   `-m system` suite both depend on. The client scope `aiac-username-sub` and its links (D31) are
   AIAC's; AIAC makes them again at its next start and onboarding.
 - **the operator's `*-aud` audience client scopes**, which it owns and recreates.
-- **step 2's OPA overlay**, unless you pass `--include-opa`.
+- **step 1's OPA overlay**, unless you pass `--include-opa`.
 - **container images already in the Kind node.** Inert; the script prints the `docker image rm` line.
 
 > **One caveat on `authproxy-routes`.** The demo declares that ConfigMap in `team1`, so `teardown`
@@ -856,7 +858,7 @@ lives in `team1`, not `aiac-system`.)
   Under agent side, `github-tool` gets a **pass-through** CR, so nothing derived from `policy.md`
   constrains that path, and the driver does not probe it rather than report a fabricated result.
   `github-tool` is a bare FastMCP stub with **no authentication of its own**; with the sidecar
-  injected (`injectTools=true`, step 2) its inbound `jwt-validation` still rejects an
+  injected (`injectTools=true`, step 1) its inbound `jwt-validation` still rejects an
   unauthenticated call with **401**, but any valid token passes the pass-through.
 
   Check how the tool is fronted on your cluster:
@@ -1010,4 +1012,4 @@ for p in 7071 7072 7074 7070; do
 done
 ```
 
-Then continue from [step 2](#step-2--wire-opa-into-both-authbridge-legs).
+Then continue from [step 3](#step-3--provision-users-roles-and-the-policy).
