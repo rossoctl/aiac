@@ -227,7 +227,7 @@ A manual probe that mints a user token with the password grant through the
 login client `rossoctl` needs Direct Access Grants on that client. In a fresh
 realm it is off, and the mint fails with `unauthorized_client`. The system
 tests do not need this step: their fixture enables the grant itself
-(`ensure_direct_access_grants` in `test/system/uc1_onboard.py`) and turns it off
+(`direct_access_grants` in `test/system/uc1_onboard.py`) and turns it off
 again at teardown if it was off. To enable it by hand (a partial update: only
 this field changes), source the repo-root `.env` first. The snippet uses the
 same variables as the harness:
@@ -235,13 +235,13 @@ same variables as the harness:
 ```bash
 ( set -e  # a subshell: a failed check stops the snippet, not your shell
 set -a; . .env; set +a
-KC=${KEYCLOAK_URL:?}; REALM=${AIAC_TEST_REALM:-rossoctl}
-ADMIN=$(curl -s -X POST "$KC/realms/master/protocol/openid-connect/token" \
+KC=${KEYCLOAK_URL:?}; REALM=${AIAC_TEST_REALM:-rossoctl}; ADMIN_REALM=${KEYCLOAK_ADMIN_REALM:-master}
+ADMIN=$(curl -s -X POST "$KC/realms/$ADMIN_REALM/protocol/openid-connect/token" \
   -d client_id=admin-cli -d grant_type=password \
   --data-urlencode "username=${KEYCLOAK_ADMIN_USERNAME:?}" \
   --data-urlencode "password=${KEYCLOAK_ADMIN_PASSWORD:?}" \
   | python3 -c 'import sys,json;print(json.load(sys.stdin).get("access_token",""))')
-[ -n "$ADMIN" ] || { echo "admin login failed: check KEYCLOAK_ADMIN_*"; exit 1; }
+[ -n "$ADMIN" ] || { echo "admin login at realm $ADMIN_REALM failed: check KEYCLOAK_ADMIN_*"; exit 1; }
 CID=$(curl -s -H "Authorization: Bearer $ADMIN" "$KC/admin/realms/$REALM/clients?clientId=rossoctl" \
   | python3 -c 'import sys,json;c=json.load(sys.stdin);print(c[0]["id"] if c else "")')
 [ -n "$CID" ] || { echo "login client rossoctl not found in realm $REALM"; exit 1; }

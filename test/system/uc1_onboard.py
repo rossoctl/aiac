@@ -31,7 +31,9 @@ pipeline wired into both legs:
       → capture every AIAC CR + the global combiner to the pytest host (``teardown``) — the first
         teardown step, on the success and the failure path, best-effort (it never raises)
       → teardown full-to-pristine (undeploy + delete all registrations + delete CRs, verified); the
-        realm users, roles and Direct Access Grants on the login client stay (leave-in-place)
+        realm users and roles stay (leave-in-place)
+      → Direct Access Grants on the login client: the fixture turns it on before the pre-run slate and
+        turns it off again at the end if it was off (``direct_access_grants``)
 
 The only thing that differs between rungs is *which workloads are onboarded and in what order*, so
 all the machinery lives here and each ``test_uc1_onboard_*.py`` supplies just its own oracle
@@ -40,8 +42,8 @@ all the machinery lives here and each ``test_uc1_onboard_*.py`` supplies just it
 This module owns:
 
 * **Config** (env, spec § Configuration) — single stack, no variants.
-* **Keycloak** — ``connect_admin`` / ``provision_realm_and_users`` (the fixture UC-1 does *not* do,
-  with ``ensure_direct_access_grants`` on the login client, ``restore_direct_access_grants`` at teardown) /
+* **Keycloak** — ``connect_admin`` / ``direct_access_grants`` (the password grant on the login client,
+  for the life of the fixture) / ``provision_realm_and_users`` (the fixture UC-1 does *not* do) /
   ``cleanup_provisioned`` / ``delete_workload_registrations`` (teardown).
 * **CRs** — ``delete_workload_crs`` (the agent's and the tool's CR) / ``sweep_authpolicies`` (every
   other CR in the namespace) / ``delete_authpolicy`` (one CR, raising).
@@ -327,15 +329,13 @@ def connect_admin():
     )
 
 
-def provision_realm_and_users(admin, realm: str) -> bool:
+def provision_realm_and_users(admin, realm: str) -> None:
     """Idempotently ensure ``realm`` holds ``scenario_uc1``'s users + realm roles with the
     descriptions the PRB reads. Realm roles carry the ``aiac.managed`` marker so the IdP populates
     each role's ``actorIds`` (member usernames) — the PCE needs them to build the ``subject_roles``
-    map the inbound/outbound gates key on. Also turns on Direct Access Grants on the login client
-    (``ensure_direct_access_grants``), so that ``verify_login_subject`` and ``mint_token`` can use the
-    password grant. Never deletes/recreates — reruns converge (spec: shared realm, leave-in-place: the
-    users and the roles stay after the run). Returns ``True`` when it turned the grant on: the caller
-    turns it off again at teardown (``restore_direct_access_grants``)."""
+    map the inbound/outbound gates key on. Never deletes/recreates — reruns converge (spec: shared
+    realm, leave-in-place: the users and the roles stay after the run). The password grant on the login
+    client is not set here: see ``direct_access_grants``."""
     from keycloak.exceptions import KeycloakError
 
     try:
@@ -355,8 +355,6 @@ def provision_realm_and_users(admin, realm: str) -> bool:
         _complete_user_profile(admin, user_id, profile)
         admin.set_user_password(user_id, scn.USER_PASSWORD, temporary=False)
         admin.assign_realm_roles(user_id, [admin.get_realm_role(role_name)])
-
-    return ensure_direct_access_grants(admin, realm)
 
 
 def _user_profile(username: str) -> dict:
@@ -1036,26 +1034,27 @@ def subject_scope_problems(
 
 def login_client(admin, realm: str = TEST_REALM) -> dict | None:
     """The Keycloak client representation of the login client ``rossoctl`` (``KEYCLOAK_CLIENT_ID``, the
-    client the harness mints user tokens through) in ``realm``, keyed on its ``clientId``; ``None`` if
-    absent."""
+    client the harness mints user tokens through) in ``realm``; ``None`` if absent. A query filtered by
+    ``clientId`` finds its UUID, so the call does not list every client of the realm."""
     admin.change_current_realm(realm)
-    return next((c for c in admin.get_clients() if c.get("clientId") == KEYCLOAK_CLIENT_ID), None)
+    client_uuid = admin.get_client_id(KEYCLOAK_CLIENT_ID)
+    return admin.get_client(client_uuid) if client_uuid else None
 
 
-def ensure_direct_access_grants(admin, realm: str) -> bool:
+def ensure_direct_access_grants(admin, realm: str) -> str | None:
     """Turn on Direct Access Grants on the login client (``KEYCLOAK_CLIENT_ID``) of ``realm``, so that
-    ``mint_token`` can use the password grant. ``provision_realm_and_users`` calls it, so each setup path
-    that provisions the users also gets the grant.
+    ``mint_token`` can use the password grant. Use it through ``direct_access_grants``, which turns the
+    grant off again.
 
     Idempotent: a client that has the grant already is not written. The write is a partial update (only
     ``directAccessGrantsEnabled``), so it does not write back a stale copy of the client over a change
-    that the IdP Configuration Service made (for example its D31 scope link). Returns ``True`` when this
-    call turned the grant on: the caller then turns it off again at teardown
-    (``restore_direct_access_grants``), so a realm that had it off on purpose stays as it was.
+    that the IdP Configuration Service made (for example its D31 scope link). Returns the client UUID
+    when this call turned the grant on, else ``None``.
 
     ``pytest.skip`` (with the cause) when the login client does not exist (the realm owns its login
     client, so nothing is created) or when the admin API refuses the read or the update (for example the
-    admin cannot manage clients). Both are prerequisite gaps, not AIAC failures."""
+    admin cannot manage clients). Both are prerequisite gaps, not AIAC failures. A refused update writes
+    nothing, so each skip leaves the realm as it was."""
     import pytest
     from keycloak.exceptions import KeycloakError
 
@@ -1064,7 +1063,8 @@ def ensure_direct_access_grants(admin, realm: str) -> bool:
     except KeycloakError as exc:
         pytest.skip(
             f"cannot read the login client {KEYCLOAK_CLIENT_ID!r} in realm {realm!r} to enable Direct Access "
-            f"Grants: {exc}. Give the admin user the view-clients and manage-clients roles."
+            f"Grants: {exc}. Make sure that the realm exists and that the admin user has the view-clients and "
+            "manage-clients roles."
         )
     if client is None:
         pytest.skip(
@@ -1072,7 +1072,7 @@ def ensure_direct_access_grants(admin, realm: str) -> bool:
             "mint a user token through it (the realm owns its login client; the harness does not create it)"
         )
     if client.get("directAccessGrantsEnabled"):
-        return False
+        return None
     try:
         admin.update_client(client["id"], {"directAccessGrantsEnabled": True})
     except KeycloakError as exc:
@@ -1086,26 +1086,40 @@ def ensure_direct_access_grants(admin, realm: str) -> bool:
         KEYCLOAK_CLIENT_ID,
         realm,
     )
-    return True
+    return client["id"]
 
 
-def restore_direct_access_grants(admin, realm: str) -> None:
-    """Turn Direct Access Grants off again on the login client of ``realm``: the teardown half of
-    ``ensure_direct_access_grants``, called only when that call turned it on. Best-effort: a missing
-    client or a ``KeycloakError`` is logged, never raised, so it does not mask a teardown failure."""
-    from keycloak.exceptions import KeycloakError
-
+def restore_direct_access_grants(admin, realm: str, client_uuid: str) -> None:
+    """Turn Direct Access Grants off again on the login client ``client_uuid`` of ``realm`` (the UUID that
+    ``ensure_direct_access_grants`` returned): a partial update, like the enable. Best-effort: any error
+    is logged, never raised, so it does not mask a teardown failure that is propagating."""
     try:
-        client = login_client(admin, realm)
-        if client is not None:
-            admin.update_client(client["id"], {"directAccessGrantsEnabled": False})
-    except KeycloakError as exc:
+        admin.change_current_realm(realm)
+        admin.update_client(client_uuid, {"directAccessGrantsEnabled": False})
+    except Exception as exc:  # noqa: BLE001 — best-effort teardown: log, never mask the real failure
         log.error(
             "cannot turn Direct Access Grants off again on the login client %r in realm %r: %s",
             KEYCLOAK_CLIENT_ID,
             realm,
             exc,
         )
+
+
+@contextmanager
+def direct_access_grants(admin, realm: str) -> Iterator[None]:
+    """Direct Access Grants on the login client of ``realm`` for the ``with`` body.
+
+    At entry: ``ensure_direct_access_grants`` (turn it on, or skip with the cause). At exit: if the entry
+    turned it on, ``restore_direct_access_grants`` turns it off again, so a realm that had it off stays
+    as it was. The restore is in this context manager's own ``finally``: it runs when the body raises,
+    skips or returns, and also when a teardown step of the body raises. Enter it before the first
+    mutation of shared cluster state, so a skip at entry changes nothing."""
+    client_uuid = ensure_direct_access_grants(admin, realm)
+    try:
+        yield
+    finally:
+        if client_uuid is not None:
+            restore_direct_access_grants(admin, realm, client_uuid)
 
 
 def _workload_list(workloads: str | Sequence[str]) -> list[str]:
@@ -1434,10 +1448,11 @@ def onboarded_stack(
     Teardown first captures every AIAC CR and the global combiner to the pytest host
     (``capture_aiac_crs``, phase ``teardown``; best-effort, it never masks a failure), then is
     **full-to-pristine** — the workloads and every registration are removed and the removal is
-    verified. The users and the roles of ``provision_realm_and_users`` are shared realm state and stay;
-    Direct Access Grants on the login client is turned off again if the setup turned it on. The capture directories are named for
-    the test module that started the stack. The workload order is the rung's identity — e.g. rung 2
-    passes ``[agent, tool]`` so tool onboarding
+    verified. The users and the roles of ``provision_realm_and_users`` are shared realm state and stay.
+    Direct Access Grants on the login client is on for the whole flow (``direct_access_grants``, entered
+    after the skip gates and before the pre-run slate) and is turned off again at the end if it was off.
+    The capture directories are named for the test module that started the stack. The workload order is
+    the rung's identity — e.g. rung 2 passes ``[agent, tool]`` so tool onboarding
     completes the tool check (under target side it writes github-tool's own CR with both gates; under
     agent side it completes the agent's outbound gate); rung 3 passes ``[tool, agent]`` and must
     converge to the same live decisions.
@@ -1470,226 +1485,229 @@ def onboarded_stack(
     require_event_path(admin=admin, realm=TEST_REALM)
     side = live_enforcement_side()  # read-only; the suite runs under the live side
 
-    # Pre-run: start from a NO-WORKLOADS slate. The trigger is event-driven — deploying a workload only
-    # re-fires ``CLIENT_CREATED`` if there is no client for it yet, so a leftover workload + its Keycloak
-    # client from a prior run would silently swallow the event and onboarding would never trigger. Remove
-    # both workloads and every registration first (best-effort, tolerant of already-absent), then poll the
-    # clients actually gone before deploying. Capture the CRs first: a prior run's leftovers are evidence.
-    label = _capture_label()  # the rung, read once here (a session fixture is torn down after the session)
-    capture_aiac_crs("pre-run-slate", label=label)
-    undeploy_workload(scn.AGENT_WORKLOAD)
-    undeploy_workload(scn.TOOL_WORKLOAD)
-    _scrub_to_pristine(
-        admin
-    )  # clients + *-aud scopes + workload CRs + stray AuthorizationPolicy CRs + roles/scopes + store
-    reenable_provisioned_clients(
-        admin, TEST_REALM
-    )  # undo any prior run's failed-service disable (a no-op once scrubbed)
-    if not poll_until(lambda: not workload_clients_present(admin), timeout=DEPLOY_TIMEOUT, interval=5):
-        raise RuntimeError(
-            f"pre-run cleanup left Keycloak client(s) {workload_clients_present(admin)} for {NAMESPACE!r} — the "
-            "fresh deploy would not re-fire CLIENT_CREATED, so event-driven onboarding would never trigger."
-        )
-
-    # BEFORE deploying (PRB reads the role universe when the event fires). It also enables Direct Access
-    # Grants on the login client (the password grant of ``mint_token`` needs it; skip if it cannot);
-    # ``grant_enabled`` = it was off, so the teardown turns it off again.
-    grant_enabled = provision_realm_and_users(admin, TEST_REALM)
-
-    tool_onboarded = scn.TOOL_WORKLOAD in workloads
-    signals = list(ready_signals) if ready_signals is not None else _default_ready_signals(tool_onboarded)
-    try:
-        # Inside the ``try``, so a skip here still restores the grant. Skip if a token still can't be
-        # minted. The login token's ``sub`` comes from ``aiac-username-sub``, which the IdP Configuration
-        # Service links to the login client at startup (D31): fail if it isn't the username.
-        # ``require_subject_scope`` below checks the links again after each onboarding.
-        verify_login_subject(keycloak_url=keycloak_url, realm=TEST_REALM, user="dev-user", password=scn.USER_PASSWORD)
-        ensure_agent_policy(CONTROLLER_NAMESPACE, policy_md=policy_md)  # mount this run's policy.md BEFORE deploying
-
-        # Minimal probe ctx for the per-workload agent convergence gate: the inbound leg reaches the
-        # agent through its pod-agnostic Service, so no ``agent_pod`` is needed yet (it is resolved after
-        # Part B for the outbound leg). The full ``ctx`` is assembled below once ``agent_pod`` is known.
-        probe_ctx = {"admin": admin, "namespace": NAMESPACE, "keycloak_url": keycloak_url, "realm": TEST_REALM}
-
-        # Fulfill the images precondition BEFORE any deploy: build-if-absent + ``kind load`` the demo
-        # image(s) for exactly the workloads this rung deploys. Loading is order-independent, so it is
-        # done once here rather than per-iteration; the loop below then only ``kubectl apply``s.
-        load_workload_images(workloads)
-
-        # Deploy in the rung's ``workloads`` order, one at a time, converging before the next — each
-        # ``deploy_workload`` fires the event-driven trigger (deploy -> operator -> CLIENT_CREATED ->
-        # SPI -> NATS -> consumer). The order is the rung's ordering proof.
-        for workload in workloads:
-            deployed_at = datetime.now(timezone.utc)  # the log window of the race hint (handoff 20)
-            deploy_workload(workload)
-            if not wait_for_registration(admin, workload):
-                raise RuntimeError(
-                    f"operator did not register Keycloak client {NAMESPACE}/{workload!r} within "
-                    f"{DEPLOY_TIMEOUT:.0f}s of deploying it — is the event path wired (NATS broker + "
-                    "aiac-event-listener SPI)? (The rollout already passed, so the image is loaded.) "
-                    "See docs/testing/uc1-onboarding-pipeline.md Preconditions."
-                )
-            if workload == scn.AGENT_WORKLOAD:
-                # Option A′ — one representative ENFORCED decision proves OPA loaded the agent's bundle.
-                # A bare AuthorizationPolicy CR proves only that the operator reconciled, not that the
-                # bundle is in force; a live inbound dev-user=allow through AuthBridge->OPA is positive
-                # proof. dev-user inbound is deterministically allow on every rung. The changed combiner
-                # denies the agent pod until its own CR is loaded (D20), so the allow cannot come from a
-                # missing CR.
-                gate = ReadySignal("inbound", "dev-user", "allow")
-                if not poll_until(
-                    lambda g=gate: g.decide(probe_ctx) == g.expected,
-                    timeout=BUNDLE_TIMEOUT,
-                    interval=BUNDLE_POLL_INTERVAL,
-                ):
-                    # The hint says when the Controller log shows the event-before-commit race (handoff 20):
-                    # then the onboarding had not run yet, and OPA had no CR of the agent to load.
-                    raise RuntimeError(
-                        append_hint(
-                            f"agent did not converge after deploy: {gate.label()}={gate.decide(probe_ctx)!r} "
-                            f"(want {gate.expected!r}) within {BUNDLE_TIMEOUT:.0f}s — OPA had not loaded the "
-                            "agent's bundle. See k8s/opa-kind-runbook.md and issue #139.",
-                            controller_commit_race_hint(deployed_at, admin=admin, workload=workload),
-                        )
-                    )
-            else:
-                # Tool — it has its own CR (D20): under target side its inbound decides the tool calls,
-                # under agent side it is a pass-through CR. A live decision on its inbound needs the
-                # outbound leg (Part B, below), so the per-workload gate reads state instead: the scopes
-                # provisioned, SPM(github-tool) stored (the PRB ran, not only the bootstrap), and the CR
-                # present with both request packages (``tool_onboarding_state``).
-                seen = {"state": {}}
-
-                def _tool_converged() -> bool:
-                    seen["state"] = tool_onboarding_state(admin)
-                    return all(seen["state"].values())
-
-                if not poll_until(_tool_converged, timeout=ONBOARD_TIMEOUT, interval=5):
-                    raise RuntimeError(
-                        append_hint(
-                            f"tool did not converge after deploy within {ONBOARD_TIMEOUT:.0f}s: {seen['state']} "
-                            f"(scopes = all of {sorted(scn.TOOL_SCOPES)} provisioned; spm = "
-                            f"SPM({scn.TOOL_WORKLOAD}) stored; cr = its AuthorizationPolicy CR with both request "
-                            "packages). A failed onboarding check (D30: the tool pod has no authbridge-proxy "
-                            "sidecar — injectTools; no opa / mcp-parser in the namespace inbound pipeline; an "
-                            "httpGet probe) leaves no CR — see the Controller log and k8s/opa-kind-enable.sh.",
-                            controller_commit_race_hint(deployed_at, admin=admin, workload=workload),
-                        )
-                    )
-
-            # The workload converged, so its Provision ran and linked the subject scope (D31). Fail fast
-            # (not skip) when it did not: a missing link is AIAC's own fault, and without it the exchanged
-            # token keeps sub = the user ID, so every tool call would be denied later with no clear cause.
-            require_subject_scope(admin, workload)
-
-        # Part B — enable the outbound token-exchange leg so the tool check is actually reached (under
-        # target side github-tool's inbound OPA, which accepts only a token with its audience; under
-        # agent side the agent's outbound OPA). Done after onboarding so the restarted agent (and its
-        # OPA sidecar) picks up both the new route and, on its next poll, the recomposed bundle.
-        #
-        # Prepared ONLY when this run actually probes outbound (``has_outbound``). The agent-only rung
-        # (rung 1) has no tool onboarded, so there is no real ``agent -> tool`` call to make and no
-        # outbound signal in its set — its outbound leg has no real-life counterpart, and token-exchange
-        # would short-circuit before OPA anyway (no ``github-tool`` audience grant, since the operator
-        # creates ``agent-{ns}-github-tool-aud`` only on TOOL deploy). So on a tool-less rung Part B is
-        # skipped entirely: no outbound route, no restart. Its inbound gate already converged in the
-        # per-workload loop above, and skipping the restart means rung 1 asserts the exact bundle the
-        # live event-driven onboard produced (no restart papering over a bad compose).
-        #
-        # When there IS an outbound leg: add the route so the forward proxy intercepts the github-tool
-        # call and runs token-exchange, grant the agent client the ``*-aud`` scope (only ever present
-        # once the tool is deployed) so the exchange succeeds and OPA is reached, then restart the agent
-        # so it reloads the route and re-fetches the recomposed bundle.
-        has_outbound = any(sig.kind == "outbound" for sig in signals)
-        if has_outbound:
-            ensure_github_tool_route(NAMESPACE)
-            if tool_onboarded:
-                grant_exchange_scope(admin)
-            restart_agent(NAMESPACE)
-        # Resolved once for the ctx contract, but the live outbound path re-resolves per probe
-        # (``resolve_agent_pod``) so a pod replaced after this point can't poison the whole run (#139).
-        agent_pod = resolve_agent_pod()
-
-        ctx = {
-            "admin": admin,
-            "namespace": NAMESPACE,
-            "agent_pod": agent_pod,
-            "keycloak_url": keycloak_url,
-            "realm": TEST_REALM,
-            "tool_onboarded": tool_onboarded,
-            "side": side,
-        }
-
-        # Wait for bundle-service + OPA to reflect THIS run's CR (and token-exchange to settle) before
-        # any assertion. The ``signals`` set (this policy's ``ready_signals``, or the Policy-A default)
-        # is polled until every probe reaches its terminal verdict — each deterministic for its
-        # scenario regardless of a stale CR (which the run replaced), and each polled to a *definitive*
-        # allow/deny (not ``error``) so we also wait out the post-restart token-exchange 503 window.
-        def _ready() -> bool:
-            return all(sig.decide(ctx) == sig.expected for sig in signals)
-
-        if not poll_until(_ready, timeout=BUNDLE_TIMEOUT, interval=BUNDLE_POLL_INTERVAL):
-            # Surface the RAW outbound (code, body) — not just the classified outcome — so a stalled
-            # run is self-diagnosing (issue #139). The classifier collapses three very different
-            # failures into ``"error"``; the raw ``(code, body)`` tells them apart in one shot:
-            #   * ``code=None`` + body ``"outbound probe exec failed: ..."`` — the *probe's* ``kubectl
-            #     exec`` failed (e.g. the agent pod was replaced by a restart and its name went stale,
-            #     ``NotFound``). A harness/pod issue, not the pipeline — OPA was never reached.
-            #   * ``code=503`` — the ``token-exchange`` leg failed upstream (audience refused, IdP
-            #     unreachable), so OPA was never consulted.
-            #   * a genuine OPA policy stall can't show as ``"error"`` at all: it surfaces as ``"deny"``
-            #     under deny-by-default (target side: github-tool's inbound HTTP 403 with an OPA body;
-            #     agent side: HTTP 200 + an OPA error frame), because the generated Rego carries
-            #     ``default allow := false``.
-            # The observed-vs-expected line is recomputed against *this run's* signals so a denyworld
-            # (or any parametrized) run diagnoses itself, not a hardcoded Policy-A probe.
-            observed = "; ".join(f"{sig.label()}={sig.decide(ctx)!r}(want {sig.expected!r})" for sig in signals)
-            # Re-resolve the pod fresh here (not the possibly-stale ``ctx["agent_pod"]``) so the raw
-            # line reflects the *current* live pod. Dump the raw (code, body) for the first outbound
-            # signal — the leg where the #139 stale-pod / 503 failures actually show up.
-            raw_line = ""
-            ob_sig = next((s for s in signals if s.kind == "outbound"), None)
-            if ob_sig is not None:
-                ob_token = mint_token(
-                    ob_sig.subject, scn.USER_PASSWORD, keycloak_url=ctx["keycloak_url"], realm=ctx["realm"]
-                )
-                ob_code, ob_body = outbound_probe(
-                    ob_token, ob_sig.tool_bare, namespace=ctx["namespace"], agent_pod=resolve_agent_pod()
-                )
-                raw_line = f" [raw {ob_sig.label()}: HTTP {ob_code}, body={ob_body[:300]!r}]"
+    # Direct Access Grants on the login client (the password grant of ``mint_token`` needs it). Enter it
+    # before the first mutation, so a skip (missing client, refused write) leaves the cluster as it was.
+    # Its own ``finally`` turns the grant off again if it was off, whatever teardown step below raises.
+    with direct_access_grants(admin, TEST_REALM):
+        # Pre-run: start from a NO-WORKLOADS slate. The trigger is event-driven — deploying a workload only
+        # re-fires ``CLIENT_CREATED`` if there is no client for it yet, so a leftover workload + its Keycloak
+        # client from a prior run would silently swallow the event and onboarding would never trigger. Remove
+        # both workloads and every registration first (best-effort, tolerant of already-absent), then poll the
+        # clients actually gone before deploying. Capture the CRs first: a prior run's leftovers are evidence.
+        label = _capture_label()  # the rung, read once here (a session fixture is torn down after the session)
+        capture_aiac_crs("pre-run-slate", label=label)
+        undeploy_workload(scn.AGENT_WORKLOAD)
+        undeploy_workload(scn.TOOL_WORKLOAD)
+        _scrub_to_pristine(
+            admin
+        )  # clients + *-aud scopes + workload CRs + stray AuthorizationPolicy CRs + roles/scopes + store
+        reenable_provisioned_clients(
+            admin, TEST_REALM
+        )  # undo any prior run's failed-service disable (a no-op once scrubbed)
+        if not poll_until(lambda: not workload_clients_present(admin), timeout=DEPLOY_TIMEOUT, interval=5):
             raise RuntimeError(
-                f"live pipeline did not converge within {BUNDLE_TIMEOUT:.0f}s after onboarding "
-                f"{workloads} + Part B: {observed}.{raw_line} code=None + 'exec failed' body = a "
-                "stale/gone agent pod (harness); 503 = token-exchange never came up (OPA not reached); "
-                "under deny-by-default a real policy stall reads 'deny', never 'error' — see "
-                "k8s/opa-kind-runbook.md and issue #139."
+                f"pre-run cleanup left Keycloak client(s) {workload_clients_present(admin)} for {NAMESPACE!r} — the "
+                "fresh deploy would not re-fire CLIENT_CREATED, so event-driven onboarding would never trigger."
             )
-        yield ctx
-    finally:
-        # Capture every AIAC CR and the combiner to the pytest host FIRST — the undeploy and the scrub
-        # remove or change them. Best-effort: it never raises, on the success and the failure path.
-        capture_aiac_crs("teardown", label=label)
-        # Teardown — full-to-pristine, best-effort per step (each helper tolerates already-absent objects).
-        for workload in reversed(workloads):  # undeploy in reverse deploy order
-            undeploy_workload(workload)
-        # Explicit scrub — do not trust an unverified operator cascade. Same reset the pre-run slate runs.
-        _scrub_to_pristine(admin)
-        if grant_enabled:  # best-effort, before the pristine check (which can raise)
-            restore_direct_access_grants(admin, TEST_REALM)
-        # Verify pristine: both clients gone AND no AuthorizationPolicy CR remains. A leaked footprint is
-        # a test failure, not silent drift — but do not mask a failure already propagating out of the try.
-        if not poll_until(
-            lambda: not workload_clients_present(admin) and no_authpolicies_remain(), timeout=DEPLOY_TIMEOUT, interval=5
-        ):
-            msg = (
-                f"teardown did not restore pristine: Keycloak client(s) still present="
-                f"{workload_clients_present(admin)}, AuthorizationPolicy CR(s) remain={not no_authpolicies_remain()} "
-                f"in {NAMESPACE!r}. See handoff 03 teardown (full-to-pristine)."
-            )
-            if sys.exc_info()[0] is not None:
-                log.error("%s [suppressed — a prior error is propagating]", msg)
-            else:
-                raise RuntimeError(msg)
+
+        # BEFORE deploying (PRB reads the role universe when the event fires).
+        provision_realm_and_users(admin, TEST_REALM)
+        # Skip if a token can't be minted (the grant is on: ``direct_access_grants`` above). The login token's
+        # ``sub`` comes from ``aiac-username-sub``, which the IdP Configuration Service links to the login
+        # client at startup (D31): fail if it isn't the username. ``require_subject_scope`` below checks the
+        # links again after each onboarding.
+        verify_login_subject(keycloak_url=keycloak_url, realm=TEST_REALM, user="dev-user", password=scn.USER_PASSWORD)
+
+        tool_onboarded = scn.TOOL_WORKLOAD in workloads
+        signals = list(ready_signals) if ready_signals is not None else _default_ready_signals(tool_onboarded)
+        try:
+            # Mount this run's policy.md BEFORE deploying.
+            ensure_agent_policy(CONTROLLER_NAMESPACE, policy_md=policy_md)
+
+            # Minimal probe ctx for the per-workload agent convergence gate: the inbound leg reaches the
+            # agent through its pod-agnostic Service, so no ``agent_pod`` is needed yet (it is resolved after
+            # Part B for the outbound leg). The full ``ctx`` is assembled below once ``agent_pod`` is known.
+            probe_ctx = {"admin": admin, "namespace": NAMESPACE, "keycloak_url": keycloak_url, "realm": TEST_REALM}
+
+            # Fulfill the images precondition BEFORE any deploy: build-if-absent + ``kind load`` the demo
+            # image(s) for exactly the workloads this rung deploys. Loading is order-independent, so it is
+            # done once here rather than per-iteration; the loop below then only ``kubectl apply``s.
+            load_workload_images(workloads)
+
+            # Deploy in the rung's ``workloads`` order, one at a time, converging before the next — each
+            # ``deploy_workload`` fires the event-driven trigger (deploy -> operator -> CLIENT_CREATED ->
+            # SPI -> NATS -> consumer). The order is the rung's ordering proof.
+            for workload in workloads:
+                deployed_at = datetime.now(timezone.utc)  # the log window of the race hint (handoff 20)
+                deploy_workload(workload)
+                if not wait_for_registration(admin, workload):
+                    raise RuntimeError(
+                        f"operator did not register Keycloak client {NAMESPACE}/{workload!r} within "
+                        f"{DEPLOY_TIMEOUT:.0f}s of deploying it — is the event path wired (NATS broker + "
+                        "aiac-event-listener SPI)? (The rollout already passed, so the image is loaded.) "
+                        "See docs/testing/uc1-onboarding-pipeline.md Preconditions."
+                    )
+                if workload == scn.AGENT_WORKLOAD:
+                    # Option A′ — one representative ENFORCED decision proves OPA loaded the agent's bundle.
+                    # A bare AuthorizationPolicy CR proves only that the operator reconciled, not that the
+                    # bundle is in force; a live inbound dev-user=allow through AuthBridge->OPA is positive
+                    # proof. dev-user inbound is deterministically allow on every rung. The changed combiner
+                    # denies the agent pod until its own CR is loaded (D20), so the allow cannot come from a
+                    # missing CR.
+                    gate = ReadySignal("inbound", "dev-user", "allow")
+                    if not poll_until(
+                        lambda g=gate: g.decide(probe_ctx) == g.expected,
+                        timeout=BUNDLE_TIMEOUT,
+                        interval=BUNDLE_POLL_INTERVAL,
+                    ):
+                        # The hint says when the Controller log shows the event-before-commit race (handoff 20):
+                        # then the onboarding had not run yet, and OPA had no CR of the agent to load.
+                        raise RuntimeError(
+                            append_hint(
+                                f"agent did not converge after deploy: {gate.label()}={gate.decide(probe_ctx)!r} "
+                                f"(want {gate.expected!r}) within {BUNDLE_TIMEOUT:.0f}s — OPA had not loaded the "
+                                "agent's bundle. See k8s/opa-kind-runbook.md and issue #139.",
+                                controller_commit_race_hint(deployed_at, admin=admin, workload=workload),
+                            )
+                        )
+                else:
+                    # Tool — it has its own CR (D20): under target side its inbound decides the tool calls,
+                    # under agent side it is a pass-through CR. A live decision on its inbound needs the
+                    # outbound leg (Part B, below), so the per-workload gate reads state instead: the scopes
+                    # provisioned, SPM(github-tool) stored (the PRB ran, not only the bootstrap), and the CR
+                    # present with both request packages (``tool_onboarding_state``).
+                    seen = {"state": {}}
+
+                    def _tool_converged() -> bool:
+                        seen["state"] = tool_onboarding_state(admin)
+                        return all(seen["state"].values())
+
+                    if not poll_until(_tool_converged, timeout=ONBOARD_TIMEOUT, interval=5):
+                        raise RuntimeError(
+                            append_hint(
+                                f"tool did not converge after deploy within {ONBOARD_TIMEOUT:.0f}s: {seen['state']} "
+                                f"(scopes = all of {sorted(scn.TOOL_SCOPES)} provisioned; spm = "
+                                f"SPM({scn.TOOL_WORKLOAD}) stored; cr = its AuthorizationPolicy CR with both request "
+                                "packages). A failed onboarding check (D30: the tool pod has no authbridge-proxy "
+                                "sidecar — injectTools; no opa / mcp-parser in the namespace inbound pipeline; an "
+                                "httpGet probe) leaves no CR — see the Controller log and k8s/opa-kind-enable.sh.",
+                                controller_commit_race_hint(deployed_at, admin=admin, workload=workload),
+                            )
+                        )
+
+                # The workload converged, so its Provision ran and linked the subject scope (D31). Fail fast
+                # (not skip) when it did not: a missing link is AIAC's own fault, and without it the exchanged
+                # token keeps sub = the user ID, so every tool call would be denied later with no clear cause.
+                require_subject_scope(admin, workload)
+
+            # Part B — enable the outbound token-exchange leg so the tool check is actually reached (under
+            # target side github-tool's inbound OPA, which accepts only a token with its audience; under
+            # agent side the agent's outbound OPA). Done after onboarding so the restarted agent (and its
+            # OPA sidecar) picks up both the new route and, on its next poll, the recomposed bundle.
+            #
+            # Prepared ONLY when this run actually probes outbound (``has_outbound``). The agent-only rung
+            # (rung 1) has no tool onboarded, so there is no real ``agent -> tool`` call to make and no
+            # outbound signal in its set — its outbound leg has no real-life counterpart, and token-exchange
+            # would short-circuit before OPA anyway (no ``github-tool`` audience grant, since the operator
+            # creates ``agent-{ns}-github-tool-aud`` only on TOOL deploy). So on a tool-less rung Part B is
+            # skipped entirely: no outbound route, no restart. Its inbound gate already converged in the
+            # per-workload loop above, and skipping the restart means rung 1 asserts the exact bundle the
+            # live event-driven onboard produced (no restart papering over a bad compose).
+            #
+            # When there IS an outbound leg: add the route so the forward proxy intercepts the github-tool
+            # call and runs token-exchange, grant the agent client the ``*-aud`` scope (only ever present
+            # once the tool is deployed) so the exchange succeeds and OPA is reached, then restart the agent
+            # so it reloads the route and re-fetches the recomposed bundle.
+            has_outbound = any(sig.kind == "outbound" for sig in signals)
+            if has_outbound:
+                ensure_github_tool_route(NAMESPACE)
+                if tool_onboarded:
+                    grant_exchange_scope(admin)
+                restart_agent(NAMESPACE)
+            # Resolved once for the ctx contract, but the live outbound path re-resolves per probe
+            # (``resolve_agent_pod``) so a pod replaced after this point can't poison the whole run (#139).
+            agent_pod = resolve_agent_pod()
+
+            ctx = {
+                "admin": admin,
+                "namespace": NAMESPACE,
+                "agent_pod": agent_pod,
+                "keycloak_url": keycloak_url,
+                "realm": TEST_REALM,
+                "tool_onboarded": tool_onboarded,
+                "side": side,
+            }
+
+            # Wait for bundle-service + OPA to reflect THIS run's CR (and token-exchange to settle) before
+            # any assertion. The ``signals`` set (this policy's ``ready_signals``, or the Policy-A default)
+            # is polled until every probe reaches its terminal verdict — each deterministic for its
+            # scenario regardless of a stale CR (which the run replaced), and each polled to a *definitive*
+            # allow/deny (not ``error``) so we also wait out the post-restart token-exchange 503 window.
+            def _ready() -> bool:
+                return all(sig.decide(ctx) == sig.expected for sig in signals)
+
+            if not poll_until(_ready, timeout=BUNDLE_TIMEOUT, interval=BUNDLE_POLL_INTERVAL):
+                # Surface the RAW outbound (code, body) — not just the classified outcome — so a stalled
+                # run is self-diagnosing (issue #139). The classifier collapses three very different
+                # failures into ``"error"``; the raw ``(code, body)`` tells them apart in one shot:
+                #   * ``code=None`` + body ``"outbound probe exec failed: ..."`` — the *probe's* ``kubectl
+                #     exec`` failed (e.g. the agent pod was replaced by a restart and its name went stale,
+                #     ``NotFound``). A harness/pod issue, not the pipeline — OPA was never reached.
+                #   * ``code=503`` — the ``token-exchange`` leg failed upstream (audience refused, IdP
+                #     unreachable), so OPA was never consulted.
+                #   * a genuine OPA policy stall can't show as ``"error"`` at all: it surfaces as ``"deny"``
+                #     under deny-by-default (target side: github-tool's inbound HTTP 403 with an OPA body;
+                #     agent side: HTTP 200 + an OPA error frame), because the generated Rego carries
+                #     ``default allow := false``.
+                # The observed-vs-expected line is recomputed against *this run's* signals so a denyworld
+                # (or any parametrized) run diagnoses itself, not a hardcoded Policy-A probe.
+                observed = "; ".join(f"{sig.label()}={sig.decide(ctx)!r}(want {sig.expected!r})" for sig in signals)
+                # Re-resolve the pod fresh here (not the possibly-stale ``ctx["agent_pod"]``) so the raw
+                # line reflects the *current* live pod. Dump the raw (code, body) for the first outbound
+                # signal — the leg where the #139 stale-pod / 503 failures actually show up.
+                raw_line = ""
+                ob_sig = next((s for s in signals if s.kind == "outbound"), None)
+                if ob_sig is not None:
+                    ob_token = mint_token(
+                        ob_sig.subject, scn.USER_PASSWORD, keycloak_url=ctx["keycloak_url"], realm=ctx["realm"]
+                    )
+                    ob_code, ob_body = outbound_probe(
+                        ob_token, ob_sig.tool_bare, namespace=ctx["namespace"], agent_pod=resolve_agent_pod()
+                    )
+                    raw_line = f" [raw {ob_sig.label()}: HTTP {ob_code}, body={ob_body[:300]!r}]"
+                raise RuntimeError(
+                    f"live pipeline did not converge within {BUNDLE_TIMEOUT:.0f}s after onboarding "
+                    f"{workloads} + Part B: {observed}.{raw_line} code=None + 'exec failed' body = a "
+                    "stale/gone agent pod (harness); 503 = token-exchange never came up (OPA not reached); "
+                    "under deny-by-default a real policy stall reads 'deny', never 'error' — see "
+                    "k8s/opa-kind-runbook.md and issue #139."
+                )
+            yield ctx
+        finally:
+            # Capture every AIAC CR and the combiner to the pytest host FIRST — the undeploy and the scrub
+            # remove or change them. Best-effort: it never raises, on the success and the failure path.
+            capture_aiac_crs("teardown", label=label)
+            # Teardown — full-to-pristine, best-effort per step (each helper tolerates already-absent objects).
+            for workload in reversed(workloads):  # undeploy in reverse deploy order
+                undeploy_workload(workload)
+            # Explicit scrub — do not trust an unverified operator cascade. Same reset the pre-run slate runs.
+            _scrub_to_pristine(admin)
+            # Verify pristine: both clients gone AND no AuthorizationPolicy CR remains. A leaked footprint is
+            # a test failure, not silent drift — but do not mask a failure already propagating out of the try.
+            if not poll_until(
+                lambda: not workload_clients_present(admin) and no_authpolicies_remain(),
+                timeout=DEPLOY_TIMEOUT,
+                interval=5,
+            ):
+                msg = (
+                    f"teardown did not restore pristine: Keycloak client(s) still present="
+                    f"{workload_clients_present(admin)}, AuthorizationPolicy CR(s) remain={not no_authpolicies_remain()} "
+                    f"in {NAMESPACE!r}. See handoff 03 teardown (full-to-pristine)."
+                )
+                if sys.exc_info()[0] is not None:
+                    log.error("%s [suppressed — a prior error is propagating]", msg)
+                else:
+                    raise RuntimeError(msg)
 
 
 # ======================================================================================
@@ -2457,53 +2475,60 @@ def pristine_stack(workloads: Sequence[str], *, policy_md: str = scn.POLICY_ABST
     never comes). Yields ``ctx = {"admin", "namespace", "keycloak_url", "realm", "side"}`` (``side`` =
     ``live_enforcement_side()``); the caller deploys.
 
-    Same skip gates (pipeline wiring, env, event path — before any mutation), same no-workloads slate
-    (a ``pre-run-slate`` CR capture, then undeploy + ``_scrub_to_pristine`` +
-    ``reenable_provisioned_clients`` + clients-gone poll), same realm/users provisioning (with Direct
-    Access Grants on the login client) + ``sub`` mapper gate, ``policy.md`` mount and image load for
-    ``workloads``; and the same teardown: a ``teardown`` CR capture first, then full-to-pristine (and
-    Direct Access Grants off again if the setup turned it on), verified (clients gone, no CR left)."""
+    Same skip gates (pipeline wiring, env, event path, Direct Access Grants on the login client — before
+    any mutation), same no-workloads slate (a ``pre-run-slate`` CR capture, then undeploy +
+    ``_scrub_to_pristine`` + ``reenable_provisioned_clients`` + clients-gone poll), same realm/users
+    provisioning + ``sub`` mapper gate, ``policy.md`` mount and image load for ``workloads``; and the
+    same teardown: a ``teardown`` CR capture first, then full-to-pristine, verified (clients gone, no CR
+    left), and last the grant off again if it was off (``direct_access_grants``)."""
     require_pipeline(namespace=NAMESPACE, workloads=[])
     creds = require_env_or_skip("KEYCLOAK_URL", "KEYCLOAK_ADMIN_USERNAME", "KEYCLOAK_ADMIN_PASSWORD")
     keycloak_url = creds["KEYCLOAK_URL"]
     admin = connect_admin()
     require_event_path(admin=admin, realm=TEST_REALM)
     side = live_enforcement_side()
-
-    label = _capture_label()
-    capture_aiac_crs("pre-run-slate", label=label)
-    undeploy_workload(scn.AGENT_WORKLOAD)
-    undeploy_workload(scn.TOOL_WORKLOAD)
-    _scrub_to_pristine(admin)
-    reenable_provisioned_clients(admin, TEST_REALM)
-    if not poll_until(lambda: not workload_clients_present(admin), timeout=DEPLOY_TIMEOUT, interval=5):
-        raise RuntimeError(
-            f"pre-run cleanup left Keycloak client(s) {workload_clients_present(admin)} for {NAMESPACE!r} — the "
-            "fresh deploy would not re-fire CLIENT_CREATED, so event-driven onboarding would never trigger."
-        )
-    grant_enabled = provision_realm_and_users(admin, TEST_REALM)
-
-    try:
-        verify_login_subject(keycloak_url=keycloak_url, realm=TEST_REALM, user="dev-user", password=scn.USER_PASSWORD)
-        ensure_agent_policy(CONTROLLER_NAMESPACE, policy_md=policy_md)
-        load_workload_images(list(workloads))
-        yield {"admin": admin, "namespace": NAMESPACE, "keycloak_url": keycloak_url, "realm": TEST_REALM, "side": side}
-    finally:
-        capture_aiac_crs("teardown", label=label)  # FIRST: the undeploy and the scrub remove the CRs
-        for workload in reversed(list(workloads)):
-            undeploy_workload(workload)
+    # Before the first mutation, so a skip leaves the cluster as it was; restored in its own ``finally``.
+    with direct_access_grants(admin, TEST_REALM):
+        label = _capture_label()
+        capture_aiac_crs("pre-run-slate", label=label)
+        undeploy_workload(scn.AGENT_WORKLOAD)
+        undeploy_workload(scn.TOOL_WORKLOAD)
         _scrub_to_pristine(admin)
-        if grant_enabled:
-            restore_direct_access_grants(admin, TEST_REALM)
-        if not poll_until(
-            lambda: not workload_clients_present(admin) and no_authpolicies_remain(), timeout=DEPLOY_TIMEOUT, interval=5
-        ):
-            msg = (
-                f"teardown did not restore pristine: Keycloak client(s) still present="
-                f"{workload_clients_present(admin)}, AuthorizationPolicy CR(s) remain={not no_authpolicies_remain()} "
-                f"in {NAMESPACE!r}."
+        reenable_provisioned_clients(admin, TEST_REALM)
+        if not poll_until(lambda: not workload_clients_present(admin), timeout=DEPLOY_TIMEOUT, interval=5):
+            raise RuntimeError(
+                f"pre-run cleanup left Keycloak client(s) {workload_clients_present(admin)} for {NAMESPACE!r} — the "
+                "fresh deploy would not re-fire CLIENT_CREATED, so event-driven onboarding would never trigger."
             )
-            if sys.exc_info()[0] is not None:
-                log.error("%s [suppressed — a prior error is propagating]", msg)
-            else:
-                raise RuntimeError(msg)
+        provision_realm_and_users(admin, TEST_REALM)
+        verify_login_subject(keycloak_url=keycloak_url, realm=TEST_REALM, user="dev-user", password=scn.USER_PASSWORD)
+
+        try:
+            ensure_agent_policy(CONTROLLER_NAMESPACE, policy_md=policy_md)
+            load_workload_images(list(workloads))
+            yield {
+                "admin": admin,
+                "namespace": NAMESPACE,
+                "keycloak_url": keycloak_url,
+                "realm": TEST_REALM,
+                "side": side,
+            }
+        finally:
+            capture_aiac_crs("teardown", label=label)  # FIRST: the undeploy and the scrub remove the CRs
+            for workload in reversed(list(workloads)):
+                undeploy_workload(workload)
+            _scrub_to_pristine(admin)
+            if not poll_until(
+                lambda: not workload_clients_present(admin) and no_authpolicies_remain(),
+                timeout=DEPLOY_TIMEOUT,
+                interval=5,
+            ):
+                msg = (
+                    f"teardown did not restore pristine: Keycloak client(s) still present="
+                    f"{workload_clients_present(admin)}, AuthorizationPolicy CR(s) remain={not no_authpolicies_remain()} "
+                    f"in {NAMESPACE!r}."
+                )
+                if sys.exc_info()[0] is not None:
+                    log.error("%s [suppressed — a prior error is propagating]", msg)
+                else:
+                    raise RuntimeError(msg)

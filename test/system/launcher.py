@@ -1033,7 +1033,7 @@ def verify_login_subject(
 
     The live loop keys OPA decisions on ``input.identity.subject`` (the token ``sub``). To mint the
     token, Direct Access Grants must be enabled on ``client_id``. The fixture enables it before this call
-    (``uc1_onboard.provision_realm_and_users`` -> ``ensure_direct_access_grants``, which itself skips with
+    (``uc1_onboard.direct_access_grants`` -> ``ensure_direct_access_grants``, which itself skips with
     the cause on a missing login client or a refused read or write), so a mint failure here means the
     user cannot log in, and it is a skip. The ``sub`` = username comes from the client
     scope ``aiac-username-sub``, which the IdP Configuration Service links as a default scope to the

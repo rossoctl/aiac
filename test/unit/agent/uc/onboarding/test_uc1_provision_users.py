@@ -38,9 +38,6 @@ def _admin(existing: dict[str, dict] | None = None) -> MagicMock:
 
     admin.create_user.side_effect = create_user
     admin.get_user.side_effect = lambda user_id: {**(existing.get(user_id[3:]) or created[user_id[3:]])}
-    # The login client, with Direct Access Grants on (``test_uc1_login_client.py`` covers that step).
-    login = {"clientId": uc1.KEYCLOAK_CLIENT_ID, "id": "c", "directAccessGrantsEnabled": True}
-    admin.get_clients.return_value = [login]
     return admin
 
 

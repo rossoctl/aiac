@@ -323,21 +323,20 @@ LLM endpoint and model of the repo-root `.env`, and not with an older value in t
 docker build -f src/aiac/agent/controller/Dockerfile -t localhost/aiac-agent:local src/
 kind load docker-image localhost/aiac-agent:local --name <cluster-name>
 
-# Reload the ConfigMap: the apply writes the manifest values (placeholders), the patch
-# puts the real LLM values from .env back (step 3b). A subshell: a failed check or step
-# stops the rest of the block, not your shell.
-( set -e
+# Reload the ConfigMap: the apply writes the manifest value of each key (the LLM keys are
+# placeholders). The patch puts every live key back and then the real LLM values from .env
+# (step 3b). A subshell: a failed check or step stops the rest of the block, not your shell.
+( set -eo pipefail
 set -a; . .env; set +a
 : "${LLM_BASE_URL:?missing in .env}" "${LLM_MODEL:?missing in .env}"
-# Read the live side and log level BEFORE the apply: the apply resets them to the manifest values.
-SIDE=$(kubectl get configmap aiac-agent-config -n aiac-system -o jsonpath='{.data.AIAC_ENFORCEMENT_SIDE}')
-LEVEL=$(kubectl get configmap aiac-agent-config -n aiac-system -o jsonpath='{.data.LOG_LEVEL}')
+# Read ALL live keys BEFORE the apply: the apply resets each key to its manifest value.
+LIVE=$(kubectl get configmap aiac-agent-config -n aiac-system -o json | jq -c '.data // {}')
 kubectl apply -f k8s/agent-deployment.yaml
-# jq builds the JSON, so a quote or a backslash in a value cannot break the patch.
+# Live keys first, the .env LLM values on top. jq builds the JSON, so a quote or a backslash in
+# a value cannot break the patch.
 kubectl patch configmap aiac-agent-config -n aiac-system --type merge -p "$(jq -n \
-  --arg url "$LLM_BASE_URL" --arg model "$LLM_MODEL" \
-  --arg side "${SIDE:-target-side}" --arg level "${LEVEL:-INFO}" \
-  '{data: {LLM_BASE_URL: $url, LLM_MODEL: $model, AIAC_ENFORCEMENT_SIDE: $side, LOG_LEVEL: $level}}')"
+  --argjson live "$LIVE" --arg url "$LLM_BASE_URL" --arg model "$LLM_MODEL" \
+  '{data: ($live + {LLM_BASE_URL: $url, LLM_MODEL: $model})}')"
 
 # Restart AFTER the patch. The Agent reads the ConfigMap at start only.
 kubectl rollout restart deployment/aiac-agent -n aiac-system
@@ -345,10 +344,13 @@ kubectl rollout status deployment/aiac-agent -n aiac-system
 )
 ```
 
-- The apply also writes the manifest values of `AIAC_ENFORCEMENT_SIDE` (`target-side`) and
-  `LOG_LEVEL` (`INFO`). The block reads the live values before the apply and patches them back
-  before the restart, so an `agent-side` deployment stays `agent-side`. To change the side, see
-  `docs/agents/deploy.md`, `ac-side`.
+- The apply writes the manifest value of each key, for example `AIAC_ENFORCEMENT_SIDE`
+  (`target-side`), `LOG_LEVEL` (`INFO`) and `LLM_REQUEST_TIMEOUT` (`120`). The block reads all
+  live keys before the apply and patches them back before the restart. Thus an `agent-side`
+  deployment stays `agent-side`, and a tuned key (for example `LLM_MAX_RETRIES` or
+  `LLM_RETRY_BACKOFF_MAX`) keeps its live value. Only a key that is new in the manifest gets its
+  manifest value. To set a key back to its manifest default, patch it by hand. To change the
+  side, see `docs/agents/deploy.md`, `ac-side`.
 - `.env` must have `LLM_BASE_URL` and `LLM_MODEL`. If one is missing, the `:?` check stops the
   block before the apply. Then stop and ask. Do not leave the placeholder in the ConfigMap.
 - The Secret `aiac-agent-secret` (`LLM_API_KEY`) is not changed by this flow. To change it, see
