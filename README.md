@@ -27,7 +27,9 @@ events — new services, role changes, policy updates — by consulting a Policy
 per-pod configuration.
 
 Each trigger maps to a use case under `src/aiac/agent/uc/`: service onboarding, policy update,
-role update and offboarding (specs in [docs/specs/components/aiac-agent/](docs/specs/components/aiac-agent/)).
+role update and offboarding. Onboarding, policy update and role update have specs in
+[docs/specs/components/aiac-agent/](docs/specs/components/aiac-agent/); offboarding is described in
+the [PRD](docs/specs/PRD.md).
 
 ## Repository layout
 
@@ -71,7 +73,7 @@ set -a; . .env; set +a              # LLM_* / KEYCLOAK_* for the live lanes
 | unit | Nothing |
 | integration | Nothing (fakes stand in for Keycloak, the Policy Model Store and the Kubernetes API) |
 | llm | `LLM_BASE_URL` / `LLM_MODEL` / `LLM_API_KEY` |
-| system | A rossoctl/Kind cluster wired by `k8s/opa-kind-enable.sh`, Keycloak admin creds, an LLM endpoint |
+| system | A rossoctl/Kind cluster wired by `k8s/opa-kind-enable.sh`, the event path (the NATS broker and the `aiac-event-listener` Keycloak SPI), Keycloak admin creds, an LLM endpoint — see [docs/agents/test.md](docs/agents/test.md) |
 | eval | Keycloak, an LLM endpoint, `opa` on `PATH` for the e2e level |
 
 Live lanes skip cleanly when their env or cluster is missing — a skip is not a pass. Full lane
@@ -86,8 +88,8 @@ plugin and the AIAC global combiner into Kind, see [k8s/opa-kind-runbook.md](k8s
 
 The enforcement side is a deploy-time setting — `AIAC_ENFORCEMENT_SIDE` in the
 `aiac-agent-config` ConfigMap (`target-side`, the default: each callee checks its own inbound; or
-`agent-side`: the agent checks its outbound calls). There is no live switch; changing it is a clean
-redeploy. See [docs/agents/deploy.md](docs/agents/deploy.md).
+`agent-side`: each callee still checks its inbound, and the agent also checks its outbound calls).
+There is no live switch; changing it is a clean redeploy. See [docs/agents/deploy.md](docs/agents/deploy.md).
 
 ## Demo — onboarding an agent and a tool
 
@@ -102,8 +104,11 @@ proves two claims:
   evaluating a file on the side.
 
 Prerequisites: a Kind cluster named `rossoctl` with the rossoctl platform (SPIRE, Keycloak, the
-operator), the `team1` namespace, sibling clones of `rossoctl/operator`, `rossoctl/rossoctl` and
+operator), the `team1` namespace, `kubectl`, `helm`, `kind`, `curl`, `python3` and `docker` or
+`podman` on `PATH`, sibling clones of `rossoctl/operator`, `rossoctl/rossoctl` and
 `rossoctl/cortex`, and two secrets (`team1/openai-secret` and `aiac-system/keycloak-admin-secret`).
+`github-agent` and `github-tool` must **not** already be deployed in `team1`: their first-time deploy
+is the trigger. If you ran the demo or the system lane before, run `make restore` first.
 Then, from that directory, in this order — the AIAC Controller does not start until `make opa` has
 applied the changed combiner:
 
@@ -114,11 +119,12 @@ make users      # create the demo users and roles, mount policy.md
 make e2e        # deploy the workloads (the trigger), then probe the live OPA plugin
 ```
 
-The agent ships with its outbound route to `github-tool` already set, so no extra wiring step is
-needed between the deploy and the probe.
+The agent ships with its outbound route to `github-tool` already set. Before the probe, `make e2e`
+grants the agent's Keycloak client the tool's audience scope and restarts the agent (phase PREP).
 
-`make demo` walks the same scenario step by step for inspection; `make restore` / `make teardown`
-clean up; `make help` lists every target. The full narrative, verification and troubleshooting are
+After `make e2e`, `make demo` walks the same scenario step by step for inspection; it needs the
+workloads already deployed. `make restore` / `make teardown` clean up; `make help` lists every
+target. The full narrative, verification and troubleshooting are
 in [demo/use-cases/onboarding/demo.md](demo/use-cases/onboarding/demo.md). The demo workloads live
 under [demo/assets/](demo/assets/) — see [demo/assets/INSTALL.md](demo/assets/INSTALL.md) and their
 specs in [docs/specs/demo/](docs/specs/demo/).
