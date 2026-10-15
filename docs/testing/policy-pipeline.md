@@ -94,8 +94,8 @@ over the fully onboarded stack.
    and checks that its `sub` is the username, and `ensure_agent_policy` mounts the single
    abstract `policy.md` on the Controller pod. `verify_login_subject` skips when it cannot mint the
    token (the fixture enables Direct Access Grants before the slate, and skips with the cause if
-   the login client is absent or the admin cannot manage clients; the teardown turns the grant off
-   again if it was off), and fails when `sub` is not the username. The `sub` comes
+   the realm or the login client is absent or the admin cannot manage clients; the session end turns
+   the grant off again if the harness turned it on), and fails when `sub` is not the username. The `sub` comes
    from the client scope `aiac-username-sub`, which the IdP Configuration Service links to
    `rossoctl` at its startup and at each onboarding. That link is an AIAC step, not a prerequisite,
    so a wrong `sub` is a failure. The exchanged token gets the same mapping from the same scope,

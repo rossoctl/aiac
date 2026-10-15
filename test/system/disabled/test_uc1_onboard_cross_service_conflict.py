@@ -164,35 +164,35 @@ def test_cross_service_conflict_is_surfaced_as_422_conflict_report() -> None:
     keycloak_url = creds["KEYCLOAK_URL"]
 
     admin = uc1.connect_admin()
-    # The password grant on the login client, before the first mutation: a skip at entry changes nothing,
-    # and its own ``finally`` turns the grant off again if it was off, whatever cleanup step raises.
-    with uc1.direct_access_grants(admin, TEST_REALM):
-        # Open the cleanup guard BEFORE the first shared-state mutation: the clean-slate steps below
-        # (Agent CR delete, Keycloak cleanup, Policy Store clear, provisioning) already mutate shared
-        # cluster state, so a failure mid-setup must still hit the ``finally`` teardown.
-        try:
-            uc1.delete_workload_crs()  # clean policy slate (drop any prior run's CRs)
-            uc1.cleanup_provisioned(admin, TEST_REALM)  # clean slate (Keycloak)
-            uc1.clear_policy_store()  # clean slate ONCE — NOT between phases (the agent must see the tool's rule)
-            uc1.provision_realm_and_users(admin, TEST_REALM)  # PRB reads the role universe
-            uc1.verify_login_subject(
-                keycloak_url=keycloak_url, realm=TEST_REALM, user="test-user", password=scn.USER_PASSWORD
-            )
+    # Open the cleanup guard BEFORE the first shared-state mutation: the clean-slate steps below
+    # (Agent CR delete, Keycloak cleanup, Policy Store clear, provisioning) already mutate shared
+    # cluster state, so a failure mid-setup must still hit the ``finally`` teardown.
+    try:
+        uc1.delete_workload_crs()  # clean policy slate (drop any prior run's CRs)
+        uc1.cleanup_provisioned(admin, TEST_REALM)  # clean slate (Keycloak)
+        uc1.clear_policy_store()  # clean slate ONCE — NOT between phases (the agent must see the tool's rule)
+        uc1.provision_realm_and_users(admin, TEST_REALM)  # PRB reads the role universe
+        # After the provisioning: it creates the realm, so a missing login client is the true skip cause.
+        # Turned off again at session end if the harness turned it on.
+        uc1.hold_direct_access_grants(admin, TEST_REALM)
+        uc1.verify_login_subject(
+            keycloak_url=keycloak_url, realm=TEST_REALM, user="test-user", password=scn.USER_PASSWORD
+        )
 
-            # Phase 1 — tool onboarding under the exclusivity policy: clean (200), persists the tool-side
-            # DENY(tester -> github-tool.source-*) on SPM(github-tool).
-            _onboard_via_fresh_controller(POLICY_TOOL_EXCLUSIVE, scn.TOOL_WORKLOAD, expect_conflict=False)
+        # Phase 1 — tool onboarding under the exclusivity policy: clean (200), persists the tool-side
+        # DENY(tester -> github-tool.source-*) on SPM(github-tool).
+        _onboard_via_fresh_controller(POLICY_TOOL_EXCLUSIVE, scn.TOOL_WORKLOAD, expect_conflict=False)
 
-            # Phase 2 — agent onboarding under the source-granting policy: the outbound subject gate's fresh
-            # ALLOW(tester -> github-tool.source-*) collides with the tool's already-applied DENY on the same
-            # (role, scope). The #2504 store read surfaces it -> 422 + ConflictReport.
-            report = _onboard_via_fresh_controller(POLICY_AGENT_GRANTS_SOURCE, scn.AGENT_WORKLOAD, expect_conflict=True)
-        finally:
-            uc1.delete_workload_crs()  # after — drop any CR (there should be none on the raising path)
-            uc1.cleanup_provisioned(admin, TEST_REALM)  # restore the pre-run Keycloak state
-            # Phase 1 persisted a tool-side deny; clear it so later integration tests don't read stale
-            # inbound rules and become order-dependent.
-            uc1.clear_policy_store()
+        # Phase 2 — agent onboarding under the source-granting policy: the outbound subject gate's fresh
+        # ALLOW(tester -> github-tool.source-*) collides with the tool's already-applied DENY on the same
+        # (role, scope). The #2504 store read surfaces it -> 422 + ConflictReport.
+        report = _onboard_via_fresh_controller(POLICY_AGENT_GRANTS_SOURCE, scn.AGENT_WORKLOAD, expect_conflict=True)
+    finally:
+        uc1.delete_workload_crs()  # after — drop any CR (there should be none on the raising path)
+        uc1.cleanup_provisioned(admin, TEST_REALM)  # restore the pre-run Keycloak state
+        # Phase 1 persisted a tool-side deny; clear it so later integration tests don't read stale
+        # inbound rules and become order-dependent.
+        uc1.clear_policy_store()
 
     # The 422 body is the shared ConflictReport shape (same as the deterministic routes test), carrying
     # at least one cross-service conflict with a real role + scope. Structural (not id-pinned) so it is

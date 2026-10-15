@@ -221,7 +221,8 @@ To tear the forward down afterwards: `pkill -f 'port-forward .*keycloak-service'
 
 If the realm was freshly provisioned, the `rossoctl` client needs Direct Access Grants enabled.
 Without it, token minting fails with `unauthorized_client`. This is platform state, so the demo does
-not set it:
+not set it. The snippet also removes the attribute `aiac.test.direct-access-grants-by-harness`, so a
+system-test run does not turn the grant off at its end:
 
 ```bash
 KC=http://keycloak.localtest.me:8080
@@ -232,7 +233,7 @@ ADMIN=$(curl -s -X POST "$KC/realms/master/protocol/openid-connect/token" \
 CID=$(curl -s -H "Authorization: Bearer $ADMIN" "$KC/admin/realms/rossoctl/clients?clientId=rossoctl" \
   | python3 -c 'import sys,json;print(json.load(sys.stdin)[0]["id"])')
 curl -s -H "Authorization: Bearer $ADMIN" "$KC/admin/realms/rossoctl/clients/$CID" \
-  | python3 -c 'import sys,json;d=json.load(sys.stdin);d["directAccessGrantsEnabled"]=True;print(json.dumps(d))' \
+  | python3 -c 'import sys,json;d=json.load(sys.stdin);d["directAccessGrantsEnabled"]=True;d.setdefault("attributes",{})["aiac.test.direct-access-grants-by-harness"]="";print(json.dumps(d))' \
   | curl -s -o /dev/null -w "enable DAG HTTP %{http_code}\n" -X PUT -H "Authorization: Bearer $ADMIN" \
     -H "Content-Type: application/json" "$KC/admin/realms/rossoctl/clients/$CID" --data-binary @-
 ```

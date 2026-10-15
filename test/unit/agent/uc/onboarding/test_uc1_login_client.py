@@ -1,12 +1,15 @@
-"""``uc1_onboard.direct_access_grants`` turns on the password grant of the login client for the life of
-a fixture, and turns it off again at exit if it was off — pure unit tests.
+"""``uc1_onboard.hold_direct_access_grants`` turns on the password grant of the login client for the
+session, and ``release_direct_access_grants`` turns it off again at session end if the harness turned it
+on — pure unit tests.
 
 The harness mints user tokens through the login client ``rossoctl`` with the password grant, so the
-client needs Direct Access Grants on. ``onboarded_stack``, ``pristine_stack`` and the disabled
-cross-service test enter ``direct_access_grants`` before their first mutation. Its own ``finally``
-turns the grant off again, so a teardown step that raises cannot leave the grant on. A grant that
-cannot be written is a skip with the cause. These tests use a ``MagicMock`` admin (no Keycloak). They
-import the system harness like ``test_uc1_subject_scope.py`` does.
+client needs Direct Access Grants on. ``_clean_slate`` (shared by ``onboarded_stack`` and
+``pristine_stack``) holds the grant before its first mutation, and ``test/system/conftest.py`` releases
+it at session end. The harness writes a marker attribute with the grant, so a run that is killed before
+its release is undone by the next run, and a grant that someone else turned on is never turned off. A
+grant that cannot be read or written is a skip with the cause. These tests use a stateful fake admin (no
+Keycloak) that applies the partial-update rules of Keycloak 26. They import the system harness like
+``test_uc1_subject_scope.py`` does.
 """
 
 from __future__ import annotations
@@ -25,20 +28,45 @@ sys.path.insert(0, str(REPO_ROOT))  # so ``import test.system.*`` resolves
 from test.system import uc1_onboard as uc1  # noqa: E402
 
 LOGIN_UUID = "uuid-1"
+MARKER = uc1.DAG_MARKER_ATTRIBUTE
+
+
+@pytest.fixture(autouse=True)
+def _no_holds(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Each test starts a fresh session: no login client is held."""
+    monkeypatch.setattr(uc1, "_dag_holds", {})
+
+
+def _login(enabled: bool, *, marked: bool = False, client_id: str = uc1.KEYCLOAK_CLIENT_ID) -> dict:
+    attributes = {"keep.me": "yes", **({MARKER: "true"} if marked else {})}
+    return {"clientId": client_id, "id": LOGIN_UUID, "directAccessGrantsEnabled": enabled, "attributes": attributes}
 
 
 def _admin(client: dict | None) -> MagicMock:
-    """A ``KeycloakAdmin`` stand-in whose filtered ``clientId`` query finds ``client`` (or nothing)."""
+    """A ``KeycloakAdmin`` stand-in over one stored client. Its filtered ``clientId`` query finds the
+    client (or nothing), and ``update_client`` applies a partial update as Keycloak 26 does: only the
+    given fields change; in ``attributes`` only the given keys change, and ``""`` removes a key."""
     admin = MagicMock(name="KeycloakAdmin")
+    admin.stored = client
+
+    def _update(uuid: str, fields: dict) -> None:
+        stored = admin.stored
+        for key, value in fields.items():
+            if key != "attributes":
+                stored[key] = value
+                continue
+            for name, attr in value.items():
+                if attr == "":
+                    stored["attributes"].pop(name, None)
+                else:
+                    stored["attributes"][name] = attr
+
     admin.get_client_id.side_effect = lambda client_id: (
-        client["id"] if client is not None and client_id == client["clientId"] else None
+        admin.stored["id"] if admin.stored is not None and client_id == admin.stored["clientId"] else None
     )
-    admin.get_client.side_effect = lambda uuid: dict(client)
+    admin.get_client.side_effect = lambda uuid: {**admin.stored, "attributes": dict(admin.stored["attributes"])}
+    admin.update_client.side_effect = _update
     return admin
-
-
-def _login(enabled: bool) -> dict:
-    return {"clientId": uc1.KEYCLOAK_CLIENT_ID, "id": LOGIN_UUID, "directAccessGrantsEnabled": enabled}
 
 
 def _grant_writes(admin: MagicMock) -> list[bool]:
@@ -65,44 +93,107 @@ def test_a_missing_login_client_is_none() -> None:
 
 
 # ======================================================================================
-# ensure_direct_access_grants — the entry half
+# hold_direct_access_grants — the entry half, once per session
 # ======================================================================================
 
 
-def test_the_grant_is_enabled_with_a_partial_update() -> None:
+def test_the_grant_is_enabled_with_the_marker_in_one_partial_update() -> None:
     admin = _admin(_login(False))
-    assert uc1.ensure_direct_access_grants(admin, "rossoctl") == LOGIN_UUID
+    uc1.hold_direct_access_grants(admin, "rossoctl")
     admin.change_current_realm.assert_called_with("rossoctl")
-    admin.update_client.assert_called_once_with(LOGIN_UUID, {"directAccessGrantsEnabled": True})
+    admin.update_client.assert_called_once_with(
+        LOGIN_UUID, {"directAccessGrantsEnabled": True, "attributes": {MARKER: "true"}}
+    )
+    assert admin.stored["attributes"]["keep.me"] == "yes"  # other attributes are not written
 
 
-def test_a_grant_that_is_on_is_not_written() -> None:
+def test_a_grant_that_is_on_with_no_marker_is_not_written_and_not_released() -> None:
     admin = _admin(_login(True))
-    assert uc1.ensure_direct_access_grants(admin, "rossoctl") is None
+    uc1.hold_direct_access_grants(admin, "rossoctl")
+    uc1.release_direct_access_grants()
     admin.update_client.assert_not_called()
+
+
+def test_the_grant_is_read_and_written_once_per_session() -> None:
+    admin = _admin(_login(False))
+    for _ in range(3):  # three stacks (three test modules) in one session
+        uc1.hold_direct_access_grants(admin, "rossoctl")
+    uc1.release_direct_access_grants()
+    assert admin.get_client_id.call_count == 1
+    assert _grant_writes(admin) == [True, False]
+
+
+def test_a_marker_left_by_a_killed_run_is_taken_over_and_released() -> None:
+    """The case of the review: an earlier run turned the grant on and was killed before its release. The
+    marker is still on the client, so this session turns the grant off at its end."""
+    admin = _admin(_login(True, marked=True))
+    uc1.hold_direct_access_grants(admin, "rossoctl")
+    admin.update_client.assert_not_called()  # already on: nothing to write at entry
+    uc1.release_direct_access_grants()
+    assert admin.stored["directAccessGrantsEnabled"] is False
+    assert MARKER not in admin.stored["attributes"]
 
 
 def test_a_missing_login_client_skips_and_is_not_created() -> None:
     admin = _admin(None)
     with pytest.raises(pytest.skip.Exception, match=uc1.KEYCLOAK_CLIENT_ID):
-        uc1.ensure_direct_access_grants(admin, "rossoctl")
+        uc1.hold_direct_access_grants(admin, "rossoctl")
     admin.update_client.assert_not_called()
     admin.create_client.assert_not_called()
 
 
-def test_a_refused_read_skips_with_the_cause() -> None:
+def test_a_missing_realm_skips_with_that_cause() -> None:
     admin = _admin(_login(False))
-    admin.get_client_id.side_effect = KeycloakError(error_message="forbidden", response_code=403)
-    with pytest.raises(pytest.skip.Exception, match="cannot read the login client.*forbidden"):
-        uc1.ensure_direct_access_grants(admin, "rossoctl")
+    admin.get_client_id.side_effect = KeycloakError(error_message="Realm not found.", response_code=404)
+    with pytest.raises(pytest.skip.Exception, match="realm 'rossoctl' does not exist"):
+        uc1.hold_direct_access_grants(admin, "rossoctl")
     admin.update_client.assert_not_called()
 
 
-def test_a_refused_update_skips_with_the_cause() -> None:
+@pytest.mark.parametrize(
+    "error",
+    [KeycloakError(error_message="forbidden", response_code=403), ConnectionError("reset"), TypeError("not a list")],
+)
+def test_a_failed_read_skips_with_the_cause(error: Exception) -> None:
+    admin = _admin(_login(False))
+    admin.get_client_id.side_effect = error
+    with pytest.raises(pytest.skip.Exception, match=f"cannot read the login client.*{error}"):
+        uc1.hold_direct_access_grants(admin, "rossoctl")
+    admin.update_client.assert_not_called()
+
+
+def test_a_refused_update_skips_with_the_cause_and_writes_nothing_more() -> None:
     admin = _admin(_login(False))
     admin.update_client.side_effect = KeycloakError(error_message="forbidden", response_code=403)
     with pytest.raises(pytest.skip.Exception, match="cannot enable Direct Access Grants.*forbidden"):
-        uc1.ensure_direct_access_grants(admin, "rossoctl")
+        uc1.hold_direct_access_grants(admin, "rossoctl")
+    assert admin.update_client.call_count == 1  # the read again finds no marker: nothing to undo
+    assert uc1._dag_holds == {}
+
+
+def test_an_update_that_was_applied_but_lost_its_response_is_undone_before_the_skip() -> None:
+    """The case of the review: the PUT is applied, but the response times out or the connection resets."""
+    admin = _admin(_login(False))
+    apply = admin.update_client.side_effect
+
+    def _applied_then_reset(uuid: str, fields: dict) -> None:
+        apply(uuid, fields)
+        if admin.update_client.call_count == 1:
+            raise ConnectionError("connection reset")
+
+    admin.update_client.side_effect = _applied_then_reset
+    with pytest.raises(pytest.skip.Exception, match="cannot enable Direct Access Grants.*connection reset"):
+        uc1.hold_direct_access_grants(admin, "rossoctl")
+    assert admin.stored["directAccessGrantsEnabled"] is False
+    assert MARKER not in admin.stored["attributes"]
+    assert uc1._dag_holds == {}
+
+
+def test_another_login_client_can_be_held() -> None:
+    admin = _admin(_login(False, client_id="other-login"))
+    uc1.hold_direct_access_grants(admin, "rossoctl", client_id="other-login")
+    admin.get_client_id.assert_called_once_with("other-login")
+    assert _grant_writes(admin) == [True]
 
 
 def test_provision_realm_and_users_does_not_touch_the_login_client() -> None:
@@ -114,85 +205,105 @@ def test_provision_realm_and_users_does_not_touch_the_login_client() -> None:
 
 
 # ======================================================================================
-# restore_direct_access_grants — the exit half, best-effort
+# release_direct_access_grants — the exit half at session end, best-effort
 # ======================================================================================
 
 
-def test_the_restore_turns_the_grant_off_with_a_partial_update_and_no_read() -> None:
-    admin = _admin(_login(True))
-    uc1.restore_direct_access_grants(admin, "rossoctl", LOGIN_UUID)
-    admin.change_current_realm.assert_called_with("rossoctl")
-    admin.update_client.assert_called_once_with(LOGIN_UUID, {"directAccessGrantsEnabled": False})
-    admin.get_client_id.assert_not_called()  # the UUID comes from the enable
+def test_the_release_reads_again_and_turns_the_grant_and_the_marker_off() -> None:
+    admin = _admin(_login(False))
+    uc1.hold_direct_access_grants(admin, "rossoctl")
+    admin.get_client.reset_mock()
+    uc1.release_direct_access_grants()
+    admin.get_client.assert_called_once_with(LOGIN_UUID)  # the UUID comes from the hold
+    assert admin.update_client.call_args.args == (
+        LOGIN_UUID,
+        {"directAccessGrantsEnabled": False, "attributes": {MARKER: ""}},
+    )
+    assert admin.stored == _login(False)
+    assert uc1._dag_holds == {}
+
+
+def test_a_grant_that_someone_took_over_during_the_run_is_not_turned_off() -> None:
+    """The case of the review: during the run an operator enables the grant on purpose (the runbook
+    snippet), which removes the marker. The release reads the client again and leaves the grant on."""
+    admin = _admin(_login(False))
+    uc1.hold_direct_access_grants(admin, "rossoctl")
+    admin.update_client(LOGIN_UUID, {"directAccessGrantsEnabled": True, "attributes": {MARKER: ""}})  # the operator
+    admin.update_client.reset_mock()
+    uc1.release_direct_access_grants()
+    admin.update_client.assert_not_called()
+    assert admin.stored["directAccessGrantsEnabled"] is True
 
 
 @pytest.mark.parametrize("error", [KeycloakError(error_message="forbidden", response_code=403), ConnectionError()])
-def test_a_refused_restore_is_logged_not_raised(caplog: pytest.LogCaptureFixture, error: Exception) -> None:
-    admin = _admin(_login(True))
+def test_a_failed_release_is_logged_not_raised(caplog: pytest.LogCaptureFixture, error: Exception) -> None:
+    admin = _admin(_login(False))
+    uc1.hold_direct_access_grants(admin, "rossoctl")
     admin.update_client.side_effect = error
-    uc1.restore_direct_access_grants(admin, "rossoctl", LOGIN_UUID)  # never masks a teardown failure
+    uc1.release_direct_access_grants()  # never masks a teardown failure
     assert "cannot turn Direct Access Grants off again" in caplog.text
+    assert uc1._dag_holds == {}
+
+
+def test_a_release_with_nothing_held_does_nothing() -> None:
+    uc1.release_direct_access_grants()
 
 
 # ======================================================================================
-# direct_access_grants — the context manager: the restore is in its own ``finally``
+# _clean_slate — the slate and teardown that onboarded_stack and pristine_stack share
 # ======================================================================================
 
-
-def test_the_context_turns_on_a_grant_that_was_off_and_turns_it_off_at_exit() -> None:
-    admin = _admin(_login(False))
-    with uc1.direct_access_grants(admin, "rossoctl"):
-        assert _grant_writes(admin) == [True]
-    assert _grant_writes(admin) == [True, False]
-
-
-def test_the_context_does_not_write_a_grant_that_was_on() -> None:
-    admin = _admin(_login(True))
-    with uc1.direct_access_grants(admin, "rossoctl"):
-        pass
-    admin.update_client.assert_not_called()
-
-
-@pytest.mark.parametrize(
-    "error",
-    [AssertionError("clear_policy_store: HTTP 500"), KeycloakError(error_message="token refused", response_code=401)],
+_SLATE_STEPS = (
+    "hold_direct_access_grants",
+    "capture_aiac_crs",
+    "undeploy_workload",
+    "_scrub_to_pristine",
+    "reenable_provisioned_clients",
+    "provision_realm_and_users",
+    "verify_login_subject",
 )
-def test_a_teardown_step_that_raises_still_restores_the_grant(error: Exception) -> None:
-    """The case of the review: a scrub step of the fixture teardown raises (for example
-    ``clear_policy_store`` or ``cleanup_provisioned``). The grant is still turned off, and the error
-    propagates unchanged."""
-    admin = _admin(_login(False))
-    with pytest.raises(type(error)) as raised:
-        with uc1.direct_access_grants(admin, "rossoctl"):
-            try:
-                pass  # the fixture body
-            finally:
-                raise error  # a teardown step of the body
-    assert raised.value is error
-    assert _grant_writes(admin) == [True, False]
 
 
-def test_a_skip_in_the_body_still_restores_the_grant() -> None:
-    admin = _admin(_login(False))
-    with pytest.raises(pytest.skip.Exception):
-        with uc1.direct_access_grants(admin, "rossoctl"):
-            pytest.skip("verify_login_subject cannot mint a token")
-    assert _grant_writes(admin) == [True, False]
+@pytest.fixture
+def steps(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
+    """Every step of ``_clean_slate`` replaced by a recorder; the polls succeed at once."""
+    recorder = MagicMock(name="steps")
+    for name in _SLATE_STEPS:
+        monkeypatch.setattr(uc1, name, getattr(recorder, name))
+    monkeypatch.setattr(uc1, "poll_until", lambda *a, **k: True)
+    monkeypatch.setattr(uc1, "workload_clients_present", lambda admin: set())
+    monkeypatch.setattr(uc1, "no_authpolicies_remain", lambda: True)
+    monkeypatch.setattr(uc1, "_capture_label", lambda: "rung")
+    return recorder
 
 
-def test_a_failed_restore_does_not_mask_the_body_error() -> None:
-    admin = _admin(_login(False))
-    admin.update_client.side_effect = [None, KeycloakError(error_message="forbidden", response_code=403)]
-    with pytest.raises(RuntimeError, match="teardown did not restore pristine"):
-        with uc1.direct_access_grants(admin, "rossoctl"):
-            raise RuntimeError("teardown did not restore pristine")
+def _step_names(recorder: MagicMock) -> list[str]:
+    return [call[0] for call in recorder.mock_calls]
 
 
-def test_a_skip_at_entry_writes_nothing() -> None:
-    admin = _admin(None)
+def test_the_slate_holds_the_grant_before_its_first_mutation(steps: MagicMock) -> None:
+    with uc1._clean_slate(MagicMock(), ["github-agent"], keycloak_url="http://kc"):
+        assert _step_names(steps)[0] == "hold_direct_access_grants"
+        assert _step_names(steps)[-1] == "verify_login_subject"
+    assert _step_names(steps)[-2:] == ["undeploy_workload", "_scrub_to_pristine"]
+
+
+def test_a_skip_at_the_hold_mutates_nothing(steps: MagicMock) -> None:
+    steps.hold_direct_access_grants.side_effect = pytest.skip.Exception("no login client")
     body = MagicMock(name="body")
     with pytest.raises(pytest.skip.Exception):
-        with uc1.direct_access_grants(admin, "rossoctl"):
+        with uc1._clean_slate(MagicMock(), ["github-agent"], keycloak_url="http://kc"):
             body()
     body.assert_not_called()
-    admin.update_client.assert_not_called()
+    assert _step_names(steps) == ["hold_direct_access_grants"]
+
+
+@pytest.mark.parametrize("error", [RuntimeError("did not converge"), pytest.skip.Exception("no token")])
+def test_the_body_failing_still_runs_the_teardown(steps: MagicMock, error: BaseException) -> None:
+    with pytest.raises(type(error)):
+        with uc1._clean_slate(MagicMock(), ["github-agent", "github-tool"], keycloak_url="http://kc"):
+            steps.reset_mock()
+            raise error
+    assert steps.mock_calls[0].args == ("teardown",)  # the CR capture comes first
+    assert [c.args[0] for c in steps.undeploy_workload.call_args_list] == ["github-tool", "github-agent"]
+    steps._scrub_to_pristine.assert_called_once()

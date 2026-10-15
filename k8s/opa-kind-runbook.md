@@ -226,28 +226,46 @@ such pods, it skips this check.
 A manual probe that mints a user token with the password grant through the
 login client `rossoctl` needs Direct Access Grants on that client. In a fresh
 realm it is off, and the mint fails with `unauthorized_client`. The system
-tests do not need this step: their fixture enables the grant itself
-(`direct_access_grants` in `test/system/uc1_onboard.py`) and turns it off
-again at teardown if it was off. To enable it by hand (a partial update: only
-this field changes), source the repo-root `.env` first. The snippet uses the
-same variables as the harness:
+tests do not need this step: their fixture enables the grant itself, once per
+session (`hold_direct_access_grants` in `test/system/uc1_onboard.py`), and
+turns it off again at session end if it turned it on. The client attribute
+`aiac.test.direct-access-grants-by-harness` records that the harness turned it
+on, so the next run undoes a run that was killed.
+
+To enable it by hand, source the repo-root `.env` first. The snippet uses the
+same variables as the harness. It is a partial update: only the grant changes,
+and it removes the harness marker. So a system run that is in progress, or a
+later one, does not turn your grant off:
 
 ```bash
 ( set -e  # a subshell: a failed check stops the snippet, not your shell
 set -a; . .env; set +a
 KC=${KEYCLOAK_URL:?}; REALM=${AIAC_TEST_REALM:-rossoctl}; ADMIN_REALM=${KEYCLOAK_ADMIN_REALM:-master}
+# Print the value at a key path (for example "0 id") of an admin API response; when the response has
+# another shape, print "" and show the raw response on stderr.
+pick() { python3 -c 'import sys,json
+raw=sys.stdin.read()
+try:
+    v=json.loads(raw)
+    for k in sys.argv[1:]: v=v[int(k)] if k.isdigit() else v[k]
+except Exception:
+    v=""
+print(v or "")
+v or print("unexpected admin API response:", raw[:300], file=sys.stderr)' "$@"; }
 ADMIN=$(curl -s -X POST "$KC/realms/$ADMIN_REALM/protocol/openid-connect/token" \
   -d client_id=admin-cli -d grant_type=password \
   --data-urlencode "username=${KEYCLOAK_ADMIN_USERNAME:?}" \
-  --data-urlencode "password=${KEYCLOAK_ADMIN_PASSWORD:?}" \
-  | python3 -c 'import sys,json;print(json.load(sys.stdin).get("access_token",""))')
+  --data-urlencode "password=${KEYCLOAK_ADMIN_PASSWORD:?}" | pick access_token)
 [ -n "$ADMIN" ] || { echo "admin login at realm $ADMIN_REALM failed: check KEYCLOAK_ADMIN_*"; exit 1; }
 CID=$(curl -s -H "Authorization: Bearer $ADMIN" "$KC/admin/realms/$REALM/clients?clientId=rossoctl" \
-  | python3 -c 'import sys,json;c=json.load(sys.stdin);print(c[0]["id"] if c else "")')
-[ -n "$CID" ] || { echo "login client rossoctl not found in realm $REALM"; exit 1; }
-curl -s -o /dev/null -w "enable DAG HTTP %{http_code}\n" -X PUT \
+  | pick 0 id)
+[ -n "$CID" ] || { echo "login client rossoctl not found in realm $REALM (or the admin cannot view clients)"; exit 1; }
+CODE=$(curl -s -o /dev/null -w "%{http_code}" -X PUT \
   -H "Authorization: Bearer $ADMIN" -H "Content-Type: application/json" \
-  "$KC/admin/realms/$REALM/clients/$CID" -d '{"directAccessGrantsEnabled": true}'
+  "$KC/admin/realms/$REALM/clients/$CID" \
+  -d '{"directAccessGrantsEnabled": true, "attributes": {"aiac.test.direct-access-grants-by-harness": ""}}')
+[ "$CODE" = 204 ] || { echo "enable DAG failed: HTTP $CODE"; exit 1; }
+echo "enable DAG HTTP 204"
 )
 ```
 

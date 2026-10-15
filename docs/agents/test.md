@@ -115,8 +115,10 @@ test both sides, run the lane, do a clean redeploy with the other side (see
 
 The platform prerequisites, wiring, verification and the setting of the side:
 `k8s/opa-kind-runbook.md`. The fixture enables Direct Access Grants on the login
-client `rossoctl` itself and turns it off again at teardown if it was off, so the
-lane needs no manual realm step. A
+client `rossoctl` itself, once per session, and turns it off again at session end
+if it turned it on, so the lane needs no manual realm step. A client attribute
+records that the harness turned it on, so a run that is killed is undone by the
+next run. A
 manual probe with the password grant outside the lane needs the grant set by hand:
 see the runbook section "Direct Access Grants on the login client". The per-loop
 shape: `test/system/uc1_onboard.py`.
