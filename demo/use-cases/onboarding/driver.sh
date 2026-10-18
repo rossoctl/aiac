@@ -16,7 +16,7 @@
 #   Phase PREP            grant github-agent's client the tool's audience scope (closes the race
 #                         with the operator's realm default) and restart the agent so its OPA sidecar
 #                         loads the recomposed bundle. Runs before every ENFORCE; idempotent.
-#   Phase ENFORCE        real HTTP probes through the live AuthBridge OPA plugin, reproducing
+#   Phase ENFORCE         real HTTP probes through the live AuthBridge OPA plugin, reproducing
 #                         #646's acceptance table.
 #   Phase REPLAY-TRIGGER  opt-in only (--only-replay-trigger): re-prove the trigger on a cluster
 #                         where the workloads are ALREADY deployed, by deleting their Keycloak
@@ -587,9 +587,25 @@ print("yes" if os.environ["SCOPE"] in names else "")' 2>/dev/null || true)
 #      Granting it here (204, or 409 when already linked) closes that race.
 #   2. The agent's OPA sidecar must load the bundle AIAC recomposed after the pod started, and the
 #      sidecar re-reads routes.yaml, so the restart also picks up a re-applied configmaps.yaml.
-# Idempotent, so it runs before every ENFORCE, --only-enforce included.
+# Idempotent, so it runs before every ENFORCE, --only-enforce included. The restart is skipped when
+# the scope was already linked and nothing it would reload changed after the agent pods started.
+#
+# last_write <resource> <name> — the newest managedFields time of the object (RFC 3339, UTC), or "".
+last_write() {
+  kubectl get "$1" "$2" -n "$NS" -o jsonpath='{range .metadata.managedFields[*]}{.time}{"\n"}{end}' 2>/dev/null \
+    | sort | tail -1
+}
+
 phase_prep() {
   printf '\n%s%s====== Phase PREP — exchange scope + agent restart ======%s\n' "$C_BLD" "$C_CYN" "$C_RST"
+
+  # WIRE used to write this route. Now ENFORCE relies on the cluster's ConfigMap matching
+  # configmaps.yaml, which a cluster from before the route moved there (or a re-seeded one) does not.
+  step "Checking that authproxy-routes has the github-tool route"
+  kubectl get configmap authproxy-routes -n "$NS" -o jsonpath='{.data.routes\.yaml}' 2>/dev/null \
+    | grep -q 'host: "github-tool"' \
+    || die "configmap/authproxy-routes in ${NS} has no github-tool route, so the agent's tool calls are not exchanged — re-apply it: kubectl apply -n ${NS} -f ${ASSETS_DIR}/agents/github_agent/k8s/configmaps.yaml"
+  pass "authproxy-routes lists host \"github-tool\""
 
   step "Granting github-agent the exchange scope on its Keycloak client (expect HTTP 204 or 409)"
   local admin agent_uuid scope_id scope_http tool_aud="agent-${NS}-github-tool-aud"
@@ -607,9 +623,23 @@ phase_prep() {
     *) die "assigning the optional client-scope returned HTTP ${scope_http} (expected 204 or 409)" ;;
   esac
 
+  # The oldest agent pod start against the newest write to what the restart reloads: both CRs (the
+  # namespace bundle) and the routes. RFC 3339 UTC times compare as strings.
+  local started changed=""
+  started="$(kubectl get pod -n "$NS" -l "$AGENT_LABEL" -o jsonpath='{range .items[*]}{.status.startTime}{"\n"}{end}' \
+    2>/dev/null | sort | head -1)"
+  changed="$( { last_write "$POLICY_CR" github-agent; last_write "$POLICY_CR" github-tool
+                last_write configmap authproxy-routes; } | sort | tail -1)"
+  if [ "$scope_http" = "409" ] && [ -n "$started" ] && [ -n "$changed" ] && [[ "$started" > "$changed" ]]; then
+    pass "github-agent started ${started}, after the last CR/route write ${changed} — no restart needed"
+    return 0
+  fi
+
   step "Restarting github-agent so its OPA sidecar loads the recomposed bundle"
-  kubectl delete pod -n "$NS" -l "$AGENT_LABEL" || die "failed to delete github-agent pod"
-  kubectl wait --for=condition=ready pod -n "$NS" -l "$AGENT_LABEL" --timeout=120s \
+  # rollout restart + status, not pod delete + wait -l: the wait can run before the ReplicaSet creates
+  # the new pod, find no pods, and fail.
+  kubectl rollout restart deployment/github-agent -n "$NS" || die "failed to restart deployment/github-agent"
+  kubectl rollout status deployment/github-agent -n "$NS" --timeout=180s \
     || die "github-agent did not become Ready after the restart"
   pass "github-agent restarted and Ready"
 }

@@ -6,7 +6,7 @@
 #
 #   The live path (demo.md Parts 1-5) — deploying the workloads IS the onboarding trigger, and a
 #   real HTTP request through the live AuthBridge OPA plugin decides allow/deny:
-#     make enable && make opa && make users && make e2e
+#     make opa && make enable && make users && make e2e
 #
 #   The narrated walkthrough (demo.md Part 6) — manual onboarding calls + offline `opa eval`, for
 #   inspecting what was generated step by step. Needs the workloads already deployed:

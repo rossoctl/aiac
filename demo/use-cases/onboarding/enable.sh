@@ -145,10 +145,20 @@ except Exception: print("")'
 step_stack() {
   # The Controller's start check #4 (D30) needs the changed combiner (D20), which `make opa` applies
   # as the `default` AuthorizationPolicy. Without it aiac-agent never becomes Available and
-  # step_wait_agent only times out, so fail here with the fix instead.
+  # step_wait_agent only times out, so fail here with the fix instead. The full resource name, because
+  # Istio's AuthorizationPolicy shares the short name. The content check is driver.sh's: the stock
+  # combiner (after `make opa-restore`) has the request fallback rules, and start check #4 rejects it too.
+  local policy_cr="authorizationpolicies.agent.rossoctl.dev" req_fallback
   echo "==> [stack] Checking that 'make opa' ran (AuthorizationPolicy 'default' in ${COMBINER_NAMESPACE})"
-  if ! kubectl get authorizationpolicy default -n "$COMBINER_NAMESPACE" >/dev/null 2>&1; then
+  if ! kubectl get "$policy_cr" default -n "$COMBINER_NAMESPACE" >/dev/null 2>&1; then
     echo "ERROR: AuthorizationPolicy 'default' is missing in ${COMBINER_NAMESPACE}, so the AIAC Controller cannot start (start check #4)." >&2
+    echo "       Run 'make opa' (demo.md step 1) first, then re-run this script." >&2
+    exit 1
+  fi
+  req_fallback=$(kubectl get "$policy_cr" default -n "$COMBINER_NAMESPACE" -o jsonpath='{.spec.policies[*].content}' \
+    | grep -cE 'client_ok if not data\.authbridge\.client\.(inbound|outbound)\.request' || true)
+  if [ "$req_fallback" != "0" ]; then
+    echo "ERROR: AuthorizationPolicy 'default' in ${COMBINER_NAMESPACE} is the stock combiner (${req_fallback} request fallback rules, expected 0), so the AIAC Controller cannot start (start check #4)." >&2
     echo "       Run 'make opa' (demo.md step 1) first, then re-run this script." >&2
     exit 1
   fi
