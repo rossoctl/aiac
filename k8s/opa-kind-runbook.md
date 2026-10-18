@@ -228,9 +228,12 @@ login client `rossoctl` needs Direct Access Grants on that client. In a fresh
 realm it is off, and the mint fails with `unauthorized_client`. The system
 tests do not need this step: their fixture enables the grant itself, once per
 session (`hold_direct_access_grants` in `test/system/uc1_onboard.py`), and
-turns it off again at session end if it turned it on. The client attribute
-`aiac.test.direct-access-grants-by-harness` records that the harness turned it
-on, so the next run undoes a run that was killed.
+turns it off again at session end if it turned it on and no other run still
+holds it. The client attribute `aiac.test.direct-access-grants-by-harness`
+records which harness runs hold the grant, each with an expiry
+(`AIAC_DAG_HOLD_TTL_SECONDS`, default 6 h). So two runs at the same time do not
+turn the grant off under each other, and a later run undoes a run that was
+killed.
 
 To enable it by hand, source the repo-root `.env` first. The snippet uses the
 same variables as the harness. It is a partial update: only the grant changes,

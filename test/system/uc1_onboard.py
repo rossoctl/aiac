@@ -103,6 +103,8 @@ import os
 import re
 import subprocess
 import sys
+import time
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -1054,15 +1056,86 @@ def _update_client(admin, realm: str, client_uuid: str, fields: dict) -> None:
 
 # Direct Access Grants on the login client. The harness mints user tokens with the password grant, so the
 # grant must be on. When the harness turns it on, it writes this client attribute in the same update. The
-# marker is the record that the harness owns the grant, and it is in Keycloak, not in process memory: a
-# run that is killed before its session teardown leaves the marker, and the next run takes the grant over
-# and turns it off at its end. A grant that is on with no marker belongs to the realm (or to an operator:
-# the runbook snippet removes the marker), and the harness never changes it.
+# marker is the record of the harness sessions that hold the grant, and it is in Keycloak, not in process
+# memory. Its value is a JSON object: holder id (``_dag_holder``) -> expiry (epoch seconds, the hold time +
+# ``_dag_hold_ttl``). A release removes its own holder and turns the grant off only when no other live
+# (not expired) holder remains, so two runs at the same time do not turn the grant off under each other.
+# A run that is killed before its release leaves its holder; the entry expires, and the next run takes the
+# grant over and turns it off at its end. A marker with no live holder, or a value that is not such an
+# object (the legacy ``"true"`` of an earlier harness), is stale: it is taken over the same way. A grant
+# that is on with no marker belongs to the realm (or to an operator: the runbook snippet removes the
+# marker), and the harness never changes it. Keycloak has no compare-and-set: two holds at the same
+# instant can lose one entry, and then the first release can turn the grant off early (a skip or a
+# failed mint in the other run, never a false pass).
 DAG_MARKER_ATTRIBUTE = "aiac.test.direct-access-grants-by-harness"
+
+# How long a holder entry stays live: longer than a whole system run. Override with this env var.
+DAG_HOLD_TTL_ENV = "AIAC_DAG_HOLD_TTL_SECONDS"
+DAG_HOLD_TTL_DEFAULT = 6 * 3600.0
+
+# The run id of this process when pytest-xdist does not give one (a run with no ``-n``).
+_PROCESS_RUN_ID = uuid.uuid4().hex
 
 # The login clients whose grant the harness holds in this session: ``(realm, clientId)`` -> ``(admin,
 # client UUID)``. ``release_direct_access_grants`` empties it at session end (``test/system/conftest.py``).
 _dag_holds: dict[tuple[str, str], tuple[object, str]] = {}
+
+
+def _dag_holder() -> str:
+    """The holder id of this pytest session: ``<run id>:<worker>``. The run id is the same in all xdist
+    workers of one run (``PYTEST_XDIST_TESTRUNUID``; else one id for this process). Each xdist worker is
+    its own pytest session with its own session-end release, so the worker id (``PYTEST_XDIST_WORKER``)
+    is part of the holder: the first worker to finish must not turn the grant off under its siblings."""
+    run = os.environ.get("PYTEST_XDIST_TESTRUNUID") or _PROCESS_RUN_ID
+    return f"{run}:{os.environ.get('PYTEST_XDIST_WORKER', 'main')}"
+
+
+def _dag_hold_ttl() -> float:
+    """The holder TTL in seconds (``DAG_HOLD_TTL_ENV``); a missing, non-numeric or non-positive value
+    gives the default."""
+    try:
+        ttl = float(os.environ.get(DAG_HOLD_TTL_ENV, ""))
+    except ValueError:
+        return DAG_HOLD_TTL_DEFAULT
+    return ttl if ttl > 0 else DAG_HOLD_TTL_DEFAULT
+
+
+def _now() -> float:
+    """The wall-clock time in epoch seconds (a seam for the unit tests)."""
+    return time.time()
+
+
+def _dag_holders(client: dict) -> dict[str, float] | None:
+    """The holders that the marker of ``client`` records (holder id -> expiry), or ``None`` when the
+    client has no marker. A value that is not a JSON object of holder -> number (the legacy ``"true"``)
+    gives ``{}``: a stale marker with no holder."""
+    raw = (client.get("attributes") or {}).get(DAG_MARKER_ATTRIBUTE)
+    if isinstance(raw, list):  # an attribute read as a list of values
+        raw = raw[0] if raw else None
+    if not raw:
+        return None
+    try:
+        doc = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+    if not isinstance(doc, dict):
+        return {}
+    return {
+        str(holder): float(expiry)
+        for holder, expiry in doc.items()
+        if isinstance(expiry, (int, float)) and not isinstance(expiry, bool)
+    }
+
+
+def _live_others(holders: dict[str, float], me: str) -> dict[str, float]:
+    """The holders other than ``me`` whose entry has not expired."""
+    now = _now()
+    return {holder: expiry for holder, expiry in holders.items() if holder != me and expiry > now}
+
+
+def _marker_value(holders: dict[str, float]) -> str:
+    """The marker attribute value for ``holders`` (sorted, so the same holders give the same value)."""
+    return json.dumps({holder: round(expiry) for holder, expiry in sorted(holders.items())})
 
 
 def _login_client_read_skip(realm: str, client_id: str, exc: Exception) -> str:
@@ -1085,11 +1158,13 @@ def hold_direct_access_grants(admin, realm: str, client_id: str = KEYCLOAK_CLIEN
     * The first call of the session reads the client. Later calls for the same client do nothing.
     * A grant that is on with no marker (``DAG_MARKER_ATTRIBUTE``) is the realm's own setting: it is not
       written, and it is not turned off later.
-    * A grant that is off is turned on, with the marker, in one partial update (``_update_client``).
-    * A marker from an earlier run that did not finish: this session takes the grant over. If the grant
-      is off with the marker on, it is turned on again (the marker stays).
+    * Else this session adds itself as a holder (``_dag_holder``, with an expiry) and turns the grant on,
+      in one partial update (``_update_client``). The update keeps the other live holders and drops the
+      expired ones. A marker with no live holder (a run that did not finish, or the legacy ``"true"``) is
+      taken over. A grant that is off with the marker on is turned on again.
 
-    In the last two cases ``release_direct_access_grants`` turns the grant off at session end.
+    ``release_direct_access_grants`` removes this holder at session end, and turns the grant off when no
+    other live holder remains.
 
     ``pytest.skip`` (with the cause) when the realm or the login client does not exist (nothing is
     created) or when the read or the update fails, for any reason (refused by the admin API, a transport
@@ -1110,28 +1185,38 @@ def hold_direct_access_grants(admin, realm: str, client_id: str = KEYCLOAK_CLIEN
             f"the login client {client_id!r} does not exist in realm {realm!r}, so the harness cannot mint a "
             "user token through it (the realm owns its login client; the harness does not create it)"
         )
-    marked = (client.get("attributes") or {}).get(DAG_MARKER_ATTRIBUTE) == "true"
-    if client.get("directAccessGrantsEnabled") and not marked:
+    holders = _dag_holders(client)
+    if client.get("directAccessGrantsEnabled") and holders is None:
         return
-    # Record the hold before the write: a write that raises after the server applied it is still undone.
-    _dag_holds[key] = (admin, client["id"])
-    if marked:
+    me = _dag_holder()
+    others = _live_others(holders or {}, me)
+    if holders is not None and not others:
         log.warning(
             "an earlier run turned on Direct Access Grants on the login client %r in realm %r and did not "
-            "turn it off: this session takes it over and turns it off at its end",
+            "turn it off (no live holder in %r): this session takes it over and turns it off at its end",
             client_id,
             realm,
+            DAG_MARKER_ATTRIBUTE,
         )
-        if client.get("directAccessGrantsEnabled"):
-            return
-        # The marker stays but the grant is off (an operator turned it off, a realm re-import, or a
-        # release that wrote only part of its update): turn the grant on again below.
+    elif others:
+        log.info(
+            "Direct Access Grants on the login client %r in realm %r is held by other live runs %s: this "
+            "session joins them",
+            client_id,
+            realm,
+            sorted(others),
+        )
+    # Record the hold before the write: a write that raises after the server applied it is still undone.
+    _dag_holds[key] = (admin, client["id"])
     try:
         _update_client(
             admin,
             realm,
             client["id"],
-            {"directAccessGrantsEnabled": True, "attributes": {DAG_MARKER_ATTRIBUTE: "true"}},
+            {
+                "directAccessGrantsEnabled": True,
+                "attributes": {DAG_MARKER_ATTRIBUTE: _marker_value({**others, me: _now() + _dag_hold_ttl()})},
+            },
         )
     except Exception as exc:  # noqa: BLE001 — a refused write or a lost response: undo if applied, then skip
         _release_one(key)
@@ -1142,28 +1227,45 @@ def hold_direct_access_grants(admin, realm: str, client_id: str = KEYCLOAK_CLIEN
             "(k8s/opa-kind-runbook.md, 'Direct Access Grants on the login client')."
         )
     log.warning(
-        "enabled Direct Access Grants on the login client %r in realm %r (turned off again at session end)",
+        "holding Direct Access Grants on the login client %r in realm %r as %r (turned off again at session "
+        "end when no other run holds it)",
         client_id,
         realm,
+        me,
     )
 
 
 def _release_one(key: tuple[str, str]) -> None:
-    """Turn the grant of one held login client off again, and remove the marker, if the marker is still
-    on the client. The client is read again first: when the marker is gone, someone else took the grant
-    over during the run (the runbook snippet removes the marker), and the grant is not changed.
+    """Remove this session's holder from one held login client, and turn its grant off (and remove the
+    marker) when no other live holder remains. The client is read again first: when the marker is gone,
+    someone else took the grant over during the run (the runbook snippet removes the marker), and the
+    grant is not changed. When another live holder remains, only this holder is removed (the expired
+    ones are dropped too) and the grant stays on.
     Best-effort: any error is logged, never raised, so it does not mask a failure that is propagating.
-    The marker stays when the write fails, so the next run turns the grant off."""
+    The marker stays when the write fails, so the entry expires and a later run turns the grant off."""
     admin, client_uuid = _dag_holds.pop(key)
     realm, client_id = key
+    me = _dag_holder()
     try:
         admin.change_current_realm(realm)
         client = admin.get_client(client_uuid)
-        if (client.get("attributes") or {}).get(DAG_MARKER_ATTRIBUTE) != "true":
+        holders = _dag_holders(client)
+        if holders is None:
             log.info(
                 "Direct Access Grants on the login client %r in realm %r has no harness marker now: not changed",
                 client_id,
                 realm,
+            )
+            return
+        others = _live_others(holders, me)
+        if others:
+            if me in holders:
+                _update_client(admin, realm, client_uuid, {"attributes": {DAG_MARKER_ATTRIBUTE: _marker_value(others)}})
+            log.info(
+                "Direct Access Grants on the login client %r in realm %r stays on: other live runs %s hold it",
+                client_id,
+                realm,
+                sorted(others),
             )
             return
         _update_client(
@@ -1171,19 +1273,20 @@ def _release_one(key: tuple[str, str]) -> None:
         )
     except Exception as exc:  # noqa: BLE001 — best-effort teardown: log, never mask the real failure
         log.error(
-            "cannot turn Direct Access Grants off again on the login client %r in realm %r: %s. The marker "
-            "%r stays, so the next run turns it off.",
+            "cannot release Direct Access Grants on the login client %r in realm %r: %s. The marker %r "
+            "stays, so its holder %r expires and a later run turns the grant off.",
             client_id,
             realm,
             exc,
             DAG_MARKER_ATTRIBUTE,
+            me,
         )
 
 
 def release_direct_access_grants() -> None:
-    """At the end of the pytest session (``test/system/conftest.py``): turn Direct Access Grants off again
-    on each login client that ``hold_direct_access_grants`` holds (``_release_one``). A realm that had the
-    grant on is not changed. A no-op when no stack ran."""
+    """At the end of the pytest session (``test/system/conftest.py``): release each login client that
+    ``hold_direct_access_grants`` holds (``_release_one``). A realm that had the grant on is not changed.
+    A no-op when no stack ran."""
     for key in list(_dag_holds):
         _release_one(key)
 

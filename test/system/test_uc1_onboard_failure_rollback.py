@@ -56,8 +56,10 @@ independent of the real LLM provider (no bad-key / bad-model behaviour to depend
 path is the same: both errors are in ``_ROLLBACK_ERRORS``, so the rollback and quarantine are identical.
 The error type alone does not prove that the injection caused the failure: every LLM fault that is not
 transient and not a refused credential (a schema-invalid response, another 4xx) also raises
-``UnparseableLLMResponseError``. So the log check also asks for the PRB's chat-completions request to
-``UNUSABLE_LLM_BASE_URL`` and its 404 (``_injected_request_line``).
+``UnparseableLLMResponseError``. So the log check asks for AIAC's own ERROR line of the error with the
+injected status (``_injected_error_line``: ``log_by_type`` logs the sanitized message, which ends with the
+HTTP status, ``aiac.agent.llm.raise_sanitized``). It does not read the httpx INFO request line: that one
+depends on ``LOG_LEVEL`` and on the httpx log format.
 
 **Re-onboarding trigger — the NATS subject.** ``publish_service_event`` publishes
 ``aiac.apply.service.<uuid>`` (the subject + payload the ``aiac-event-listener`` SPI emits on
@@ -120,14 +122,16 @@ LIFT_TIMEOUT = float(os.environ.get("AIAC_ROLLBACK_LIFT_TIMEOUT", "600"))
 
 # What the injection makes the consumer log (``log_by_type`` + the dead-letter move, both at ERROR).
 INJECTED_ERROR = "UnparseableLLMResponseError"
+INJECTED_STATUS = 404  # the Controller's own app answers the injected path with 404
 DLQ_SUBJECT = "aiac.apply.dlq"
 
 
-def _injected_request_line() -> str:
-    """The Controller's httpx log line for the PRB call that the injection answers: the chat-completions
-    request to ``uc1.UNUSABLE_LLM_BASE_URL``, answered 404. Up to the status code, so the reason phrase
-    does not matter."""
-    return f'HTTP Request: POST {uc1.UNUSABLE_LLM_BASE_URL.rstrip("/")}/chat/completions "HTTP/1.1 404'
+def _injected_error_line() -> str:
+    """AIAC's own ERROR line for the build failure that the injection causes (``log_by_type``:
+    ``"<type>: <sanitized message>"``). The sanitized message ends with the HTTP status of the raw error
+    (``aiac.agent.llm.raise_sanitized``), so the line proves the failure came from the injected 404, not
+    from another fault of the same type (a schema-invalid response has no status)."""
+    return f"{INJECTED_ERROR}: LLM returned an unparseable or schema-invalid response (HTTP {INJECTED_STATUS})"
 
 
 def _dlq_line(uuid: str) -> str:
@@ -423,14 +427,14 @@ def test_failed_service_has_no_spm(run: dict, key: str) -> None:
 def test_failure_logged_and_dead_lettered(run: dict, key: str) -> None:
     """The Controller logs the build failure (its type) and moves the event to the DLQ as a
     **permanent** failure on the first delivery — the injection's error, never a redelivery loop. The
-    PRB's request to the injected URL and its 404 prove that the injection caused the failure, not
-    another LLM fault of the same type (module docstring)."""
+    error line with the injected 404 (``_injected_error_line``, AIAC's own ERROR line) proves that the
+    injection caused the failure, not another LLM fault of the same type (module docstring)."""
     obs = _failed(run, key)
-    assert _injected_request_line() in obs["logs"], (
-        f"{key}: no {_injected_request_line()!r} in the Controller log — the build failed, but not on the "
+    assert INJECTED_ERROR in obs["logs"], f"{key}: no {INJECTED_ERROR!r} in the Controller log"
+    assert _injected_error_line() in obs["logs"], (
+        f"{key}: no {_injected_error_line()!r} in the Controller log — the build failed, but not on the "
         "injected 404. Did the injection reach the Controller?"
     )
-    assert INJECTED_ERROR in obs["logs"], f"{key}: no {INJECTED_ERROR!r} in the Controller log"
     assert _dlq_line(obs["uuid"]) in obs["logs"], f"{key}: no dead-letter line {_dlq_line(obs['uuid'])!r}"
 
 

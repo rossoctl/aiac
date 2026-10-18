@@ -1,12 +1,14 @@
 """``uc1_onboard.hold_direct_access_grants`` turns on the password grant of the login client for the
-session, and ``release_direct_access_grants`` turns it off again at session end if the harness turned it
-on — pure unit tests.
+session, and ``release_direct_access_grants`` turns it off again at session end when no other live harness
+session holds it — pure unit tests.
 
 The harness mints user tokens through the login client ``rossoctl`` with the password grant, so the
 client needs Direct Access Grants on. ``_clean_slate`` (shared by ``onboarded_stack`` and
 ``pristine_stack``) holds the grant before its first mutation, and ``test/system/conftest.py`` releases
-it at session end. The harness writes a marker attribute with the grant, so a run that is killed before
-its release is undone by the next run, and a grant that someone else turned on is never turned off. A
+it at session end. The harness writes a marker attribute with the grant: a JSON map of holder (one per
+pytest session) -> expiry. A release turns the grant off only when no other live holder remains, a run
+that is killed before its release expires and is undone by a later run, and a grant that someone else
+turned on is never turned off. A
 grant that cannot be read or written is a skip with the cause. These tests use a stateful fake admin (no
 Keycloak) that applies the partial-update rules of Keycloak 26. They import the system harness like
 ``test_uc1_subject_scope.py`` does.
@@ -15,6 +17,7 @@ Keycloak) that applies the partial-update rules of Keycloak 26. They import the 
 from __future__ import annotations
 
 import sys
+import types
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -29,16 +32,31 @@ from test.system import uc1_onboard as uc1  # noqa: E402
 
 LOGIN_UUID = "uuid-1"
 MARKER = uc1.DAG_MARKER_ATTRIBUTE
+NOW = 1_000_000.0  # the fixed clock of the tests (``uc1._now``)
+TTL = 3600.0
+ME = "run-a:main"  # this session's holder id
+OTHER = "run-b:main"  # another live run
 
 
 @pytest.fixture(autouse=True)
 def _no_holds(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Each test starts a fresh session: no login client is held."""
+    """Each test starts a fresh session: no login client is held, a fixed clock and holder id."""
     monkeypatch.setattr(uc1, "_dag_holds", {})
+    monkeypatch.setattr(uc1, "_now", lambda: NOW)
+    monkeypatch.setenv(uc1.DAG_HOLD_TTL_ENV, str(TTL))
+    monkeypatch.setattr(uc1, "_dag_holder", lambda: ME)
 
 
-def _login(enabled: bool, *, marked: bool = False, client_id: str = uc1.KEYCLOAK_CLIENT_ID) -> dict:
-    attributes = {"keep.me": "yes", **({MARKER: "true"} if marked else {})}
+def _mine() -> str:
+    return uc1._marker_value({ME: NOW + TTL})
+
+
+def _login(
+    enabled: bool, *, marked: bool = False, marker: str | None = None, client_id: str = uc1.KEYCLOAK_CLIENT_ID
+) -> dict:
+    """The login client. ``marked`` puts the legacy ``"true"`` marker; ``marker`` puts the given value."""
+    value = marker if marker is not None else ("true" if marked else None)
+    attributes = {"keep.me": "yes", **({MARKER: value} if value is not None else {})}
     return {"clientId": client_id, "id": LOGIN_UUID, "directAccessGrantsEnabled": enabled, "attributes": attributes}
 
 
@@ -102,7 +120,7 @@ def test_the_grant_is_enabled_with_the_marker_in_one_partial_update() -> None:
     uc1.hold_direct_access_grants(admin, "rossoctl")
     admin.change_current_realm.assert_called_with("rossoctl")
     admin.update_client.assert_called_once_with(
-        LOGIN_UUID, {"directAccessGrantsEnabled": True, "attributes": {MARKER: "true"}}
+        LOGIN_UUID, {"directAccessGrantsEnabled": True, "attributes": {MARKER: _mine()}}
     )
     assert admin.stored["attributes"]["keep.me"] == "yes"  # other attributes are not written
 
@@ -123,12 +141,18 @@ def test_the_grant_is_read_and_written_once_per_session() -> None:
     assert _grant_writes(admin) == [True, False]
 
 
-def test_a_marker_left_by_a_killed_run_is_taken_over_and_released() -> None:
-    """The case of the review: an earlier run turned the grant on and was killed before its release. The
-    marker is still on the client, so this session turns the grant off at its end."""
-    admin = _admin(_login(True, marked=True))
+@pytest.mark.parametrize(
+    "marker",
+    ["true", uc1._marker_value({"run-dead:main": NOW - 1}), "{}", "not json"],
+    ids=["legacy", "expired-holder", "no-holder", "garbage"],
+)
+def test_a_stale_marker_left_by_a_killed_run_is_taken_over_and_released(marker: str) -> None:
+    """The case of the review: an earlier run turned the grant on and was killed before its release. Its
+    marker has no live holder (the legacy ``"true"``, an expired entry, or an unreadable value), so this
+    session takes the grant over (it writes itself as the one holder) and turns it off at its end."""
+    admin = _admin(_login(True, marker=marker))
     uc1.hold_direct_access_grants(admin, "rossoctl")
-    admin.update_client.assert_not_called()  # already on: nothing to write at entry
+    assert admin.stored["attributes"][MARKER] == _mine()  # the expired holder is dropped
     uc1.release_direct_access_grants()
     assert admin.stored["directAccessGrantsEnabled"] is False
     assert MARKER not in admin.stored["attributes"]
@@ -136,19 +160,93 @@ def test_a_marker_left_by_a_killed_run_is_taken_over_and_released() -> None:
 
 def test_a_marker_with_the_grant_off_turns_the_grant_on_and_is_released() -> None:
     """The case of the review: the marker is on the client but the grant is off (an operator turned it
-    off, a realm re-import, or a partial release). The session turns the grant on again, keeps the marker,
-    and turns the grant off at its end."""
+    off, a realm re-import, or a partial release). The session turns the grant on again, writes itself as
+    the holder, and turns the grant off at its end."""
     admin = _admin(_login(False, marked=True))
     uc1.hold_direct_access_grants(admin, "rossoctl")
     admin.update_client.assert_called_once_with(
-        LOGIN_UUID, {"directAccessGrantsEnabled": True, "attributes": {MARKER: "true"}}
+        LOGIN_UUID, {"directAccessGrantsEnabled": True, "attributes": {MARKER: _mine()}}
     )
     assert admin.stored["directAccessGrantsEnabled"] is True
-    assert admin.stored["attributes"][MARKER] == "true"
+    assert admin.stored["attributes"][MARKER] == _mine()
     assert ("rossoctl", uc1.KEYCLOAK_CLIENT_ID) in uc1._dag_holds
     uc1.release_direct_access_grants()
     assert admin.stored["directAccessGrantsEnabled"] is False
     assert MARKER not in admin.stored["attributes"]
+
+
+# ======================================================================================
+# Two runs at the same time — each run is a holder; the grant goes off with the last one
+# ======================================================================================
+
+
+def test_a_second_run_joins_the_live_holder_and_keeps_its_entry() -> None:
+    admin = _admin(_login(True, marker=uc1._marker_value({OTHER: NOW + 60})))
+    uc1.hold_direct_access_grants(admin, "rossoctl")
+    assert uc1._dag_holders(admin.stored) == {OTHER: NOW + 60, ME: NOW + TTL}
+
+
+def test_the_first_run_to_finish_does_not_turn_the_grant_off_under_another_live_run() -> None:
+    """The case of the review: run A and run B hold the grant. A finishes first: it removes only its own
+    entry, and the grant stays on for B. B then finishes and turns the grant off."""
+    admin = _admin(_login(True, marker=uc1._marker_value({OTHER: NOW + 60})))
+    uc1.hold_direct_access_grants(admin, "rossoctl")  # this session (ME) joins OTHER
+    uc1.release_direct_access_grants()  # ME finishes first
+    assert admin.stored["directAccessGrantsEnabled"] is True
+    assert uc1._dag_holders(admin.stored) == {OTHER: NOW + 60}
+    assert admin.update_client.call_args.args[1] == {"attributes": {MARKER: uc1._marker_value({OTHER: NOW + 60})}}
+
+
+def test_the_last_live_run_to_finish_turns_the_grant_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    admin = _admin(_login(False))
+    uc1.hold_direct_access_grants(admin, "rossoctl")
+    # Another run joins during this session (as the test above, from its side).
+    admin.stored["attributes"][MARKER] = uc1._marker_value({ME: NOW + TTL, OTHER: NOW + 60})
+    monkeypatch.setattr(uc1, "_now", lambda: NOW + 61)  # the other run was killed: its entry expires
+    uc1.release_direct_access_grants()
+    assert admin.stored["directAccessGrantsEnabled"] is False
+    assert MARKER not in admin.stored["attributes"]
+
+
+def test_an_expired_holder_does_not_keep_the_grant_on() -> None:
+    admin = _admin(_login(True, marker=uc1._marker_value({OTHER: NOW - 1, ME: NOW + TTL})))
+    uc1._dag_holds[("rossoctl", uc1.KEYCLOAK_CLIENT_ID)] = (admin, LOGIN_UUID)
+    uc1.release_direct_access_grants()
+    assert admin.stored["directAccessGrantsEnabled"] is False
+
+
+def test_the_holder_id_is_shared_by_the_run_and_names_the_worker(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.undo()  # the real _dag_holder
+    monkeypatch.setenv("PYTEST_XDIST_TESTRUNUID", "run-123")
+    monkeypatch.setenv("PYTEST_XDIST_WORKER", "gw1")
+    assert uc1._dag_holder() == "run-123:gw1"
+    monkeypatch.delenv("PYTEST_XDIST_TESTRUNUID")
+    monkeypatch.delenv("PYTEST_XDIST_WORKER")
+    assert uc1._dag_holder() == f"{uc1._PROCESS_RUN_ID}:main"
+
+
+@pytest.mark.parametrize(
+    ("raw", "ttl"), [("120", 120.0), ("0", uc1.DAG_HOLD_TTL_DEFAULT), ("x", uc1.DAG_HOLD_TTL_DEFAULT)]
+)
+def test_the_hold_ttl_comes_from_the_env(monkeypatch: pytest.MonkeyPatch, raw: str, ttl: float) -> None:
+    monkeypatch.setenv(uc1.DAG_HOLD_TTL_ENV, raw)
+    assert uc1._dag_hold_ttl() == ttl
+
+
+@pytest.mark.parametrize(
+    ("value", "holders"),
+    [
+        (None, None),
+        ("", None),
+        ("true", {}),
+        ('["a"]', {}),
+        ('{"a": 5, "b": "x", "c": true}', {"a": 5.0}),
+        (['{"a": 5}'], {"a": 5.0}),  # an attribute read as a list of values
+    ],
+)
+def test_the_marker_value_is_read_as_holders(value, holders) -> None:
+    client = {"attributes": {} if value is None else {MARKER: value}}
+    assert uc1._dag_holders(client) == holders
 
 
 def test_a_missing_login_client_skips_and_is_not_created() -> None:
@@ -206,6 +304,15 @@ def test_an_update_that_was_applied_but_lost_its_response_is_undone_before_the_s
     assert uc1._dag_holds == {}
 
 
+def test_a_failed_hold_that_joined_another_run_leaves_the_other_holder(monkeypatch: pytest.MonkeyPatch) -> None:
+    admin = _admin(_login(True, marker=uc1._marker_value({OTHER: NOW + 60})))
+    admin.update_client.side_effect = KeycloakError(error_message="forbidden", response_code=403)
+    with pytest.raises(pytest.skip.Exception):
+        uc1.hold_direct_access_grants(admin, "rossoctl")
+    assert admin.update_client.call_count == 1  # ME is not in the marker, OTHER is live: nothing to undo
+    assert admin.stored["directAccessGrantsEnabled"] is True
+
+
 def test_another_login_client_can_be_held() -> None:
     admin = _admin(_login(False, client_id="other-login"))
     uc1.hold_direct_access_grants(admin, "rossoctl", client_id="other-login")
@@ -258,7 +365,7 @@ def test_a_failed_release_is_logged_not_raised(caplog: pytest.LogCaptureFixture,
     uc1.hold_direct_access_grants(admin, "rossoctl")
     admin.update_client.side_effect = error
     uc1.release_direct_access_grants()  # never masks a teardown failure
-    assert "cannot turn Direct Access Grants off again" in caplog.text
+    assert "cannot release Direct Access Grants" in caplog.text
     assert uc1._dag_holds == {}
 
 
@@ -324,3 +431,48 @@ def test_the_body_failing_still_runs_the_teardown(steps: MagicMock, error: BaseE
     assert steps.mock_calls[0].args == ("teardown",)  # the CR capture comes first
     assert [c.args[0] for c in steps.undeploy_workload.call_args_list] == ["github-tool", "github-agent"]
     steps._scrub_to_pristine.assert_called_once()
+
+
+# ======================================================================================
+# test/system/conftest.py — the session release finds the harness under any import name
+# ======================================================================================
+
+
+@pytest.fixture
+def system_conftest(monkeypatch: pytest.MonkeyPatch):
+    """``test/system/conftest.py`` with only fake harness copies in ``sys.modules``."""
+    from test.system import conftest
+
+    monkeypatch.setattr(sys, "modules", {"test.system.conftest": conftest})
+    return conftest
+
+
+def _fake_harness(name: str, *, release=None) -> types.ModuleType:
+    module = types.ModuleType(name)
+    module.__file__ = str(Path(uc1.__file__))
+    if release is not None:
+        module.release_direct_access_grants = release
+    return module
+
+
+def test_the_release_finds_the_harness_under_another_import_name(system_conftest) -> None:
+    release = MagicMock()
+    sys.modules["uc1_onboard"] = _fake_harness("uc1_onboard", release=release)  # another sys.path entry
+    sys.modules["other"] = types.ModuleType("other")  # not the harness: no __file__
+    system_conftest.release_harness_grants()
+    release.assert_called_once_with()
+
+
+def test_the_release_does_nothing_when_no_harness_is_loaded(system_conftest, caplog) -> None:
+    system_conftest.release_harness_grants()
+    assert caplog.records == []
+
+
+def test_a_release_that_cannot_run_is_a_warning(system_conftest, caplog: pytest.LogCaptureFixture) -> None:
+    sys.modules["a"] = _fake_harness("a")  # no release function
+    sys.modules["b"] = _fake_harness("b", release=MagicMock(side_effect=RuntimeError("boom")))
+    system_conftest.release_harness_grants()  # never raises
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 2
+    assert "has no release_direct_access_grants" in warnings[0].getMessage()
+    assert "release of Direct Access Grants by the harness module 'b' failed" in warnings[1].getMessage()
