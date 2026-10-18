@@ -261,7 +261,7 @@ The `/apply/*` endpoints return bare HTTP status codes: `200 OK` on success (no 
 | `LLM_MAX_RETRIES` | `3` | ConfigMap |
 | `LLM_RETRY_BACKOFF_MIN` | `1` | ConfigMap |
 | `LLM_RETRY_BACKOFF_MAX` | `30` | ConfigMap |
-| `LLM_REQUEST_TIMEOUT` | `120` | ConfigMap |
+| `LLM_REQUEST_TIMEOUT` | `60` | ConfigMap (the code default, if the key is not set, is `120`) |
 | `ONBOARD_LABEL_WAIT_ATTEMPTS` | `15` | env (optional; not set in `k8s/`; code default) |
 | `ONBOARD_LABEL_WAIT_BACKOFF` | `2.0` | env (optional; not set in `k8s/`; code default) |
 | `ONBOARD_CARD_WAIT_ATTEMPTS` | `15` | env (optional; not set in `k8s/`; code default) |

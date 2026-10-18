@@ -432,7 +432,7 @@ kubectl rollout status deployment/aiac-agent -n aiac-system
 ```
 
 - The apply writes the manifest value of each key, for example `AIAC_ENFORCEMENT_SIDE`
-  (`target-side`), `LOG_LEVEL` (`INFO`) and `LLM_REQUEST_TIMEOUT` (`120`). The block reads all
+  (`target-side`), `LOG_LEVEL` (`INFO`) and `LLM_REQUEST_TIMEOUT` (`60`). The block reads all
   live keys before the apply and patches them back before the restart. Thus an `agent-side`
   deployment stays `agent-side`, and a tuned key (for example `LLM_MAX_RETRIES` or
   `LLM_RETRY_BACKOFF_MAX`) keeps its live value. Only a key that is new in the manifest gets its

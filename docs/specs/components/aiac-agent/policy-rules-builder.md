@@ -291,8 +291,9 @@ distinct:
   `aiac.agent.llm.call_with_retry`, which `_structured_call` calls (the Policy Digester uses the
   same seam), driven by **dedicated LLM knobs** (not the shared `UPSTREAM_MAX_RETRIES`): `LLM_MAX_RETRIES`
   (default `3`), `LLM_RETRY_BACKOFF_MIN` (`1`) and `LLM_RETRY_BACKOFF_MAX` (`30`). `is_transient`
-  classifies which failures retry (5xx / connect / timeout). `LLM_REQUEST_TIMEOUT` (default `120`)
-  bounds each request. The Phase-1 file read does **not** retry; it raises directly.
+  classifies which failures retry (5xx / connect / timeout). `LLM_REQUEST_TIMEOUT` (code default
+  `120`, `60` in the `aiac-agent-config` manifest) bounds each request. The Phase-1 file read does
+  **not** retry; it raises directly.
 
 `_structured_call` has three raise outcomes:
 
@@ -616,7 +617,7 @@ and is **not yet enforced** here.
 |---|---|---|
 | `AIAC_POLICY_FILE` | Path to the whole-file access policy (default `/etc/aiac/policy.md`) | 1 |
 | `LLM_BASE_URL`, `LLM_MODEL`, `LLM_API_KEY` | LLM calls | 1 |
-| `LLM_REQUEST_TIMEOUT` | Per-request LLM timeout, in seconds (default `120`) | 1 |
+| `LLM_REQUEST_TIMEOUT` | Per-request LLM timeout, in seconds (code default `120`, `60` in the manifest) | 1 |
 | `LLM_MAX_RETRIES` | Transient-failure retry budget for the LLM seam (tenacity `stop_after_attempt`, default `3`) | 1 |
 | `LLM_RETRY_BACKOFF_MIN` | Minimum exponential backoff for the LLM seam, in seconds (default `1`) | 1 |
 | `LLM_RETRY_BACKOFF_MAX` | Maximum exponential backoff for the LLM seam, in seconds (default `30`) | 1 |
