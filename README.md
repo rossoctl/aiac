@@ -54,31 +54,13 @@ Always use `.venv` for Python execution, tests, and dependency checks (`.venv/bi
 
 ## Running tests
 
-`pytest` collects both `test/` and `eval/`. Selection is **marker-only** — never pass a path. A
-bare run is the offline unit lane (the default `addopts` deselects `integration`, `system`, `llm`
-and `eval`); a command-line `-m` opts into another lane:
-
 ```bash
 .venv/bin/pytest                    # unit lane — offline, needs nothing
-.venv/bin/pytest -m integration     # several AIAC units in one process — offline, needs nothing
-
-set -a; . .env; set +a              # LLM_* / KEYCLOAK_* for the live lanes
-.venv/bin/pytest -m llm             # live-LLM Policy Rules Builder suite — LLM endpoint only
-.venv/bin/pytest -m system          # real OPA loop through AuthBridge — wired Kind cluster
-.venv/bin/pytest -m eval            # policy-pipeline evaluation suite under eval/
 ```
 
-| Lane | Needs |
-|---|---|
-| unit | Nothing |
-| integration | Nothing (fakes stand in for Keycloak, the Policy Model Store and the Kubernetes API) |
-| llm | `LLM_BASE_URL` / `LLM_MODEL` / `LLM_API_KEY` |
-| system | A rossoctl/Kind cluster wired by `k8s/opa-kind-enable.sh`, the event path (the NATS broker and the `aiac-event-listener` Keycloak SPI), Keycloak admin creds, an LLM endpoint — see [docs/agents/test.md](docs/agents/test.md) |
-| eval | Keycloak, an LLM endpoint, `opa` on `PATH` for the e2e level |
-
-Live lanes skip cleanly when their env or cluster is missing — a skip is not a pass. Full lane
-contract: [docs/agents/test.md](docs/agents/test.md); where to put a new test:
-[docs/testing/testing-strategy.md](docs/testing/testing-strategy.md).
+Selection is by marker (`-m integration`, `-m llm`, `-m system`, `-m eval`), never by path. The
+lanes, what each one needs and their env are in [docs/agents/test.md](docs/agents/test.md); where to
+put a new test: [docs/testing/testing-strategy.md](docs/testing/testing-strategy.md).
 
 ## Deploying to Kubernetes
 
@@ -86,9 +68,16 @@ Build/load the per-service images and apply the manifests under [k8s/](k8s/); fu
 are in [k8s/aiac-deployment-guide.md](k8s/aiac-deployment-guide.md). To wire the AuthBridge OPA
 plugin and the AIAC global combiner into Kind, see [k8s/opa-kind-runbook.md](k8s/opa-kind-runbook.md).
 
+Onboarding also needs the `aiac-event-listener` Keycloak SPI: without it no registration event
+reaches the Controller and new workloads are never onboarded. Install it with
+`./k8s/keycloak-spi-install.sh` and check it with `./k8s/keycloak-spi-verify.sh`. Run the check again
+after `k8s/opa-kind-enable.sh`: its `helm upgrade` can put the stock Keycloak image back. See
+[docs/agents/deploy.md](docs/agents/deploy.md#precondition-keycloak-event-listener-spi).
+
 The enforcement side is a deploy-time setting — `AIAC_ENFORCEMENT_SIDE` in the
 `aiac-agent-config` ConfigMap (`target-side`, the default: each callee checks its own inbound; or
-`agent-side`: each callee still checks its inbound, and the agent also checks its outbound calls).
+`agent-side`: the agent's outbound OPA checks its calls to tools, and each tool gets a pass-through
+CR, so the agent's check is the only one that protects a tool).
 There is no live switch; changing it is a clean redeploy. See [docs/agents/deploy.md](docs/agents/deploy.md).
 
 ## Demo — onboarding an agent and a tool
@@ -106,9 +95,13 @@ proves two claims:
 Prerequisites: a Kind cluster named `rossoctl` with the rossoctl platform (SPIRE, Keycloak, the
 operator), the `team1` namespace, `kubectl`, `helm`, `kind`, `curl`, `python3` and `docker` or
 `podman` on `PATH`, sibling clones of `rossoctl/operator`, `rossoctl/rossoctl` and
-`rossoctl/cortex`, and two secrets (`team1/openai-secret` and `aiac-system/keycloak-admin-secret`).
+`rossoctl/cortex`, two secrets (`team1/openai-secret` and `aiac-system/keycloak-admin-secret`), and,
+on a freshly provisioned realm, the one-time
+[Keycloak realm fix-up](demo/use-cases/onboarding/demo.md#one-time-keycloak-realm-fix-up) (Direct
+Access Grants on the `rossoctl` client; without it token minting fails with `unauthorized_client`).
 `github-agent` and `github-tool` must **not** already be deployed in `team1`: their first-time deploy
-is the trigger. If you ran the demo or the system lane before, run `make restore` first.
+is the trigger. A clean system-lane run removes them at teardown; after an earlier demo run or an
+aborted system-lane run, run `make restore` first.
 Then, from that directory, in this order — the AIAC Controller does not start until `make opa` has
 applied the changed combiner:
 

@@ -36,7 +36,7 @@ to put a new test, see `docs/testing/testing-strategy.md`.
 | unit | bare `pytest` | `unit` | Nothing |
 | integration | `-m integration` | `integration` | Nothing (offline: several AIAC units in one process, no cluster, no LLM endpoint). The tests are under `test/integration/`, a mirror of `src/aiac/`. |
 | llm | `-m llm` | `system` | An LLM endpoint only (no cluster, no Keycloak) |
-| system | `-m system` | `system` | A wired Kind cluster, Keycloak admin credentials, an LLM endpoint |
+| system | `-m system` | `system` | A wired Kind cluster with the event path (NATS broker + Keycloak SPI), Keycloak admin credentials, an LLM endpoint, and `kind` plus `docker` or `podman` on `PATH` (the session fixture builds and loads the demo images) |
 | eval | `-m eval` | `system` | Keycloak, an LLM endpoint, `opa` on `PATH` for the e2e level |
 
 All live lanes (`llm`, `system`, `eval`) **skip cleanly** when their env is not
