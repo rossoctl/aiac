@@ -147,9 +147,10 @@ def _structured_call(schema: type[T], messages: list[BaseMessage]) -> T:
     surviving failure into the PRB's own typed, sanitized error subclasses (so consumers that catch
     ``PolicyRulesBuilderBaseError`` are unaffected).
 
-    Only transient failures (connection errors / timeouts / 5xx) are retried — a permanent
-    failure (e.g. a bad request or a validation error) fails identically on every attempt, so
-    it is surfaced immediately (consistent with ``aiac.shared.upstream``)."""
+    Only transient failures (``aiac.shared.upstream.is_transient``: connection errors / timeouts /
+    5xx / HTTP 408 and 429) are retried — a permanent failure (e.g. a bad request, a validation
+    error, or a 429 for an exhausted quota) fails identically on every attempt, so it is surfaced
+    immediately."""
     settings = load_llm_settings()  # PRB profile: the bare LLM_* vars
     runnable = _build_llm().with_structured_output(schema)
     try:

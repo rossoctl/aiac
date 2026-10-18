@@ -900,25 +900,23 @@ def test_structured_call_honors_llm_max_retries(monkeypatch):
 
 
 def test_structured_call_backoff_bounds_from_env(monkeypatch):
-    # The exponential-backoff bounds flow from LLM_RETRY_BACKOFF_MIN / _MAX into the retry wait.
-    # One attempt (no sleep) is enough: we assert the wait_exponential CONSTRUCTION bounds.
-    monkeypatch.setenv("LLM_MAX_RETRIES", "1")
-    monkeypatch.setenv("LLM_RETRY_BACKOFF_MIN", "7")
-    monkeypatch.setenv("LLM_RETRY_BACKOFF_MAX", "9")
+    # The exponential-backoff bounds flow from LLM_RETRY_BACKOFF_MIN / _MAX into the retry wait. The
+    # waits are recorded (no real sleep): 1, 2, 4, 8 s clamped to [3, 5].
+    monkeypatch.setenv("LLM_MAX_RETRIES", "5")
+    monkeypatch.setenv("LLM_RETRY_BACKOFF_MIN", "3")
+    monkeypatch.setenv("LLM_RETRY_BACKOFF_MAX", "5")
 
     llm, _ = _failing_llm(ConnectionError("down"))
+    waits: list[float] = []
 
     with ExitStack() as stack:
         stack.enter_context(patch("aiac.agent.policy_rules_builder.graph.get_policy_source", return_value=_Source()))
         stack.enter_context(patch("aiac.agent.policy_rules_builder.graph._build_llm", return_value=llm))
-        stack.enter_context(patch("time.sleep"))
-        # The retry loop (and its wait_exponential) now lives in the shared aiac.agent.llm seam.
-        we = stack.enter_context(patch("aiac.agent.llm.wait_exponential"))
+        stack.enter_context(patch("time.sleep", side_effect=waits.append))
         with pytest.raises(LLMAccessError):
             build_role_rules(_role(), [_scope("s-write", "write")])
 
-    assert we.call_args.kwargs["min"] == 7
-    assert we.call_args.kwargs["max"] == 9
+    assert waits == [3, 3, 4, 5]
 
 
 def test_structured_call_decoupled_from_upstream_max_retries(monkeypatch):

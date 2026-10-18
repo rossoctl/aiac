@@ -255,3 +255,68 @@ def test_raise_sanitized_uses_caller_supplied_credentials_error_type() -> None:
 
     with pytest.raises(MyCredentials):
         raise_sanitized(_openai_status_error(openai.AuthenticationError, 401), credentials_error=MyCredentials)
+
+
+def _rate_limit(*, retry_after: str | None = None, code: str | None = None) -> openai.RateLimitError:
+    """The ``openai.RateLimitError`` that the client raises for a 429: the response (with an optional
+    ``Retry-After``) and the body ``error`` object (openai passes ``body["error"]``)."""
+    headers = {"Retry-After": retry_after} if retry_after is not None else {}
+    response = httpx.Response(
+        429, headers=headers, request=httpx.Request("POST", "http://llm.example/v1/chat/completions")
+    )
+    body = {"message": _POISON, "type": code, "code": code} if code else None
+    return openai.RateLimitError(_POISON, response=response, body=body)
+
+
+def test_call_with_retry_waits_the_retry_after_of_a_rate_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    waits: list[float] = []
+    monkeypatch.setattr("time.sleep", waits.append)
+    runnable = MagicMock()
+    runnable.invoke.side_effect = [_rate_limit(retry_after="12"), _rate_limit(retry_after="600"), "ok"]
+    assert call_with_retry(runnable, ["msg"], settings=_SETTINGS) == "ok"
+    assert waits == [12.0, 30.0]  # the Retry-After, capped at settings.backoff_max
+
+
+def test_call_with_retry_uses_the_backoff_without_a_retry_after(monkeypatch: pytest.MonkeyPatch) -> None:
+    waits: list[float] = []
+    monkeypatch.setattr("time.sleep", waits.append)
+    runnable = MagicMock()
+    runnable.invoke.side_effect = [_rate_limit(), _rate_limit(), "ok"]
+    assert call_with_retry(runnable, ["msg"], settings=replace(_SETTINGS, backoff_min=2.0)) == "ok"
+    assert waits == [2.0, 2.0]  # wait_exponential from backoff_min
+
+
+def test_a_rate_limit_for_an_exhausted_quota_is_not_retried_and_is_permanent(monkeypatch: pytest.MonkeyPatch) -> None:
+    # OpenAI answers 429 ``insufficient_quota`` when the account has no quota: a wait cannot clear it,
+    # so it is permanent (not the retryable access error), as before the 429 rule.
+    monkeypatch.setattr("time.sleep", lambda _s: pytest.fail("a quota 429 must not be retried"))
+    cause = _rate_limit(retry_after="1", code="insufficient_quota")
+    runnable = MagicMock()
+    runnable.invoke.side_effect = cause
+    with pytest.raises(openai.RateLimitError):
+        call_with_retry(runnable, ["msg"], settings=_SETTINGS)
+    runnable.invoke.assert_called_once()
+    with pytest.raises(UnparseableLLMResponseError) as ei:
+        raise_sanitized(cause)
+    assert not isinstance(ei.value, LLMAccessError)
+    assert _POISON not in str(ei.value)
+    assert ei.value.__cause__ is cause
+
+
+@pytest.mark.parametrize(
+    ("cause", "error", "message"),
+    [
+        (_openai_status_error(openai.NotFoundError, 404), UnparseableLLMResponseError, "response (HTTP 404)"),
+        (_openai_status_error(openai.InternalServerError, 503), LLMAccessError, "retries (HTTP 503)"),
+        (ValueError(_POISON), UnparseableLLMResponseError, "schema-invalid response"),
+        (TimeoutError(_POISON), LLMAccessError, "transport retries"),
+    ],
+    ids=["404", "503", "no-status", "timeout"],
+)
+def test_the_sanitized_message_names_the_status_and_nothing_else(cause, error, message) -> None:
+    # The status number is the one part of the raw error in the message: the ERROR log line names the
+    # cause (the rung-5 system test reads it), and the endpoint / key still cannot leak.
+    with pytest.raises(error) as ei:
+        raise_sanitized(cause)
+    assert str(ei.value).endswith(message)
+    assert _POISON not in str(ei.value)

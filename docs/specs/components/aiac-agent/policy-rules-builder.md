@@ -69,14 +69,16 @@ without touching the rest of the graph.
 ## Exceptions
 
 The PRB raises a small, closed hierarchy. Every message is **sanitized**: it never contains the
-LLM endpoint, host, or API key. The HTTP column is the status a **single-entity caller** returns.
+LLM endpoint, host, or API key. The `LLMAccessError` and `UnparseableLLMResponseError` messages end
+with the HTTP status of the raw error when it has one (for example `(HTTP 404)`), so the ERROR log
+line names the cause. The HTTP column is the status a **single-entity caller** returns.
 The async **retry class** is a separate axis — see the decoupling note below the table.
 
 | Exception | Where raised | HTTP (single-entity) | Async class | Notes |
 |---|---|---|---|---|
 | `PolicyRulesBuilderBaseError` | Base of the hierarchy — **never raised directly** | 500 | — | A safety net at the HTTP boundary |
 | `PolicyRulesBuilderError` | `_audit`, after `MAX_AUDIT_RETRIES` (3) ordinary rejections | 422 | permanent | The audit budget is exhausted |
-| `LLMAccessError` | `_structured_call`, when **transient** failures (5xx / connect / timeout) are **exhausted** | 502 | **retryable** | Wraps the original error; message sanitized |
+| `LLMAccessError` | `_structured_call`, when **transient** failures (5xx / connect / timeout / HTTP 408 / a rate-limit 429) are **exhausted** | 502 | **retryable** | Wraps the original error; message sanitized |
 | `UnparseableLLMResponseError` | `_structured_call`, when the LLM is **reachable but the response is unparseable / schema-invalid** | 502 | permanent | A non-transient parse or validation error; message sanitized |
 | `LLMCredentialsError` | `_structured_call`, when the LLM endpoint **refuses the credentials** (HTTP 401 / 403, for example a revoked API key) | 502 | permanent | Not retried; the key must be fixed first. Message sanitized |
 | `PolicyContradictionError` | `_audit`, on a **genuine** intra-focal grant/deny contradiction | 422 | permanent | Carries the focal entity + all contradictions; short-circuits past retry. UC1 aggregates it — see **Contradiction contract** |
@@ -291,7 +293,10 @@ distinct:
   `aiac.agent.llm.call_with_retry`, which `_structured_call` calls (the Policy Digester uses the
   same seam), driven by **dedicated LLM knobs** (not the shared `UPSTREAM_MAX_RETRIES`): `LLM_MAX_RETRIES`
   (default `3`), `LLM_RETRY_BACKOFF_MIN` (`1`) and `LLM_RETRY_BACKOFF_MAX` (`30`). `is_transient`
-  classifies which failures retry (5xx / connect / timeout). `LLM_REQUEST_TIMEOUT` (code default
+  classifies which failures retry (5xx / connect / timeout / HTTP 408 / 429). A 429 that names an
+  exhausted quota (for example OpenAI `insufficient_quota`) is permanent and is not retried. A
+  `Retry-After` header on the error replaces the backoff, up to `LLM_RETRY_BACKOFF_MAX`. The loop is
+  the shared `aiac.shared.upstream.upstream_retrying`. `LLM_REQUEST_TIMEOUT` (code default
   `120`, `60` in the `aiac-agent-config` manifest) bounds each request. The Phase-1 file read does
   **not** retry; it raises directly.
 

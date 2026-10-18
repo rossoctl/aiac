@@ -23,9 +23,8 @@ from typing import Any, NoReturn, TypeVar
 from langchain_core.messages import BaseMessage
 from langchain_openai import ChatOpenAI
 from pydantic import SecretStr
-from tenacity import Retrying, retry_if_exception, stop_after_attempt, wait_exponential
 
-from aiac.shared.upstream import http_status, is_transient
+from aiac.shared.upstream import http_status, is_transient, upstream_retrying
 
 _DEFAULT_LLM_REQUEST_TIMEOUT = 120.0
 _DEFAULT_LLM_MAX_RETRIES = 3
@@ -59,15 +58,6 @@ class LLMCredentialsError(LLMError):
 
 # The HTTP statuses that mean the LLM endpoint refused the credentials, not the response.
 _CREDENTIALS_STATUSES = frozenset({401, 403})
-
-# The 4xx statuses that are transient for an LLM endpoint: 408 (request timeout) and 429 (rate limit).
-# The next attempt can succeed, so they are retried like a 5xx. They are not unparseable responses.
-_TRANSIENT_4XX_STATUSES = frozenset({408, 429})
-
-
-def _is_transient(err: BaseException) -> bool:
-    """``aiac.shared.upstream.is_transient``, plus HTTP 408 and 429 (``_TRANSIENT_4XX_STATUSES``)."""
-    return is_transient(err) or http_status(err) in _TRANSIENT_4XX_STATUSES
 
 
 @dataclass(frozen=True)
@@ -149,15 +139,15 @@ def call_with_retry(runnable: Any, messages: list[BaseMessage], *, settings: LLM
     what the runnable is (a structured-output binding, or a bare chat model) and what its result
     means.
 
-    Only transient failures (connection errors / timeouts / 5xx / HTTP 408 and 429) are retried; a permanent failure
-    (bad request, validation error) fails identically on every attempt, so it surfaces immediately.
+    The retry loop is the shared ``aiac.shared.upstream.upstream_retrying`` on the LLM knobs. Only
+    transient failures (``is_transient``: connection errors / timeouts / 5xx / HTTP 408 and 429) are
+    retried; a 429 for an exhausted quota (``insufficient_quota``) and other permanent failures (bad
+    request, validation error) fail identically on every attempt, so they surface immediately. A
+    ``Retry-After`` on the error replaces the exponential backoff, up to ``settings.backoff_max``.
     ``reraise=True`` hands back the ORIGINAL last exception (never a tenacity ``RetryError``) so the
     caller can classify it exactly as the retry loop did — see ``raise_sanitized``."""
-    retryer = Retrying(
-        retry=retry_if_exception(_is_transient),
-        stop=stop_after_attempt(settings.max_retries),
-        wait=wait_exponential(multiplier=1, min=settings.backoff_min, max=settings.backoff_max),
-        reraise=True,
+    retryer = upstream_retrying(
+        attempts=settings.max_retries, backoff_min=settings.backoff_min, backoff_max=settings.backoff_max
     )
     return retryer(runnable.invoke, messages)
 
@@ -169,15 +159,20 @@ def raise_sanitized(
     unparseable_error: type[LLMError] = UnparseableLLMResponseError,
     credentials_error: type[LLMError] = LLMCredentialsError,
 ) -> NoReturn:
-    """Re-raise ``err`` as a typed, sanitized LLM error. A still-transient error (also an HTTP 408 or
-    429) means the retry budget was exhausted against an unreachable LLM -> ``access_error``; an
-    HTTP 401 / 403 means the LLM refused the credentials -> ``credentials_error``; anything else
-    means the LLM was reachable but its response was unusable -> ``unparseable_error``. The messages are STATIC
-    (never ``str(err)``) so an endpoint / host / API key embedded in the raw error cannot leak; the
-    raw error stays reachable via ``__cause__``. Callers pass their own subclasses to specialise the
-    error vocabulary (the PRB folds these into ``PolicyRulesBuilderBaseError``)."""
-    if _is_transient(err):
-        raise access_error("LLM endpoint unreachable after exhausting transport retries") from err
-    if http_status(err) in _CREDENTIALS_STATUSES:
+    """Re-raise ``err`` as a typed, sanitized LLM error. A still-transient error (``is_transient``,
+    also an HTTP 408 or a rate-limit 429) means the retry budget was exhausted against an unreachable
+    LLM -> ``access_error``; an HTTP 401 / 403 means the LLM refused the credentials ->
+    ``credentials_error``; anything else (also a 429 for an exhausted quota, which is permanent) means
+    the LLM was reachable but its response was unusable -> ``unparseable_error``. The messages are
+    STATIC (never ``str(err)``) so an endpoint / host / API key embedded in the raw error cannot leak;
+    the raw error stays reachable via ``__cause__``. The access and unparseable messages end with the
+    HTTP status of the error (``" (HTTP 404)"``) when it has one: a number only, so the ERROR log line
+    (``log_by_type``) names the cause and still leaks nothing. Callers pass their own subclasses to
+    specialise the error vocabulary (the PRB folds these into ``PolicyRulesBuilderBaseError``)."""
+    status = http_status(err)
+    suffix = f" (HTTP {status})" if status is not None else ""
+    if is_transient(err):
+        raise access_error(f"LLM endpoint unreachable after exhausting transport retries{suffix}") from err
+    if status in _CREDENTIALS_STATUSES:
         raise credentials_error("LLM endpoint rejected the credentials (HTTP 401/403)") from err
-    raise unparseable_error("LLM returned an unparseable or schema-invalid response") from err
+    raise unparseable_error(f"LLM returned an unparseable or schema-invalid response{suffix}") from err
