@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # combiner-check.sh — the one shell copy of the AIAC Controller start check #4 (D30), shared by the
 # scripts that need the changed global combiner (D20) in place: k8s/opa-kind-enable.sh,
 # k8s/opa-kind-verify.sh, demo/use-cases/onboarding/enable.sh and driver.sh. Source it; it defines
