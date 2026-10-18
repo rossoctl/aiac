@@ -327,8 +327,9 @@ Controller does not start again until `make opa` runs again).
 
 > **[Step 1](#step-1--wire-opa-into-both-authbridge-legs) must have run.** The AIAC Controller does
 > not start without the changed combiner that step 1 applies (start check #4), so `make enable`
-> checks for it first. If the `default` AuthorizationPolicy is missing, or is the stock combiner,
-> `make enable` stops before it installs anything and says to run `make opa`. Run `make opa`, then
+> checks for it first, with the same rules as start check #4. If the `default` AuthorizationPolicy is
+> missing, is the stock combiner, or can allow a pod that has no client CR in any other way,
+> `make enable` stops before it installs anything, names the problem, and says to run `make opa`. Run `make opa`, then
 > `make enable` again.
 
 > **`make enable` defaults to `LLM_BASE_URL=https://api.openai.com/v1` and `LLM_MODEL=gpt-4o-mini`.**
@@ -535,11 +536,11 @@ make enforce
 
 **PREP** grants `github-agent`'s Keycloak client the tool's audience scope
 `agent-team1-github-tool-aud` (HTTP 204, or 409 when already linked), then restarts the agent so its
-OPA sidecar loads the bundle AIAC recomposed. The outbound route to `github-tool` already ships in the
-agent's `configmaps.yaml`; PREP first checks that `authproxy-routes` on the cluster lists it, and
-stops with the `kubectl apply` fix if not. It skips the restart when the scope was already linked and
-the agent pod started after the last write to the two CRs and the routes, so a repeated `make enforce`
-does not pay for it. The operator also makes that scope a realm default when `github-tool`
+OPA sidecar loads the bundle AIAC recomposed, and waits until the rollout is Ready. The outbound route
+to `github-tool` already ships in the agent's `configmaps.yaml`; PREP first checks that
+`authproxy-routes` on the cluster has it, with `target_audience`
+`spiffe://<TRUST_DOMAIN>/ns/<NS>/sa/github-tool` and `agent-<NS>-github-tool-aud` in `token_scopes`
+(defaults `localtest.me` and `team1`), and stops with the `kubectl apply` fix if not. The operator also makes that scope a realm default when `github-tool`
 registers, but that is best-effort and can lose the race with the agent's own registration, so PREP
 grants it explicitly. PREP is idempotent and runs before every ENFORCE.
 

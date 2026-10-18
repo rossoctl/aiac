@@ -40,7 +40,7 @@
 #   KEYCLOAK_NAMESPACE   namespace Keycloak runs in                  (default: keycloak)
 #   KEYCLOAK_STATEFULSET name of the Keycloak StatefulSet             (default: keycloak)
 #   KEYCLOAK_IMAGE_BASE  base image to derive the SPI image from     (default: read live, fallback quay.io/keycloak/keycloak:26.5.2)
-#   COMBINER_NAMESPACE   namespace of the `default` AuthorizationPolicy (default: rossoctl-system)
+#   SYS_NS               namespace of the `default` AuthorizationPolicy (default: rossoctl-system)
 
 set -euo pipefail
 
@@ -53,8 +53,11 @@ AIAC_NAMESPACE="${AIAC_NAMESPACE:-aiac-system}"
 # script provisions it (see step_stack) rather than depending on a leftover from an earlier run of
 # this demo, which may hold a stale/incomplete policy.
 POLICY_CONFIGMAP="${POLICY_CONFIGMAP:-aiac-policy}"
-# Where `make opa` (k8s/opa-kind-enable.sh, RELEASE_NAMESPACE) puts the combiner's `default` CR.
-COMBINER_NAMESPACE="${COMBINER_NAMESPACE:-rossoctl-system}"
+# Where `make opa` (k8s/opa-kind-enable.sh, RELEASE_NAMESPACE) puts the combiner's `default` CR. The
+# same name as in driver.sh and k8s/opa-kind-verify.sh.
+SYS_NS="${SYS_NS:-rossoctl-system}"
+# shellcheck source=../../../k8s/lib/combiner-check.sh
+. "$AIAC_DIR/k8s/lib/combiner-check.sh"
 OPENAI_SECRET_NS="${OPENAI_SECRET_NS:-team1}"
 OPENAI_SECRET_NAME="${OPENAI_SECRET_NAME:-openai-secret}"
 LLM_BASE_URL="${LLM_BASE_URL:-https://api.openai.com/v1}"
@@ -145,20 +148,15 @@ except Exception: print("")'
 step_stack() {
   # The Controller's start check #4 (D30) needs the changed combiner (D20), which `make opa` applies
   # as the `default` AuthorizationPolicy. Without it aiac-agent never becomes Available and
-  # step_wait_agent only times out, so fail here with the fix instead. The full resource name, because
-  # Istio's AuthorizationPolicy shares the short name. The content check is driver.sh's: the stock
-  # combiner (after `make opa-restore`) has the request fallback rules, and start check #4 rejects it too.
-  local policy_cr="authorizationpolicies.agent.rossoctl.dev" req_fallback
-  echo "==> [stack] Checking that 'make opa' ran (AuthorizationPolicy 'default' in ${COMBINER_NAMESPACE})"
-  if ! kubectl get "$policy_cr" default -n "$COMBINER_NAMESPACE" >/dev/null 2>&1; then
-    echo "ERROR: AuthorizationPolicy 'default' is missing in ${COMBINER_NAMESPACE}, so the AIAC Controller cannot start (start check #4)." >&2
-    echo "       Run 'make opa' (demo.md step 1) first, then re-run this script." >&2
-    exit 1
-  fi
-  req_fallback=$(kubectl get "$policy_cr" default -n "$COMBINER_NAMESPACE" -o jsonpath='{.spec.policies[*].content}' \
-    | grep -cE 'client_ok if not data\.authbridge\.client\.(inbound|outbound)\.request' || true)
-  if [ "$req_fallback" != "0" ]; then
-    echo "ERROR: AuthorizationPolicy 'default' in ${COMBINER_NAMESPACE} is the stock combiner (${req_fallback} request fallback rules, expected 0), so the AIAC Controller cannot start (start check #4)." >&2
+  # step_wait_agent only times out, so fail here with the fix instead. combiner_problems is the same
+  # allowlist as start check #4 (k8s/lib/combiner-check.sh), so a CR that is missing, is the stock
+  # combiner, or fails the check in any other way stops here.
+  local problems
+  echo "==> [stack] Checking the combiner that 'make opa' applies (AuthorizationPolicy 'default' in ${SYS_NS})"
+  problems="$(combiner_problems "$SYS_NS")"
+  if [ -n "$problems" ]; then
+    echo "ERROR: the AIAC Controller cannot start (start check #4), because:" >&2
+    printf '%s\n' "$problems" | sed 's/^/         /' >&2
     echo "       Run 'make opa' (demo.md step 1) first, then re-run this script." >&2
     exit 1
   fi

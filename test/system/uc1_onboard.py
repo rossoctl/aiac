@@ -210,8 +210,8 @@ CR_CAPTURE_DIR = Path(os.environ.get("AIAC_CR_CAPTURE_DIR") or HERE / "artifacts
 
 # --- Live-cluster loop knobs (handoff 08) ---------------------------------------------------
 
-# The workload Deployment to restart after Part B so it reloads the new outbound route (and, on its
-# OPA sidecar's next poll, the recomposed bundle). Defaults to the agent workload name.
+# The workload Deployment to restart after Part B so its OPA sidecar re-fetches the recomposed bundle.
+# Defaults to the agent workload name.
 AGENT_DEPLOYMENT = os.environ.get("AIAC_AGENT_DEPLOYMENT", scn.AGENT_WORKLOAD)
 
 # SPIFFE trust domain the operator registers the demo workloads under (the ``spiffe://<td>/ns/...``
@@ -818,6 +818,37 @@ def grant_exchange_scope(admin) -> None:
         admin.add_client_optional_client_scope(client_uuid, scope["id"], {})
     except KeycloakError as exc:
         log.info("grant_exchange_scope: assign %r returned (benign if already assigned): %s", aud_scope, exc)
+
+
+def require_tool_route(namespace: str) -> None:
+    """Fail unless the live ``authproxy-routes`` route for ``github-tool`` exchanges to the audience and
+    scope this harness expects (``_tool_audience`` / ``_tool_aud_scope``).
+
+    The route ships static in the agent's ``configmaps.yaml``, fixed to ``team1`` / ``localtest.me``, so
+    ``AIAC_TRUST_DOMAIN`` or the namespace do not reach it. Without this check a mismatch makes the
+    sidecar exchange to a different audience than ``exchanged_subject`` does, and the outbound probes
+    deny while the direct exchange passes."""
+    import yaml
+
+    raw = kubectl("get", "configmap", "authproxy-routes", "-n", namespace, "-o", "jsonpath={.data.routes\\.yaml}")
+    routes = yaml.safe_load(raw) or []
+    route = next((r for r in routes if isinstance(r, dict) and r.get("host") == scn.TOOL_WORKLOAD), None)
+    fix = (
+        "edit target_audience and token_scopes in demo/assets/agents/github_agent/k8s/configmaps.yaml to match, "
+        f"and apply it in {namespace}"
+    )
+    if route is None:
+        raise AssertionError(f"configmap/authproxy-routes in {namespace} has no {scn.TOOL_WORKLOAD!r} route — {fix}")
+    if route.get("target_audience") != _tool_audience():
+        raise AssertionError(
+            f"the {scn.TOOL_WORKLOAD!r} route's target_audience is {route.get('target_audience')!r}, expected "
+            f"{_tool_audience()!r} (AIAC_TRUST_DOMAIN={TRUST_DOMAIN!r}) — {fix}"
+        )
+    if _tool_aud_scope() not in str(route.get("token_scopes", "")).split():
+        raise AssertionError(
+            f"the {scn.TOOL_WORKLOAD!r} route's token_scopes {route.get('token_scopes')!r} do not contain "
+            f"{_tool_aud_scope()!r} — {fix}"
+        )
 
 
 def restart_agent(namespace: str) -> None:
@@ -1473,6 +1504,7 @@ def onboarded_stack(
         # then restart the agent so it re-fetches the recomposed bundle.
         has_outbound = any(sig.kind == "outbound" for sig in signals)
         if has_outbound:
+            require_tool_route(NAMESPACE)
             if tool_onboarded:
                 grant_exchange_scope(admin)
             restart_agent(NAMESPACE)

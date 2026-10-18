@@ -49,6 +49,8 @@
 #
 # Env vars (defaults match the rest of this demo family):
 #   NS, SYS_NS, AIAC_NS   namespaces (team1, rossoctl-system, aiac-system)
+#   TRUST_DOMAIN          SPIFFE trust domain of the workloads (default: localtest.me). PREP checks
+#                         that the github-tool route's target_audience uses it.
 #   KC, REALM             Keycloak base URL + realm
 #   ROPC_CLIENT_ID        OIDC client the demo users log in through (default: rossoctl). Must be a
 #                         client AIAC's inbound rego accepts as the source (its source_ok allows the
@@ -89,6 +91,7 @@ ASSETS_DIR="$AIAC_DIR/demo/assets"
 NS="${NS:-team1}"
 SYS_NS="${SYS_NS:-rossoctl-system}"
 AIAC_NS="${AIAC_NS:-aiac-system}"
+TRUST_DOMAIN="${TRUST_DOMAIN:-localtest.me}"
 KC="${KC:-http://keycloak.localtest.me:8080}"
 REALM="${REALM:-rossoctl}"
 ROPC_CLIENT_ID="${ROPC_CLIENT_ID:-rossoctl}"
@@ -111,7 +114,9 @@ RUN_START_TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 AGENT_LABEL="app.kubernetes.io/name=github-agent"
 TOOL_LABEL="app=github-tool"
-POLICY_CR="authorizationpolicies.agent.rossoctl.dev"
+# shellcheck source=../../../k8s/lib/combiner-check.sh
+. "$AIAC_DIR/k8s/lib/combiner-check.sh"
+POLICY_CR="$COMBINER_POLICY_CR"
 # The client scope that sets sub=<username> in the login and the exchanged token (D31).
 SUBJECT_SCOPE="aiac-username-sub"
 # The live enforcement side; read in preflight.
@@ -365,12 +370,11 @@ kubectl get deployment aiac-event-broker -n "$AIAC_NS" >/dev/null 2>&1 \
 OPA_COUNT=$(kubectl get configmap authbridge-runtime-config -n "$NS" \
               -o jsonpath='{.data.config\.yaml}' 2>/dev/null | grep -c 'name: opa' || true)
 [ "$OPA_COUNT" = "2" ] || die "OPA not wired into both AuthBridge legs (got ${OPA_COUNT}, expected 2) — run k8s/opa-kind-enable.sh first"
-# The changed combiner (D20): no request fallback rule, so a pod with no client CR is denied. The AIAC
-# Controller does not start without it (start check #4, D30).
-REQ_FALLBACK=$(kubectl get "$POLICY_CR" default -n "$SYS_NS" -o jsonpath='{.spec.policies[*].content}' 2>/dev/null \
-  | grep -cE 'client_ok if not data\.authbridge\.client\.(inbound|outbound)\.request' || true)
-[ "$REQ_FALLBACK" = "0" ] \
-  || die "the global combiner in ${SYS_NS} is not the changed combiner (D20): ${REQ_FALLBACK} request fallback rules, expected 0 — run k8s/opa-kind-enable.sh first"
+# The changed combiner (D20) denies a pod with no client CR. The AIAC Controller does not start without
+# it (start check #4, D30); combiner_problems is the same allowlist, and a missing CR fails it too.
+COMBINER_PROBLEMS="$(combiner_problems "$SYS_NS")"
+[ -z "$COMBINER_PROBLEMS" ] \
+  || die "the global combiner in ${SYS_NS} fails start check #4 ($(printf '%s' "$COMBINER_PROBLEMS" | tr '\n' ';')) — run k8s/opa-kind-enable.sh first"
 SIDE=$(kubectl get configmap aiac-agent-config -n "$AIAC_NS" \
          -o jsonpath='{.data.AIAC_ENFORCEMENT_SIDE}' 2>/dev/null || true)
 SIDE="${SIDE:-target-side}"
@@ -587,28 +591,55 @@ print("yes" if os.environ["SCOPE"] in names else "")' 2>/dev/null || true)
 #      Granting it here (204, or 409 when already linked) closes that race.
 #   2. The agent's OPA sidecar must load the bundle AIAC recomposed after the pod started, and the
 #      sidecar re-reads routes.yaml, so the restart also picks up a re-applied configmaps.yaml.
-# Idempotent, so it runs before every ENFORCE, --only-enforce included. The restart is skipped when
-# the scope was already linked and nothing it would reload changed after the agent pods started.
+# Idempotent, so it runs before every ENFORCE, --only-enforce included. It always restarts, as the
+# system harness's restart_agent does: a restart costs one rollout, and it leaves the agent Ready.
 #
-# last_write <resource> <name> — the newest managedFields time of the object (RFC 3339, UTC), or "".
-last_write() {
-  kubectl get "$1" "$2" -n "$NS" -o jsonpath='{range .metadata.managedFields[*]}{.time}{"\n"}{end}' 2>/dev/null \
-    | sort | tail -1
+# route_field <routes.yaml> <host> <field> — print <field> of the route for <host>, or "" when there is
+# none. routes.yaml is a flat list of `- host: "..."` entries with `key: "value"` lines under each.
+route_field() {
+  ROUTES="$1" python3 -c '
+import os, sys
+host, field = sys.argv[1], sys.argv[2]
+cur = None
+for raw in os.environ["ROUTES"].splitlines():
+    line = raw.strip()
+    if line.startswith("- "):
+        cur = {}
+        line = line[2:]
+    if cur is None or ":" not in line:
+        continue
+    k, v = line.split(":", 1)
+    cur[k.strip()] = v.strip().strip(chr(34) + chr(39))  # drop the double or single quotes
+    if cur.get("host") == host and field in cur:
+        print(cur[field]); break
+' "$2" "$3"
 }
 
 phase_prep() {
   printf '\n%s%s====== Phase PREP — exchange scope + agent restart ======%s\n' "$C_BLD" "$C_CYN" "$C_RST"
 
-  # WIRE used to write this route. Now ENFORCE relies on the cluster's ConfigMap matching
-  # configmaps.yaml, which a cluster from before the route moved there (or a re-seeded one) does not.
-  step "Checking that authproxy-routes has the github-tool route"
-  kubectl get configmap authproxy-routes -n "$NS" -o jsonpath='{.data.routes\.yaml}' 2>/dev/null \
-    | grep -q 'host: "github-tool"' \
-    || die "configmap/authproxy-routes in ${NS} has no github-tool route, so the agent's tool calls are not exchanged — re-apply it: kubectl apply -n ${NS} -f ${ASSETS_DIR}/agents/github_agent/k8s/configmaps.yaml"
-  pass "authproxy-routes lists host \"github-tool\""
+  # WIRE used to write this route from ${NS} and the trust domain. Now ENFORCE relies on the cluster's
+  # ConfigMap matching configmaps.yaml, which is fixed to team1 / localtest.me: a cluster from before
+  # the route moved there, a re-seeded one, or an edit with a typo does not. A wrong audience or scope
+  # denies every tool call, so check both values, not just the host.
+  step "Checking the github-tool route in authproxy-routes"
+  local routes want_aud="spiffe://${TRUST_DOMAIN}/ns/${NS}/sa/github-tool" tool_aud="agent-${NS}-github-tool-aud"
+  local got_aud got_scopes fix="re-apply it: kubectl apply -n ${NS} -f ${ASSETS_DIR}/agents/github_agent/k8s/configmaps.yaml (edit target_audience and token_scopes first if NS or TRUST_DOMAIN is not team1 / localtest.me)"
+  routes="$(kubectl get configmap authproxy-routes -n "$NS" -o jsonpath='{.data.routes\.yaml}' 2>/dev/null || true)"
+  [ -n "$(route_field "$routes" github-tool host)" ] \
+    || die "configmap/authproxy-routes in ${NS} has no github-tool route, so the agent's tool calls are not exchanged — ${fix}"
+  got_aud="$(route_field "$routes" github-tool target_audience)"
+  [ "$got_aud" = "$want_aud" ] \
+    || die "the github-tool route's target_audience is '${got_aud}', expected '${want_aud}' — ${fix}"
+  got_scopes="$(route_field "$routes" github-tool token_scopes)"
+  case " ${got_scopes} " in
+    *" ${tool_aud} "*) ;;
+    *) die "the github-tool route's token_scopes '${got_scopes}' do not contain '${tool_aud}' — ${fix}" ;;
+  esac
+  pass "github-tool route: target_audience ${got_aud}, token_scopes include ${tool_aud}"
 
   step "Granting github-agent the exchange scope on its Keycloak client (expect HTTP 204 or 409)"
-  local admin agent_uuid scope_id scope_http tool_aud="agent-${NS}-github-tool-aud"
+  local admin agent_uuid scope_id scope_http
   admin="$(admin_token)"
   [ -n "$admin" ] || die "could not obtain a Keycloak master admin token"
   agent_uuid="$(client_uuid_by_name "${NS}/github-agent" "$admin")"
@@ -622,18 +653,6 @@ phase_prep() {
     409) pass "client-scope already linked (HTTP 409) — idempotent" ;;
     *) die "assigning the optional client-scope returned HTTP ${scope_http} (expected 204 or 409)" ;;
   esac
-
-  # The oldest agent pod start against the newest write to what the restart reloads: both CRs (the
-  # namespace bundle) and the routes. RFC 3339 UTC times compare as strings.
-  local started changed=""
-  started="$(kubectl get pod -n "$NS" -l "$AGENT_LABEL" -o jsonpath='{range .items[*]}{.status.startTime}{"\n"}{end}' \
-    2>/dev/null | sort | head -1)"
-  changed="$( { last_write "$POLICY_CR" github-agent; last_write "$POLICY_CR" github-tool
-                last_write configmap authproxy-routes; } | sort | tail -1)"
-  if [ "$scope_http" = "409" ] && [ -n "$started" ] && [ -n "$changed" ] && [[ "$started" > "$changed" ]]; then
-    pass "github-agent started ${started}, after the last CR/route write ${changed} — no restart needed"
-    return 0
-  fi
 
   step "Restarting github-agent so its OPA sidecar loads the recomposed bundle"
   # rollout restart + status, not pod delete + wait -l: the wait can run before the ReplicaSet creates

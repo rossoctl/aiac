@@ -51,6 +51,9 @@ KIND_CLUSTER="${KIND_CLUSTER:-rossoctl}"
 WORKLOAD_LABEL='rossoctl.io/type in (agent,tool)'
 BUNDLE_URL="http://bundle-service.${SYS_NS}.svc.cluster.local:8080"
 
+# shellcheck source=lib/combiner-check.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/combiner-check.sh"
+
 # ── Output helpers ──────────────────────────────────────────────────────────
 if [ -t 1 ]; then
   C_RED=$'\033[31m'; C_GRN=$'\033[32m'
@@ -123,21 +126,21 @@ kubectl wait --for=condition=established --timeout=30s \
   crd/authorizationpolicies.agent.rossoctl.dev >/dev/null 2>&1 \
   || die "CRD authorizationpolicies.agent.rossoctl.dev is not established"
 pass "CRD authorizationpolicies.agent.rossoctl.dev established"
-GLOBAL_SCOPE=$(kubectl get authorizationpolicy default -n "$SYS_NS" \
+GLOBAL_SCOPE=$(kubectl get "$COMBINER_POLICY_CR" default -n "$SYS_NS" \
                  -o jsonpath='{.spec.scope}' 2>/dev/null || true)
 expect_eq "global AuthorizationPolicy 'default' scope in ${SYS_NS}" "${GLOBAL_SCOPE:-<none>}" "global"
-# The changed combiner (D20) drops `client_ok if not data.authbridge.client.<dir>.request`
-# from the two request packages and keeps it in the two response packages. The
-# AIAC Controller start check #4 (D30) makes the same check.
-COMBINER=$(kubectl get authorizationpolicy default -n "$SYS_NS" \
+# The changed combiner (D20) denies a pod with no client CR in the two request
+# packages and keeps `client_ok if not data.authbridge.client.<dir>.response` in
+# the two response packages. The request side is the AIAC Controller start check
+# #4 (D30), from the shared k8s/lib/combiner-check.sh.
+COMBINER_PROBLEMS="$(combiner_problems "$SYS_NS")"
+[ -z "$COMBINER_PROBLEMS" ] \
+  || die "the combiner can allow a pod that has no client CR ($(printf '%s' "$COMBINER_PROBLEMS" | tr '\n' ';')) — run k8s/opa-kind-enable.sh"
+pass "combiner request packages pass start check #4 (changed combiner, D20)"
+COMBINER=$(kubectl get "$COMBINER_POLICY_CR" default -n "$SYS_NS" \
              -o jsonpath='{.spec.policies[*].content}' 2>/dev/null || true)
-REQ_FALLBACK=$(printf '%s\n' "$COMBINER" \
-  | grep -cE 'client_ok if not data\.authbridge\.client\.(inbound|outbound)\.request' || true)
 RESP_FALLBACK=$(printf '%s\n' "$COMBINER" \
   | grep -cE 'client_ok if not data\.authbridge\.client\.(inbound|outbound)\.response' || true)
-[ "$REQ_FALLBACK" = "0" ] \
-  || die "combiner request fallback rules: got '${REQ_FALLBACK}', expected '0' — the stock combiner allows a pod that has no client CR; run k8s/opa-kind-enable.sh"
-pass "combiner request fallback rules (changed combiner, D20): got '0' (expected '0')"
 expect_eq "combiner response fallback rules" "$RESP_FALLBACK" "2"
 
 # ── Verify 3 — bundle-service Running ────────────────────────────────────────
