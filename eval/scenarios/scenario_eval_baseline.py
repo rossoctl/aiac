@@ -14,7 +14,7 @@ role->access facts (``user-role-developer`` reaches both agents; ``user-role-tes
 
 Unlike ``scenario_eval_baseline.py``'s previous revision, this scenario carries **no**
 agent-to-agent delegation grant — that mechanism now has its own dedicated scenario,
-``scenario_eval_agent_delegation.py`` (``test/system/``).
+``scenario_eval_agent_delegation.py``.
 
 Pure data: no imports beyond ``__future__``, mirroring ``scenario.py``.
 """

@@ -15,21 +15,16 @@
 
 Two independent groups of files, split by cost tier:
 
-**Heavy scenarios (1, 3, 4, 6-10) — full pipeline, `eval` marker — under `eval/`,
-except `agent_delegation`:**
+**Heavy scenarios (1, 3, 4, 6-10) — full pipeline, `eval` marker — under `eval/`:**
 - `eval/test_policy_pipeline_eval.py` — the test module, `@pytest.mark.eval`.
 - `eval/scenarios/scenario_eval_baseline.py` (Scenario 1),
+  `scenario_eval_agent_delegation.py` (Scenario 3),
   `scenario_eval_unreachable_resources.py` (Scenario 4), `scenario_eval_ambiguous_clause.py`
   (Scenario 6), `scenario_eval_wildcard_grant.py` (Scenario 7),
   `scenario_eval_misleading_descriptions.py` (Scenario 8), `scenario_eval_confusable_agents.py`
   (Scenario 9), `scenario_eval_empty_descriptions.py` (Scenario 10) — pure-data scenario modules
   (mirroring `scenario.py`'s shape, generalized to lists/dicts of many entities), each isolating
   exactly one aspect at the minimal entity count that aspect needs.
-- **`test/system/scenario_eval_agent_delegation.py`** (Scenario 3) — the one exception:
-  lives at the **top level** of `test/system/` (sibling of `launcher.py`/`scenario_uc1.py`),
-  not under `eval/` like the other seven. It isolates the agent-to-agent delegation
-  (`delegation_scopes`) mechanism, which is conceptually closer to the top-level fixed-scenario family than to
-  the `eval/` catalog's silent-gap/ambiguity/adversarial-authoring aspects.
 - A matching `policy.eval_<name>.md` next to each scenario module above — the scenario's *source*
   policy text. Not read directly at runtime: the harness's `pipeline` fixture points
   `AIAC_POLICY_FILE` at that scenario's **committed digested** counterpart in
@@ -324,8 +319,7 @@ See each scenario module's own module docstring (`scenario_eval_baseline.py`,
 `scenario_eval_empty_descriptions.py`) for the full entity list and role→access facts — these are
 the single source of truth (`INBOUND_PAIRS`/`OUTBOUND_SUBJECT_PAIRS`/`OUTBOUND_PAIRS`, plus
 `EXPECT_NO_REGO`/`IDENTITY_CONFUSION_PROBES` where applicable), not a second hand-maintained copy in
-this document. Note that `scenario_eval_agent_delegation.py` lives at the top level of
-`test/system/`, not under `eval/` like the other seven (see [Location](#location)). Scenarios
+this document. Scenarios
 2 and 5's cast is defined inline in their test modules' `_POLICY`/`_USER_ROLES`/`_ROLES` constants —
 see [Location](#location) for why the standalone `.md` mirrors are not what the tests actually
 read.
@@ -340,7 +334,7 @@ scenarios (`KEYCLOAK_URL`, `KEYCLOAK_ADMIN_USERNAME`/`PASSWORD`, `AIAC_PDP_CONFI
 | Variable | Difference from `policy-pipeline.md` |
 |----------|----------------------------------------|
 | `KEYCLOAK_REALM` | Set per scenario module (`scenario.REALM_DEFAULT`), not a single fixed realm — eight distinct realms across the session. |
-| `AIAC_POLICY_FILE` | Set per scenario to its **digested** policy in `eval/scenarios_digested/` (heavy scenarios only) — `digested_policy_path(scenario)`, same filename as `scenario.POLICY_FILE` regardless of which directory that scenario's source lives in, so `scenario_eval_agent_delegation.py` living one level up from the rest (see [Location](#location)) needs no special-casing here. |
+| `AIAC_POLICY_FILE` | Set per scenario to its **digested** policy in `eval/scenarios_digested/` (heavy scenarios only) — `digested_policy_path(scenario)`, same filename as `scenario.POLICY_FILE` regardless of which directory that scenario's source lives in. |
 
 The light scenarios (2, 5) need only `LLM_BASE_URL`/`LLM_MODEL`/`LLM_API_KEY` — no Keycloak, store,
 or OPA URLs, no `opa` binary.
