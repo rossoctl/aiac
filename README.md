@@ -7,6 +7,11 @@ concrete permission rules on the active Policy Decision Point (OPA), using an id
 
 ## Architecture
 
+![AIAC Architecture image](docs/presentations/aiac-architecture.png)
+
+Source: [docs/presentations/aiac-architecture.drawio](docs/presentations/aiac-architecture.drawio)
+(open it in [draw.io](https://app.diagrams.net/)).
+
 AIAC enforces a strict three-layer model:
 
 | Layer | Component | Role |
