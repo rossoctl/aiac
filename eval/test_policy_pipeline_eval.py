@@ -121,8 +121,8 @@ SRC = REPO_ROOT / "src"
 sys.path.insert(0, str(REPO_ROOT))  # so ``import test.system.*``/``eval.*`` resolves
 sys.path.insert(0, str(SRC))  # so ``import aiac.*`` resolves
 
-from eval.scenarios import scenario_eval_ambiguous_clause as scn_ambiguous_clause  # noqa: E402
 from eval.scenarios import scenario_eval_agent_delegation as scn_agent_delegation  # noqa: E402
+from eval.scenarios import scenario_eval_ambiguous_clause as scn_ambiguous_clause  # noqa: E402
 from eval.scenarios import scenario_eval_baseline as scn_baseline  # noqa: E402
 from eval.scenarios import scenario_eval_confusable_agents as scn_confusable_agents  # noqa: E402
 from eval.scenarios import scenario_eval_empty_descriptions as scn_empty_descriptions  # noqa: E402
