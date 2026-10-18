@@ -7,10 +7,11 @@ concrete permission rules on the active Policy Decision Point (OPA), using an id
 
 ## Architecture
 
-![AIAC Architecture image](docs/presentations/aiac-architecture.png)
+![AIAC Architecture image](docs/presentations/aiac-architecture.drawio.png)
 
-Source: [docs/presentations/aiac-architecture.drawio](docs/presentations/aiac-architecture.drawio)
-(open it in [draw.io](https://app.diagrams.net/)).
+The image is also the source: it embeds the diagram, so open
+[docs/presentations/aiac-architecture.drawio.png](docs/presentations/aiac-architecture.drawio.png)
+in [draw.io](https://app.diagrams.net/) to edit it.
 
 AIAC enforces a strict three-layer model:
 
@@ -26,10 +27,11 @@ events — new services, role changes, policy updates — by consulting a Policy
 (policy model + Policy Computation Engine). Policy intent lives entirely in the PDP, never in
 per-pod configuration.
 
-Each trigger maps to a use case under `src/aiac/agent/uc/`: service onboarding, policy update,
-role update and offboarding. Onboarding, policy update and role update have specs in
-[docs/specs/components/aiac-agent/](docs/specs/components/aiac-agent/); offboarding is described in
-the [PRD](docs/specs/PRD.md).
+Each trigger maps to a use case under `src/aiac/agent/uc/`: service onboarding, policy update and
+role update. These have specs in
+[docs/specs/components/aiac-agent/](docs/specs/components/aiac-agent/). Offboarding is also a use
+case, but it has no event trigger: it is HTTP-only (`POST /apply/offboard/{service_id}`), and a
+deleted workload does not start it. Offboarding is described in the [PRD](docs/specs/PRD.md).
 
 ## Repository layout
 
@@ -64,9 +66,13 @@ put a new test: [docs/testing/testing-strategy.md](docs/testing/testing-strategy
 
 ## Deploying to Kubernetes
 
-Build/load the per-service images and apply the manifests under [k8s/](k8s/); full instructions
-are in [k8s/aiac-deployment-guide.md](k8s/aiac-deployment-guide.md). To wire the AuthBridge OPA
-plugin and the AIAC global combiner into Kind, see [k8s/opa-kind-runbook.md](k8s/opa-kind-runbook.md).
+First, wire the AuthBridge OPA plugin and apply the AIAC global combiner, as
+[k8s/opa-kind-runbook.md](k8s/opa-kind-runbook.md) says. This is a precondition of every deploy:
+without the changed combiner, the AIAC Controller fails start check #4 and does not start. See
+[docs/agents/deploy.md](docs/agents/deploy.md).
+
+Then build and load the per-service images and apply the manifests under [k8s/](k8s/). The full
+instructions are in [k8s/aiac-deployment-guide.md](k8s/aiac-deployment-guide.md).
 
 Onboarding also needs the `aiac-event-listener` Keycloak SPI: without it no registration event
 reaches the Controller and new workloads are never onboarded. Install it with
@@ -92,18 +98,27 @@ proves two claims:
 - **AIAC enforced a natural language policy in rossoctl** — verdicts come from the live OPA plugin, not from
   evaluating a file on the side.
 
-Prerequisites: a Kind cluster named `rossoctl` with the rossoctl platform (SPIRE, Keycloak, the
-operator), the `team1` namespace, `kubectl`, `helm`, `kind`, `curl`, `python3` and `docker` or
-`podman` on `PATH`, sibling clones of `rossoctl/operator`, `rossoctl/rossoctl` and
-`rossoctl/cortex`, two secrets (`team1/openai-secret` and `aiac-system/keycloak-admin-secret`), and,
-on a freshly provisioned realm, the one-time
-[Keycloak realm fix-up](demo/use-cases/onboarding/demo.md#one-time-keycloak-realm-fix-up) (Direct
-Access Grants on the `rossoctl` client; without it token minting fails with `unauthorized_client`).
-`github-agent` and `github-tool` must **not** already be deployed in `team1`: their first-time deploy
-is the trigger. A clean system-lane run removes them at teardown; after an earlier demo run or an
-aborted system-lane run, run `make restore` first.
-Then, from that directory, in this order — the AIAC Controller does not start until `make opa` has
-applied the changed combiner:
+Before you start, make sure that you have:
+
+- A Kind cluster named `rossoctl` with the rossoctl platform (SPIRE, Keycloak, the operator).
+- The `team1` namespace.
+- `kubectl`, `helm`, `kind`, `curl`, `python3`, and `docker` or `podman` on `PATH`.
+- Sibling clones of `rossoctl/operator`, `rossoctl/rossoctl` and `rossoctl/cortex`.
+- Two secrets: `team1/openai-secret` and `aiac-system/keycloak-admin-secret`.
+- An LLM endpoint for the key in `team1/openai-secret`. `make enable` uses
+  `LLM_BASE_URL=https://api.openai.com/v1` and `LLM_MODEL=gpt-4o-mini` by default. For a different
+  endpoint, set both: `LLM_BASE_URL=... LLM_MODEL=... make enable`. If they do not match the key,
+  onboarding fails with a 401 error.
+- On a new realm, the one-time
+  [Keycloak realm fix-up](demo/use-cases/onboarding/demo.md#one-time-keycloak-realm-fix-up)
+  (Direct Access Grants on the `rossoctl` client). Without it, token minting fails with
+  `unauthorized_client`.
+- No `github-agent` or `github-tool` deployed in `team1`. Their first-time deploy is the trigger. A
+  clean system-lane run removes them at teardown. After an earlier demo run or an aborted
+  system-lane run, run `make restore` first.
+
+Then, from that directory, run these steps in this order. The AIAC Controller does not start until
+`make opa` has applied the changed combiner.
 
 ```bash
 make opa        # wire the OPA plugin into both AuthBridge legs, apply the combiner (one-time)
@@ -115,9 +130,11 @@ make e2e        # deploy the workloads (the trigger), then probe the live OPA pl
 The agent ships with its outbound route to `github-tool` already set. Before the probe, `make e2e`
 grants the agent's Keycloak client the tool's audience scope and restarts the agent (phase PREP).
 
-After `make e2e`, `make demo` walks the same scenario step by step for inspection; it needs the
-workloads already deployed. `make restore` / `make teardown` clean up; `make help` lists every
-target. The full narrative, verification and troubleshooting are
+`make demo` is a separate, narrated walkthrough of the same scenario. It is not an inspection of
+the `make e2e` result: it first resets the state (it deletes both AuthorizationPolicy CRs and the
+Policy Store), then onboards by hand, and gets its verdicts from an offline `opa eval`, not from the
+live OPA plugin. It needs the workloads already deployed. `make restore` and `make teardown` clean
+up, and `make help` lists every target. The full narrative, verification and troubleshooting are
 in [demo/use-cases/onboarding/demo.md](demo/use-cases/onboarding/demo.md). The demo workloads live
 under [demo/assets/](demo/assets/) — see [demo/assets/INSTALL.md](demo/assets/INSTALL.md) and their
 specs in [docs/specs/demo/](docs/specs/demo/).
