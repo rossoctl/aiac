@@ -167,9 +167,10 @@ The FastAPI `lifespan` handler runs these steps in this order, at every Controll
    The resync renders each CR with the current role holders from the IdP (D32), so it also repairs a role-membership event that the Controller did not get.
 
    If the resync fails, the Controller stops.
-4. **Start the NATS consumer** as a background task (see [NATS Consumer](#nats-consumer)). The consumer start first updates an existing durable consumer to the config of the code, then subscribes. A failure of this step does not stop the Controller. The background task tries the full consumer start again (connect, `ensure_stream`, `ensure_consumer`, subscribe) with backoff (1 s, doubled after each try, at most 30 s) until it succeeds. During that time, `GET /health` answers `200` and the `/apply/*` routes are served, but no event is consumed. For a refused consumer update, see [`event-broker.md` → Consumer config at start](event-broker.md#consumer-config-at-start).
+4. **The login-client audience warning (D30).** Under agent side only, the Controller logs a WARNING for each audience mapper of a platform login client (`PLATFORM_SOURCE_CLIENTS`) that puts the clientId of a managed tool into `aud` (`warn_platform_tool_audiences`, see [uc1-service-onboarding.md → The login-client audience warning](aiac-agent/uc1-service-onboarding.md#the-login-client-audience-warning-agent-side)). It reads the IdP Configuration Service (`GET /platform-clients/tool-audiences`). Under target side it does nothing. It is best effort: a failure is logged and does not stop the Controller.
+5. **Start the NATS consumer** as a background task (see [NATS Consumer](#nats-consumer)). The consumer start first updates an existing durable consumer to the config of the code, then subscribes. A failure of this step does not stop the Controller. The background task tries the full consumer start again (connect, `ensure_stream`, `ensure_consumer`, subscribe) with backoff (1 s, doubled after each try, at most 30 s) until it succeeds. During that time, `GET /health` answers `200` and the `/apply/*` routes are served, but no event is consumed. For a refused consumer update, see [`event-broker.md` → Consumer config at start](event-broker.md#consumer-config-at-start).
 
-Uvicorn accepts a connection only after the lifespan start ends. So the Controller serves no request during steps 1–3: no onboarding runs during the resync, and `GET /health` does not answer yet. The Controller probes in `k8s/agent-deployment.yaml` are `httpGet /health`, so the Deployment also has a `startupProbe` on `/health`. Its budget (`failureThreshold` × `periodSeconds`) must be longer than the start sequence. The readiness and liveness probes start only after the startup probe passes, so a long resync does not cause a restart.
+Uvicorn accepts a connection only after the lifespan start ends. So the Controller serves no request during steps 1–4: no onboarding runs during the resync, and `GET /health` does not answer yet. The Controller probes in `k8s/agent-deployment.yaml` are `httpGet /health`, so the Deployment also has a `startupProbe` on `/health`. Its budget (`failureThreshold` × `periodSeconds`) must be longer than the start sequence. The readiness and liveness probes start only after the startup probe passes, so a long resync does not cause a restart.
 
 The resync makes every CR agree with the store at each start. It is also the upgrade path from the per-agent CRs of earlier versions. It is **not** a path for a side change: the side is set at deploy time, and a live switch (a ConfigMap patch and a Controller restart) is not supported. A side change is a clean redeploy of AIAC. It deletes every AIAC CR and the Policy Model Store, so no CR of the old side stays (see [`opa-kind-runbook.md` → Set the enforcement side](../../../k8s/opa-kind-runbook.md#set-the-enforcement-side)).
 
@@ -333,7 +334,7 @@ Not every error body is sanitized:
 - An unhandled error (`500`) returns only the text `Internal Server Error`.
 - An `HTTPException` that a use-case handler raises returns its detail as it is. The IdP, Kubernetes, discovery-token and MCP `502`s and `ServiceNotVisibleError` put the upstream error text in the detail: for example the body of an IdP `404`, a `requests` error with the host, the port and the URL, or the MCP endpoint URL (see [`uc1-service-onboarding.md` → The first read waits for a new client](aiac-agent/uc1-service-onboarding.md#the-first-read-waits-for-a-new-client-d33)).
 
-`EnforcementPreconditionError` is **not** a UC1 rollback error. The checks run first, so nothing has changed yet: there is no rollback, no client disable and no quarantine. A first onboarding then has no CR, so D20 denies the service (fail closed). An onboarded service keeps its policy (see [`uc1-service-onboarding.md` → Precondition checks](aiac-agent/uc1-service-onboarding.md#precondition-checks-d30)).
+`EnforcementPreconditionError` is **not** a UC1 rollback error. The checks run first, so nothing has changed yet: there is no rollback, no client disable and no quarantine. A first onboarding then has no CR, so D20 denies the service (fail closed) where its inbound pipeline has `opa` (a tool under agent side can have no `opa`). An onboarded service keeps its policy (see [`uc1-service-onboarding.md` → Precondition checks](aiac-agent/uc1-service-onboarding.md#precondition-checks-d30)).
 
 Upstream failures and PRB exceptions propagate as HTTP error responses on the synchronous `/apply/*` paths: a use-case handler raises an upstream failure as a FastAPI `HTTPException`, and the Controller's exception handlers map the PRB exceptions and `EnforcementPreconditionError`. An upstream failure that comes through the PCE, `reenable_service` or the UC1 rollback is not mapped, so it answers `500` (see [Upstream → HTTP status](#upstream--http-status)). The status code is authoritative.
 
@@ -375,7 +376,7 @@ src/aiac/
 └── agent/
     ├── controller/
     │   ├── routes.py                   ← FastAPI app, the /apply/* routes, the read-only route, the exception handlers
-    │   └── start.py                    ← run_start_sequence (the side D29, start check #4 D30, the resync D28)
+    │   └── start.py                    ← run_start_sequence (the side D29, start check #4 D30, the resync D28, the login-client audience warning D30)
     ├── eventbus/                       ← consumer.py (NATS consumer, lifespan); stream.py (stream/consumer config, ensure_stream, ensure_consumer)
     ├── init/                           ← wait_and_provision.py (aiac-init container: health gates + stream provisioning)
     ├── llm.py                          ← shared LLM seam (client, retry, sanitized LLM errors) for the PRB and the Policy Digester
@@ -385,8 +386,9 @@ src/aiac/
     │   ├── offboarding/
     │   │   └── offboard.py             ← offboard_service stub: returns the clientId unchanged
     │   ├── onboarding/
-    │   │   ├── orchestrator.py         ← sequences the precondition checks (D30) → (tool only) PCE bootstrap → provision → policy_builder, then onboard_and_apply calls compute_and_apply(rules, override=False, focus_service=client_id) itself (returns None)
+    │   │   ├── orchestrator.py         ← sequences the precondition checks (D30) → (tool only) PCE bootstrap → provision → policy_builder → (tool) audience warning, then onboard_and_apply calls compute_and_apply(rules, override=False, focus_service=client_id) itself (returns None)
     │   │   ├── preconditions.py        ← check_preconditions (#1, #2, #6; D30); EnforcementPreconditionError
+    │   │   ├── platform_audience.py    ← warn_platform_tool_audiences (the login-client audience warning, D30, agent side, log only)
     │   │   ├── provision/              ← non-LLM sub-agent: classify, analyze, write to IdP; kube.py = retrying K8s seam
     │   │   └── policy_builder/         ← IdP reader + PRB invoker: read IdP, call PRB, return list[PolicyRule]; cross_service.py = read-only Policy Store read (applied_rules_for_scopes)
     │   ├── policy_update/

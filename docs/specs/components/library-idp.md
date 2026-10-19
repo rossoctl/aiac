@@ -128,6 +128,18 @@ Represents a service scope (Keycloak: `client scope`).
 
 Scopes also expose an `aiac_managed` property (`bool`): `True` when `attributes` carries the AIAC provisioning marker `aiac.managed` (client-scope attribute values are plain strings, so the marker appears as `"true"`). See the naming convention in the idp-configuration-service spec. The shared subject scope `aiac-username-sub` (D31) has no marker, so its `aiac_managed` is `False`, as for a Keycloak built-in such as `profile`.
 
+#### `PlatformToolAudience`
+
+An audience mapper of a platform login client that puts the clientId of a managed tool into the access token `aud` (the login-client audience warning, [D30](../PRD.md#key-architectural-decisions)). `Configuration.get_platform_tool_audiences` returns a list of them. `extra="ignore"`.
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `login_client` | `str` | The clientId of the platform login client (`PLATFORM_SOURCE_CLIENTS`) |
+| `link` | `Literal["default", "optional", "client"]` | Where the mapper is: in a default or an optional client scope of the login client, or on the login client itself |
+| `scope` | `str \| None` (default `None`) | The name of the client scope; `None` when `link` is `client` |
+| `mapper` | `str` | The name of the audience mapper |
+| `tool_client_id` | `str` | The clientId of the tool that the mapper puts into `aud` |
+
 ### Usage
 
 ```python
@@ -214,6 +226,7 @@ retried write then makes no duplicate, as follows:
 | `link_subject_scope` | `POST /services/{id}/subject-scope` | Idempotent (see the method below). |
 | `delete_service_role`, `delete_service_scope` | `DELETE /services/{id}/roles/{role_id}`, `DELETE /services/{id}/scopes/{scope_id}` | Idempotent: an already-gone object is success. |
 | `mint_discovery_token` | `GET /services/{id}/discovery-token` | Mints a new token; no state change. |
+| `get_platform_tool_audiences` | `GET /platform-clients/tool-audiences` | Read only; no state change. |
 
 > **A retried or concurrent create (REJ-02).** The two create primitives are not idempotent. A
 > `create_role` / `create_scope` fails with `409` in two cases. (i) Its first attempt was committed
@@ -285,6 +298,10 @@ class Configuration:
     # each platform login client (D31).
     # Idempotent. UC1 Provision calls it right before set_service_type.
     def link_subject_scope(self, service: Service) -> Scope: ...
+
+    # Read only: the audience mappers of the platform login clients that put a managed tool's
+    # clientId into aud (only client_id when given). The login-client audience warning (D30).
+    def get_platform_tool_audiences(self, client_id: str | None = None) -> list[PlatformToolAudience]: ...
 
     # Teardown + disable — the two deletes and the enable/disable are consumed by the UC1
     # compensating rollback. The two deletes obey unmap-then-delete order and shared-object safety
@@ -450,6 +467,12 @@ The PCE calls `get_roles()` one time for each operation, next to `get_services()
 3. Idempotent: an existing scope, mapper or link is not an error, so a second call changes nothing. An existing `username-to-sub` mapper with a wrong type or config is changed back to the expected mapper.
 4. Raises `IdPHTTPError` on non-2xx HTTP status (via `_request`), including `409` if the existing `aiac-username-sub` carries the `aiac.managed` marker.
 5. Returns the `Scope` instance parsed from the response. Its `aiac_managed` is `False`, so it is never an own scope of a service. The scope is shared by every AIAC-managed client, so UC1 never puts it into the created-manifest, and the rollback never deletes it (see `idp-configuration-service.md` → `POST /services/{service_id}/subject-scope`).
+
+`get_platform_tool_audiences(client_id: str | None = None) -> list[PlatformToolAudience]`: read the audience mappers of the platform login clients that put a managed tool's clientId into `aud` ([D30](../PRD.md#key-architectural-decisions)).
+1. Issues `GET {AIAC_PDP_CONFIG_URL}/platform-clients/tool-audiences`, appending `?realm=<self.realm>`, and `&client_id=<client_id>` when `client_id` is given (then only that tool is matched).
+2. The service reads `PLATFORM_SOURCE_CLIENTS`, and for each login client its default and optional client scopes and the mappers on the client itself (see `idp-configuration-service.md` → `GET /platform-clients/tool-audiences`). Read only.
+3. Raises `IdPHTTPError` on non-2xx HTTP status (via `_request`); a `5xx` is retried.
+4. Returns a `PlatformToolAudience` for each item of the response (`[]` when there is no match). The AIAC Agent helper `warn_platform_tool_audiences` logs one WARNING for each.
 
 `delete_service_role(service: Service, role: Role) -> None`: teardown of a role this service created.
 1. Issues `DELETE {AIAC_PDP_CONFIG_URL}/services/{service.id}/roles/{role.id}`, appending `?realm=<self.realm>`.

@@ -10,11 +10,12 @@ clientId, which :func:`onboard_and_apply` gives to the PCE as ``focus_service``:
     0. The precondition checks (D30, see ``preconditions``) — run FIRST, after the one IdP read
        that resolves the clientId (a ``404`` on that read is the event-before-commit race: it is read
        again for a bounded time, see ``CLIENT_WAIT``): the pod has the AuthBridge sidecar (#1),
-       the namespace pipeline has ``opa`` (and ``mcp-parser`` for a tool) inbound, and under agent
-       side also ``mcp-parser`` and ``opa`` outbound (#2), no app container has an ``httpGet`` probe
-       (#6). The scope depends on the enforcement side: every service under target side, agents only
-       under agent side (a tool then gets a pass-through CR, which needs no check; its pod type is
-       still read). A failed check raises ``EnforcementPreconditionError``.
+       the namespace pipeline has ``jwt-validation`` and ``opa`` (and ``mcp-parser`` for a tool)
+       inbound, and for an agent under agent side also ``mcp-parser`` and ``opa`` outbound (#2), no
+       app container has an ``httpGet`` probe (#6). The scope depends on the enforcement side: every
+       check for every service under target side; under agent side #1 and #2 for every service (a
+       tool then gets a pass-through CR, so it needs only ``jwt-validation`` inbound) and #6 for
+       agents only. A failed check raises ``EnforcementPreconditionError``.
        Then, for an enabled TOOL only, the PCE ``bootstrap`` writes the tool's first CR (under
        target side its rules-based CR, under agent side a pass-through CR), so that discovery
        (``tools/list`` through the tool's own inbound) passes D20 (checkpoint B1).
@@ -22,6 +23,9 @@ clientId, which :func:`onboard_and_apply` gives to the PCE as ``focus_service``:
        producing the discovered ``service_type`` and the **created-manifest** (exactly the
        roles/scopes it created on this run — see ``provision_service``).
     2. Service Policy Builder — reads the excluded-self IdP universe and builds the rules.
+       Then, for a TOOL under agent side, the login-client audience warning (D30, see
+       ``platform_audience``): a WARNING for each platform login client that holds the tool's
+       audience. It is best effort and never raises.
 
 :func:`onboard_and_apply` is the whole UC1 for the Controller route and the NATS consumer: it runs
 :func:`_onboard` (the build), then the single
@@ -54,6 +58,7 @@ from aiac.agent.policy_rules_builder.graph import (
     PolicyRulesBuilderError,
     UnparseableLLMResponseError,
 )
+from aiac.agent.uc.onboarding.platform_audience import warn_platform_tool_audiences
 from aiac.agent.uc.onboarding.policy_builder.builder import ServicePolicyBuilder
 from aiac.agent.uc.onboarding.preconditions import check_preconditions
 from aiac.agent.uc.onboarding.provision.graph import build_provision_graph
@@ -331,8 +336,9 @@ def _onboard(service_id: ServiceUuid, wait_for_client: bool) -> _Onboarded:
 
     Then the precondition checks (D30, :func:`~aiac.agent.uc.onboarding.preconditions.check_preconditions`)
     run, before Provision and the PRB. They read the enforcement side: under target side they check
-    every service, under agent side agents only (a tool's pass-through CR needs no check, but the
-    checks still return its pod type). A failed check raises ``EnforcementPreconditionError``,
+    every service with #1, #2 and #6; under agent side every service with #1 and #2 (a tool's
+    pass-through CR needs only ``jwt-validation`` inbound) and agents only with #6. They return the
+    pod type. A failed check raises ``EnforcementPreconditionError``,
     which names each failed check; nothing changed yet, so there is no rollback, no client disable
     and no quarantine (checkpoint O2). If the service is a tool (the type of its pod label) and its
     client is enabled, the PCE ``bootstrap(client_id, ServiceType.TOOL)`` writes the tool's first CR
@@ -340,7 +346,10 @@ def _onboard(service_id: ServiceUuid, wait_for_client: bool) -> _Onboarded:
     agent side), so that discovery passes (checkpoint B1). A disabled tool gets no bootstrap:
     it fails at the discovery-token mint anyway (C5). A bootstrap failure propagates (no rollback:
     Provision has not run). Any other failure of Provision or the build (no quarantine) drops this
-    run's bootstrap CR (:func:`_drop_bootstrap`) and propagates.
+    run's bootstrap CR (:func:`_drop_bootstrap`) and propagates. After a successful build of a tool,
+    the login-client audience warning runs (D30,
+    :func:`~aiac.agent.uc.onboarding.platform_audience.warn_platform_tool_audiences`): under agent side
+    only, best effort, log only.
 
     On any of the four typed build failures (see ``_ROLLBACK_ERRORS``, for agents and tools, on the
     first failure — also the retryable ``LLMAccessError``) the Orchestrator runs the compensating
@@ -376,7 +385,8 @@ def _onboard(service_id: ServiceUuid, wait_for_client: bool) -> _Onboarded:
     # D30: the precondition checks run FIRST, before anything changes. A failed check raises
     # EnforcementPreconditionError, which is NOT a rollback error (checkpoint O2): nothing was
     # provisioned, so there is no rollback, no client disable and no quarantine. Under agent
-    # side a tool gets no check, but its pod type is still returned (for the bootstrap below).
+    # side a tool gets #1 and #2 (jwt-validation only) and no #6. The pod type is returned (for
+    # the bootstrap below).
     pod_type = check_preconditions(service)  # the type from the pod label (no catalog type yet)
     # Checkpoint B1: the first CR of a tool, before Provision, so that discovery (tools/list
     # through the tool's own inbound) passes D20. Only for an enabled client: a disabled
@@ -420,5 +430,12 @@ def _onboard(service_id: ServiceUuid, wait_for_client: bool) -> _Onboarded:
         if bootstrapped:
             _drop_bootstrap(client_id)
         raise
+
+    # The login-client audience warning (D30; agent side only, best effort): warn when a platform login
+    # client holds a scope that puts this tool's clientId into aud. Its pass-through CR then lets such a
+    # user token in with no AIAC check. It never raises, so it cannot fail the onboarding or drop the
+    # bootstrap CR.
+    if pod_type is ServiceType.TOOL:
+        warn_platform_tool_audiences(config, client_id)
 
     return _Onboarded(rules, client_id, bootstrapped)

@@ -4,6 +4,7 @@ import logging
 import os
 import sys
 import threading
+from collections.abc import Iterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal
@@ -38,6 +39,16 @@ _SERVICE_TYPE_ATTRIBUTE = "client.type"
 # and presents it to the tool's AuthBridge sidecar, whose jwt-validation plugin expects the tool's
 # own clientId as the audience (it defaults ``audience_file`` to ``/shared/client-id.txt``).
 _DISCOVERY_AUDIENCE_MAPPER = "aiac-discovery-audience"
+
+# The Keycloak mapper type that adds an audience to a token, and the two config keys that name it: the
+# operator's audience scopes use ``included.custom.audience``, AIAC's own discovery mapper
+# ``included.client.audience``. The login-client audience read (``GET /platform-clients/tool-audiences``)
+# matches on these, not on the scope name.
+_AUDIENCE_MAPPER_TYPE = "oidc-audience-mapper"
+_AUDIENCE_CONFIG_KEYS = ("included.client.audience", "included.custom.audience")
+
+# The ``client.type`` value of a managed tool (``_SERVICE_TYPE_ATTRIBUTE``; Provision sets it).
+_TOOL_TYPE = "Tool"
 
 # Name of the shared client scope that is the one source of ``sub`` = username (D31). AIAC links
 # it as a default scope to each platform login client (``_PLATFORM_SOURCE_CLIENTS_ENV``), so the
@@ -323,6 +334,57 @@ def _platform_clients() -> tuple[str, ...]:
     return tuple(c.strip() for c in raw.split(",") if c.strip()) or _DEFAULT_PLATFORM_CLIENTS
 
 
+def _mapper_audiences(mappers: list[dict]) -> list[tuple[str, str]]:
+    """The ``(mapper name, audience)`` pairs that the ``oidc-audience-mapper`` items of ``mappers``
+    put into the access token (``included.client.audience`` and ``included.custom.audience``). A
+    mapper counts only when its ``access.token.claim`` is absent or ``"true"`` (Keycloak's
+    ``includeInAccessToken``: a missing key is ``true``, every other value is ``false``)."""
+    pairs: list[tuple[str, str]] = []
+    for mapper in mappers:
+        config = mapper.get("config") or {}
+        if mapper.get("protocolMapper") != _AUDIENCE_MAPPER_TYPE:
+            continue
+        if config.get("access.token.claim", "true") != "true":
+            continue
+        for key in _AUDIENCE_CONFIG_KEYS:
+            audience = config.get(key)
+            pair = (str(mapper.get("name", "")), str(audience))
+            if audience and pair not in pairs:
+                pairs.append(pair)
+    return pairs
+
+
+def _tool_client_ids(admin: KeycloakAdmin) -> set[str]:
+    """The clientIds of the clients whose ``client.type`` attribute is ``Tool`` (one ``get_clients()``)."""
+    return {
+        c["clientId"]
+        for c in admin.get_clients()
+        if (c.get("attributes") or {}).get(_SERVICE_TYPE_ATTRIBUTE) == _TOOL_TYPE and c.get("clientId")
+    }
+
+
+# Where a login client holds an audience mapper: a default or an optional client scope, or the client itself.
+_LinkKind = Literal["default", "optional", "client"]
+
+
+def _login_client_mappers(
+    admin: KeycloakAdmin, client_uuid: str, realm_scopes: dict[str, dict]
+) -> Iterator[tuple[_LinkKind, str | None, list[dict]]]:
+    """The mapper sources of one login client, as ``(link, scope name, mappers)``: each default and
+    each optional client scope (its mappers from ``realm_scopes``, the realm scope list by id; a linked
+    scope that is not in it is skipped), then the mappers on the client itself (scope ``None``)."""
+    linked: tuple[tuple[_LinkKind, list[dict]], ...] = (
+        ("default", admin.get_client_default_client_scopes(client_uuid)),
+        ("optional", admin.get_client_optional_client_scopes(client_uuid)),
+    )
+    for link, refs in linked:
+        for ref in refs:
+            scope = realm_scopes.get(ref.get("id"))
+            if scope is not None:
+                yield link, scope.get("name"), scope.get("protocolMappers") or []
+    yield "client", None, admin.get_mappers_from_client(client_uuid)
+
+
 def _link_default_scope(admin: KeycloakAdmin, client_uuid: str, scope_id: str) -> None:
     """Link a scope to a client as a default scope; an optional link is moved to default.
 
@@ -395,6 +457,14 @@ class _ServiceTypeUpdate(BaseModel):
 
 class _ServiceEnabledUpdate(BaseModel):
     enabled: bool
+
+
+class _ToolAudienceLink(BaseModel):
+    login_client: str  # the clientId of the platform login client
+    link: _LinkKind  # a default or optional client scope, or a mapper on the login client
+    scope: str | None  # the name of the client scope; None when link is "client"
+    mapper: str  # the name of the audience mapper
+    tool_client_id: str  # the clientId of the tool that the mapper puts into aud
 
 
 class _DiscoveryToken(BaseModel):
@@ -724,6 +794,52 @@ def link_subject_scope(service_id: str, admin: KeycloakAdmin = Depends(get_admin
         # 404 for an unknown service_id: the library does not retry a 4xx, so a bad UUID is not tried
         # again as if Keycloak were down.
         return _read_error(e)
+
+
+@app.get("/platform-clients/tool-audiences")
+def list_platform_tool_audiences(
+    client_id: str | None = Query(default=None), admin: KeycloakAdmin = Depends(get_admin)
+):
+    """The client scopes of the platform login clients that put a tool's clientId into ``aud``
+    (the login-client audience warning, D30).
+
+    For each login client of ``_platform_clients()`` (D31; a login client that is not in the realm is
+    skipped, as in ``_link_login_clients``), read its default and its optional client scopes and the
+    protocol mappers on the client itself. The mappers of the scopes come from one read of the realm
+    scope list (``get_client_scopes()``, each item with its ``protocolMappers``), not from one read
+    for each scope: the operator links the audience scope of every workload to the login client, so
+    that count would grow with the realm. A linked scope that is not in that list (a race with a
+    delete) is skipped. List each audience mapper (``_mapper_audiences``) that names a tool clientId.
+    The tools are the clients with ``client.type`` = ``Tool`` (``_tool_client_ids``); with
+    ``client_id``, only that clientId is matched, and the client list is not read. Read only: it
+    changes nothing. ``502`` on a ``KeycloakError``."""
+    try:
+        tools = {client_id} if client_id else _tool_client_ids(admin)
+        if not tools:
+            return []
+        logins = []
+        for login_client in _platform_clients():
+            client_uuid = admin.get_client_id(login_client)
+            if client_uuid is None:
+                _log.info("login client '%s' not found: its audience scopes are not read", login_client)
+                continue
+            logins.append((login_client, client_uuid))
+        if not logins:
+            return []
+        realm_scopes = {s.get("id"): s for s in admin.get_client_scopes()}
+        found: list[_ToolAudienceLink] = []
+        for login_client, client_uuid in logins:
+            for link, scope, mappers in _login_client_mappers(admin, client_uuid, realm_scopes):
+                found.extend(
+                    _ToolAudienceLink(
+                        login_client=login_client, link=link, scope=scope, mapper=mapper, tool_client_id=audience
+                    )
+                    for mapper, audience in _mapper_audiences(mappers)
+                    if audience in tools
+                )
+        return found
+    except KeycloakError as e:
+        return JSONResponse(status_code=502, content={"error": str(e)})
 
 
 @app.delete("/services/{service_id}/scopes/{scope_id}", status_code=200)

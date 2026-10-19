@@ -29,7 +29,9 @@ data:
   # At startup the service links the client scope aiac-username-sub (D31) to the
   # login clients PLATFORM_SOURCE_CLIENTS (comma-separated, default rossoctl) of
   # the realm KEYCLOAK_REALM. Without KEYCLOAK_REALM it skips the startup link;
-  # each onboarding makes the link too. PLATFORM_SOURCE_CLIENTS is not set here,
+  # each onboarding makes the link too. The same list names the login clients
+  # whose client scopes it reads for the login-client audience warning (D30).
+  # PLATFORM_SOURCE_CLIENTS is not set here,
   # so this dev Pod uses the code default (rossoctl). The one value for the real
   # topology is in aiac-pdp-config (pdp-interface-deployment.yaml); add the key
   # here only to test other login clients with this Pod.
