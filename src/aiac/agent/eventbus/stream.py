@@ -36,10 +36,17 @@ CONSUMER_FILTER_SUBJECTS = [
 DLQ_SUBJECT = "aiac.apply.dlq"
 MAX_DELIVER = 5
 
-# Onboarding's LLM calls run synchronously inside the dispatch callback, each bounded by
-# LLM_REQUEST_TIMEOUT (default 120s) and retried up to UPSTREAM_MAX_RETRIES times (default 3),
-# across multiple structured calls (propose/audit). JetStream's own 30s default ack_wait would
-# redeliver a message that's still being processed, so this is sized well above the worst case.
+# Onboarding's LLM calls run synchronously inside the dispatch callback, across multiple structured
+# calls (propose/audit). Each call is bounded by LLM_REQUEST_TIMEOUT (60 s in the aiac-agent-config
+# manifest, 120 s code default) and makes up to LLM_MAX_RETRIES attempts (default 3; the LLM seam does
+# not use UPSTREAM_MAX_RETRIES). Between attempts it waits the exponential backoff or the error's
+# Retry-After, each wait at most LLM_RETRY_BACKOFF_MAX (default 30 s). Recheck with these numbers: the
+# worst case of ONE call is 3 x 60 + 2 x 30 = 240 s with the manifest (3 x 120 + 2 x 30 = 420 s at the
+# code default), so 600 s is still above it, and a Retry-After cannot make it longer (it is capped at
+# the same 30 s). A normal onboarding, where each call answers in seconds, stays far below 600 s. It is
+# not sized for an onboarding where several calls each use their full retry budget: NATS can then
+# redeliver while the first delivery still runs. JetStream's own 30 s default ack_wait would redeliver a
+# message that's still being processed even in the normal case.
 ACK_WAIT_SECONDS = 600.0
 
 # JetStream's "stream name already in use with a different configuration" error code.

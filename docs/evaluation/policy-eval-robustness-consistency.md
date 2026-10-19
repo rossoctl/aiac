@@ -46,8 +46,8 @@ scenarios, and reuse that family's scenario corpus rather than defining their ow
 six siblings, plus their `policy.eval_*.md` files) were moved from `eval/` directly into a new
 `eval/scenarios/` subpackage, so the growing `eval/` directory doesn't flatten test modules,
 scenario-data modules, and (now) two more scenario-data variants (`scenarios_perturbed/`) into one
-namespace. `scenario_eval_agent_delegation.py`/`policy.eval_agent_delegation.md` are unaffected —
-they already lived at `test/system/` top level and stay there. `test_policy_pipeline_eval.py`'s
+namespace. `scenario_eval_agent_delegation.py`/`policy.eval_agent_delegation.md` were first left
+at `test/system/` top level; they later moved to `eval/scenarios/` too. `test_policy_pipeline_eval.py`'s
 imports were updated accordingly; no test logic changed.
 
 ## Description
@@ -426,7 +426,7 @@ chart over time, not just show up as a one-off failed run with no lasting record
   robustness tests *and* the consistency suite identically for this scenario, both invariance
   (unedited) and sensitivity (edited) — proving it was a corpus gap, not an edit-mechanism bug.
   Fixed in two places: the committed digested `.md` (both original and perturbed sibling) now
-  states the read grant explicitly, and `agent-role-dispatcher`'s own description (`test/system/
+  states the read grant explicitly, and `agent-role-dispatcher`'s own description (`eval/scenarios/
   scenario_eval_agent_delegation.py` and its perturbed counterpart) now says "reading, creating,
   and updating" instead of just "creating and updating" — the same cascade-needs-its-own-textual-
   grounding principle this file already documents for `unreachable_resources`/`empty_descriptions`

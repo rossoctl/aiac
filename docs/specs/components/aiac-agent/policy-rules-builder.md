@@ -69,21 +69,24 @@ without touching the rest of the graph.
 ## Exceptions
 
 The PRB raises a small, closed hierarchy. Every message is **sanitized**: it never contains the
-LLM endpoint, host, or API key. The HTTP column is the status a **single-entity caller** returns.
+LLM endpoint, host, or API key. The `LLMAccessError` and `UnparseableLLMResponseError` messages end
+with the HTTP status of the raw error when it has one (for example `(HTTP 404)`), so the ERROR log
+line names the cause. The HTTP column is the status a **single-entity caller** returns.
 The async **retry class** is a separate axis — see the decoupling note below the table.
 
 | Exception | Where raised | HTTP (single-entity) | Async class | Notes |
 |---|---|---|---|---|
 | `PolicyRulesBuilderBaseError` | Base of the hierarchy — **never raised directly** | 500 | — | A safety net at the HTTP boundary |
 | `PolicyRulesBuilderError` | `_audit`, after `MAX_AUDIT_RETRIES` (3) ordinary rejections | 422 | permanent | The audit budget is exhausted |
-| `LLMAccessError` | `_structured_call`, when **transient** failures (5xx / connect / timeout) are **exhausted** | 502 | **retryable** | Wraps the original error; message sanitized |
+| `LLMAccessError` | `_structured_call`, when **transient** failures (5xx / connect / timeout / HTTP 408 / a rate-limit 429) are **exhausted** | 502 | **retryable** | Wraps the original error; message sanitized |
 | `UnparseableLLMResponseError` | `_structured_call`, when the LLM is **reachable but the response is unparseable / schema-invalid** | 502 | permanent | A non-transient parse or validation error; message sanitized |
+| `LLMCredentialsError` | `_structured_call`, when the LLM endpoint **refuses the credentials** (HTTP 401 / 403, for example a revoked API key) | 502 | permanent | Not retried; the key must be fixed first. Message sanitized |
 | `PolicyContradictionError` | `_audit`, on a **genuine** intra-focal grant/deny contradiction | 422 | permanent | Carries the focal entity + all contradictions; short-circuits past retry. UC1 aggregates it — see **Contradiction contract** |
 | `PolicyConflictError` | `ServicePolicyBuilder.build` (UC1, `conflict_detection.py`) — **not** the graph | 422 | permanent | Carries a `ConflictReport`; aggregates per-focal contradictions across a UC1 run |
 
-**HTTP status is decoupled from the async retry class.** `LLMAccessError` and
-`UnparseableLLMResponseError` both map to **502**, but only `LLMAccessError` is **retryable** — the
-unparseable case is **permanent**. A caller must read the async class, not the HTTP code, to decide
+**HTTP status is decoupled from the async retry class.** `LLMAccessError`,
+`UnparseableLLMResponseError` and `LLMCredentialsError` all map to **502**, but only `LLMAccessError` is
+**retryable** — the unparseable and the refused-credentials cases are **permanent**. A caller must read the async class, not the HTTP code, to decide
 whether to retry.
 
 ---
@@ -290,15 +293,22 @@ distinct:
   `aiac.agent.llm.call_with_retry`, which `_structured_call` calls (the Policy Digester uses the
   same seam), driven by **dedicated LLM knobs** (not the shared `UPSTREAM_MAX_RETRIES`): `LLM_MAX_RETRIES`
   (default `3`), `LLM_RETRY_BACKOFF_MIN` (`1`) and `LLM_RETRY_BACKOFF_MAX` (`30`). `is_transient`
-  classifies which failures retry (5xx / connect / timeout). `LLM_REQUEST_TIMEOUT` (default `120`)
-  bounds each request. The Phase-1 file read does **not** retry; it raises directly.
+  classifies which failures retry (5xx / connect / timeout / HTTP 408 / 429). A 429 that names an
+  exhausted quota (for example OpenAI `insufficient_quota`) is permanent and is not retried. A
+  `Retry-After` header on the error replaces the backoff, up to `LLM_RETRY_BACKOFF_MAX`. The loop is
+  the shared `aiac.shared.upstream.upstream_retrying`. `LLM_REQUEST_TIMEOUT` (code default
+  `120`, `60` in the `aiac-agent-config` manifest) bounds each request. The Phase-1 file read does
+  **not** retry; it raises directly.
 
-`_structured_call` has two raise outcomes:
+`_structured_call` has three raise outcomes:
 
 - **Transient failures exhausted** → raise `LLMAccessError` (502, **retryable**). It wraps the
   original error and sanitizes the message.
+- **The endpoint refuses the credentials** (HTTP 401 / 403) → raise `LLMCredentialsError` (502,
+  **permanent**), sanitized. It is not retried.
 - **Reachable but the response is unparseable / schema-invalid** (a non-transient parse or
-  validation error) → raise `UnparseableLLMResponseError` (502, **permanent**), sanitized.
+  validation error, or any other non-transient error) → raise `UnparseableLLMResponseError` (502,
+  **permanent**), sanitized.
 
 See **Exceptions** for the full taxonomy and the HTTP-vs-retry-class decoupling.
 
@@ -612,7 +622,7 @@ and is **not yet enforced** here.
 |---|---|---|
 | `AIAC_POLICY_FILE` | Path to the whole-file access policy (default `/etc/aiac/policy.md`) | 1 |
 | `LLM_BASE_URL`, `LLM_MODEL`, `LLM_API_KEY` | LLM calls | 1 |
-| `LLM_REQUEST_TIMEOUT` | Per-request LLM timeout, in seconds (default `120`) | 1 |
+| `LLM_REQUEST_TIMEOUT` | Per-request LLM timeout, in seconds (code default `120`, `60` in the manifest) | 1 |
 | `LLM_MAX_RETRIES` | Transient-failure retry budget for the LLM seam (tenacity `stop_after_attempt`, default `3`) | 1 |
 | `LLM_RETRY_BACKOFF_MIN` | Minimum exponential backoff for the LLM seam, in seconds (default `1`) | 1 |
 | `LLM_RETRY_BACKOFF_MAX` | Maximum exponential backoff for the LLM seam, in seconds (default `30`) | 1 |

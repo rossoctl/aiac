@@ -294,6 +294,11 @@ def _admin(
     optional_map.update(optionals or {})
     admin.get_client_default_client_scopes.side_effect = lambda uuid: [{"id": i} for i in default_map[uuid]]
     admin.get_client_optional_client_scopes.side_effect = lambda uuid: [{"id": i} for i in optional_map[uuid]]
+    # The filtered read of ``login_client`` (``get_client_id`` + ``get_client``), over the same client list.
+    admin.get_client_id.side_effect = lambda client_id: next(
+        (c["id"] for c in admin.get_clients.return_value if c.get("clientId") == client_id), None
+    )
+    admin.get_client.side_effect = lambda uuid: next(c for c in admin.get_clients.return_value if c["id"] == uuid)
     return admin
 
 

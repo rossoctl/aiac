@@ -7,10 +7,10 @@ itself), awaiting completion before acking. A role-membership change
 (``aiac.apply.role-members.{role-id}``, D32) calls the PCE ``rerender_role`` instead, as the
 ``POST /apply/role-members/{role_id}`` route does: no use-case handler (no PRB run) and no
 ``compute_and_apply``. Before it subscribes, the start updates an existing durable consumer to the
-config of the code (``ensure_consumer``). On a **permanent** failure (see
-``_PERMANENT_ERRORS``: a policy conflict or contradiction, a PRB fault, an unparseable LLM
-response, or a failed UC1 precondition check) the message is republished to the DLQ subject and
-terminated at the FIRST delivery. On any other failure the message is left unacked (NATS
+config of the code (``ensure_consumer``). On a **permanent** failure (see ``_PERMANENT_ERRORS``: a
+policy conflict or contradiction, a PRB fault, an unparseable LLM response, LLM credentials the
+endpoint refused, or a failed UC1 precondition check) the message is republished to the DLQ subject
+and terminated at the FIRST delivery. On any other failure the message is left unacked (NATS
 redelivers after ``ACK_WAIT_SECONDS``) until ``num_delivered`` reaches ``MAX_DELIVER``, at which
 point it is republished to the DLQ subject and terminated (stops redelivery on this consumer). One
 retryable failure is nak'd instead of left unacked: ``ServiceNotVisibleError`` (the IdP does not show
@@ -48,6 +48,7 @@ from aiac.agent.eventbus.stream import (
 )
 from aiac.agent.policy_rules_builder.conflict_detection import PolicyConflictError
 from aiac.agent.policy_rules_builder.graph import (
+    LLMCredentialsError,
     PolicyContradictionError,
     PolicyRulesBuilderError,
     UnparseableLLMResponseError,
@@ -76,9 +77,9 @@ _ROLE_MEMBERS_PREFIX = "aiac.apply.role-members."
 _POLICY_BUILD_SUBJECT = "aiac.apply.policy.build"
 
 # PERMANENT failures: redelivery can never make them succeed (a real policy conflict /
-# contradiction, an unparseable LLM response, a builder fault, or a failed UC1 precondition
-# check — that one needs a fix in the cluster first), so they are DLQ'd + term()ed on the
-# FIRST delivery. Everything else — LLMAccessError (a transient LLM
+# contradiction, an unparseable LLM response, a builder fault, LLM credentials the endpoint refused,
+# or a failed UC1 precondition check — those two need a fix in the cluster first), so they are
+# DLQ'd + term()ed on the FIRST delivery. Everything else — LLMAccessError (a transient LLM
 # outage that may clear) and genuinely unknown/transient errors — is RETRYABLE: left
 # unacked to redeliver until MAX_DELIVER, then DLQ'd (ServiceNotVisibleError is nak'd with a
 # short delay instead; see _NOT_VISIBLE_NAK_DELAY_ENV below). LLMAccessError is a sibling of the
@@ -89,6 +90,7 @@ _PERMANENT_ERRORS: tuple[type[Exception], ...] = (
     PolicyContradictionError,
     PolicyRulesBuilderError,
     UnparseableLLMResponseError,
+    LLMCredentialsError,
     EnforcementPreconditionError,
 )
 

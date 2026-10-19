@@ -107,7 +107,7 @@ The consumer **awaits** the internal handler before it issues the NATS acknowled
 
 On handler failure, the consumer classifies the exception by **type**, not by HTTP status code:
 
-- **Permanent** — `PolicyConflictError`, `PolicyContradictionError`, `PolicyRulesBuilderError`, `UnparseableLLMResponseError`, and `EnforcementPreconditionError` (a failed UC1 precondition check, D30). The consumer calls `term()` and routes the message to `aiac.apply.dlq` **immediately**. There is no redelivery, because the same input cannot succeed on a retry. A failed precondition check needs a fix in the cluster first. After the fix, the operator starts the onboarding again (see [`uc1-service-onboarding.md` → Precondition checks](aiac-agent/uc1-service-onboarding.md#precondition-checks-d30)).
+- **Permanent** — `PolicyConflictError`, `PolicyContradictionError`, `PolicyRulesBuilderError`, `UnparseableLLMResponseError`, `LLMCredentialsError` (the LLM endpoint refused the API key, HTTP 401 / 403), and `EnforcementPreconditionError` (a failed UC1 precondition check, D30). The consumer calls `term()` and routes the message to `aiac.apply.dlq` **immediately**. There is no redelivery, because the same input cannot succeed on a retry. A refused LLM key and a failed precondition check need a fix in the cluster first. After the fix, the operator starts the onboarding again (see [`uc1-service-onboarding.md` → Precondition checks](aiac-agent/uc1-service-onboarding.md#precondition-checks-d30)).
 - **Retryable** — `LLMAccessError`, plus any genuinely unknown or transient error. The consumer does **not** ack. NATS redelivers after `AckWait`, up to `MAX_DELIVER` (5) deliveries, then routes the message to `aiac.apply.dlq`. A failed `rerender_role` (a role-membership subject; it re-raises each IdP, Policy Store or PDP error) is in this class. A redelivery is safe, because each run reads the current holders.
 - **Retryable, not visible yet** — `ServiceNotVisibleError` (UC1 only). The IdP still answers `404` for the new service after the Orchestrator's bounded wait on the first read, or after the one read of a redelivery (the event-before-commit race; see [`uc1-service-onboarding.md` → The first read waits for a new client](aiac-agent/uc1-service-onboarding.md#the-first-read-waits-for-a-new-client-d33)). The client can become visible some seconds later, so the consumer does not wait for `AckWait`:
   - Below `MAX_DELIVER`, the consumer calls `nak(delay=…)` with the delay `AIAC_NOT_VISIBLE_NAK_DELAY_SECONDS` (default `30` s; see [Configuration](#configuration) below). NATS redelivers the message after the delay, not after `AckWait` (600 s). The consumer does not ack the message, and it does not call `term()`.
@@ -261,7 +261,7 @@ The `/apply/*` endpoints return bare HTTP status codes: `200 OK` on success (no 
 | `LLM_MAX_RETRIES` | `3` | ConfigMap |
 | `LLM_RETRY_BACKOFF_MIN` | `1` | ConfigMap |
 | `LLM_RETRY_BACKOFF_MAX` | `30` | ConfigMap |
-| `LLM_REQUEST_TIMEOUT` | `120` | ConfigMap |
+| `LLM_REQUEST_TIMEOUT` | `60` | ConfigMap (the code default, if the key is not set, is `120`) |
 | `ONBOARD_LABEL_WAIT_ATTEMPTS` | `15` | env (optional; not set in `k8s/`; code default) |
 | `ONBOARD_LABEL_WAIT_BACKOFF` | `2.0` | env (optional; not set in `k8s/`; code default) |
 | `ONBOARD_CARD_WAIT_ATTEMPTS` | `15` | env (optional; not set in `k8s/`; code default) |
@@ -287,7 +287,7 @@ ChromaDB collections: `aiac-policies` and `aiac-domain-knowledge`. **Status: not
 
 The Agent keeps two retry layers distinct.
 
-**Transport retries.** The Agent makes each upstream transport call up to `UPSTREAM_MAX_RETRIES` attempts in total (default `3`: the first attempt and two retries), with exponential backoff (`tenacity`; 1 s, 2 s, …, at most 30 s), before the error propagates. It retries only a transient failure: a connection error, a timeout or a `5xx`. A `4xx` is raised at once (see [`library-idp.md` → Transport retries](library-idp.md)). The retry primitive is the project-level shared `run_upstream(fn)` helper (`aiac/shared/upstream.py`). It is transport-agnostic: it re-raises the original exception after the final attempt. The Agent applies retry at the **transport boundary**, not at the agent call sites — inside the idp-library `Configuration` (its `_request` helper), inside the provision MCP helper (`_mcp_tools_list`), and inside the provision Kubernetes seam (`uc/onboarding/provision/kube.py`). Each caller then maps the re-raised failure to the upstream status below.
+**Transport retries.** The Agent makes each upstream transport call up to `UPSTREAM_MAX_RETRIES` attempts in total (default `3`: the first attempt and two retries), with exponential backoff (`tenacity`; 1 s, 2 s, …, at most 30 s; a `Retry-After` header on the error replaces the backoff, up to the same 30 s), before the error propagates. It retries only a transient failure: a connection error, a timeout, a `5xx`, a `408` or a `429` (also the Kubernetes API Priority and Fairness `429`). A `429` that names an exhausted quota (for example `insufficient_quota`) and every other `4xx` are raised at once (see [`library-idp.md` → Transport retries](library-idp.md)). The retry primitive is the project-level shared `run_upstream(fn)` helper (`aiac/shared/upstream.py`). It is transport-agnostic: it re-raises the original exception after the final attempt. The Agent applies retry at the **transport boundary**, not at the agent call sites — inside the idp-library `Configuration` (its `_request` helper), inside the provision MCP helper (`_mcp_tools_list`), and inside the provision Kubernetes seam (`uc/onboarding/provision/kube.py`). Each caller then maps the re-raised failure to the upstream status below.
 
 **LLM-seam retries.** The Policy Rules Builder (PRB) retries its own LLM seam with dedicated knobs — `LLM_MAX_RETRIES`, `LLM_RETRY_BACKOFF_MIN`, and `LLM_RETRY_BACKOFF_MAX` (specified in [`aiac-agent/policy-rules-builder.md`](aiac-agent/policy-rules-builder.md)). `UPSTREAM_MAX_RETRIES` does **not** govern LLM calls. It stays for the IdP, MCP, and Kubernetes transport seams only.
 
@@ -314,12 +314,13 @@ The PRB raises a typed exception hierarchy (specified in [`aiac-agent/policy-rul
 | `PolicyRulesBuilderError` | PRB `_audit`, after `MAX_AUDIT_RETRIES` | `422` |
 | `LLMAccessError` | PRB `_structured_call`, transient retries exhausted | `502` |
 | `UnparseableLLMResponseError` | PRB `_structured_call`, reachable but unparseable | `502` |
+| `LLMCredentialsError` | PRB `_structured_call`, the endpoint refused the credentials (HTTP 401 / 403) | `502` |
 | `PolicyContradictionError` | PRB `_audit`, genuine contradiction | `422` |
 | `PolicyConflictError` (carries a `ConflictReport`) | `ServicePolicyBuilder.build` (UC1) | `422` |
 | `EnforcementPreconditionError` (carries `failures: list[str]`) | UC1 Orchestrator, the precondition checks (D30), before Provision | `409` |
 | `ServiceNotVisibleError` (an `HTTPException`) | UC1 Orchestrator, the first `get_service`, when the IdP still answers `404` after the client wait (D33) | `502` |
 
-The base class `PolicyRulesBuilderBaseError` is a `500` safety net: any unforeseen PRB error still returns a defined status, not an untyped `500`. Both `LLMAccessError` and `UnparseableLLMResponseError` map to `502`, but they differ on the async path (see [Async failure classification](#async-failure-classification)). The HTTP status is decoupled from the async retry class.
+The base class `PolicyRulesBuilderBaseError` is a `500` safety net: any unforeseen PRB error still returns a defined status, not an untyped `500`. `LLMAccessError`, `UnparseableLLMResponseError` and `LLMCredentialsError` all map to `502`, but they differ on the async path (see [Async failure classification](#async-failure-classification)). The HTTP status is decoupled from the async retry class.
 
 ### Sanitized body vs. full log
 

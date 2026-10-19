@@ -35,10 +35,7 @@ tool id), every path/query here is derived from each scenario module's own agent
 generalized ``probe_eval.rego`` (parameterized by ``input.agent_id``) rather than the fixed
 ``probe.rego``. ``launcher.py`` is reused unmodified.
 
-``scenario_eval_agent_delegation``'s data file is the one exception to the "everything lives in
-``eval/``" rule — it sits at ``test/system/scenario_eval_agent_delegation.py`` (sibling of
-``launcher.py``/``scenario_uc1.py``). Regardless of where a scenario's own source ``POLICY_FILE``
-lives, every scenario's ``AIAC_POLICY_FILE`` is pointed at its **committed digested** counterpart
+Every scenario's ``AIAC_POLICY_FILE`` is pointed at its **committed digested** counterpart
 in ``eval/scenarios_digested/`` (``digested_policy_path``, same filename) — production feeds the
 PRB only digested policy (see ``docs/specs/digested-policy.md``), so this suite runs against the
 same input shape.
@@ -124,6 +121,7 @@ SRC = REPO_ROOT / "src"
 sys.path.insert(0, str(REPO_ROOT))  # so ``import test.system.*``/``eval.*`` resolves
 sys.path.insert(0, str(SRC))  # so ``import aiac.*`` resolves
 
+from eval.scenarios import scenario_eval_agent_delegation as scn_agent_delegation  # noqa: E402
 from eval.scenarios import scenario_eval_ambiguous_clause as scn_ambiguous_clause  # noqa: E402
 from eval.scenarios import scenario_eval_baseline as scn_baseline  # noqa: E402
 from eval.scenarios import scenario_eval_confusable_agents as scn_confusable_agents  # noqa: E402
@@ -135,7 +133,6 @@ from eval.scenarios import (  # noqa: E402
     scenario_eval_unreachable_resources as scn_unreachable_resources,
 )
 from eval.scenarios import scenario_eval_wildcard_grant as scn_wildcard_grant  # noqa: E402
-from test.system import scenario_eval_agent_delegation as scn_agent_delegation  # noqa: E402
 from test.system.launcher import (  # noqa: E402
     Service,
     require_env_or_skip,

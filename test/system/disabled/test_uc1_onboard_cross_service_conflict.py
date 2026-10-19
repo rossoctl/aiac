@@ -164,6 +164,10 @@ def test_cross_service_conflict_is_surfaced_as_422_conflict_report() -> None:
     keycloak_url = creds["KEYCLOAK_URL"]
 
     admin = uc1.connect_admin()
+    # Direct Access Grants on the login client, before the first mutation, as in ``uc1._clean_slate``:
+    # the same skip cause on the same cluster (a missing realm or login client), and a skip here leaves
+    # the cluster as it was (no new realm). Released at session end (``test/system/conftest.py``).
+    uc1.hold_direct_access_grants(admin, TEST_REALM)
     # Open the cleanup guard BEFORE the first shared-state mutation: the clean-slate steps below
     # (Agent CR delete, Keycloak cleanup, Policy Store clear, provisioning) already mutate shared
     # cluster state, so a failure mid-setup must still hit the ``finally`` teardown.

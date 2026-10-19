@@ -20,7 +20,7 @@ The Event Broker is a single-node NATS JetStream instance. It owns no business l
 | Consumer filter subjects | `aiac.apply.service.*`, `aiac.apply.role.*`, `aiac.apply.role-members.*`, `aiac.apply.policy.build` (`CONSUMER_FILTER_SUBJECTS`, `stream.py`). Not the DLQ subject, so the consumer never gets a dead-lettered message again. At each start, the Agent updates an existing durable consumer to this config (see [Consumer config at start](#consumer-config-at-start)) |
 | Authentication | None — ClusterIP network isolation is the access control mechanism |
 | Dead-letter subject | `aiac.apply.dlq` |
-| Max delivery attempts | 5 — after the 5th failed delivery, the Agent consumer republishes the message to `aiac.apply.dlq` and calls `term()`. A permanent error (`PolicyConflictError`, `PolicyContradictionError`, `PolicyRulesBuilderError`, `UnparseableLLMResponseError`, `EnforcementPreconditionError`) goes to the DLQ on the first delivery. A nak with a delay (see [Delivery Guarantees](#delivery-guarantees)) also uses one of the 5 deliveries |
+| Max delivery attempts | 5 — after the 5th failed delivery, the Agent consumer republishes the message to `aiac.apply.dlq` and calls `term()`. A permanent error (`PolicyConflictError`, `PolicyContradictionError`, `PolicyRulesBuilderError`, `UnparseableLLMResponseError`, `LLMCredentialsError`, `EnforcementPreconditionError`) goes to the DLQ on the first delivery. A nak with a delay (see [Delivery Guarantees](#delivery-guarantees)) also uses one of the 5 deliveries |
 | Ack wait | `600` s (`ACK_WAIT_SECONDS`, sized for long LLM onboardings) |
 
 ---

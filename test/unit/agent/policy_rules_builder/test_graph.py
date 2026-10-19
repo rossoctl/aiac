@@ -9,6 +9,8 @@ retries (slice 9) patch graph._build_llm + time.sleep instead.
 from contextlib import ExitStack
 from unittest.mock import MagicMock, patch
 
+import httpx
+import openai
 import pytest
 from openai import APIConnectionError, APITimeoutError
 
@@ -16,6 +18,7 @@ from aiac.agent.policy_rules_builder.graph import (
     AuditVerdict,
     Contradiction,
     LLMAccessError,
+    LLMCredentialsError,
     PolicyContradictionError,
     PolicyRulesBuilderBaseError,
     PolicyRulesBuilderError,
@@ -350,6 +353,21 @@ def test_parse_error_raises_sanitized_unparseable_response_error(monkeypatch):
     message = str(raised)
     for secret in _LEAK_SUBSTRINGS:
         assert secret not in message  # message is sanitized -- no endpoint/host/key leak
+
+
+def test_rejected_api_key_raises_sanitized_credentials_error_without_retry(monkeypatch):
+    # The LLM proxy answers 401 (a refused API key): not transient, so not retried, and typed as
+    # LLMCredentialsError -- not UnparseableLLMResponseError, which hid the cause in the logs.
+    response = httpx.Response(401, request=httpx.Request("POST", _FAKE_ENDPOINT))
+    leaky = openai.AuthenticationError(f"Invalid proxy server token key={_FAKE_KEY}", response=response, body=None)
+    raised = _run_with_failing_invoke(leaky, monkeypatch)
+
+    assert type(raised) is LLMCredentialsError
+    assert isinstance(raised, PolicyRulesBuilderBaseError)  # shares the PRB base hierarchy
+    assert raised.__cause__ is leaky
+    message = str(raised)
+    for secret in _LEAK_SUBSTRINGS:
+        assert secret not in message
 
 
 # =========================================================================== #
@@ -882,25 +900,23 @@ def test_structured_call_honors_llm_max_retries(monkeypatch):
 
 
 def test_structured_call_backoff_bounds_from_env(monkeypatch):
-    # The exponential-backoff bounds flow from LLM_RETRY_BACKOFF_MIN / _MAX into the retry wait.
-    # One attempt (no sleep) is enough: we assert the wait_exponential CONSTRUCTION bounds.
-    monkeypatch.setenv("LLM_MAX_RETRIES", "1")
-    monkeypatch.setenv("LLM_RETRY_BACKOFF_MIN", "7")
-    monkeypatch.setenv("LLM_RETRY_BACKOFF_MAX", "9")
+    # The exponential-backoff bounds flow from LLM_RETRY_BACKOFF_MIN / _MAX into the retry wait. The
+    # waits are recorded (no real sleep): 1, 2, 4, 8 s clamped to [3, 5].
+    monkeypatch.setenv("LLM_MAX_RETRIES", "5")
+    monkeypatch.setenv("LLM_RETRY_BACKOFF_MIN", "3")
+    monkeypatch.setenv("LLM_RETRY_BACKOFF_MAX", "5")
 
     llm, _ = _failing_llm(ConnectionError("down"))
+    waits: list[float] = []
 
     with ExitStack() as stack:
         stack.enter_context(patch("aiac.agent.policy_rules_builder.graph.get_policy_source", return_value=_Source()))
         stack.enter_context(patch("aiac.agent.policy_rules_builder.graph._build_llm", return_value=llm))
-        stack.enter_context(patch("time.sleep"))
-        # The retry loop (and its wait_exponential) now lives in the shared aiac.agent.llm seam.
-        we = stack.enter_context(patch("aiac.agent.llm.wait_exponential"))
+        stack.enter_context(patch("time.sleep", side_effect=waits.append))
         with pytest.raises(LLMAccessError):
             build_role_rules(_role(), [_scope("s-write", "write")])
 
-    assert we.call_args.kwargs["min"] == 7
-    assert we.call_args.kwargs["max"] == 9
+    assert waits == [3, 3, 4, 5]
 
 
 def test_structured_call_decoupled_from_upstream_max_retries(monkeypatch):

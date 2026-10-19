@@ -41,8 +41,8 @@ def _digest_call(messages: list[BaseMessage]) -> str:
     """THE digester seam. Unit tests patch this. Delegates the client build + transport retry to the
     shared ``aiac.agent.llm`` seam (on the digester's own ``DIGEST_LLM_*`` settings profile) and
     returns the model's free-text content, folding any surviving failure into the shared sanitized
-    LLM errors (``LLMAccessError`` / ``UnparseableLLMResponseError``) so an endpoint / API key can
-    never leak."""
+    LLM errors (``LLMAccessError`` / ``UnparseableLLMResponseError`` / ``LLMCredentialsError``) so
+    an endpoint / API key can never leak."""
     settings = load_llm_settings(_DIGEST_NAMESPACE)
     try:
         result = call_with_retry(build_llm(settings), messages, settings=settings)

@@ -190,7 +190,7 @@ So:
 - **Agent side:** one hop works, which is why the runbook's agent-side example (B.5) shows
   `dev-user`. It fails at the second agent of a chain, in both that agent's inbound and its
   outbound. AIAC models such a chain: the delegation scenario `dispatch-agent` → `customs-agent`
-  (`test/system/scenario_eval_agent_delegation.py`).
+  (`eval/scenarios/scenario_eval_agent_delegation.py`).
 
 The agent-side rows come from the code paths. They are not run live (§9).
 
