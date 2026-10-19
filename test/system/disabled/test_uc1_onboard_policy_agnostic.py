@@ -84,8 +84,9 @@ def test_default_ready_signals_match_todays_policy_a_probe_tool_onboarded() -> N
 
 
 def test_default_ready_signals_flip_source_read_for_the_agent_only_rung() -> None:
-    """Rung 1 (agent only, empty outbound gate): dev-user outbound source-read converges to ``deny``,
-    exactly as today's ``expected_source_read = "allow" if tool_onboarded else "deny"``."""
+    """Rung 1 (agent only, no tool onboarded, so the tool check denies): dev-user outbound source-read
+    converges to ``deny``, exactly as today's ``expected_source_read = "allow" if tool_onboarded else
+    "deny"``."""
     signals = uc1._default_ready_signals(tool_onboarded=False)
     outbound = [s for s in signals if s.kind == "outbound"]
     assert len(outbound) == 1

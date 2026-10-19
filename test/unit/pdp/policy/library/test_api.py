@@ -3,11 +3,11 @@
 The PDP Policy Writer HTTP boundary is mocked; no live service is required.
 
 ``aiac.pdp.policy.library`` is a *pass-through* over the canonical policy models:
-``api.py`` imports ``AgentPolicyModel`` / ``PolicyModel`` straight from
-``aiac.policy.model.models`` (there is no separate library ``models`` module). So the
-model-shape + round-trip assertions here exercise the same canonical ALLOW/DENY models the
-library serializes over the wire, and the HTTP-client transport stays a pass-through
-``model_dump()`` (no ``?realm=``).
+``api.py`` imports ``PolicyModel`` straight from ``aiac.policy.model.models`` (there is
+no separate library ``models`` module). So the model-shape + round-trip assertions here
+exercise the same canonical ALLOW/DENY models (``PolicyModel`` with its SPMs)
+that the library serializes over the wire, and the HTTP-client transport stays a
+pass-through ``model_dump()`` (no ``?realm=``).
 """
 
 from unittest.mock import MagicMock, patch
@@ -16,11 +16,10 @@ import pytest
 
 from aiac.idp.configuration.models import Role, RoleKind, Scope, ServiceType
 from aiac.policy.model.models import (
-    AgentPolicyModel,
+    PolicyModel,
     PolicyRule,
     RuleEffect,
     ServicePolicyModel,
-    TargetSidePolicyModel,
 )
 
 BASE = "http://127.0.0.1:7072"
@@ -43,49 +42,12 @@ def _scope(id: str = "scope-1", name: str = "read") -> Scope:
     return Scope(id=id, name=name, serviceId="weather-tool")
 
 
-def _agent_policy_model() -> AgentPolicyModel:
-    """A representative agent policy exercising the new ALLOW/DENY shape.
-
-    Populates identity maps, both split target-scope maps, and at least one ALLOW rule and one
-    DENY rule across the 8 entity×effect rule lists, so a ``model_dump()`` round-trip is lossless
-    for both effects.
-    """
-    role = _role()
-    deny_role = _role(id="role-2", name="blocked")
-    scope = _scope()
-    allow = PolicyRule(role=role, scope=scope, effect=RuleEffect.ALLOW)
-    deny = PolicyRule(role=deny_role, scope=scope, effect=RuleEffect.DENY)
-    return AgentPolicyModel(
-        agent_id="weather-agent",
-        agent_roles=[role],
-        agent_scopes=[scope],
-        # Effect-agnostic identity maps must include the deny-only role.
-        source_roles={"caller-agent": [role]},
-        subject_roles={"alice": [role, deny_role]},
-        # Split outbound target maps.
-        target_allow_scopes={"weather-tool": [scope]},
-        target_deny_scopes={"secret-tool": [scope]},
-        # 8 entity×effect rule lists (ALLOW + DENY populated).
-        inbound_subject_allow_rules=[allow],
-        inbound_subject_deny_rules=[deny],
-        inbound_source_allow_rules=[allow],
-        inbound_source_deny_rules=[deny],
-        outbound_target_allow_rules=[allow],
-        outbound_target_deny_rules=[deny],
-        outbound_subject_allow_rules=[allow],
-        outbound_subject_deny_rules=[deny],
-    )
-
-
-_AGENT_MODEL = _agent_policy_model()
-
-
-def _policy_model() -> TargetSidePolicyModel:
-    """A target-side policy model with one tool SPM that carries an allow and a deny edge."""
+def _policy_model() -> PolicyModel:
+    """A policy model with one tool SPM that carries an allow and a deny edge."""
     scope = Scope(id="scope-1", name="weather-tool.read", serviceId="team1/weather-tool")
     allow = PolicyRule(role=_role(), scope=scope)
     deny = PolicyRule(role=_role(id="role-2", name="blocked"), scope=scope, effect=RuleEffect.DENY)
-    return TargetSidePolicyModel(
+    return PolicyModel(
         services=[
             ServicePolicyModel(
                 service_id="team1/weather-tool",
@@ -128,32 +90,6 @@ class TestModelShape:
         rule = PolicyRule(role=_role(), scope=_scope())
         assert rule.effect == RuleEffect.ALLOW
 
-    def test_agent_policy_model_has_split_target_maps(self):
-        fields = set(AgentPolicyModel.model_fields)
-        assert {"target_allow_scopes", "target_deny_scopes"} <= fields
-        # The pre-ALLOW/DENY single map is gone.
-        assert "target_scopes" not in fields
-
-    def test_agent_policy_model_has_eight_split_rule_lists(self):
-        fields = set(AgentPolicyModel.model_fields)
-        assert {
-            "inbound_subject_allow_rules",
-            "inbound_subject_deny_rules",
-            "inbound_source_allow_rules",
-            "inbound_source_deny_rules",
-            "outbound_target_allow_rules",
-            "outbound_target_deny_rules",
-            "outbound_subject_allow_rules",
-            "outbound_subject_deny_rules",
-        } <= fields
-        # The pre-ALLOW/DENY intermixed lists are gone.
-        assert "inbound_rules" not in fields
-        assert "outbound_rules" not in fields
-
-    def test_agent_policy_model_keeps_effect_agnostic_identity_maps(self):
-        fields = set(AgentPolicyModel.model_fields)
-        assert {"agent_roles", "agent_scopes", "source_roles", "subject_roles"} <= fields
-
 
 # ---------------------------------------------------------------------------
 # Round-trip — lossless, including a DENY tuple
@@ -161,25 +97,9 @@ class TestModelShape:
 
 
 class TestRoundTrip:
-    def test_agent_policy_model_round_trips_losslessly(self):
-        restored = AgentPolicyModel.model_validate(_AGENT_MODEL.model_dump(mode="json"))
-        assert restored == _AGENT_MODEL
-
-    def test_deny_tuple_survives_round_trip(self):
-        restored = AgentPolicyModel.model_validate(_AGENT_MODEL.model_dump(mode="json"))
-        deny_rule = restored.outbound_target_deny_rules[0]
-        assert deny_rule.effect == RuleEffect.DENY
-        assert deny_rule.role.name == "blocked"
-        assert deny_rule.scope.name == "read"
-        # DENY-only role still resolvable via the effect-agnostic subject map.
-        assert any(r.name == "blocked" for r in restored.subject_roles["alice"])
-        # Split target maps survive with the right sides.
-        assert "weather-tool" in restored.target_allow_scopes
-        assert "secret-tool" in restored.target_deny_scopes
-
     def test_policy_model_round_trips_losslessly(self):
         model = _policy_model()
-        restored = TargetSidePolicyModel.model_validate(model.model_dump(mode="json"))
+        restored = PolicyModel.model_validate(model.model_dump(mode="json"))
         assert restored == model
         assert restored.services[0].inbound_deny_rules[0].effect == RuleEffect.DENY
 
@@ -190,7 +110,7 @@ class TestRoundTrip:
 
 
 class TestApplyPolicy:
-    def test_posts_the_tagged_policy_model(self):
+    def test_posts_the_policy_model(self):
         model = _policy_model()
         with patch("aiac.pdp.policy.library.api.requests.post", return_value=_ok()) as m:
             from aiac.pdp.policy.library.api import apply_policy
@@ -200,7 +120,7 @@ class TestApplyPolicy:
         assert m.call_args[0][0] == f"{BASE}/policy"
         body = m.call_args.kwargs["json"]
         assert body == model.model_dump(mode="json")
-        assert body["enforcement_side"] == "target-side"
+        assert set(body) == {"services"}
         assert m.call_args.kwargs.get("params") is None
 
     def test_raises_on_non_2xx(self):
@@ -217,7 +137,7 @@ class TestApplyPolicy:
 
 
 class TestReplacePolicy:
-    def test_puts_the_tagged_policy_model(self):
+    def test_puts_the_policy_model(self):
         model = _policy_model()
         with patch("aiac.pdp.policy.library.api.requests.put", return_value=_ok(204)) as m:
             from aiac.pdp.policy.library.api import replace_policy
@@ -293,14 +213,6 @@ class TestTimeout:
 
         monkeypatch.setenv("AIAC_PDP_HTTP_TIMEOUT", value)
         assert api._http_timeout() == expected
-
-
-class TestRetiredFunctions:
-    def test_the_per_agent_functions_are_gone(self):
-        import aiac.pdp.policy.library.api as api
-
-        assert not hasattr(api, "apply_agent_policy")
-        assert not hasattr(api, "delete_agent_policy")
 
 
 # ---------------------------------------------------------------------------

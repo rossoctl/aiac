@@ -2,9 +2,7 @@
 
 ``project_inbound(spm)`` splits the inbound edges of one ``ServicePolicyModel`` into the user gate
 (``role.kind == User`` → subject) and the calling-agent gate (``Agent`` → source), each by effect,
-and builds the effect-agnostic identity maps. Both sides use it: ``_derive`` for an APM's inbound
-(agent side), and the writer for the inbound of ``SPM(X)`` (target side). So, for one SPM, both
-sides give the same inbound gates.
+and builds the effect-agnostic identity maps. The writer uses it for the inbound of ``SPM(X)``.
 
 Pure: no I/O.
 """

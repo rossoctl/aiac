@@ -70,8 +70,9 @@ AGENTS: dict[str, dict] = {
 
 # --- Tools --------------------------------------------------------------------------------------
 
+# Each tool id is "<namespace>/<name>", as each agent id: the writer derives the CR of the tool from it.
 TOOLS: dict[str, dict] = {
-    "repo-tool": {
+    "team1/repo-tool": {
         "description": (
             "Capability provider Tool for a source repository. It performs read and write "
             "operations on repository source contents."
@@ -81,7 +82,7 @@ TOOLS: dict[str, dict] = {
             "tool-scope-repo-write": "Create, modify, or delete source repository contents; commit file changes.",
         },
     },
-    "tracker-tool": {
+    "team1/tracker-tool": {
         "description": (
             "Capability provider Tool for an issue tracker. It performs read and write "
             "operations on issues and their comment threads."

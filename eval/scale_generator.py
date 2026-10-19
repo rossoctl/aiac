@@ -145,11 +145,11 @@ def generate_total_corpus(
 
     agents: dict[str, dict] = {}
     for i in range(n_agents):
-        # "team1/" -- the PDP writer server-side-applies a real AuthorizationPolicy CR per agent
-        # against a live cluster namespace matching the agent id's own namespace segment (not just
-        # a local file dump), so this must be a namespace that actually exists there. Every
-        # hand-authored eval scenario already shares "team1" for exactly this reason -- reused
-        # here rather than inventing a new namespace that would need to be created out of band.
+        # "team1/" -- the PDP writer server-side-applies a real AuthorizationPolicy CR per service
+        # (agent or tool) against a live cluster namespace matching the service id's own namespace
+        # segment (not just a local file dump), so this must be a namespace that actually exists
+        # there. Every hand-authored eval scenario already shares "team1" for exactly this reason --
+        # reused here rather than inventing a new namespace that would need to be created out of band.
         agent_id = f"team1/scale-agent-{i:03d}"
         agents[agent_id] = {
             "description": f"Generated agent {i}.",
@@ -160,7 +160,7 @@ def generate_total_corpus(
 
     tools: dict[str, dict] = {}
     for i in range(n_tools):
-        tool_id = f"scale-tool-{i:03d}"
+        tool_id = f"team1/scale-tool-{i:03d}"  # "team1/": see the agent ids above
         tools[tool_id] = {
             "description": f"Generated tool {i}.",
             "scopes": {f"tool-scope-{i:03d}": f"Scope for generated tool {i}."},
@@ -193,12 +193,12 @@ def generate_total_corpus(
     for scope in inbound_scope_names:
         if scope not in reachable_inbound:
             inbound_pairs.append((rng.choice(user_names), scope))
-    # Checked independently, not as a union: the real pipeline only ever renders a user->tool pair
-    # through an agent role that targets the same scope (the PCE's outbound-subject derivation is
-    # gated on an outbound-target grant existing for that scope) -- a scope that already has a
-    # user-role (subject) grant but zero agent-role (target) grant would otherwise look "reachable"
-    # from the union and skip repair, leaving that scope's subject pairs permanently unrenderable
-    # in Rego even though the ground truth says they should be granted. Each side gets its own
+    # Checked independently, not as a union: a user->tool call passes only through an agent role
+    # that targets the same scope (the tool inbound needs both its user gate and its calling-agent
+    # gate) -- a scope that already has a user-role (subject) grant but zero agent-role (target)
+    # grant would otherwise look "reachable" from the union and skip repair, leaving that scope's
+    # subject pairs permanently unreachable even though the ground truth says they should be
+    # granted. Each side gets its own
     # independent top-up instead, so every tool scope ends up with at least one grant on *both*
     # sides, not just one or the other.
     reachable_subject = {s for _, s in outbound_subject_pairs}
@@ -253,11 +253,12 @@ class PerDecisionCorpus:
 
 FOCAL_SCOPE_NAME = "scale-scope-per-decision"
 FOCAL_ROLE_NAME = "scale-role-per-decision"
-# The two agents in PerDecisionCorpus.e2e_scenario -- named constants (not re-typed at each call
-# site) so eval/test_policy_pipeline_scale.py's e2e fixture/structural test and this module agree
-# by construction, never by convention.
+# The two agents and the tool in PerDecisionCorpus.e2e_scenario -- named constants (not re-typed
+# at each call site) so eval/test_policy_pipeline_scale.py's e2e fixture/structural test and this
+# module agree by construction, never by convention.
 PER_DECISION_SCOPE_AGENT_ID = "team1/scale-agent-pd-scope"
 PER_DECISION_ROLE_AGENT_ID = "team1/scale-agent-pd-role"
+PER_DECISION_TOOL_ID = "team1/scale-tool-pd-role"
 
 
 def _render_per_decision_text(focal_description: str, grant_lines: list[str]) -> str:
@@ -327,7 +328,7 @@ def generate_per_decision(*, n_candidates: int = 100, seed: int = 0, granted_den
             },
         },
         TOOLS={
-            "scale-tool-pd-role": {
+            PER_DECISION_TOOL_ID: {
                 "description": "Generated tool owning every per-decision candidate scope.",
                 "scopes": {name: f"Candidate scope {name}." for name in candidate_scopes},
             }
@@ -343,7 +344,7 @@ def generate_per_decision(*, n_candidates: int = 100, seed: int = 0, granted_den
         INBOUND_PAIRS=[(role, FOCAL_SCOPE_NAME) for role in sorted(granted_roles)],
         OUTBOUND_PAIRS=[(FOCAL_ROLE_NAME, scope) for scope in sorted(granted_scopes)],
         OUTBOUND_SUBJECT_PAIRS=[],
-        policy_text="",  # unused at the e2e level -- each agent's own inbound/outbound rego is
+        policy_text="",  # unused at the e2e level -- the rego of each scope owner is
         # rendered from whatever PolicyRules the caller directly computes with _invoke_graph and
         # hands to compute_and_apply, not from a policy document read off AIAC_POLICY_FILE.
     )

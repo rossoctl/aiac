@@ -29,14 +29,15 @@ exactly which scope/role decisions this applies to. See
 mechanism, and its module docstring for why this applies uniformly to the shared fixture's other
 consumer (the scenarios suite) too.
 
-Known gap: the ``outbound_target`` gate's denial side (``AgentPolicyModel.outbound_target_deny_rules``)
-is computed by the PCE but never rendered into the outbound Rego by
-``aiac.pdp.service.policy.opa.rego.generate_outbound_rego`` — only the ALLOW side
-(``agent_role_scopes``) is emitted. So for that one gate ``denied`` is always empty and its
-``denial_precision`` reads vacuously ``1.0``; ``over_grants``/``under_grants`` for that gate are
-unaffected (they depend only on ``granted``/``expected``). See
-``docs/evaluation/policy-eval-correctness-e2e.md`` for the full writeup — this is a pre-existing
-production Rego-generator gap, not something this suite introduces or is scoped to fix.
+Scoring source: the rendered inbound Rego of each service (agent or tool). Each callee checks the
+access to itself in its own inbound, so every rule is in the inbound Rego of the service that owns
+its scope. Each map is flat (keyed by role), and ``_accumulate_service_gates`` puts its pairs in the
+three gates: the subject maps of an agent give ``inbound``; the subject maps on a target scope give
+``outbound_subject``; the source maps (the calling-agent gate, allow and deny) on a target scope
+give ``outbound_target``. Each row is checked against the owner of its scope: a row in the
+inbound of a service that does not own its scope is scored as ``(role, "<scope>@<service>")``, so a
+rule that the PCE routes to the wrong service is an over-grant and an under-grant, not a true
+positive.
 
 Run (needs KEYCLOAK_URL + admin creds + LLM_* exported, ``opa`` on PATH). Unlike the PRB-level
 suite, this one is NOT `-n`-parallelizable (all 8 scenarios share one session-scoped ``pipeline``
@@ -63,7 +64,7 @@ SRC = REPO_ROOT / "src"
 sys.path.insert(0, str(REPO_ROOT))  # so ``import test.system.*``/``eval.*`` resolves
 sys.path.insert(0, str(SRC))  # so ``import aiac.*`` resolves
 
-from eval.correctness_e2e_helpers import _accumulate_agent_gates, _user_role_rows  # noqa: E402
+from eval.correctness_e2e_helpers import _accumulate_service_gates, _user_role_rows  # noqa: E402
 from eval.correctness_scorer import score_scenario  # noqa: E402
 from eval.test_policy_pipeline_eval import (  # noqa: E402
     SCENARIOS,
@@ -92,62 +93,49 @@ Pair = tuple[str, str]
 
 def _rego_map(rego: Path, doc: str) -> dict:
     """Query one rendered Rego data document under ``data.authbridge.client.<doc>`` (e.g.
-    ``inbound.request.subject_role_allow_scopes``) with no input — these are plain declarations,
-    not decision rules, so they need none. ``{}`` when ``rego`` has no file on disk (an agent with
-    no rendered rego for this direction — see ``_e2e_grant_sets``).
+    ``inbound.request``) with no input — the maps are plain declarations, not decision rules, so
+    they need none. ``{}`` when ``rego`` has no file on disk (a service with no rendered rego — see
+    ``_e2e_grant_sets``).
 
-    The value is the rendered shape: ``{role: [scope, ...]}`` for the inbound maps and
-    ``agent_role_scopes``, ``{role: {target: [tool, ...]}}`` for the two outbound subject maps
-    (LIM-02). ``_accumulate_agent_gates`` reads each map in its own shape."""
+    The value of each ``*_scopes`` map of the inbound package is flat: ``{role: [scope, ...]}``."""
     if not rego.is_file():
         return {}
     return opa_eval([rego], f"data.authbridge.client.{doc}", {})
 
 
 def _scope_owners(scenario: ModuleType) -> dict[str, str]:
-    """The owner (serviceId) of each scope of ``scenario``, as ``_scope_owner`` gives it. The
-    outbound subject maps key each rule by this id (the eval provisions each client with its
-    scenario id as clientId, so the serviceId is the scenario id)."""
+    """The owner (serviceId) of each scope of ``scenario``, as ``_scope_owner`` gives it. Each rule
+    must be in the inbound of this service (the eval provisions each client with its scenario id as
+    clientId, so the serviceId is the scenario id)."""
     names = _agent_inbound_scope_names(scenario) | _agent_delegation_scope_names(scenario) | _tool_scope_names(scenario)
     return {name: _scope_owner(scenario, name) for name in names}
 
 
 def _e2e_grant_sets(pipeline_result: dict, scenario: ModuleType) -> tuple[dict[str, set[Pair]], dict[str, set[Pair]]]:
     """Build the ``(granted, denied)`` gate dicts ``score_scenario`` expects, sourced from the
-    rendered Rego of every agent in ``scenario`` (real Keycloak+PCE+OPA output, not the PRB's raw
-    rules) — see the module docstring for the per-gate map table and the ``outbound_target``
-    denial gap. Agents with no rego on disk (declared/emergent ``EXPECT_NO_REGO``) contribute
-    nothing, same as ``test_inbound``/``test_outbound`` already handle it.
-
-    An outbound subject rule that is keyed by a target that does not own its scope is scored as
-    ``(role, "<scope>@<target>")``, an over-grant for a grant (``_pairs_from_target_map``)."""
+    rendered inbound Rego of every agent and tool in ``scenario`` (real Keycloak+PCE+OPA output,
+    not the PRB's raw rules) — see the module docstring for the per-gate maps. A service with no
+    rego on disk (no rule was routed to its scopes, or declared ``EXPECT_NO_REGO``) contributes
+    nothing, same as ``test_inbound``/``test_outbound`` already handle it."""
     rego_dir = pipeline_result["rego_dir"]
     user_roles = _user_role_names(scenario)
+    target_scopes = _tool_scope_names(scenario) | _agent_delegation_scope_names(scenario)
     scope_owners = _scope_owners(scenario)
     granted: dict[str, set[Pair]] = {}
     denied: dict[str, set[Pair]] = {}
 
-    for agent_id in scenario.AGENTS:
-        inbound_rego = _rego_path(rego_dir, agent_id, "inbound")
-        outbound_rego = _rego_path(rego_dir, agent_id, "outbound")
-        _accumulate_agent_gates(
+    for service_id in {**scenario.AGENTS, **scenario.TOOLS}:
+        inbound = _rego_map(_rego_path(rego_dir, service_id, "inbound"), "inbound.request")
+        _accumulate_service_gates(
             granted,
             denied,
-            inbound_allow=_user_role_rows(
-                _rego_map(inbound_rego, "inbound.request.subject_role_allow_scopes"), user_roles
-            ),
-            inbound_deny=_user_role_rows(
-                _rego_map(inbound_rego, "inbound.request.subject_role_deny_scopes"), user_roles
-            ),
-            # The two outbound subject maps are keyed by role and then by target (LIM-02); each
-            # target is checked against the owner of the tool (``scope_owners``).
-            outbound_subject_allow=_user_role_rows(
-                _rego_map(outbound_rego, "outbound.request.subject_role_allow_scopes"), user_roles
-            ),
-            outbound_subject_deny=_user_role_rows(
-                _rego_map(outbound_rego, "outbound.request.subject_role_deny_scopes"), user_roles
-            ),
-            outbound_target_allow=_rego_map(outbound_rego, "outbound.request.agent_role_scopes"),
+            service_id=service_id,
+            is_agent=service_id in scenario.AGENTS,
+            subject_allow=_user_role_rows(inbound.get("subject_role_allow_scopes", {}), user_roles),
+            subject_deny=_user_role_rows(inbound.get("subject_role_deny_scopes", {}), user_roles),
+            source_allow=inbound.get("source_role_allow_scopes", {}),
+            source_deny=inbound.get("source_role_deny_scopes", {}),
+            target_scopes=target_scopes,
             scope_owners=scope_owners,
         )
     return granted, denied

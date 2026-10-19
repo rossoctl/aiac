@@ -55,8 +55,9 @@ AGENTS: dict[str, dict] = {
 #
 # Byte-identical to scenario_eval_confusable_agents_perturbed.py.
 
+# Each tool id is "<namespace>/<name>", as each agent id: the writer derives the CR of the tool from it.
 TOOLS: dict[str, dict] = {
-    "roster-tool": {
+    "team1/roster-tool": {
         "description": (
             "A capability provider for team rosters and practice schedules, handling lookups of "
             "the roster and updates to the practice schedule."
@@ -66,7 +67,7 @@ TOOLS: dict[str, dict] = {
             "tool-scope-schedule-write": "Create and update the practice schedule.",
         },
     },
-    "evaluation-tool": {
+    "team1/evaluation-tool": {
         "description": (
             "A capability provider for player performance evaluations, handling both lookups and "
             "updates of evaluation records."

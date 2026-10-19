@@ -74,8 +74,9 @@ AGENTS: dict[str, dict] = {
 #
 # Byte-identical to scenario_eval_baseline_perturbed.py.
 
+# Each tool id is "<namespace>/<name>", as each agent id: the writer derives the CR of the tool from it.
 TOOLS: dict[str, dict] = {
-    "repo-tool": {
+    "team1/repo-tool": {
         "description": (
             "A capability provider for a source repository, carrying out read and write "
             "operations against what's stored in it."
@@ -85,7 +86,7 @@ TOOLS: dict[str, dict] = {
             "tool-scope-repo-write": "Add, edit, or remove repository contents, including committing file changes.",
         },
     },
-    "tracker-tool": {
+    "team1/tracker-tool": {
         "description": (
             "A capability provider for an issue tracker, carrying out read and write operations "
             "on issues and their comment threads."

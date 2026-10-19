@@ -52,8 +52,9 @@ AGENTS: dict[str, dict] = {
 
 # --- Tools --------------------------------------------------------------------------------------
 
+# Each tool id is "<namespace>/<name>", as each agent id: the writer derives the CR of the tool from it.
 TOOLS: dict[str, dict] = {
-    "roster-tool": {
+    "team1/roster-tool": {
         "description": (
             "Capability provider Tool for team rosters and practice schedules. It performs read "
             "operations on the roster and write operations on the practice schedule."
@@ -63,7 +64,7 @@ TOOLS: dict[str, dict] = {
             "tool-scope-schedule-write": "Create and update the practice schedule.",
         },
     },
-    "evaluation-tool": {
+    "team1/evaluation-tool": {
         "description": (
             "Capability provider Tool for player performance evaluations. It performs read and "
             "write operations on evaluation records."

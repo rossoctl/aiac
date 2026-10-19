@@ -72,8 +72,9 @@ AGENTS: dict[str, dict] = {
 #
 # Byte-identical to scenario_eval_unreachable_resources_perturbed.py.
 
+# Each tool id is "<namespace>/<name>", as each agent id: the writer derives the CR of the tool from it.
 TOOLS: dict[str, dict] = {
-    "records-tool": {
+    "team1/records-tool": {
         "description": (
             "A capability provider for patient records, carrying out read and write operations on "
             "what's stored in them."
@@ -83,7 +84,7 @@ TOOLS: dict[str, dict] = {
             "tool-scope-records-write": "Create and update patient records.",
         },
     },
-    "insurance-tool": {
+    "team1/insurance-tool": {
         "description": (
             "A capability provider for insurance-coverage verification, performing lookups against "
             "a patient's insurance details. No agent role is ever handed its scope anywhere in the "

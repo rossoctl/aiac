@@ -17,11 +17,10 @@ no ``.rego`` dump and no ``opa`` binary here anymore (handoff 08). Both gates ar
 build the outbound ``input.identity`` + ``input.mcp.params.name`` (the **bare** tool name) — so the
 test never hand-builds an input document.
 
-**The enforcement side.** The run uses the live side (``AIAC_ENFORCEMENT_SIDE`` in the
-``aiac-agent-config`` ConfigMap, default ``target-side``). Under target side the agent's outbound is a
-pass-through (D24) and github-tool's own inbound OPA decides each tool call; under agent side the
-agent's outbound OPA decides. The verdict tables are the same; only the enforcement-point node
-(``test_deny_comes_from_enforcement_point``) depends on the side.
+**The enforcement point.** Each callee checks the access to itself in its own inbound OPA (PRD D34).
+The agent's outbound is a pass-through (D24), and github-tool's own inbound OPA decides each tool
+call. UC-1 rungs 2 and 3 (``test_uc1_onboard_*::test_deny_comes_from_enforcement_point``) check
+that a deny comes from that place.
 
 Where this sits vs. the UC-1 ladder: rungs 1–3 (``test_uc1_onboard_*``) isolate onboarding-order
 properties; this module is the **full happy-path matrix + negative controls** over the fully onboarded
@@ -99,9 +98,8 @@ def test_outbound(pipeline: dict, subject: str, tool_bare: str) -> None:
     """The enforced tool check — a real MCP ``tools/call`` for the **bare** tool through AuthBridge's
     forward proxy (token-exchange → the tool check) — allows a subject's call iff both the subject and
     some agent role are entitled to that tool's scope. ``mcp-parser`` surfaces
-    ``input.mcp.params.name`` (no hand-built input). A denial is github-tool's inbound HTTP 403 under
-    target side, or the agent's outbound JSON-RPC error frame under agent side; the harness classifies
-    both."""
+    ``input.mcp.params.name`` (no hand-built input). A denial is github-tool's inbound HTTP 403; the
+    harness classifies it."""
     assert uc1.outbound_decision(pipeline, subject, tool_bare) == uc1.expected_outbound_decision(subject, tool_bare), (
         f"{subject} / {tool_bare}"
     )
@@ -114,7 +112,7 @@ def test_outbound(pipeline: dict, subject: str, tool_bare: str) -> None:
 
 def test_outbound_unknown_tool_denied(pipeline: dict) -> None:
     """An otherwise-allowed subject (dev-user) invoking a tool name that is in **no** allowed scope is
-    denied — the tool check (under target side, github-tool's inbound gate) matches
+    denied — the tool check (github-tool's inbound gate) matches
     ``input.mcp.params.name`` exactly, so an unknown tool falls through to deny-by-default (not an
     accidental allow)."""
     assert uc1.outbound_decision(pipeline, "dev-user", "nonexistent-tool") == "deny"
@@ -124,22 +122,3 @@ def test_outbound_bogus_tool_shape_denied(pipeline: dict) -> None:
     """A bogus, destructive-sounding tool name matching no discovered scope is denied — guards against
     an over-broad match letting an unrecognized operation through."""
     assert uc1.outbound_decision(pipeline, "dev-user", "delete_everything") == "deny"
-
-
-# ======================================================================================
-# Enforcement point — where the deny comes from, by the live enforcement side
-# ======================================================================================
-
-
-def test_deny_comes_from_enforcement_point(pipeline: dict) -> None:
-    """The raw response of an ungranted call (``test-user`` × ``source-read``) shows that the deny comes
-    from the enforcement point of the live side (``deny_origin``). Under target side it comes from
-    github-tool's inbound (HTTP 403, relayed by the agent's pass-through outbound), so the agent's
-    outbound let the call through: the tool check moved from the agent's outbound to the tool's inbound.
-    Under agent side it comes from the agent's outbound (a JSON-RPC error frame at HTTP 200)."""
-    probe = uc1.outbound_deny_probe(pipeline, "test-user", "source-read")
-    want = uc1.SIDE_ENFORCEMENT_POINT[pipeline["side"]]
-    assert probe["decision"] == "deny" and probe["origin"] == want, (
-        f"{pipeline['side']}: test-user / source-read decision={probe['decision']!r} origin={probe['origin']!r} "
-        f"(want 'deny' from {want!r}); HTTP {probe['code']}, body={probe['body'][:300]!r}"
-    )

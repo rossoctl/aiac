@@ -72,15 +72,16 @@ def test_inbound_oracle(subject: str, allowed: bool) -> None:
 
 
 # ======================================================================================
-# Rung 1 (agent only) — the outbound gate is empty
+# Rung 1 (agent only) — no tool is onboarded, so the user gate of the tool inbound is empty
 # ======================================================================================
 
 
 @pytest.mark.parametrize("subject", list(scn.USERS))
 @pytest.mark.parametrize("tool_bare", scn.TOOL_REQUEST_NAMES)
 def test_rung1_outbound_oracle_all_deny(subject: str, tool_bare: str) -> None:
-    """Rung 1's defining property: the outbound user gate is empty, so every ``(subject, tool)`` is
-    denied — no tool was onboarded, so no tool scope is in the universe."""
+    """Rung 1's defining property: the user gate of the tool inbound is empty, so every
+    ``(subject, tool)`` is denied — no tool was onboarded, so github-tool has no CR and no tool scope
+    is in the universe."""
     assert _rung1_expected_outbound(subject, tool_bare) is False
 
 
@@ -117,9 +118,9 @@ def test_rung1_grant_set_oracle() -> None:
     ],
 )
 def test_tool_onboarded_outbound_oracle(subject: str, tool_bare: str, allowed: bool) -> None:
-    """The full user→tool outbound gate over the **bare** tool names (developer: source rw + issues
-    read; tester: issues rw; devops: nothing) — the gate tool onboarding completes on the agent, shared
-    by rungs 2 and 3 and the full-matrix suite."""
+    """The full user→tool oracle over the **bare** tool names (developer: source rw + issues
+    read; tester: issues rw; devops: nothing) — the user gate of the tool inbound that tool onboarding
+    writes into github-tool's CR, shared by rungs 2 and 3 and the full-matrix suite."""
     assert uc1.expected_outbound_bare(subject, tool_bare) is allowed
 
 
@@ -128,7 +129,7 @@ def test_rung2_grant_set_oracle() -> None:
     (bare) grant set == the (non-empty) ``OUTBOUND_SUBJECT_BARE`` truth table."""
     assert RUNG2_INBOUND == set(scn.INBOUND_PAIRS)
     assert RUNG2_OUTBOUND_SUBJECT_BARE == scn.OUTBOUND_SUBJECT_BARE
-    assert RUNG2_OUTBOUND_SUBJECT_BARE, "rung 2's outbound gate must be non-empty (the tool was onboarded)"
+    assert RUNG2_OUTBOUND_SUBJECT_BARE, "rung 2's tool-inbound user gate must be non-empty (the tool was onboarded)"
 
 
 def test_rung3_grant_set_oracle() -> None:
@@ -136,7 +137,7 @@ def test_rung3_grant_set_oracle() -> None:
     (bare) grant set == the (non-empty) ``OUTBOUND_SUBJECT_BARE`` truth table."""
     assert RUNG3_INBOUND == set(scn.INBOUND_PAIRS)
     assert RUNG3_OUTBOUND_SUBJECT_BARE == scn.OUTBOUND_SUBJECT_BARE
-    assert RUNG3_OUTBOUND_SUBJECT_BARE, "rung 3's outbound gate must be non-empty (the tool was onboarded)"
+    assert RUNG3_OUTBOUND_SUBJECT_BARE, "rung 3's tool-inbound user gate must be non-empty (the tool was onboarded)"
 
 
 def test_order_independence_oracle() -> None:

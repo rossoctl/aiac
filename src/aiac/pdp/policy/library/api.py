@@ -1,9 +1,9 @@
 """HTTP client for the PDP Policy Writer (OPA) REST API.
 
 Module-level functions wrapping ``{AIAC_PDP_POLICY_URL}/policy...`` endpoints (D18c). The body
-of ``apply_policy`` / ``replace_policy`` is a tagged policy model; the writer upserts one CR per
-entry and reads the enforcement side from the tag. The PDP Policy Writer operates on Kubernetes
-CRs, not a Keycloak realm, so none of these functions take or send a ``realm`` parameter.
+of ``apply_policy`` / ``replace_policy`` is the policy model; the writer upserts one CR per
+entry. The PDP Policy Writer operates on Kubernetes CRs, not a Keycloak realm, so none of these
+functions take or send a ``realm`` parameter.
 """
 
 import os

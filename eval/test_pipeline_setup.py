@@ -21,10 +21,7 @@ def _role(name: str, kind: RoleKind, actor_ids: list[str]) -> Role:
 
 
 class TestPreparePipeline:
-    def test_sets_the_agent_side_and_every_url(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-        # The suites score the agents' outbound Rego, which is a pass-through under target side
-        # (the PCE default), so every caller must get agent-side -- the Scale suite once did not.
-        monkeypatch.delenv("AIAC_ENFORCEMENT_SIDE", raising=False)
+    def test_sets_every_url(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         idp, store, opa = prepare_pipeline(
             monkeypatch.setenv,
             realm="r1",
@@ -34,7 +31,6 @@ class TestPreparePipeline:
             store=("127.0.0.1", 7602),
             opa=("127.0.0.1", 7601),
         )
-        assert os.environ["AIAC_ENFORCEMENT_SIDE"] == "agent-side"
         assert os.environ["KEYCLOAK_REALM"] == "r1"
         assert os.environ["AIAC_PDP_CONFIG_URL"] == "http://127.0.0.1:7600"
         assert os.environ["AIAC_POLICY_MODEL_STORE_URL"] == "http://127.0.0.1:7602"

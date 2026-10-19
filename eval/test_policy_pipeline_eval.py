@@ -31,9 +31,9 @@ scenario):
 
 Unlike ``test_policy_pipeline.py`` (hardcoded to the literal ``github_agent`` slug and a single
 tool id), every path/query here is derived from each scenario module's own agent/tool ids via
-``slugify``-equivalent ``.replace("-", "_")``, and the outbound gate is driven through the
-generalized ``probe_eval.rego`` (parameterized by ``input.agent_id``) rather than the fixed
-``probe.rego``. ``launcher.py`` is reused unmodified.
+``slugify``-equivalent ``.replace("-", "_")``, and a tool call is driven through the generalized
+``probe_eval.rego`` (loaded beside the inbound Rego of the callee, with the calling agent in
+``input.client_id``) rather than the fixed ``probe.rego``. ``launcher.py`` is reused unmodified.
 
 Every scenario's ``AIAC_POLICY_FILE`` is pointed at its **committed digested** counterpart
 in ``eval/scenarios_digested/`` (``digested_policy_path``, same filename) — production feeds the
@@ -217,7 +217,8 @@ def provision_keycloak_admin(admin: KeycloakAdmin, test_realm: str, scenario: Mo
 
     for name, description in scenario.USER_ROLES.items():
         # aiac.managed marker required: the IdP service only populates actorIds (member usernames)
-        # for managed roles, and the PCE needs actorIds to build the subject_roles map in the APM.
+        # for managed roles, and the writer needs actorIds to build the subject_roles map of each
+        # inbound Rego.
         admin.create_realm_role(
             {"name": name, "description": description, "attributes": {"aiac.managed": ["true"]}},
             skip_exists=True,
@@ -301,9 +302,9 @@ def _read_back(config: Configuration) -> tuple[dict[str, Role], dict[str, Scope]
     call never queries). Overlaid below, once, for every role any service actually owns, piggy-
     backing on the ``get_services()`` call already made for scopes rather than paying for a
     second one — so every caller gets the correct attribution for free, not just one that
-    remembers to patch it locally. Getting this wrong is why ``compute_and_apply`` could
-    misattribute an agent role's rules away from its owning agent's own outbound APM, leaving an
-    agent that genuinely received grants with no rendered outbound Rego at all.
+    remembers to patch it locally. Getting this wrong puts the rules of an agent role in the user
+    gate of the callee's inbound Rego (with the wrong holders), so the calling-agent gate has no
+    grant for the agent that genuinely received it.
     """
     roles = {r.name: r for r in config.get_roles()}
     owned: dict[str, Role] = {}
@@ -477,10 +478,10 @@ def opa_eval(rego_paths: list[Path], query: str, input_doc: dict) -> Any:
     return json.loads(out)["result"][0]["expressions"][0]["value"]
 
 
-def _rego_path(rego_dir: Path, agent_id: str, direction: str) -> Path:
-    """Path to a generated policy file, matching ``main.py``'s
+def _rego_path(rego_dir: Path, service_id: str, direction: str) -> Path:
+    """Path to a generated policy file of one service (agent or tool), matching ``main.py``'s
     ``<rego_dir>/<namespace>/<name>/{inbound,outbound}/request.rego`` layout."""
-    namespace, _, name = agent_id.partition("/")
+    namespace, _, name = service_id.partition("/")
     return rego_dir / namespace / name / direction / "request.rego"
 
 
@@ -528,7 +529,7 @@ def expected_inbound(scenario: ModuleType, subject: str, agent_id: str) -> bool:
     audience gate — cannot distinguish "may call me directly" from "may reach me only as a
     delegation target through another agent". A role granted a delegation scope for delegation
     purposes necessarily also passes the owning agent's own inbound gate; there is no mechanism in
-    the two-layer policy model that would keep the two separate."""
+    the policy model that would keep the two separate."""
     role = scenario.USERS[subject]
     agent = scenario.AGENTS[agent_id]
     agent_scopes = set(agent["inbound_scopes"]) | set(agent.get("delegation_scopes", {}))
@@ -540,7 +541,8 @@ def expected_inbound(scenario: ModuleType, subject: str, agent_id: str) -> bool:
 def expected_outbound(scenario: ModuleType, subject: str, agent_id: str, scope: str) -> bool:
     """A subject's call through ``agent_id`` resolves to ``scope`` iff the subject is entitled to
     it (``OUTBOUND_SUBJECT_PAIRS``) *and* one of ``agent_id``'s OWN roles is entitled to it
-    (``OUTBOUND_PAIRS``) — per-agent, since each agent's outbound gate only sees its own roles."""
+    (``OUTBOUND_PAIRS``) — per-agent, since the calling-agent gate of the callee's inbound sees only
+    the roles of the calling agent."""
     role = scenario.USERS[subject]
     subject_ok = (role, scope) in set(scenario.OUTBOUND_SUBJECT_PAIRS)
     agent_role_names = set(scenario.AGENTS[agent_id]["roles"])
@@ -664,13 +666,13 @@ def prepare_pipeline(
 
     Wipes and recreates ``rego_dir``, points the store at ``db_path`` (the caller gives a fresh
     path and owns its directory), and sets (through ``setenv``) every env var that the in-process
-    PCE reads: the realm, the four ``AIAC_*_URL`` vars at the ``(host, port)`` pairs, and the
-    enforcement side. Each caller that runs the pipeline uses this one helper, so a new pipeline
-    setting reaches all of them. The caller sets ``AIAC_POLICY_FILE`` itself (a run can use more
-    than one policy file). ``setenv`` is ``os.environ.__setitem__`` in a ``ProcessPoolExecutor``
-    worker (never the pytest process), else a ``MonkeyPatch.setenv`` that restores the env when
-    the caller is done. Set every var on each call, never conditionally: a worker can run more
-    than one scenario, and a later scenario must not keep the realm or URLs of an earlier one."""
+    PCE reads: the realm and the four ``AIAC_*_URL`` vars at the ``(host, port)`` pairs. Each caller
+    that runs the pipeline uses this one helper, so a new pipeline setting reaches all of them. The
+    caller sets ``AIAC_POLICY_FILE`` itself (a run can use more than one policy file). ``setenv``
+    is ``os.environ.__setitem__`` in a ``ProcessPoolExecutor`` worker (never the pytest process),
+    else a ``MonkeyPatch.setenv`` that restores the env when the caller is done. Set every var on
+    each call, never conditionally: a worker can run more than one scenario, and a later scenario
+    must not keep the realm or URLs of an earlier one."""
     if rego_dir.exists():
         shutil.rmtree(rego_dir)
     rego_dir.mkdir(parents=True)
@@ -684,9 +686,6 @@ def prepare_pipeline(
     # default once ports diverge.
     setenv("AIAC_POLICY_MODEL_STORE_URL", f"http://{store[0]}:{store[1]}")
     setenv("AIAC_PDP_POLICY_URL", f"http://{opa[0]}:{opa[1]}")
-    # The suites score each AGENT's outbound Rego (agent_role_scopes, target_allow_scopes), which is
-    # a pass-through under target side, so this in-process PCE always deploys the agent side.
-    setenv("AIAC_ENFORCEMENT_SIDE", "agent-side")
 
     return (
         Service("aiac.idp.service.configuration.keycloak.main:app", port=idp[1], host=idp[0]),
@@ -781,15 +780,19 @@ def _provision_scenario(name: str, idp_port: int, store_port: int, opa_port: int
             )
             compute_and_apply(rules, override=False)
 
-        # Assert every agent's rego actually landed here at setup — EXCEPT agents the scenario
-        # itself declares as deliberately/emergently unreachable (Scenario 4), so a real
-        # pipeline failure still surfaces as one clear error instead of cryptic per-test skips.
+        # Assert the rego of each scope owner (agent or tool) that has a rule actually landed here
+        # at setup: the PCE deploys a CR only for a service whose SPM the run touched (a rule routed
+        # to its scopes). An agent that the scenario declares as deliberately/emergently unreachable
+        # (Scenario 4) is excused, as before. So a real pipeline failure still surfaces as one clear
+        # error instead of cryptic per-test failures.
         allow_missing = set(getattr(scenario, "EXPECT_NO_REGO", frozenset()))
+        services = {**scenario.AGENTS, **scenario.TOOLS}
+        owners = sorted({rule.scope.serviceId for rule in rules if rule.scope.serviceId in services})
         expected = [
-            _rego_path(rego_dir, agent_id, direction)
-            for agent_id in scenario.AGENTS
+            _rego_path(rego_dir, owner, direction)
+            for owner in owners
             for direction in ("inbound", "outbound")
-            if agent_id not in allow_missing
+            if owner not in allow_missing
         ]
         missing = [str(p.relative_to(rego_dir)) for p in expected if not p.is_file()]
         if missing:
@@ -916,10 +919,11 @@ def test_inbound(pipeline: dict[str, dict], scenario_name: str, agent_id: str, s
 
     rego = _rego_path(scenario_result["rego_dir"], agent_id, "inbound")
     if not rego.is_file():
-        # Only agents the scenario declared as emergently unreachable can be missing here (the
-        # fixture already raised for anything else) — confirm ground truth agrees no one reaches it.
+        # An agent has no rego only when the run routed no rule to its scopes, or when the scenario
+        # declares it emergently unreachable (the fixture already raised for any other agent). With
+        # no CR, every call to it is denied (D20) — confirm ground truth agrees no one reaches it.
         record_property("output", None)
-        record_property("llm_reasoning", f"'{agent_id}' produced no inbound rego (declared unreachable)")
+        record_property("llm_reasoning", f"'{agent_id}' produced no inbound rego (no rule on its scopes)")
         assert not expected, f"{agent_id} produced no inbound rego but {subject} is expected to reach it"
         return
 
@@ -943,13 +947,24 @@ def _outbound_cases() -> list[tuple[str, str, str, str]]:
     return cases
 
 
+def _probe_tool_call(rego: Path, subject: str, client_id: str, function_name: str) -> bool:
+    """Evaluate the generalized probe (``probe_eval.rego``) beside the inbound Rego of the callee:
+    ``subject`` calls the tool ``function_name`` (soft match) of the callee through the agent
+    ``client_id``."""
+    return opa_eval(
+        [rego, HERE / "probe_eval.rego"],
+        "data.probe.inbound_eval.allow",
+        {"subject": subject, "client_id": client_id, "function_name": function_name},
+    )
+
+
 @pytest.mark.parametrize("scenario_name,agent_id,subject,scope", _outbound_cases())
 def test_outbound(
     pipeline: dict[str, dict], scenario_name: str, agent_id: str, subject: str, scope: str, record_property
 ) -> None:
-    """The generated outbound gate (via the generalized probe) allows a subject's call through
-    ``agent_id`` to a target scope iff both the subject and that specific agent's own role are
-    entitled to it."""
+    """The generated inbound gate of the scope owner (via the generalized probe) allows a subject's
+    call through ``agent_id`` to a target scope iff both the subject and that specific agent's own
+    role are entitled to it."""
     scenario = SCENARIOS[scenario_name]
     role = scenario.USERS[subject]
     scenario_result = _require_scenario(pipeline, scenario_name)
@@ -966,60 +981,66 @@ def test_outbound(
     record_property("expected", expected)
     record_property("expected_explanation", _outbound_explanation(scenario, subject, agent_id, scope))
 
-    rego = _rego_path(scenario_result["rego_dir"], agent_id, "outbound")
+    owner = _scope_owner(scenario, scope)
+    rego = _rego_path(scenario_result["rego_dir"], owner, "inbound")
     if not rego.is_file():
+        # The run routed no rule to the owner's scopes, so it has no CR: every call to it is denied (D20).
         record_property("output", None)
-        record_property("llm_reasoning", f"'{agent_id}' produced no outbound rego (declared unreachable)")
-        assert not expected, f"{agent_id} produced no outbound rego but {subject}/{scope} is expected reachable"
+        record_property("llm_reasoning", f"'{owner}' produced no inbound rego (no rule on its scopes)")
+        assert not expected, f"{owner} produced no inbound rego but {subject}/{scope} is expected reachable"
         return
 
-    target = _scope_owner(scenario, scope)
     fn = reformat_function_name(scope)  # soft-match rendering, e.g. quill-read -> Quill.Read
-    allowed = opa_eval(
-        [rego, HERE / "probe_eval.rego"],
-        "data.probe.outbound_eval.allow",
-        {"subject": subject, "target": target, "function_name": fn},
-    )
+    allowed = _probe_tool_call(rego, subject, agent_id, fn)
     record_property("output", allowed)
     reasoning_lines = [f"subject-side (scope '{scope}'): {reasoning_by_scope.get(scope, 'no reasoning recorded')}"]
     reasoning_lines += [
-        f"agent-side (role '{r}'): {reasoning_by_agent_role.get(r, 'no reasoning recorded')}" for r in agent_role_names
+        f"agent role '{r}': {reasoning_by_agent_role.get(r, 'no reasoning recorded')}" for r in agent_role_names
     ]
     record_property("llm_reasoning", "\n".join(reasoning_lines))
     assert allowed == expected
 
 
+def _owner_regos(scenario: ModuleType, rego_dir: Path) -> dict[str, Path]:
+    """The inbound Rego of each service (agent or tool) of ``scenario`` that has one on disk."""
+    regos = {sid: _rego_path(rego_dir, sid, "inbound") for sid in {**scenario.AGENTS, **scenario.TOOLS}}
+    return {sid: rego for sid, rego in regos.items() if rego.is_file()}
+
+
 @pytest.mark.parametrize("scenario_name,agent_id", _scenario_agent_cases())
-def test_outbound_unknown_target_denied(pipeline: dict[str, dict], scenario_name: str, agent_id: str) -> None:
-    """An otherwise-allowed call to an unknown target is denied (target not in target_scopes)."""
+def test_outbound_unknown_caller_denied(pipeline: dict[str, dict], scenario_name: str, agent_id: str) -> None:
+    """A call that the truth table allows through ``agent_id`` is denied when an unknown client makes
+    it: the calling-agent gate of the scope owner's inbound finds no role for that client."""
     scenario = SCENARIOS[scenario_name]
-    rego = _rego_path(_require_scenario(pipeline, scenario_name)["rego_dir"], agent_id, "outbound")
-    if not rego.is_file():
-        pytest.skip(f"{agent_id} produced no outbound rego in scenario {scenario_name}")
-    subject = next(iter(scenario.USERS))
-    allowed = opa_eval(
-        [rego, HERE / "probe_eval.rego"],
-        "data.probe.outbound_eval.allow",
-        {"subject": subject, "target": "unknown-target", "function_name": "Some.Op"},
-    )
-    assert allowed is False
+    rego_dir = _require_scenario(pipeline, scenario_name)["rego_dir"]
+    target_scopes = sorted(_tool_scope_names(scenario) | _agent_delegation_scope_names(scenario))
+    cells = [
+        (subject, scope, rego)
+        for subject in scenario.USERS
+        for scope in target_scopes
+        if expected_outbound(scenario, subject, agent_id, scope)
+        and (rego := _rego_path(rego_dir, _scope_owner(scenario, scope), "inbound")).is_file()
+    ]
+    if not cells:
+        pytest.skip(f"no allowed call through {agent_id} has a rendered inbound rego in scenario {scenario_name}")
+    allowed = [
+        (subject, scope)
+        for subject, scope, rego in cells
+        if _probe_tool_call(rego, subject, "team1/unknown-agent", reformat_function_name(scope))
+    ]
+    assert allowed == []
 
 
 @pytest.mark.parametrize("scenario_name,agent_id", _scenario_agent_cases())
 def test_outbound_soft_match_not_overbroad(pipeline: dict[str, dict], scenario_name: str, agent_id: str) -> None:
     """A function name whose tokens match no scope is denied — guards against soft-match over-match."""
     scenario = SCENARIOS[scenario_name]
-    rego = _rego_path(_require_scenario(pipeline, scenario_name)["rego_dir"], agent_id, "outbound")
-    if not rego.is_file():
-        pytest.skip(f"{agent_id} produced no outbound rego in scenario {scenario_name}")
+    regos = _owner_regos(scenario, _require_scenario(pipeline, scenario_name)["rego_dir"])
+    if not regos:
+        pytest.skip(f"no service produced an inbound rego in scenario {scenario_name}")
     subject = next(iter(scenario.USERS))
-    target = next(iter({**scenario.AGENTS, **scenario.TOOLS}))
-    allowed = opa_eval(
-        [rego, HERE / "probe_eval.rego"],
-        "data.probe.outbound_eval.allow",
-        {"subject": subject, "target": target, "function_name": "delete_everything"},
-    )
-    assert allowed is False
+    allowed = [owner for owner, rego in regos.items() if _probe_tool_call(rego, subject, agent_id, "delete_everything")]
+    assert allowed == []
 
 
 @pytest.mark.parametrize("scenario_name", _scenario_ids())

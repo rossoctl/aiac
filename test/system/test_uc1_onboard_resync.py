@@ -3,9 +3,9 @@
 Spec ``docs/testing/uc1-onboarding-pipeline.md`` (§ *Controller restart — the resync and the no-CR deny
 (rung 6)*); decisions D20 and D28 of ``docs/handoffs/12-target-side-ac-and-method-switch.md``.
 
-At each start the Controller reads the enforcement side, runs the start check #4 (the changed
-combiner), and then runs the **resync** under the PCE lock, before it serves (D28): ``PUT /policy`` with
-the full policy model of the live side — built from the stored SPM of every live service (in the IdP
+At each start the Controller runs the start check #4 (the changed combiner), and then runs the
+**resync** under the PCE lock, before it serves (D28): ``PUT /policy`` with the full policy model —
+built from the stored SPM of every live service (in the IdP
 catalog and not disabled) — then a teardown (quarantine) of each disabled service that still has an
 SPM. The ``PUT`` also deletes each AIAC CR whose service is not in the model. The new Controller pod is
 Ready only after that start sequence, so ``restart_controller`` returns after the resync ran.
@@ -23,8 +23,8 @@ and the later phases report "not reached":
 2. **No CR, so deny (D20).** Capture every AIAC CR to the pytest host (``uc1.capture_aiac_crs``, phase
    ``pre-cr-delete``), then delete github-tool's CR by hand. Poll until the ``dev-user``
    ``source-read`` call, which phase 1 allowed, is denied. github-tool now has no client CR, so the
-   changed combiner denies the call on github-tool's inbound (HTTP 403 with an OPA body), under both
-   sides — ``deny_origin`` must give github-tool's inbound.
+   changed combiner denies the call on github-tool's inbound (HTTP 403 with an OPA body) —
+   ``deny_origin`` must give github-tool's inbound.
 3. **Restart, repair.** Call ``restart_controller`` again. The resync writes the missing CR from
    ``SPM(github-tool)``. Assert: github-tool's CR is back with the same ``spec.policies`` as in phase 1
    (and the whole AIAC CR set equals phase 1's), and the ``dev-user`` ``source-read`` call is allowed
@@ -167,7 +167,7 @@ def run() -> Iterator[dict]:
     each observed. Module-scoped, so this rung's stack is torn down as soon as its tests end; teardown
     undeploys both workloads and scrubs every registration + CR back to pristine, verified."""
     with uc1.onboarded_stack([AGENT, TOOL]) as ctx:
-        observed: dict = {"side": ctx["side"]}
+        observed: dict = {}
         _run_phases(ctx, observed)
         yield observed
 
@@ -236,17 +236,16 @@ def test_restart_keeps_the_verdicts(run: dict) -> None:
 def test_service_without_cr_is_denied(run: dict) -> None:
     """With github-tool's CR deleted by hand, the ``dev-user`` ``source-read`` call that phase 1 allowed
     is denied, and the deny comes from github-tool's inbound: the changed combiner denies a pod that has
-    no client CR (D20). This holds under both sides — the agent's outbound (a pass-through under target
-    side, a grant under agent side) lets the call through."""
+    no client CR (D20). The agent's outbound (a pass-through, D24) lets the call through."""
     obs = _phase(run, "no_cr")
     assert obs["cr"] is None, f"github-tool's CR is still present after the delete: {obs['cr']}"
     probe = obs["probe"]
     assert probe["decision"] == "deny", (
-        f"{run['side']}: dev-user / {PROBE_TOOL} with no github-tool CR: {probe['decision']!r} "
+        f"dev-user / {PROBE_TOOL} with no github-tool CR: {probe['decision']!r} "
         f"(HTTP {probe['code']}, body={probe['body'][:300]!r}) — is the global combiner changed (D20)?"
     )
     assert probe["origin"] == uc1.DENY_ORIGIN_TOOL_INBOUND, (
-        f"{run['side']}: the deny came from {probe['origin']!r}, not github-tool's inbound "
+        f"the deny came from {probe['origin']!r}, not github-tool's inbound "
         f"(HTTP {probe['code']}, body={probe['body'][:300]!r})"
     )
 
@@ -276,6 +275,6 @@ def test_repaired_tool_call_allowed(run: dict) -> None:
     """With github-tool's CR back, the ``dev-user`` ``source-read`` call is allowed again."""
     probe = _phase(run, "repaired")["probe"]
     assert probe["decision"] == "allow", (
-        f"{run['side']}: dev-user / {PROBE_TOOL} after the repair: {probe['decision']!r} "
+        f"dev-user / {PROBE_TOOL} after the repair: {probe['decision']!r} "
         f"(HTTP {probe['code']}, body={probe['body'][:300]!r})"
     )

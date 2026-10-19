@@ -8,7 +8,7 @@ succeeds and writes the service's roles/scopes, then ``ServicePolicyBuilder.buil
 ``orchestrator._ROLLBACK_ERRORS``. The Orchestrator runs ``_rollback`` (delete only this run's
 roles/scopes, **keep** ``client.type``, disable the client last), then the PCE ``quarantine`` (delete
 the SPM, remove the service's roles from the other SPMs, **delete the service's CR** — agent or tool —
-and deploy the affected services of the live enforcement side), and re-raises. The changed global
+and deploy the affected services), and re-raises. The changed global
 combiner denies a pod that has no client CR (D20), so a deleted CR means deny. Under the event model
 there is no HTTP status to assert, so the rung asserts only observable end state: Keycloak, the
 ``AuthorizationPolicy`` CRs, the Policy Store, the Controller log, and real requests through
@@ -31,14 +31,12 @@ assert on the record, so a failed phase reports its own facts and the later phas
    B), converge, and record the tool's CR and the agent's CR. Assert: one MCP session (``initialize``,
    ``notifications/initialized``, ``tools/list``, ``tools/call``) is allowed for ``dev-user`` (a grant on
    some tool of the target), and the session methods are denied for ``devops-user`` (no grant — the
-   negative control that keeps the session rule from passing as allow-all). Under target side
-   github-tool's inbound decides the session (D26) and the agent's outbound passes it through; under
-   agent side the agent's outbound decides it (the MCP session rule).
+   negative control that keeps the session rule from passing as allow-all). github-tool's inbound
+   decides the session (D26), and the agent's outbound passes it through.
 4. **Failed tool** — break the seam again and re-fire the tool's trigger. Assert: the client is disabled
    and ``Tool`` is kept; the tool's CR, which phase 3 recorded, is **deleted**; its SPM (written in phase
-   3) is gone; the agent's CR, by side (target side: unchanged since phase 3 — its inbound grants stay
-   and its outbound stays a pass-through; agent side: every outbound grant binding is empty and its
-   inbound grants stay); the shared subject scope ``aiac-username-sub`` stays — it still exists and is
+   3) is gone; the agent's CR is unchanged since phase 3 (its inbound grants stay and its outbound
+   stays a pass-through); the shared subject scope ``aiac-username-sub`` stays — it still exists and is
    still a default scope of the disabled tool client (phase 3 linked it, and the link is not in the
    created-manifest, D31); the ``dev-user`` outbound call that phase 3 allowed is now blocked.
 
@@ -73,13 +71,12 @@ So the tool phase runs last and the lift is proven on the agent. Failing an onbo
 stronger check: its SPM existed and ``dev-user``'s call to it was allowed, so "no SPM" and "blocked"
 are real transitions, not an empty start.
 
-**Outbound "blocked".** After the quarantine github-tool has no CR. Under target side the combiner
-denies the call on github-tool's inbound (D20; an HTTP 403 with an OPA body, relayed by the agent's
-pass-through outbound). Under agent side the agent's outbound Rego has no grant to the tool, so its OPA
-denies (a JSON-RPC error frame, ``plugin: opa``). Under both sides the tool's client is also disabled,
-so Keycloak may instead refuse the token exchange to its audience before OPA is consulted (a
-``token-exchange`` error frame). All of these mean the call never reaches the tool, so all count as
-blocked; the OPA-side proof is the CR assertion. Any other outcome (``allow``, a transport error) fails.
+**Outbound "blocked".** After the quarantine github-tool has no CR. The combiner denies the call on
+github-tool's inbound (D20; an HTTP 403 with an OPA body, relayed by the agent's pass-through
+outbound). The tool's client is also disabled, so Keycloak may instead refuse the token exchange to
+its audience before OPA is consulted (a ``token-exchange`` error frame). All of these mean the call
+never reaches the tool, so all count as blocked; the OPA-side proof is the CR assertion. Any other
+outcome (``allow``, a transport error) fails.
 
 Run (a live rossoctl/Kind cluster with the AIAC stack + AuthBridge OPA pipeline wired in — see
 ``k8s/opa-kind-runbook.md`` / ``k8s/opa-kind-enable.sh`` — the event path wired (NATS broker +
@@ -206,7 +203,7 @@ def _prefixed(admin, prefix: str) -> dict[str, list[str]]:
 
 def _outbound_block(ctx: dict, user: str, tool_bare: str) -> tuple[str, int | None, str]:
     """One live outbound ``tools/call``; classify it as ``"deny"`` (an OPA verdict: github-tool's
-    inbound 403 under target side, the agent's outbound error frame under agent side), ``"refused"``
+    inbound 403), ``"refused"``
     (a token-exchange error frame — Keycloak refused the exchange before OPA, see the module
     docstring), ``"allow"``, or ``"error"``. Returns ``(class, http_code, body)``."""
     code, body = uc1.outbound_raw(ctx, user, tool_bare)
@@ -223,8 +220,8 @@ def _outbound_block(ctx: dict, user: str, tool_bare: str) -> tuple[str, int | No
 
 def _poll_blocked(ctx: dict, user: str, tool_bare: str) -> tuple[str, int | None, str]:
     """Poll the outbound call until it is blocked (``deny`` / ``refused``) on two probes in a row — the
-    old bundle may still allow it until bundle-service + OPA pick up the CR change (target side:
-    github-tool's deleted CR; agent side: the agent's re-derived CR), and two in a row keeps a one-off
+    old bundle may still allow it until bundle-service + OPA pick up the CR change (github-tool's
+    deleted CR), and two in a row keeps a one-off
     exchange blip from ending the wait. Returns the last observation."""
     seen = {"last": ("unobserved", None, ""), "streak": 0}
 
@@ -339,7 +336,7 @@ def run() -> Iterator[dict]:
     harness restores the Controller's env on every exit path; teardown undeploys both workloads and
     scrubs every registration + CR back to pristine, verified."""
     with uc1.pristine_stack([AGENT, TOOL]) as ctx:
-        observed: dict = {"side": ctx["side"]}  # the live enforcement side, for the side-aware asserts
+        observed: dict = {}
         _run_phases(ctx, observed)
         yield observed
 
@@ -387,8 +384,8 @@ def test_failed_agent_provisioned_entities_removed(run: dict) -> None:
 
 
 def test_failed_agent_has_no_cr(run: dict) -> None:
-    """The failed agent has NO ``AuthorizationPolicy`` CR: the quarantine deletes the CR under both
-    sides (D20; a 404 counts as success). There is no no-rules CR any more — the changed combiner denies
+    """The failed agent has NO ``AuthorizationPolicy`` CR: the quarantine deletes the CR (D20; a 404
+    counts as success). There is no no-rules CR any more — the changed combiner denies
     a pod that has no client CR."""
     policies = _failed(run, "agent_failed")["cr"]
     assert policies is None, f"the quarantined agent still has an AuthorizationPolicy CR {AGENT!r}: {policies}"
@@ -468,7 +465,7 @@ def _result(body: str) -> dict | None:
 
 def test_mcp_session_allowed_for_granted_user(run: dict) -> None:
     """For ``dev-user`` (a grant on some tool of the target) the whole MCP session passes the tool check
-    (target side: github-tool's inbound, D26; agent side: the agent's outbound session rule):
+    (github-tool's inbound, D26):
     ``initialize`` and ``tools/list`` return a ``result`` frame (``tools/list`` names every tool), the
     ``notifications/initialized`` notification is accepted, and the ``tools/call`` reaches the tool."""
     session = _phase(run, "session")["dev-user"]
@@ -483,8 +480,8 @@ def test_mcp_session_allowed_for_granted_user(run: dict) -> None:
 
 def test_mcp_session_denied_for_ungranted_user(run: dict) -> None:
     """For ``devops-user`` (no grant on any tool) the session methods are denied: no tool of the target
-    passes the per-tool check, so the session rule does not fire (it is not an allow-all). Under target
-    side the deny is github-tool's inbound 403; under agent side the agent's outbound error frame."""
+    passes the per-tool check, so the session rule does not fire (it is not an allow-all). The deny is
+    github-tool's inbound 403."""
     session = _phase(run, "session")["devops-user"]
     for method in ("initialize", "tools/list", "tools/call"):
         decision, code, body = session[method]
@@ -497,7 +494,7 @@ def test_mcp_session_denied_for_ungranted_user(run: dict) -> None:
 
 
 def test_failed_tool_has_no_cr(run: dict) -> None:
-    """The quarantine deletes the tool's CR (D20) under both sides. Phase 3 recorded the CR that the
+    """The quarantine deletes the tool's CR (D20). Phase 3 recorded the CR that the
     tool's onboarding wrote (every managed service has a CR), so "no CR" is a real transition."""
     onboarded = _phase(run, "tool_onboarded")["tool_cr"]
     assert uc1.cr_has_request_packages(onboarded), f"phase 3: github-tool had no CR with both packages: {onboarded}"
@@ -505,38 +502,27 @@ def test_failed_tool_has_no_cr(run: dict) -> None:
     assert policies is None, f"the quarantined tool still has an AuthorizationPolicy CR {TOOL!r}: {policies}"
 
 
-def test_failed_tool_agent_cr_by_side(run: dict) -> None:
-    """The agent's CR after the tool's quarantine, by the live enforcement side:
-
-    * **target side** — unchanged since phase 3 (order-agnostic: ``uc1.cr_canonical``; the order of a
-      list or of map keys is not a change). The tool owns no role, so the footprint purge changes
-      no other SPM and the agent is not affected: its inbound grants stay, and its outbound stays a
-      pass-through (the callee decides, D24).
-    * **agent side** — the quarantine re-derives the agent that targeted the tool: its outbound Rego no
-      longer grants any user or the agent a tool of the failed tool (every outbound grant binding is
-      empty — the tool was its only target), while its own inbound grants stay."""
+def test_failed_tool_leaves_the_agent_cr_unchanged(run: dict) -> None:
+    """The agent's CR after the tool's quarantine is unchanged since phase 3 (order-agnostic:
+    ``uc1.cr_canonical``; the order of a list or of map keys is not a change). The tool owns no role,
+    so the footprint purge changes no other SPM and the agent is not affected: its inbound grants stay,
+    and its outbound stays a pass-through (the callee decides, D24)."""
     policies = _failed(run, "tool_failed")["agent_cr"]
     assert policies is not None, f"the agent's CR {AGENT!r} is missing"
     assert uc1.cr_has_grants(policies), "the agent lost its inbound grants in the tool's quarantine"
-    if run["side"] == uc1.AGENT_SIDE:
-        outbound = policies.get(uc1.CR_OUTBOUND_PATH, "")
-        for var in uc1.AGENT_SIDE_OUTBOUND_GRANT_BINDINGS:
-            assert uc1.rego_binding_empty(outbound, var) is True, f"agent outbound {var} still grants: {outbound}"
-        return
     assert uc1.rego_is_pass_through(policies.get(uc1.CR_OUTBOUND_PATH)), (
-        f"target side: the agent's outbound is not a pass-through: {policies.get(uc1.CR_OUTBOUND_PATH)!r}"
+        f"the agent's outbound is not a pass-through: {policies.get(uc1.CR_OUTBOUND_PATH)!r}"
     )
     before = _phase(run, "tool_onboarded")["agent_cr"]
     assert uc1.cr_canonical(policies) == uc1.cr_canonical(before), (
-        "target side: the tool's quarantine changed the agent's CR (no agent SPM changed)"
+        "the tool's quarantine changed the agent's CR (no agent SPM changed)"
     )
 
 
 def test_failed_tool_outbound_call_denied(run: dict) -> None:
-    """The ``dev-user`` call to the tool that phase 3 allowed is now blocked — an OPA deny (target side:
-    github-tool has no CR, so the combiner denies on its inbound, D20; agent side: the agent's outbound),
-    or a token-exchange refusal to the disabled tool's audience (module docstring); never ``allow``,
-    never a transport error."""
+    """The ``dev-user`` call to the tool that phase 3 allowed is now blocked — an OPA deny (github-tool
+    has no CR, so the combiner denies on its inbound, D20), or a token-exchange refusal to the disabled
+    tool's audience (module docstring); never ``allow``, never a transport error."""
     decision, code, body = _failed(run, "tool_failed")["outbound"]
     assert decision in ("deny", "refused"), (
         f"dev-user outbound {PROBE_TOOL} to the quarantined tool: {decision!r} (HTTP {code}, body={body[:300]!r})"

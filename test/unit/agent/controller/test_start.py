@@ -1,11 +1,9 @@
 """Unit tests for the Controller start sequence (the FastAPI lifespan, before the NATS consumer).
 
-The sequence: read the enforcement side (D29: ``AIAC_ENFORCEMENT_SIDE``), then start check #4 (D30:
-the global combiner denies a pod that has no client CR), then the PCE ``resync()`` (D28), then the
-login-client audience warning (D30, agent side only, never stops the start), then the NATS consumer.
-An unknown side, a failed check #4 or a failed resync stops the Controller: the lifespan raises, so
-uvicorn never serves. Driven through the real app with a ``TestClient`` context (which runs the
-lifespan). The side is set in the env, the k8s read of the combiner CR is faked at the
+The sequence: start check #4 (D30: the global combiner denies a pod that has no client CR), then the
+PCE ``resync()`` (D28), then the NATS consumer. A failed check #4 or a failed resync stops the
+Controller: the lifespan raises, so uvicorn never serves. Driven through the real app with a
+``TestClient`` context (which runs the lifespan). The k8s read of the combiner CR is faked at the
 ``kube._custom_objects`` seam, the PCE ``resync`` at its import site, and the NATS consumer is a fake.
 """
 
@@ -20,9 +18,7 @@ from kubernetes.client.exceptions import ApiException
 
 from aiac.agent.controller import start
 from aiac.agent.controller.routes import app
-from aiac.agent.uc.onboarding import platform_audience
 from aiac.agent.uc.onboarding.provision import kube
-from aiac.idp.configuration.api import IdPHTTPError
 
 _INBOUND_LINE = "client_ok if not data.authbridge.client.inbound.request"
 _OUTBOUND_LINE = "client_ok if not data.authbridge.client.outbound.request"
@@ -91,12 +87,9 @@ class _FakeConsumer:
 @pytest.fixture
 def cluster(monkeypatch):
     """The fake CustomObjectsApi (``get_namespaced_custom_object`` returns the changed combiner), the
-    PCE ``resync``, the IdP seam of the login-client audience warning (``platform_audience.Configuration``,
-    exposed as ``cluster.idp``) and the NATS consumer, recording the start order in ``cluster.events``.
-    The side is unset (the default, target side), so the warning makes no IdP read."""
+    PCE ``resync`` and the NATS consumer, recording the start order in ``cluster.events``."""
     monkeypatch.setenv("UPSTREAM_MAX_RETRIES", "1")
     monkeypatch.delenv("AIAC_BUNDLE_SERVICE_NAMESPACE", raising=False)
-    monkeypatch.delenv("AIAC_ENFORCEMENT_SIDE", raising=False)
     events: list[str] = []
     objects = MagicMock()
     objects.get_namespaced_custom_object.side_effect = lambda **_: events.append("check #4") or objects.combiner
@@ -104,12 +97,9 @@ def cluster(monkeypatch):
     with (
         patch.object(kube, "_custom_objects", return_value=objects),
         patch.object(start, "resync", side_effect=lambda: events.append("resync")) as resync,
-        patch.object(platform_audience, "Configuration") as configuration,
         patch("aiac.agent.eventbus.consumer.AiacEventConsumer", side_effect=lambda: _FakeConsumer(events)),
     ):
         objects.resync = resync
-        objects.idp = configuration.for_default_realm.return_value
-        objects.idp.get_platform_tool_audiences.side_effect = lambda *_: events.append("audience warning") or []
         objects.events = events
         yield objects
 
@@ -150,35 +140,6 @@ class TestStartSequencePasses:
         content = _package("inbound", "request", fail_open=False) + f"# {_INBOUND_LINE}\n"
         cluster.combiner["spec"]["policies"][0]["content"] = content
         assert _serve() == 200
-
-
-class TestTheEnforcementSide:
-    """Step 1 (D29): the Controller reads ``AIAC_ENFORCEMENT_SIDE`` before every other step."""
-
-    @pytest.mark.parametrize(
-        ("value", "side"),
-        [(None, "target-side"), ("target-side", "target-side"), ("agent-side", "agent-side")],
-        ids=["unset-is-target-side", "target-side", "agent-side"],
-    )
-    def test_each_valid_side_starts_and_is_logged(self, cluster, monkeypatch, caplog, value, side):
-        if value is not None:
-            monkeypatch.setenv("AIAC_ENFORCEMENT_SIDE", value)
-        with caplog.at_level("INFO", logger=start.__name__):
-            assert _serve() == 200
-        warning = ["audience warning"] if side == "agent-side" else []
-        assert cluster.events == ["check #4", "resync", *warning, "consumer"]
-        assert any(side in r.getMessage() and r.levelname == "INFO" for r in caplog.records)
-
-    @pytest.mark.parametrize("value", ["both-sides", "", "Target-Side"])
-    def test_an_unknown_side_stops_the_start_before_check_4_and_the_resync(self, cluster, monkeypatch, caplog, value):
-        monkeypatch.setenv("AIAC_ENFORCEMENT_SIDE", value)
-        with pytest.raises(ValueError, match="AIAC_ENFORCEMENT_SIDE"):
-            _serve()
-        cluster.get_namespaced_custom_object.assert_not_called()
-        cluster.resync.assert_not_called()
-        assert cluster.events == []
-        errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
-        assert any("AIAC_ENFORCEMENT_SIDE" in m and repr(value) in m for m in errors)
 
 
 class TestCheck4StopsTheController:
@@ -281,37 +242,6 @@ class TestResyncStopsTheController:
             _serve()
         assert "consumer" not in cluster.events
         assert any("resync" in r.getMessage() and r.levelname == "ERROR" for r in caplog.records)
-
-    def test_a_failed_resync_runs_no_audience_warning(self, cluster, monkeypatch):
-        monkeypatch.setenv("AIAC_ENFORCEMENT_SIDE", "agent-side")
-        cluster.resync.side_effect = RuntimeError("PDP unreachable")
-        with pytest.raises(RuntimeError, match="PDP unreachable"):
-            _serve()
-        assert "audience warning" not in cluster.events
-
-
-class TestTheAudienceWarning:
-    """Step 4 (D30): under agent side only, a WARNING for each platform login client that holds a
-    managed tool's audience. Best effort: a failure does not stop the Controller."""
-
-    def test_under_agent_side_the_audience_warning_runs_after_the_resync_and_before_the_consumer(
-        self, cluster, monkeypatch
-    ):
-        monkeypatch.setenv("AIAC_ENFORCEMENT_SIDE", "agent-side")
-        assert _serve() == 200
-        assert cluster.events == ["check #4", "resync", "audience warning", "consumer"]
-        cluster.idp.get_platform_tool_audiences.assert_called_once_with(None)
-
-    def test_under_target_side_there_is_no_idp_read(self, cluster):
-        assert _serve() == 200
-        cluster.idp.get_platform_tool_audiences.assert_not_called()
-
-    def test_an_audience_warning_failure_does_not_stop_the_start(self, cluster, monkeypatch, caplog):
-        monkeypatch.setenv("AIAC_ENFORCEMENT_SIDE", "agent-side")
-        cluster.idp.get_platform_tool_audiences.side_effect = IdPHTTPError(502, "x")
-        assert _serve() == 200
-        assert "consumer" in cluster.events
-        assert "cannot read" in caplog.text
 
 
 def _opa_client_ok_rules(content: str) -> list[dict]:

@@ -1,5 +1,5 @@
 from enum import Enum
-from typing import Any, Literal, NewType
+from typing import Any, NewType
 
 from pydantic import BaseModel, ConfigDict, model_validator
 
@@ -109,7 +109,7 @@ ServiceUuid = NewType("ServiceUuid", str)
 
 ClientId = NewType("ClientId", str)
 """``Service.serviceId`` — the Keycloak ``clientId`` (a SPIFFE ID, can contain ``/``). The SPM key,
-``PolicyRule.scope.serviceId``, the ``decommission`` key and OPA ``input.identity.service_id``."""
+``PolicyRule.scope.serviceId`` and the ``decommission`` key."""
 
 
 class Service(BaseModel):
@@ -175,20 +175,6 @@ class Scope(BaseModel):
     def aiac_managed(self) -> bool:
         """True when this scope carries the ``aiac.managed`` provisioning marker."""
         return _is_aiac_managed(self.attributes)
-
-
-class PlatformToolAudience(BaseModel):
-    """An audience mapper of a platform login client (in a default or optional client scope, or on the
-    client itself) that puts the clientId of a managed tool into ``aud`` (the login-client audience
-    warning, D30). Read by ``Configuration.get_platform_tool_audiences``."""
-
-    model_config = ConfigDict(extra="ignore")
-
-    login_client: str
-    link: Literal["default", "optional", "client"]
-    scope: str | None = None  # None when link is "client"
-    mapper: str
-    tool_client_id: str
 
 
 Subject.model_rebuild()

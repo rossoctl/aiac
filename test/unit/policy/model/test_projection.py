@@ -1,6 +1,6 @@
 """The shared inbound projection (D18b): one SPM's edges split into the user gate and the
-calling-agent gate, plus the effect-agnostic identity maps. ``_derive`` (agent side) and the
-target-side renderer both use it, so one SPM gives the same inbound under both sides."""
+calling-agent gate, plus the effect-agnostic identity maps. The writer uses it for the inbound of
+one SPM."""
 
 from aiac.idp.configuration.models import Role, RoleKind, Scope, ServiceType
 from aiac.policy.model.models import PolicyRule, RuleEffect, ServicePolicyModel

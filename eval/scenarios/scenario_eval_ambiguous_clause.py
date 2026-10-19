@@ -56,8 +56,9 @@ AGENTS: dict[str, dict] = {
 
 # --- Tools --------------------------------------------------------------------------------------
 
+# Each tool id is "<namespace>/<name>", as each agent id: the writer derives the CR of the tool from it.
 TOOLS: dict[str, dict] = {
-    "enrollment-tool": {
+    "team1/enrollment-tool": {
         "description": (
             "Capability provider Tool for student enrollment records. It performs read "
             "operations on a student's current status and historical enrollment record."

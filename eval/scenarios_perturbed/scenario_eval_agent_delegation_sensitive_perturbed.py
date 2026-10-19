@@ -70,8 +70,9 @@ AGENTS: dict[str, dict] = {
 #
 # Byte-identical to scenario_eval_agent_delegation_perturbed.py.
 
+# Each tool id is "<namespace>/<name>", as each agent id: the writer derives the CR of the tool from it.
 TOOLS: dict[str, dict] = {
-    "manifest-tool": {
+    "team1/manifest-tool": {
         "description": (
             "A capability provider for shipment manifests, handling both reads and writes of "
             "manifest contents and status."

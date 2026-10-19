@@ -11,12 +11,14 @@ each mirroring its skill scope's name + description. The pair-lists below are th
 over those **discovered, prefixed** names — exactly the strings the generated Rego data maps contain
 — so the test's expected verdicts are *computed from* this module, never from the Rego under test.
 
-Outbound access is a **per-scope two-gate AND**: a requested tool scope is allowed iff **both** the
-user role reaches it (subject gate, ``OUTBOUND_SUBJECT_PAIRS``) **and** the agent's own per-skill
-operator role reaches it (capability gate, ``OUTBOUND_TARGET_PAIRS``). The capability gate is mapped
-from the operator-role **descriptions** by the PRB (capability-match under ``generic_policy.md``); in
-UC-1 the agent reaches all four tool scopes, so the AND reduces to the subject gate for the verdicts
-but both gates are populated and probed.
+Tool access is a **per-scope two-gate AND** in the tool's inbound (D26): a requested tool scope is
+allowed iff **both** the user role reaches it (the user gate, ``OUTBOUND_SUBJECT_PAIRS``) **and** the
+agent's own per-skill operator role reaches it (the calling-agent or capability gate,
+``OUTBOUND_TARGET_PAIRS``). The ``OUTBOUND_*`` names keep the call direction (the agent's outbound
+call to the tool), not the place of the check. The capability gate is mapped from the operator-role
+**descriptions** by the PRB (capability-match under ``generic_policy.md``); in UC-1 the agent reaches
+all four tool scopes, so the AND reduces to the user gate for the verdicts but both gates are
+populated and probed.
 
 **Prefixed provisioned names vs. bare runtime names.** The pair-lists above hold the **prefixed**
 names UC-1 provisions and the PCE writes into the CR's data maps (``github-tool.source-read`` …).
@@ -104,8 +106,9 @@ AGENT_SCOPES: dict[str, str] = {
 
 # The per-skill operator roles UC-1 emits — one per skill, mirroring each scope's name +
 # description (``analyze_agent`` builds ``roles`` from the same skills as ``scopes``). Their
-# descriptions are what the PRB capability-match reads to grant the agent's outbound access on a
-# domain basis, populating the agent->tool capability gate (``OUTBOUND_TARGET_PAIRS`` below).
+# descriptions are what the PRB capability-match reads to grant the agent access to the tool on a
+# domain basis, populating the agent->tool capability gate of the tool inbound (``OUTBOUND_TARGET_PAIRS``
+# below).
 AGENT_ROLES: dict[str, str] = dict(AGENT_SCOPES)
 
 # name -> description. Fine-grained tool operations, from the simplified tool's MCP ``tools/list``
@@ -121,9 +124,9 @@ TOOL_SCOPES: dict[str, str] = {
 #
 # Identical *decisions* to ``scenario.py``; only the scope-name strings are prefixed. Each set maps
 # 1:1 to a generated Rego gate:
-#   INBOUND_PAIRS          — user role     -> agent scope  (inbound; user may call the agent)
-#   OUTBOUND_SUBJECT_PAIRS — user role     -> tool scope   (outbound subject gate; user reaches the tool)
-#   OUTBOUND_TARGET_PAIRS  — operator role -> tool scope   (outbound capability gate; agent reaches the tool)
+#   INBOUND_PAIRS          — user role     -> agent scope  (the user gate of the agent inbound)
+#   OUTBOUND_SUBJECT_PAIRS — user role     -> tool scope   (the user gate of the tool inbound)
+#   OUTBOUND_TARGET_PAIRS  — operator role -> tool scope   (the calling-agent gate of the tool inbound)
 
 INBOUND_PAIRS: list[tuple[str, str]] = [
     ("developer", "github-agent.source_operations"),
@@ -171,10 +174,11 @@ def bare(scope_name: str) -> str:
 # the outbound matrix is crafted + probed over (order preserved from ``TOOL_SCOPES``).
 TOOL_REQUEST_NAMES: list[str] = [bare(name) for name in TOOL_SCOPES]
 
-# Outbound subject gate as ``(user-role, bare-tool-name)`` — the user->tool truth, bare.
+# The user gate of the tool inbound as ``(user-role, bare-tool-name)`` — the user->tool truth, bare.
 OUTBOUND_SUBJECT_BARE: set[tuple[str, str]] = {(role, bare(scope)) for role, scope in OUTBOUND_SUBJECT_PAIRS}
 
-# Outbound capability gate as the set of bare tool names the agent's operator roles reach.
+# The calling-agent gate of the tool inbound as the set of bare tool names the agent's operator roles
+# reach.
 OUTBOUND_TARGET_BARE: set[str] = {bare(scope) for _, scope in OUTBOUND_TARGET_PAIRS}
 
 

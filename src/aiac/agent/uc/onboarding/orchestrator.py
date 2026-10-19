@@ -11,21 +11,15 @@ clientId, which :func:`onboard_and_apply` gives to the PCE as ``focus_service``:
        that resolves the clientId (a ``404`` on that read is the event-before-commit race: it is read
        again for a bounded time, see ``CLIENT_WAIT``): the pod has the AuthBridge sidecar (#1),
        the namespace pipeline has ``jwt-validation`` and ``opa`` (and ``mcp-parser`` for a tool)
-       inbound, and for an agent under agent side also ``mcp-parser`` and ``opa`` outbound (#2), no
-       app container has an ``httpGet`` probe (#6). The scope depends on the enforcement side: every
-       check for every service under target side; under agent side #1 and #2 for every service (a
-       tool then gets a pass-through CR, so it needs only ``jwt-validation`` inbound) and #6 for
-       agents only. A failed check raises ``EnforcementPreconditionError``.
-       Then, for an enabled TOOL only, the PCE ``bootstrap`` writes the tool's first CR (under
-       target side its rules-based CR, under agent side a pass-through CR), so that discovery
-       (``tools/list`` through the tool's own inbound) passes D20 (checkpoint B1).
+       inbound (#2), no app container has an ``httpGet`` probe (#6). Every check runs for every
+       service. A failed check raises ``EnforcementPreconditionError``.
+       Then, for an enabled TOOL only, the PCE ``bootstrap`` writes the tool's first CR (its
+       rules-based CR), so that discovery (``tools/list`` through the tool's own inbound) passes
+       D20 (checkpoint B1).
     1. Service Provision  — classifies the service and writes its roles/scopes into the IdP,
        producing the discovered ``service_type`` and the **created-manifest** (exactly the
        roles/scopes it created on this run — see ``provision_service``).
     2. Service Policy Builder — reads the excluded-self IdP universe and builds the rules.
-       Then, for a TOOL under agent side, the login-client audience warning (D30, see
-       ``platform_audience``): a WARNING for each platform login client that holds the tool's
-       audience. It is best effort and never raises.
 
 :func:`onboard_and_apply` is the whole UC1 for the Controller route and the NATS consumer: it runs
 :func:`_onboard` (the build), then the single
@@ -58,7 +52,6 @@ from aiac.agent.policy_rules_builder.graph import (
     PolicyRulesBuilderError,
     UnparseableLLMResponseError,
 )
-from aiac.agent.uc.onboarding.platform_audience import warn_platform_tool_audiences
 from aiac.agent.uc.onboarding.policy_builder.builder import ServicePolicyBuilder
 from aiac.agent.uc.onboarding.preconditions import check_preconditions
 from aiac.agent.uc.onboarding.provision.graph import build_provision_graph
@@ -299,8 +292,8 @@ def onboard_and_apply(service_id: ServiceUuid, *, wait_for_client: bool = True) 
 
 def _drop_bootstrap(client_id: ClientId) -> None:
     """After a failure that runs no quarantine: the PCE ``drop_bootstrap`` deletes the bootstrap CR
-    of a service that is not managed (no SPM), so an agent-side pass-through CR does not stay open.
-    A failure here is logged, and the caller re-raises the original error: the next delivery tries
+    of a service that is not managed (no SPM), so the CR does not stay for it. A failure here is
+    logged, and the caller re-raises the original error: the next delivery tries
     again."""
     try:
         drop_bootstrap(client_id)
@@ -335,21 +328,15 @@ def _onboard(service_id: ServiceUuid, wait_for_client: bool) -> _Onboarded:
     the client is still not visible after the wait, at once for any other error.
 
     Then the precondition checks (D30, :func:`~aiac.agent.uc.onboarding.preconditions.check_preconditions`)
-    run, before Provision and the PRB. They read the enforcement side: under target side they check
-    every service with #1, #2 and #6; under agent side every service with #1 and #2 (a tool's
-    pass-through CR needs only ``jwt-validation`` inbound) and agents only with #6. They return the
+    run, before Provision and the PRB. They check every service with #1, #2 and #6, and return the
     pod type. A failed check raises ``EnforcementPreconditionError``,
     which names each failed check; nothing changed yet, so there is no rollback, no client disable
     and no quarantine (checkpoint O2). If the service is a tool (the type of its pod label) and its
     client is enabled, the PCE ``bootstrap(client_id, ServiceType.TOOL)`` writes the tool's first CR
-    before Provision (of the current side: rules-based under target side, a pass-through under
-    agent side), so that discovery passes (checkpoint B1). A disabled tool gets no bootstrap:
+    before Provision (its rules-based CR), so that discovery passes (checkpoint B1). A disabled tool gets no bootstrap:
     it fails at the discovery-token mint anyway (C5). A bootstrap failure propagates (no rollback:
     Provision has not run). Any other failure of Provision or the build (no quarantine) drops this
-    run's bootstrap CR (:func:`_drop_bootstrap`) and propagates. After a successful build of a tool,
-    the login-client audience warning runs (D30,
-    :func:`~aiac.agent.uc.onboarding.platform_audience.warn_platform_tool_audiences`): under agent side
-    only, best effort, log only.
+    run's bootstrap CR (:func:`_drop_bootstrap`) and propagates.
 
     On any of the four typed build failures (see ``_ROLLBACK_ERRORS``, for agents and tools, on the
     first failure — also the retryable ``LLMAccessError``) the Orchestrator runs the compensating
@@ -384,9 +371,8 @@ def _onboard(service_id: ServiceUuid, wait_for_client: bool) -> _Onboarded:
 
     # D30: the precondition checks run FIRST, before anything changes. A failed check raises
     # EnforcementPreconditionError, which is NOT a rollback error (checkpoint O2): nothing was
-    # provisioned, so there is no rollback, no client disable and no quarantine. Under agent
-    # side a tool gets #1 and #2 (jwt-validation only) and no #6. The pod type is returned (for
-    # the bootstrap below).
+    # provisioned, so there is no rollback, no client disable and no quarantine. The pod type is
+    # returned (for the bootstrap below).
     pod_type = check_preconditions(service)  # the type from the pod label (no catalog type yet)
     # Checkpoint B1: the first CR of a tool, before Provision, so that discovery (tools/list
     # through the tool's own inbound) passes D20. Only for an enabled client: a disabled
@@ -397,9 +383,9 @@ def _onboard(service_id: ServiceUuid, wait_for_client: bool) -> _Onboarded:
         bootstrap(client_id, ServiceType.TOOL)
 
     # A failure that runs no quarantine (a 502 from Provision, any error of the build that is not a
-    # rollback error) must not leave the bootstrap CR: under agent side it is a pass-through CR,
-    # which allows every request, for a service that is not managed. The PCE drops it if the store
-    # has no SPM. A rollback error runs the quarantine, which deletes the CR, so it drops nothing.
+    # rollback error) must not leave the bootstrap CR of a service that is not managed (before the
+    # bootstrap, D20 denied it). The PCE drops it if the store has no SPM. A rollback error runs the
+    # quarantine, which deletes the CR, so it drops nothing.
     # Set before the ``try``: a rollback error from Provision must not become an UnboundLocalError
     # in the handler, which would hide the error and skip the quarantine.
     created_roles: list[Role] = []
@@ -430,12 +416,5 @@ def _onboard(service_id: ServiceUuid, wait_for_client: bool) -> _Onboarded:
         if bootstrapped:
             _drop_bootstrap(client_id)
         raise
-
-    # The login-client audience warning (D30; agent side only, best effort): warn when a platform login
-    # client holds a scope that puts this tool's clientId into aud. Its pass-through CR then lets such a
-    # user token in with no AIAC check. It never raises, so it cannot fail the onboarding or drop the
-    # bootstrap CR.
-    if pod_type is ServiceType.TOOL:
-        warn_platform_tool_audiences(config, client_id)
 
     return _Onboarded(rules, client_id, bootstrapped)

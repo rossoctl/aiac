@@ -62,8 +62,9 @@ AGENTS: dict[str, dict] = {
 
 # --- Tools --------------------------------------------------------------------------------------
 
+# Each tool id is "<namespace>/<name>", as each agent id: the writer derives the CR of the tool from it.
 TOOLS: dict[str, dict] = {
-    "records-tool": {
+    "team1/records-tool": {
         "description": (
             "Capability provider Tool for patient records. It performs read and write operations "
             "on patient record contents."
@@ -73,7 +74,7 @@ TOOLS: dict[str, dict] = {
             "tool-scope-records-write": "Create and update patient records.",
         },
     },
-    "insurance-tool": {
+    "team1/insurance-tool": {
         "description": (
             "Capability provider Tool for insurance coverage verification. It performs read "
             "operations against a patient's insurance details."
