@@ -15,6 +15,7 @@ from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel
 
 from aiac.agent.llm import LLMAccessError as _LLMAccessError
+from aiac.agent.llm import LLMCredentialsError as _LLMCredentialsError
 from aiac.agent.llm import UnparseableLLMResponseError as _UnparseableLLMResponseError
 from aiac.agent.llm import build_llm, call_with_retry, load_llm_settings, raise_sanitized
 from aiac.idp.configuration.models import Role, Scope
@@ -86,6 +87,15 @@ class UnparseableLLMResponseError(_UnparseableLLMResponseError, PolicyRulesBuild
     ``PolicyRulesBuilderBaseError`` hierarchy (see ``LLMAccessError``)."""
 
 
+class LLMCredentialsError(_LLMCredentialsError, PolicyRulesBuilderBaseError):
+    """Raised by ``_structured_call`` when the LLM endpoint refuses the credentials (HTTP 401 / 403:
+    for example a revoked API key). Not retried. Distinct from ``UnparseableLLMResponseError`` so the
+    log names the real cause. Sanitized the same way; original error chained on ``__cause__``.
+
+    Specialises the shared ``aiac.agent.llm.LLMCredentialsError`` into the PRB's
+    ``PolicyRulesBuilderBaseError`` hierarchy (see ``LLMAccessError``)."""
+
+
 class PolicyContradictionError(PolicyRulesBuilderBaseError):
     """Raised when the policy GENUINELY both grants and prohibits the same (focal, candidate) pair
     (a direct conflict or a coarse-scope granularity mismatch). Carries the focal entity and ALL
@@ -137,19 +147,26 @@ def _structured_call(schema: type[T], messages: list[BaseMessage]) -> T:
     surviving failure into the PRB's own typed, sanitized error subclasses (so consumers that catch
     ``PolicyRulesBuilderBaseError`` are unaffected).
 
-    Only transient failures (connection errors / timeouts / 5xx) are retried — a permanent
-    failure (e.g. a bad request or a validation error) fails identically on every attempt, so
-    it is surfaced immediately (consistent with ``aiac.shared.upstream``)."""
+    Only transient failures (``aiac.shared.upstream.is_transient``: connection errors / timeouts /
+    5xx / HTTP 408 and 429) are retried — a permanent failure (e.g. a bad request, a validation
+    error, or a 429 for an exhausted quota) fails identically on every attempt, so it is surfaced
+    immediately."""
     settings = load_llm_settings()  # PRB profile: the bare LLM_* vars
     runnable = _build_llm().with_structured_output(schema)
     try:
         return cast(T, call_with_retry(runnable, messages, settings=settings))
     except Exception as err:
         # raise_sanitized classifies the ORIGINAL error exactly as the retry loop did (transient
-        # exhaustion -> LLMAccessError; reachable-but-unparseable -> UnparseableLLMResponseError),
-        # with a STATIC endpoint-free message and the raw error chained on __cause__. The PRB
-        # subclasses are passed so the raised type stays inside PolicyRulesBuilderBaseError.
-        raise_sanitized(err, access_error=LLMAccessError, unparseable_error=UnparseableLLMResponseError)
+        # exhaustion -> LLMAccessError; refused credentials, HTTP 401/403 -> LLMCredentialsError;
+        # reachable-but-unparseable -> UnparseableLLMResponseError), with a STATIC endpoint-free
+        # message and the raw error chained on __cause__. The PRB subclasses are passed so the
+        # raised type stays inside PolicyRulesBuilderBaseError.
+        raise_sanitized(
+            err,
+            access_error=LLMAccessError,
+            unparseable_error=UnparseableLLMResponseError,
+            credentials_error=LLMCredentialsError,
+        )
 
 
 # shared node helpers (typed against _PRBWorking; direction specifics passed as kwargs)

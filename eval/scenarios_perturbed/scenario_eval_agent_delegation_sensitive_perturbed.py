@@ -9,9 +9,6 @@ touched by the swap is copied verbatim from ``scenario_eval_agent_delegation_per
 *user* role gets the capability, not what the agent role itself covers). The truth delta is
 reused directly from ``SENSITIVITY_EDITS["agent_delegation"].removed``/``.added``.
 
-Like its `_perturbed` sibling, lives under ``eval/scenarios_perturbed/`` even though the original
-lives at ``test/system/`` top level, for the same uniformity reason.
-
 Requires human sign-off before entering the corpus (spec §4) — see ``eval/scenarios_perturbed/
 SIGNOFF.md``.
 

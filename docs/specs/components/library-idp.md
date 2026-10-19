@@ -181,7 +181,8 @@ status, message, response and notes. A transport failure (connection error, time
 |---|---|
 | Connection error, timeout | Yes |
 | `IdPHTTPError` with a `5xx` status (for example `502`, `503`) | Yes |
-| `IdPHTTPError` with a `4xx` status (for example `400`, `404`, `409`) | No: raised at the first attempt |
+| `IdPHTTPError` with a `408` or `429` status | Yes (a `Retry-After` header replaces the backoff, up to 30 s) |
+| `IdPHTTPError` with another `4xx` status (for example `400`, `404`, `409`) | No: raised at the first attempt |
 
 The status is the status of the IdP Configuration Service, not of Keycloak. The service keeps a
 Keycloak `404` only on the reads that name one entity, and a Keycloak `409` only on some writes. It

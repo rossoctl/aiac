@@ -36,6 +36,7 @@ from aiac.agent.policy_rules_builder.conflict_detection import (
 )
 from aiac.agent.policy_rules_builder.graph import (
     LLMAccessError,
+    LLMCredentialsError,
     PolicyContradictionError,
     PolicyRulesBuilderBaseError,
     PolicyRulesBuilderError,
@@ -92,6 +93,13 @@ def _unparseable_llm_response_error(_request: Request, exc: UnparseableLLMRespon
     return _sanitized(exc, 502, "The policy language model returned an unusable response.")
 
 
+# The LLM endpoint refused the Controller's credentials (HTTP 401 / 403, e.g. a revoked API key):
+# an upstream fault the Controller cannot recover from until the key is fixed, so 502.
+@app.exception_handler(LLMCredentialsError)
+def _llm_credentials_error(_request: Request, exc: LLMCredentialsError) -> JSONResponse:
+    return _sanitized(exc, 502, "The policy language model endpoint rejected the Controller's credentials.")
+
+
 # The two grant/deny conflict mechanisms both surface as a 422 whose body IS a structured
 # ``ConflictReport`` (settled design Q15 — one report shape at the boundary):
 #   * ``PolicyConflictError`` (cross-pass structural detector, already enriched with verbatim quotes
@@ -134,8 +142,9 @@ def _enforcement_precondition_error(_request: Request, exc: EnforcementPrecondit
 # sanitized the same way (never leaks, full detail logged). Registering the base-class net after
 # the specific handlers keeps the intent explicit; resolution itself is by specificity, not order —
 # Starlette walks the exception's MRO and picks the most-specific REGISTERED handler, so a mapped
-# subclass (``LLMAccessError``, ``UnparseableLLMResponseError``, ``PolicyRulesBuilderError``,
-# ``PolicyContradictionError``) always wins over this base handler and never falls through to 500.
+# subclass (``LLMAccessError``, ``UnparseableLLMResponseError``, ``LLMCredentialsError``,
+# ``PolicyRulesBuilderError``, ``PolicyContradictionError``) always wins over this base handler
+# and never falls through to 500.
 @app.exception_handler(PolicyRulesBuilderBaseError)
 def _policy_builder_base_error(_request: Request, exc: PolicyRulesBuilderBaseError) -> JSONResponse:
     return _sanitized(exc, 500, "The policy build failed unexpectedly.")
