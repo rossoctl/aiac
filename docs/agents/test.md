@@ -111,13 +111,9 @@ demo images (`demo/assets/kind-load.sh`), removes any demo workloads and their
 registrations, deploys the workloads as the onboarding trigger, and removes them
 again at teardown.
 
-The lane runs under the enforcement side that `AIAC_ENFORCEMENT_SIDE` sets in the
-`aiac-agent-config` ConfigMap (default `target-side`: each callee, the tool
-included, checks its own inbound from its own CR). No test changes the side. To
-test both sides, run the lane, do a clean redeploy with the other side (see
-`docs/agents/deploy.md`), and run the lane again.
+Each callee, the tool included, checks its own inbound from its own CR.
 
-The platform prerequisites, wiring, verification and the setting of the side:
+The platform prerequisites, wiring and verification:
 `k8s/opa-kind-runbook.md`. The fixture enables Direct Access Grants on the login
 client `rossoctl` itself, once per session, and turns it off again at session end
 if it turned it on, so the lane needs no manual realm step. A client attribute

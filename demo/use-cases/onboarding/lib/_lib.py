@@ -151,19 +151,18 @@ class Config:
 
     @property
     def outbound_rego(self) -> str:
-        """Snapshot-relative path of the agent's outbound rego: a pass-through under target side,
-        the per-tool check under agent side."""
+        """Snapshot-relative path of the agent's outbound rego (a pass-through, D24)."""
         return f"{self.namespace}/{self.cr_name}/outbound/request.rego"
 
     @property
     def tool_inbound_rego(self) -> str:
-        """Snapshot-relative path of the tool's inbound rego — under target side the package that
-        decides each tool call (the user gate and the calling-agent gate)."""
+        """Snapshot-relative path of the tool's inbound rego — the package that decides each tool
+        call (the user gate and the calling-agent gate)."""
         return f"{self.namespace}/{self.tool_cr_name}/inbound/request.rego"
 
     @property
     def tool_outbound_rego(self) -> str:
-        """Snapshot-relative path of the tool's outbound rego (a pass-through on both sides)."""
+        """Snapshot-relative path of the tool's outbound rego (a pass-through, D24)."""
         return f"{self.namespace}/{self.tool_cr_name}/outbound/request.rego"
 
 
@@ -303,16 +302,6 @@ def opa_eval(rego_paths: list[Path], query: str, input_doc: dict) -> object:
         return json.loads(proc.stdout)["result"][0]["expressions"][0]["value"]
     except (KeyError, IndexError) as exc:
         abort(f"opa eval produced no value for {query!r} against {rego_paths}: {exc}")
-
-
-def is_pass_through(rego_path: Path, tier: str) -> bool:
-    """True when the ``tier`` request package at ``rego_path`` is a pass-through (D24): its whole
-    data document is ``{"allow": true}`` — ``allow := true`` and no other rule.
-
-    Tells the enforcement side from the agent's outbound package: a pass-through under target side
-    (the tool's own inbound decides each tool call), the per-tool check under agent side."""
-    package = opa_eval([rego_path], f"data.authbridge.client.{tier}.request", {})
-    return package == {"allow": True}
 
 
 # ======================================================================================
@@ -603,28 +592,24 @@ def drive(username: str) -> None:
     ``scenario.expected_inbound``/``expected_outbound``; any mismatch aborts naming the offending
     ``(subject, function_name)`` rather than printing a quietly-wrong table.
 
-    The tool-call gate follows the enforcement side of the captured CRs. Under target side (the
-    default) the agent's outbound package is a pass-through and the tool's own inbound package
-    decides each ``tools/call`` (the user gate on ``input.identity.subject``, the calling-agent gate
-    on ``input.identity.client_id``). Under agent side the agent's outbound package decides it
-    (keyed on the exchange target ``input.identity.service_id``)."""
+    The agent's outbound package is a pass-through (D24), and the tool's own inbound package decides
+    each ``tools/call`` (the user gate on ``input.identity.subject``, the calling-agent gate on
+    ``input.identity.client_id``)."""
     cfg = load_config()
     role = scn.USERS[username]
     rego_dir = GENERATED / "02-after-tool"
     inbound_rego = rego_dir / cfg.inbound_rego
+    # The agent outbound is a pass-through that no gate below reads; checking it only shows that the
+    # snapshot is complete.
     outbound_rego = rego_dir / cfg.outbound_rego
     if not (inbound_rego.is_file() and outbound_rego.is_file()):
         abort(
             f"no policy found at {rego_dir} — run `make agent` and `make tool` first "
             "(run-*.py always drives against the after-tool snapshot)"
         )
-    target_side = is_pass_through(outbound_rego, "outbound")
     tool_inbound_rego = rego_dir / cfg.tool_inbound_rego
-    if target_side and not tool_inbound_rego.is_file():
-        abort(
-            f"the agent's outbound is a pass-through (target side), but no tool inbound policy is at "
-            f"{tool_inbound_rego} — run `make tool` first (it captures the tool's CR)"
-        )
+    if not tool_inbound_rego.is_file():
+        abort(f"no tool inbound policy is at {tool_inbound_rego} — run `make tool` first (it captures the tool's CR)")
 
     admin = connect_admin(cfg)
 
@@ -660,24 +645,11 @@ def drive(username: str) -> None:
     agent_client_id = admin.get_client(agent_uuid)["clientId"]
     secret = client_secret(admin, cfg, agent_uuid)
 
-    if target_side:
-        # Target side: the exchange target is the tool's own clientId (its SPIFFE id), and the
-        # tool's inbound package decides the call.
-        tool_uuid = resolve_service_id(admin, cfg, f"{cfg.namespace}/{scn.TOOL_WORKLOAD}")
-        target_uri = admin.get_client(tool_uuid)["clientId"]
-        gate_rego, gate_query = tool_inbound_rego, "data.authbridge.client.inbound.request.allow"
-        note(f"target side: {scn.TOOL_WORKLOAD}'s inbound decides; {scn.AGENT_WORKLOAD}'s outbound is a pass-through")
-    else:
-        # Agent side: target_allow_scopes is keyed by the FULL target service id (a SPIFFE id), with
-        # bare de-prefixed scope values. next(iter(...)) yields the id to exchange for.
-        target_scopes = (
-            opa_eval([outbound_rego], "data.authbridge.client.outbound.request.target_allow_scopes", {}) or {}
-        )
-        if not target_scopes:
-            abort(f"outbound rego at {outbound_rego} has no target_allow_scopes — is the tool onboarded?")
-        target_uri = next(iter(target_scopes))
-        gate_rego, gate_query = outbound_rego, "data.authbridge.client.outbound.request.allow"
-        note(f"agent side: {scn.AGENT_WORKLOAD}'s outbound decides")
+    # The exchange target is the tool's own clientId (its SPIFFE id), and the tool's inbound package
+    # decides the call.
+    tool_uuid = resolve_service_id(admin, cfg, f"{cfg.namespace}/{scn.TOOL_WORKLOAD}")
+    target_uri = admin.get_client(tool_uuid)["clientId"]
+    note(f"{scn.TOOL_WORKLOAD}'s inbound decides; {scn.AGENT_WORKLOAD}'s outbound is a pass-through")
 
     token_exchange(
         cfg, client_id=agent_client_id, client_secret_value=secret, subject_token=subject_token, audience=target_uri
@@ -686,16 +658,12 @@ def drive(username: str) -> None:
 
     rows: list[tuple[str, ...]] = []
     for intent in scn.INTENTS[username]:
-        if target_side:
-            # The tool inbound input: the user, the calling agent's clientId, and the invoked tool.
-            identity = {"subject": username, "client_id": agent_client_id}
-        else:
-            # The agent outbound input: the delegated user and the exchange target.
-            identity = {"subject": username, "service_id": target_uri}
+        # The tool inbound input: the user, the calling agent's clientId, and the invoked tool.
+        identity = {"subject": username, "client_id": agent_client_id}
         allowed = bool(
             opa_eval(
-                [gate_rego],
-                gate_query,
+                [tool_inbound_rego],
+                "data.authbridge.client.inbound.request.allow",
                 {"identity": identity, "mcp": {"method": "tools/call", "params": {"name": intent.function_name}}},
             )
         )

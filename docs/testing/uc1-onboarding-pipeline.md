@@ -16,18 +16,15 @@
 > | Rung | Issue | Onboards | Proves |
 > |---|---|---|---|
 > | 1 | `testing/5.4.1-uc1-onboard-agent-only.md` | agent only | agent discovery + inbound enforcement stand alone; **inbound gate only** — no tool onboarded, so there is no real outbound call and the outbound leg is not probed live |
-> | 2 | `testing/5.4.2-uc1-onboard-agent-then-tool.md` | agent → tool | onboarding the tool **after** the agent completes the tool check (PCE additive merge): under target side it writes the tool's own CR; under agent side it completes the agent's outbound gate. Also the subject on every leg (D31): each client links `aiac-username-sub`, and the exchanged token has `sub` = the username |
+> | 2 | `testing/5.4.2-uc1-onboard-agent-then-tool.md` | agent → tool | onboarding the tool **after** the agent completes the tool check (PCE additive merge): it writes the tool's own CR. Also the subject on every leg (D31): each client links `aiac-username-sub`, and the exchanged token has `sub` = the username |
 > | 3 | `testing/5.4.3-uc1-onboard-tool-then-agent.md` | tool → agent | the happy path; **and, vs rung 2, onboarding-order-independence** |
 > | 4 | `testing/5.4.4-uc1-onboard-two-policies.md` | two policies | **deferred / TBD**; two-stack impl discarded |
 > | 5 | `testing/5.4.5-uc1-onboard-failure-rollback.md` | agent / tool (build failure) | UC-1 **compensating rollback + PCE quarantine**: the quarantine deletes the CR, so a failed agent is denied (it has no CR, D20), a failed tool is unreachable, and a successful re-onboarding lifts the quarantine. Also the **MCP session** for a granted user. Test file: `test/system/test_uc1_onboard_failure_rollback.py` |
 > | 6 | — | agent + tool, then Controller restarts | the **resync** at Controller start (D28) leaves every CR unchanged; a service with **no CR is denied** (D20); the next resync writes the missing CR again. Test file: `test/system/test_uc1_onboard_resync.py` |
 >
-> **Enforcement side.** Every rung runs under the live **enforcement side** (D16): the
-> `AIAC_ENFORCEMENT_SIDE` value in the `aiac-agent-config` ConfigMap (default `target-side`). The
-> verdict tables do not depend on the side. Only the CR shapes and the place of a deny depend on it
-> (see *[CR end state for each side](#cr-end-state-for-each-side)*). No rung changes the side: the side
-> is set at deploy time, and a live switch is not supported. To cover both sides, run the lane under
-> each side, with a clean redeploy of AIAC between the runs (see *[Runbook](#runbook)*).
+> **The enforcement point.** Each callee checks the access to itself in its own inbound OPA, from its
+> own CR (PRD D34): github-tool decides each tool call, and github-agent decides the calls to the
+> agent. The outbound of every CR is a pass-through (D24). See *[CR end state](#cr-end-state)*.
 
 > **Relationship to `policy-pipeline`.** This is the **onboarding-order-focused sibling** of
 > [policy-pipeline.md](policy-pipeline.md). Identical *scenario facts and truth tables* (same three users,
@@ -67,12 +64,11 @@ restarts. They import three shared modules:
   — the agent's and the tool's CR; it replaces `delete_agent_cr` — and `sweep_authpolicies`), the
   rung-5 helpers (`pristine_stack`, `controller_llm_unusable`, `publish_service_event`,
   `workload_client`, `authpolicy_policies`, `cr_has_grants`, `spm_present`, `controller_logs`,
-  `mcp_session_decisions`), and the side helpers for every rung: `live_enforcement_side` (reads
-  `AIAC_ENFORCEMENT_SIDE` from the live `aiac-agent-config` ConfigMap; absent → `target-side`),
-  `rego_is_pass_through` (the package is `allow := true` only), `cr_matches_side` (a CR has the
-  shape of a given side for an agent or a tool — see
-  *[CR end state for each side](#cr-end-state-for-each-side)*), and `deny_origin` (where the raw
-  response of a denied tool call comes from: github-tool's inbound or the agent's outbound). The
+  `mcp_session_decisions`), and the CR-shape helpers for every rung: `rego_is_pass_through` (the
+  package is `allow := true` only), `cr_mismatches` / `cr_matches` (each way the CR of an agent or a
+  tool differs from its shape; an empty list is a match — see *[CR end state](#cr-end-state)*), and
+  `deny_origin` (where the raw response of a denied tool call comes from: github-tool's inbound, or
+  the agent's outbound — a fault, because that outbound is a pass-through). The
   rung-6 helpers are `aiac_crs` (every CR with the managed-by label
   `app.kubernetes.io/managed-by: aiac-pdp-policy-writer`, name → `spec.policies`) and
   `restart_controller` (rollout restart + wait for Ready). The subject-scope check (D31) is
@@ -128,11 +124,10 @@ token-exchange leg where a tool is present (Part B), waits for `bundle-service` 
 sidecars to recompose and reload the bundle, then drives real requests through AuthBridge on the **inbound
 leg always** — plus the **outbound leg only where a tool is onboarded** (rungs 2/3, 5–6)
 (`jwt-validation` builds `input.identity` inbound; `token-exchange` + `mcp-parser` build the outbound
-`input.identity` + `input.mcp.params.name`). Under **target side** the agent's outbound is a
+`input.identity` + `input.mcp.params.name`). The agent's outbound is a
 pass-through (D24), and github-tool's own inbound OPA decides each tool call: on github-tool's inbound,
 `jwt-validation` builds `input.identity` from the exchanged token (`subject` = the user, `client_id` =
-the calling agent) and `mcp-parser` builds `input.mcp.params.name`. Under **agent side** the agent's
-outbound OPA decides, as above. Rung 1 (agent only) probes the **inbound leg only**: with no
+the calling agent) and `mcp-parser` builds `input.mcp.params.name`. Rung 1 (agent only) probes the **inbound leg only**: with no
 tool onboarded there is no real `agent -> tool` call, and token-exchange short-circuits before OPA (no
 `github-tool` audience grant on the agent client), so an outbound probe would observe a Keycloak audience
 refusal rather than the AIAC OPA policy the rung exists to prove. The agent's own CrewAI reasoning flow is
@@ -165,12 +160,9 @@ operator + Keycloak + a real LLM, they are `@pytest.mark.system` (out of the def
   tool's (D20); `bundle-service` (in `rossoctl-system`) recomposes the namespace bundle,
   and each workload pod's AuthBridge OPA sidecar polls + reloads it (~20–30 s). There is **no** `/rego`
   dump and **no** `kubectl cp` — the artifact under test is the enforced decision, not a file.
-- **One enforcement side for every callee.** The Controller reads `AIAC_ENFORCEMENT_SIDE` (ConfigMap
-  `aiac-agent-config`, default `target-side`) at start. Under target side, each callee (github-agent
-  and github-tool) checks the access to itself in its own inbound OPA, from its own CR. Under agent
-  side, github-agent's outbound OPA checks its calls to github-tool, and github-tool has a pass-through
-  CR. The two sides never exist together. The harness reads the live side with
-  `live_enforcement_side` and asserts the CR shapes and the deny origin of that side.
+- **Each callee is its own enforcement point.** Each callee (github-agent and github-tool) checks the
+  access to itself in its own inbound OPA, from its own CR (PRD D34). The harness asserts the CR shapes
+  (`cr_mismatches`) and the deny origin (`deny_origin`).
 - **Convergence by polling real decisions.** After the CR is upserted (and, for the outbound leg, after
   Part B + the agent restart), `onboarded_stack` polls real requests through AuthBridge until this run's
   policy is reflected in the plugin's decisions, up to `AIAC_BUNDLE_TIMEOUT`.
@@ -196,12 +188,8 @@ cleanly** when any of it is absent (they never stand it up, and never false-pass
 - **Tool pods with the sidecar.** The script sets `injectTools=true`. It restarts the
   `rossoctl.io/type=tool` pods as well as the `rossoctl.io/type=agent` pods, because the webhook
   injects the sidecar only on pod CREATE. The namespace inbound pipeline has `jwt-validation`, `mcp-parser` and
-  `opa` (the onboarding check #2 for a tool under target side; under agent side a tool needs only
-  `jwt-validation`). The fixture deploys fresh workload pods, so
+  `opa` (the onboarding check #2 for a tool). The fixture deploys fresh workload pods, so
   github-agent and github-tool both get the sidecar at CREATE.
-- **The enforcement side.** `AIAC_ENFORCEMENT_SIDE` in the `aiac-agent-config` ConfigMap selects the
-  side (default `target-side`; the other value is `agent-side`). The suite runs under the live side,
-  and no rung changes it.
 - **Event Broker running.** The NATS broker `aiac-event-broker-service` (ns `aiac-system`, port `4222`,
   from `k8s/event-broker-deployment.yaml`) is deployed and reachable, and the Agent's in-pod consumer is
   connected — its `aiac-init` initContainer gates on NATS and provisions the `aiac-events` stream. The
@@ -267,14 +255,13 @@ real requests + assert → full teardown.**
    the operator registers the Keycloak client (`client.name = "{ns}/{workload}"`), Keycloak emits
    `CLIENT_CREATED`, the SPI publishes over NATS, and the Agent's consumer runs `onboard_and_apply`.
    - **Tool** (`github-tool`) → `onboard_and_apply` classifies it a **Tool**, writes its bootstrap CR
-     before Provision (so that the discovery `tools/list` passes D20; under target side through the self-discovery rule), reads
+     before Provision (so that the discovery `tools/list` passes D20, through the self-discovery rule), reads
      the MCP manifest,
      provisions scopes `github-tool.{source-read, source-write, issues-read, issues-write}`, sets
      `client.type=Tool`. The rules on the tool's scopes are stored on `SPM(github-tool)` (the service
      that owns the scopes). The PCE stores `SPM(github-tool)` also when it has zero rules (D21), so the
-     tool is in the managed set and gets its own CR with both request packages (D20). Under target side
-     that CR has the rules-based tool inbound (D26) and a pass-through outbound (D24). Under agent side
-     it is a pass-through CR (D24). **Tool convergence** = those `github-tool.*` client scopes are
+     tool is in the managed set and gets its own CR with both request packages (D20). That CR has
+     the rules-based tool inbound (D26) and a pass-through outbound (D24). **Tool convergence** = those `github-tool.*` client scopes are
      provisioned in Keycloak **and** github-tool's CR is present with both request packages. The
      bootstrap CR is present before Provision, so the CR check alone does not prove the final CR. For the
      tool, the CR check is the per-workload gate, because a live decision on github-tool's inbound
@@ -345,7 +332,7 @@ real requests + assert → full teardown.**
    re-fetches the recomposed bundle). Assigning the agent's `*-aud` scope is **not** operator-automatic,
    so it stays harness provisioning (the operator creates that `*-aud` scope only on **tool** deploy, so
    it does not even exist on the tool-less rung). Without this the outbound call passes through
-   unexchanged and never reaches OPA. Under target side the step is still necessary: the agent's
+   unexchanged and never reaches OPA. The step is still necessary: the agent's
    outbound is a pass-through, but github-tool's inbound `jwt-validation` accepts only a token whose
    audience is github-tool, so `token-exchange` must mint it.
 4. **Poll until the pipeline converges.** `poll_until` drives real decisions until this run's CR is
@@ -365,22 +352,20 @@ real requests + assert → full teardown.**
         `expected_inbound`.
       - **Outbound (per-scope two-gate AND)** — **rungs 2/3 only** (a tool is onboarded); rung 1 does not
         probe the outbound leg. Per `(subject × bare tool name)`, a real MCP `tools/call`
-        for the **bare** tool through AuthBridge's forward proxy (`outbound_decision`). Under target
-        side github-tool's inbound OPA decides: its reverse proxy rejects an ungranted call with HTTP
-        403 and a plain JSON body (`error: "policy.forbidden"`, `plugin: "opa"`), and the agent's
-        pass-through outbound relays that response. Under agent side the agent's outbound OPA
-        decides: its denial is a JSON-RPC error frame (`error.data.plugin: "opa"`) at HTTP 200. The
-        harness classifies both as `deny`. A **token-exchange refusal** (`error.data.plugin: "token-exchange"` /
+        for the **bare** tool through AuthBridge's forward proxy (`outbound_decision`). github-tool's
+        inbound OPA decides: its reverse proxy rejects an ungranted call with HTTP 403 and a plain
+        JSON body (`error: "policy.forbidden"`, `plugin: "opa"`), and the agent's pass-through
+        outbound relays that response. The harness classifies it as `deny`. A **token-exchange refusal** (`error.data.plugin: "token-exchange"` /
         `upstream.token-exchange-failed`) classifies as `"error"` — not `deny`, not `allow` — because the
         outbound authz decision was never reached; this keeps a genuine token-exchange fault on rungs 2/3
         from masquerading as an `allow`. Expected from `expected_outbound_bare` — allowed iff the subject
         **and** some agent role both reach that tool's scope.
-      - **The enforcement point** — rungs 2/3. One node reads the raw response of
-        an ungranted call (`test-user` × `source-read`) and asserts with `deny_origin` that the deny
-        comes from the side's enforcement point: from github-tool's inbound under target side (so the
-        agent's outbound let the call through), from the agent's outbound under agent side. One node
-        asserts with `cr_matches_side` that github-agent's and github-tool's CRs have the shape of the
-        live side (see *[CR end state for each side](#cr-end-state-for-each-side)*).
+      - **The enforcement point** — rungs 2/3. One node (`test_deny_comes_from_enforcement_point`)
+        reads the raw response of an ungranted call (`test-user` × `source-read`) and asserts with
+        `deny_origin` that the deny comes from github-tool's inbound (`DENY_ORIGIN_TOOL_INBOUND`), so
+        the agent's outbound let the call through. One node (`test_crs_match`) asserts with
+        `cr_mismatches` that github-agent's and github-tool's CRs have their shape (see
+        *[CR end state](#cr-end-state)*).
       - Verdicts are **computed from** `scenario_uc1.py`, never from the policy. A failing node names the
         exact cell.
    3. **The subject on every leg (D31)** — rung 2.
@@ -394,8 +379,8 @@ real requests + assert → full teardown.**
         the agent client uses a client authenticator other than `client-secret` (for example a SPIFFE
         JWT-SVID through `federated-jwt`). The harness exchanges with the agent's client secret, the
         identity that `k8s/opa-kind-enable.sh` gives AuthBridge's `token-exchange`, so a refused secret
-        is a failure. It is the one direct check of the exchanged `sub`: under agent side no one-hop
-        decision reads it.
+        is a failure. It is the one direct check of the exchanged `sub` (`test_outbound` reads it only
+        through a decision).
 6. **Teardown → pristine.** Restore the cluster to its pre-test (no-workloads) state:
    - **Capture the CRs first** (`capture_aiac_crs`, phase `teardown`), on the success and the failure
      path: every AIAC CR (the managed-by label, all namespaces) and the global combiner, written as YAML
@@ -421,33 +406,27 @@ real requests + assert → full teardown.**
 The **final** enforced policy must not depend on the order services are onboarded. This is a
 **requirement**: if onboarding order changes the end state, that is a **bug** the ladder exists to catch —
 not an accepted difference. Rung 3 (tool → agent) is the **live counterpart of the PCE's
-order-independence unit test (8.11)** and the exact repro of the original order-dependence bug: under the
-old APM-only design, tool-then-agent **lost** the outbound gate.
+order-independence unit test (8.11)** and the exact repro of the original order-dependence bug, where
+tool-then-agent **lost** the tool check.
 
 Why it holds: `compute_and_apply` is **affected-service** oriented and **additive** (`override=False`, see
 [../components/policy-computation-engine.md](../specs/components/policy-computation-engine.md)). When the **tool**
 is onboarded, its Service Policy Builder pairs the tool's scopes against the rest of the role universe,
 producing `(agent-role, tool-scope)` and `(user-role, tool-scope)` rules; the PCE stores those rules on
-`SPM(github-tool)` (the service that owns the scopes). Then the PCE deploys the affected services of the
-live side (D23):
-
-- **Target side:** the affected set is the `changed` set — the services whose SPM changed in this run.
-  The PCE upserts the CR of each one from its stored SPM. The tool check is github-tool's inbound.
-- **Agent side:** the PCE derives the **agent's** `AgentPolicyModel` from the stored SPMs and re-upserts
-  the agent's `AuthorizationPolicy` CR, plus the pass-through CR of the focus tool.
+`SPM(github-tool)` (the service that owns the scopes). Then the PCE deploys the affected services
+(D23): the affected set is the `changed` set — the services whose SPM changed in this run. The PCE
+upserts the CR of each one from its stored SPM. The tool check is github-tool's inbound.
 
 So:
 
 - **Rung 2 (agent → tool):** agent onboarding leaves the tool check empty; **tool onboarding fills it
-  in**. Under target side, the tool onboarding changes only `SPM(github-tool)`, so it writes github-tool's
-  CR with both gates (the agent's roles already exist), and the agent's CR does not change. Under agent
-  side, it re-writes the agent's CR with the full outbound gate.
+  in**. The tool onboarding changes only `SPM(github-tool)`, so it writes github-tool's
+  CR with both gates (the agent's roles already exist), and the agent's CR does not change.
 - **Rung 3 (tool → agent):** the tool's scopes already exist, so **agent onboarding produces the full
-  gate** in one pass. Under target side, the tool onboarding writes github-tool's CR with the user gate
+  gate** in one pass. The tool onboarding writes github-tool's CR with the user gate
   only (no agent role exists yet). The agent onboarding adds the `(agent-role, tool-scope)` rules to
   `SPM(github-tool)`, so the `changed` set holds both services, and the PCE writes both CRs: the
-  calling-agent gate of github-tool's inbound is then complete. Under agent side, the agent's CR gets
-  the full outbound gate.
+  calling-agent gate of github-tool's inbound is then complete.
 - **Both converge** to the same enforced decisions. The unit-level `test_order_independence_oracle`
   (`test/unit/agent/uc/onboarding/test_uc1_grant_set_oracles.py`) asserts that rung 3's intended
   end state is **identical** to rung 2's published expectations (`RUNG3_* == RUNG2_*`); rung 3 then proves the
@@ -455,8 +434,8 @@ So:
   is enforced.
 
 Rung 1 (agent only) is the exception by construction: with no tool onboarded there are no tool scopes in
-the universe, so there is no tool check — under agent side the outbound user gate is **empty**, and
-under target side the agent's outbound is a pass-through and no tool CR exists. Rung 1 does **not** probe that gate live (the
+the universe, so there is no tool check — the agent's outbound is a pass-through and no tool CR
+exists. Rung 1 does **not** probe that gate live (the
 outbound leg has no real counterpart — see the inbound-only note above); its emptiness is asserted where
 it is deterministic and real: at the unit level by the grant-set oracle
 (`test/unit/agent/uc/onboarding/test_uc1_grant_set_oracles.py`) and live by `test_no_tool_scopes_provisioned`
@@ -474,7 +453,7 @@ Service Provision succeeds and creates the service's roles/scopes; the build the
 an HTTP status, so the rung asserts only observable end state (Keycloak, CRs, the policy store, the
 Controller log, and real requests through AuthBridge + OPA):
 
-The quarantine **deletes** the failed service's CR under both sides (D20). There is no no-rules CR: the
+The quarantine **deletes** the failed service's CR (D20). There is no no-rules CR: the
 changed combiner denies a pod that has no client CR, so a deleted CR means deny.
 
 - **Failed agent:**
@@ -503,23 +482,20 @@ changed combiner denies a pod that has no client CR, so a deleted CR means deny.
     scope of the disabled tool client. The phase-3 onboarding linked it, and the link is not in the
     created-manifest, so the rollback does not delete it (D31). `test_rollback_keeps_the_subject_scope`
     covers the failed agent and the failed tool;
-  - the agent's CR, by side: under target side it does not change (the tool owns no role, so the
-    footprint purge changes no other SPM) — its inbound grants stay and its outbound stays a
-    pass-through. Under agent side, the agent CR's outbound grant bindings are all empty, and its
-    inbound grants stay;
-  - the agent's call to the tool is **blocked**. Under target side, github-tool has no CR, so the
-    combiner denies the call on github-tool's inbound (D20). Under agent side, the agent's outbound OPA
-    denies it. Under both sides, Keycloak can instead refuse the token exchange to the disabled tool's
-    audience.
+  - the agent's CR does not change (`test_failed_tool_leaves_the_agent_cr_unchanged`): the tool owns
+    no role, so the footprint purge changes no other SPM — its inbound grants stay and its outbound
+    stays a pass-through;
+  - the agent's call to the tool is **blocked**. github-tool has no CR, so the combiner denies the call
+    on github-tool's inbound (D20). Keycloak can instead refuse the token exchange to the disabled
+    tool's audience.
 - **Lift:** a successful re-onboarding writes the agent's CR again (with grants) and **re-enables** the
   client. The test proves the lift on the agent only: a quarantined tool cannot be re-onboarded today
   (see the known limit in `docs/specs/components/aiac-agent/uc1-service-onboarding.md`; C5), so the failed-tool
   phase runs last.
 - **MCP session:** `initialize`, `notifications/initialized`, `tools/list` and `tools/call` work for a
   granted user (a user who holds a grant on at least one tool of the target, here `dev-user`);
-  `initialize`, `tools/list` and `tools/call` are denied for `devops-user` (no grant). Under target
-  side, github-tool's inbound decides the session (D26), and the agent's outbound passes it through.
-  Under agent side, the agent's outbound decides it (the MCP session rule).
+  `initialize`, `tools/list` and `tools/call` are denied for `devops-user` (no grant).
+  github-tool's inbound decides the session (D26), and the agent's outbound passes it through.
 - **The race hint (handoff 20, D33).** A failed onboarding that does not settle (the failed agent and
   the failed tool), and a tool that does not converge on the happy path, add the event-before-commit
   race hint to their message (see *[Per-rung flow](#per-rung-flow)*, step 2). The rung reads the hint
@@ -529,9 +505,9 @@ changed combiner denies a pod that has no client CR, so a deleted CR means deny.
 ## Controller restart — the resync and the no-CR deny (rung 6)
 
 Rung 6 (`test/system/test_uc1_onboard_resync.py`) proves the resync at Controller start (D28) and the
-D20 deny of a service that has no CR. At each start the Controller reads the side, runs the start
+D20 deny of a service that has no CR. At each start the Controller runs the start
 check #4, and then runs the resync under the PCE lock, before it serves: `PUT /policy` with the full
-policy model of the live side (built from the stored SPM of every live service: in the IdP catalog and
+policy model (built from the stored SPM of every live service: in the IdP catalog and
 not disabled), then a
 teardown (quarantine) of each disabled service that still has an SPM. The `PUT` also deletes each AIAC
 CR whose service is not in the model. The harness also restarts the Controller in `ensure_agent_policy` (a `policy.md` change)
@@ -548,7 +524,7 @@ first.
 2. **No CR, so deny (D20).** Delete github-tool's CR by hand
    (`kubectl delete authorizationpolicy github-tool`). Poll until the `dev-user` `source-read` call,
    which phase 1 allowed, is denied. github-tool now has no client CR, so the combiner denies the call
-   on github-tool's inbound (HTTP 403), under both sides.
+   on github-tool's inbound (HTTP 403).
 3. **Restart, repair.** Call `restart_controller` again. The resync writes the missing CR from
    `SPM(github-tool)`. Assert: github-tool's CR is back with the same `spec.policies` as in phase 1, and
    the `dev-user` `source-read` call is allowed again.
@@ -576,8 +552,7 @@ rendering). They are **identical to policy-pipeline's** and to what the deployed
 
 **Outbound allow(subject, tool)** (the real plugin's decision on the agent's call to the tool, per-scope
 two-gate AND over the **bare** tool names; the agent reaches all four tool scopes, so the user gate
-discriminates; under target side github-tool's inbound OPA decides, under agent side the agent's
-outbound OPA decides, and the table is the same) — **rungs 2 and 3** (with a tool onboarded):
+discriminates; github-tool's inbound OPA decides) — **rungs 2 and 3** (with a tool onboarded):
 
 | | source-read | source-write | issues-read | issues-write |
 |---|---|---|---|---|
@@ -587,7 +562,7 @@ outbound OPA decides, and the table is the same) — **rungs 2 and 3** (with a t
 
 The table covers `tools/call`. The MCP session messages (`initialize`, `notifications/initialized`,
 `ping`, `tools/list`) to `github-tool` are allowed for a user who holds a grant on at least one of its
-tools (`dev-user`, `test-user`) and denied otherwise (`devops-user`). Under target side, github-tool's
+tools (`dev-user`, `test-user`) and denied otherwise (`devops-user`). github-tool's
 inbound denies every other MCP method (D26).
 
 **Rung 1 (agent only):** the outbound leg is not probed (see
@@ -595,25 +570,27 @@ inbound denies every other MCP method (D26).
 
 The pipeline emits one `AuthorizationPolicy` CR per onboarded service — the agent's **and the tool's**
 (D20). Each CR has both request packages (`inbound/request.rego`, `outbound/request.rego`), and no
-response package. The shape depends on the side (see the next section). Each rung also asserts the
+response package (for the shape, see the next section). Each rung also asserts the
 expected Keycloak provisioning end state (agent roles/scopes with the expected descriptions; rung 1
 additionally asserts **no** tool scopes exist).
 
-### CR end state for each side
+### CR end state
 
-`cr_matches_side` checks these shapes. A rules-based package has `default allow := false` (D25). A
-pass-through package is only `allow := true` (`rego_is_pass_through`).
+`cr_mismatches` checks these shapes (`cr_matches` is true when it finds no mismatch). A rules-based
+package has `default allow := false` (D25). A pass-through package is only `allow := true`
+(`rego_is_pass_through`).
 
-| Side | github-agent CR | github-tool CR | Where the tool check runs |
-|---|---|---|---|
-| **target side** (default) | inbound: rules, agent-level (D26a), with grants; outbound: pass-through (D24) | inbound: rules, per tool (D26), with grants; outbound: pass-through (D24) | github-tool's inbound |
-| **agent side** | inbound: rules, agent-level, with grants; outbound: rules (per-tool checks + the MCP session rule) | inbound and outbound: pass-through (a pass-through CR, D24) | github-agent's outbound |
+| github-agent CR | github-tool CR | Where the tool check runs |
+|---|---|---|
+| inbound: rules, agent-level (D26a), with grants; outbound: pass-through (D24) | inbound: rules, per tool (D26), with grants; outbound: pass-through (D24) | github-tool's inbound |
 
 A service that is not in the managed set (no stored SPM — for example after a quarantine) has **no**
-CR, and the combiner denies it (D20). `deny_origin` tells the two enforcement points apart from the raw
-response of a denied tool call: HTTP 403 with a plain JSON body (`plugin: "opa"`) relayed from
-github-tool's inbound, or HTTP 200 with a JSON-RPC error frame (`error.data.plugin: "opa"`) from the
-agent's outbound.
+CR, and the combiner denies it (D20). `deny_origin` tells from the raw response of a denied tool call
+where the deny comes from: HTTP 403 with a plain JSON body (`plugin: "opa"`) relayed from
+github-tool's inbound (`DENY_ORIGIN_TOOL_INBOUND`), or HTTP 200 with a JSON-RPC error frame
+(`error.data.plugin: "opa"`) from the agent's outbound (`DENY_ORIGIN_AGENT_OUTBOUND`). The agent's
+outbound is a pass-through, so a deny from it is a fault (for example the D20 combiner deny when the
+agent has no CR).
 
 ### Prefixed provisioned names vs. bare runtime names
 
@@ -638,11 +615,10 @@ same `input.mcp.params.name`) and, for this scenario, its verdicts equal the use
 genuine, not degenerate: if the agent reached only a subset of the tool's scopes, the request would be
 denied for the scopes it does not reach.
 
-Under target side the same two gates run in github-tool's own inbound (D26), keyed by the bare tool
+The two gates run in github-tool's own inbound (D26), keyed by the bare tool
 name: the user gate on `input.identity.subject`, and the calling-agent gate on
 `input.identity.client_id` (the agent that called). A deny vetoes an allow. The callee is the key, so
-the gate needs no target ID. Under agent side the gates run in the agent's outbound, and the capability
-gate is keyed by the target (`input.identity.service_id`).
+the gate needs no target ID.
 
 ## Scenario
 
@@ -674,7 +650,6 @@ The suite reads its config from the repo-root `.env` (gitignored); source it bef
 | `AIAC_TEST_REALM` | Realm the tests provision/read back against. **Must match the deployed AIAC stack's `KEYCLOAK_REALM`** — the in-cluster consumer onboards in *its own* realm off the `CLIENT_CREATED` event, so a harness that provisions roles in a different realm would leave onboarding unable to see them | `rossoctl` |
 | `AIAC_DEMO_NAMESPACE` | Namespace the tests deploy (and tear down) the demo workloads into | `team1` |
 | `AIAC_TRUST_DOMAIN` | SPIFFE trust domain the operator registers the demo workloads under | `localtest.me` |
-| `AIAC_ENFORCEMENT_SIDE` (ConfigMap `aiac-agent-config`, not a harness env var) | The enforcement side the Controller uses (`target-side` or `agent-side`). `live_enforcement_side` reads it from the live ConfigMap; no rung changes it | `target-side` |
 | NATS Event Broker (not an env var) | Precondition. `require_event_path` skips unless pods labelled `app=aiac-event-broker` in `aiac-system` are Running; the harness has no env var for the broker | — (`k8s/event-broker-deployment.yaml`) |
 | SPI listener (realm `eventsListeners`) | Must contain `aiac-event-listener` (with `adminEventsEnabled: true`) so `CLIENT_CREATED` reaches NATS (precondition) | — (Helm/realm setup, per `keycloak-spi/README.md`) |
 
@@ -712,11 +687,6 @@ set -a; . .env; set +a
 .venv/bin/pytest -m system -k uc1_onboard_resync -v        # rung 6 only
 ```
 
-The lane runs under the live side (default `target-side`). The side is set at deploy time, and a live
-switch is not supported. To run the whole lane under agent side, do a clean redeploy of AIAC with
-`agent-side` first (see [`opa-kind-runbook.md` → Set the enforcement side](../../k8s/opa-kind-runbook.md#set-the-enforcement-side)), then run the lane again. Do a clean redeploy with `target-side`
-afterwards to restore the default.
-
 Without `-m system` the suite is deselected (the default `addopts`); when the cluster/pipeline is not wired — including the
 **broker/SPI not installed** and the **combiner not changed** — or the env is unset, it **skips cleanly** (`require_pipeline`,
 `require_env_or_skip`, `require_event_path`; it never false-passes). Image
@@ -744,12 +714,10 @@ Rung 6 restarts the Controller twice, so it takes several minutes.
   image toolchain, see *[Preconditions](#preconditions-the-wired-platform--not-stood-up-by-the-tests)*. Full teardown keeps reruns hermetic.
 - **One stack, one policy, the deployed plugin.** Rungs 1–3 need only one AIAC stack; the deployed OPA
   plugin + the upserted `AuthorizationPolicy` CRs (one per managed service) are what make the pipeline observable.
-- **Side-aware, verdict-stable.** The verdict tables are the same under each enforcement side. The
-  harness reads the live side (`live_enforcement_side`) and selects only the side-dependent assertions:
-  the CR shapes (`cr_matches_side`) and the place of a deny (`deny_origin`). Under target side these
-  prove that the tool check moved from the agent's outbound to github-tool's inbound: a granted
-  `tools/call` passes, github-tool's inbound denies an ungranted one, and the agent's outbound is a
-  pass-through.
+- **The enforcement point is asserted.** The harness asserts the CR shapes (`cr_mismatches`, in
+  `test_crs_match`) and the place of a deny (`deny_origin`, in `test_deny_comes_from_enforcement_point`).
+  These prove that github-tool's inbound decides the tool check: a granted `tools/call` passes,
+  github-tool's inbound denies an ungranted one, and the agent's outbound is a pass-through.
 - **Onboarding-order-independence is asserted, not assumed** (rungs 2 vs 3). Rung 3's intended end state
   is checked identical to rung 2's published expectations at the unit level (`test_order_independence_oracle`
   in `test_uc1_grant_set_oracles.py`), and the real plugin's decisions are asserted in
@@ -764,37 +732,37 @@ Rung 6 restarts the Controller twice, so it takes several minutes.
   re-enables the client.
 - **The Controller start is tested live** (rung 6). A restart with no change leaves every CR
   unchanged (the resync, D28). A CR deleted by hand denies its service (D20), and the next resync
-  writes it again. No rung changes the side (a live switch is not supported, D16, D29).
+  writes it again.
 - **Per-scope two-gate AND.** UC-1's per-skill operator roles are mapped to the tool scopes by
   capability-match, so the capability gate is populated; the plugin enforces the real per-scope AND. The
-  agent reaches all four tool scopes, so the user gate discriminates. Under target side the same AND
-  runs in github-tool's inbound (the user gate and the calling-agent gate, D26).
+  agent reaches all four tool scopes, so the user gate discriminates. The AND runs in github-tool's
+  inbound (the user gate and the calling-agent gate, D26).
 - **Unit-level counterparts.** The unit lane (untagged; a bare `.venv/bin/pytest`; the tests mirror
   `src/aiac/` under `test/unit/`) owns the parts that these system rungs observe only from outside:
-  - `test/unit/policy/model/` — the policy-model parse (D18a): a target-side body parses to
-    `TargetSidePolicyModel`, an agent-side body to `AgentSidePolicyModel`; and the shared projection
-    (D18b): for one SPM, `project_inbound` gives the same inbound gates as the APM inbound that
-    `_derive` builds.
+  - `test/unit/policy/model/` — the policy-model parse (D18a): a body with `services` parses to
+    `PolicyModel`, a body without `services` is rejected, and an unknown field is ignored; and the
+    shared projection (D18b): `project_inbound` splits the edges of one
+    SPM into the user gate and the calling-agent gate, plus the effect-agnostic identity maps.
   - `test/unit/policy/computation/` — the policy-model stage (D23, D21: the managed set, the zero-rule
-    focus SPM, the `changed` set, the affected set for each side); the quarantine and the decommission
+    focus SPM, the `changed` set, the affected set); the quarantine and the decommission
     call `delete_service_cr` (D20); the resync (D28: one `PUT` with every live stored SPM, the deletes by
     the label, the teardown of a disabled service); the bootstrap (the CR of a focus tool, and no SPM
     stored); `drop_bootstrap` (it holds the PCE lock, deletes the CR of a service that has no stored
-    SPM, and changes nothing when an SPM is stored); and the switch parse (`enforcement_side()`: an
-    unknown `AIAC_ENFORCEMENT_SIDE` value raises `ValueError`).
+    SPM, and changes nothing when an SPM is stored).
   - `test/unit/pdp/service/policy/opa/` — the writer: a tool CR (name and namespace from
     `identity_ref`, the label, both request packages), a batch, `PUT /policy` deletes the stale
     labelled CRs and keeps the others, `DELETE /policy/services/{service_id:path}` (a 404 counts as
-    success), a body with a wrong or missing tag gives 422; and the Rego with `opa eval`
-    (`_assert_opa_allow` / `_opa_verdict`, which skip without `opa`): both renderings for an agent and
-    a tool, the tool inbound (D26, with the self-discovery rule), the agent inbound (D26a), no request without identity passes
+    success), a `POST` or `PUT /policy` body without `services` gives 422 and writes nothing
+    (`test_a_body_without_services_is_422_and_writes_nothing`); and the Rego with `opa eval`
+    (`_assert_opa_allow` in `test_rego.py` and `_opa_allows` in `test_main.py`, which skip without `opa`): the CRs that the writer applied
+    for an agent and a tool, the tool inbound (D26, with the self-discovery rule), the agent inbound (D26a), no request without identity passes
     (D27), the pass-through outbound (D24), and the changed combiner (D20).
-  - `test/unit/agent/` — the start sequence (an unknown side, a failed start check #4, or a failed
-    resync stops the Controller before it serves), the onboarding checks #1, #2 and
-    #6 (each gives 409, is permanent in the NATS consumer, runs no rollback and no quarantine, and runs
-    before the bootstrap, Provision and the PRB, D30; #2 needs `jwt-validation` inbound, and under agent
-    side a tool gets #1 and #2 and no #6), the login-client audience warning (agent side only, after the
-    build of a tool and after the resync at start; a failure stops neither), the bootstrap of a tool before Provision, the
+  - `test/unit/agent/` — the start sequence (start check #4, then the resync, then the NATS consumer;
+    a failed start check #4 or a failed resync stops the Controller before it serves), the onboarding
+    checks #1, #2 and #6 (each gives 409, is permanent in the NATS consumer, runs no rollback and no
+    quarantine, and runs before the bootstrap, Provision and the PRB, D30; every service gets the
+    three checks; #2 needs an enforcing `jwt-validation` and `opa` in the inbound pipeline, and a tool
+    also needs `mcp-parser`; the outbound pipeline is not checked), the bootstrap of a tool before Provision, the
     drop of the bootstrap CR (a failure that runs no quarantine, and a failed `compute_and_apply`,
     call `drop_bootstrap` only for a tool that this run bootstrapped; a failed drop does not hide
     the original error), and the read-only route `GET /policy/services/{service_id:path}` (D18). For D31: Provision links the

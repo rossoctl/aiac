@@ -37,8 +37,7 @@ for any Python execution, test runs, or dependency checks.
 
 - Build and deploy: `k8s/aiac-deployment-guide.md`. The OPA pipeline on Kind:
   `k8s/opa-kind-runbook.md`.
-- Deploy parameters (for example the access-control scheme,
-  `ac-side=agent|target`): `docs/agents/deploy.md`.
+- Deploy preconditions: `docs/agents/deploy.md`.
 
 ## External references
 

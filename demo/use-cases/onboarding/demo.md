@@ -61,8 +61,8 @@ Grant access on a least-privilege basis: allow only what this policy states; den
 AIAC writes one `AuthorizationPolicy` CR per managed service — one for the agent and one for the
 tool — derived from the policy text plus the realm-role descriptions already in Keycloak and the
 tool's own discovered capabilities. Each CR carries two Rego packages, with the fixed AuthBridge
-names (`authbridge.client.{inbound,outbound}.request`) the live OPA plugin evaluates. Under the
-default **target side** enforcement, each service checks the calls to itself:
+names (`authbridge.client.{inbound,outbound}.request`) the live OPA plugin evaluates. Each service
+checks the calls to itself, in its own inbound package:
 
 - `github-agent`'s inbound package decides who may call the agent (`input.identity.subject`);
 - `github-tool`'s inbound package decides each tool call — which user may call which tool, and
@@ -112,14 +112,6 @@ read and write source and read issues; a tester can read and write issues but ne
 — exactly the two-line policy, and nothing it didn't say. The full pair of CRs is in
 [`docs/examples/opa-team1-policy.yaml`](../../../docs/examples/opa-team1-policy.yaml).
 
-Under **agent side** enforcement (`AIAC_ENFORCEMENT_SIDE=agent-side`), the same per-tool check is in
-`github-agent`'s outbound package instead (keyed by the exchange target
-`input.identity.service_id`), and `github-tool` gets a pass-through CR. The side is set at deploy
-time; to change it, do a clean redeploy of AIAC (a live switch is not supported). See
-[`k8s/opa-kind-runbook.md` → Set the enforcement side](../../../k8s/opa-kind-runbook.md#set-the-enforcement-side).
-The driver reads the live side and checks the matching CR, so the steps below are the same under
-both sides; only where a tool call is decided changes.
-
 ## How enforcement works
 
 ```
@@ -148,8 +140,7 @@ Tool:      github-agent (outbound) ─► jwt-validation ─► OPA ─► githu
 ```
 
 So a call from `github-agent` to `github-tool` crosses two OPA checks: the agent's outbound and the
-tool's inbound. Under target side the tool's inbound has the rules and the agent's outbound is a
-pass-through; under agent side it is the other way round.
+tool's inbound. The tool's inbound has the rules, and the agent's outbound is a pass-through.
 
 Policies reach the plugin via the bundle service every AuthBridge workload polls
 (`http://bundle-service.rossoctl-system.svc.cluster.local:8080`). On the outbound leg OPA sits
@@ -159,7 +150,7 @@ that leg. On the tool's inbound leg, `input.identity` comes from the exchanged t
 [realm fix-up](#one-time-keycloak-realm-fix-up)).
 
 Under the changed combiner (D20) that step 2 applies, a pod that has no CR is **denied**. That is
-why AIAC writes a CR for every managed service, a pass-through where it has no rules.
+why AIAC writes a CR for every managed service.
 
 ---
 
@@ -488,10 +479,8 @@ VERIFY-TRIGGER polls until each of these is true, in order:
    provisioned).
 3. The `authorizationpolicies.agent.rossoctl.dev/github-agent` **and** `.../github-tool` CRs exist
    (one per managed service, D20).
-4. The **per-tool check is populated**, then it prints both CRs. Where it is depends on the side:
-   under target side, `github-tool`'s inbound `source_roles` (the calling-agent gate) carries
-   `github-agent`; under agent side, `github-agent`'s outbound `target_allow_scopes` carries the
-   tool's scopes.
+4. The **per-tool check is populated**, then it prints both CRs: `github-tool`'s inbound
+   `source_roles` (the calling-agent gate) carries `github-agent`.
 
 Check 4 matters because check 3 alone would pass a half-onboarded state whose per-tool maps are all
 empty, deferring the failure to step 5 where the cause is much harder to see.
@@ -529,8 +518,7 @@ make enforce
 
 1. Adds the `github-tool` route to the `authproxy-routes` ConfigMap. Its `host` decides whether
    token-exchange fires at all. Its `target_audience` is the audience of the exchanged token that
-   `github-tool`'s inbound validates (target side), and it becomes `input.identity.service_id` on
-   the agent's outbound leg, the key that the agent-side policy looks up in `target_allow_scopes`.
+   `github-tool`'s inbound validates.
 2. Ensures `github-agent`'s Keycloak client may request the `agent-team1-github-tool-aud` audience.
 3. Restarts the agent pod, because the route is read at sidecar start.
 
@@ -549,26 +537,24 @@ it drives real HTTP probes through the live plugin:
 | `dev-user` → `github-agent` | allowed | `source-read`, `source-write`, `issues-read` allowed; `issues-write` denied |
 | `test-user` → `github-agent` | allowed | `issues-read`, `issues-write` allowed; `source-read`, `source-write` denied |
 | `devops-user` → `github-agent` | **denied (403)** | never reached |
-| `dev-user` → `github-tool` directly, no agent | — | **denied** under target side (no calling-agent role); not probed under agent side |
+| `dev-user` → `github-tool` directly, no agent | — | **denied** (no calling-agent role) |
 
 `devops-user`'s denial is the intended story, not a failure — nothing in the policy grants it access
 to the agent at all.
 
 The driver hard-fails on the two decisive tool-call checks (`dev-user`→`source-read` must be
-allowed, `test-user`→`source-read` must not be) and, under target side, on the direct call. It
-reports the rest of the matrix, then prints the matching OPA decision-log lines: the tool-call
-decisions come from `github-tool`'s sidecar (inbound) under target side, and from `github-agent`'s
-sidecar (outbound) under agent side.
+allowed, `test-user`→`source-read` must not be) and on the direct call. It reports the rest of
+the matrix, then prints the matching OPA decision-log lines: the tool-call decisions come from
+`github-tool`'s sidecar (inbound).
 
 ### Reading the verdicts
 
-A tool-call denial looks different under each side:
+A denial looks like this:
 
 | Where it is denied | A denial looks like |
 |---|---|
 | Agent inbound | **HTTP 403**, body `{"error":"policy.forbidden","plugin":"opa"}` |
-| Tool inbound (target side) | **HTTP 403**, body `{"error":"policy.forbidden","plugin":"opa"}` — the tool's reverse proxy sends it and the agent's forward proxy relays it |
-| Agent outbound (agent side) | **HTTP 200** with a JSON-RPC error frame — `error.code: -32000`, `error.data.plugin: "opa"`, because the outbound pipeline includes `mcp-parser` |
+| Tool inbound | **HTTP 403**, body `{"error":"policy.forbidden","plugin":"opa"}` — the tool's reverse proxy sends it and the agent's forward proxy relays it |
 
 So classify a tool call by the response **body**: a `result` frame is allowed; an `error` frame, or
 a `403` body that names `opa`, is denied. A denied request never reaches the `github-tool` app. The
@@ -586,7 +572,7 @@ in the decision log — that term only exists in the AIAC-generated package:
 ```bash
 kubectl logs deployment/github-agent -n team1 -c authbridge-proxy --tail=200 \
   | grep "Decision Log" | tail -2
-# the tool-call decisions under target side:
+# the tool-call decisions:
 kubectl logs deployment/github-tool -n team1 -c authbridge-proxy --tail=200 \
   | grep "Decision Log" | grep 'path=authbridge/inbound/request' | tail -2
 ```
@@ -632,8 +618,7 @@ make diff PRIOR=01-after-agent
 gate (`subject_role_allow_scopes`), the calling-agent gate (`source_roles` keyed by the agent's
 SPIFFE identity), and per-role grants for every discovered tool. The agent's CR does not change.
 This is the moment least-privilege access to a downstream tool exists — generated, not
-hand-written. (Under agent side, the diff shows the agent's outbound maps fill in instead:
-`target_allow_scopes` keyed by the tool's SPIFFE identity.)
+hand-written.
 
 Now drive real users through it:
 
@@ -644,9 +629,8 @@ make devops   # devops-user: blocked at the inbound gate
 ```
 
 Each target performs a real `grant_type=password` login, checks the agent's inbound gate, performs
-a real RFC 8693 token exchange for the tool's audience, and checks the tool-call gate per intent —
-the tool's inbound package under target side, the agent's outbound package under agent side —
-printing a result table. **The verdicts should match step 5's live ones.** That agreement is the
+a real RFC 8693 token exchange for the tool's audience, and checks the tool-call gate (the tool's
+inbound package) per intent, printing a result table. **The verdicts should match step 5's live ones.** That agreement is the
 point.
 
 Phase aggregates: `make init` (steps 00–03), `make onboard` (04–05), `make run` (all three users),
@@ -672,15 +656,13 @@ kubectl get authorizationpolicies.agent.rossoctl.dev github-agent github-tool -n
 mirroring the CR's `policies[].path`, then `opa eval` those files. `make clear` deletes both CRs; a
 re-onboard server-side-applies fresh ones.
 
-The run targets read the enforcement side from the captured CRs: if `github-agent`'s outbound
-package is a pass-through (`allow := true` and no other rule), the side is target side and
-`github-tool`'s inbound package decides each tool call; else the side is agent side and
-`github-agent`'s outbound package decides it.
+The run targets read the tool-call gate from `github-tool`'s captured inbound package: it decides
+each tool call, and `github-agent`'s outbound package is a pass-through (`allow := true`).
 
 > The snapshots under `generated/` are not committed (`.gitignore`): each `make agent` / `make tool`
 > captures them again from the live CRs, which are the authoritative source.
 > [`docs/examples/opa-team1-policy.yaml`](../../../docs/examples/opa-team1-policy.yaml) shows the two
-> target-side CRs of this scenario as the real generator renders them.
+> CRs of this scenario as the real generator renders them.
 
 ---
 
@@ -692,7 +674,7 @@ package is a pass-through (`allow := true` and no other rule), the side is targe
 | OPA is wired into both legs | `grep -c 'name: opa'` on `authbridge-runtime-config` | `2` |
 | Onboarding was event-driven | `make trigger` output | VERIFY-TRIGGER passes all four checks |
 | A policy was generated | `kubectl get authorizationpolicy github-agent github-tool -n team1` | both exist, each with two `spec.policies[]` |
-| The per-tool check is populated | target side: `github-tool`'s `source_roles`; agent side: `github-agent`'s `target_allow_scopes` | non-empty |
+| The per-tool check is populated | `github-tool`'s `source_roles` | non-empty |
 | The generated policy enforces | `make enforce` output | full matrix matches, both decisive checks pass |
 | Verdicts came from AIAC's policy | OPA decision log | `client_ok:true` present on an allow |
 | Offline and live agree | `make dev` / `make test` vs step 5 | same verdicts |
@@ -710,7 +692,7 @@ package is a pass-through (`allow := true` and no other rule), the side is targe
 | **Every tool call denies, for every user** | Usually the outbound route is missing — run `make enforce`, which includes WIRE, rather than the enforce half alone. Otherwise one of the two onboardings did not finish, leaving the per-tool maps empty: `kubectl logs deployment/aiac-agent -n aiac-system \| grep -iE 'label missing\|MCP tools/list'`. JetStream redelivers after `ACK_WAIT` (600 s) and usually succeeds, so waiting then re-running `make enforce` often cures it. |
 | **ENFORCE stops: a client does not link `aiac-username-sub` as a default scope** | The token keeps `sub` = the Keycloak user ID, so the rego cannot find the user (D31). For `rossoctl`, restart the IdP Configuration Service once Keycloak is ready: `kubectl rollout restart deployment/aiac-interface -n aiac-system`. For `github-agent`, let AIAC onboard it again. Do not add a `sub` mapper by hand. |
 | **The AIAC Controller does not start (start check #4)** | The global combiner is the stock one, which allows a pod that has no client CR. A `make opa-restore` or another bundle-service install brought it back. Run `make opa` again. |
-| **Onboarding fails with a `401` from the LLM** | `enable.sh` defaulted to OpenAI. Patch `aiac-agent-config` and `rollout restart` — see [step 1](#point-it-at-your-llm). The values come in via `envFrom`, so a patch without a restart does nothing. |
+| **Onboarding fails with a `401` from the LLM** | `enable.sh` defaulted to OpenAI. Patch `aiac-agent-config` and `rollout restart` — see [step 1](#change-llm). The values come in via `envFrom`, so a patch without a restart does nothing. |
 | **`driver.sh` refuses DEPLOY: workloads already exist** | The guard preventing a silent degrade into a replay. `make restore` first, or use `make replay` if you meant the replay. |
 | **`make replay` refuses: workloads aren't deployed** | Mirror of the same guard. Run `make e2e` — its DEPLOY phase is the real trigger. |
 | **Keycloak never registers the new clients** | Check the operator reconciled the `AgentRuntime` CRs (`kubectl logs deployment/rossoctl-controller-manager -n rossoctl-system`) and that the label landed: `kubectl get deployment github-agent -n team1 -o jsonpath='{.spec.template.metadata.labels}'`. |
@@ -848,23 +830,6 @@ lives in `team1`, not `aiac-system`.)
 
 ## Known gaps
 
-- **"Direct user → tool" is enforced under target side only.** A fourth acceptance row —
-  `dev-user` calling `github-tool` **directly**, bypassing the agent — is decided by
-  `github-tool`'s own inbound package under target side: both gates are mandatory, with no
-  platform-client bypass, so a call that no agent makes (the login token's `client_id` is
-  `rossoctl`) is denied. The driver probes it and fails the run if it is allowed.
-
-  Under agent side, `github-tool` gets a **pass-through** CR, so nothing derived from `policy.md`
-  constrains that path, and the driver does not probe it rather than report a fabricated result.
-  `github-tool` is a bare FastMCP stub with **no authentication of its own**; with the sidecar
-  injected (`injectTools=true`, step 2) its inbound `jwt-validation` still rejects an
-  unauthenticated call with **401**, but any valid token passes the pass-through.
-
-  Check how the tool is fronted on your cluster:
-
-  ```bash
-  kubectl get pod -n team1 -l app=github-tool -o jsonpath='{.items[*].spec.containers[*].name}'
-  ```
 - **Step 6 does not sit in the request path.** Its verdicts come from `opa eval` against the
   generated Rego. Steps 4–5 are the in-path proof.
 - **Step 6's token exchange stops short of a call.** `run-*.py` performs a real RFC 8693 exchange to

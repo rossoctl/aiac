@@ -102,8 +102,7 @@ mapping and each unmap gives a `role-members` event. This is correct: the AIAC A
 the CRs that use the role, so a new holder of a shared role gets the grants of the role at once
 (the platform Keycloak runs this listener since 2026-10-08; see
 [PRD → Role members · a new render](../docs/specs/PRD.md#role-members--a-new-render-aiacapplyrole-membersrole-id)).
-A new role has no SPM edge, so its event changes no decision (under agent side, the AIAC Agent
-writes the CR of every live agent again).
+A new role has no SPM edge, so its event changes no decision.
 
 A reused (shared) role stays mapped to the disabled client, so the rollback gives no event for it.
 The quarantine renders the CRs that use that role again without the client, because a disabled

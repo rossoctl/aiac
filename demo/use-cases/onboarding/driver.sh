@@ -24,15 +24,10 @@
 #                         re-registers them. Not part of a default run — DEPLOY is the real story;
 #                         this exists for when tearing the workloads down isn't worth it.
 #
-# The enforcement side (D16, D29) is read from the live aiac-agent-config ConfigMap
-# (AIAC_ENFORCEMENT_SIDE; absent = target-side, the default). It selects where a tool call is
-# checked, so it selects what VERIFY-TRIGGER waits for and where ENFORCE reads the decision logs:
-#   target-side  github-tool's inbound OPA decides each tool call (the github-tool CR carries the
-#                per-tool check); every outbound is a pass-through. A tool-call deny is an HTTP 403.
-#   agent-side   github-agent's outbound OPA decides it (the github-agent CR's outbound package);
-#                github-tool gets a pass-through CR. A tool-call deny is a JSON-RPC error frame.
-# The verdicts are the same under both sides. The side is set at deploy time; to change it, do a
-# clean redeploy of AIAC (k8s/opa-kind-runbook.md "Set the enforcement side").
+# Each callee checks the calls to itself in its own inbound OPA (D34). github-tool's inbound OPA
+# decides each tool call (the github-tool CR carries the per-tool check), and every outbound is a
+# pass-through. So VERIFY-TRIGGER waits for the per-tool check in github-tool's CR, and ENFORCE
+# reads the tool-call decisions from github-tool's sidecar log. A tool-call deny is an HTTP 403.
 #
 # step()/pass()/warn()/die() style matches k8s/opa-kind-verify.sh: fails loudly and specifically the
 # moment an observed result doesn't match, rather than continuing silently.
@@ -115,8 +110,6 @@ TOOL_LABEL="app=github-tool"
 POLICY_CR="authorizationpolicies.agent.rossoctl.dev"
 # The client scope that sets sub=<username> in the login and the exchanged token (D31).
 SUBJECT_SCOPE="aiac-username-sub"
-# The live enforcement side; read in preflight.
-SIDE=""
 
 DO_DEPLOY=1
 DO_WIRE=1
@@ -286,7 +279,7 @@ delete_client() {
 # Dumps every component this demo touches into one per-run directory: the operator (client
 # registration), aiac-agent (onboarding pipeline), the NATS broker, Keycloak (SPI listener), and the
 # github-agent sidecar (the OPA allow/deny decisions) + app container + github-tool (its sidecar has
-# the tool-call decisions under target side). Component logs
+# the tool-call decisions). Component logs
 # are time-scoped to this run (COLLECT_SINCE / RUN_START_TS) so log volume can't push evidence out of
 # view — the same reasoning phase_verify_trigger uses for --since-time over --tail. Durable state
 # (the two AuthorizationPolicy CRs, the routing/runtime ConfigMaps, pod listings) is captured as
@@ -374,13 +367,6 @@ REQ_FALLBACK=$(kubectl get "$POLICY_CR" default -n "$SYS_NS" -o jsonpath='{.spec
   | grep -cE 'client_ok if not data\.authbridge\.client\.(inbound|outbound)\.request' || true)
 [ "$REQ_FALLBACK" = "0" ] \
   || die "the global combiner in ${SYS_NS} is not the changed combiner (D20): ${REQ_FALLBACK} request fallback rules, expected 0 — run k8s/opa-kind-enable.sh first"
-SIDE=$(kubectl get configmap aiac-agent-config -n "$AIAC_NS" \
-         -o jsonpath='{.data.AIAC_ENFORCEMENT_SIDE}' 2>/dev/null || true)
-SIDE="${SIDE:-target-side}"
-case "$SIDE" in
-  target-side|agent-side) info "enforcement side: ${SIDE} (AIAC_ENFORCEMENT_SIDE in configmap/aiac-agent-config)" ;;
-  *) die "unknown AIAC_ENFORCEMENT_SIDE='${SIDE}' in configmap/aiac-agent-config (${AIAC_NS}) — want target-side or agent-side" ;;
-esac
 ADMIN="$(admin_token)"
 [ -n "$ADMIN" ] || die "could not obtain a Keycloak master admin token"
 LISTENERS=$(curl -s -H "Authorization: Bearer ${ADMIN}" "${KC}/admin/realms/${REALM}/events/config" \
@@ -509,9 +495,8 @@ print("yes" if os.environ["SCOPE"] in names else "")' 2>/dev/null || true)
   fi
 
   step "Confirming fresh AuthorizationPolicy CRs for github-agent AND github-tool [polling up to ${POLL_SECS}s]"
-  # One CR per managed service (D20), under both sides: under target side the tool CR carries the
-  # per-tool check, under agent side it is a pass-through. Under the changed combiner a pod with no CR
-  # is denied, so both must exist.
+  # One CR per managed service (D20): the tool CR carries the per-tool check. Under the changed
+  # combiner a pod with no CR is denied, so both must exist.
   local before_rv="${ONBOARDING_BEFORE_RV:-<none>}" before_tool_rv="${ONBOARDING_BEFORE_TOOL_RV:-<none>}"
   local cr_start=$SECONDS cr_deadline=$((SECONDS + POLL_SECS)) cr_next_info=$((SECONDS + 30))
   AFTER_RV=""
@@ -543,22 +528,12 @@ print("yes" if os.environ["SCOPE"] in names else "")' 2>/dev/null || true)
   # The wait matters because a failed onboard is REDELIVERED by JetStream (ACK_WAIT) and succeeds on a
   # later attempt — POLL_SECS is sized to outlast one such redelivery.
   #
-  # Where the per-tool check lives depends on the side:
-  #   target-side  github-tool's inbound package. `source_roles` (the calling-agent gate, keyed by
-  #                github-agent's SPIFFE id) is filled only when both services are onboarded.
-  #   agent-side   github-agent's outbound package. `target_allow_scopes` (keyed by github-tool's
-  #                SPIFFE id) is filled only when the tool is onboarded.
+  # The per-tool check is in github-tool's inbound package. `source_roles` (the calling-agent gate,
+  # keyed by github-agent's SPIFFE id) is filled only when both services are onboarded.
   # The generator renders an empty map as `:= {}` on one line and a filled one as `:= {` followed by
   # newline-separated entries — so the EMPTY LITERAL is the exact signal. Test for it first (`:= {`
   # matches both forms), and require the key to be present at all.
-  local gate_cr gate_map gate_what
-  if [ "$SIDE" = "target-side" ]; then
-    gate_cr="github-tool"; gate_map="source_roles"
-    gate_what="github-tool's inbound gate (target side)"
-  else
-    gate_cr="github-agent"; gate_map="target_allow_scopes"
-    gate_what="github-agent's outbound gate (agent side)"
-  fi
+  local gate_cr="github-tool" gate_map="source_roles" gate_what="github-tool's inbound gate"
   step "Confirming ${gate_what} carries the tool's scopes (not just that the CR exists) [timeout ${POLL_SECS}s]"
   local gate_deadline=$((SECONDS + POLL_SECS)) cr_content=""
   while :; do
@@ -768,15 +743,15 @@ phase_enforce() {
   #   - on ${ROPC_CLIENT_ID} (a platform login client), for the login token — else every inbound
   #     probe is denied with a UUID subject;
   #   - on github-agent (an onboarded client), for the token it exchanges for github-tool — the
-  #     Keycloak standard token exchange (V2) applies the scopes of the agent client. Under target
-  #     side github-tool's inbound keys users by that 'sub', so without the link every tool call is
+  #     Keycloak standard token exchange (V2) applies the scopes of the agent client.
+  #     github-tool's inbound keys users by that 'sub', so without the link every tool call is
   #     denied.
   check_subject_scope "${ROPC_CLIENT_ID}" "$ROPC_UUID" \
     "the login token keeps sub = the Keycloak user ID, but the inbound rego keys users by username, so every inbound probe would be DENIED."
   AGENT_UUID="$(client_uuid_by_name "${NS}/github-agent" "$ADMIN")"
   [ -n "$AGENT_UUID" ] || die "could not resolve the Keycloak client uuid for ${NS}/github-agent"
   check_subject_scope "github-agent" "$AGENT_UUID" \
-    "the token that github-agent exchanges for github-tool keeps sub = the Keycloak user ID, but github-tool's inbound keys users by username, so every tool call would be DENIED under target side."
+    "the token that github-agent exchanges for github-tool keeps sub = the Keycloak user ID, but github-tool's inbound keys users by username, so every tool call would be DENIED."
 
   step "Inbound — dev-user and test-user allowed, devops-user denied [polling up to ${POLL_SECS}s]"
   probe_agent dev-user    200 "$POLL_SECS" "dev-user -> github-agent (inbound)"
@@ -801,7 +776,7 @@ phase_enforce() {
     && pass "test-user -> source-read: ${TEST_SOURCE_READ} (correctly not ALLOWED_RESULT)" \
     || die "test-user -> source-read: got ALLOWED_RESULT, expected denied (testers don't touch source)"
 
-  step "Decision logs — one inbound allow/deny, one tool-call allow/deny (${SIDE})"
+  step "Decision logs — one inbound allow/deny, one tool-call allow/deny"
   local pod tool_pod tool_leg tool_path
   pod="$(latest_pod "$AGENT_LABEL")"
   info "inbound (dev-user, allowed):"
@@ -810,13 +785,8 @@ phase_enforce() {
   info "inbound (devops-user, denied):"
   kubectl logs -n "$NS" "$pod" -c authbridge-proxy --tail=500 2>/dev/null \
     | grep 'path=authbridge/inbound/request' | grep 'allow:false' | tail -1 | sed 's/^/    /'
-  # The tool-call decision is on github-tool's inbound under target side, on github-agent's
-  # outbound under agent side (the other one is a pass-through).
-  if [ "$SIDE" = "target-side" ]; then
-    tool_pod="$(latest_pod "$TOOL_LABEL")"; tool_leg="github-tool inbound"; tool_path="authbridge/inbound/request"
-  else
-    tool_pod="$pod"; tool_leg="github-agent outbound"; tool_path="authbridge/outbound/request"
-  fi
+  # The tool-call decision is on github-tool's inbound (github-agent's outbound is a pass-through).
+  tool_pod="$(latest_pod "$TOOL_LABEL")"; tool_leg="github-tool inbound"; tool_path="authbridge/inbound/request"
   info "${tool_leg} (dev-user -> source-read, allowed):"
   kubectl logs -n "$NS" "$tool_pod" -c authbridge-proxy --tail=500 2>/dev/null \
     | grep "path=${tool_path}" | grep 'allow:true' | tail -1 | sed 's/^/    /'
@@ -824,26 +794,20 @@ phase_enforce() {
   kubectl logs -n "$NS" "$tool_pod" -c authbridge-proxy --tail=500 2>/dev/null \
     | grep "path=${tool_path}" | grep 'allow:false' | tail -1 | sed 's/^/    /'
 
-  # Row 4 of #646's table: dev-user calls github-tool DIRECTLY, with no agent. Under target side
-  # github-tool's inbound package has both gates, with no platform-client bypass (D26, D27): the
-  # login token's client_id (rossoctl) has no entry in source_roles, so the call is denied (403, or
-  # 401 from jwt-validation when the token has no github-tool audience). Under agent side github-tool
-  # has a pass-through CR, so nothing derived from policy.md constrains the path — report it, do not
-  # probe it. See demo.md's 'Known gaps' section.
-  if [ "$SIDE" = "target-side" ]; then
-    local direct
-    direct="$(probe_tool_direct dev-user source-read)"
-    case "$direct" in
-      ALLOWED_RESULT)
-        die "direct dev-user -> github-tool (no agent) -> source-read: ALLOWED_RESULT, expected denied — github-tool's inbound gate is open" ;;
-      "DENIED_HTTP 401"|"DENIED_HTTP 403"|DENIED_JSONRPC)
-        pass "direct dev-user -> github-tool (no agent) -> source-read: ${direct} (github-tool's inbound gate checks the calling agent)" ;;
-      *)
-        warn "direct dev-user -> github-tool (no agent) -> source-read: inconclusive (${direct:-<none>}) — check: kubectl logs -n ${NS} $(latest_pod "$TOOL_LABEL") -c authbridge-proxy | grep path=authbridge/inbound/request" ;;
-    esac
-  else
-    warn "known gap under agent side: 'direct dev-user -> github-tool, no agent' (row 4 of #646's table) is NOT enforced by the GENERATED policy — github-tool's CR is a pass-through, so no policy derived from policy.md constrains it. Not probed here to avoid reporting a fabricated result. Under target side github-tool's inbound gate denies it."
-  fi
+  # Row 4 of #646's table: dev-user calls github-tool DIRECTLY, with no agent. github-tool's inbound
+  # package has both gates, with no platform-client bypass (D26, D27): the login token's client_id
+  # (rossoctl) has no entry in source_roles, so the call is denied (403, or 401 from jwt-validation
+  # when the token has no github-tool audience).
+  local direct
+  direct="$(probe_tool_direct dev-user source-read)"
+  case "$direct" in
+    ALLOWED_RESULT)
+      die "direct dev-user -> github-tool (no agent) -> source-read: ALLOWED_RESULT, expected denied — github-tool's inbound gate is open" ;;
+    "DENIED_HTTP 401"|"DENIED_HTTP 403"|DENIED_JSONRPC)
+      pass "direct dev-user -> github-tool (no agent) -> source-read: ${direct} (github-tool's inbound gate checks the calling agent)" ;;
+    *)
+      warn "direct dev-user -> github-tool (no agent) -> source-read: inconclusive (${direct:-<none>}) — check: kubectl logs -n ${NS} $(latest_pod "$TOOL_LABEL") -c authbridge-proxy | grep path=authbridge/inbound/request" ;;
+  esac
 }
 
 # ── Phase REPLAY-TRIGGER (opt-in) ─────────────────────────────────────────────

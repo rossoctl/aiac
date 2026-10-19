@@ -2,13 +2,13 @@
 
 ## Problem Statement
 
-The AIAC Agent's Policy Computation Engine produces and merges `ServicePolicyModel` (SPM) objects — one per service, keyed by `serviceId` — representing the inbound access control policy (inbound edges) for each service. The PDP Policy Writer translates the policy model of the current enforcement side (the stored SPMs under target side, the derived `AgentPolicyModel`s under agent side) into Rego packages and writes one `AuthorizationPolicy` Kubernetes CR per managed service — but this derived artifact cannot be reverse-engineered back into structured SPM data. Without a durable structured policy store:
+The AIAC Agent's Policy Computation Engine produces and merges `ServicePolicyModel` (SPM) objects — one per service, keyed by `serviceId` — representing the inbound access control policy (inbound edges) for each service. The PDP Policy Writer translates the policy model (the stored SPMs) into Rego packages and writes one `AuthorizationPolicy` Kubernetes CR per managed service — but this derived artifact cannot be reverse-engineered back into structured SPM data. Without a durable structured policy store:
 
 - The Policy Computation Engine cannot read current policy state for additive merging — it must re-derive the full state from the PDP snapshot on every trigger.
 - Override-purge cannot find stale role→service mappings that the live IdP no longer reflects — there is no record of what was previously granted.
 - Pod restarts lose any in-flight policy construction context.
 
-The `AgentPolicyModel` (APM) is **derived and never persisted** — it is computed on demand from SPMs. The store therefore has no per-agent surface; it persists SPMs only. This is true under both enforcement sides (D18): the store keeps only SPMs, and the policy model (target-side or agent-side) is never stored. The PCE builds it at each deploy. The stored SPMs are the **managed set** (D21): every service that has a stored SPM has a CR.
+The store persists SPMs only. The policy model (D18) is never stored: the PCE builds it from the stored SPMs at each deploy. The stored SPMs are the **managed set** (D21): every service that has a stored SPM has a CR.
 
 ## Solution
 
@@ -77,7 +77,7 @@ consistent.
 - Per-service upsert (`POST /policy/services/{service_id}`): `INSERT OR REPLACE INTO service_policies VALUES (?, ?)`.
 - Per-service delete (`DELETE /policy/services/{service_id}`): `DELETE FROM service_policies WHERE service_id = ?`; evict the cache entry.
 
-**By-role query:** `GET /policy/services?role={role_id}` scans the cache and returns every SPM whose `inbound_allow_rules` **or** `inbound_deny_rules` contains a rule referencing `role_id` (the scan covers **both** effect lists). **Why a store query and not an IdP lookup:** the SPM is the source of truth, so this must return *stored* rows — including stale role→service mappings that the live IdP no longer reflects, which override-purge depends on to remove access that should no longer exist. The PCE also uses it (through `get_service_policies_by_role`) to find the SPMs that have an edge of a role: for the agent-side outbound derivation, the role re-render, the shared SPMs of a quarantine or a decommission, and the lift of a quarantine (D32; see [policy-computation-engine.md → Algorithm](policy-computation-engine.md#algorithm) step 3d). It may start as a full scan; a `role.id -> {service_id}` index can be added later behind the same route/signature without changing callers.
+**By-role query:** `GET /policy/services?role={role_id}` scans the cache and returns every SPM whose `inbound_allow_rules` **or** `inbound_deny_rules` contains a rule referencing `role_id` (the scan covers **both** effect lists). **Why a store query and not an IdP lookup:** the SPM is the source of truth, so this must return *stored* rows — including stale role→service mappings that the live IdP no longer reflects, which override-purge depends on to remove access that should no longer exist. The PCE also uses it (through `get_service_policies_by_role`) to find the SPMs that have an edge of a role: for the role re-render, the shared SPMs of a quarantine or a decommission, and the lift of a quarantine (D32; see [policy-computation-engine.md → Algorithm](policy-computation-engine.md#algorithm) step 3d). It may start as a full scan; a `role.id -> {service_id}` index can be added later behind the same route/signature without changing callers.
 
 **List all (C3):** `GET /policy/services` with **no** `role` returns every cached SPM. The stored SPMs are the managed set (D21), so this is the list of every service that must have a CR. The PCE resync (D28) calls it at every Controller start, through the library function `list_service_policies()`. It never 404s: an empty store gives `[]`.
 
@@ -178,8 +178,7 @@ See [library-policy-model-store.md](library-policy-model-store.md) for the compa
 
 ## Out of Scope
 
-- **APM persistence:** APMs are derived on demand and never stored; the store has no per-agent surface.
-- **Policy-model persistence:** the policy model of either enforcement side (D18) is built by the PCE at each deploy and never stored.
+- **Policy-model persistence:** the policy model (D18) is built by the PCE at each deploy and never stored.
 - **Triggering Rego generation:** the Policy Model Store writes structured data only. Triggering Rego generation in the PDP Policy Writer is the responsibility of `aiac.pdp.policy.library` (called by `aiac.policy.computation`).
 - **Pagination:** the by-role query and the list-all call return all matching SPMs without pagination. At target scale (hundreds of services), the full result fits within one query and one HTTP response.
 - **In-cluster mTLS between Policy Computation Engine and Policy Model Store:** secured by Kubernetes network policy; no application-layer auth.

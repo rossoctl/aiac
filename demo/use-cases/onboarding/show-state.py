@@ -7,9 +7,8 @@ snapshot. Serves all three pauses (baseline, after-agent, after-tool) from one i
     show-state.py --diff PRIOR       # diff the current default snapshot against generated/<PRIOR>
 
 A snapshot holds one CR per managed service (D20): the agent's, and the tool's once the tool is
-onboarded. Under target side (the default) the agent's outbound is a pass-through and the tool's
-inbound decides each tool call; under agent side the agent's outbound decides it and the tool's CR
-is a pass-through. The tool-call grants are read from the package that decides.
+onboarded. Every outbound is a pass-through (D24), and the tool's inbound decides each tool call.
+So the tool-call grants are read from the tool's inbound package.
 
 The diff narrates the raw ``.rego`` text (line-oriented, so a presenter can see it) but only
 *asserts* on order-independent ``(role, scope)`` sets — the writer's list ordering is not stable
@@ -20,14 +19,13 @@ from __future__ import annotations
 
 import argparse
 import difflib
-import re
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
 
 import scenario as scn
-from _lib import GENERATED, abort, connect_admin, is_pass_through, load_config, note, opa_eval, rule, say, table
+from _lib import GENERATED, abort, connect_admin, load_config, note, opa_eval, rule, say, table
 
 
 def latest_snapshot() -> Path | None:
@@ -69,42 +67,20 @@ def snapshot_files(cfg) -> tuple[str, ...]:
 def grant_sets(cfg, rego_dir: Path) -> tuple[set[tuple[str, str]], set[tuple[str, str]]]:
     """The ``(user role, agent scope)`` inbound grants and the ``(user role, tool)`` tool-call grants."""
     inbound_rego = rego_dir / cfg.inbound_rego
-    outbound_rego = rego_dir / cfg.outbound_rego
     # Inbound values stay FULL agent-scope names (not de-prefixed) — the inbound gate compares
     # subject_role_allow_scopes against agent_scopes internally, never against input.mcp.params.name.
     role_scopes = opa_eval([inbound_rego], "data.authbridge.client.inbound.request.subject_role_allow_scopes", {}) or {}
     agent_scopes = set(opa_eval([inbound_rego], "data.authbridge.client.inbound.request.agent_scopes", {}) or [])
     inbound = {(role, scope) for role, scopes in role_scopes.items() for scope in scopes if scope in agent_scopes}
 
-    # The tool-call user gate: under target side in the tool's inbound (absent until the tool is
-    # onboarded), under agent side in the agent's outbound. Its values are BARE de-prefixed tools.
-    if is_pass_through(outbound_rego, "outbound"):
-        tool_inbound_rego = rego_dir / cfg.tool_inbound_rego
-        if not tool_inbound_rego.is_file():
-            return inbound, set()
-        query = "data.authbridge.client.inbound.request.subject_role_allow_scopes"
-        subj_scopes = opa_eval([tool_inbound_rego], query, {}) or {}
-        return inbound, {(role, tool) for role, tools in subj_scopes.items() for tool in tools}
-    # Agent side: the agent's outbound map is keyed by role and then by the full target service id
-    # (LIM-02), so only the tool's own target gives its grants, as the tool's inbound does above.
-    query = "data.authbridge.client.outbound.request.subject_role_allow_scopes"
-    by_role = opa_eval([outbound_rego], query, {}) or {}
-    tool_calls = {
-        (role, tool)
-        for role, by_target in by_role.items()
-        for target, tools in by_target.items()
-        if _is_tool_target(cfg, target)
-        for tool in tools
-    }
-    return inbound, tool_calls
-
-
-def _is_tool_target(cfg, service_id: str) -> bool:
-    """True when ``service_id`` (a target key of the agent's outbound) is the demo tool's clientId:
-    the CR that it names (the SPIFFE ``ns``/``sa`` segments, or a plain ``<ns>/<name>``) is
-    ``cfg.namespace``/``cfg.tool_cr_name``."""
-    match = re.fullmatch(r"spiffe://[^/]+/ns/([^/]+)/sa/([^/]+)", service_id)
-    return (match.groups() if match else tuple(service_id.split("/"))) == (cfg.namespace, cfg.tool_cr_name)
+    # The tool-call user gate is in the tool's inbound (absent until the tool is onboarded). Its
+    # values are BARE de-prefixed tools.
+    tool_inbound_rego = rego_dir / cfg.tool_inbound_rego
+    if not tool_inbound_rego.is_file():
+        return inbound, set()
+    query = "data.authbridge.client.inbound.request.subject_role_allow_scopes"
+    subj_scopes = opa_eval([tool_inbound_rego], query, {}) or {}
+    return inbound, {(role, tool) for role, tools in subj_scopes.items() for tool in tools}
 
 
 def show_snapshot(cfg, rego_dir: Path) -> None:
@@ -119,11 +95,11 @@ def show_snapshot(cfg, rego_dir: Path) -> None:
         print(f"  {f}:")
         print((rego_dir / f).read_text())
 
-    # grant_sets loads BOTH Rego files of the agent's CR; an interrupted capture that left only one
-    # would abort here after printing partial state. Only tally grants when the snapshot is complete.
+    # An interrupted capture can leave only one Rego file of the agent's CR. Only tally grants when
+    # the snapshot is complete (a check of the snapshot, not an input of the tallies).
     if not _complete(cfg, rego_dir):
         rule()
-        print("  (incomplete snapshot — grant tallies need both Rego files of the agent's CR; skipping)")
+        print("  (incomplete snapshot — the agent's CR has only one of its two Rego files; skipping)")
         return
 
     inbound, tool_calls = grant_sets(cfg, rego_dir)
@@ -136,8 +112,8 @@ def show_snapshot(cfg, rego_dir: Path) -> None:
 
 
 def _complete(cfg, d: Path) -> bool:
-    """True only when both Rego files of the agent's CR are present — grant_sets loads both, so a
-    half-captured snapshot cannot be diffed. (The tool's CR exists only after the tool is onboarded.)"""
+    """True only when both Rego files of the agent's CR are present — a half-captured snapshot
+    cannot be diffed or tallied. (The tool's CR exists only after the tool is onboarded.)"""
     return (d / cfg.inbound_rego).is_file() and (d / cfg.outbound_rego).is_file()
 
 

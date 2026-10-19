@@ -35,11 +35,8 @@ from aiac.policy.model.models import ServicePolicyModel, Scope, Role
 ## SPM redesign context
 
 The `ServicePolicyModel` (SPM), keyed by `serviceId`, is the **persistent source of truth**.
-The `AgentPolicyModel` (APM) is now **derived and never persisted** — so the store no longer
-exposes any per-agent read/write functions. The library surface is entirely SPM-centric.
-This is true under both enforcement sides (D18): the store keeps only SPMs. The policy model
-(target-side or agent-side) is built by the PCE at each deploy and never stored. The stored SPMs
-are the **managed set** (D21).
+The store keeps only SPMs, so the library surface is entirely SPM-centric. The policy model (D18)
+is built by the PCE at each deploy and never stored. The stored SPMs are the **managed set** (D21).
 
 ---
 
@@ -113,11 +110,8 @@ segment via `aiac.policy.model_store.keying.encode_service_id` before issuing th
 slash-bearing and can't be a single path segment); the service decodes it back. `service_id` in every
 returned `ServicePolicyModel` is always the original, decoded form.
 
-**Removed** (APMs are no longer persisted): `get_agent_policy`, `apply_agent_policy`, and the
-prior whole-collection `get_policy` / `apply_policy` / `delete_policy` / `delete_agent_policy`
-functions. The consumers are the Policy Computation Engine (read and write), which is migrated to the
-functions above, and the UC1 Service Policy Builder's cross-service conflict check
-(`get_service_policy`, read only).
+The store keeps only SPMs. The consumers are the Policy Computation Engine (read and write) and the UC1 Service Policy Builder's
+cross-service conflict check (`get_service_policy`, read only).
 
 ### Why by-role must be a store query (not an IdP lookup)
 

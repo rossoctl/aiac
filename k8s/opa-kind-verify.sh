@@ -167,7 +167,7 @@ pass "GET /readyz -> 200, GET /bundles?spiffe=${TRUST_DOMAIN}/ns/${NS}/sa/opa-pr
 # ── Verify 5 — existing agent and tool sidecars run the built image ──────────
 step "Verify 5 — existing agent and tool pods run the OPA-capable sidecar"
 # Tools too: with injectTools=true the webhook gives a tool pod the sidecar, and
-# the tool's inbound OPA decides each tool call under target side.
+# the tool's inbound OPA decides each tool call.
 PODS=$(kubectl get pods -n "$NS" -l "$WORKLOAD_LABEL" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)
 if [ -z "$PODS" ]; then
   info "no pods labelled ${WORKLOAD_LABEL} in ${NS} — nothing to check; workloads deployed later get the OPA pipeline from the operator webhook"
