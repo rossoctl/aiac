@@ -21,6 +21,13 @@ offline unit lane.
 - To write a new test (placement, markers, clean-skip), see
   `docs/testing/testing-strategy.md`.
 
+**Dependency direction.** Tests of any type (`test/`, `eval/`) must not depend on
+`demo/` or point to a demo doc (for example `demo.md`). They set up what they need
+themselves. The demo may use the test harness, but the harness must not use the demo.
+One exception: `demo/assets/` (the `github-agent` and `github-tool` workloads, their
+manifests, Dockerfiles and `kind-load.sh`). The system tests deploy these two
+workloads, so they may use `demo/assets/` and nothing else under `demo/`.
+
 ## Python environment
 
 Always use the `.venv` virtual environment (`.venv/bin/python`, `.venv/bin/pytest`)

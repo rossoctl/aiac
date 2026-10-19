@@ -2,11 +2,7 @@
 
 Companion to ``scenario_eval_baseline.py`` (``eval/``) for
 ``test_policy_pipeline_eval.py`` (spec: ``docs/evaluation/policy-eval-scenarios.md``).
-Unlike every other scenario in the family, this module lives directly under ``test/system/``
-(a sibling of ``scenario.py``/``scenario_uc1.py``), not under ``eval/`` — the one
-deliberate exception in this suite's file layout, called out in the spec's *Location* section. It
-is still imported and driven by the shared ``eval/test_policy_pipeline_eval.py`` harness; only its
-file location differs, not its test wiring.
+It is imported and driven by the shared ``eval/test_policy_pipeline_eval.py`` harness.
 
 This scenario isolates the suite's **one** aspect: the agent-to-agent ``target_scopes`` delegation
 mechanism (``src/aiac/policy/computation/engine.py``) — an Agent-typed service standing in as an
