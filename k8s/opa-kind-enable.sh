@@ -194,71 +194,17 @@ load_image_to_kind() {
   fi
 }
 
-# Check the global combiner as the Controller start check #4 (D30) does: the
-# two request packages must not keep
-# `client_ok if not data.authbridge.client.<dir>.request`.
-# The same allowlist as the Controller's start check #4 (src/aiac/agent/controller/start.py): in each
-# request package, every client_ok rule (comments dropped, string text dropped, white-space runs as
-# one space) must be `client_ok if data.authbridge.client.<dir>.request.allow` or
-# `default client_ok := false`, and there must be at least one. A search for the stock fail-open line
-# only would pass a fail-open rule in another form, and the Controller would then stop at its start.
-# A rule start is each line that names client_ok and starts outside every bracket (a rule head can
-# span lines, so a line that is only `client_ok` there is a rule too); unbalanced brackets print the
-# whole content, which is not a safe rule. See `_client_ok_rules` in start.py.
-client_ok_rules() {
-  awk '
-    { text = text $0 "\n" }
-    END {
-      n = length(text); code = ""; depth = 0; bad = 0; raw = 0
-      for (i = 1; i <= n; i++) {
-        c = substr(text, i, 1)
-        if (raw) { if (c == "`") { raw = 0; code = code "``" } else if (c == "\n") code = code c; continue }
-        if (c == "`") { raw = 1; continue }
-        if (c == "#") { while (i < n && substr(text, i + 1, 1) != "\n") i++; continue }
-        if (c == "\"") {
-          for (i++; i <= n && substr(text, i, 1) != "\"" && substr(text, i, 1) != "\n"; i++)
-            if (substr(text, i, 1) == "\\") i++
-          code = code "\"\""
-          if (substr(text, i, 1) == "\n") i--
-          continue
-        }
-        code = code c
-      }
-      m = split(code, lines, "\n")
-      for (j = 1; j <= m; j++) {
-        line = lines[j]; gsub(/[ \t]+/, " ", line); sub(/^ /, "", line); sub(/ $/, "", line)
-        if (depth == 0 && line ~ /(^|[^A-Za-z0-9_])client_ok([^A-Za-z0-9_]|$)/) out[++k] = line
-        for (x = 1; x <= length(line); x++) {
-          c = substr(line, x, 1)
-          if (index("{[(", c)) depth++
-          else if (index("}])", c)) depth--
-          if (depth < 0) break
-        }
-        if (depth < 0) break
-      }
-      if (depth != 0) { gsub(/[ \t\n]+/, " ", text); print text; exit }
-      for (j = 1; j <= k; j++) print out[j]
-    }'
-}
-
+# Check the global combiner as the Controller start check #4 (D30) does (k8s/lib/combiner-check.sh).
+# shellcheck source=lib/combiner-check.sh
+. "$SCRIPT_DIR/lib/combiner-check.sh"
 check_combiner() {
-  local dir content rules bad
-  for dir in inbound outbound; do
-    if ! content="$(kubectl get authorizationpolicy default -n "$RELEASE_NAMESPACE" \
-      -o jsonpath="{.spec.policies[?(@.path==\"${dir}/request.rego\")].content}")"; then
-      echo "ERROR: cannot read the default AuthorizationPolicy in ${RELEASE_NAMESPACE} to check the combiner" >&2
-      exit 1
-    fi
-    rules="$(printf '%s\n' "$content" | client_ok_rules)"
-    bad="$(printf '%s\n' "$rules" | grep -vxF \
-      -e "client_ok if data.authbridge.client.${dir}.request.allow" \
-      -e "default client_ok := false" || true)"
-    if [ -z "$rules" ] || [ -n "$bad" ]; then
-      echo "ERROR: the default AuthorizationPolicy in ${RELEASE_NAMESPACE} can allow a pod that has no client CR" \
-        "(${dir}/request.rego: ${bad:-no client_ok rule})" >&2
-      exit 1
-    fi
-  done
+  local problems
+  problems="$(combiner_problems "$RELEASE_NAMESPACE")"
+  if [ -n "$problems" ]; then
+    echo "ERROR: the default AuthorizationPolicy in ${RELEASE_NAMESPACE} can allow a pod that has no client CR:" >&2
+    printf '%s\n' "$problems" | sed 's/^/       /' >&2
+    exit 1
+  fi
 }
 
 OVERLAY_FILE="$(mktemp "${TMPDIR:-/tmp}/opa-kind-enable-overlay.XXXXXX")"

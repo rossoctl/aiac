@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# enable.sh — Part 1 of demo.md: turn on the infra this demo needs before the live trigger can fire:
+# enable.sh — Part 2 of demo.md (after `make opa`): turn on the infra this demo needs before the live trigger can fire:
 #   1. the AIAC stack itself (aiac-agent, aiac-interface, policy-model-store, pdp-interface)
 #   2. the NATS event broker
 #   3. the Keycloak Event-Listener SPI (built + installed into the live Keycloak pod)
@@ -40,6 +40,7 @@
 #   KEYCLOAK_NAMESPACE   namespace Keycloak runs in                  (default: keycloak)
 #   KEYCLOAK_STATEFULSET name of the Keycloak StatefulSet             (default: keycloak)
 #   KEYCLOAK_IMAGE_BASE  base image to derive the SPI image from     (default: read live, fallback quay.io/keycloak/keycloak:26.5.2)
+#   SYS_NS               namespace of the `default` AuthorizationPolicy (default: rossoctl-system)
 
 set -euo pipefail
 
@@ -52,6 +53,11 @@ AIAC_NAMESPACE="${AIAC_NAMESPACE:-aiac-system}"
 # script provisions it (see step_stack) rather than depending on a leftover from an earlier run of
 # this demo, which may hold a stale/incomplete policy.
 POLICY_CONFIGMAP="${POLICY_CONFIGMAP:-aiac-policy}"
+# Where `make opa` (k8s/opa-kind-enable.sh, RELEASE_NAMESPACE) puts the combiner's `default` CR. The
+# same name as in driver.sh and k8s/opa-kind-verify.sh.
+SYS_NS="${SYS_NS:-rossoctl-system}"
+# shellcheck source=../../../k8s/lib/combiner-check.sh
+. "$AIAC_DIR/k8s/lib/combiner-check.sh"
 OPENAI_SECRET_NS="${OPENAI_SECRET_NS:-team1}"
 OPENAI_SECRET_NAME="${OPENAI_SECRET_NAME:-openai-secret}"
 LLM_BASE_URL="${LLM_BASE_URL:-https://api.openai.com/v1}"
@@ -140,6 +146,21 @@ except Exception: print("")'
 
 # ── Step 1 — The AIAC stack ─────────────────────────────────────────────────
 step_stack() {
+  # The Controller's start check #4 (D30) needs the changed combiner (D20), which `make opa` applies
+  # as the `default` AuthorizationPolicy. Without it aiac-agent never becomes Available and
+  # step_wait_agent only times out, so fail here with the fix instead. combiner_problems is the same
+  # allowlist as start check #4 (k8s/lib/combiner-check.sh), so a CR that is missing, is the stock
+  # combiner, or fails the check in any other way stops here.
+  local problems
+  echo "==> [stack] Checking the combiner that 'make opa' applies (AuthorizationPolicy 'default' in ${SYS_NS})"
+  problems="$(combiner_problems "$SYS_NS")"
+  if [ -n "$problems" ]; then
+    echo "ERROR: the AIAC Controller cannot start (start check #4), because:" >&2
+    printf '%s\n' "$problems" | sed 's/^/         /' >&2
+    echo "       Run 'make opa' (demo.md step 1) first, then re-run this script." >&2
+    exit 1
+  fi
+
   echo "==> [stack] Ensuring namespace '${AIAC_NAMESPACE}' exists"
   kubectl create namespace "$AIAC_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
 
@@ -180,7 +201,7 @@ step_stack() {
   #
   # `make users` (init/03-setup.py's ensure_agent_policy) writes the same ConfigMap from the same
   # constant. The overlap is deliberate and cannot drift: both are idempotent and both read
-  # lib/scenario.py. This script keeps doing it so Part 1 stands alone, before any make target runs.
+  # lib/scenario.py. This script keeps doing it so Part 2 stands alone, before any make target runs.
   echo "==> [stack] Provisioning scenario policy ConfigMap '${POLICY_CONFIGMAP}' (policy.md)"
   local scenario_lib="$SCRIPT_DIR/lib" policy_md
   policy_md="$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import scenario; sys.stdout.write(scenario.POLICY_ABSTRACT)' "$scenario_lib")"
@@ -210,7 +231,7 @@ step_stack() {
 # Split out of step_stack on purpose. aiac-agent's `aiac-init` container waits for NATS at
 # aiac-event-broker-service:4222, which step_broker only deploys afterwards — so waiting inside
 # step_stack could never succeed on a clean install, and `set -e` turned that timeout into an
-# abort that skipped the broker AND the SPI, leaving Part 1 a third done. Waiting here, after
+# abort that skipped the broker AND the SPI, leaving Part 2 a third done. Waiting here, after
 # the broker, matches the real dependency order.
 step_wait_agent() {
   # --stack-only skips step_broker, so the broker may legitimately not exist yet. Waiting then would

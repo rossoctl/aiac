@@ -50,8 +50,9 @@ This module owns:
   other CR in the namespace) / ``delete_authpolicy`` (one CR, raising).
 * **Onboarding (event-driven)** — ``ensure_agent_policy`` (mount the PRB's ``policy.md``) +
   ``deploy_workload`` (deploy fires the trigger) / ``wait_for_registration`` / ``undeploy_workload``.
-* **Outbound-leg prep (Part B)** — ``ensure_github_tool_route`` / ``grant_exchange_scope`` /
-  ``restart_agent`` so ``token-exchange`` runs and OPA is actually consulted on the outbound leg.
+* **Outbound-leg prep (Part B)** — ``grant_exchange_scope`` / ``restart_agent`` so ``token-exchange``
+  runs and OPA is actually consulted on the outbound leg (the route ships in the agent's
+  ``configmaps.yaml``).
 * **The subject on every leg (D31)** — ``SUBJECT_SCOPE`` (``aiac-username-sub``) and its mapper
   expectation; the pure ``subject_scope_problems``; the live reader ``subject_scope_link_problems`` and
   ``require_subject_scope`` (the login client ``rossoctl`` and each onboarded client link the scope as
@@ -216,8 +217,8 @@ CR_CAPTURE_DIR = Path(os.environ.get("AIAC_CR_CAPTURE_DIR") or HERE / "artifacts
 
 # --- Live-cluster loop knobs (handoff 08) ---------------------------------------------------
 
-# The workload Deployment to restart after Part B so it reloads the new outbound route (and, on its
-# OPA sidecar's next poll, the recomposed bundle). Defaults to the agent workload name.
+# The workload Deployment to restart after Part B so its OPA sidecar re-fetches the recomposed bundle.
+# Defaults to the agent workload name.
 AGENT_DEPLOYMENT = os.environ.get("AIAC_AGENT_DEPLOYMENT", scn.AGENT_WORKLOAD)
 
 # SPIFFE trust domain the operator registers the demo workloads under (the ``spiffe://<td>/ns/...``
@@ -771,9 +772,11 @@ def delete_workload_crs() -> None:
 # ======================================================================================
 #
 # The tool check is only reached if ``token-exchange`` first intercepts + exchanges the agent's call to
-# github-tool. That needs: (B.1) an outbound route for the github-tool host, (B.2) the agent's Keycloak
-# client granted the github-tool audience scope as optional, and (B.3) the agent restarted so it
-# reloads the route. Without this the call would pass through unexchanged and never reach OPA. Under
+# github-tool. That needs: (B.1) an outbound route for the github-tool host, which the agent's
+# ``configmaps.yaml`` ships and ``deploy_workload`` applies before the agent Deployment, (B.2) the
+# agent's Keycloak client granted the github-tool audience scope as optional, and (B.3) the agent
+# restarted so its OPA sidecar re-fetches the recomposed bundle. Without the route and the scope the
+# call would pass through unexchanged and never reach OPA. Under
 # target side the leg is still necessary: the agent's outbound is a pass-through, but github-tool's
 # inbound ``jwt-validation`` accepts only a token whose audience is github-tool, so ``token-exchange``
 # must mint it.
@@ -787,59 +790,6 @@ def _tool_audience() -> str:
 def _tool_aud_scope() -> str:
     """The realm client-scope whose audience mapper stamps the github-tool audience."""
     return f"agent-{NAMESPACE}-{scn.TOOL_WORKLOAD}-aud"
-
-
-def ensure_github_tool_route(namespace: str) -> None:
-    """Ensure ``authproxy-routes`` carries an outbound route for the github-tool host.
-
-    Reads the current ``routes.yaml``, appends the github-tool route if it is not already present
-    (preserving any existing routes, e.g. the weather route), and patches it back. Creates the
-    ConfigMap if it does not exist. Idempotent: a second call is a no-op when the route is present."""
-    tool = scn.TOOL_WORKLOAD
-    route_block = (
-        f'- host: "{tool}"\n  target_audience: "{_tool_audience()}"\n  token_scopes: "openid {_tool_aud_scope()}"\n'
-    )
-    try:
-        current = kubectl(
-            "get",
-            "configmap",
-            "authproxy-routes",
-            "-n",
-            namespace,
-            "-o",
-            r"jsonpath={.data.routes\.yaml}",
-            timeout=30,
-        )
-    except subprocess.CalledProcessError:
-        current = ""  # ConfigMap (or key) absent — treat as empty, create below
-
-    if f'host: "{tool}"' in current or f"host: {tool}" in current:
-        return  # already routed
-    new_routes = (current + ("\n" if current.strip() else "") + route_block) if current.strip() else route_block
-
-    patch = {"data": {"routes.yaml": new_routes}}
-    try:
-        kubectl(
-            "patch",
-            "configmap",
-            "authproxy-routes",
-            "-n",
-            namespace,
-            "--type",
-            "merge",
-            "-p",
-            json.dumps(patch),
-            timeout=30,
-        )
-    except subprocess.CalledProcessError:
-        # ConfigMap does not exist yet — create it with just the github-tool route.
-        cm = {
-            "apiVersion": "v1",
-            "kind": "ConfigMap",
-            "metadata": {"name": "authproxy-routes", "namespace": namespace},
-            "data": {"routes.yaml": new_routes},
-        }
-        kubectl("apply", "-f", "-", input_text=json.dumps(cm), timeout=30)
 
 
 def grant_exchange_scope(admin) -> None:
@@ -878,9 +828,40 @@ def grant_exchange_scope(admin) -> None:
         log.info("grant_exchange_scope: assign %r returned (benign if already assigned): %s", aud_scope, exc)
 
 
+def require_tool_route(namespace: str) -> None:
+    """Fail unless the live ``authproxy-routes`` route for ``github-tool`` exchanges to the audience and
+    scope this harness expects (``_tool_audience`` / ``_tool_aud_scope``).
+
+    The route ships static in the agent's ``configmaps.yaml``, fixed to ``team1`` / ``localtest.me``, so
+    ``AIAC_TRUST_DOMAIN`` or the namespace do not reach it. Without this check a mismatch makes the
+    sidecar exchange to a different audience than ``exchanged_subject`` does, and the outbound probes
+    deny while the direct exchange passes."""
+    import yaml
+
+    raw = kubectl("get", "configmap", "authproxy-routes", "-n", namespace, "-o", "jsonpath={.data.routes\\.yaml}")
+    routes = yaml.safe_load(raw) or []
+    route = next((r for r in routes if isinstance(r, dict) and r.get("host") == scn.TOOL_WORKLOAD), None)
+    fix = (
+        "edit target_audience and token_scopes in demo/assets/agents/github_agent/k8s/configmaps.yaml to match, "
+        f"and apply it in {namespace}"
+    )
+    if route is None:
+        raise AssertionError(f"configmap/authproxy-routes in {namespace} has no {scn.TOOL_WORKLOAD!r} route — {fix}")
+    if route.get("target_audience") != _tool_audience():
+        raise AssertionError(
+            f"the {scn.TOOL_WORKLOAD!r} route's target_audience is {route.get('target_audience')!r}, expected "
+            f"{_tool_audience()!r} (AIAC_TRUST_DOMAIN={TRUST_DOMAIN!r}) — {fix}"
+        )
+    if _tool_aud_scope() not in str(route.get("token_scopes", "")).split():
+        raise AssertionError(
+            f"the {scn.TOOL_WORKLOAD!r} route's token_scopes {route.get('token_scopes')!r} do not contain "
+            f"{_tool_aud_scope()!r} — {fix}"
+        )
+
+
 def restart_agent(namespace: str) -> None:
-    """Restart the agent Deployment so it reloads the outbound route (routes are read once at
-    startup) and its OPA sidecar re-fetches the recomposed bundle on its next poll."""
+    """Restart the agent Deployment so its OPA sidecar re-fetches the recomposed bundle on its next
+    poll."""
     kubectl("rollout", "restart", f"deployment/{AGENT_DEPLOYMENT}", "-n", namespace, timeout=60)
     kubectl_rollout_status(f"deployment/{AGENT_DEPLOYMENT}", namespace=namespace, timeout=180)
 
@@ -1369,7 +1350,7 @@ def exchanged_subject(ctx: dict, user: str) -> str:
     comes from the agent's default scope ``aiac-username-sub``).
 
     Mints ``user``'s login token through ``rossoctl``, reads the agent client and its client secret
-    from the admin API, and sends the request that AuthBridge's route sends (``ensure_github_tool_route``):
+    from the admin API, and sends the request that AuthBridge's route sends (the agent's ``configmaps.yaml``):
     a standard token exchange to ``_tool_audience()`` with ``scope`` = ``openid`` + the tool's audience
     scope (``exchange_token``). The Keycloak standard token exchange builds the token for the requester
     (the agent), so its ``sub`` comes from the agent's scopes only.
@@ -1812,25 +1793,25 @@ def onboarded_stack(
 
         # Part B — enable the outbound token-exchange leg so the tool check is actually reached (under
         # target side github-tool's inbound OPA, which accepts only a token with its audience; under
-        # agent side the agent's outbound OPA). Done after onboarding so the restarted agent (and its
-        # OPA sidecar) picks up both the new route and, on its next poll, the recomposed bundle.
+        # agent side the agent's outbound OPA). Done after onboarding so the restarted agent's OPA
+        # sidecar picks up, on its next poll, the recomposed bundle. The outbound route itself ships in
+        # the agent's configmaps.yaml, applied before the agent Deployment.
         #
         # Prepared ONLY when this run actually probes outbound (``has_outbound``). The agent-only rung
         # (rung 1) has no tool onboarded, so there is no real ``agent -> tool`` call to make and no
         # outbound signal in its set — its outbound leg has no real-life counterpart, and token-exchange
         # would short-circuit before OPA anyway (no ``github-tool`` audience grant, since the operator
         # creates ``agent-{ns}-github-tool-aud`` only on TOOL deploy). So on a tool-less rung Part B is
-        # skipped entirely: no outbound route, no restart. Its inbound gate already converged in the
+        # skipped entirely: no scope grant, no restart. Its inbound gate already converged in the
         # per-workload loop above, and skipping the restart means rung 1 asserts the exact bundle the
         # live event-driven onboard produced (no restart papering over a bad compose).
         #
-        # When there IS an outbound leg: add the route so the forward proxy intercepts the github-tool
-        # call and runs token-exchange, grant the agent client the ``*-aud`` scope (only ever present
-        # once the tool is deployed) so the exchange succeeds and OPA is reached, then restart the agent
-        # so it reloads the route and re-fetches the recomposed bundle.
+        # When there IS an outbound leg: grant the agent client the ``*-aud`` scope (only ever present
+        # once the tool is deployed) so the exchange the route triggers succeeds and OPA is reached,
+        # then restart the agent so it re-fetches the recomposed bundle.
         has_outbound = any(sig.kind == "outbound" for sig in signals)
         if has_outbound:
-            ensure_github_tool_route(NAMESPACE)
+            require_tool_route(NAMESPACE)
             if tool_onboarded:
                 grant_exchange_scope(admin)
             restart_agent(NAMESPACE)

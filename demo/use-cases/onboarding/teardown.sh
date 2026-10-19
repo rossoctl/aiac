@@ -16,8 +16,8 @@
 #     roles + client scopes     |    Policy Model Store PVC, aiac-agent-secret, aiac-policy CM
 #   the AuthorizationPolicy CRs |  the demo's Keycloak users (dev-user/test-user/devops-user)
 #   credentials Secrets         |  the demo's Keycloak realm roles (developer/tester/devops)
-#   the outbound-leg wiring     |  the demo's ROPC client (aiac-demo-cli)
-#   the Keycloak SPI + image    |  optionally the OPA pipeline overlay (--include-opa)
+#   the Keycloak SPI + image    |  the demo's ROPC client (aiac-demo-cli)
+#                               |  optionally the OPA pipeline overlay (--include-opa)
 #
 # DELIBERATELY LEFT IN PLACE (platform state this demo does not own — see demo.md "Cleanup"):
 #   - the team1 namespace itself. The Rossoctl installer creates and owns it
@@ -221,7 +221,7 @@ else
 step "Removing demo state + Keycloak SPI (restore.sh --include-infra)"
 # Delegated rather than duplicated: restore.sh already owns this teardown surface (workloads, their
 # Keycloak clients, provisioned roles/scopes, the AuthorizationPolicy CRs, credentials Secrets, the
-# outbound wiring, the SPI listener and the Keycloak image).
+# SPI listener and the Keycloak image).
 if [ "$DRY_RUN" -eq 1 ]; then
   info "[dry-run] would run: ${SCRIPT_DIR}/restore.sh --include-infra"
 else
@@ -356,7 +356,7 @@ Everything else is untouched, by design — this was an uninstall of AIAC, not a
   - the Keycloak SPI listener + derived image are still installed
   - the OPA pipeline overlay is still wired
 
-Reinstall AIAC with: ./enable.sh        (demo.md Part 1)
+Reinstall AIAC with: ./enable.sh        (demo.md Part 2)
 Full post-install reset instead:  ./teardown.sh
 EOF
   exit 0
@@ -395,7 +395,7 @@ Still in place, by design (platform state this demo does not own):
     these — so any source change you made since would not reach the cluster. Use --rebuild below.
 $([ "$DO_OPA" -eq 0 ] && printf '%s' "  - the OPA pipeline overlay in ${NS} — re-run with --include-opa to revert it.")
 
-To stand the demo back up: see demo.md, Part 1.
+To stand the demo back up: see demo.md, Part 2 (Part 1 first if you passed --include-opa).
   ./enable.sh --rebuild     # rebuild the four stack images from current source, then install
   ./enable.sh               # reuse the images already built (faster; no source change since)
 EOF

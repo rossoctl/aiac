@@ -59,8 +59,8 @@ restarts. They import three shared modules:
 - `uc1_onboard.py` — the shared live harness: config, Keycloak provisioning/cleanup
   (`provision_realm_and_users` / `cleanup_provisioned` / `clear_policy_store`), the **deploy/teardown of
   the rung's workload manifests** (which is what fires the event-driven onboarding trigger — see
-  *[Per-rung flow](#per-rung-flow)*), the outbound token-exchange-leg prep (`ensure_github_tool_route` /
-  `grant_exchange_scope` / `restart_agent`), the bundle-convergence poll, the live decision oracle
+  *[Per-rung flow](#per-rung-flow)*), the outbound token-exchange-leg prep (`grant_exchange_scope` /
+  `restart_agent`; the route itself ships in the agent's `configmaps.yaml`), the bundle-convergence poll, the live decision oracle
   (`expected_inbound` / `expected_outbound_bare`, `inbound_decision` / `outbound_decision`), and
   `onboarded_stack(workloads)` — the whole per-rung fixture flow parameterised by the ordered workload
   list. It also holds the teardown helpers (`delete_workload_registrations`, `delete_workload_crs`
@@ -336,12 +336,12 @@ real requests + assert → full teardown.**
      poll.
 3. **Enable the outbound token-exchange leg (Part B)** — runs **only when a tool is onboarded** (rungs 2
    and 3). The harness gates the whole step on `has_outbound` (a rung has an outbound convergence signal),
-   so on rung 1 the route, grant, and restart are **all skipped** — rung 1 then asserts the exact bundle
+   so on rung 1 the grant and the restart are **both skipped** — rung 1 then asserts the exact bundle
    the live event-driven onboard produced, with no restart papering over a bad compose.
-   `ensure_github_tool_route` adds the `github-tool` outbound route to
-   `authproxy-routes`, `grant_exchange_scope` grants the agent's client the `github-tool` audience scope
-   as optional, and `restart_agent` restarts the agent so it reloads the route (and its OPA sidecar
-   re-fetches the recomposed bundle). Assigning the agent's `*-aud` scope is **not** operator-automatic,
+   The `github-tool` outbound route ships in the agent's `configmaps.yaml` (applied before the agent
+   Deployment), `grant_exchange_scope` grants the agent's client the `github-tool` audience scope
+   as optional, and `restart_agent` restarts the agent so its OPA sidecar re-fetches the recomposed
+   bundle. Assigning the agent's `*-aud` scope is **not** operator-automatic,
    so it stays harness provisioning (the operator creates that `*-aud` scope only on **tool** deploy, so
    it does not even exist on the tool-less rung). Without this the outbound call passes through
    unexchanged and never reaches OPA. Under target side the step is still necessary: the agent's

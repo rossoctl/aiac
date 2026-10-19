@@ -125,10 +125,10 @@ over the fully onboarded stack.
    so a missing link **fails** the run; it does not skip. The UC-1 ladder also decodes an exchanged
    token and checks `sub` = the username (rung 2, see
    [uc1-onboarding-pipeline.md](uc1-onboarding-pipeline.md#per-rung-flow)).
-4. **Enable the outbound token-exchange leg (Part B).** `ensure_github_tool_route` adds the
-   `github-tool` outbound route to `authproxy-routes`, `grant_exchange_scope` grants the agent's
-   Keycloak client the `github-tool` audience scope as optional, and `restart_agent` restarts the
-   agent so it reloads the route (and its OPA sidecar re-fetches the recomposed bundle). Without this
+4. **Enable the outbound token-exchange leg (Part B).** The `github-tool` outbound route ships in the
+   agent's `configmaps.yaml`, which `deploy_workload` applies before the agent Deployment.
+   `grant_exchange_scope` grants the agent's Keycloak client the `github-tool` audience scope as
+   optional, and `restart_agent` restarts the agent so its OPA sidecar re-fetches the recomposed bundle. Without this
    the outbound call would pass through unexchanged and never reach OPA. Under target side the leg is
    still necessary: github-tool's inbound `jwt-validation` accepts only a token whose audience is
    github-tool.
