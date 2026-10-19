@@ -36,11 +36,12 @@ to put a new test, see `docs/testing/testing-strategy.md`.
 | unit | bare `pytest` | `unit` | Nothing |
 | integration | `-m integration` | `integration` | Nothing (offline: several AIAC units in one process, no cluster, no LLM endpoint). The tests are under `test/integration/`, a mirror of `src/aiac/`. |
 | llm | `-m llm` | `system` | An LLM endpoint only (no cluster, no Keycloak) |
-| system | `-m system` | `system` | A wired Kind cluster with the event path (NATS broker + Keycloak SPI), Keycloak admin credentials, an LLM endpoint, and `kubectl`, `kind` plus `docker` or `podman` on `PATH`. The session fixture builds the demo images and loads them into Kind (`demo/assets/kind-load.sh`), so pytest must run on the host of the Kind node, and the cluster name must resolve: from `AIAC_KIND_CLUSTER`, else from a `kind-<name>` kube-context, else `rossoctl`. If the load fails, the tests fail; they do not skip |
+| system | `-m system` | `system` | A wired Kind cluster with the event path (NATS broker + Keycloak SPI), Keycloak admin credentials, an LLM endpoint, and `kubectl`, `kind` plus `docker` or `podman` on `PATH`. The session fixture builds the demo images and loads them into Kind (`demo/assets/kind-load.sh`), so pytest must run on the host of the Kind node. The load targets the cluster named by `AIAC_KIND_CLUSTER`, else by a `kind-<name>` kube-context, else `rossoctl`; if no Kind cluster has that name, `kind-load.sh` reports `Kind cluster not found`. The lane skips when the cluster is not wired (checked before the load); a failed load fails the tests, it does not skip |
 | eval | `-m eval` | `system` | Keycloak, an LLM endpoint, `opa` on `PATH` for the e2e level |
 
 All live lanes (`llm`, `system`, `eval`) **skip cleanly** when their env is not
-set or the cluster is not wired. A skip is not a pass.
+set or the cluster is not wired. A skip is not a pass. A failure after the skip
+checks (for example the `system` lane's image load) fails the tests.
 
 ## Env
 
