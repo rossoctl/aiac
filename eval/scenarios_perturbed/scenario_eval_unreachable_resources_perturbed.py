@@ -18,7 +18,7 @@ POLICY_FILE = "policy.eval_unreachable_resources_perturbed.md"
 # --- Agents -------------------------------------------------------------------------------------
 
 AGENTS: dict[str, dict] = {
-    "intake-agent": {
+    "team1/intake-agent": {
         "description": (
             "An autonomous agent that handles patient intake on a user's behalf: booking "
             "appointments and reading and updating patient records."
@@ -36,7 +36,7 @@ AGENTS: dict[str, dict] = {
             ),
         },
     },
-    "billing-agent": {
+    "team1/billing-agent": {
         "description": ("An autonomous agent that handles patient billing and invoicing."),
         "inbound_scopes": {
             "agent-scope-biller": (
@@ -109,4 +109,4 @@ OUTBOUND_SUBJECT_PAIRS: list[tuple[str, str]] = [
 
 # --- Emergent unreachability -----------------------------------------------------------------
 
-EXPECT_NO_REGO: frozenset[str] = frozenset({"billing-agent"})
+EXPECT_NO_REGO: frozenset[str] = frozenset({"team1/billing-agent"})

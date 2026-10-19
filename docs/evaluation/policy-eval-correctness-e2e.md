@@ -65,10 +65,15 @@ that `score_scenario` expects. A target scope is a tool scope or an agent delega
 |---|---|---|---|
 | `inbound` | the inbound Rego of each agent, every row | `subject_role_allow_scopes` | `subject_role_deny_scopes` |
 | `outbound_subject` | the inbound Rego of each agent and tool, the rows on a target scope | `subject_role_allow_scopes` | `subject_role_deny_scopes` |
-| `outbound_target` | the inbound Rego of each agent and tool, the rows on a target scope | `source_role_allow_scopes` | `source_role_deny_scopes` |
+| `outbound_target` | the inbound Rego of each agent and tool, every row | `source_role_allow_scopes` | `source_role_deny_scopes` |
 
-The tool inbound renders `source_role_deny_scopes` (the calling-agent DENY gate), so the
+The inbound renders `source_role_deny_scopes` (the calling-agent DENY gate), so the
 `outbound_target` gate also has a deny side.
+
+**A source row on an agent inbound scope.** The truth tables pair an agent role with a target
+scope only. The agent inbound is agent-level (D26a), so a source row on an ordinary inbound scope
+of an agent lets the calling agent call that agent. So `outbound_target` keeps every source row,
+and the suite scores such a row as an over-grant.
 
 **The owner of each row.** The suite checks each row against the owner of its scope
 (`_scope_owners` in the test module, built with `_scope_owner`). A row on a scope that the service

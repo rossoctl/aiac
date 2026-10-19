@@ -25,7 +25,7 @@ POLICY_FILE = "policy.eval_confusable_agents_sensitive_perturbed.md"
 # Byte-identical to scenario_eval_confusable_agents_perturbed.py.
 
 AGENTS: dict[str, dict] = {
-    "coach-agent": {
+    "team1/coach-agent": {
         "description": ("An autonomous agent that handles team rosters and practice schedules on a user's behalf."),
         "inbound_scopes": {
             "agent-scope-coach": ("Lets a holder use the coaching agent's roster and scheduling abilities."),
@@ -35,7 +35,7 @@ AGENTS: dict[str, dict] = {
             "agent-role-coach": "Covers looking up the team roster and updating the practice schedule.",
         },
     },
-    "coach-review-agent": {
+    "team1/coach-review-agent": {
         "description": (
             "An autonomous agent that records and looks up player performance evaluations on a "
             "user's behalf. Has nothing to do with rosters or scheduling — no overlap with "
@@ -128,6 +128,6 @@ OUTBOUND_SUBJECT_PAIRS: list[tuple[str, str]] = [
 # Byte-identical to scenario_eval_confusable_agents_perturbed.py — unrelated to this edit.
 
 IDENTITY_CONFUSION_PROBES: list[tuple[str, str, bool]] = [
-    ("service-account-coach-agent", "coach-review-agent", False),
-    ("service-account-coach-review-agent", "coach-agent", False),
+    ("service-account-team1/coach-agent", "team1/coach-review-agent", False),
+    ("service-account-team1/coach-review-agent", "team1/coach-agent", False),
 ]

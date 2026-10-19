@@ -33,8 +33,8 @@ Scoring source: the rendered inbound Rego of each service (agent or tool). Each 
 access to itself in its own inbound, so every rule is in the inbound Rego of the service that owns
 its scope. Each map is flat (keyed by role), and ``_accumulate_service_gates`` puts its pairs in the
 three gates: the subject maps of an agent give ``inbound``; the subject maps on a target scope give
-``outbound_subject``; the source maps (the calling-agent gate, allow and deny) on a target scope
-give ``outbound_target``. Each row is checked against the owner of its scope: a row in the
+``outbound_subject``; every row of the source maps (the calling-agent gate, allow and deny) gives
+``outbound_target``, so a source row on an ordinary agent inbound scope is an over-grant. Each row is checked against the owner of its scope: a row in the
 inbound of a service that does not own its scope is scored as ``(role, "<scope>@<service>")``, so a
 rule that the PCE routes to the wrong service is an over-grant and an under-grant, not a true
 positive.

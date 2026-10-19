@@ -64,7 +64,7 @@ prohibition fires.
 
 import json
 import re
-from typing import Literal, NamedTuple
+from typing import NamedTuple
 
 from aiac.idp.configuration.models import Scope, ServiceType
 from aiac.policy.model.models import PolicyRule, ServicePolicyModel
@@ -81,8 +81,7 @@ __all__ = [
 # dropping the bypass would deny end-user traffic, which carries the platform client.
 DEFAULT_PLATFORM_CLIENTS: tuple[str, ...] = ("rossoctl",)
 
-# The two request tiers of a client CR, and their fixed package headers (Q2).
-Tier = Literal["inbound", "outbound"]
+# The fixed package headers of the two request tiers of a client CR (Q2).
 _PACKAGES: dict[str, str] = {
     "inbound": "package authbridge.client.inbound.request\nimport rego.v1",
     "outbound": "package authbridge.client.outbound.request\nimport rego.v1",
@@ -397,15 +396,16 @@ def render_target_side(
         inbound = _tool_inbound_rego(spm)
     else:
         inbound = _agent_inbound_rego(spm.owned_scopes, project_inbound(spm), platform_clients)
-    return ClientPolicies(inbound=inbound, outbound=generate_pass_through_rego("outbound"))
+    return ClientPolicies(inbound=inbound, outbound=generate_pass_through_rego())
 
 
-def generate_pass_through_rego(tier: Tier) -> str:
-    """Render the pass-through package of ``tier`` (D24): the header and ``allow := true``.
+def generate_pass_through_rego() -> str:
+    """Render the outbound pass-through package (D24): the outbound header and ``allow := true``.
 
     The pass-throughs are the only ALLOW packages (D25). The outbound of every service is one: the
-    callee decides."""
-    return f"{_PACKAGES[tier]}\n\nallow := true\n"
+    callee decides. There is no inbound pass-through: an inbound that allows all requests has no
+    use, because the callee decides in its inbound."""
+    return f"{_PACKAGES['outbound']}\n\nallow := true\n"
 
 
 def _agent_inbound_rego(agent_scopes: list[Scope], gates: InboundProjection, platform_clients: tuple[str, ...]) -> str:

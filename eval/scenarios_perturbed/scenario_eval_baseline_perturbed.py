@@ -21,7 +21,7 @@ POLICY_FILE = "policy.eval_baseline_perturbed.md"
 # --- Agents -------------------------------------------------------------------------------------
 
 AGENTS: dict[str, dict] = {
-    "repo-agent": {
+    "team1/repo-agent": {
         "description": (
             "An autonomous agent that acts for a user against a source-code repository, able to "
             "look at and change what's stored in it."
@@ -40,7 +40,7 @@ AGENTS: dict[str, dict] = {
             ),
         },
     },
-    "tracker-agent": {
+    "team1/tracker-agent": {
         "description": (
             "An autonomous agent that acts for a user against an issue tracker, handling reading, "
             "filing, and updating issues along with their comment threads."

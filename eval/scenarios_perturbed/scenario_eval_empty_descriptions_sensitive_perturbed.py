@@ -31,7 +31,7 @@ POLICY_FILE = "policy.eval_empty_descriptions_sensitive_perturbed.md"
 # Byte-identical to scenario_eval_empty_descriptions_perturbed.py — every description stays "".
 
 AGENTS: dict[str, dict] = {
-    "irrigation-agent": {
+    "team1/irrigation-agent": {
         "description": "",
         "inbound_scopes": {
             "agent-scope-grounds-worker": "",

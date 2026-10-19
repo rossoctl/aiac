@@ -24,7 +24,7 @@ POLICY_FILE = "policy.eval_ambiguous_clause_sensitive_perturbed.md"
 # Byte-identical to scenario_eval_ambiguous_clause_perturbed.py.
 
 AGENTS: dict[str, dict] = {
-    "registrar-agent": {
+    "team1/registrar-agent": {
         "description": (
             "An autonomous agent that acts for a user against the student enrollment system, "
             "looking up a student's current enrollment status and past enrollment record."

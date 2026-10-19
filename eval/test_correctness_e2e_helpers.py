@@ -144,8 +144,10 @@ def test_a_delegation_scope_of_an_agent_gives_the_inbound_and_the_outbound_gates
     }
 
 
-def test_a_source_row_on_an_agent_inbound_scope_is_not_an_outbound_target_pair() -> None:
-    """``outbound_target`` pairs an agent role with a target scope only, as ``grant_sets`` does."""
+def test_a_source_row_on_an_agent_inbound_scope_is_an_outbound_target_over_grant() -> None:
+    """The agent inbound is agent-level (D26a): a source row on an ordinary inbound scope of the
+    agent lets the calling agent call it. The truth tables pair an agent role with a target scope
+    only, so the scorer must count the row as an over-grant, not drop it."""
     granted: dict[str, set[tuple[str, str]]] = {}
     denied: dict[str, set[tuple[str, str]]] = {}
 
@@ -155,9 +157,14 @@ def test_a_source_row_on_an_agent_inbound_scope_is_not_an_outbound_target_pair()
         service_id="repo-agent",
         is_agent=True,
         source_allow={"agent-role-dispatcher": ["agent-scope-repo-access"]},
+        source_deny={"agent-role-restricted": ["agent-scope-repo-access"]},
     )
 
-    assert granted["outbound_target"] == set()
+    assert granted["outbound_target"] == {("agent-role-dispatcher", "agent-scope-repo-access")}
+    assert denied["outbound_target"] == {("agent-role-restricted", "agent-scope-repo-access")}
+    score = score_scenario("agent-inbound-source-row", granted, denied, expected={})
+    assert score.passed is False
+    assert score.over_grants == {"outbound_target": {("agent-role-dispatcher", "agent-scope-repo-access")}}
 
 
 def test_the_gates_union_across_services() -> None:

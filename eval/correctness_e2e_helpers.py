@@ -56,8 +56,10 @@ def _owned_pairs(pairs: set[Pair], *, service_id: str, scope_owners: Mapping[str
 def _on_target_scopes(
     pairs: set[Pair], *, service_id: str, scope_owners: Mapping[str, str], target_scopes: Set[str]
 ) -> set[Pair]:
-    """The pairs of ``pairs`` that an outbound bucket scores: a pair on a target scope, and every pair
-    on a scope that ``service_id`` does not own (named by ``_owned_pairs``, so it is never dropped)."""
+    """The pairs of ``pairs`` that ``outbound_subject`` scores: a pair on a target scope, and every
+    pair on a scope that ``service_id`` does not own (named by ``_owned_pairs``, so it is never
+    dropped). A user row on an ordinary agent inbound scope is an ``inbound`` pair, so this bucket
+    drops it."""
     return _owned_pairs(
         {(role, scope) for role, scope in pairs if scope in target_scopes or scope_owners.get(scope) != service_id},
         service_id=service_id,
@@ -85,9 +87,11 @@ def _accumulate_service_gates(
     * ``inbound`` — every row of the subject maps of an agent's inbound.
     * ``outbound_subject`` — the rows of the subject maps on a target scope (``target_scopes``: the
       tool scopes and the agent delegation scopes).
-    * ``outbound_target`` — the rows of the source maps on a target scope. The tool inbound renders
-      both ``source_role_allow_scopes`` and ``source_role_deny_scopes``, so this gate has a deny
-      side.
+    * ``outbound_target`` — every row of the source maps. The truth tables pair an agent role with a
+      target scope only, so a source row on an ordinary agent inbound scope is an over-grant: the
+      agent inbound is agent-level (D26a), so that row lets the calling agent call the agent. The
+      inbound renders both ``source_role_allow_scopes`` and ``source_role_deny_scopes``, so this
+      gate has a deny side.
 
     Each row is checked against the owner of its scope (``scope_owners``, as ``_scope_owner`` gives
     it). A row on a scope that ``service_id`` does not own gives ``(role, "<scope>@<service_id>")``
@@ -105,5 +109,5 @@ def _accumulate_service_gates(
         denied.setdefault("inbound", set()).update(_owned_pairs(subject_deny_pairs, **owners))
     granted.setdefault("outbound_subject", set()).update(_on_target_scopes(subject_allow_pairs, **outbound))
     denied.setdefault("outbound_subject", set()).update(_on_target_scopes(subject_deny_pairs, **outbound))
-    granted.setdefault("outbound_target", set()).update(_on_target_scopes(_pairs_from_map(source_allow), **outbound))
-    denied.setdefault("outbound_target", set()).update(_on_target_scopes(_pairs_from_map(source_deny), **outbound))
+    granted.setdefault("outbound_target", set()).update(_owned_pairs(_pairs_from_map(source_allow), **owners))
+    denied.setdefault("outbound_target", set()).update(_owned_pairs(_pairs_from_map(source_deny), **owners))

@@ -154,7 +154,7 @@ import rego.v1
 allow := true
 ```
 
-The writer renders only the outbound pass-through in a CR. `generate_pass_through_rego(tier)` can also render the inbound pass-through, with `package authbridge.client.inbound.request`.
+The writer renders only the outbound pass-through in a CR. `generate_pass_through_rego()` renders only this package. There is no inbound pass-through, because the callee decides in its inbound (D34).
 
 ### Live plugin input shape (Q4)
 
@@ -595,7 +595,7 @@ docker build -f src/aiac/pdp/service/policy/opa/Dockerfile \
 - **`identity_ref(service_id) -> (namespace, name)`** (in `rego.py`): SPIFFE or `<ns>/<name>` → DNS-1123-validated `(namespace, name)`; raises `ValueError` (each write route logs and skips that id; `_cr_identity`) when no namespace is derivable or a segment is an invalid label — no fallback.
 - **The generators** (in `rego.py`) render three package kinds: the agent inbound, the tool inbound and the pass-through. See [What the writer renders](#what-the-writer-renders).
 - **The tool inbound generator** (`_tool_inbound_rego`) renders the tool package from the projection of one SPM (D26): `owned_tools`, `self_client_id` (the SPM `service_id`), `subject_roles` / `source_roles`, the four de-prefixed role maps, `session_methods`, the gate functions (`subject_allows` / `subject_denies` / `source_allows` / `source_denies`), `tool_ok(tool)`, `default allow := false`, and the three `allow` rules (`tools/call`; the session messages over `owned_tools`, only when the tool owns a tool; the session messages for `self_client_id`). It emits no platform-client bypass.
-- **The pass-through generator** `generate_pass_through_rego(tier)` renders one pass-through package: the package header, `import rego.v1` and `allow := true` (D24), for either tier.
+- **The pass-through generator** `generate_pass_through_rego()` renders the outbound pass-through package: the outbound package header, `import rego.v1` and `allow := true` (D24). It has no inbound form.
 - **The agent inbound generator** (`_agent_inbound_rego`) renders the agent package from `owned_scopes` and the projection of one SPM (D26a): `agent_scopes`, `subject_roles` / `source_roles` (effect-agnostic), the four role maps with full scope names, the gates `subject_allow_ok` / `subject_deny_ok` / `source_allow_ok` / `source_deny_ok` (one `source_allow_ok` bypass rule per `platform_clients` entry, plus the no-`client_id` and role-based rules), `default allow := false`, and one `allow` rule with deny-overrides. There is no default-effect branch. The generator never reconciles an allow-vs-deny overlap (a genuine overlap is an upstream 422; see [Always DENY by default](#always-deny-by-default)).
 - **The CR renderer** `render_target_side(spm, platform_clients)` (in `rego.py`; `_entries` in `main.py` calls it, one per entry) returns the two packages of one CR (`ClientPolicies`): the tool inbound, or the agent inbound from `project_inbound(spm)` (D18b), by `service_type`; and a pass-through outbound.
 

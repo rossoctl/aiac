@@ -2,8 +2,9 @@ package probe.inbound_eval
 
 import rego.v1
 
-# The inbound package of the callee: the tool that owns the scope (or the agent that owns a
-# delegation scope). The callee's own CR is the key, so each scope map is keyed by role only.
+# The inbound package of the callee: the tool that owns the scope. The callee's own CR is the key,
+# so each scope map is keyed by role only. The eval does not use this probe for an agent inbound:
+# that gate is agent-level (D26a), so the eval evaluates its allow rule.
 gen := data.authbridge.client.inbound.request
 
 tokens(s) := {lower(t) | some t in regex.split(`[._-]+`, s)}

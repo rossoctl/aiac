@@ -130,12 +130,10 @@ _SESSION_METHODS = ("initialize", "notifications/initialized", "ping", "tools/li
 # --- the pass-through package (D24) -----------------------------------------
 
 _PASS_THROUGH_OUTBOUND = "package authbridge.client.outbound.request\nimport rego.v1\n\nallow := true\n"
-_PASS_THROUGH_INBOUND = "package authbridge.client.inbound.request\nimport rego.v1\n\nallow := true\n"
 
 
-def test_pass_through_package_is_the_header_and_allow_true():
-    assert generate_pass_through_rego("outbound") == _PASS_THROUGH_OUTBOUND
-    assert generate_pass_through_rego("inbound") == _PASS_THROUGH_INBOUND
+def test_pass_through_package_is_the_outbound_header_and_allow_true():
+    assert generate_pass_through_rego() == _PASS_THROUGH_OUTBOUND
 
 
 @pytest.mark.skipif(not shutil.which("opa"), reason="opa binary not on PATH")

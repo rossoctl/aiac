@@ -550,6 +550,19 @@ def expected_outbound(scenario: ModuleType, subject: str, agent_id: str, scope: 
     return subject_ok and agent_ok
 
 
+def expected_agent_call(scenario: ModuleType, subject: str, agent_id: str, callee: str) -> bool:
+    """A subject's call through ``agent_id`` to the agent ``callee`` passes the agent-level inbound
+    of ``callee`` (D26a) iff the subject may call ``callee`` (``expected_inbound``) *and* one of
+    ``agent_id``'s OWN roles is entitled to a scope of ``callee`` (``OUTBOUND_PAIRS``). The gate
+    does not know which scope (skill) the call uses, so a call to a scope of ``callee`` passes when
+    any scope of ``callee`` passes."""
+    callee_agent = scenario.AGENTS[callee]
+    callee_scopes = set(callee_agent["inbound_scopes"]) | set(callee_agent.get("delegation_scopes", {}))
+    agent_role_names = set(scenario.AGENTS[agent_id]["roles"])
+    agent_ok = any(r in agent_role_names and s in callee_scopes for r, s in scenario.OUTBOUND_PAIRS)
+    return expected_inbound(scenario, subject, callee) and agent_ok
+
+
 def _inbound_explanation(scenario: ModuleType, subject: str, agent_id: str) -> str:
     """Human-readable mirror of ``expected_inbound``'s logic, for the eval report's 'Expected
     output' field — names which pair matched (direct inbound grant or target-scope delegation), or
@@ -584,6 +597,24 @@ def _outbound_explanation(scenario: ModuleType, subject: str, agent_id: str, sco
     if not subject_ok:
         return f"role '{role}' is not entitled to scope '{scope}' (even though '{agent_id}' is)"
     return f"'{agent_id}' is not entitled to scope '{scope}' (even though role '{role}' is)"
+
+
+def _agent_call_explanation(scenario: ModuleType, subject: str, agent_id: str, callee: str) -> str:
+    """Human-readable mirror of ``expected_agent_call``'s logic, for the eval report's 'Expected
+    output' field."""
+    subject_ok = expected_inbound(scenario, subject, callee)
+    callee_agent = scenario.AGENTS[callee]
+    callee_scopes = set(callee_agent["inbound_scopes"]) | set(callee_agent.get("delegation_scopes", {}))
+    agent_role_names = set(scenario.AGENTS[agent_id]["roles"])
+    agent_ok = any(r in agent_role_names and s in callee_scopes for r, s in scenario.OUTBOUND_PAIRS)
+    gate = f"the agent-level inbound of '{callee}' (D26a)"
+    if subject_ok and agent_ok:
+        return f"'{subject}' and '{agent_id}' each hold a scope of '{callee}', so {gate} allows the call"
+    if not subject_ok and not agent_ok:
+        return f"neither '{subject}' nor '{agent_id}' holds a scope of '{callee}' — {gate} denies on both sides"
+    if not subject_ok:
+        return f"'{subject}' holds no scope of '{callee}' (even though '{agent_id}' does) — {gate} denies"
+    return f"'{agent_id}' holds no scope of '{callee}' (even though '{subject}' does) — {gate} denies"
 
 
 def reformat_function_name(scope: str) -> str:
@@ -958,13 +989,39 @@ def _probe_tool_call(rego: Path, subject: str, client_id: str, function_name: st
     )
 
 
+def _callee_decision(scenario: ModuleType, rego: Path, owner: str, subject: str, client_id: str, scope: str) -> bool:
+    """The decision of the inbound Rego of ``owner`` on a call by ``subject`` through the agent
+    ``client_id`` to ``scope``.
+
+    A tool inbound checks each tool call, so the generalized probe (``_probe_tool_call``) gives its
+    decision: ``test_probe_eval.py`` checks that the probe gives the decision of the deployed tool
+    gate. An agent inbound is agent-level (D26a) and has no per-scope check, so the deployed gate
+    (``allow``) gives its decision. A per-scope probe on an agent inbound can deny a call that the
+    deployed gate admits."""
+    if owner in scenario.AGENTS:
+        return opa_eval(
+            [rego],
+            "data.authbridge.client.inbound.request.allow",
+            {"identity": {"subject": subject, "client_id": client_id}},
+        )
+    return _probe_tool_call(rego, subject, client_id, reformat_function_name(scope))
+
+
+def _expected_callee_decision(scenario: ModuleType, owner: str, subject: str, agent_id: str, scope: str) -> bool:
+    """The truth-table decision that ``_callee_decision`` must give."""
+    if owner in scenario.AGENTS:
+        return expected_agent_call(scenario, subject, agent_id, owner)
+    return expected_outbound(scenario, subject, agent_id, scope)
+
+
 @pytest.mark.parametrize("scenario_name,agent_id,subject,scope", _outbound_cases())
 def test_outbound(
     pipeline: dict[str, dict], scenario_name: str, agent_id: str, subject: str, scope: str, record_property
 ) -> None:
-    """The generated inbound gate of the scope owner (via the generalized probe) allows a subject's
-    call through ``agent_id`` to a target scope iff both the subject and that specific agent's own
-    role are entitled to it."""
+    """The generated inbound gate of the scope owner allows a subject's call through ``agent_id`` to
+    a target scope iff the truth table allows it. On a tool, both the subject and that specific
+    agent's own role must be entitled to the scope. On an agent (a delegation scope), the gate is
+    agent-level (D26a): both must be entitled to a scope of that agent."""
     scenario = SCENARIOS[scenario_name]
     role = scenario.USERS[subject]
     scenario_result = _require_scenario(pipeline, scenario_name)
@@ -972,16 +1029,21 @@ def test_outbound(
     reasoning_by_agent_role = scenario_result["reasoning_by_agent_role"]
     agent_role_names = sorted(scenario.AGENTS[agent_id]["roles"])
 
-    expected = expected_outbound(scenario, subject, agent_id, scope)
+    owner = _scope_owner(scenario, scope)
+    expected = _expected_callee_decision(scenario, owner, subject, agent_id, scope)
     record_property(
         "description",
         f"Can '{subject}' (subject, role '{role}') reach scope '{scope}' through '{agent_id}' "
         f"(agent) in the '{scenario_name}' scenario?",
     )
     record_property("expected", expected)
-    record_property("expected_explanation", _outbound_explanation(scenario, subject, agent_id, scope))
+    record_property(
+        "expected_explanation",
+        _agent_call_explanation(scenario, subject, agent_id, owner)
+        if owner in scenario.AGENTS
+        else _outbound_explanation(scenario, subject, agent_id, scope),
+    )
 
-    owner = _scope_owner(scenario, scope)
     rego = _rego_path(scenario_result["rego_dir"], owner, "inbound")
     if not rego.is_file():
         # The run routed no rule to the owner's scopes, so it has no CR: every call to it is denied (D20).
@@ -990,8 +1052,7 @@ def test_outbound(
         assert not expected, f"{owner} produced no inbound rego but {subject}/{scope} is expected reachable"
         return
 
-    fn = reformat_function_name(scope)  # soft-match rendering, e.g. quill-read -> Quill.Read
-    allowed = _probe_tool_call(rego, subject, agent_id, fn)
+    allowed = _callee_decision(scenario, rego, owner, subject, agent_id, scope)
     record_property("output", allowed)
     reasoning_lines = [f"subject-side (scope '{scope}'): {reasoning_by_scope.get(scope, 'no reasoning recorded')}"]
     reasoning_lines += [
@@ -1015,18 +1076,18 @@ def test_outbound_unknown_caller_denied(pipeline: dict[str, dict], scenario_name
     rego_dir = _require_scenario(pipeline, scenario_name)["rego_dir"]
     target_scopes = sorted(_tool_scope_names(scenario) | _agent_delegation_scope_names(scenario))
     cells = [
-        (subject, scope, rego)
+        (subject, scope, owner, rego)
         for subject in scenario.USERS
         for scope in target_scopes
-        if expected_outbound(scenario, subject, agent_id, scope)
-        and (rego := _rego_path(rego_dir, _scope_owner(scenario, scope), "inbound")).is_file()
+        if _expected_callee_decision(scenario, owner := _scope_owner(scenario, scope), subject, agent_id, scope)
+        and (rego := _rego_path(rego_dir, owner, "inbound")).is_file()
     ]
     if not cells:
         pytest.skip(f"no allowed call through {agent_id} has a rendered inbound rego in scenario {scenario_name}")
     allowed = [
         (subject, scope)
-        for subject, scope, rego in cells
-        if _probe_tool_call(rego, subject, "team1/unknown-agent", reformat_function_name(scope))
+        for subject, scope, owner, rego in cells
+        if _callee_decision(scenario, rego, owner, subject, "team1/unknown-agent", scope)
     ]
     assert allowed == []
 

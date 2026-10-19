@@ -24,7 +24,7 @@ POLICY_FILE = "policy.eval_wildcard_grant_sensitive_perturbed.md"
 # Byte-identical to scenario_eval_wildcard_grant_perturbed.py.
 
 AGENTS: dict[str, dict] = {
-    "inventory-agent": {
+    "team1/inventory-agent": {
         "description": (
             "An autonomous agent that acts for a user against the retail inventory system, "
             "handling every inventory operation the inventory tool offers: stock-level checks, "

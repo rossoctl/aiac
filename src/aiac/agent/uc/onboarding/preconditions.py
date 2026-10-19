@@ -146,12 +146,12 @@ def _on_error(entry: dict) -> str:
     return str(value)
 
 
-def _plugin_policies(config, direction: str) -> dict[str, str] | None:
-    """The plugins of ``pipeline.<direction>.plugins`` in ``config``, as name -> ``on_error``, or
+def _inbound_plugin_policies(config) -> dict[str, str] | None:
+    """The plugins of ``pipeline.inbound.plugins`` in ``config``, as name -> ``on_error``, or
     ``None`` if that list cannot be read. An entry is a map or a bare name (cortex reads a bare name
     as ``{name: <name>}``, so ``enforce``). If a name has more than one entry, an ``enforce`` one wins."""
     try:
-        plugins = config["pipeline"][direction]["plugins"] or []
+        plugins = config["pipeline"]["inbound"]["plugins"] or []
         policies: dict[str, str] = {}
         for p in plugins:
             if isinstance(p, str):
@@ -182,21 +182,21 @@ def _check_pipeline(namespace: str, service_type: ServiceType) -> list[str]:
     except (yaml.YAMLError, AttributeError):
         config = None
     kind = "an agent" if service_type is ServiceType.AGENT else "a tool"
-    reason = f"needed for {kind}"
-    direction = "inbound"
     plugins = _required_inbound_plugins(service_type)
     problems = []
-    policies = _plugin_policies(config, direction)
+    policies = _inbound_plugin_policies(config)
     if policies is None:
-        problems.append(f"no readable pipeline.{direction}.plugins in {PIPELINE_CONFIG_KEY!r}")
+        problems.append(f"no readable pipeline.inbound.plugins in {PIPELINE_CONFIG_KEY!r}")
     else:
         missing = [name for name in plugins if name not in policies]
         if missing:
-            problems.append(f"the {direction} pipeline has no {', '.join(repr(n) for n in missing)} plugin ({reason})")
+            problems.append(
+                f"the inbound pipeline has no {', '.join(repr(n) for n in missing)} plugin (needed for {kind})"
+            )
         # `off` takes the plugin out of the running pipeline, and `observe` turns its Reject into a
         # pass-through: such an entry is there, but it does not enforce.
         problems += [
-            f"the {direction} plugin {name!r} has on_error={policies[name]!r}, so it does not enforce ({reason})"
+            f"the inbound plugin {name!r} has on_error={policies[name]!r}, so it does not enforce (needed for {kind})"
             for name in plugins
             if name in policies and policies[name] != "enforce"
         ]

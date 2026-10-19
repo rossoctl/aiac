@@ -21,7 +21,7 @@ POLICY_FILE = "policy.eval_empty_descriptions_perturbed.md"
 # --- Agents -------------------------------------------------------------------------------------
 
 AGENTS: dict[str, dict] = {
-    "irrigation-agent": {
+    "team1/irrigation-agent": {
         "description": "",
         "inbound_scopes": {
             "agent-scope-grounds-worker": "",

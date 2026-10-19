@@ -19,13 +19,14 @@ import json
 import shutil
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from aiac.idp.configuration.models import Role, RoleKind, Scope, ServiceType
 from aiac.pdp.service.policy.opa.rego import render_target_side
 from aiac.policy.model.models import PolicyRule, RuleEffect, ServicePolicyModel
-from eval.test_policy_pipeline_eval import reformat_function_name
+from eval.test_policy_pipeline_eval import _callee_decision, expected_agent_call, reformat_function_name
 
 pytestmark = pytest.mark.skipif(not shutil.which("opa"), reason="opa binary not on PATH")
 
@@ -38,6 +39,7 @@ REPO_TOOL = "team1/repo-tool"
 TRACKER_TOOL = "team1/tracker-tool"
 AGENT = "team1/repo-agent"
 UNKNOWN_AGENT = "team1/unknown-agent"
+BROKER_AGENT = "team1/broker-agent"
 
 
 def _user_role(name: str, *users: str) -> Role:
@@ -229,3 +231,67 @@ def test_probe_decides_as_the_real_gate(tmp_path: Path, tool_regos) -> None:
         if real != probe:
             mismatches.append(((target, subject, caller, tool), real, probe))
     assert mismatches == []
+
+
+# --- the agent inbound (D26a): the deployed gate, not the per-scope probe -------------------------
+#
+# broker-agent owns two delegation scopes. alice's role is granted only the first one; repo-agent's
+# role is granted both. The deployed agent inbound is agent-level, so it admits alice for a call to
+# either scope. A per-scope probe would deny the call to the second scope.
+
+_BROKER_FIRST = "agent-scope-broker-first"
+_BROKER_SECOND = "agent-scope-broker-second"
+
+_AGENT_SCENARIO = SimpleNamespace(
+    USERS={"alice": "user-role-developer", "mallory": "user-role-guest"},
+    AGENTS={
+        AGENT: {"inbound_scopes": {}, "delegation_scopes": {}, "roles": {"agent-role-repo": ""}},
+        BROKER_AGENT: {"inbound_scopes": {}, "delegation_scopes": {_BROKER_FIRST: "", _BROKER_SECOND: ""}, "roles": {}},
+    },
+    TOOLS={},
+    INBOUND_PAIRS=[],
+    OUTBOUND_SUBJECT_PAIRS=[("user-role-developer", _BROKER_FIRST)],
+    OUTBOUND_PAIRS=[("agent-role-repo", _BROKER_FIRST), ("agent-role-repo", _BROKER_SECOND)],
+)
+
+
+def _agent_inbound(tmp_path: Path) -> Path:
+    """Write the agent inbound of broker-agent, as the writer renders it, to a file."""
+    developer = _user_role("user-role-developer", "alice")
+    agent_role = _agent_role("agent-role-repo", AGENT)
+    first = _scope(_BROKER_FIRST, BROKER_AGENT)
+    second = _scope(_BROKER_SECOND, BROKER_AGENT)
+    spm = ServicePolicyModel(
+        service_id=BROKER_AGENT,
+        service_type=ServiceType.AGENT,
+        owned_roles=[],
+        owned_scopes=[first, second],
+        inbound_allow_rules=[_allow(developer, first), _allow(agent_role, first), _allow(agent_role, second)],
+        inbound_deny_rules=[],
+    )
+    path = tmp_path / "broker_agent" / "inbound.rego"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(render_target_side(spm).inbound)
+    return path
+
+
+def test_a_call_to_an_agent_is_decided_by_the_agent_level_gate(tmp_path: Path) -> None:
+    """alice holds only the first scope of broker-agent, but the agent-level gate admits her call to
+    the second scope too. The decision and the truth table agree on every cell."""
+    rego = _agent_inbound(tmp_path)
+    cells = [
+        (subject, caller, scope)
+        for subject in ("alice", "mallory")
+        for caller in (AGENT, UNKNOWN_AGENT)
+        for scope in (_BROKER_FIRST, _BROKER_SECOND)
+    ]
+    got = {cell: _callee_decision(_AGENT_SCENARIO, rego, BROKER_AGENT, *cell) for cell in cells}
+    assert got[("alice", AGENT, _BROKER_SECOND)] is True
+    mismatches = [
+        (cell, decision)
+        for cell, decision in got.items()
+        if cell[1] in _AGENT_SCENARIO.AGENTS
+        and decision != expected_agent_call(_AGENT_SCENARIO, cell[0], cell[1], BROKER_AGENT)
+    ]
+    assert mismatches == []
+    assert [cell for cell, decision in got.items() if cell[1] == UNKNOWN_AGENT and decision] == []

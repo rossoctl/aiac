@@ -17,7 +17,7 @@ POLICY_FILE = "policy.eval_agent_delegation_perturbed.md"
 # --- Agents -------------------------------------------------------------------------------------
 
 AGENTS: dict[str, dict] = {
-    "dispatch-agent": {
+    "team1/dispatch-agent": {
         "description": (
             "An autonomous agent that coordinates shipment dispatch on a user's behalf: creating "
             "and updating shipment manifests, and able to hand off agent-scope-broker work to the "
@@ -38,7 +38,7 @@ AGENTS: dict[str, dict] = {
             ),
         },
     },
-    "customs-agent": {
+    "team1/customs-agent": {
         "description": (
             "An autonomous agent that clears shipments through customs on a user's behalf, taking "
             "on clearance work handed off from the dispatch agent as part of a coordinated "

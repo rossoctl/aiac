@@ -140,11 +140,16 @@ per session, each against its own realm):
      `client_id`: end-user traffic, so the source gate of the agent inbound passes).
    - **Outbound** — one node per `(scenario × agent × subject × scope)`: a call by the subject
      through the agent to a target scope. The callee is the scope owner (`_scope_owner`: a tool, or
-     the agent that owns a delegation scope). The node evaluates the generalized probe
-     `data.probe.inbound_eval.allow` (`probe_eval.rego`), loaded beside the scope owner's own inbound
+     the agent that owns a delegation scope). On a tool, the node evaluates the generalized probe
+     `data.probe.inbound_eval.allow` (`probe_eval.rego`), loaded beside the tool's own inbound
      Rego, with input `{subject, client_id: <the agent>, function_name}`, so a single probe file
-     serves every callee across every heavy scenario. It uses a token soft-match (see
-     [Testing Decisions](#testing-decisions)). When the scope owner has no inbound Rego (the run
+     serves every tool across every heavy scenario. It uses a token soft-match (see
+     [Testing Decisions](#testing-decisions)). On an agent (a delegation scope), the node evaluates
+     the deployed gate `data.authbridge.client.inbound.request.allow` with input
+     `{"identity": {subject, client_id: <the agent>}}`, because the agent inbound is agent-level
+     (D26a) and has no per-scope check. Its expected value is `expected_agent_call`: the subject may
+     call the callee agent (`expected_inbound`), and a role of the calling agent is granted a scope
+     of the callee agent (`OUTBOUND_PAIRS`). When the scope owner has no inbound Rego (the run
      routed no rule to its scopes, so it has no CR and every call to it is denied), the node asserts
      that ground truth agrees no one reaches that scope.
    - **Grant-set equivalence** (`test_grant_set_matches_truth_table`) — the PRB's raw
@@ -445,7 +450,8 @@ scenarios; the heavy scenarios additionally need Keycloak + `opa`, same discover
   `probe.inbound_eval`) reads the fixed `data.authbridge.client.inbound.request` package of the
   callee and takes `input.subject`/`input.client_id`/`input.function_name`; it is loaded beside the
   inbound Rego of each scope owner, so one probe file serves every callee across all eight heavy
-  scenarios rather than needing one probe per service. It uses a token soft-match (split on
+  scenarios rather than needing one probe per service. The outbound nodes use it on a tool inbound
+  only (see the next paragraphs for an agent inbound). It uses a token soft-match (split on
   `[._-]+`, lowercase, set equality). Each map is flat (keyed by role): the callee's own CR is the
   key. `allow` needs both `subject_ok` (a role of the subject, via `subject_roles` and
   `subject_role_allow_scopes[role]`, matches the function name) and `source_ok` (a role of the
@@ -453,13 +459,15 @@ scenarios; the heavy scenarios additionally need Keycloak + `opa`, same discover
   it), and no deny gate may match the same name (`subject_role_deny_scopes[role]`,
   `source_role_deny_scopes[role]`), as in the real gate. A target scope owned by another agent (a
   delegation scope) is in the maps of that agent's inbound, as a tool's scope is in the maps of the
-  tool's inbound (see the next point), so a single probe covers both mechanisms uniformly. On an
-  agent inbound the probe reads the same maps per scope; the deployed agent inbound is agent-level
-  (it allows a call when one scope of the agent passes), so the probe scores the rendered rules for
-  each scope, not the agent-level decision. `eval/test_probe_eval.py` (unmarked, so it runs in the
-  unit lane) renders a real tool inbound with `render_target_side` and checks that the probe gives
-  the same decision as `data.authbridge.client.inbound.request.allow` on each cell, deny gates
-  included.
+  tool's inbound (see the next point). But the deployed agent inbound is agent-level (D26a): it
+  allows a call when one scope of the agent passes. A per-scope probe on an agent inbound can deny a
+  call that the deployed gate admits (a subject granted only one of two scopes of the agent). So on
+  an agent inbound the outbound nodes evaluate the deployed gate, not the probe
+  (`_callee_decision`). `eval/test_probe_eval.py` (unmarked, so it runs in the unit lane) renders a
+  real tool inbound with `render_target_side` and checks that the probe gives the same decision as
+  `data.authbridge.client.inbound.request.allow` on each cell, deny gates included. It also renders
+  a real agent inbound and checks that `_callee_decision` agrees with `expected_agent_call` on each
+  cell.
 - **`delegation_scopes` and `inbound_scopes` are indistinguishable at the real system's data-model
   level — this is a property of the system, not a scenario defect.** The PCE seeds the
   `owned_scopes` of each SPM directly from the IdP `Service` record's `aiac.managed` scopes
