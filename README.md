@@ -69,10 +69,10 @@ put a new test: [docs/testing/testing-strategy.md](docs/testing/testing-strategy
 
 ## Deploying to Kubernetes
 
-The build and deploy flow is in [k8s/aiac-deployment-guide.md](k8s/aiac-deployment-guide.md).
-Every deploy has two preconditions, the OPA pipeline with the AIAC combiner and the Keycloak
-event-listener SPI, and one deploy-time parameter, the enforcement side. All three are in
-[docs/agents/deploy.md](docs/agents/deploy.md).
+The build and deploy flow is in [k8s/aiac-deployment-guide.md](k8s/aiac-deployment-guide.md). Its
+"Platform preconditions" section lists the two checks of every deploy: the OPA pipeline with the
+AIAC combiner, and the Keycloak event-listener SPI. The deploy-time parameters, such as the
+enforcement side, are in [docs/agents/deploy.md](docs/agents/deploy.md).
 
 ## Demo — onboarding an agent and a tool
 
