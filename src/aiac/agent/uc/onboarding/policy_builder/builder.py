@@ -80,11 +80,11 @@ class ServicePolicyBuilder:
         # rule set is withheld) is accumulated as its ``(focal, contradictions)`` and the fan-out
         # CONTINUES, so every focal's contradiction is collected in one build rather than the report
         # stopping at whichever pair the loop happened to reach first. A HARD failure
-        # (PolicyRulesBuilderError / LLMAccessError / UnparseableLLMResponseError -- sibling
-        # PolicyRulesBuilderBaseError subclasses that are NOT PolicyContradictionError) is deliberately
-        # NOT caught here: it aborts the build immediately and propagates so the Orchestrator rolls
-        # back. We catch the narrow PolicyContradictionError ONLY -- never the base -- so a hard fault
-        # can never be silently folded into the report.
+        # (PolicyRulesBuilderError / LLMAccessError / UnparseableLLMResponseError /
+        # LLMCredentialsError -- sibling PolicyRulesBuilderBaseError subclasses that are NOT
+        # PolicyContradictionError) is deliberately NOT caught here: it aborts the build immediately
+        # and propagates so the Orchestrator rolls back. We catch the narrow PolicyContradictionError
+        # ONLY -- never the base -- so a hard fault can never be silently folded into the report.
         contradictions: list[PolicyContradictionError] = []
 
         def _guarded(fn, *args) -> None:

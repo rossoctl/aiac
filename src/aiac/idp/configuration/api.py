@@ -16,11 +16,12 @@ logger = logging.getLogger(__name__)
 
 class IdPHTTPError(RuntimeError):
     """A non-OK response from the IdP Configuration Service. It keeps the HTTP ``status`` and the
-    ``response``, so ``aiac.shared.upstream.is_transient`` retries a ``5xx`` and not a ``4xx``. It is
-    a ``RuntimeError`` subclass, so the callers that catch ``RuntimeError`` do not change, and the
-    message stays ``"HTTP {status}: {text}"``. A caller that must tell one status from another (for
-    example a ``404`` for a client that Keycloak has not committed yet) reads ``.status``, not the
-    message. A pickled or copied error keeps its status, text, response and notes."""
+    ``response``, so ``aiac.shared.upstream.is_transient`` retries a ``5xx`` (and a ``408`` / ``429``)
+    and not another ``4xx``. It is a ``RuntimeError`` subclass, so the callers that catch
+    ``RuntimeError`` do not change, and the message stays ``"HTTP {status}: {text}"``. A caller that
+    must tell one status from another (for example a ``404`` for a client that Keycloak has not
+    committed yet) reads ``.status``, not the message. A pickled or copied error keeps its status,
+    text, response and notes."""
 
     def __init__(self, status: int, text: str, response=None) -> None:
         super().__init__(f"HTTP {status}: {text}")
@@ -153,13 +154,14 @@ class Configuration:
         so callers and tests keep a stable, mockable surface. Retries transient failures via
         ``run_upstream``: a connection error, a timeout or a ``5xx`` is tried again up to
         ``UPSTREAM_MAX_RETRIES`` attempts (default 3) with exponential backoff (1 s, 2 s, …); a
-        ``4xx`` is raised at once. A non-OK response raises :class:`IdPHTTPError` (``_check``), so
-        callers just consume ``resp.json()``. Retrying at this leaf boundary means composite methods
-        (``create_service_role`` / ``create_service_scope``) retry each sub-request without
-        compounding. Writes are retried too: a repeated write makes no duplicate, but a repeated
-        ``create_role`` / ``create_scope`` whose first attempt was committed answers ``409`` (see
-        ``library-idp.md``); ``create_service_role`` / ``create_service_scope`` take that ``409`` as
-        reuse (``_get_or_create``).
+        ``408`` / ``429`` is tried again too; another ``4xx`` is raised at once. A non-OK response
+        raises :class:`IdPHTTPError` (``_check``), so callers just consume ``resp.json()``. Retrying
+        at this leaf boundary means composite methods (``create_service_role`` /
+        ``create_service_scope``) retry each sub-request without compounding. Writes are retried
+        too: a repeated write makes no duplicate, but a repeated ``create_role`` / ``create_scope``
+        whose first attempt was committed answers ``409`` (see ``library-idp.md``);
+        ``create_service_role`` / ``create_service_scope`` take that ``409`` as reuse
+        (``_get_or_create``).
         """
         caller = getattr(requests, method.lower())
 

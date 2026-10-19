@@ -14,10 +14,13 @@ from __future__ import annotations
 from dataclasses import replace
 from unittest.mock import MagicMock, patch
 
+import httpx
+import openai
 import pytest
 
 from aiac.agent.llm import (
     LLMAccessError,
+    LLMCredentialsError,
     LLMSettings,
     UnparseableLLMResponseError,
     build_llm,
@@ -184,3 +187,136 @@ def test_raise_sanitized_uses_caller_supplied_error_types() -> None:
 
     with pytest.raises(MyAccess):
         raise_sanitized(TimeoutError("x"), access_error=MyAccess)
+
+
+def _openai_status_error(cls: type[openai.APIStatusError], status: int) -> openai.APIStatusError:
+    response = httpx.Response(status, request=httpx.Request("POST", "http://llm.example/v1/chat/completions"))
+    return cls(_POISON, response=response, body=None)
+
+
+@pytest.mark.parametrize(
+    ("cls", "status"),
+    [(openai.AuthenticationError, 401), (openai.PermissionDeniedError, 403)],
+    ids=["401", "403"],
+)
+def test_raise_sanitized_rejected_credentials_give_credentials_error(cls, status) -> None:
+    # The LLM proxy refuses the API key (401) or its permissions (403): not an unparseable response.
+    cause = _openai_status_error(cls, status)
+    with pytest.raises(LLMCredentialsError) as ei:
+        raise_sanitized(cause)
+    assert not isinstance(ei.value, UnparseableLLMResponseError)
+    assert _POISON not in str(ei.value)
+    assert ei.value.__cause__ is cause
+
+
+def _status_error(status: int) -> openai.APIStatusError:
+    """The openai error for ``status``: ``RateLimitError`` for 429, the generic ``APIStatusError`` else."""
+    return _openai_status_error(openai.RateLimitError if status == 429 else openai.APIStatusError, status)
+
+
+@pytest.mark.parametrize("status", [408, 429], ids=["408", "429"])
+def test_call_with_retry_retries_request_timeout_and_rate_limit(monkeypatch: pytest.MonkeyPatch, status: int) -> None:
+    # A rate limit (429) or a request timeout (408) can clear on the next attempt: it is retried.
+    monkeypatch.setattr("time.sleep", lambda _s: None)  # no real backoff in a unit test
+    runnable = MagicMock()
+    runnable.invoke.side_effect = [_status_error(status), "ok"]
+    assert call_with_retry(runnable, ["msg"], settings=_SETTINGS) == "ok"
+    assert runnable.invoke.call_count == 2
+
+
+@pytest.mark.parametrize("status", [408, 429], ids=["408", "429"])
+def test_exhausted_request_timeout_and_rate_limit_give_access_error(
+    monkeypatch: pytest.MonkeyPatch, status: int
+) -> None:
+    # When the retries are exhausted, the error is an access error (as for a 5xx), not an unparseable one.
+    monkeypatch.setattr("time.sleep", lambda _s: None)
+    cause = _status_error(status)
+    runnable = MagicMock()
+    runnable.invoke.side_effect = cause
+    with pytest.raises(openai.APIStatusError) as raw:
+        call_with_retry(runnable, ["msg"], settings=replace(_SETTINGS, max_retries=3))
+    assert raw.value is cause
+    assert runnable.invoke.call_count == 3
+    with pytest.raises(LLMAccessError) as ei:
+        raise_sanitized(raw.value)
+    assert not isinstance(ei.value, UnparseableLLMResponseError)
+    assert _POISON not in str(ei.value)
+    assert ei.value.__cause__ is cause
+
+
+def test_raise_sanitized_other_4xx_stays_unparseable_error() -> None:
+    # A 404 (e.g. a wrong base URL path) keeps its old classification.
+    with pytest.raises(UnparseableLLMResponseError):
+        raise_sanitized(_openai_status_error(openai.NotFoundError, 404))
+
+
+def test_raise_sanitized_uses_caller_supplied_credentials_error_type() -> None:
+    class MyCredentials(LLMCredentialsError): ...
+
+    with pytest.raises(MyCredentials):
+        raise_sanitized(_openai_status_error(openai.AuthenticationError, 401), credentials_error=MyCredentials)
+
+
+def _rate_limit(*, retry_after: str | None = None, code: str | None = None) -> openai.RateLimitError:
+    """The ``openai.RateLimitError`` that the client raises for a 429: the response (with an optional
+    ``Retry-After``) and the body ``error`` object (openai passes ``body["error"]``)."""
+    headers = {"Retry-After": retry_after} if retry_after is not None else {}
+    response = httpx.Response(
+        429, headers=headers, request=httpx.Request("POST", "http://llm.example/v1/chat/completions")
+    )
+    body = {"message": _POISON, "type": code, "code": code} if code else None
+    return openai.RateLimitError(_POISON, response=response, body=body)
+
+
+def test_call_with_retry_waits_the_retry_after_of_a_rate_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    waits: list[float] = []
+    monkeypatch.setattr("time.sleep", waits.append)
+    runnable = MagicMock()
+    runnable.invoke.side_effect = [_rate_limit(retry_after="12"), _rate_limit(retry_after="600"), "ok"]
+    assert call_with_retry(runnable, ["msg"], settings=_SETTINGS) == "ok"
+    assert waits == [12.0, 30.0]  # the Retry-After, capped at settings.backoff_max
+
+
+def test_call_with_retry_uses_the_backoff_without_a_retry_after(monkeypatch: pytest.MonkeyPatch) -> None:
+    waits: list[float] = []
+    monkeypatch.setattr("time.sleep", waits.append)
+    runnable = MagicMock()
+    runnable.invoke.side_effect = [_rate_limit(), _rate_limit(), "ok"]
+    assert call_with_retry(runnable, ["msg"], settings=replace(_SETTINGS, backoff_min=2.0)) == "ok"
+    assert waits == [2.0, 2.0]  # wait_exponential from backoff_min
+
+
+def test_a_rate_limit_for_an_exhausted_quota_is_not_retried_and_is_permanent(monkeypatch: pytest.MonkeyPatch) -> None:
+    # OpenAI answers 429 ``insufficient_quota`` when the account has no quota: a wait cannot clear it,
+    # so it is permanent (not the retryable access error), as before the 429 rule.
+    monkeypatch.setattr("time.sleep", lambda _s: pytest.fail("a quota 429 must not be retried"))
+    cause = _rate_limit(retry_after="1", code="insufficient_quota")
+    runnable = MagicMock()
+    runnable.invoke.side_effect = cause
+    with pytest.raises(openai.RateLimitError):
+        call_with_retry(runnable, ["msg"], settings=_SETTINGS)
+    runnable.invoke.assert_called_once()
+    with pytest.raises(UnparseableLLMResponseError) as ei:
+        raise_sanitized(cause)
+    assert not isinstance(ei.value, LLMAccessError)
+    assert _POISON not in str(ei.value)
+    assert ei.value.__cause__ is cause
+
+
+@pytest.mark.parametrize(
+    ("cause", "error", "message"),
+    [
+        (_openai_status_error(openai.NotFoundError, 404), UnparseableLLMResponseError, "response (HTTP 404)"),
+        (_openai_status_error(openai.InternalServerError, 503), LLMAccessError, "retries (HTTP 503)"),
+        (ValueError(_POISON), UnparseableLLMResponseError, "schema-invalid response"),
+        (TimeoutError(_POISON), LLMAccessError, "transport retries"),
+    ],
+    ids=["404", "503", "no-status", "timeout"],
+)
+def test_the_sanitized_message_names_the_status_and_nothing_else(cause, error, message) -> None:
+    # The status number is the one part of the raw error in the message: the ERROR log line names the
+    # cause (the rung-5 system test reads it), and the endpoint / key still cannot leak.
+    with pytest.raises(error) as ei:
+        raise_sanitized(cause)
+    assert str(ei.value).endswith(message)
+    assert _POISON not in str(ei.value)

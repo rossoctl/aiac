@@ -36,6 +36,7 @@ from aiac.agent.policy_rules_builder.conflict_detection import PolicyConflictErr
 from aiac.agent.policy_rules_builder.diagnostic_models import ConflictReport
 from aiac.agent.policy_rules_builder.graph import (
     LLMAccessError,
+    LLMCredentialsError,
     PolicyRulesBuilderError,
     UnparseableLLMResponseError,
 )
@@ -134,9 +135,9 @@ def _config_returning(service):
 
 
 def _rollback_errors():
-    """The four typed build failures that trigger the UC1 compensating rollback.
+    """The five typed build failures that trigger the UC1 compensating rollback.
 
-    Instances (not classes): PolicyConflictError needs a ConflictReport, so all four are
+    Instances (not classes): PolicyConflictError needs a ConflictReport, so all five are
     built here and passed as `build` side effects. `from_survey([], [], 0)` is the minimal
     valid report (see test_error_logging.py)."""
     return [
@@ -144,6 +145,7 @@ def _rollback_errors():
         PolicyRulesBuilderError("auditor rejected after retries"),
         LLMAccessError("LLM endpoint unreachable"),
         UnparseableLLMResponseError("schema validation failed"),
+        LLMCredentialsError("LLM endpoint rejected the credentials"),
     ]
 
 

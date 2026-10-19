@@ -221,7 +221,8 @@ To tear the forward down afterwards: `pkill -f 'port-forward .*keycloak-service'
 
 If the realm was freshly provisioned, the `rossoctl` client needs Direct Access Grants enabled.
 Without it, token minting fails with `unauthorized_client`. This is platform state, so the demo does
-not set it:
+not set it. The snippet also removes the attribute `aiac.test.direct-access-grants-by-harness`, so a
+system-test run does not turn the grant off at its end:
 
 ```bash
 KC=http://keycloak.localtest.me:8080
@@ -232,7 +233,7 @@ ADMIN=$(curl -s -X POST "$KC/realms/master/protocol/openid-connect/token" \
 CID=$(curl -s -H "Authorization: Bearer $ADMIN" "$KC/admin/realms/rossoctl/clients?clientId=rossoctl" \
   | python3 -c 'import sys,json;print(json.load(sys.stdin)[0]["id"])')
 curl -s -H "Authorization: Bearer $ADMIN" "$KC/admin/realms/rossoctl/clients/$CID" \
-  | python3 -c 'import sys,json;d=json.load(sys.stdin);d["directAccessGrantsEnabled"]=True;print(json.dumps(d))' \
+  | python3 -c 'import sys,json;d=json.load(sys.stdin);d["directAccessGrantsEnabled"]=True;d.setdefault("attributes",{})["aiac.test.direct-access-grants-by-harness"]="";print(json.dumps(d))' \
   | curl -s -o /dev/null -w "enable DAG HTTP %{http_code}\n" -X PUT -H "Authorization: Bearer $ADMIN" \
     -H "Content-Type: application/json" "$KC/admin/realms/rossoctl/clients/$CID" --data-binary @-
 ```
@@ -817,8 +818,8 @@ make teardown ARGS=--include-opa   # also revert step 2's overlay and combiner (
 - **the `team1` namespace itself** — the installer owns it
   ([`INSTALL.md`](../../assets/INSTALL.md): "a precondition, not an output"). A fresh install gives
   you an *empty* `team1`, so emptying it *is* the post-install state.
-- **the realm fix-up** (Direct Access Grants) — one-time cluster state that this demo and the
-  `-m system` suite both depend on. The client scope `aiac-username-sub` and its links (D31) are
+- **the realm fix-up** (Direct Access Grants) — one-time cluster state that this demo depends on.
+  (The `-m system` suite enables the grant itself.) The client scope `aiac-username-sub` and its links (D31) are
   AIAC's; AIAC makes them again at its next start and onboarding.
 - **the operator's `*-aud` audience client scopes**, which it owns and recreates.
 - **step 2's OPA overlay**, unless you pass `--include-opa`.

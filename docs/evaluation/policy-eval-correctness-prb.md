@@ -191,8 +191,7 @@ covered exactly as `policy-eval-scenarios.md` already documents them
 
 ## Policy-text rewrite
 
-As part of this ticket, all 8 scenarios' policy `.md` files (`eval/scenarios/policy.eval_*.md`,
-`test/system/policy.eval_agent_delegation.md`) and their 8 `eval/scenarios_perturbed/`
+As part of this ticket, all 8 scenarios' policy `.md` files (`eval/scenarios/policy.eval_*.md`) and their 8 `eval/scenarios_perturbed/`
 semantic siblings were rewritten to read like real human-authored access-control policy rather
 than the pipeline's own internal vocabulary reflected back into the document a policy author would
 supposedly have written. The previous text opened with the literal internal-modeling phrase
