@@ -36,7 +36,7 @@ to put a new test, see `docs/testing/testing-strategy.md`.
 | unit | bare `pytest` | `unit` | Nothing |
 | integration | `-m integration` | `integration` | Nothing (offline: several AIAC units in one process, no cluster, no LLM endpoint). The tests are under `test/integration/`, a mirror of `src/aiac/`. |
 | llm | `-m llm` | `system` | An LLM endpoint only (no cluster, no Keycloak) |
-| system | `-m system` | `system` | A wired Kind cluster with the event path (NATS broker + Keycloak SPI), Keycloak admin credentials, an LLM endpoint, and `kubectl`, `kind` plus `docker` or `podman` on `PATH`. Pytest must run on the host of the Kind node. See [`system` lane](#system-lane) for the image load and the skip conditions |
+| system | `-m system` | `system` | A wired Kind cluster with the event path (NATS broker + Keycloak SPI), Keycloak admin credentials and an LLM endpoint. The tools `kubectl`, `kind` and `docker` or `podman` must be on `PATH`. Pytest must run on the host of the Kind node. See [`system` lane](#system-lane) for the image load and the skip conditions |
 | eval | `-m eval` | `system` | Keycloak, an LLM endpoint, `opa` on `PATH` for the e2e level |
 
 All live lanes (`llm`, `system`, `eval`) **skip cleanly** when their env is not
