@@ -177,9 +177,10 @@ first. A clean `-m system` run removes them at teardown; after an aborted one, a
 first.
 
 **The project `.venv`** with its dependencies installed (see the
-[README's Getting started](../../../README.md#getting-started)). The Makefile's Python targets run
-`../../../.venv/bin/python`, not `python3`. `make demo` also needs the `opa` binary on `PATH` (or
-`OPA_BIN`).
+[README's Getting started](../../../README.md#getting-started)). You need both interpreters. Only
+the Makefile's Python targets run `../../../.venv/bin/python`. The shell scripts (`restore.sh` and
+`driver.sh`, used by `make restore` and `make e2e`) call `python3` from `PATH` directly. `make demo`
+also needs the `opa` binary on `PATH` (or `OPA_BIN`).
 
 ### Two secrets to create first
 
@@ -599,9 +600,15 @@ rather than from the live plugin. Same policy, same generated files — inspecte
 
 ```bash
 make setup    # the full version: adds client-UUID resolution + direct token-exchange config
-make clear    # reset to a clean baseline — deletes both AuthorizationPolicy CRs and generated/
+make clear    # reset to a clean baseline (see below)
 make show
 ```
+
+`make clear` (`init/02-clear.py`) deletes the `github-agent.*` and `github-tool.*` Keycloak roles
+and client scopes, the Policy Store, both AuthorizationPolicy CRs and the local `generated/` copy.
+Under the changed combiner (D20), a pod with no CR is denied. Thus the live workloads deny every
+request from the reset until the manual onboarding writes their CRs. If you stop before then, they
+deny every request until they are onboarded again.
 
 **Pause 1 — baseline.** Three users with roles, no `github-*` roles or scopes, no generated `.rego`.
 

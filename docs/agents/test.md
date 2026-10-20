@@ -36,12 +36,13 @@ to put a new test, see `docs/testing/testing-strategy.md`.
 | unit | bare `pytest` | `unit` | Nothing |
 | integration | `-m integration` | `integration` | Nothing (offline: several AIAC units in one process, no cluster, no LLM endpoint). The tests are under `test/integration/`, a mirror of `src/aiac/`. |
 | llm | `-m llm` | `system` | An LLM endpoint only (no cluster, no Keycloak) |
-| system | `-m system` | `system` | A wired Kind cluster with the event path (NATS broker + Keycloak SPI), Keycloak admin credentials, an LLM endpoint, and `kubectl`, `kind` plus `docker` or `podman` on `PATH`. The stack fixture of each rung module (`onboarded_stack` or `pristine_stack`, module-scoped) builds the demo images and loads them into Kind (`demo/assets/kind-load.sh`), once per module, so pytest must run on the host of the Kind node. The load targets the cluster named by `AIAC_KIND_CLUSTER`, else by a `kind-<name>` kube-context, else `rossoctl`; if no Kind cluster has that name, `kind-load.sh` prints `ERROR: Kind cluster '<name>' not found (kind get clusters)`. The lane skips when the cluster is not wired (checked before the load); a failed load fails the tests, it does not skip |
+| system | `-m system` | `system` | A wired Kind cluster with the event path (NATS broker + Keycloak SPI), Keycloak admin credentials, an LLM endpoint, and `kubectl`, `kind` plus `docker` or `podman` on `PATH`. Pytest must run on the host of the Kind node. See [`system` lane](#system-lane) for the image load and the skip conditions |
 | eval | `-m eval` | `system` | Keycloak, an LLM endpoint, `opa` on `PATH` for the e2e level |
 
 All live lanes (`llm`, `system`, `eval`) **skip cleanly** when their env is not
-set or the cluster is not wired. A skip is not a pass. A failure after the skip
-checks (for example the `system` lane's image load) fails the tests.
+set. The `system` lane has more skip conditions (see [`system` lane](#system-lane)).
+A skip is not a pass. A failure after the skip checks (for example the `system`
+lane's image load) fails the tests.
 
 ## Env
 
@@ -106,11 +107,38 @@ Preconditions:
   The Controller log then shows `LLMCredentialsError`. To check or change the
   key: `k8s/aiac-deployment-guide.md`, step 3b, "Check or change the API key".
 
-Do **not** deploy the demo `github-agent` / `github-tool` yourself. The session
-fixture (`onboarded_stack` in `test/system/uc1_onboard.py`) builds and loads the
-demo images (`demo/assets/kind-load.sh`), removes any demo workloads and their
-registrations, deploys the workloads as the onboarding trigger, and removes them
-again at teardown.
+Do **not** deploy the demo `github-agent` / `github-tool` yourself. The stack
+helper (`onboarded_stack` or `pristine_stack` in `test/system/uc1_onboard.py`)
+removes any demo workloads and their registrations. Then it loads the demo
+images, deploys the workloads as the onboarding trigger, and removes them again
+at teardown.
+
+Fixture scope:
+
+- Rungs 1-3 (`test_uc1_onboard_agent_only`, `test_uc1_onboard_agent_then_tool`,
+  `test_uc1_onboard_tool_then_agent`) and `test_policy_pipeline` call
+  `onboarded_stack` from a session-scoped fixture.
+- `test_uc1_onboard_resync` and `test_uc1_onboard_failure_rollback` call it
+  (or `pristine_stack`) from a module-scoped fixture.
+
+Thus a session-scoped stack stays up until the session ends.
+
+Image load: the helper runs `demo/assets/kind-load.sh` with no `--rebuild`.
+The script builds an image only if it is not present. Otherwise it loads the
+cached `localhost/github-*:latest` image. After a change to the `demo/assets`
+source, run `demo/assets/kind-load.sh --rebuild` first, or the lane tests the
+old image. The load targets the cluster named by `AIAC_KIND_CLUSTER`, else by a
+`kind-<name>` kube-context, else `rossoctl`. If no Kind cluster has that name,
+`kind-load.sh` prints `ERROR: Kind cluster '<name>' not found (kind get clusters)`.
+
+Skip conditions, in this order, all before the image load:
+
+1. The cluster is not wired (`require_pipeline`).
+2. `KEYCLOAK_URL`, `KEYCLOAK_ADMIN_USERNAME` or `KEYCLOAK_ADMIN_PASSWORD` is not
+   set (`require_env_or_skip`).
+3. The Keycloak event path is not wired (`require_event_path`).
+
+A failed image load fails the tests. It does not skip them.
 
 Each callee, the tool included, checks its own inbound from its own CR.
 

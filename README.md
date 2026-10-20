@@ -29,14 +29,25 @@ per-pod configuration.
 
 The use cases live under `src/aiac/agent/uc/`. Service onboarding, policy update and role update
 each have a spec in [docs/specs/components/aiac-agent/](docs/specs/components/aiac-agent/).
-Service onboarding and role update have an event trigger. Policy update has no event trigger yet:
-nothing publishes `aiac.apply.policy.build`, so a policy change starts a rebuild only when someone
-calls `POST /apply/policy/build` or `POST /apply/policy/rebuild`. A role-membership change
-(`aiac.apply.role-members.*`, D32) is a trigger with no use case: the consumer sends it to the
-Policy Computation Engine's `rerender_role`, which gives the role's CRs the current holders and
-does not run the Policy Rules Builder. Offboarding is also a use
-case, but it has no event trigger: it is HTTP-only (`POST /apply/offboard/{service_id}`), and a
-deleted workload does not start it. Offboarding is described in the [PRD](docs/specs/PRD.md).
+
+Service onboarding is implemented. A Keycloak event or `POST /apply/service/{service_id}` starts
+it.
+
+Policy update and role update are **not implemented yet**. Their handlers (`build_policy()`,
+`rebuild_policy()` and `update_role()`) are stubs that return no rules. Thus these calls and
+events build no rules:
+
+- `POST /apply/policy/build` and `POST /apply/policy/rebuild`. Also, nothing publishes the
+  `aiac.apply.policy.build` event yet.
+- `POST /apply/role/{role_id}` and the `aiac.apply.role.*` event.
+
+A role-membership change (`aiac.apply.role-members.*`, D32) has no use case. The consumer sends it
+to the Policy Computation Engine's `rerender_role`. This gives the CRs of the role its current
+holders, and does not run the Policy Rules Builder.
+
+Offboarding is also a use case, but it has no event trigger. It is HTTP-only
+(`POST /apply/offboard/{service_id}`), and a deleted workload does not start it. Offboarding is
+described in the [PRD](docs/specs/PRD.md).
 
 ## Repository layout
 
@@ -77,35 +88,30 @@ AIAC combiner, and the Keycloak event-listener SPI.
 
 ## Demo — onboarding an agent and a tool
 
-[demo/use-cases/onboarding/](demo/use-cases/onboarding/) is a fully live, end-to-end demo: AIAC
-discovers a `github-agent` and a `github-tool` deployed into `team1`, reads a two-line
-plain-English policy, and writes one `AuthorizationPolicy` CR per service. Real HTTP requests
-through the deployed AuthBridge OPA plugin are then allowed or denied by that generated Rego. It
-proves two claims:
+[demo/use-cases/onboarding/](demo/use-cases/onboarding/) is a fully live, end-to-end demo. AIAC
+discovers a `github-agent` and a `github-tool` deployed into `team1`. It reads a plain-English
+policy (deny by default, plus two grants), and writes one `AuthorizationPolicy` CR per service.
+Then the deployed AuthBridge OPA plugin allows or denies real HTTP requests with that generated
+Rego. The demo proves two claims:
 
 - **AIAC is triggered by onboarded workloads** — no one runs an onboarding command.
-- **AIAC enforced a natural language policy in rossoctl** — verdicts come from the live OPA plugin, not from
-  evaluating a file on the side.
+- **AIAC enforced a natural language policy in rossoctl** — verdicts come from the live OPA
+  plugin, not from evaluating a file on the side.
 
-The prerequisites (cluster, tools, sibling clones, the two secrets, the LLM endpoint, the one-time
-Keycloak realm fix-up, and no demo workloads already deployed) are in
-[Before you start](demo/use-cases/onboarding/demo.md#before-you-start). This README copies none of
-them.
-
+The prerequisites are in [Before you start](demo/use-cases/onboarding/demo.md#before-you-start).
 Then run the steps of [demo/use-cases/onboarding/demo.md](demo/use-cases/onboarding/demo.md), in
 the order it gives, from that directory. Each step is a `make` target, and `make help` lists them
-all. The full narrative, verification and troubleshooting are also there.
+all. The full narrative, verification and troubleshooting are also in `demo.md`.
 
-`make demo` is a separate, narrated walkthrough of the same scenario. It is not an inspection of
-the live path's result: it first resets the state, then onboards by hand, and gets its verdicts
-from an offline `opa eval`, not from the live OPA plugin. It needs the workloads already deployed.
-The reset deletes the `github-agent.*` and `github-tool.*` Keycloak roles and client scopes, the
-Policy Store and both AuthorizationPolicy CRs. Under the changed combiner (D20) a pod with no CR is
-denied, so from the reset until its manual onboarding finishes (or for good, if `make demo` stops
-before then) the live workloads deny every request. `make restore` and `make teardown` clean up.
-The demo workloads live
-under [demo/assets/](demo/assets/) — see [demo/assets/INSTALL.md](demo/assets/INSTALL.md) and their
-specs in [docs/specs/demo/](docs/specs/demo/).
+`make demo` is a separate, narrated walkthrough. It resets the live state, onboards by hand and
+gets its verdicts from an offline `opa eval`. If the workloads are not deployed, it deploys them.
+That is a first-time deploy, so it also starts the live onboarding. For the details, see
+[Step 6](demo/use-cases/onboarding/demo.md#step-6--inspect-what-was-generated-optional) in
+`demo.md`. `make restore` and `make teardown` clean up.
+
+The demo workloads live under [demo/assets/](demo/assets/). See
+[demo/assets/INSTALL.md](demo/assets/INSTALL.md) and their specs in
+[docs/specs/demo/](docs/specs/demo/).
 
 ## Documentation
 
