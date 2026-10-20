@@ -1,0 +1,90 @@
+"""How the UC-1 system-test harness classifies a live response — pure unit tests.
+
+An outbound refusal by the exchange plugin (``discovery-exchange``) means the request never reached
+OPA. ``discovery-exchange`` answers a target not granted to the caller with ``policy.forbidden``, the
+same error code OPA uses, so the classifier must go by the named ``plugin`` and never report that
+refusal as an OPA ``deny`` (a false pass for a deny expectation).
+
+They import the system harness like ``test_uc1_subject_scope.py`` does: it does no cluster I/O at
+import time.
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+import pytest
+
+HERE = Path(__file__).resolve().parent  # test/unit/agent/uc/onboarding/
+REPO_ROOT = HERE.parents[4]  # -> aiac/
+sys.path.insert(0, str(REPO_ROOT))  # so ``import test.system.*`` resolves
+
+from test.system import launcher  # noqa: E402
+
+
+def _frame(data: dict) -> str:
+    """A JSON-RPC error frame, as the forward proxy renders a rejected MCP request (HTTP 200)."""
+    return json.dumps({"jsonrpc": "2.0", "id": 1, "error": {"code": -32000, "message": "x", "data": data}})
+
+
+OPA_DENY = {"error": "policy.forbidden", "plugin": "opa"}
+NOT_GRANTED = {"error": "policy.forbidden", "plugin": "discovery-exchange"}
+EXCHANGE_FAILED = {"error": "upstream.token-exchange-failed", "plugin": "discovery-exchange"}
+LEGACY_EXCHANGE_FAILED = {"error": "upstream.token-exchange-failed", "plugin": "token-exchange"}
+
+
+@pytest.mark.parametrize(
+    ("doc", "expected"),
+    [
+        (OPA_DENY, True),
+        ({"error": "policy.forbidden"}, True),  # no plugin named: the OPA error code alone
+        (NOT_GRANTED, False),
+        (EXCHANGE_FAILED, False),
+        ({"plugin": "jwt-validation", "error": "policy.forbidden"}, False),
+        (None, False),
+    ],
+)
+def test_is_opa_violation_goes_by_the_named_plugin(doc: object, expected: bool) -> None:
+    assert launcher.is_opa_violation(doc) is expected
+
+
+@pytest.mark.parametrize(
+    ("doc", "expected"),
+    [
+        (NOT_GRANTED, True),
+        (EXCHANGE_FAILED, True),
+        (LEGACY_EXCHANGE_FAILED, True),
+        ({"error": "upstream.token-exchange-failed"}, True),
+        (OPA_DENY, False),
+        ("not a dict", False),
+    ],
+)
+def test_is_exchange_refusal(doc: object, expected: bool) -> None:
+    assert launcher.is_exchange_refusal(doc) is expected
+
+
+@pytest.mark.parametrize(
+    ("code", "body", "expected"),
+    [
+        (200, _frame(OPA_DENY), "deny"),
+        (403, json.dumps(OPA_DENY), "deny"),
+        (200, _frame(NOT_GRANTED), "error"),
+        (403, json.dumps(NOT_GRANTED), "error"),
+        (200, _frame(EXCHANGE_FAILED), "error"),
+        (200, _frame(LEGACY_EXCHANGE_FAILED), "error"),
+        (503, json.dumps(EXCHANGE_FAILED), "error"),
+        (200, json.dumps({"jsonrpc": "2.0", "id": 1, "result": {}}), "allow"),
+    ],
+)
+def test_outbound_outcome_never_reports_an_exchange_refusal_as_an_opa_deny(
+    code: int, body: str, expected: str
+) -> None:
+    assert launcher.outbound_outcome(code, body) == expected
+
+
+def test_deny_origin_ignores_an_exchange_refusal() -> None:
+    assert launcher.deny_origin(200, _frame(NOT_GRANTED)) is None
+    assert launcher.deny_origin(403, json.dumps(NOT_GRANTED)) is None
+    assert launcher.deny_origin(200, _frame(OPA_DENY)) == launcher.DENY_ORIGIN_AGENT_OUTBOUND

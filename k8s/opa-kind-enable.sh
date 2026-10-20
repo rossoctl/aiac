@@ -9,9 +9,11 @@
 # (a2a-parser, mcp-parser, inference-parser) so OPA policies have input.a2a /
 # input.mcp / input.inference available on both legs, not just input.host.
 #
-# On the outbound leg OPA is placed AFTER token-exchange so policies can
-# read input.delegation (the target audience + scopes the agent's token was
-# exchanged for). See the overlay comment in Step 3 for the rationale.
+# The outbound leg exchanges by default: discovery-exchange (no routes) mints a
+# token for every in-cluster destination Keycloak has a client for, and OPA runs
+# AFTER it so policies can read input.identity / input.delegation (the target
+# audience + scopes the token was exchanged for). See the overlay comment in
+# Step 3 for the rationale.
 #
 # Step 1 applies the changed combiner of AIAC (D20,
 # k8s/aiac-combiner-default.yaml) as the global combiner (the `default`
@@ -50,7 +52,11 @@
 #   CLUSTER_NAME        kind cluster name                 (default: rossoctl)
 #   RELEASE_NAME        helm release name                 (default: rossoctl)
 #   RELEASE_NAMESPACE   namespace the chart is installed in (default: rossoctl-system)
-#   AGENT_NAMESPACE     namespace to restart agent and tool pods in (default: team1)
+#   AGENT_NAMESPACE     namespace to restart agent and tool pods in; also the
+#                       namespace discovery-exchange assumes for short host
+#                       names such as github-tool:9090   (default: team1)
+#   TRUST_DOMAIN        SPIFFE trust domain in the outbound exchange audience
+#                       spiffe://<td>/ns/<ns>/sa/<service> (default: localtest.me)
 #   IMAGE_TAG           local tag for the authbridge proxy-sidecar image built
 #                       from cmd/cortex (default: localhost/authbridge:local).
 #                       The tag name stays "authbridge" because it feeds the
@@ -90,6 +96,7 @@ CLUSTER_NAME="${CLUSTER_NAME:-rossoctl}"
 RELEASE_NAME="${RELEASE_NAME:-rossoctl}"
 RELEASE_NAMESPACE="${RELEASE_NAMESPACE:-rossoctl-system}"
 AGENT_NAMESPACE="${AGENT_NAMESPACE:-team1}"
+TRUST_DOMAIN="${TRUST_DOMAIN:-localtest.me}"
 IMAGE_TAG="${IMAGE_TAG:-localhost/authbridge:local}"
 
 if [ -z "$OPERATOR_DIR" ] || [ ! -f "$OPERATOR_DIR/operator/Dockerfile" ] || [ ! -d "$OPERATOR_DIR/charts/operator/templates/bundleservice" ]; then
@@ -375,26 +382,32 @@ cat > "$OVERLAY_FILE" <<YAML
 #     input.mcp, input.inference) are always populated, even if a later
 #     gate denies the request.
 #   - opa runs after jwt-validation on inbound so input.identity is set.
-#   - On OUTBOUND, opa runs AFTER token-exchange so the delegation signal
-#     is populated: token-exchange records the target audience + granted
-#     scopes it minted a token for (RFC 8693) into the delegation chain,
-#     and OPA exposes it as input.delegation (origin, actor, depth, and a
-#     chain of {subject_id, audience, scopes, strategy, from_cache}). This
-#     lets outbound policy reason about WHAT the agent's token was
-#     exchanged for without re-parsing the minted token and without a fail-closed JWT
-#     gate that would reject passthrough egress.
-#     token-exchange ALSO synthesizes input.identity on this leg, even though
-#     no JWT is validated here: a matched route yields
-#     identity.{subject, client_id, service_id, scopes}, where service_id is
-#     the route's target_audience and subject is the delegating end user, so
-#     outbound policy can key on input.identity the same way as inbound. A
-#     host with NO matching route gets no exchange and therefore no identity,
-#     so gates keyed on it go undefined and the policy's default applies.
-#     input.delegation carries the complementary per-hop audit trail.
-#   - token-exchange uses the chart's default shape (client-secret identity
-#     from /shared, passthrough default policy). Per-destination routes
-#     come from the authproxy-routes ConfigMap; hosts with no route fall
-#     through unchanged and simply carry no delegation hop.
+#   - OUTBOUND token exchange is ON by default, with no routes: discovery-exchange
+#     derives the audience from the destination host
+#     (spiffe://${TRUST_DOMAIN}/ns/{namespace}/sa/{service}; a short name uses
+#     namespace ${AGENT_NAMESPACE}) and asks Keycloak. A granted target gets a
+#     token narrowed to it; a destination Keycloak has no client for is the ONLY
+#     passthrough; an existing-but-not-granted target is 403 and any other IdP
+#     failure is 503. A request with no bearer is exchanged with the workload's
+#     own client-credentials token (no_token_policy: client-credentials), never
+#     passed through.
+#   - opa runs AFTER discovery-exchange so the exchange is visible to policy:
+#     each exchange appends a delegation hop, and OPA exposes it as
+#     input.delegation (origin, actor, depth, chain of {subject_id, audience,
+#     scopes, strategy, from_cache}) and as an outbound input.identity
+#     {subject, client_id, service_id, scopes} in the same shape as inbound,
+#     where service_id is the target audience and subject/scopes come from the
+#     token Keycloak issued. A request that is not exchanged carries no
+#     identity, so gates keyed on it go undefined and the policy's default
+#     applies.
+#   - Keycloak must grant each target as a DEFAULT client scope of the caller
+#     (an optional scope is never applied: the plugin requests no scope) and
+#     have standard token exchange enabled on the caller's client.
+#   - The SPIFFE audience form requires the destination Service and its
+#     ServiceAccount to share a name; otherwise the derived audience names no
+#     client and the request passes through un-exchanged.
+#   - discovery-exchange rejects unknown config keys, so token-exchange-only
+#     keys (routes, default_policy, identity, token_scopes) must not appear.
 # NOTE: the rossoctl chart reads the pipeline from \`.Values.authBridge.pipeline\`
 # (a multiline string rendered via tpl() into the namespace
 # authbridge-runtime-config ConfigMap — see charts/rossoctl/templates/
@@ -422,13 +435,13 @@ authBridge:
         - name: a2a-parser
         - name: mcp-parser
         - name: inference-parser
-        - name: token-exchange
+        - name: discovery-exchange
           config:
             keycloak_url: "http://keycloak-service.keycloak.svc:8080"
             keycloak_realm: "rossoctl"
-            default_policy: "passthrough"
-            identity:
-              type: "client-secret"
+            audience_template: "spiffe://${TRUST_DOMAIN}/ns/{namespace}/sa/{service}"
+            namespace: "${AGENT_NAMESPACE}"
+            no_token_policy: "client-credentials"
         - name: opa
           config:
             bundle_url: "http://bundle-service.${RELEASE_NAMESPACE}.svc.cluster.local:8080"

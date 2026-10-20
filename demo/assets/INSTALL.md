@@ -35,7 +35,7 @@ they automate.
 | Workload | Image | Manifests, in order | Objects created (ns `team1`) |
 |---|---|---|---|
 | tool | `localhost/github-tool:latest` | `tools/github_tool/k8s/github-tool-deployment.yaml` | ServiceAccount + Deployment + Service `github-tool` (`:9090`) + `AgentRuntime` `github-tool` (`type: tool`) |
-| agent | `localhost/github-agent:latest` | `agents/github_agent/k8s/configmaps.yaml`, **then** `agents/github_agent/k8s/github-agent-deployment.yaml` | ServiceAccount + Deployment + Service `github-agent` (`:8001`, `:8080`) + `AgentRuntime` `github-agent` (`type: agent`); the ConfigMaps are `authbridge-config` + `authproxy-routes` |
+| agent | `localhost/github-agent:latest` | `agents/github_agent/k8s/configmaps.yaml`, **then** `agents/github_agent/k8s/github-agent-deployment.yaml` | ServiceAccount + Deployment + Service `github-agent` (`:8001`, `:8080`) + `AgentRuntime` `github-agent` (`type: agent`); the ConfigMap is `authbridge-config` (no `authproxy-routes`: the `discovery-exchange` that `k8s/opa-kind-enable.sh` wires derives the outbound audience from the destination host) |
 
 Per workload: phase 1 (`kind-load.sh`) builds the image → `kind load docker-image <image> --name
 <cluster>`; phase 2 (`deploy.sh`) applies the manifests **in the order above** → `kubectl rollout

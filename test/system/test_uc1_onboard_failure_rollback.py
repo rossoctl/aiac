@@ -213,7 +213,7 @@ def _outbound_block(ctx: dict, user: str, tool_bare: str) -> tuple[str, int | No
             data = (json.loads(body).get("error") or {}).get("data") or {}
         except (ValueError, AttributeError):
             data = {}
-        if data.get("plugin") == "token-exchange" or data.get("error") == "upstream.token-exchange-failed":
+        if uc1.is_exchange_refusal(data):
             return "refused", code, body
     return decision, code, body
 
@@ -291,7 +291,6 @@ def _run_phases(ctx: dict, run: dict) -> None:
     deployed_at = datetime.now(timezone.utc)
     uc1.deploy_workload(TOOL)
     tool = _registered_client(admin, TOOL)
-    uc1.ensure_github_tool_route(uc1.NAMESPACE)
     uc1.grant_exchange_scope(admin)
     uc1.restart_agent(uc1.NAMESPACE)
     outbound = _poll_decision(lambda: uc1.outbound_decision(ctx, "dev-user", PROBE_TOOL), "allow", LIFT_TIMEOUT)

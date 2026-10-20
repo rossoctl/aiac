@@ -276,6 +276,25 @@ def select_live_pod(items: list[dict]) -> str | None:
     return chosen.get("metadata", {}).get("name")
 
 
+# The AuthBridge sidecar the operator injects (``preconditions.SIDECAR_CONTAINER``; the harness never
+# imports ``aiac``).
+AUTHBRIDGE_CONTAINER = "authbridge-proxy"
+
+
+def sidecar_rollout_done(items: list[dict]) -> bool:
+    """True when every live (not terminating) pod of a ``kubectl get pods`` ``items`` list has the
+    ``authbridge-proxy`` container and is Ready, and there is at least one such pod. Pure — no I/O.
+
+    The operator injects the sidecar only after the first pod of a fresh deploy is up (it registers
+    the client, patches the Deployment and rolls out a new pod), so ``kubectl rollout status`` can
+    pass on that plain first pod. Until it is gone, its Service can route a probe to it, past OPA."""
+    live = [p for p in items if not p.get("metadata", {}).get("deletionTimestamp")]
+    return bool(live) and all(
+        _pod_is_ready(p) and any(c.get("name") == AUTHBRIDGE_CONTAINER for c in p.get("spec", {}).get("containers", []))
+        for p in live
+    )
+
+
 def resolve_pod(selector: str, *, namespace: str) -> str:
     """Return the name of the **newest live** pod matching a label ``selector`` (e.g. ``app=aiac-opa``).
 
@@ -409,7 +428,7 @@ def mint_token(
     return resp.json()["access_token"]
 
 
-# RFC 8693 token exchange — the request AuthBridge's ``token-exchange`` plugin sends on the outbound leg.
+# RFC 8693 token exchange — the request AuthBridge's ``discovery-exchange`` plugin sends on the outbound leg.
 TOKEN_EXCHANGE_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:token-exchange"
 ACCESS_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:access_token"
 
@@ -446,29 +465,32 @@ def exchange_token(
     client_id: str,
     client_secret: str,
     audience: str,
-    scope: str,
+    scope: str | None = None,
     timeout: float = 30.0,
 ) -> str:
     """Exchange ``subject_token`` for an access token to ``audience`` (RFC 8693, the Keycloak standard
     token exchange) as the client ``client_id``, and return the new access token.
 
-    The same request that AuthBridge's ``token-exchange`` plugin sends on the agent's outbound leg
-    (``audience`` + ``scope`` from the route, ``subject_token_type`` and ``requested_token_type`` =
-    access token). The client authenticates with ``client_secret`` (form data, like ``mint_token``),
+    With ``scope`` left ``None``, the same request that AuthBridge's ``discovery-exchange`` plugin sends
+    on the agent's outbound leg: ``audience`` only, **no** ``scope`` (so only the client's default
+    scopes apply), ``subject_token_type`` and ``requested_token_type`` = access token. The client
+    authenticates with ``client_secret`` (form data, like ``mint_token``),
     as AuthBridge does with the ``client-secret`` identity that ``k8s/opa-kind-enable.sh`` sets. Raises ``TokenExchangeError`` on a non-2xx answer;
     its ``client_auth_refused`` tells a refused client authentication from every other failure."""
+    data = {
+        "grant_type": TOKEN_EXCHANGE_GRANT_TYPE,
+        "subject_token": subject_token,
+        "subject_token_type": ACCESS_TOKEN_TYPE,
+        "requested_token_type": ACCESS_TOKEN_TYPE,
+        "audience": audience,
+        "client_id": client_id,
+        "client_secret": client_secret,
+    }
+    if scope is not None:
+        data["scope"] = scope
     resp = requests.post(
         f"{keycloak_url.rstrip('/')}/realms/{realm}/protocol/openid-connect/token",
-        data={
-            "grant_type": TOKEN_EXCHANGE_GRANT_TYPE,
-            "subject_token": subject_token,
-            "subject_token_type": ACCESS_TOKEN_TYPE,
-            "requested_token_type": ACCESS_TOKEN_TYPE,
-            "audience": audience,
-            "scope": scope,
-            "client_id": client_id,
-            "client_secret": client_secret,
-        },
+        data=data,
         timeout=timeout,
     )
     if not (200 <= resp.status_code < 300):
@@ -697,9 +719,28 @@ def inbound_outcome(code: int | None) -> str:
 
 def is_opa_violation(doc: object) -> bool:
     """True when ``doc`` (a parsed rejection body, or the ``error.data`` of a JSON-RPC error frame)
-    names the OPA plugin: ``plugin == "opa"`` or ``error == "policy.forbidden"`` (cortex
-    ``pipeline.Violation.Render`` / ``httpx.MarshalMCPRejectionBody``)."""
-    return isinstance(doc, dict) and (doc.get("plugin") == "opa" or doc.get("error") == "policy.forbidden")
+    names the OPA plugin: ``plugin == "opa"``, or, when no ``plugin`` is named, ``error ==
+    "policy.forbidden"`` (cortex ``pipeline.Violation.Render`` / ``httpx.MarshalMCPRejectionBody``).
+    A named non-OPA plugin never counts: ``discovery-exchange`` also answers ``policy.forbidden``
+    (a target not granted to the caller), and that refusal is not an OPA verdict."""
+    if not isinstance(doc, dict):
+        return False
+    plugin = doc.get("plugin")
+    if plugin is not None:
+        return plugin == "opa"
+    return doc.get("error") == "policy.forbidden"
+
+
+# The outbound exchange plugins, either of which may sit before OPA on the agent's outbound leg
+# (``k8s/opa-kind-enable.sh`` wires ``discovery-exchange``), and the error code of a failed exchange.
+EXCHANGE_PLUGINS = frozenset({"token-exchange", "discovery-exchange"})
+EXCHANGE_FAILED_ERROR = "upstream.token-exchange-failed"
+
+
+def is_exchange_refusal(doc: object) -> bool:
+    """True when ``doc`` (a parsed rejection body, or the ``error.data`` of a JSON-RPC error frame) is
+    a refusal of the outbound token exchange — the request never reached OPA."""
+    return isinstance(doc, dict) and (doc.get("plugin") in EXCHANGE_PLUGINS or doc.get("error") == EXCHANGE_FAILED_ERROR)
 
 
 def _json_or_none(body: str) -> object:
@@ -734,8 +775,9 @@ def outbound_outcome(code: int | None, body: str) -> str:
         -> ``"deny"``. This is an OPA verdict, but not the tool check: the agent's outbound is a
         pass-through, so it comes only from a fault (for example the PRD D20 combiner deny).
         ``deny_origin`` tells it apart from the deny of the callee's inbound.
-      * **token-exchange** refused to mint the downstream token — ``error.data.plugin ==
-        "token-exchange"`` (``error.data.error == "upstream.token-exchange-failed"``) -> ``"error"``,
+      * the **exchange plugin** (``discovery-exchange``, or a legacy ``token-exchange``) refused to
+        mint the downstream token — ``error.data.plugin`` in ``EXCHANGE_PLUGINS``, or ``error.data.error
+        == "upstream.token-exchange-failed"`` (``is_exchange_refusal``) -> ``"error"``,
         NOT ``"deny"``. A refused RFC 8693 exchange means the outbound authorization decision was
         **never reached** — the exchange broke *before* OPA — so it is not an OPA deny and must not be
         reported as one. Reporting it as ``"error"`` (a) surfaces a genuine token-exchange fault on a
@@ -763,9 +805,9 @@ def outbound_outcome(code: int | None, body: str) -> str:
     if isinstance(err, dict):
         data = err.get("data")
         if isinstance(data, dict):
-            # token-exchange refusal = the outbound decision was never reached (exchange broke before
+            # Exchange refusal = the outbound decision was never reached (exchange broke before
             # OPA). Honest class is "error", never "deny" — it must not stand in for an OPA verdict.
-            if data.get("plugin") == "token-exchange" or data.get("error") == "upstream.token-exchange-failed":
+            if is_exchange_refusal(data):
                 return "error"
             # A real OPA verdict — token-exchange succeeded and the request reached the policy.
             if is_opa_violation(data):

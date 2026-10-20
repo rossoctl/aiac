@@ -15,7 +15,8 @@
 #
 # Checks, mirroring the runbook 1:1:
 #   Preflight  kubectl present, cluster reachable, agent namespace present
-#   Verify 1   'name: opa' appears twice in authbridge-runtime-config (both legs)
+#   Verify 1   'name: opa' appears twice in authbridge-runtime-config (both legs),
+#              and the outbound leg carries discovery-exchange, not token-exchange
 #   Verify 2   AuthorizationPolicy CRD established + global 'default' CR present,
 #              and it is the changed combiner (D20): 0 request fallback rules (a
 #              pod with no client CR is denied), 2 response fallback rules
@@ -116,6 +117,15 @@ OPA_COUNT=$(kubectl get configmap authbridge-runtime-config -n "$NS" \
 [ "$OPA_COUNT" = "2" ] \
   || die "'name: opa' occurrences in authbridge-runtime-config: got '${OPA_COUNT}', expected '2' — run k8s/opa-kind-enable.sh"
 pass "'name: opa' occurrences in authbridge-runtime-config: got '2' (expected '2')"
+# Outbound token exchange is on by default via discovery-exchange (no routes);
+# a leftover token-exchange entry means the pipeline predates the switch.
+PIPELINE_CFG=$(kubectl get configmap authbridge-runtime-config -n "$NS" \
+                 -o jsonpath='{.data.config\.yaml}' 2>/dev/null || true)
+DX_COUNT=$(grep -c 'name: discovery-exchange' <<<"$PIPELINE_CFG" || true)
+TX_COUNT=$(grep -c 'name: token-exchange' <<<"$PIPELINE_CFG" || true)
+[ "$DX_COUNT" = "1" ] && [ "$TX_COUNT" = "0" ] \
+  || die "outbound exchange plugins in authbridge-runtime-config: discovery-exchange='${DX_COUNT}', token-exchange='${TX_COUNT}', expected '1'/'0' — run k8s/opa-kind-enable.sh"
+pass "outbound exchange plugin: discovery-exchange (token-exchange absent)"
 
 # ── Verify 2 — CRD + global policy ───────────────────────────────────────────
 step "Verify 2 — AuthorizationPolicy CRD and the changed global combiner (D20)"

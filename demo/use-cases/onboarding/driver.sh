@@ -13,8 +13,8 @@
 #   Phase VERIFY-TRIGGER  poll Keycloak for the brand-new clients, aiac-agent logs for evidence it
 #                         consumed both over NATS, and the two AuthorizationPolicy CRs AIAC wrote
 #                         (one per managed service, D20: github-agent AND github-tool).
-#   Phase WIRE            wire AuthBridge's own outbound leg (authproxy-routes + optional
-#                         client-scope) — demo-owned wiring the platform runbook
+#   Phase WIRE            wire AuthBridge's own outbound leg (the github-tool audience as a DEFAULT
+#                         client-scope of github-agent; discovery-exchange needs no route) — demo-owned wiring the platform runbook
 #                         (k8s/opa-kind-runbook.md) leaves out; AIAC's own onboarding does not do this.
 #   Phase ENFORCE         real HTTP probes through the live AuthBridge OPA plugin, reproducing
 #                         #646's acceptance table.
@@ -329,8 +329,6 @@ collect_logs() {
     >"${dir}/authorizationpolicy-github-agent.yaml" 2>&1 || true
   kubectl get "$POLICY_CR" github-tool -n "$NS" -o yaml \
     >"${dir}/authorizationpolicy-github-tool.yaml" 2>&1 || true
-  kubectl get configmap authproxy-routes -n "$NS" -o yaml \
-    >"${dir}/cm-authproxy-routes.yaml" 2>&1 || true
   kubectl get configmap authbridge-runtime-config -n "$NS" -o yaml \
     >"${dir}/cm-authbridge-runtime-config.yaml" 2>&1 || true
   kubectl get pods -n "$NS" -o wide      >"${dir}/pods-${NS}.txt" 2>&1 || true
@@ -559,18 +557,7 @@ print("yes" if os.environ["SCOPE"] in names else "")' 2>/dev/null || true)
 
 # ── Phase WIRE ────────────────────────────────────────────────────────────────
 phase_wire_outbound() {
-  printf '\n%s%s====== Phase WIRE — AuthBridge outbound leg (authproxy-routes + optional scope) ======%s\n' "$C_BLD" "$C_CYN" "$C_RST"
-
-  step "Adding the github-tool outbound route to authproxy-routes"
-  kubectl patch configmap authproxy-routes -n "$NS" --type merge -p "$(NS="$NS" python3 -c '
-import json, os
-ns = os.environ["NS"]
-print(json.dumps({"data":{"routes.yaml":
-f"""- host: \"github-tool\"
-  target_audience: \"spiffe://localtest.me/ns/{ns}/sa/github-tool\"
-  token_scopes: \"openid agent-{ns}-github-tool-aud\"
-"""}}))')" || die "failed to patch authproxy-routes"
-  pass "authproxy-routes carries the github-tool route"
+  printf '\n%s%s====== Phase WIRE — AuthBridge outbound leg (default client scope, no routes) ======%s\n' "$C_BLD" "$C_CYN" "$C_RST"
 
   step "Granting github-agent the exchange scope on its Keycloak client (expect HTTP 204)"
   ADMIN="$(admin_token)"
@@ -581,17 +568,20 @@ f"""- host: \"github-tool\"
   SCOPE_ID="$(scope_id_by_name "$tool_aud" "$ADMIN")"
   [ -n "$SCOPE_ID" ] || die "client-scope '${tool_aud}' not found — has github-tool onboarded yet?"
   SCOPE_HTTP=$(curl -s -o /dev/null -w "%{http_code}" -X PUT -H "Authorization: Bearer ${ADMIN}" \
-    "${KC}/admin/realms/${REALM}/clients/${AGENT_UUID}/optional-client-scopes/${SCOPE_ID}")
+    "${KC}/admin/realms/${REALM}/clients/${AGENT_UUID}/default-client-scopes/${SCOPE_ID}")
   case "$SCOPE_HTTP" in
-    204) pass "assigned optional client-scope: HTTP 204" ;;
-    409) warn "optional client-scope already assigned (HTTP 409) — idempotent, continuing" ;;
-    *) die "assigning the optional client-scope returned HTTP ${SCOPE_HTTP} (expected 204)" ;;
+    204) pass "assigned default client-scope: HTTP 204" ;;
+    409) warn "default client-scope already assigned (HTTP 409) — idempotent, continuing" ;;
+    *) die "assigning the default client-scope returned HTTP ${SCOPE_HTTP} (expected 204)" ;;
   esac
 
-  step "Restarting github-agent to load the route"
+  # discovery-exchange (k8s/opa-kind-enable.sh) derives the github-tool audience from the host —
+  # no route. It requests no scope, so the grant must be a DEFAULT scope. The restart clears the
+  # audience it may have cached as unknown before github-tool's client existed (5 min).
+  step "Restarting github-agent to clear its exchange caches"
   kubectl delete pod -n "$NS" -l "$AGENT_LABEL" || die "failed to delete github-agent pod"
   kubectl wait --for=condition=ready pod -n "$NS" -l "$AGENT_LABEL" --timeout=120s \
-    || die "github-agent did not become Ready after the route-load restart"
+    || die "github-agent did not become Ready after the restart"
   pass "github-agent restarted and Ready"
 }
 

@@ -211,13 +211,10 @@ Manifests live under `demo/assets/agents/github_agent/k8s/`, adapted from the gi
   - `AgentRuntime{ type: agent, targetRef: this Deployment }` — enrolls the workload (operator applies
     `rossoctl.io/type=agent`, registers a Keycloak client, injects the AuthBridge sidecar).
   - Image `localhost/github-agent:latest`, `imagePullPolicy: IfNotPresent` (kind-load; name is a documented knob).
-- **`configmaps.yaml`** — `authbridge-config` (Keycloak URL/realm/issuer) + `authproxy-routes` with the
-  outbound token-exchange route:
-  ```yaml
-  - host: "github-tool-mcp"
-    target_audience: "github-tool"
-    token_scopes: "openid github-tool-aud github-full-access"
-  ```
+- **`configmaps.yaml`** — `authbridge-config` (Keycloak URL/realm/issuer) only. There is no
+  `authproxy-routes`: the outbound plugin `discovery-exchange` (wired by `k8s/opa-kind-enable.sh`) has no
+  routes. It derives the audience `spiffe://<trust-domain>/ns/<namespace>/sa/<host>` from the `MCP_URL`
+  host and exchanges for it when the agent's client has that audience as a **default** client scope.
 - **Prerequisite (reused, not created here):** the existing **production** `github-tool` Deployment/Service
   (`authbridge/demos/github-issue/k8s/github-tool-deployment.yaml`, Service name `github-tool-mcp`) +
   `github-tool-secrets`, a running rossoctl cluster (Keycloak realm `rossoctl`, namespace `team1` —
@@ -225,8 +222,11 @@ Manifests live under `demo/assets/agents/github_agent/k8s/`, adapted from the gi
   The sibling UC-1 stub at `demo/assets/tools/github_tool/` (Service `github-tool`) is a separate deployment
   for AIAC onboarding discovery and is **not** a runtime dependency of this agent.
 
-**Wiring invariant:** agent `MCP_URL` host (`github-tool-mcp`) == `authproxy-routes` host == tool
-Service name; exchanged audience (`github-tool`) == tool `AUDIENCE`.
+**Wiring invariant:** for a tool call to be exchanged, the agent `MCP_URL` host == the tool's Service name
+== its ServiceAccount name, and the derived `spiffe://…/sa/<host>` == the tool's Keycloak client ID (its
+`AUDIENCE`). The shipped default does not meet it: the host `github-tool-mcp` derives an audience that
+names no client (the production tool's audience is `github-tool`), so those calls pass through
+un-exchanged. The UC-1 stub (`github-tool`, Service = ServiceAccount = `github-tool`) meets it.
 
 ---
 

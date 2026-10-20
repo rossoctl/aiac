@@ -33,7 +33,7 @@ outbound of every service is a pass-through (D24). See
 To see OPA **enforce** a real policy for real users, run a use case on top of
 this setup. For example, the onboarding use case
 ([`demo/use-cases/onboarding/demo.md`](../demo/use-cases/onboarding/demo.md))
-deploys its own workloads, users, outbound routes and policy. The onboarding use
+deploys its own workloads, users, Keycloak grants and policy. The onboarding use
 case's system tests list their extra platform prerequisites (event broker,
 Keycloak SPI) in
 [`docs/testing/uc1-onboarding-pipeline.md`](../docs/testing/uc1-onboarding-pipeline.md#preconditions-the-wired-platform--not-stood-up-by-the-tests).
@@ -44,9 +44,9 @@ shows what AIAC writes for `github-agent` and `github-tool`.
 
 ```
 Inbound:   caller ─► parsers ─► jwt-validation ─► opa ─► app
-Outbound:  app ─► parsers ─► token-exchange ─► opa ─► destination
-                                                │
-                    bundle-service ◄────────────┘  (polls its bundle)
+Outbound:  app ─► parsers ─► discovery-exchange ─► opa ─► destination
+                                                    │
+                    bundle-service ◄────────────────┘  (polls its bundle)
 ```
 
 - The parsers (`a2a-parser`, `mcp-parser`, `inference-parser`) run first, so
@@ -54,7 +54,11 @@ Outbound:  app ─► parsers ─► token-exchange ─► opa ─► destinatio
   matches that protocol.
 - Inbound, `opa` runs after `jwt-validation`, so `input.identity` comes from the
   validated JWT.
-- Outbound, `opa` runs after `token-exchange`, so policies can read the
+- Outbound, token exchange is **on by default**. `discovery-exchange` needs no
+  routes: it derives the target audience from the destination host and lets
+  Keycloak decide whether the destination is a target
+  (see [Outbound token exchange](#outbound-token-exchange)).
+- Outbound, `opa` runs after `discovery-exchange`, so policies can read the
   delegation chain and a synthesized `input.identity`
   (see [What OPA sees](#what-opa-sees-on-each-leg)).
 - Every sidecar polls its bundle from
@@ -114,6 +118,11 @@ kubectl get authorizationpolicy github-tool -n team1 \
     module root is elsewhere. An untracked `authbridge/` directory left over in
     an older clone is stale and can be ignored. Restore does not need this
     clone.
+    The checkout must contain the `discovery-exchange` plugin
+    (`core/plugins/discoveryexchange/`, including its delegation-hop
+    recording). Until it is merged to `main`, check out the
+    `feat/discovery-exchange` branch. An older checkout fails at sidecar start
+    with an unknown-plugin error.
 
   These paths are resolved against **your current directory**, not the script.
   Pass absolute paths unless you run from the repo root.
@@ -177,6 +186,10 @@ Expect two image builds, so allow a few minutes. The script runs six steps:
    `on_error: enforce`. Check #2 does not check the outbound leg. The overlay
    keeps `opa` there for the pass-through outbound package (D24) and the
    changed combiner (D20). `charts/rossoctl/values.yaml` is never modified.
+   The outbound `discovery-exchange` entry is configured with
+   `audience_template: spiffe://$TRUST_DOMAIN/ns/{namespace}/sa/{service}`
+   (`TRUST_DOMAIN`, default `localtest.me`), `namespace: $AGENT_NAMESPACE` for
+   short host names, and `no_token_policy: client-credentials`.
 4. **Helm upgrade.** Applies the chart's `values.yaml` plus the overlay, with
    the sidecar image pointed at the locally built one.
    - It sets `operator-chart.featureGates.injectTools=true`. So the operator
@@ -211,6 +224,11 @@ It runs these checks. Each one can also be run by hand:
 # 1. OPA is in both legs of the namespace pipeline — expect 2
 kubectl get configmap authbridge-runtime-config -n team1 \
   -o jsonpath='{.data.config\.yaml}' | grep -c 'name: opa'
+# 1b. Outbound exchange is discovery-exchange — expect 1, then 0
+kubectl get configmap authbridge-runtime-config -n team1 \
+  -o jsonpath='{.data.config\.yaml}' | grep -c 'name: discovery-exchange'
+kubectl get configmap authbridge-runtime-config -n team1 \
+  -o jsonpath='{.data.config\.yaml}' | grep -c 'name: token-exchange'
 
 # 2. The CRD is served and the global combiner exists — expect 'default', scope global
 kubectl get crd authorizationpolicies.agent.rossoctl.dev
@@ -427,7 +445,7 @@ kubectl logs -n <ns> <pod> -c authbridge-proxy --tail=500 \
 - Credential headers (`authorization`, `cookie`, …) are **redacted** from
   `headers`. Use `identity` for auth decisions.
 
-**Outbound** — there is no validated JWT on this leg. When `token-exchange`
+**Outbound** — there is no validated JWT on this leg. When `discovery-exchange`
 mints the downstream token, it records a delegation hop, and OPA builds
 `input.identity` **in the same shape as inbound**:
 
@@ -452,7 +470,7 @@ mints the downstream token, it records a delegation hop, and OPA builds
         "subject_id": "<delegating user>",
         "audience": "spiffe://<td>/ns/<ns>/sa/<destination>",
         "scopes": ["openid", "<exchanged scopes>"],
-        "strategy": "token-exchange",
+        "strategy": "discovery-exchange",
         "from_cache": false,
         "timestamp": "..."
       }
@@ -462,20 +480,70 @@ mints the downstream token, it records a delegation hop, and OPA builds
 }
 ```
 
-- `subject` is the delegated caller, decoded on a best-effort basis from the
-  incoming bearer's `sub`.
+- `subject` is the `sub` of the token Keycloak issued: the delegating user, or
+  the calling workload's service account when the request carried no bearer
+  (`no_token_policy: client-credentials`). The workload cannot choose it,
+  because it comes from the IdP's answer and not from the caller's bearer.
 - `client_id` is the **calling workload's own client**
   (`/shared/client-id.txt`), the party doing the exchange, not the target.
-- `scopes` are the scopes the downstream token was minted with (the last hop).
-- `service_id` is the exchange target (the last hop's `audience`). It is the
-  outbound counterpart of the inbound token audience. No AIAC package reads
-  it: the outbound package is a pass-through (D24).
-- `token-exchange` only runs for hosts that have a route in the namespace's
-  `authproxy-routes` ConfigMap. Routes are read once at sidecar startup.
-  Traffic to a host with no route is passed through with **no** `identity` and
-  no `delegation`, so a policy keyed on them falls to its default.
+- `scopes` is the issued token's `scope` claim. With default-scope grants
+  Keycloak lists **all** of the caller's scope names there, even though `aud`
+  names one target. So don't treat `scopes` as per-target.
+- `service_id` is the exchange target (the last hop's `audience`, the derived
+  `spiffe://…/sa/<service>`). It is the outbound counterpart of the inbound
+  token audience. No AIAC package reads it: the outbound package is a
+  pass-through (D24).
+- Only an **exchanged** request (`token_exchanged` or `cache_hit`) carries
+  `identity` and `delegation`. A destination that is passed through (out of
+  cluster, or no Keycloak client) has neither, so a policy keyed on them falls
+  to its default (deny, for AIAC's generated policy).
 - Parser sections (`mcp` / `a2a` / `inference`) appear **only** when the body
   matches that protocol.
+
+### Outbound token exchange
+
+`discovery-exchange` runs on every outbound request and has no routes and no
+`authproxy-routes` ConfigMap. Adding a target is a Keycloak change only, with no
+restart. Exchange is the default; passthrough happens in exactly two cases:
+
+| Destination | Result | Session event |
+|---|---|---|
+| Outside the cluster (external host, IP literal, `svc.namespace` without `.svc`) | forwarded unchanged, Keycloak not asked | `skip / host_not_in_cluster` |
+| In-cluster, audience granted to the caller | `Authorization` replaced with a token narrowed to that audience | `modify / token_exchanged` (or `cache_hit`) |
+| In-cluster, Keycloak has **no client** for the derived audience | forwarded unchanged; remembered for 5 min | `skip / audience_unknown` |
+| In-cluster, client exists but is **not granted** to the caller | **403**, OPA not consulted | `deny / audience_not_granted` |
+| Keycloak down, timeout, bad credentials, any other error | **503**, OPA not consulted | `deny / exchange_failed` |
+| Sidecar credentials not yet in `/shared/` | **503** (pod held not-ready) | `deny / credentials_not_ready` |
+
+A request with **no** bearer is still exchanged, using the workload's own
+`client_credentials` token as the subject (`no_token_policy:
+client-credentials`). It is never sent un-narrowed.
+
+The audience is derived from the Host header as
+`spiffe://<TRUST_DOMAIN>/ns/<namespace>/sa/<service>`. The namespace comes from
+the host (`github-tool.team1.svc[.cluster.local]`), or from `AGENT_NAMESPACE`
+for a short name (`github-tool:9090`). This makes two demands on workloads and
+Keycloak, which a use case (not this runbook) sets up:
+
+1. **Service name = ServiceAccount name.** The Host header carries the Service
+   name. If it differs from the ServiceAccount, the derived audience names no
+   client and the request **passes through un-exchanged**. For example, the
+   demo agent's default `MCP_URL` host is `github-tool-mcp`, but the client is
+   `…/sa/github-tool`.
+2. **Keycloak grants**, on the caller's client:
+   - standard token exchange enabled (`standard.token.exchange.enabled=true`);
+   - each target granted through a client scope with an audience mapper for
+     it, attached as a **default** scope. The plugin requests no `scope`, so an
+     *optional* scope is never applied and the target answers 403. A **realm**
+     default scope would grant every target to every caller.
+
+`AGENT_NAMESPACE` is baked into the pipeline at enable time. The chart renders
+one pipeline for every agent namespace, and the sidecar has no
+`POD_NAMESPACE` env to expand. A workload in another agent namespace must
+therefore call its targets by `service.namespace.svc` name. Otherwise its short
+names derive the wrong namespace and pass through.
+
+The full plugin reference is cortex `docs/discovery-exchange-plugin.md`.
 
 ### Reading a decision
 
@@ -484,7 +552,9 @@ mints the downstream token, it records a delegation hop, and OPA builds
 | HTTP `403`, body `{"error":"policy.forbidden","plugin":"opa",...}` | OPA denied a plain HTTP or A2A request, or an inbound OPA denied an MCP request. A tool call that the tool's inbound OPA denies comes back this way: the tool's reverse proxy sends the `403`, and the agent's forward proxy relays it. |
 | HTTP `200`, JSON-RPC `error` frame with `error.code: -32000`, `error.data.plugin: "opa"` | An **outbound** OPA denied an **MCP** request (one with a `method` and an `id`). In an AIAC setup, the outbound package of a managed service is a pass-through (D24), so this is a call from a pod that has no client CR (D20). The forward proxy returns the deny as a JSON-RPC error, so the MCP client sees one failed call instead of a broken transport (`writeMCPRejection` in cortex `core/listener/httpx/render.go`). The request never reaches the destination. |
 | HTTP `200`, JSON-RPC `result` frame | Allowed. |
-| HTTP `503` (outbound) | `token-exchange` failed. OPA was never consulted. |
+| HTTP `403` (outbound), or an MCP error frame, with `plugin: "discovery-exchange"` | Keycloak has a client for the destination, but it is not granted to the caller as a default scope (`audience_not_granted`). OPA was never consulted. |
+| HTTP `503` (outbound), `error: "upstream.token-exchange-failed"` | `discovery-exchange` could not get a token (Keycloak error, timeout, credentials not loaded). OPA was never consulted. |
+| Allowed or denied by OPA as if no exchange ran, with no `identity` in the decision log | The destination passed through (`audience_unknown` / `host_not_in_cluster`). Check the Service/ServiceAccount naming and the Keycloak client. |
 
 For MCP traffic, classify by the response **body**, not the status code: a
 `result` frame is allowed; an `error` frame or a `403` body that names `opa` is

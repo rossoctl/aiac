@@ -32,11 +32,13 @@
 #   1. github-tool Deployment + Service named "github-tool-mcp" (the MCP tool server)
 #   2. github-tool-secrets Secret (GitHub token used by the tool)
 #   3. authbridge-config ConfigMap (apply configmaps.yaml first)
-#   4. authproxy-routes ConfigMap (apply configmaps.yaml first)
 #
-# Invariant: MCP_URL host ("github-tool-mcp") == authproxy-routes host entry
-# ("github-tool-mcp") == the Kubernetes Service name for the tool server.
-# All three must match or token exchange will not fire for tool calls.
+# Token exchange (discovery-exchange, no routes): the audience is derived from
+# the MCP_URL host as spiffe://<td>/ns/<ns>/sa/<host>, so the tool's Service
+# name must equal its ServiceAccount (its Keycloak client) and the tool's
+# audience scope must be a DEFAULT client scope of github-agent. The default
+# host "github-tool-mcp" names no client, so those calls pass through
+# un-exchanged; point MCP_URL at "github-tool" to have them exchanged.
 #
 # Usage:
 #   kubectl apply -f configmaps.yaml
@@ -133,9 +135,8 @@ spec:
               value: "DEBUG"
 
             # MCP Tool endpoint - the GitHub tool service
-            # AuthBridge will exchange the token when the agent calls this URL.
-            # This hostname MUST match the authproxy-routes host entry and the
-            # Kubernetes Service name for the tool (see invariant in header above).
+            # AuthBridge exchanges the token for the audience derived from this
+            # host — see the token-exchange note in the header above.
             - name: MCP_URL
               value: "http://github-tool-mcp:9090/mcp"
 

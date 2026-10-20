@@ -407,7 +407,7 @@ def _stub_post(monkeypatch: pytest.MonkeyPatch, response: _Response) -> list[dic
     return calls
 
 
-def _exchange() -> str:
+def _exchange(**kwargs: str) -> str:
     return launcher.exchange_token(
         "subject-jwt",
         keycloak_url="http://kc.example:8080/",
@@ -415,25 +415,35 @@ def _exchange() -> str:
         client_id=AGENT_CLIENT_ID,
         client_secret="s3cret",
         audience="spiffe://x/ns/team1/sa/github-tool",
-        scope="openid agent-team1-github-tool-aud",
+        **kwargs,
     )
 
 
+_EXCHANGE_FORM = {
+    "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+    "subject_token": "subject-jwt",
+    "subject_token_type": "urn:ietf:params:oauth:token-type:access_token",
+    "requested_token_type": "urn:ietf:params:oauth:token-type:access_token",
+    "audience": "spiffe://x/ns/team1/sa/github-tool",
+    "client_id": AGENT_CLIENT_ID,
+    "client_secret": "s3cret",
+}
+
+
 def test_exchange_token_sends_the_rfc8693_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With no ``scope``, the request of AuthBridge's ``discovery-exchange``: audience only, so only
+    the client's default scopes apply."""
     calls = _stub_post(monkeypatch, _Response(200, {"access_token": "exchanged-jwt"}))
     assert _exchange() == "exchanged-jwt"
     assert len(calls) == 1
     assert calls[0]["url"] == "http://kc.example:8080/realms/rossoctl/protocol/openid-connect/token"
-    assert calls[0]["data"] == {
-        "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
-        "subject_token": "subject-jwt",
-        "subject_token_type": "urn:ietf:params:oauth:token-type:access_token",
-        "requested_token_type": "urn:ietf:params:oauth:token-type:access_token",
-        "audience": "spiffe://x/ns/team1/sa/github-tool",
-        "scope": "openid agent-team1-github-tool-aud",
-        "client_id": AGENT_CLIENT_ID,
-        "client_secret": "s3cret",
-    }
+    assert calls[0]["data"] == _EXCHANGE_FORM
+
+
+def test_exchange_token_sends_an_explicit_scope(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = _stub_post(monkeypatch, _Response(200, {"access_token": "exchanged-jwt"}))
+    _exchange(scope="openid extra")
+    assert calls[0]["data"] == {**_EXCHANGE_FORM, "scope": "openid extra"}
 
 
 @pytest.mark.parametrize(
@@ -504,8 +514,8 @@ def _secret_admin(secret: object = "s3cret") -> MagicMock:
 
 
 def test_exchanged_subject_exchanges_as_the_agent_to_the_tool_audience(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The request of AuthBridge's route: the agent client, the tool's SPIFFE audience, and
-    ``openid`` + the tool's audience scope; the result is the exchanged token's ``sub``."""
+    """The request of AuthBridge's ``discovery-exchange``: the agent client and the tool's SPIFFE
+    audience, no ``scope``; the result is the exchanged token's ``sub``."""
     calls = _stub_exchange(monkeypatch, _jwt({"sub": "dev-user"}))
     admin = _secret_admin()
     assert uc1.exchanged_subject(_ctx(admin), "dev-user") == "dev-user"
@@ -518,7 +528,6 @@ def test_exchanged_subject_exchanges_as_the_agent_to_the_tool_audience(monkeypat
             "client_id": AGENT_CLIENT_ID,
             "client_secret": "s3cret",
             "audience": uc1._tool_audience(),
-            "scope": f"openid {uc1._tool_aud_scope()}",
         }
     ]
 
