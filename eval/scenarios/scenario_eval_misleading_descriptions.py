@@ -52,8 +52,9 @@ AGENTS: dict[str, dict] = {
 
 # --- Tools --------------------------------------------------------------------------------------
 
+# Each tool id is "<namespace>/<name>", as each agent id: the writer derives the CR of the tool from it.
 TOOLS: dict[str, dict] = {
-    "reservation-tool": {
+    "team1/reservation-tool": {
         "description": (
             "Capability provider Tool for hotel reservations and guest notes. It performs read "
             "operations on reservation details and guest notes, and exposes an inert diagnostic "

@@ -1,11 +1,6 @@
 """The Controller start sequence — runs in the FastAPI lifespan, before the NATS consumer starts.
 
-1. **The enforcement side (D29):** the PCE ``enforcement_side()`` reads ``AIAC_ENFORCEMENT_SIDE``
-   (``target-side``, the default, or ``agent-side``). An unknown value raises ``ValueError`` (it
-   names the variable and the value). The side in use is logged at INFO. Every later PCE operation
-   reads the same env, so the Controller serves one side. The side is set at deploy time: a live
-   switch is not supported, and a side change is a clean redeploy of AIAC.
-2. **Start check #4 (D30):** the global combiner denies a pod that has no client CR. The check reads
+1. **Start check #4 (D30):** the global combiner denies a pod that has no client CR. The check reads
    the ``AuthorizationPolicy`` named ``default`` in the bundle-service namespace
    (``AIAC_BUNDLE_SERVICE_NAMESPACE``, default ``rossoctl-system``). Its ``inbound/request.rego``
    and ``outbound/request.rego`` entries must exist, and each rule of ``client_ok`` in them must be
@@ -19,11 +14,10 @@
    Reason: the quarantine and the decommission delete the CR of the service (D20); the stock
    combiner allows a pod that has no client CR, so a delete would open the service. A ``helm
    upgrade`` of the operator can put the stock combiner back; this check finds that at the next start.
-   The check runs under both sides.
-3. **The resync (D28):** the PCE ``resync()`` writes every CR of the current side and quarantines
-   each disabled service that still has an SPM.
+2. **The resync (D28):** the PCE ``resync()`` writes every CR and quarantines each disabled service
+   that still has an SPM.
 
-A failure in a step stops the Controller: the error is logged (naming the failed step) and raised
+A failure in step 1 or 2 stops the Controller: the error is logged (naming the failed step) and raised
 from the lifespan, so uvicorn never serves, exits, and Kubernetes restarts the pod. Each restart
 runs the steps again. The NATS consumer starts after this sequence (see ``eventbus.consumer.lifespan``).
 """
@@ -33,7 +27,7 @@ import os
 import re
 
 from aiac.agent.uc.onboarding.provision.kube import is_not_found, read_authorization_policy
-from aiac.policy.computation import enforcement_side, resync
+from aiac.policy.computation import resync
 
 logger = logging.getLogger(__name__)
 
@@ -166,13 +160,7 @@ def check_combiner() -> None:
 
 
 def run_start_sequence() -> None:
-    """Run the start sequence (the side, check #4, then the resync). Raise on the first failure."""
-    try:
-        side = enforcement_side()
-    except ValueError as e:
-        logger.error("Controller start stopped: unknown enforcement side (D29): %s", e)
-        raise
-    logger.info("enforcement side (D29): %s", side.value)
+    """Run the start sequence (check #4, then the resync). Raise on the first failure."""
     try:
         check_combiner()
     except StartCheckError as e:

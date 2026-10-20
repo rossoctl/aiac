@@ -16,18 +16,8 @@ data:
   # then: kubectl rollout restart deployment/aiac-agent -n aiac-system
   LLM_BASE_URL: "https://openai-compatible-endpoint.example.com/v1"
   LLM_MODEL: "your-model-name"
+  # AIAC_AC_MODEL names a modeling paradigm (RBAC/ABAC/REBAC). No code reads it.
   AIAC_AC_MODEL: "RBAC"
-  # Enforcement side (D16, D29): where the access to each callee is checked.
-  #   target-side (default): each callee (agent or tool) checks the access to
-  #     itself in its own inbound OPA, from its own CR.
-  #   agent-side (legacy): each agent's outbound OPA checks the agent's calls
-  #     to tools; each tool gets a pass-through CR.
-  # The Controller reads it at start and stops on an unknown value. Set it at
-  # deploy time: a live switch is not supported, and a change is a clean
-  # redeploy of AIAC (k8s/opa-kind-runbook.md, "Set the enforcement side").
-  # Not the same as AIAC_AC_MODEL above, which names a modeling
-  # paradigm (RBAC/ABAC/REBAC) and is read by no code.
-  AIAC_ENFORCEMENT_SIDE: "target-side"
   # Namespace of the bundle service and its `default` global combiner CR (D20).
   # At every start the Controller reads that CR (start check #4, D30) and stops
   # if a request package still allows a pod that has no client CR.
@@ -208,11 +198,11 @@ spec:
           # 5s per-probe timeout before restarting; readiness just gates traffic, so it can
           # react a little faster.
           #
-          # Uvicorn serves /health only after the FastAPI lifespan start ends: read the
-          # enforcement side, start check #4 (the combiner, D30), then the resync (D28,
-          # PUT /policy). The startupProbe gives that sequence its own budget —
-          # 30 x 10s = 5 min (it typically takes < 30s) — and holds the liveness and
-          # readiness probes until /health first answers, so a slow resync is not killed
+          # Uvicorn serves /health only after the FastAPI lifespan start ends: start
+          # check #4 (the combiner, D30), then the resync (D28, PUT /policy). The
+          # startupProbe gives that sequence its own budget — 30 x 10s = 5 min (it
+          # typically takes < 30s) — and holds the liveness and readiness probes until
+          # /health first answers, so a slow resync is not killed
           # by the liveness probe. A failed start check or resync exits the process: the
           # container restarts (with the kubelet back-off) and does not wait out this budget.
           startupProbe:

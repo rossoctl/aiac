@@ -109,7 +109,7 @@ ServiceUuid = NewType("ServiceUuid", str)
 
 ClientId = NewType("ClientId", str)
 """``Service.serviceId`` — the Keycloak ``clientId`` (a SPIFFE ID, can contain ``/``). The SPM key,
-``PolicyRule.scope.serviceId``, the ``decommission`` key and OPA ``input.identity.service_id``."""
+``PolicyRule.scope.serviceId`` and the ``decommission`` key."""
 
 
 class Service(BaseModel):

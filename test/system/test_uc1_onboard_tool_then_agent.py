@@ -13,21 +13,16 @@ This is the direct single-pass happy path: onboarding the tool first provisions 
 **durably onto ``SPM(github-tool)``** (no agent role exists yet, so no agent→tool rule). When the agent
 is then onboarded, its Service Policy Builder reads the universe (now including the tool scopes) and
 the PCE routes the agent→tool rules to ``SPM(github-tool)``. Then the PCE deploys the affected services
-of the live **enforcement side** (D23):
-
-* **target side** (default) — the tool onboarding wrote github-tool's own CR with the user gate only.
-  The agent onboarding changes ``SPM(github-agent)`` and ``SPM(github-tool)``, so the ``changed`` set
-  holds both, and the PCE writes both CRs: the calling-agent gate of github-tool's inbound is then
-  complete (D26), and the agent's outbound is a pass-through (D24).
-* **agent side** — the PCE marks the agent affected and **derives** its APM from the SPMs — picking up
-  the durable user→tool rules already on ``SPM(github-tool)`` — so the agent's outbound package is
-  written with the full user→tool gate in one pass; github-tool has a pass-through CR.
+(D23). The tool onboarding wrote github-tool's own CR with the user gate only. The agent onboarding
+changes ``SPM(github-agent)`` and ``SPM(github-tool)``, so the ``changed`` set holds both, and the PCE
+writes both CRs: the calling-agent gate of github-tool's inbound is then complete (D26), and the
+agent's outbound is a pass-through (D24).
 
 This rung is the **live counterpart of the PCE's order-independence unit test (8.11)** and the exact
-repro of the original order-dependence bug: under the old APM-only design, tool-then-agent **lost** the
+repro of the original order-dependence bug: under the old design, tool-then-agent **lost** the
 ``user role → tool scope`` rule because no agent yet targeted the tool scope at tool onboarding. The
-SPM redesign stores that rule durably on ``SPM(github-tool)`` and uses it at each deploy (target side:
-github-tool's inbound is rendered from that SPM; agent side: the agent's APM is derived from it). So
+SPM redesign stores that rule durably on ``SPM(github-tool)`` and uses it at each deploy
+(github-tool's inbound is rendered from that SPM). So
 this rung's live outbound matrix must **equal rung 2's** — the live proof is both rungs
 driving the *same* bare user→tool matrix through the real plugin and getting the same decisions. A
 divergence is an onboarding-order **bug** this rung exists to surface (spec § *Onboarding order is
@@ -92,7 +87,7 @@ def onboarded() -> dict:
     shared harness (order is this rung's identity — the tool's scopes already exist when the agent's
     Service Policy Builder reads the universe, so the agent onboarding completes the tool check in one
     pass), and yield the live probe context (``admin`` handle, ``agent_pod``, Keycloak URL/realm,
-    ``tool_onboarded=True``, the live ``side``). The harness starts from a no-workloads slate and, on teardown,
+    ``tool_onboarded=True``). The harness starts from a no-workloads slate and, on teardown,
     tears both workloads + all their Keycloak registrations and ``AuthorizationPolicy`` CRs back down
     to pristine (spec § Per-rung flow)."""
     with uc1.onboarded_stack([scn.TOOL_WORKLOAD, scn.AGENT_WORKLOAD]) as ctx:
@@ -152,8 +147,8 @@ def test_inbound(onboarded: dict, subject: str) -> None:
 def test_outbound(onboarded: dict, subject: str, tool_bare: str) -> None:
     """Tool check — a real MCP ``tools/call`` for the **bare** tool through AuthBridge's forward proxy
     (token-exchange → the tool check) decides each ``(subject, tool)`` per the full
-    ``OUTBOUND_SUBJECT_BARE`` table — built from the durable ``SPM(github-tool)`` rules (target side:
-    github-tool's inbound; agent side: the agent's derived outbound). This is the same bare matrix
+    ``OUTBOUND_SUBJECT_BARE`` table — built from the durable ``SPM(github-tool)`` rules (github-tool's
+    inbound). This is the same bare matrix
     rung 2 drives; **both rungs passing it is the live order-independence proof** (the exact cell the
     original order-dependence bug corrupted)."""
     assert uc1.outbound_decision(onboarded, subject, tool_bare) == uc1.expected_outbound_decision(subject, tool_bare), (
@@ -162,25 +157,22 @@ def test_outbound(onboarded: dict, subject: str, tool_bare: str) -> None:
 
 
 def test_deny_comes_from_enforcement_point(onboarded: dict) -> None:
-    """The deny of an ungranted call (``test-user`` × ``source-read``) comes from the enforcement point
-    of the live side, as in rung 2: github-tool's inbound under target side, the agent's outbound under
-    agent side (``deny_origin`` reads the raw response)."""
+    """The deny of an ungranted call (``test-user`` × ``source-read``) comes from the enforcement point,
+    as in rung 2: github-tool's inbound (``deny_origin`` reads the raw response)."""
     probe = uc1.outbound_deny_probe(onboarded, "test-user", "source-read")
-    want = uc1.SIDE_ENFORCEMENT_POINT[onboarded["side"]]
+    want = uc1.DENY_ORIGIN_TOOL_INBOUND
     assert probe["decision"] == "deny" and probe["origin"] == want, (
-        f"{onboarded['side']}: test-user / source-read decision={probe['decision']!r} origin={probe['origin']!r} "
+        f"test-user / source-read decision={probe['decision']!r} origin={probe['origin']!r} "
         f"(want 'deny' from {want!r}); HTTP {probe['code']}, body={probe['body'][:300]!r}"
     )
 
 
-def test_crs_match_live_side(onboarded: dict) -> None:
+def test_crs_match(onboarded: dict) -> None:
     """github-agent's and github-tool's CRs both exist (D20) with exactly the two request packages, in
-    the shape of the live side (``cr_matches_side``) — the same end state as rung 2. Under target side
-    this also proves that the agent onboarding rewrote github-tool's CR: its inbound calling-agent gate
-    is populated."""
-    side = onboarded["side"]
+    their shape (``cr_matches``) — the same end state as rung 2. This also proves that the agent
+    onboarding rewrote github-tool's CR: its inbound calling-agent gate is populated."""
     problems = {
-        workload: uc1.cr_side_mismatches(uc1.authpolicy_policies(workload), kind, side)
+        workload: uc1.cr_mismatches(uc1.authpolicy_policies(workload), kind)
         for workload, kind in uc1.WORKLOAD_KIND.items()
     }
-    assert not any(problems.values()), f"CRs do not match {side}: {problems}"
+    assert not any(problems.values()), f"CRs do not match their shape: {problems}"

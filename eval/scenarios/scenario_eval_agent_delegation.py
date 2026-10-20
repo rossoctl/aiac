@@ -81,8 +81,9 @@ AGENTS: dict[str, dict] = {
 
 # --- Tools --------------------------------------------------------------------------------------
 
+# Each tool id is "<namespace>/<name>", as each agent id: the writer derives the CR of the tool from it.
 TOOLS: dict[str, dict] = {
-    "manifest-tool": {
+    "team1/manifest-tool": {
         "description": (
             "Capability provider Tool for shipment manifests. It performs read and write "
             "operations on manifest contents and status."

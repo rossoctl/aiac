@@ -24,7 +24,7 @@ POLICY_FILE = "policy.eval_wildcard_grant_sensitive_perturbed.md"
 # Byte-identical to scenario_eval_wildcard_grant_perturbed.py.
 
 AGENTS: dict[str, dict] = {
-    "inventory-agent": {
+    "team1/inventory-agent": {
         "description": (
             "An autonomous agent that acts for a user against the retail inventory system, "
             "handling every inventory operation the inventory tool offers: stock-level checks, "
@@ -50,8 +50,9 @@ AGENTS: dict[str, dict] = {
 #
 # Byte-identical to scenario_eval_wildcard_grant_perturbed.py.
 
+# Each tool id is "<namespace>/<name>", as each agent id: the writer derives the CR of the tool from it.
 TOOLS: dict[str, dict] = {
-    "inventory-tool": {
+    "team1/inventory-tool": {
         "description": (
             "A capability provider for retail inventory management, handling stock-level checks, "
             "count adjustments, and reorders."

@@ -30,7 +30,7 @@ POLICY_FILE = "policy.eval_misleading_descriptions_sensitive_perturbed.md"
 # Byte-identical to scenario_eval_misleading_descriptions_perturbed.py.
 
 AGENTS: dict[str, dict] = {
-    "guest-services-agent": {
+    "team1/guest-services-agent": {
         "description": (
             "An autonomous agent that acts for a user against the hotel's guest-services system: "
             "looking up reservation details and guest notes, plus exposing a no-op hook kept "
@@ -55,8 +55,9 @@ AGENTS: dict[str, dict] = {
 #
 # Byte-identical to scenario_eval_misleading_descriptions_perturbed.py.
 
+# Each tool id is "<namespace>/<name>", as each agent id: the writer derives the CR of the tool from it.
 TOOLS: dict[str, dict] = {
-    "reservation-tool": {
+    "team1/reservation-tool": {
         "description": (
             "A capability provider for hotel reservations and guest notes, performing lookups of "
             "reservation details and guest notes and exposing a harmless diagnostic hook."

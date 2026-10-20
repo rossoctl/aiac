@@ -1,7 +1,7 @@
 """Unit tests for aiac/policy/model_store/library/api.py.
 
 SPM-centric HTTP client. Mocks the ``requests`` layer — no live Policy Store. The store
-persists ``ServicePolicyModel`` only; there are no per-agent or whole-collection functions.
+persists ``ServicePolicyModel`` only; there are no whole-collection functions.
 """
 
 from unittest.mock import MagicMock, patch
@@ -317,22 +317,15 @@ class TestClearServicePolicies:
 
 
 # ---------------------------------------------------------------------------
-# Removed surface: no per-agent / whole-collection functions
+# Removed surface: no whole-collection functions
 # ---------------------------------------------------------------------------
 
 
 class TestRemovedFunctions:
-    def test_no_agent_or_collection_functions(self):
+    def test_no_collection_functions(self):
         import aiac.policy.model_store.library.api as api
 
-        for removed in (
-            "get_policy",
-            "apply_policy",
-            "delete_policy",
-            "get_agent_policy",
-            "apply_agent_policy",
-            "delete_agent_policy",
-        ):
+        for removed in ("get_policy", "apply_policy", "delete_policy"):
             assert not hasattr(api, removed), f"{removed} should be removed"
 
 

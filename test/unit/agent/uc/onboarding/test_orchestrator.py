@@ -99,11 +99,9 @@ def bootstrap():
 def k8s(monkeypatch):
     """The Kubernetes seam of the precondition checks (D30): by default one agent pod and a pipeline
     that pass every check. Tests that change the cluster request this fixture by name. The
-    deploy->onboard re-poll is one look with no sleep, unless a test sets it. The enforcement side
-    is unset (target side), unless a test sets it."""
+    deploy->onboard re-poll is one look with no sleep, unless a test sets it."""
     monkeypatch.setenv("ONBOARD_LABEL_WAIT_ATTEMPTS", "1")
     monkeypatch.setenv("ONBOARD_LABEL_WAIT_BACKOFF", "0")
-    monkeypatch.delenv("AIAC_ENFORCEMENT_SIDE", raising=False)
     core = kf.core_v1()
     with patch.object(kube, "_core_v1", return_value=core):
         yield core
@@ -1190,6 +1188,28 @@ class TestPreconditionChecksRunFirst:
 
         assert [f[:2] for f in ei.value.failures] == ["#1", "#2", "#6"]
 
+    def test_a_tool_with_no_jwt_validation_fails_before_the_bootstrap(self, k8s, quarantine, bootstrap):
+        # #2 runs for a tool too, before the bootstrap writes its CR.
+        k8s.list_namespaced_pod.return_value = kf.pod_list(kf.pod(type_label="tool"))
+        k8s.read_namespaced_config_map.return_value = kf.pipeline_configmap(inbound=("mcp-parser", "opa"))
+        config = _config_returning(_service())
+        graph = _graph(service_type=ServiceType.TOOL)
+
+        with (
+            patch.object(orchestrator, "build_provision_graph", return_value=graph),
+            patch.object(orchestrator, "ServicePolicyBuilder"),
+            patch.object(orchestrator, "_config", return_value=config),
+        ):
+            with pytest.raises(EnforcementPreconditionError) as ei:
+                _run_onboarding(SERVICE_ID)
+
+        assert [f[:2] for f in ei.value.failures] == ["#2"]
+        assert "'jwt-validation'" in ei.value.failures[0]
+        bootstrap.assert_not_called()
+        graph.invoke.assert_not_called()
+        quarantine.assert_not_called()
+        config.set_service_enabled.assert_not_called()
+
     def test_the_checks_read_the_pods_and_the_pipeline_of_the_service_namespace(self, k8s):
         with (
             patch.object(orchestrator, "build_provision_graph", return_value=_graph()),
@@ -1234,9 +1254,8 @@ class TestBootstrapOfATool:
 
     @pytest.mark.parametrize("stage", ["provision", "build"])
     def test_a_failure_with_no_quarantine_drops_the_bootstrap_cr(self, k8s, quarantine, drop_bootstrap, stage):
-        # Under agent side the bootstrap CR is a pass-through CR, which allows every request: a 502
-        # of Provision, or a build error that is not a rollback error, must not leave it for a tool
-        # that is not managed.
+        # A 502 of Provision, or a build error that is not a rollback error, must not leave the
+        # bootstrap CR for a tool that is not managed (before the bootstrap, D20 denied it).
         k8s.list_namespaced_pod.return_value = kf.pod_list(kf.pod(type_label="tool"))
         graph = _graph(service_type=ServiceType.TOOL)
         error = HTTPException(502, "no MCP manifest")
@@ -1356,49 +1375,6 @@ class TestBootstrapOfATool:
 
         bootstrap.assert_not_called()
         graph.invoke.assert_called_once()
-
-    def test_under_agent_side_a_tool_gets_no_check_but_still_its_bootstrap(self, k8s, bootstrap, monkeypatch):
-        # D30 scope: under agent side a tool gets a pass-through CR, which needs no check. So a tool
-        # pod with no sidecar and no opa passes; its type still comes from the pod label, and the
-        # bootstrap (the pass-through CR under agent side) runs before Provision.
-        monkeypatch.setenv("AIAC_ENFORCEMENT_SIDE", "agent-side")
-        k8s.list_namespaced_pod.return_value = kf.pod_list(kf.pod(type_label="tool", containers=[kf.app_container()]))
-        k8s.read_namespaced_config_map.return_value = kf.pipeline_configmap(inbound=(), outbound=())
-        graph = _graph(service_type=ServiceType.TOOL)
-        order = MagicMock()
-        order.attach_mock(bootstrap, "bootstrap")
-        order.attach_mock(graph.invoke, "provision")
-
-        with (
-            patch.object(orchestrator, "build_provision_graph", return_value=graph),
-            patch.object(orchestrator, "ServicePolicyBuilder") as spb,
-            patch.object(orchestrator, "_config", return_value=_config_returning(_service())),
-        ):
-            spb.build.return_value = []
-            _run_onboarding(SERVICE_ID)
-
-        bootstrap.assert_called_once_with(CLIENT_ID, ServiceType.TOOL)
-        assert [c[0] for c in order.mock_calls] == ["bootstrap", "provision"]
-
-    def test_under_agent_side_an_agent_with_no_outbound_opa_fails_before_provision(self, k8s, quarantine, monkeypatch):
-        monkeypatch.setenv("AIAC_ENFORCEMENT_SIDE", "agent-side")
-        k8s.read_namespaced_config_map.return_value = kf.pipeline_configmap(outbound=("token-exchange",))
-        config = _config_returning(_service())
-        graph = _graph()
-
-        with (
-            patch.object(orchestrator, "build_provision_graph", return_value=graph),
-            patch.object(orchestrator, "ServicePolicyBuilder") as spb,
-            patch.object(orchestrator, "_config", return_value=config),
-        ):
-            with pytest.raises(EnforcementPreconditionError) as ei:
-                _run_onboarding(SERVICE_ID)
-
-        assert [f[:2] for f in ei.value.failures] == ["#2"]
-        graph.invoke.assert_not_called()
-        spb.build.assert_not_called()
-        config.set_service_enabled.assert_not_called()
-        quarantine.assert_not_called()
 
     def test_a_failed_bootstrap_propagates_before_provision_with_no_rollback(self, k8s, bootstrap, quarantine):
         # The bootstrap stores no SPM and Provision has not run, so nothing needs compensation: the

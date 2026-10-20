@@ -579,10 +579,10 @@ def outbound_probe(
 
     Invokes a **bare** tool (``params.name = tool_name``,
     e.g. ``source-read``) instead of ``tools/list``, so AuthBridge's ``mcp-parser`` surfaces
-    ``input.mcp.params.name`` and OPA's per-tool check is actually exercised (github-tool's inbound
-    under target side, the agent's outbound under agent side). The agent app
-    container has ``HTTP_PROXY=127.0.0.1:8081`` (the forward proxy) and ``python3``; ``token-exchange``
-    uses the carried ``dev-user`` bearer as the RFC 8693 subject token. It is a one-frame
+    ``input.mcp.params.name`` and OPA's per-tool check in github-tool's inbound is actually exercised
+    (the agent's outbound is a pass-through, PRD D24). The agent app container has
+    ``HTTP_PROXY=127.0.0.1:8081`` (the forward proxy) and ``python3``; ``token-exchange`` uses the
+    carried ``dev-user`` bearer as the RFC 8693 subject token. It is a one-frame
     :func:`outbound_session_probe`. Any exec failure returns ``(None, <message>)`` -> ``"error"``."""
     frame = {"jsonrpc": "2.0", "id": "1", "method": "tools/call", "params": {"name": tool_name, "arguments": {}}}
     return outbound_session_probe(
@@ -612,11 +612,11 @@ def outbound_session_probe(
 
     The forward proxy is ``127.0.0.1:8081``, the user bearer is the token-exchange subject token, and
     the request carries the MCP ``Accept`` header. The frames are sent as given, so a method that
-    carries no tool name reaches the MCP session rule of the tool check (github-tool's inbound under
-    target side, the agent's outbound under agent side); :func:`outbound_probe` sends one ``tools/call``
-    frame. Each frame's output starts
-    with an ``AB_MSG:<i>`` line and carries the ``AB_HTTP:<n>`` / ``AB_ERR:<msg>`` markers that
-    ``_parse_curl_output`` reads. An exec failure returns ``(None, <message>)`` for every frame."""
+    carries no tool name reaches the MCP session rule of the tool check in github-tool's inbound (the
+    agent's outbound is a pass-through, PRD D24); :func:`outbound_probe` sends one ``tools/call``
+    frame. Each frame's output starts with an ``AB_MSG:<i>`` line and carries the ``AB_HTTP:<n>`` /
+    ``AB_ERR:<msg>`` markers that ``_parse_curl_output`` reads. An exec failure returns
+    ``(None, <message>)`` for every frame."""
     script = (
         "import urllib.request, urllib.error, json\n"
         f"tok = {json.dumps(token)}\n"
@@ -713,24 +713,27 @@ def _json_or_none(body: str) -> object:
 def outbound_outcome(code: int | None, body: str) -> str:
     """Classify an outbound probe by **body** (``k8s/opa-kind-runbook.md`` "Reading a decision").
 
-    A denied ``tools/call`` has one of two shapes, by the enforcement side:
+    A denied ``tools/call`` has one of two shapes:
 
-      * **Target side** — the agent's outbound is a pass-through, and the **callee's inbound** OPA
-        (github-tool's reverse proxy) decides. The reverse proxy renders a rejection with
-        ``httpx.WriteRejection``: **HTTP 403** and a plain JSON body
+      * **The callee's inbound** — the agent's outbound is a pass-through (PRD D24), and the
+        **callee's inbound** OPA (github-tool's reverse proxy) decides. The reverse proxy renders a
+        rejection with ``httpx.WriteRejection``: **HTTP 403** and a plain JSON body
         (``{"error": "policy.forbidden", "message": …, "plugin": "opa"}``). The agent's forward proxy
         relays that response as it is. A 403 whose body names OPA -> ``"deny"``. A 403 with any other
         body -> ``"error"``: it is not an OPA verdict, so it must not stand in for one.
-      * **Agent side** — the agent's **outbound** OPA decides. On an MCP-shaped request (a ``method``
-        + ``id``) AuthBridge's forward proxy renders **any** rejection as a JSON-RPC error frame **at
-        HTTP 200** (``writeMCPRejection`` — the MCP client sees a single failed tool call, not a
-        transport break), so the frame's ``error.data`` — not the HTTP status — carries the reason.
+      * **The agent's forward proxy** — a plugin on the agent's outbound rejects the request (for
+        example the agent's OPA, with the PRD D20 combiner deny when the agent has no CR). On an
+        MCP-shaped request (a ``method`` + ``id``) AuthBridge's forward proxy renders **any**
+        rejection as a JSON-RPC error frame **at HTTP 200** (``writeMCPRejection`` — the MCP client
+        sees a single failed tool call, not a transport break), so the frame's ``error.data`` — not
+        the HTTP status — carries the reason.
 
     The reason of a JSON-RPC error frame at HTTP 200 decides the class:
 
       * **OPA** blocked it — ``error.data.plugin == "opa"`` / ``error.data.error == "policy.forbidden"``
-        -> ``"deny"``. This is the real outbound authorization verdict: token-exchange succeeded and the
-        request reached OPA, which forbade it. Only tool-onboarded rungs (2 & 3) reach this point.
+        -> ``"deny"``. This is an OPA verdict, but not the tool check: the agent's outbound is a
+        pass-through, so it comes only from a fault (for example the PRD D20 combiner deny).
+        ``deny_origin`` tells it apart from the deny of the callee's inbound.
       * **token-exchange** refused to mint the downstream token — ``error.data.plugin ==
         "token-exchange"`` (``error.data.error == "upstream.token-exchange-failed"``) -> ``"error"``,
         NOT ``"deny"``. A refused RFC 8693 exchange means the outbound authorization decision was
@@ -742,7 +745,7 @@ def outbound_outcome(code: int | None, body: str) -> str:
         ``agent -> tool`` call and token-exchange would short-circuit here anyway — so this frame is
         not an expected verdict on any rung; it always signals a fault worth surfacing.
 
-    So: a plain ``403`` whose body names OPA (the callee's inbound, target side; or the agent's own
+    So: a plain ``403`` whose body names OPA (the callee's inbound; or the agent's own
     non-MCP-shaped rejection fallback) -> ``"deny"``; any other ``403`` -> ``"error"``; HTTP 200 with an
     OPA error frame -> ``"deny"``; HTTP 200 with a token-exchange error frame -> ``"error"``; HTTP 200
     with any other body (a ``result`` frame, or a tool-level error that means the call was *allowed*
@@ -771,7 +774,9 @@ def outbound_outcome(code: int | None, body: str) -> str:
 
 
 # Where the deny of a ``tools/call`` comes from (``deny_origin``): the callee's own inbound OPA
-# (github-tool's reverse proxy; target side) or the agent's outbound OPA (agent side).
+# (github-tool's reverse proxy), which decides each tool call, or the agent's outbound OPA. The agent's
+# outbound is a pass-through (PRD D24), so an OPA deny there (for example the PRD D20 combiner deny
+# when the agent has no CR) is a fault; the second origin stays so that a failed assert names it.
 DENY_ORIGIN_TOOL_INBOUND = "tool-inbound"
 DENY_ORIGIN_AGENT_OUTBOUND = "agent-outbound"
 
@@ -785,11 +790,11 @@ def deny_origin(code: int | None, body: str) -> str | None:
         (``httpx.WriteRejection``), and the agent's outbound let it through and relayed the response.
       * HTTP 200 with a JSON-RPC error frame whose ``error.data`` names OPA ->
         ``DENY_ORIGIN_AGENT_OUTBOUND``: the agent's forward proxy rejected the MCP-shaped request
-        (``httpx.WriteRejectionForRequest``).
+        (``httpx.WriteRejectionForRequest``); a fault, because the agent's outbound is a pass-through.
       * Anything else (an allow, a token-exchange refusal, a transport error) -> ``None``.
 
     Only a request frame (``tools/call`` with an ``id``) has two distinct shapes. A notification gets a
-    plain 403 from either side, so this helper does not apply to it."""
+    plain 403 from either proxy, so this helper does not apply to it."""
     doc = _json_or_none(body)
     if not isinstance(doc, dict):
         return None

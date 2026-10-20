@@ -26,11 +26,9 @@ webhook copies it into each AuthBridge sidecar when a pod is created. So:
   change (a no-op when there is none).
 
 **In an AIAC setup**, AIAC writes one client-scoped CR for each managed service,
-agent and tool. The **enforcement side** selects where a tool call is checked.
-Under **target side** (the default), the tool's own inbound OPA checks it, and
-the outbound of every service is a pass-through. Under **agent side**, the
-agent's outbound OPA checks it, and the tool gets a pass-through CR. See
-[Set the enforcement side](#set-the-enforcement-side).
+agent and tool. The tool's own inbound OPA checks each tool call, and the
+outbound of every service is a pass-through (D24). See
+[The AIAC CRs](#the-aiac-crs).
 
 To see OPA **enforce** a real policy for real users, run a use case on top of
 this setup. For example, the onboarding use case
@@ -40,7 +38,7 @@ case's system tests list their extra platform prerequisites (event broker,
 Keycloak SPI) in
 [`docs/testing/uc1-onboarding-pipeline.md`](../docs/testing/uc1-onboarding-pipeline.md#preconditions-the-wired-platform--not-stood-up-by-the-tests).
 The example CR pair [`opa-team1-policy.yaml`](../docs/examples/opa-team1-policy.yaml)
-shows what AIAC writes under target side for `github-agent` and `github-tool`.
+shows what AIAC writes for `github-agent` and `github-tool`.
 
 ## Architecture
 
@@ -64,8 +62,32 @@ Outbound:  app ─► parsers ─► token-exchange ─► opa ─► destinatio
 - The pipeline is the same for an agent pod and a tool pod. Each AuthBridge
   sidecar runs one OPA instance for both directions. So a call from an agent to
   a tool crosses two OPA checks: the agent's outbound and the tool's inbound.
-  The enforcement side selects which of the two has the rules; the other one is
-  a pass-through.
+  The agent's outbound package is a pass-through (D24), and the tool's inbound
+  package decides the call.
+
+### The AIAC CRs
+
+In an AIAC setup, AIAC writes one client CR for each managed service. Each CR
+has the two request packages:
+
+| CR | Inbound package | Outbound package |
+|----|-----------------|------------------|
+| agent (`github-agent`) | the agent-level check (D26a) | pass-through (D24) |
+| tool (`github-tool`) | the per-tool check (D26) | pass-through (D24) |
+
+So the tool's inbound OPA decides each tool call. The packages are described in
+[`pdp-policy-writer-opa.md` → Rego package structure](../docs/specs/components/pdp-policy-writer-opa.md#rego-package-structure).
+
+To see the CRs on a cluster:
+
+```bash
+# every AIAC CR (one per managed service)
+kubectl get authorizationpolicy -A -l app.kubernetes.io/managed-by=aiac-pdp-policy-writer
+
+# github-tool's inbound package: the per-tool check (tool_ok)
+kubectl get authorizationpolicy github-tool -n team1 \
+  -o jsonpath='{.spec.policies[?(@.path=="inbound/request.rego")].content}'
+```
 
 ---
 
@@ -149,9 +171,12 @@ Expect two image builds, so allow a few minutes. The script runs six steps:
    `authBridge.pipeline` with the pipeline shown in
    [Architecture](#architecture). Every injected pod in the namespace uses it,
    agent and tool. The inbound leg is `a2a-parser`, `mcp-parser`,
-   `inference-parser`, `jwt-validation`, `opa`: a tool needs `mcp-parser` and
-   `opa` there (onboarding check #2, D30). `charts/rossoctl/values.yaml` is
-   never modified.
+   `inference-parser`, `jwt-validation`, `opa`: every service needs
+   `jwt-validation` and `opa` there, and a tool also needs `mcp-parser`
+   (onboarding check #2, D30). Each of them must keep the default
+   `on_error: enforce`. Check #2 does not check the outbound leg. The overlay
+   keeps `opa` there for the pass-through outbound package (D24) and the
+   changed combiner (D20). `charts/rossoctl/values.yaml` is never modified.
 4. **Helm upgrade.** Applies the chart's `values.yaml` plus the overlay, with
    the sidecar image pointed at the locally built one.
    - It sets `operator-chart.featureGates.injectTools=true`. So the operator
@@ -304,125 +329,6 @@ Controller does not start again until `opa-kind-enable.sh` runs again.
 
 ---
 
-## Set the enforcement side
-
-AIAC writes the CRs of one **enforcement side** for every managed service (D16).
-The setting is `AIAC_ENFORCEMENT_SIDE` in the `aiac-agent-config` ConfigMap
-(`aiac-system`): `target-side` (the default) or `agent-side` (D29). The
-Controller reads it at start. An unknown value stops the Controller.
-
-| Side | agent CR (`github-agent`) | tool CR (`github-tool`) | Who checks a tool call |
-|------|---------------------------|-------------------------|------------------------|
-| `target-side` | agent inbound + pass-through outbound | tool inbound (the per-tool check) + pass-through outbound | the tool's inbound OPA |
-| `agent-side` | agent inbound + agent outbound (the per-tool check) | pass-through inbound + pass-through outbound | the agent's outbound OPA |
-
-The packages are described in
-[`pdp-policy-writer-opa.md` → What each side renders](../docs/specs/components/pdp-policy-writer-opa.md#what-each-side-renders).
-
-**The side is set at deploy time. A live switch is not supported.** Do not
-patch the side on a running AIAC and restart the Controller. To change the
-side, do a clean redeploy of AIAC. A clean redeploy deletes the Policy Model
-Store and every AIAC CR, so no CR or stored SPM of the old side stays. After it,
-no service is managed: onboard each service again.
-
-> **Do not change the side by hand-editing the CRs.** A partial change is open.
-> For example, a pass-through outbound on `github-agent` and a pass-through
-> inbound on `github-tool` check nothing.
-
-The clean redeploy (Kind). It deletes AIAC and installs it again with the AIAC
-manifests, as [`aiac-deployment-guide.md`](aiac-deployment-guide.md) steps 3–5
-say. It does not touch Keycloak, so the `aiac-event-listener` SPI stays.
-
-Preconditions:
-
-- Run it from the repo root. The repo-root `.env` has `KEYCLOAK_ADMIN_USERNAME`,
-  `KEYCLOAK_ADMIN_PASSWORD`, `LLM_BASE_URL`, `LLM_MODEL` and `LLM_API_KEY`. All
-  AIAC configuration comes from `.env`. The LLM endpoint, model and key come
-  from it as one set.
-- The four AIAC images are in Kind. A namespace delete does not remove them. If
-  an image changed or is not loaded, do guide steps 1–2 (build and load) first.
-
-```bash
-# A subshell: a failed check or step stops the rest of the block, not your shell.
-( set -eo pipefail
-SIDE=agent-side    # or target-side
-set -a; . .env; set +a
-: "${KEYCLOAK_ADMIN_USERNAME:?missing in .env}" "${KEYCLOAK_ADMIN_PASSWORD:?missing in .env}"
-: "${LLM_BASE_URL:?missing in .env}" "${LLM_MODEL:?missing in .env}" "${LLM_API_KEY:?missing in .env}"
-
-# 0. Check the LLM set of .env BEFORE any change: the endpoint must accept the
-#    key (guide, "Rebuilding the AIAC Agent: always reload its LLM configuration").
-CODE=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $LLM_API_KEY" "$LLM_BASE_URL/models" || true)
-[ "$CODE" = 200 ] || { echo "ERROR: $LLM_BASE_URL/models answered HTTP $CODE to the .env key. Fix .env first." >&2; exit 1; }
-
-# 1. Delete every AIAC CR. The combiner (D20) then denies each managed pod
-#    until it is onboarded again.
-kubectl delete authorizationpolicy -A -l app.kubernetes.io/managed-by=aiac-pdp-policy-writer
-
-# 2. Delete AIAC: the aiac-system namespace, with the Policy Model Store PVC
-#    and every AIAC Secret.
-kubectl delete namespace aiac-system --ignore-not-found --timeout=300s
-
-# 3. The namespace and the two Secrets (guide steps 3 and 3b). Without
-#    keycloak-admin-secret, aiac-interface stays in ContainerCreating.
-kubectl create namespace aiac-system
-kubectl create secret generic keycloak-admin-secret -n aiac-system \
-  --from-literal=KEYCLOAK_ADMIN_USERNAME="$KEYCLOAK_ADMIN_USERNAME" \
-  --from-literal=KEYCLOAK_ADMIN_PASSWORD="$KEYCLOAK_ADMIN_PASSWORD"
-kubectl create secret generic aiac-agent-secret -n aiac-system \
-  --from-literal=LLM_API_KEY="$LLM_API_KEY"
-
-# 4. Deploy, in the order of guide step 5. The Controller init container
-#    waits for the broker.
-kubectl apply -f k8s/pdp-interface-deployment.yaml
-kubectl apply -f k8s/event-broker-deployment.yaml
-kubectl apply -f k8s/policy-model-store-statefulset.yaml
-kubectl apply -f k8s/agent-deployment.yaml
-
-# 5. The LLM endpoint and model (guide step 3b) and the side. The manifest has
-#    LLM placeholders and `target-side`, so patch them after step 4, then
-#    restart. The store is empty, so the Controller start writes no CR.
-kubectl patch configmap aiac-agent-config -n aiac-system --type merge -p "$(jq -n \
-  --arg url "$LLM_BASE_URL" --arg model "$LLM_MODEL" --arg side "$SIDE" \
-  '{data: {LLM_BASE_URL: $url, LLM_MODEL: $model, AIAC_ENFORCEMENT_SIDE: $side}}')"
-kubectl rollout restart deployment/aiac-agent -n aiac-system
-
-# 6. Wait for all of AIAC (guide step 5).
-kubectl wait deployment/aiac-interface -n aiac-system --for=condition=Available --timeout=180s
-kubectl wait deployment/aiac-event-broker -n aiac-system --for=condition=Available --timeout=180s
-kubectl wait statefulset/aiac-policy-model-store -n aiac-system --for=jsonpath='{.status.readyReplicas}'=1 --timeout=180s
-kubectl rollout status deployment/aiac-agent -n aiac-system --timeout=300s
-)
-```
-
-At start, the Controller checks the combiner (check #4, D30). Under agent side,
-the onboarding checks (D30) run for agents only, and check #2 also needs
-`mcp-parser` and `opa` in the outbound pipeline. The overlay of
-[Enable](#enable) has them.
-
-Then onboard each service again. A service whose Keycloak client exists gets no
-new registration event, so start its onboarding by hand
-(`POST /apply/service/{uuid}` on the AIAC Agent), or deploy it again. The system
-tests onboard their own services, so they need no extra step.
-
-Check the result:
-
-```bash
-# the live side
-kubectl get configmap aiac-agent-config -n aiac-system \
-  -o jsonpath='{.data.AIAC_ENFORCEMENT_SIDE}'
-
-# every AIAC CR (one per managed service)
-kubectl get authorizationpolicy -A -l app.kubernetes.io/managed-by=aiac-pdp-policy-writer
-
-# github-tool's inbound package: `allow := true` under agent side;
-# the per-tool check (tool_ok) under target side
-kubectl get authorizationpolicy github-tool -n team1 \
-  -o jsonpath='{.spec.policies[?(@.path=="inbound/request.rego")].content}'
-```
-
----
-
 ## Reference — how OPA behaves once wired
 
 ### Policy tiers and targeting
@@ -468,8 +374,7 @@ In an AIAC setup, the two request packages do not have this rule:
 
 So a pod that has no client CR is **denied** on both request legs. The two
 response packages keep the stock rule. A deleted CR is then lockdown, not
-off-boarding. That is why every managed service has a CR (a pass-through where
-AIAC has no rules), and why the AIAC quarantine and decommission delete the CR.
+off-boarding. That is why every managed service has a CR, and why the AIAC quarantine and decommission delete the CR.
 
 The operator chart has no value for this yet. The upstream value is
 `bundleService.defaultPolicy.requireClientPolicy` (opt-in, default `false`).
@@ -517,8 +422,8 @@ kubectl logs -n <ns> <pod> -c authbridge-proxy --tail=500 \
   to each client that it onboards. Do not add a `sub` mapper by hand.
 - `client_id` is the client the token was issued to. On a tool's inbound leg
   the JWT is the exchanged token, so `client_id` is the calling agent's client
-  (its SPIFFE ID). The tool inbound package of target side keys its
-  calling-agent gate on it.
+  (its SPIFFE ID). The tool inbound package keys its calling-agent gate
+  on it.
 - Credential headers (`authorization`, `cookie`, …) are **redacted** from
   `headers`. Use `identity` for auth decisions.
 
@@ -563,8 +468,8 @@ mints the downstream token, it records a delegation hop, and OPA builds
   (`/shared/client-id.txt`), the party doing the exchange, not the target.
 - `scopes` are the scopes the downstream token was minted with (the last hop).
 - `service_id` is the exchange target (the last hop's `audience`). It is the
-  outbound counterpart of the inbound token audience. The agent-side outbound
-  package keys on it; the target-side pass-through does not read it.
+  outbound counterpart of the inbound token audience. No AIAC package reads
+  it: the outbound package is a pass-through (D24).
 - `token-exchange` only runs for hosts that have a route in the namespace's
   `authproxy-routes` ConfigMap. Routes are read once at sidecar startup.
   Traffic to a host with no route is passed through with **no** `identity` and
@@ -576,8 +481,8 @@ mints the downstream token, it records a delegation hop, and OPA builds
 
 | What the caller sees | Meaning |
 |---|---|
-| HTTP `403`, body `{"error":"policy.forbidden","plugin":"opa",...}` | OPA denied a plain HTTP or A2A request, or an inbound OPA denied an MCP request. Under target side, a tool call that the tool's inbound OPA denies comes back this way: the tool's reverse proxy sends the `403`, and the agent's forward proxy relays it. |
-| HTTP `200`, JSON-RPC `error` frame with `error.code: -32000`, `error.data.plugin: "opa"` | An **outbound** OPA denied an **MCP** request (one with a `method` and an `id`). Under agent side, this is a tool call that the agent's outbound OPA denies. The forward proxy returns the deny as a JSON-RPC error, so the MCP client sees one failed call instead of a broken transport (`writeMCPRejection` in cortex `core/listener/httpx/render.go`). The request never reaches the destination. |
+| HTTP `403`, body `{"error":"policy.forbidden","plugin":"opa",...}` | OPA denied a plain HTTP or A2A request, or an inbound OPA denied an MCP request. A tool call that the tool's inbound OPA denies comes back this way: the tool's reverse proxy sends the `403`, and the agent's forward proxy relays it. |
+| HTTP `200`, JSON-RPC `error` frame with `error.code: -32000`, `error.data.plugin: "opa"` | An **outbound** OPA denied an **MCP** request (one with a `method` and an `id`). In an AIAC setup, the outbound package of a managed service is a pass-through (D24), so this is a call from a pod that has no client CR (D20). The forward proxy returns the deny as a JSON-RPC error, so the MCP client sees one failed call instead of a broken transport (`writeMCPRejection` in cortex `core/listener/httpx/render.go`). The request never reaches the destination. |
 | HTTP `200`, JSON-RPC `result` frame | Allowed. |
 | HTTP `503` (outbound) | `token-exchange` failed. OPA was never consulted. |
 

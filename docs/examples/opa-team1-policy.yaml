@@ -1,8 +1,8 @@
-# Example Rossoctl OPA AuthorizationPolicies (client-scoped, team1, target side)
+# Example Rossoctl OPA AuthorizationPolicies (client-scoped, team1)
 #
 # One client-scoped policy CR per managed service (D20), as the PDP Policy
-# Writer (OPA) server-side-applies them under target side (the default
-# enforcement side): github-agent and github-tool in the `team1` namespace.
+# Writer (OPA) server-side-applies them: github-agent and github-tool in the
+# `team1` namespace.
 # Each CR carries the two request packages (inbound/request +
 # outbound/request). The `content` blocks are the exact output of
 # `render_target_side` (src/aiac/pdp/service/policy/opa/rego.py) for the two
@@ -16,8 +16,7 @@
 # THE CALLEE DECIDES. Each service checks the calls to itself in its own
 # inbound package. The outbound package of every service is a pass-through
 # (`allow := true`, D24): github-tool's inbound decides each tool call, and
-# github-agent's outbound checks nothing (known limit: no egress check under
-# target side).
+# github-agent's outbound checks nothing (known limit: no egress check).
 #
 # ALWAYS DENY BY DEFAULT (D25). Every rules-based package emits
 # `default allow := false`: a request that no rule allows is denied. Each gate
@@ -49,12 +48,7 @@
 # `default` CR in rossoctl-system, applied by k8s/opa-kind-enable.sh) has no
 # `client_ok if not data.authbridge.client.<tier>.request` fallback: a pod that
 # has no client CR is denied on both request legs. So every managed service has
-# a CR (a pass-through where AIAC has no rules), and a deleted CR denies its pod.
-#
-# AGENT SIDE (AIAC_ENFORCEMENT_SIDE=agent-side) renders other CRs: the per-tool
-# check is in github-agent's outbound package (generate_outbound_rego, keyed by
-# input.identity.service_id), and github-tool gets a pass-through CR. See
-# docs/specs/components/pdp-policy-writer-opa.md ("What each side renders").
+# a CR, and a deleted CR denies its pod.
 #
 # CLIENT-SCOPE TARGETING: bundle-service looks a client-scope CR up by
 # metadata.name + metadata.namespace, matched against the ServiceAccount segment

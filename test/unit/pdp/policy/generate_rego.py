@@ -1,8 +1,8 @@
-"""Generate the target-side Rego of the github-agent scenario by driving the live PDP Policy Writer (OPA).
+"""Generate the Rego of the github-agent scenario by driving the live PDP Policy Writer (OPA).
 
 Standalone (NOT pytest, NOT CI). Launches the writer as a uvicorn subprocess that also dumps its
 Rego to a known local dir (``POLICY_WRITER_DUMP_REGO=1``, ``REGO_OUTPUT_DIR``), applies a
-``TargetSidePolicyModel`` through the PDP policy library, shuts the service down, and prints the
+``PolicyModel`` through the PDP policy library, shuts the service down, and prints the
 dumped files. Inspect the .rego files by hand.
 
 The model holds the two SPMs of the scenario, one per managed service (D20): the agent SPM (its
@@ -35,9 +35,9 @@ sys.path.insert(0, str(SRC))  # so ``import aiac.*`` resolves
 
 from aiac.idp.configuration.models import Role, RoleKind, Scope, ServiceType  # noqa: E402
 from aiac.policy.model.models import (  # noqa: E402
+    PolicyModel,
     PolicyRule,
     ServicePolicyModel,
-    TargetSidePolicyModel,
 )
 from test.system import scenario as scn  # noqa: E402
 from test.system.launcher import (  # noqa: E402
@@ -79,8 +79,8 @@ def _scopes() -> dict[str, Scope]:
     return scopes
 
 
-def build_model() -> TargetSidePolicyModel:
-    """The target-side policy model of the scenario: the agent SPM and the tool SPM."""
+def build_model() -> PolicyModel:
+    """The policy model of the scenario: the agent SPM and the tool SPM."""
     role, scope = _roles(), _scopes()
 
     def rules(pairs: list[tuple[str, str]]) -> list[PolicyRule]:
@@ -102,7 +102,7 @@ def build_model() -> TargetSidePolicyModel:
         # tool edges and the agent -> tool edges both land on the tool SPM.
         inbound_allow_rules=rules(scn.OUTBOUND_SUBJECT_PAIRS) + rules(scn.OUTBOUND_PAIRS),
     )
-    return TargetSidePolicyModel(services=[agent, tool])
+    return PolicyModel(services=[agent, tool])
 
 
 def print_rego_dir(output_dir: Path) -> None:

@@ -88,7 +88,7 @@ class TestGetRoles:
 
     def test_aiac_managed_role_gets_member_usernames_as_actor_ids(self):
         # For a user (realm) role, actorIds = the member usernames — resolved via the same
-        # get_realm_role_members call that GET /subjects?role_id= uses (SPM/APM alignment).
+        # get_realm_role_members call that GET /subjects?role_id= uses (SPM alignment).
         admin = MagicMock()
         admin.get_realm_roles.return_value = [
             {"id": "r1", "name": "invoicing", "attributes": {"aiac.managed": ["true"]}},
@@ -1923,7 +1923,7 @@ class TestGetSubjectsByRole:
         assert body[0]["realmMappings"] == [{"id": "rid", "name": "viewer"}]
 
     def test_actor_ids_align_with_subjects_by_role(self):
-        # SPM/APM alignment (1.12 / 2.14): the member usernames GET /subjects?role_id= returns
+        # SPM alignment (1.12 / 2.14): the member usernames GET /subjects?role_id= returns
         # for a user (realm) role are exactly the Role.actorIds GET /roles populates for that
         # kind=User role — both resolve via admin.get_realm_role_members.
         admin = MagicMock()

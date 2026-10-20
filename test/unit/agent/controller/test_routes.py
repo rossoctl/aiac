@@ -29,7 +29,7 @@ from aiac.agent.uc.onboarding.orchestrator import ServiceNotVisibleError
 from aiac.agent.uc.onboarding.preconditions import EnforcementPreconditionError
 from aiac.idp.configuration.api import IdPHTTPError
 from aiac.idp.configuration.models import Role, Scope, ServiceType
-from aiac.policy.model.models import PolicyRule, RuleEffect, ServicePolicyModel, TargetSidePolicyModel
+from aiac.policy.model.models import PolicyModel, PolicyRule, RuleEffect, ServicePolicyModel
 
 client = TestClient(app)
 
@@ -199,11 +199,11 @@ def test_apply_offboard_carries_slash_bearing_spiffe_client_id():
 
 
 def test_get_policy_model_of_a_managed_service_returns_200_with_its_policy_model():
-    # D18: a read-only view of the policy model of the current side with only the entry of that
-    # service. The id is the clientId; the {service_id:path} converter keeps a slash-bearing SPIFFE
-    # URI intact. The body is the policy model as JSON, in the shape of the writer's POST /policy body.
+    # D18: a read-only view of the policy model with only the entry of that service. The id is the
+    # clientId; the {service_id:path} converter keeps a slash-bearing SPIFFE URI intact. The body
+    # is the policy model as JSON, in the shape of the writer's POST /policy body.
     spiffe_id = "spiffe://cluster.local/ns/team1/sa/github-tool"
-    model = TargetSidePolicyModel(
+    model = PolicyModel(
         services=[
             ServicePolicyModel(
                 service_id=spiffe_id,
@@ -223,7 +223,7 @@ def test_get_policy_model_of_a_managed_service_returns_200_with_its_policy_model
     assert resp.status_code == 200
     read.assert_called_once_with(spiffe_id)
     assert resp.json() == model.model_dump(mode="json")
-    assert resp.json()["enforcement_side"] == "target-side"
+    assert list(resp.json()) == ["services"]  # the policy model has no tag
     pce.assert_not_called()
 
 

@@ -10,14 +10,12 @@ clientId, which :func:`onboard_and_apply` gives to the PCE as ``focus_service``:
     0. The precondition checks (D30, see ``preconditions``) — run FIRST, after the one IdP read
        that resolves the clientId (a ``404`` on that read is the event-before-commit race: it is read
        again for a bounded time, see ``CLIENT_WAIT``): the pod has the AuthBridge sidecar (#1),
-       the namespace pipeline has ``opa`` (and ``mcp-parser`` for a tool) inbound, and under agent
-       side also ``mcp-parser`` and ``opa`` outbound (#2), no app container has an ``httpGet`` probe
-       (#6). The scope depends on the enforcement side: every service under target side, agents only
-       under agent side (a tool then gets a pass-through CR, which needs no check; its pod type is
-       still read). A failed check raises ``EnforcementPreconditionError``.
-       Then, for an enabled TOOL only, the PCE ``bootstrap`` writes the tool's first CR (under
-       target side its rules-based CR, under agent side a pass-through CR), so that discovery
-       (``tools/list`` through the tool's own inbound) passes D20 (checkpoint B1).
+       the namespace pipeline has ``jwt-validation`` and ``opa`` (and ``mcp-parser`` for a tool)
+       inbound (#2), no app container has an ``httpGet`` probe (#6). Every check runs for every
+       service. A failed check raises ``EnforcementPreconditionError``.
+       Then, for an enabled TOOL only, the PCE ``bootstrap`` writes the tool's first CR (its
+       rules-based CR), so that discovery (``tools/list`` through the tool's own inbound) passes
+       D20 (checkpoint B1).
     1. Service Provision  — classifies the service and writes its roles/scopes into the IdP,
        producing the discovered ``service_type`` and the **created-manifest** (exactly the
        roles/scopes it created on this run — see ``provision_service``).
@@ -294,8 +292,8 @@ def onboard_and_apply(service_id: ServiceUuid, *, wait_for_client: bool = True) 
 
 def _drop_bootstrap(client_id: ClientId) -> None:
     """After a failure that runs no quarantine: the PCE ``drop_bootstrap`` deletes the bootstrap CR
-    of a service that is not managed (no SPM), so an agent-side pass-through CR does not stay open.
-    A failure here is logged, and the caller re-raises the original error: the next delivery tries
+    of a service that is not managed (no SPM), so the CR does not stay for it. A failure here is
+    logged, and the caller re-raises the original error: the next delivery tries
     again."""
     try:
         drop_bootstrap(client_id)
@@ -330,14 +328,12 @@ def _onboard(service_id: ServiceUuid, wait_for_client: bool) -> _Onboarded:
     the client is still not visible after the wait, at once for any other error.
 
     Then the precondition checks (D30, :func:`~aiac.agent.uc.onboarding.preconditions.check_preconditions`)
-    run, before Provision and the PRB. They read the enforcement side: under target side they check
-    every service, under agent side agents only (a tool's pass-through CR needs no check, but the
-    checks still return its pod type). A failed check raises ``EnforcementPreconditionError``,
+    run, before Provision and the PRB. They check every service with #1, #2 and #6, and return the
+    pod type. A failed check raises ``EnforcementPreconditionError``,
     which names each failed check; nothing changed yet, so there is no rollback, no client disable
     and no quarantine (checkpoint O2). If the service is a tool (the type of its pod label) and its
     client is enabled, the PCE ``bootstrap(client_id, ServiceType.TOOL)`` writes the tool's first CR
-    before Provision (of the current side: rules-based under target side, a pass-through under
-    agent side), so that discovery passes (checkpoint B1). A disabled tool gets no bootstrap:
+    before Provision (its rules-based CR), so that discovery passes (checkpoint B1). A disabled tool gets no bootstrap:
     it fails at the discovery-token mint anyway (C5). A bootstrap failure propagates (no rollback:
     Provision has not run). Any other failure of Provision or the build (no quarantine) drops this
     run's bootstrap CR (:func:`_drop_bootstrap`) and propagates.
@@ -375,8 +371,8 @@ def _onboard(service_id: ServiceUuid, wait_for_client: bool) -> _Onboarded:
 
     # D30: the precondition checks run FIRST, before anything changes. A failed check raises
     # EnforcementPreconditionError, which is NOT a rollback error (checkpoint O2): nothing was
-    # provisioned, so there is no rollback, no client disable and no quarantine. Under agent
-    # side a tool gets no check, but its pod type is still returned (for the bootstrap below).
+    # provisioned, so there is no rollback, no client disable and no quarantine. The pod type is
+    # returned (for the bootstrap below).
     pod_type = check_preconditions(service)  # the type from the pod label (no catalog type yet)
     # Checkpoint B1: the first CR of a tool, before Provision, so that discovery (tools/list
     # through the tool's own inbound) passes D20. Only for an enabled client: a disabled
@@ -387,9 +383,9 @@ def _onboard(service_id: ServiceUuid, wait_for_client: bool) -> _Onboarded:
         bootstrap(client_id, ServiceType.TOOL)
 
     # A failure that runs no quarantine (a 502 from Provision, any error of the build that is not a
-    # rollback error) must not leave the bootstrap CR: under agent side it is a pass-through CR,
-    # which allows every request, for a service that is not managed. The PCE drops it if the store
-    # has no SPM. A rollback error runs the quarantine, which deletes the CR, so it drops nothing.
+    # rollback error) must not leave the bootstrap CR of a service that is not managed (before the
+    # bootstrap, D20 denied it). The PCE drops it if the store has no SPM. A rollback error runs the
+    # quarantine, which deletes the CR, so it drops nothing.
     # Set before the ``try``: a rollback error from Provision must not become an UnboundLocalError
     # in the handler, which would hide the error and skip the quarantine.
     created_roles: list[Role] = []

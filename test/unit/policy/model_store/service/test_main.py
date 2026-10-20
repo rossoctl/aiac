@@ -1,9 +1,8 @@
 """Unit tests for aiac/policy/model_store/service/main.py FastAPI application.
 
 SPM-centric surface: the store persists ``ServicePolicyModel`` rows keyed by
-``service_id``. ``AgentPolicyModel`` is derived and never persisted, so there are no
-per-agent or whole-collection endpoints. Seam: an in-memory SQLite connection is injected
-on startup instead of opening ``SERVICEPOLICY_DB_PATH``.
+``service_id``. There is no whole-collection endpoint. Seam: an in-memory SQLite connection is
+injected on startup instead of opening ``SERVICEPOLICY_DB_PATH``.
 """
 
 import sqlite3
@@ -325,13 +324,10 @@ class TestHealth:
 
 
 # ---------------------------------------------------------------------------
-# Removed surface: no per-agent / whole-collection endpoints
+# Removed surface: no whole-collection endpoint
 # ---------------------------------------------------------------------------
 
 
 class TestRemovedEndpoints:
     def test_whole_collection_get_policy_absent(self, client):
         assert client.get("/policy").status_code == 404
-
-    def test_per_agent_get_absent(self, client):
-        assert client.get("/policy/agents/agent-1").status_code == 404

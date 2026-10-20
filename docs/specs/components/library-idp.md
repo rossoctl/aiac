@@ -38,7 +38,7 @@ All models use `model_config = ConfigDict(extra='ignore')` to silently discard u
 
 Model definition order: `Subject` → `Role` → `Service` → `Scope`. Because `Subject` references `Role`, `Role` references itself (`childRoles`), and `Service` references `Role` and `Scope` as forward references, the module calls `Subject.model_rebuild()`, `Role.model_rebuild()`, and `Service.model_rebuild()` after `Scope` is defined.
 
-`Service`, `Role`, `Scope`, and `Subject` use pydantic's default equality (field-based) and are **not hashable** — they define no custom `__hash__`/`__eq__` and are never used as dict keys or set members. The relationship maps in `AgentPolicyModel` (`source_roles`, `subject_roles`, and the split target maps `target_allow_scopes` / `target_deny_scopes`) are keyed by a plain string (a username or a clientId) instead, so no identity override is needed.
+`Service`, `Role`, `Scope`, and `Subject` use pydantic's default equality (field-based) and are **not hashable** — they define no custom `__hash__`/`__eq__` and are never used as dict keys or set members. Code that keeps them in a map keys the map by a plain string (for example a role name or a serviceId), so no identity override is needed.
 
 #### `Subject`
 
@@ -78,7 +78,7 @@ Represents a role. Per Assumption 3 (policy-model spec), **user** roles are Keyc
 
 Roles also expose an `aiac_managed` property (`bool`): `True` when `attributes` carries the AIAC provisioning marker `aiac.managed` (realm-role attribute values are lists, so the marker appears as `["true"]`). See the naming convention in the idp-configuration-service spec.
 
-> **SPM/APM (service-side).** `Role.actorIds` is populated per kind at the IdP boundary: for an **agent** role, the owning client's `serviceId`(s) (resolved from a client role's `containerId`, or the service itself for an `aiac.managed` realm role on its service account); for a **user** (realm) role, the role's member usernames (aligned with `get_subjects_by_role`). The IdP service also fails loud on cross-kind roles (Assumption 1). A role or a scope that several services share is valid ([D32](../PRD.md#key-architectural-decisions)): `GET /services/{id}/roles` gives each service's copy of a shared realm role `actorIds = [that service's serviceId]`, and the consumers merge the holders of the copies. On a stored policy edge, `actorIds` is only a snapshot; the PCE renders the current holders. See "Agent roles are client roles, field population, and assumption enforcement" and "Shared roles and scopes (D32)" in idp-configuration-service.md.
+> **SPM (populated by the IdP service).** `Role.actorIds` is populated per kind at the IdP boundary: for an **agent** role, the owning client's `serviceId`(s) (resolved from a client role's `containerId`, or the service itself for an `aiac.managed` realm role on its service account); for a **user** (realm) role, the role's member usernames (aligned with `get_subjects_by_role`). The IdP service also fails loud on cross-kind roles (Assumption 1). A role or a scope that several services share is valid ([D32](../PRD.md#key-architectural-decisions)): `GET /services/{id}/roles` gives each service's copy of a shared realm role `actorIds = [that service's serviceId]`, and the consumers merge the holders of the copies. On a stored policy edge, `actorIds` is only a snapshot; the PCE renders the current holders. See "Agent roles are client roles, field population, and assumption enforcement" and "Shared roles and scopes (D32)" in idp-configuration-service.md.
 
 #### `Service`
 

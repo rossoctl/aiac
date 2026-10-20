@@ -12,14 +12,13 @@ event.
 
 The harness is the one of ``test_shared_roles.py`` (the real resolver, PRB graphs, PCE and writer
 between the fakes). The decisions let the holders of the shared role call each other
-(``PEER_DECISIONS``), so the inbound of each github-agent names the holders of the role under both
-sides, and the tools' inbound does under target side.
+(``PEER_DECISIONS``), so the inbound of each github-agent and of each tool names the holders of the
+role.
 """
 
 import pytest
 
 from aiac.policy import computation
-from aiac.policy.model.models import EnforcementSide
 from test.integration.policy.computation import test_shared_roles
 from test.integration.policy.computation.fakes import SERVICE_ACCOUNT_PREFIX
 from test.integration.policy.computation.test_shared_roles import (
@@ -36,7 +35,7 @@ from test.integration.policy.computation.test_shared_roles import (
 
 pytestmark = pytest.mark.integration
 
-# The harness of test_shared_roles.py: the real code between the fakes, under target side.
+# The harness of test_shared_roles.py: the real code between the fakes.
 stack = test_shared_roles.stack
 
 
@@ -57,19 +56,13 @@ class TestALaterHolderIsDecommissioned:
     review-agent is onboarded, an admin assigns the role to it, and the role-members event puts it in
     the CRs of the role. Then its client is deleted and the operator offboards it."""
 
-    @pytest.mark.parametrize("side", list(EnforcementSide), ids=lambda side: side.value)
-    def test_every_cr_of_the_role_loses_the_decommissioned_holder_at_once(
-        self, stack: Stack, side: EnforcementSide, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setenv("AIAC_ENFORCEMENT_SIDE", side.value)
+    def test_every_cr_of_the_role_loses_the_decommissioned_holder_at_once(self, stack: Stack) -> None:
         stack.llm.decisions = PEER_DECISIONS
         for workload in (AGENT1, AGENT2, *TOOLS, REVIEWER):
             stack.bring_up(workload)
         stack.realm.grant(REVIEWER.client_id, AGENT_ROLE)  # the admin's role mapping
         stack.deliver_role_events()
-        # The inbound gates of an agent are the same on both sides (D18b); a tool has them only
-        # under target side (under agent side its CR is a pass-through, D24).
-        callees = (AGENT1, AGENT2, *TOOLS) if side == EnforcementSide.TARGET_SIDE else (AGENT1, AGENT2)
+        callees = (AGENT1, AGENT2, *TOOLS)
         everyone = {AGENT1.client_id, AGENT2.client_id, REVIEWER.client_id}
         for callee in callees:
             assert _holders(stack, callee) == everyone, f"{callee.client_id}: after the admin's assignment"
@@ -94,17 +87,15 @@ class TestARetriedDecommission:
     """The same assignment, then the client delete. The first decommission fails at the redeploy (the
     Kubernetes API is down for one CR patch), and the operator offboards review-agent again."""
 
-    @pytest.mark.parametrize("side", list(EnforcementSide), ids=lambda side: side.value)
     def test_the_retry_takes_the_holder_out_of_every_cr_of_the_role(
-        self, stack: Stack, side: EnforcementSide, monkeypatch: pytest.MonkeyPatch
+        self, stack: Stack, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setenv("AIAC_ENFORCEMENT_SIDE", side.value)
         stack.llm.decisions = PEER_DECISIONS
         for workload in (AGENT1, AGENT2, *TOOLS, REVIEWER):
             stack.bring_up(workload)
         stack.realm.grant(REVIEWER.client_id, AGENT_ROLE)
         stack.deliver_role_events()
-        callees = (AGENT1, AGENT2, *TOOLS) if side == EnforcementSide.TARGET_SIDE else (AGENT1, AGENT2)
+        callees = (AGENT1, AGENT2, *TOOLS)
         _delete_client(stack, REVIEWER)
 
         patch, failed = stack.cluster.patch_namespaced_custom_object, []

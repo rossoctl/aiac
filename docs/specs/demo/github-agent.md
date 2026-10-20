@@ -33,13 +33,10 @@ This agent generalises it to the scenario's **two capability areas**.
 The agent does **not** know or enforce these scopes itself — AIAC/OPA + AuthBridge do. The agent simply
 exposes the two capability areas; the AuthBridge sidecar performs inbound JWT validation and outbound
 RFC-8693 token exchange, and the `github-tool` MitM swaps the exchanged token for a GitHub PAT by scope.
-When the OPA pipeline is wired (`k8s/opa-kind-enable.sh`), OPA also runs on both legs. Under target
-side (the default), the outbound OPA of this agent is a pass-through (D24), and the inbound OPA of
-the called tool decides each `tools/call` (D26). A call to a host that has no AIAC CR or no
-AuthBridge sidecar is not checked (see
+When the OPA pipeline is wired (`k8s/opa-kind-enable.sh`), OPA also runs on both legs. The outbound
+OPA of this agent is a pass-through (D24), and the inbound OPA of the called tool decides each
+`tools/call` (D26). A call to a host that has no AIAC CR or no AuthBridge sidecar is not checked (see
 [`pdp-policy-writer-opa.md` → Known limits](../components/pdp-policy-writer-opa.md#known-limits)).
-Under agent side, the outbound OPA of this agent allows only a granted MCP `tools/call` and the MCP
-session messages.
 
 ### Related artefacts
 - Scenario spec: [`../../testing/policy-pipeline.md`](../../testing/policy-pipeline.md)
@@ -255,9 +252,8 @@ Service name; exchanged audience (`github-tool`) == tool `AUDIENCE`.
    successful UC-1 onboarding writes its CR. With the SPI listener, the client registration starts
    that onboarding (`aiac.apply.service.{uuid}` after the Keycloak commit, D33). Then the agent
    inbound allows the A2A message only for a user who holds a role that grants an agent scope
-   (D26a). Under target side the outbound is a pass-through, so the agent's LLM and A2A calls pass.
-   Under agent side the outbound OPA returns `403` on them — see *Known limit (agent side)* in
-   [`../components/pdp-policy-writer-opa.md` → Agent outbound package](../components/pdp-policy-writer-opa.md#agent-outbound-package-agent-side-authbridgeclientoutboundrequest).
+   (D26a). The outbound is a pass-through, so the agent's LLM and A2A calls pass (see
+   [`../components/pdp-policy-writer-opa.md` → Pass-through package](../components/pdp-policy-writer-opa.md#pass-through-package-d24)).
 
 ---
 
