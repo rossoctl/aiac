@@ -99,8 +99,8 @@ class TestAnalyzeToolFound:
 
 class TestAnalyzeToolEmpty:
     def test_empty_manifest_is_not_ready_and_exhausts_the_wait_into_a_502(self, monkeypatch):
-        # A tool contributing zero scopes produces an EMPTY outbound gate downstream — the silent
-        # half-policy the readiness poll exists to prevent. So an empty manifest is re-polled and,
+        # A tool contributing zero scopes produces a tool inbound with no tool scopes downstream —
+        # the silent half-policy the readiness poll exists to prevent. So an empty manifest is re-polled and,
         # once the budget is spent, fails loudly rather than provisioning nothing.
         monkeypatch.setenv("ONBOARD_MCP_WAIT_ATTEMPTS", "3")
         with pytest.raises(HTTPException) as ei:

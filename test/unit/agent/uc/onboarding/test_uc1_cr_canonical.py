@@ -15,7 +15,7 @@ HERE = Path(__file__).resolve().parent  # test/unit/agent/uc/onboarding/
 REPO_ROOT = HERE.parents[4]  # -> aiac/
 sys.path.insert(0, str(REPO_ROOT))  # so ``import test.system.*`` resolves
 
-from aiac.pdp.service.policy.opa.rego import _render_list, _render_map, _render_nested_map  # noqa: E402
+from aiac.pdp.service.policy.opa.rego import _render_list, _render_map  # noqa: E402
 from test.system import uc1_onboard as uc1  # noqa: E402
 
 _RULES = "default allow := false\nallow if { some scope in agent_scopes; scope == input.scope }\n"
@@ -35,12 +35,6 @@ def test_list_order_is_not_a_change() -> None:
 def test_map_key_and_value_order_is_not_a_change() -> None:
     a = _package(_render_map("subject_roles", {"dev-user": ["developer", "tester"], "test-user": ["tester"]}))
     b = _package(_render_map("subject_roles", {"test-user": ["tester"], "dev-user": ["tester", "developer"]}))
-    assert uc1.rego_canonical(a) == uc1.rego_canonical(b)
-
-
-def test_nested_map_order_is_not_a_change() -> None:
-    a = _package(_render_nested_map("grants", {"u1": {"t1": ["a", "b"], "t2": ["c"]}, "u2": {"t1": ["d"]}}))
-    b = _package(_render_nested_map("grants", {"u2": {"t1": ["d"]}, "u1": {"t2": ["c"], "t1": ["b", "a"]}}))
     assert uc1.rego_canonical(a) == uc1.rego_canonical(b)
 
 
@@ -70,7 +64,6 @@ def test_a_comma_in_a_string_value_is_a_change() -> None:
     for render in (
         lambda v: _render_list("agent_scopes", [v]),
         lambda v: _render_map("subject_roles", {"dev-user": [v]}),
-        lambda v: _render_nested_map("grants", {"u1": {"t1": [v]}}),
     ):
         assert uc1.rego_canonical(_package(render("p,]"))) != uc1.rego_canonical(_package(render("p]")))
 

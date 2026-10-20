@@ -140,7 +140,7 @@ The store is repopulated by **re-onboarding every managed service** through the
 stateless Controller. Each call runs the onboarding use-case (`onboard_and_apply`),
 which calls the PCE `compute_and_apply(rules, override=False, focus_service=client_id)`. The PCE
 writes fresh SPMs (now with `inbound_allow_rules` populated) and rebuilds all **derived** state — the
-per-agent `AgentPolicyModel`s and the generated OPA Rego — automatically. No
+generated OPA Rego of each managed service — automatically. No
 separate PDP step is needed.
 
 Controller onboarding surface (`src/aiac/agent/controller/routes.py`):
@@ -179,7 +179,7 @@ curl -s http://127.0.0.1:7074/policy/services/<a-re-onboarded-service-id> \
 #   -> inbound_allow_rules should be populated for a service that had grants;
 #      the OLD "inbound_rules" key must NOT appear.
 
-# 3. Derived Rego regenerated for agents (confirm via your PDP/OPA surface).
+# 3. Derived Rego regenerated for each managed service (confirm via your PDP/OPA surface).
 ```
 
 **Success criteria:** the store returns SPMs whose grants live under

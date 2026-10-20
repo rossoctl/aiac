@@ -48,8 +48,9 @@ AGENTS: dict[str, dict] = {
 
 # --- Tools --------------------------------------------------------------------------------------
 
+# Each tool id is "<namespace>/<name>", as each agent id: the writer derives the CR of the tool from it.
 TOOLS: dict[str, dict] = {
-    "inventory-tool": {
+    "team1/inventory-tool": {
         "description": (
             "Capability provider Tool for retail inventory management. It performs stock-level "
             "checks, count adjustments, and reorder placements."

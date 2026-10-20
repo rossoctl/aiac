@@ -71,9 +71,9 @@ AGENT_SCOPES: dict[str, str] = {
 AGENT_ROLES: dict[str, str] = dict(AGENT_SCOPES)
 
 # The provisioned Keycloak client-scope NAMES stay owner-prefixed (that is what Keycloak holds).
-# The reworked writer de-prefixes them into the outbound Rego / CR — so the BARE tail
+# The reworked writer de-prefixes them into the tool's inbound Rego / CR — so the BARE tail
 # (``source-read`` …) is the value that arrives in ``input.mcp.params.name`` and the value the
-# outbound maps below key on. Keep this distinction in mind: prefixed here (Keycloak), bare in the
+# ``OUTBOUND_*`` pair-lists below key on. Keep this distinction in mind: prefixed here (Keycloak), bare in the
 # oracle pair-lists and INTENTS (Rego / the invoked MCP tool name).
 TOOL_SCOPES: dict[str, str] = {
     "github-tool.source-read": "Read source repository contents: file listings and file bodies. Read-only.",
@@ -90,8 +90,8 @@ INBOUND_PAIRS: list[tuple[str, str]] = [
     ("tester", "github-agent.issue_operations"),
 ]
 
-# Tool scopes here are BARE (de-prefixed) — they must match the outbound Rego's de-prefixed map
-# values and the bare ``input.mcp.params.name`` the drivers send. (Agent-side operator roles keep
+# Tool scopes here are BARE (de-prefixed) — they must match the tool inbound Rego's de-prefixed map
+# values and the bare ``input.mcp.params.name`` the drivers send. (The agent's operator roles keep
 # their owner prefix; only the tool-scope value de-prefixes.)
 OUTBOUND_SUBJECT_PAIRS: list[tuple[str, str]] = [
     ("developer", "source-read"),

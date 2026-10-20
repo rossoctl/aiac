@@ -772,7 +772,7 @@ def list_roles(realm: str = Query(...), admin: KeycloakAdmin = Depends(get_admin
             # Realm roles are user roles (clientRole == false) -> kind=User (Assumption 3).
             role["kind"] = "User"
             # For AIAC-managed user roles, actorIds = the member usernames — the same values
-            # GET /subjects?role_id= returns for this role (SPM/APM alignment, 1.12). Built-ins
+            # GET /subjects?role_id= returns for this role (SPM alignment, 1.12). Built-ins
             # are left unenriched (no member scan).
             if _is_aiac_managed(role.get("attributes")):
                 members = admin.get_realm_role_members(role["name"])

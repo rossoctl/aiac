@@ -21,7 +21,7 @@ POLICY_FILE = "policy.eval_baseline_perturbed.md"
 # --- Agents -------------------------------------------------------------------------------------
 
 AGENTS: dict[str, dict] = {
-    "repo-agent": {
+    "team1/repo-agent": {
         "description": (
             "An autonomous agent that acts for a user against a source-code repository, able to "
             "look at and change what's stored in it."
@@ -40,7 +40,7 @@ AGENTS: dict[str, dict] = {
             ),
         },
     },
-    "tracker-agent": {
+    "team1/tracker-agent": {
         "description": (
             "An autonomous agent that acts for a user against an issue tracker, handling reading, "
             "filing, and updating issues along with their comment threads."
@@ -62,8 +62,9 @@ AGENTS: dict[str, dict] = {
 
 # --- Tools --------------------------------------------------------------------------------------
 
+# Each tool id is "<namespace>/<name>", as each agent id: the writer derives the CR of the tool from it.
 TOOLS: dict[str, dict] = {
-    "repo-tool": {
+    "team1/repo-tool": {
         "description": (
             "A capability provider for a source repository, carrying out read and write "
             "operations against what's stored in it."
@@ -73,7 +74,7 @@ TOOLS: dict[str, dict] = {
             "tool-scope-repo-write": "Add, edit, or remove repository contents, including committing file changes.",
         },
     },
-    "tracker-tool": {
+    "team1/tracker-tool": {
         "description": (
             "A capability provider for an issue tracker, carrying out read and write operations "
             "on issues and their comment threads."

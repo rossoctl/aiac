@@ -1,8 +1,11 @@
-package probe.outbound_eval
+package probe.inbound_eval
 
 import rego.v1
 
-gen := data.authbridge.client.outbound.request
+# The inbound package of the callee: the tool that owns the scope. The callee's own CR is the key,
+# so each scope map is keyed by role only. The eval does not use this probe for an agent inbound:
+# that gate is agent-level (D26a), so the eval evaluates its allow rule.
+gen := data.authbridge.client.inbound.request
 
 tokens(s) := {lower(t) | some t in regex.split(`[._-]+`, s)}
 
@@ -12,29 +15,34 @@ soft_match(tools) if {
 	tokens(tool) == tokens(input.function_name)
 }
 
-# The two subject maps are keyed by role and then by the full target service id (LIM-02):
-# a role's grant or deny decides only on the target that it is keyed by. Each map is read with
-# object.get, as the real gate does: OPA 1.21 rejects a direct index into an empty map ({}).
+# The user gate reads input.subject, and the calling-agent gate reads input.client_id. Each map is
+# read with object.get, as the real gate does: OPA 1.21 rejects a direct index into an empty map ({}).
 subject_ok if {
 	some role in object.get(gen.subject_roles, input.subject, [])
-	soft_match(object.get(gen.subject_role_allow_scopes, [role, input.target], []))
+	soft_match(object.get(gen.subject_role_allow_scopes, role, []))
 }
 
 subject_denied if {
 	some role in object.get(gen.subject_roles, input.subject, [])
-	soft_match(object.get(gen.subject_role_deny_scopes, [role, input.target], []))
+	soft_match(object.get(gen.subject_role_deny_scopes, role, []))
 }
 
-target_ok if soft_match(object.get(gen.target_allow_scopes, input.target, []))
+source_ok if {
+	some role in object.get(gen.source_roles, input.client_id, [])
+	soft_match(object.get(gen.source_role_allow_scopes, role, []))
+}
 
-target_denied if soft_match(object.get(gen.target_deny_scopes, input.target, []))
+source_denied if {
+	some role in object.get(gen.source_roles, input.client_id, [])
+	soft_match(object.get(gen.source_role_deny_scopes, role, []))
+}
 
 default allow := false
 
 # As the real gate: the two allow gates match, and no deny gate matches the same name.
 allow if {
 	subject_ok
-	target_ok
+	source_ok
 	not subject_denied
-	not target_denied
+	not source_denied
 }

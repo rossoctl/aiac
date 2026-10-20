@@ -5,19 +5,13 @@ from aiac.idp.configuration.models import (
     Role,
     RoleKind,
     Scope,
-    Service,
     ServiceType,
-    Subject,
 )
 from aiac.policy.model.models import (
-    AgentPolicyModel,
-    AgentSidePolicyModel,
-    EnforcementSide,
+    PolicyModel,
     PolicyRule,
     RuleEffect,
     ServicePolicyModel,
-    TargetSidePolicyModel,
-    parse_policy_model,
 )
 
 
@@ -27,14 +21,6 @@ def _role(id: str = "role-1", name: str = "admin") -> Role:
 
 def _scope(id: str = "scope-1", name: str = "read") -> Scope:
     return Scope(id=id, name=name)
-
-
-def _service(id: str = "svc-1", service_id: str = "my-service") -> Service:
-    return Service(id=id, serviceId=service_id, enabled=True)
-
-
-def _subject(id: str = "sub-1", username: str = "alice") -> Subject:
-    return Subject(id=id, username=username, enabled=True)
 
 
 # --- RoleKind enum + Role.kind / Role.actorIds (SPM redesign) ---
@@ -235,177 +221,7 @@ def test_same_role_scope_coexists_as_allow_and_deny():
     assert rules == [allow, deny]
 
 
-# --- AgentPolicyModel relationship maps keyed by string id ---
-
-
-def test_agent_policy_model_source_roles_keyed_by_service_id():
-    svc = _service()
-    role = _role()
-    model = AgentPolicyModel(
-        agent_id="agent-1",
-        agent_roles=[role],
-        agent_scopes=[],
-        subject_roles={},
-        source_roles={svc.id: [role]},
-    )
-    dumped = model.model_dump(mode="json")
-    assert list(dumped["source_roles"].keys()) == [svc.id]
-
-
-def test_agent_policy_model_subject_roles_keyed_by_subject_id():
-    subject = _subject()
-    role = _role()
-    model = AgentPolicyModel(
-        agent_id="agent-1",
-        agent_roles=[],
-        agent_scopes=[],
-        subject_roles={subject.id: [role]},
-        source_roles={},
-    )
-    dumped = model.model_dump(mode="json")
-    assert list(dumped["subject_roles"].keys()) == [subject.id]
-
-
-def test_agent_policy_model_target_allow_scopes_keyed_by_target_id():
-    scope = _scope()
-    svc = _service()
-    model = AgentPolicyModel(
-        agent_id="agent-1",
-        agent_roles=[],
-        agent_scopes=[scope],
-        subject_roles={},
-        source_roles={},
-        target_allow_scopes={svc.id: [scope]},
-    )
-    dumped = model.model_dump(mode="json")
-    assert list(dumped["target_allow_scopes"].keys()) == [svc.id]
-
-
-def test_agent_policy_model_target_deny_scopes_keyed_by_target_id():
-    scope = _scope()
-    svc = _service()
-    model = AgentPolicyModel(
-        agent_id="agent-1",
-        agent_roles=[],
-        agent_scopes=[scope],
-        subject_roles={},
-        source_roles={},
-        target_deny_scopes={svc.id: [scope]},
-    )
-    dumped = model.model_dump(mode="json")
-    assert list(dumped["target_deny_scopes"].keys()) == [svc.id]
-
-
-# --- 8 entity×effect rule lists + split target maps ---
-
-_EIGHT_RULE_LISTS = [
-    "inbound_subject_allow_rules",
-    "inbound_subject_deny_rules",
-    "inbound_source_allow_rules",
-    "inbound_source_deny_rules",
-    "outbound_target_allow_rules",
-    "outbound_target_deny_rules",
-    "outbound_subject_allow_rules",
-    "outbound_subject_deny_rules",
-]
-
-
-def test_agent_policy_model_eight_lists_and_target_maps_default_empty():
-    model = AgentPolicyModel(
-        agent_id="agent-1",
-        agent_roles=[],
-        agent_scopes=[],
-        subject_roles={},
-        source_roles={},
-    )
-    for field in _EIGHT_RULE_LISTS:
-        assert getattr(model, field) == [], f"{field} should default to []"
-    assert model.target_allow_scopes == {}
-    assert model.target_deny_scopes == {}
-
-
-def test_agent_policy_model_has_no_legacy_rule_fields():
-    for legacy in ("inbound_rules", "outbound_rules", "outbound_subject_rules", "target_scopes"):
-        assert legacy not in AgentPolicyModel.model_fields, f"{legacy} should be removed"
-
-
-# --- model_validate round-trip (JSON mode) ---
-
-
-def test_agent_policy_model_round_trip():
-    subject = _subject()
-    role = _role()
-    scope = _scope()
-    svc = _service()
-    allow = PolicyRule(role=role, scope=scope, effect=RuleEffect.ALLOW)
-    deny = PolicyRule(role=role, scope=scope, effect=RuleEffect.DENY)
-    model = AgentPolicyModel(
-        agent_id="agent-1",
-        agent_roles=[role],
-        agent_scopes=[scope],
-        subject_roles={subject.id: [role]},
-        source_roles={svc.id: [role]},
-        target_allow_scopes={svc.id: [scope]},
-        target_deny_scopes={svc.id: [scope]},
-        inbound_subject_allow_rules=[allow],
-        inbound_subject_deny_rules=[deny],
-        inbound_source_allow_rules=[allow],
-        inbound_source_deny_rules=[deny],
-        outbound_target_allow_rules=[allow],
-        outbound_target_deny_rules=[deny],
-        outbound_subject_allow_rules=[allow],
-        outbound_subject_deny_rules=[deny],
-    )
-    dumped = model.model_dump(mode="json")
-    restored = AgentPolicyModel.model_validate(dumped)
-    assert restored == model
-    # Typed PolicyRule / Scope values survive the round-trip in the split lists and target maps.
-    assert restored.outbound_target_deny_rules[0].effect == RuleEffect.DENY
-    assert restored.target_allow_scopes[svc.id] == [scope]
-
-
-# --- effect-agnostic identity maps must include deny-only roles ---
-
-
-def test_deny_only_subject_role_still_registered_in_subject_roles():
-    # A role that appears ONLY in a DENY edge must still be registered in the effect-agnostic
-    # subject_roles map, or the Rego deny lookup cannot resolve it and the prohibition never fires.
-    subject = _subject()
-    deny_role = _role(id="deny-role", name="developer")
-    agent_scope = _scope(id="agent-scope", name="invoke")
-    model = AgentPolicyModel(
-        agent_id="agent-1",
-        agent_roles=[],
-        agent_scopes=[agent_scope],
-        source_roles={},
-        subject_roles={subject.id: [deny_role]},  # deny-only role, still listed
-        inbound_subject_allow_rules=[],
-        inbound_subject_deny_rules=[PolicyRule(role=deny_role, scope=agent_scope, effect=RuleEffect.DENY)],
-    )
-    assert deny_role in model.subject_roles[subject.id]
-    restored = AgentPolicyModel.model_validate(model.model_dump(mode="json"))
-    assert restored.subject_roles[subject.id] == [deny_role]
-
-
-def test_deny_only_source_role_still_registered_in_source_roles():
-    svc = _service()
-    deny_role = _role(id="deny-src", name="caller")
-    agent_scope = _scope(id="agent-scope", name="invoke")
-    model = AgentPolicyModel(
-        agent_id="agent-1",
-        agent_roles=[],
-        agent_scopes=[agent_scope],
-        source_roles={svc.id: [deny_role]},  # deny-only source role, still listed
-        subject_roles={},
-        inbound_source_allow_rules=[],
-        inbound_source_deny_rules=[PolicyRule(role=deny_role, scope=agent_scope, effect=RuleEffect.DENY)],
-    )
-    assert deny_role in model.source_roles[svc.id]
-    restored = AgentPolicyModel.model_validate(model.model_dump(mode="json"))
-    assert restored.source_roles[svc.id] == [deny_role]
-
-
-# --- extra='ignore' on all three model types ---
+# --- extra='ignore' on the model types ---
 
 
 def test_policy_rule_ignores_extra_fields():
@@ -415,26 +231,12 @@ def test_policy_rule_ignores_extra_fields():
     assert not hasattr(rule, "unknown")
 
 
-def test_agent_policy_model_ignores_extra_fields():
-    model = AgentPolicyModel.model_validate(
-        {
-            "agent_id": "a",
-            "agent_roles": [],
-            "agent_scopes": [],
-            "subject_roles": {},
-            "source_roles": {},
-            "unknown_field": "ignored",
-        }
-    )
-    assert not hasattr(model, "unknown_field")
-
-
 def test_policy_model_ignores_extra_fields():
-    model = parse_policy_model({"enforcement_side": "target-side", "services": [], "extra_key": "ignored"})
+    model = PolicyModel.model_validate({"services": [], "extra_key": "ignored"})
     assert not hasattr(model, "extra_key")
 
 
-# --- The policy-model hierarchy (D18a) ---
+# --- The policy model (D18a) ---
 
 
 def _spm_body(service_id="team1/github-tool") -> dict:
@@ -446,66 +248,18 @@ def _spm_body(service_id="team1/github-tool") -> dict:
     }
 
 
-def test_target_side_body_parses_to_target_side_policy_model():
-    model = parse_policy_model({"enforcement_side": "target-side", "services": [_spm_body()]})
-    assert isinstance(model, TargetSidePolicyModel)
-    assert model.enforcement_side == EnforcementSide.TARGET_SIDE
+def test_policy_model_body_parses_to_its_services():
+    model = PolicyModel.model_validate({"services": [_spm_body()]})
     assert [spm.service_id for spm in model.services] == ["team1/github-tool"]
 
 
-def test_target_side_policy_model_sets_its_own_tag():
-    model = TargetSidePolicyModel(services=[])
-    assert model.model_dump(mode="json")["enforcement_side"] == "target-side"
-
-
-def test_enforcement_side_values():
-    assert EnforcementSide.TARGET_SIDE == "target-side"
-    assert EnforcementSide.AGENT_SIDE == "agent-side"
-
-
-def test_policy_model_without_a_tag_is_rejected():
-    # The old shape (a bare agents list, no tag) is no longer a policy model.
+def test_policy_model_without_services_is_rejected():
     with pytest.raises(ValidationError):
-        parse_policy_model({"agents": []})
+        PolicyModel.model_validate({})
 
 
-def test_target_side_body_without_a_tag_is_rejected():
-    # The tag has a default on the class, but a body must still carry it.
-    with pytest.raises(ValidationError):
-        parse_policy_model({"services": [_spm_body()]})
-
-
-def test_policy_model_with_an_unknown_tag_is_rejected():
-    with pytest.raises(ValidationError):
-        parse_policy_model({"enforcement_side": "both-sides", "services": []})
-
-
-def _apm_body(agent_id="team1/github-agent") -> dict:
-    return {"agent_id": agent_id, "agent_roles": [], "agent_scopes": [], "source_roles": {}, "subject_roles": {}}
-
-
-def test_agent_side_body_parses_to_agent_side_policy_model():
-    model = parse_policy_model(
-        {"enforcement_side": "agent-side", "agents": [_apm_body()], "pass_through": ["team1/github-tool"]}
-    )
-    assert isinstance(model, AgentSidePolicyModel)
-    assert model.enforcement_side == EnforcementSide.AGENT_SIDE
-    assert [apm.agent_id for apm in model.agents] == ["team1/github-agent"]
-    assert model.pass_through == ["team1/github-tool"]
-
-
-def test_agent_side_policy_model_sets_its_own_tag_and_defaults_pass_through():
-    model = AgentSidePolicyModel(agents=[])
-    assert model.model_dump(mode="json") == {"enforcement_side": "agent-side", "agents": [], "pass_through": []}
-
-
-def test_a_body_cannot_mix_the_sides():
-    # The tag selects the subclass: an agent-side tag with target-side content is not a policy model.
-    with pytest.raises(ValidationError):
-        parse_policy_model({"enforcement_side": "agent-side", "services": [_spm_body()]})
-
-
-def test_target_side_policy_model_round_trips_through_json():
-    model = TargetSidePolicyModel(services=[ServicePolicyModel.model_validate(_spm_body())])
-    again = parse_policy_model(model.model_dump(mode="json"))
-    assert again == model
+def test_policy_model_round_trips_through_json():
+    model = PolicyModel(services=[ServicePolicyModel.model_validate(_spm_body())])
+    dumped = model.model_dump(mode="json")
+    assert set(dumped) == {"services"}
+    assert PolicyModel.model_validate(dumped) == model

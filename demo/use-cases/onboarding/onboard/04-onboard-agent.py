@@ -2,9 +2,8 @@
 """Onboard the ``github-agent`` workload: ``POST /apply/service/{uuid}`` behind a port-forward to
 the Controller, then capture the generated rego from the agent's ``AuthorizationPolicy`` CR into
 ``generated/01-after-agent/`` — the first pause's evidence. The agent's inbound gate is populated.
-Under target side (the default) its outbound is a pass-through, and the tool has no CR yet (it is
-not onboarded, so the changed combiner, D20, denies it). Under agent side the agent's outbound gate
-is still empty."""
+Its outbound is a pass-through, and the tool has no CR yet (it is not onboarded, so the changed
+combiner, D20, denies it)."""
 
 from __future__ import annotations
 

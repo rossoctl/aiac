@@ -26,7 +26,7 @@ POLICY_FILE = "policy.eval_unreachable_resources_sensitive_perturbed.md"
 # --- Agents -------------------------------------------------------------------------------------
 
 AGENTS: dict[str, dict] = {
-    "intake-agent": {
+    "team1/intake-agent": {
         "description": (
             "An autonomous agent that handles patient intake on a user's behalf: booking "
             "appointments and reading and updating patient records."
@@ -47,7 +47,7 @@ AGENTS: dict[str, dict] = {
             ),
         },
     },
-    "billing-agent": {
+    "team1/billing-agent": {
         "description": (
             "An autonomous agent meant to handle patient billing and invoicing, stood up before "
             "the access policy that was supposed to cover it — no policy language yet says who "
@@ -72,8 +72,9 @@ AGENTS: dict[str, dict] = {
 #
 # Byte-identical to scenario_eval_unreachable_resources_perturbed.py.
 
+# Each tool id is "<namespace>/<name>", as each agent id: the writer derives the CR of the tool from it.
 TOOLS: dict[str, dict] = {
-    "records-tool": {
+    "team1/records-tool": {
         "description": (
             "A capability provider for patient records, carrying out read and write operations on "
             "what's stored in them."
@@ -83,7 +84,7 @@ TOOLS: dict[str, dict] = {
             "tool-scope-records-write": "Create and update patient records.",
         },
     },
-    "insurance-tool": {
+    "team1/insurance-tool": {
         "description": (
             "A capability provider for insurance-coverage verification, performing lookups against "
             "a patient's insurance details. No agent role is ever handed its scope anywhere in the "
@@ -130,4 +131,4 @@ OUTBOUND_SUBJECT_PAIRS: list[tuple[str, str]] = []
 #
 # Byte-identical to scenario_eval_unreachable_resources_perturbed.py — unrelated to this edit.
 
-EXPECT_NO_REGO: frozenset[str] = frozenset({"billing-agent"})
+EXPECT_NO_REGO: frozenset[str] = frozenset({"team1/billing-agent"})

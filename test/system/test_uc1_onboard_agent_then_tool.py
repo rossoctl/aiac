@@ -13,19 +13,13 @@ the tool check. When the agent is onboarded alone there is no tool check (rung 1
 then onboarded, its Service Policy Builder pairs the tool's scopes against the existing role universe
 (agent roles + user roles) and the PCE **routes** those ``(role, tool-scope)`` rules onto the **tool's**
 persistent ``ServicePolicyModel`` via ``compute_and_apply(override=False)``. Then the PCE deploys the
-affected services of the live **enforcement side** (D23):
-
-* **target side** (default) — the affected set is the ``changed`` set: only ``SPM(github-tool)``
-  changed, so the PCE writes **github-tool's own CR**, whose inbound has both gates (the user gate and
-  the calling-agent gate, D26). The agent's CR does not change; its outbound is a pass-through (D24).
-* **agent side** — the agent's role targets a tool scope, so the agent is affected: its
-  ``AgentPolicyModel`` is **re-derived from the SPMs** and its outbound package is (re)written with the
-  full user→tool gate; github-tool gets a pass-through CR.
+affected services (D23): the affected set is the ``changed`` set. Only ``SPM(github-tool)`` changed,
+so the PCE writes **github-tool's own CR**, whose inbound has both gates (the user gate and the
+calling-agent gate, D26). The agent's CR does not change; its outbound is a pass-through (D24).
 
 The live probes below observe the result as real allow/deny decisions once ``bundle-service``
-recomposes the bundles; the verdicts are the same under each side. Two side-aware nodes check where
-the deny of an ungranted call comes from (``deny_origin``) and the shape of both CRs
-(``cr_matches_side``).
+recomposes the bundles. Two nodes check where the deny of an ungranted call comes from
+(``deny_origin``) and the shape of both CRs (``cr_matches``).
 
 **The subject on every leg (D31).** The tool's inbound keys users by username, and it reads the
 subject from the ``sub`` of the token that the agent exchanged. Keycloak's standard token exchange
@@ -99,7 +93,7 @@ def onboarded() -> dict:
     """Onboard the agent **then** the tool — event-driven — by deploying them in that order via the
     shared harness (order is this rung's identity — tool onboarding completes the tool check), and
     yield the live probe context (``admin`` handle, ``agent_pod``, Keycloak URL/realm,
-    ``tool_onboarded=True``, the live ``side``). The harness starts from a no-workloads slate and, on teardown,
+    ``tool_onboarded=True``). The harness starts from a no-workloads slate and, on teardown,
     tears both workloads + all their Keycloak registrations and ``AuthorizationPolicy`` CRs back down
     to pristine (spec § Per-rung flow). No agent re-onboard, no intermediate validation — only the end
     state is asserted below."""
@@ -161,38 +155,34 @@ def test_outbound(onboarded: dict, subject: str, tool_bare: str) -> None:
     """Tool check — a real MCP ``tools/call`` for the **bare** tool through AuthBridge's forward proxy
     (token-exchange → the tool check) decides each ``(subject, tool)`` per the full
     ``OUTBOUND_SUBJECT_BARE`` table — the check tool onboarding completed. AuthBridge's ``mcp-parser``
-    surfaces ``input.mcp.params.name`` (no hand-built input). Under target side github-tool's inbound
-    OPA decides (a deny is its HTTP 403, relayed by the agent's pass-through outbound); under agent side
-    the agent's outbound OPA decides (a deny is a JSON-RPC error frame). The harness classifies both."""
+    surfaces ``input.mcp.params.name`` (no hand-built input). github-tool's inbound OPA decides (a deny
+    is its HTTP 403, relayed by the agent's pass-through outbound)."""
     assert uc1.outbound_decision(onboarded, subject, tool_bare) == uc1.expected_outbound_decision(subject, tool_bare), (
         f"{subject} / {tool_bare}"
     )
 
 
 def test_deny_comes_from_enforcement_point(onboarded: dict) -> None:
-    """The deny of an ungranted call (``test-user`` × ``source-read``) comes from the enforcement point
-    of the live side: from github-tool's inbound under target side — so the agent's outbound let the
-    call through and the tool check moved to the callee — and from the agent's outbound under agent
-    side (``deny_origin`` reads the raw response)."""
+    """The deny of an ungranted call (``test-user`` × ``source-read``) comes from the enforcement point:
+    from github-tool's inbound, so the agent's outbound let the call through and the callee decided
+    (``deny_origin`` reads the raw response)."""
     probe = uc1.outbound_deny_probe(onboarded, "test-user", "source-read")
-    want = uc1.SIDE_ENFORCEMENT_POINT[onboarded["side"]]
+    want = uc1.DENY_ORIGIN_TOOL_INBOUND
     assert probe["decision"] == "deny" and probe["origin"] == want, (
-        f"{onboarded['side']}: test-user / source-read decision={probe['decision']!r} origin={probe['origin']!r} "
+        f"test-user / source-read decision={probe['decision']!r} origin={probe['origin']!r} "
         f"(want 'deny' from {want!r}); HTTP {probe['code']}, body={probe['body'][:300]!r}"
     )
 
 
-def test_crs_match_live_side(onboarded: dict) -> None:
+def test_crs_match(onboarded: dict) -> None:
     """github-agent's and github-tool's CRs both exist (every managed service has a CR, D20), each with
-    exactly the two request packages, in the shape of the live side (``cr_matches_side``): under target
-    side both inbounds are rules-based with grants and both outbounds are pass-throughs; under agent
-    side the agent's outbound is rules-based and github-tool has a pass-through CR."""
-    side = onboarded["side"]
+    exactly the two request packages, in their shape (``cr_matches``): both inbounds are rules-based
+    with grants and both outbounds are pass-throughs."""
     problems = {
-        workload: uc1.cr_side_mismatches(uc1.authpolicy_policies(workload), kind, side)
+        workload: uc1.cr_mismatches(uc1.authpolicy_policies(workload), kind)
         for workload, kind in uc1.WORKLOAD_KIND.items()
     }
-    assert not any(problems.values()), f"CRs do not match {side}: {problems}"
+    assert not any(problems.values()), f"CRs do not match their shape: {problems}"
 
 
 # ======================================================================================
@@ -232,7 +222,7 @@ def test_exchanged_token_subject_is_username(onboarded: dict, subject: str) -> N
     exchange applies only the agent client's scopes. The harness authenticates with the agent's client
     secret; it skips cleanly only when the agent client uses another authenticator (for example a SPIFFE
     JWT-SVID through ``federated-jwt``), and a refused secret is a failure. This is the one direct check
-    of the exchanged ``sub``: under agent side no one-hop decision reads it."""
+    of the exchanged ``sub`` (``test_outbound`` reads it only through a decision)."""
     sub = uc1.exchanged_subject(onboarded, subject)
     assert sub == subject, (
         f"the exchanged token for {subject!r} has sub={sub!r} (want the username) — is {uc1.SUBJECT_SCOPE!r} "

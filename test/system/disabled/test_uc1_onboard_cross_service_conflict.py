@@ -25,10 +25,11 @@ How the two onboardings collide **across services** (the #2504 store read is the
     those scopes. Tool onboarding itself is clean (its own scope-focal grants and Door B denies are
     disjoint), so it returns 200 and the deny is now **applied state**.
   * **Phase 2 — onboard the AGENT under a policy that GRANTS testers source** ("testers may read and
-    write source"). The agent's outbound *subject* gate derives ``ALLOW (tester -> github-tool.source-*)``
-    — a ``(user role -> tool scope)`` rule routed onto the **same** ``SPM(github-tool)``, on the **same**
-    ``(role.id, scope.id)`` the tool already denied. The agent's own build carries no deny (the policy
-    states no prohibition), so this is invisible within the agent's rules alone. #2504's
+    write source"). The agent's build derives the user rule ``ALLOW (tester -> github-tool.source-*)``
+    for the user gate of the tool inbound — a ``(user role -> tool scope)`` rule routed onto the
+    **same** ``SPM(github-tool)``, on the **same** ``(role.id, scope.id)`` the tool already denied. The
+    agent's own build carries no deny (the policy states no prohibition), so this is invisible within
+    the agent's rules alone. #2504's
     ``applied_rules_for_scopes`` reads ``SPM(github-tool)``'s already-applied inbound deny, the builder
     unions it with the fresh allow, and the #2502 detector surfaces the overlap -> ``PolicyConflictError``
     -> the Controller maps it to **422 + ``ConflictReport``**.
@@ -91,9 +92,10 @@ Grant access narrowly and state the exclusive scoping that constrains it.
 - Testers may access only issues; they may not access source.
 """
 
-# Phase 2: the agent grants testers source — the outbound subject gate derives
-# ALLOW(tester -> github-tool.source-*) on the SAME tool scopes the tool already denied. This
-# directly contradicts the tool's phase-1 applied deny (the cross-service overlap #2504 surfaces).
+# Phase 2: the agent grants testers source — the agent's build derives the user rule
+# ALLOW(tester -> github-tool.source-*) for the user gate of the tool inbound, on the SAME tool scopes
+# the tool already denied. This directly contradicts the tool's phase-1 applied deny (the cross-service
+# overlap #2504 surfaces).
 POLICY_AGENT_GRANTS_SOURCE = """\
 Grant access on the basis of what each role does.
 
@@ -150,10 +152,10 @@ def _onboard_via_fresh_controller(policy_md: str, workload: str, *, expect_confl
 @pytest.mark.xfail(strict=False, reason="live cross-service scenario under revision; not yet confirmed to fire 422")
 def test_cross_service_conflict_is_surfaced_as_422_conflict_report() -> None:
     """End-to-end #2504: onboard the tool under an exclusivity policy (persisting a tool-side deny),
-    then onboard the agent under a policy that grants the same testers source — the agent's outbound
-    subject allow collides across services with the tool's already-applied deny. The real Controller
-    must refuse the second onboarding with 422 + a ``ConflictReport``, and the atomicity guarantee holds
-    (the conflicting policy never reaches OPA — no CR is upserted on the raising path).
+    then onboard the agent under a policy that grants the same testers source — the agent's user rule
+    on SPM(github-tool) collides across services with the tool's already-applied deny. The real
+    Controller must refuse the second onboarding with 422 + a ``ConflictReport``, and the atomicity
+    guarantee holds (the conflicting policy never reaches OPA — no CR is upserted on the raising path).
 
     Skips cleanly (never false-passes) when the pipeline is not wired or the integration env is unset.
     The store is cleared once up front and NOT between phases, so the agent's build genuinely reads the
@@ -184,9 +186,10 @@ def test_cross_service_conflict_is_surfaced_as_422_conflict_report() -> None:
         # DENY(tester -> github-tool.source-*) on SPM(github-tool).
         _onboard_via_fresh_controller(POLICY_TOOL_EXCLUSIVE, scn.TOOL_WORKLOAD, expect_conflict=False)
 
-        # Phase 2 — agent onboarding under the source-granting policy: the outbound subject gate's fresh
-        # ALLOW(tester -> github-tool.source-*) collides with the tool's already-applied DENY on the same
-        # (role, scope). The #2504 store read surfaces it -> 422 + ConflictReport.
+        # Phase 2 — agent onboarding under the source-granting policy: the fresh user rule
+        # ALLOW(tester -> github-tool.source-*) on SPM(github-tool) collides with the tool's
+        # already-applied DENY on the same (role, scope). The #2504 store read surfaces it -> 422 +
+        # ConflictReport.
         report = _onboard_via_fresh_controller(POLICY_AGENT_GRANTS_SOURCE, scn.AGENT_WORKLOAD, expect_conflict=True)
     finally:
         uc1.delete_workload_crs()  # after — drop any CR (there should be none on the raising path)

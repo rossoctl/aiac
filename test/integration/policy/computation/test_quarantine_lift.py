@@ -33,7 +33,6 @@ import pytest
 
 from aiac.policy import computation
 from aiac.policy.computation import engine
-from aiac.policy.model.models import EnforcementSide
 from test.integration.policy.computation import test_shared_roles
 from test.integration.policy.computation.test_shared_roles import (
     AGENT1,
@@ -56,7 +55,7 @@ from test.integration.policy.computation.test_shared_roles import (
 
 pytestmark = pytest.mark.integration
 
-# The harness of test_shared_roles.py: the real code between the fakes, under target side.
+# The harness of test_shared_roles.py: the real code between the fakes.
 stack = test_shared_roles.stack
 
 # The shared role may also call review-agent: the scope-focal pass of its skill grants it, at the
@@ -116,13 +115,9 @@ class TestTheLiftPutsTheHolderBack:
             )
             _assert_tool_gates(stack, tool)
 
-    @pytest.mark.parametrize("side", list(EnforcementSide), ids=lambda side: side.value)
-    def test_a_callee_that_the_lift_routes_no_rule_to_names_the_lifted_holder_again(
-        self, stack: Stack, side: EnforcementSide, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        # review-agent's inbound names the holders of the shared role (its source_roles), under both
-        # sides. Its edge comes from its own onboarding, so team2's lift does not touch its SPM.
-        monkeypatch.setenv("AIAC_ENFORCEMENT_SIDE", side.value)
+    def test_a_callee_that_the_lift_routes_no_rule_to_names_the_lifted_holder_again(self, stack: Stack) -> None:
+        # review-agent's inbound names the holders of the shared role (its source_roles). Its edge
+        # comes from its own onboarding, so team2's lift does not touch its SPM.
         stack.llm.decisions = REVIEWER_CALLED
         for workload in (AGENT1, AGENT2, TOOL1, REVIEWER):
             stack.bring_up(workload)
@@ -159,15 +154,13 @@ class TestTheLiftPutsTheHolderBack:
                 f"{tool.client_id}: after the lift of team1"
             )
 
-    @pytest.mark.parametrize("side", list(EnforcementSide), ids=lambda side: side.value)
     def test_a_callee_that_no_lift_routes_a_rule_to_keeps_the_role_while_every_holder_is_quarantined(
-        self, stack: Stack, side: EnforcementSide, monkeypatch: pytest.MonkeyPatch
+        self, stack: Stack
     ) -> None:
         # review-agent's edge of the shared role comes from its own onboarding, so no lift routes a rule
         # to it: only the stored edge can give a lifted holder the grant back. team1 fails first, then
         # team2. team1 is disabled, but its client keeps the mapping of the role, so it still holds it:
         # the quarantine of team2 does not purge the edge, which is the grant of team1 too.
-        monkeypatch.setenv("AIAC_ENFORCEMENT_SIDE", side.value)
         stack.llm.decisions = REVIEWER_CALLED
         for workload in (AGENT1, AGENT2, TOOL1, REVIEWER):
             stack.bring_up(workload)
@@ -180,11 +173,7 @@ class TestTheLiftPutsTheHolderBack:
 
         assert _holders(stack, REVIEWER) == {AGENT1.client_id}, f"{REVIEWER.client_id}: after the lift of team1"
 
-    @pytest.mark.parametrize("side", list(EnforcementSide), ids=lambda side: side.value)
-    def test_the_resync_after_a_lift_gives_the_same_crs(
-        self, stack: Stack, side: EnforcementSide, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setenv("AIAC_ENFORCEMENT_SIDE", side.value)
+    def test_the_resync_after_a_lift_gives_the_same_crs(self, stack: Stack) -> None:
         stack.llm.decisions = REVIEWER_CALLED
         for workload in (*ORDERS["agents-first"], REVIEWER):
             stack.bring_up(workload)
@@ -203,17 +192,12 @@ class TestTheReEnableUnderThePceLock:
     of the shared role, which the NATS consumer or ``POST /apply/role-members/{role_id}`` can run as
     soon as the PCE lock is free."""
 
-    @pytest.mark.parametrize("side", list(EnforcementSide), ids=lambda side: side.value)
-    def test_a_role_members_event_after_the_lift_keeps_the_lifted_holder(
-        self, stack: Stack, side: EnforcementSide, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setenv("AIAC_ENFORCEMENT_SIDE", side.value)
+    def test_a_role_members_event_after_the_lift_keeps_the_lifted_holder(self, stack: Stack) -> None:
         stack.llm.decisions = REVIEWER_CALLED
         for workload in (AGENT1, AGENT2, TOOL1, REVIEWER):
             stack.bring_up(workload)
         _fail_onboarding(stack, AGENT2)
-        # Under agent side the tool CR is a pass-through: review-agent's inbound names the holders.
-        callees = (TOOL1, REVIEWER) if side == EnforcementSide.TARGET_SIDE else (REVIEWER,)
+        callees = (TOOL1, REVIEWER)
         stack.realm.provision(AGENT2.namespace, AGENT2.name, AGENT2.type, AGENT2.entries)
         assert stack.realm.events, "Provision's re-map of the shared role sends a role-members event"
         stack.onboard(AGENT2.client_id, on_applied=lambda: _set_enabled(stack, AGENT2, True))  # the lift

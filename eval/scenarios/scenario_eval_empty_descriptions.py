@@ -39,8 +39,9 @@ AGENTS: dict[str, dict] = {
 
 # --- Tools --------------------------------------------------------------------------------------
 
+# Each tool id is "<namespace>/<name>", as each agent id: the writer derives the CR of the tool from it.
 TOOLS: dict[str, dict] = {
-    "valve-tool": {
+    "team1/valve-tool": {
         "description": "",
         "scopes": {
             "tool-scope-valve-open": "",

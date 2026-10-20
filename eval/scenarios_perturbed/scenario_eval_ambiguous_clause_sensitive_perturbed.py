@@ -24,7 +24,7 @@ POLICY_FILE = "policy.eval_ambiguous_clause_sensitive_perturbed.md"
 # Byte-identical to scenario_eval_ambiguous_clause_perturbed.py.
 
 AGENTS: dict[str, dict] = {
-    "registrar-agent": {
+    "team1/registrar-agent": {
         "description": (
             "An autonomous agent that acts for a user against the student enrollment system, "
             "looking up a student's current enrollment status and past enrollment record."
@@ -48,8 +48,9 @@ AGENTS: dict[str, dict] = {
 #
 # Byte-identical to scenario_eval_ambiguous_clause_perturbed.py.
 
+# Each tool id is "<namespace>/<name>", as each agent id: the writer derives the CR of the tool from it.
 TOOLS: dict[str, dict] = {
-    "enrollment-tool": {
+    "team1/enrollment-tool": {
         "description": (
             "A capability provider for student enrollment records, performing lookups of a "
             "student's current status and past enrollment record."

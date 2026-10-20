@@ -2,10 +2,9 @@
 """Onboard the ``github-tool`` workload: ``POST /apply/service/{uuid}`` behind a port-forward to
 the Controller, then capture the rego of the agent's and the tool's ``AuthorizationPolicy`` CRs into
 ``generated/02-after-tool/`` — the second pause's evidence. Every managed service has a CR (D20).
-Under target side (the default) the tool's own inbound package now decides each tool call (the user
-gate and the calling-agent gate), and every outbound is a pass-through. Under agent side onboarding
-the tool completes the agent's outbound gate, and the tool gets a pass-through CR. The snapshot goes
-into a directory separate from ``01-after-agent/`` — the before/after diff is the point."""
+The tool's own inbound package now decides each tool call (the user gate and the calling-agent
+gate), and every outbound is a pass-through. The snapshot goes into a directory separate from
+``01-after-agent/`` — the before/after diff is the point."""
 
 from __future__ import annotations
 

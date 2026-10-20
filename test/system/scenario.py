@@ -110,10 +110,11 @@ TOOL_SCOPES: dict[str, str] = {
 # --- Role → access facts (name-level; the single source of truth) ---------------------------
 #
 # Identical to the 5.2 launcher's hand-built rule lists and to policy.explicit.md. Each set maps
-# 1:1 to a PRB mapping and to a generated Rego gate:
-#   (a) INBOUND_PAIRS          — user role  -> agent scope  (inbound; user may call the agent)
-#   (b) OUTBOUND_SUBJECT_PAIRS — user role  -> tool scope   (outbound subject; user may reach tool)
-#   (c) OUTBOUND_PAIRS         — agent role -> tool scope   (outbound target; agent may reach tool)
+# 1:1 to a PRB mapping and to a generated Rego gate. The names keep the call direction (the agent's
+# outbound call to the tool), but the tool's inbound checks (b) and (c) (D26):
+#   (a) INBOUND_PAIRS          — user role  -> agent scope  (the user gate of the agent inbound)
+#   (b) OUTBOUND_SUBJECT_PAIRS — user role  -> tool scope   (the user gate of the tool inbound)
+#   (c) OUTBOUND_PAIRS         — agent role -> tool scope   (the agent gate of the tool inbound)
 
 INBOUND_PAIRS: list[tuple[str, str]] = [
     ("developer", "source-access"),

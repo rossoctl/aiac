@@ -80,8 +80,8 @@ from eval.prb_direct import build_roles_and_scopes  # noqa: E402
 from eval.scale_generator import (  # noqa: E402
     FOCAL_ROLE_NAME,
     FOCAL_SCOPE_NAME,
-    PER_DECISION_ROLE_AGENT_ID,
     PER_DECISION_SCOPE_AGENT_ID,
+    PER_DECISION_TOOL_ID,
     generate_per_decision,
     generate_total_corpus,
 )
@@ -142,7 +142,7 @@ def _skip_if_xdist() -> None:
 @pytest.fixture(scope="module")
 def scale_env() -> Iterator[pytest.MonkeyPatch]:
     """One ``MonkeyPatch`` for every env write that the four fixtures below make
-    (``AIAC_POLICY_FILE``, and the realm/URL/enforcement-side vars of ``prepare_pipeline``). It is
+    (``AIAC_POLICY_FILE``, and the realm/URL vars of ``prepare_pipeline``). It is
     undone when this module ends, so later tests in the session do not inherit a policy file of
     this suite or a URL of a store that is already shut down."""
     with pytest.MonkeyPatch.context() as mp:
@@ -154,12 +154,11 @@ def _provision_scale_realm_and_services(
 ) -> tuple[Service, Service, Service]:
     """Shared prefix of both e2e fixtures below: connect to Keycloak and provision the realm, then
     ``eval.test_policy_pipeline_eval.prepare_pipeline`` -- the same env + idp/store/opa setup that
-    ``_provision_scenario`` uses, so a new pipeline setting (e.g. the enforcement side) reaches this
-    suite too. Each env write goes through ``mp``, so it is restored when the fixture's own
-    ``MonkeyPatch.context()`` ends and does not leak into later tests in the session. The PRB-calling
-    logic stays in each fixture (one fans a whole scenario's decisions out via
-    ``orchestrate_prb_concurrent``, the other makes exactly two sequential ``_invoke_graph`` calls
-    against two different policy files)."""
+    ``_provision_scenario`` uses, so a new pipeline setting reaches this suite too. Each env write
+    goes through ``mp``, so it is restored when the fixture's own ``MonkeyPatch.context()`` ends
+    and does not leak into later tests in the session. The PRB-calling logic stays in each fixture
+    (one fans a whole scenario's decisions out via ``orchestrate_prb_concurrent``, the other makes
+    exactly two sequential ``_invoke_graph`` calls against two different policy files)."""
     admin = _connect_admin()
     provision_keycloak_admin(admin, scenario.REALM_DEFAULT, scenario)
     host = "127.0.0.1"
@@ -579,11 +578,12 @@ def total_corpus_e2e_result(tmp_path_factory: pytest.TempPathFactory, scale_env:
 
 
 def test_scale_total_corpus_structural_e2e(total_corpus_e2e_result: dict, record_property) -> None:
-    """Total-corpus dimension, e2e level: every generated PRB decision ran, every agent's
-    inbound+outbound Rego actually landed on disk (completeness), no duplicate entry in the real
-    rendered Rego (no-duplication -- the actual Policy Computation Engine merge output, not the
-    pre-merge PRB rules ``duplicate_rule_triples`` checks at PRB level) -- gated. Latency/cost (now
-    including PCE+Rego rendering, not just the PRB) are reported and trended, never gated.
+    """Total-corpus dimension, e2e level: every generated PRB decision ran, the inbound+outbound
+    Rego of every scope owner that has a rule actually landed on disk (completeness), no duplicate
+    entry in the real rendered Rego (no-duplication -- the actual Policy Computation Engine merge
+    output, not the pre-merge PRB rules ``duplicate_rule_triples`` checks at PRB level) -- gated.
+    Latency/cost (now including PCE+Rego rendering, not just the PRB) are reported and trended,
+    never gated.
     No-orphans is a pure invariant of the generated corpus, checked offline in
     ``eval/test_scale_generator.py`` instead -- see ``test_scale_total_corpus_structural_prb``."""
     scenario = total_corpus_e2e_result["scenario"]
@@ -593,15 +593,17 @@ def test_scale_total_corpus_structural_e2e(total_corpus_e2e_result: dict, record
         scenario, total_corpus_e2e_result["reasoning_by_scope"], total_corpus_e2e_result["reasoning_by_agent_role"]
     )
 
-    # Rego is expected only for an agent the PRB actually produced at least one rule for (its own
-    # inbound scope, or one of its own agent roles) -- NOT unconditionally for every agent. The
-    # generator's repair pass (eval.scale_generator) guarantees every scope is reachable in the
-    # *ground truth*, but a live LLM can still legitimately propose zero grants for one agent's
-    # every decision (a real correctness finding, already tracked/reported -- non-gating -- by the
-    # correctness test's under_grants); treating that as a *structural* completeness failure would
-    # double-penalize the same LLM behavior under two different checks and make this "stable
-    # regression guard" flake on ordinary LLM variance rather than on an actual pipeline defect. A
-    # genuine rendering/merge-engine bug still surfaces here for any agent that DID get rules.
+    # The PCE deploys a CR only for a service whose SPM the run touched: the owner (agent or tool)
+    # of the scope of a rule. So Rego is expected only for a scope owner that the PRB actually
+    # produced at least one rule for -- NOT unconditionally for every service. The generator's
+    # repair pass (eval.scale_generator) guarantees every scope is reachable in the *ground truth*,
+    # but a live LLM can still legitimately propose zero grants for one scope's every decision (a
+    # real correctness finding, already tracked/reported -- non-gating -- by the correctness test's
+    # under_grants); treating that as a *structural* completeness failure would double-penalize the
+    # same LLM behavior under two different checks and make this "stable regression guard" flake on
+    # ordinary LLM variance rather than on an actual pipeline defect. A genuine rendering/merge-engine
+    # bug still surfaces here for any owner that DID get rules. ``agents_with_no_rules`` (reported
+    # only) names each agent with no rule on its own scope and none for one of its own roles.
     agent_role_names = {agent_id: set(agent["roles"]) for agent_id, agent in scenario.AGENTS.items()}
     agents_with_rules: set[str] = set()
     for rule in rules:
@@ -612,9 +614,11 @@ def test_scale_total_corpus_structural_e2e(total_corpus_e2e_result: dict, record
                 agents_with_rules.add(agent_id)
     agents_with_no_rules = sorted(set(scenario.AGENTS) - agents_with_rules)
 
+    services = {**scenario.AGENTS, **scenario.TOOLS}
+    owners_with_rules = sorted({rule.scope.serviceId for rule in rules if rule.scope.serviceId in services})
     rego_paths = [
-        (f"{agent_id}/{direction}", _rego_path(rego_dir, agent_id, direction))
-        for agent_id in agents_with_rules
+        (f"{owner}/{direction}", _rego_path(rego_dir, owner, direction))
+        for owner in owners_with_rules
         for direction in ("inbound", "outbound")
     ]
     missing_files = missing_rego(rego_paths)
@@ -654,7 +658,7 @@ def test_scale_total_corpus_structural_e2e(total_corpus_e2e_result: dict, record
         f"failed_decisions={failed_decisions or '{}'}"
     )
     assert not missing_decisions_, f"decisions never ran: {missing_decisions_}"
-    assert not missing_files, f"agent/direction with no rendered rego despite having rules: {missing_files}"
+    assert not missing_files, f"service/direction with no rendered rego despite having rules: {missing_files}"
     assert not merged_duplicates, (
         f"duplicate (role, scope, effect) triple in the persisted post-merge policy: {merged_duplicates}"
     )
@@ -706,7 +710,7 @@ def per_decision_e2e_result(tmp_path_factory: pytest.TempPathFactory, scale_env:
     ``orchestrate_prb_concurrent``'s loop: there are exactly two decisions to make here, named
     explicitly, not a whole scenario's worth to enumerate) for each of the two per-decision calls,
     and apply both rule sets via the real Policy Computation Engine so real Rego gets rendered for
-    both agents."""
+    the owner of each focal decision's scopes (the scope agent and the tool)."""
     require_env_or_skip(
         "KEYCLOAK_URL", "KEYCLOAK_ADMIN_USERNAME", "KEYCLOAK_ADMIN_PASSWORD", "LLM_BASE_URL", "LLM_MODEL", "LLM_API_KEY"
     )
@@ -789,20 +793,21 @@ def test_scale_per_decision_structural_e2e(per_decision_e2e_result: dict, record
     production's own precheck step -- see ``per_decision_prb_result``'s own comment for why), no
     duplicate entry in the persisted
     post-merge policy (the actual PCE output, not the pre-merge PRB rules or the rendered Rego --
-    see ``_merged_rules_for``'s own docstring), and both agents' expected Rego file actually
-    rendered (fidelity + completeness, gated). Latency/cost (now including PCE+Rego rendering) are
-    reported and trended, never gated."""
+    see ``_merged_rules_for``'s own docstring), and the expected inbound Rego file of each scope
+    owner actually rendered (fidelity + completeness, gated). Latency/cost (now including PCE+Rego
+    rendering) are reported and trended, never gated."""
     r = per_decision_e2e_result
     scope_invalid = r["scope_dropped_names"]
     role_invalid = r["role_dropped_names"]
-    # PER_DECISION_SCOPE_AGENT_ID has no outbound-side roles/target-scopes at all, and
-    # PER_DECISION_ROLE_AGENT_ID has no inbound scope -- both by design, not a gap, so at most
-    # these two files are ever expected. But a file is expected only once the PRB actually
-    # produced at least one rule for that direction: the PCE writes a CR/Rego only for an agent
-    # that some rule touches, and a live LLM can legitimately return zero rules for a
+    # The scope decision routes its rules to PER_DECISION_SCOPE_AGENT_ID (the owner of the focal
+    # scope), and the role decision routes its rules to PER_DECISION_TOOL_ID (the owner of every
+    # candidate scope); PER_DECISION_ROLE_AGENT_ID owns no scope, so it gets no CR -- by design,
+    # not a gap, so at most these two files are ever expected. But a file is expected only once the
+    # PRB actually produced at least one rule for that direction: the PCE writes a CR/Rego only for
+    # a service whose SPM some rule touches, and a live LLM can legitimately return zero rules for a
     # direction (a pure under-grant, or an exhausted best-effort fallback) -- that's a correctness
     # finding (already tracked, non-gating, by the correctness test's under_grants), not a
-    # structural defect. Mirrors the total-corpus structural test's own agents_with_rules gating.
+    # structural defect. Mirrors the total-corpus structural test's own owners_with_rules gating.
     rego_paths = []
     if r["scope_rules"]:
         rego_paths.append(
@@ -814,8 +819,8 @@ def test_scale_per_decision_structural_e2e(per_decision_e2e_result: dict, record
     if r["role_rules"]:
         rego_paths.append(
             (
-                f"{PER_DECISION_ROLE_AGENT_ID}/outbound",
-                _rego_path(r["rego_dir"], PER_DECISION_ROLE_AGENT_ID, "outbound"),
+                f"{PER_DECISION_TOOL_ID}/inbound",
+                _rego_path(r["rego_dir"], PER_DECISION_TOOL_ID, "inbound"),
             )
         )
     missing_files = missing_rego(rego_paths)
@@ -852,8 +857,9 @@ def test_scale_per_decision_correctness_e2e(per_decision_e2e_result: dict, recor
     """Per-decision dimension, e2e level: the real pipeline's rendered grant/deny output for both
     decisions, sourced from the rendered Rego data maps
     (``eval.test_policy_pipeline_correctness_e2e._e2e_grant_sets``, reused unmodified -- the
-    ``e2e_scenario``'s two gates, ``inbound``/``outbound_target``, separate the two directions with
-    no new aggregation code), scored against the generated ground truth."""
+    ``e2e_scenario``'s two gates, ``inbound`` (the scope agent's inbound) and ``outbound_target``
+    (the tool's inbound), separate the two directions with no new aggregation code), scored against
+    the generated ground truth."""
     r = per_decision_e2e_result
     scenario = r["scenario"]
     granted, denied = _e2e_grant_sets(r, scenario)

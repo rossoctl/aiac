@@ -17,10 +17,9 @@ retryable failure is nak'd instead of left unacked: ``ServiceNotVisibleError`` (
 a new service yet, the event-before-commit race), so NATS redelivers it after a short delay
 (``AIAC_NOT_VISIBLE_NAK_DELAY_SECONDS``), not after ``ACK_WAIT_SECONDS``.
 
-Also owns the FastAPI ``lifespan``: it runs the Controller start sequence (the enforcement side,
-start check #4, then the PCE resync; see ``controller.start``) and starts the consumer only after
-it. A failed step (also an unknown ``AIAC_ENFORCEMENT_SIDE``) raises from the lifespan, so the
-Controller stops before it serves.
+Also owns the FastAPI ``lifespan``: it runs the Controller start sequence (start check #4, then
+the PCE resync; see ``controller.start``) and starts the consumer only after it. A failed step
+raises from the lifespan, so the Controller stops before it serves.
 """
 
 import asyncio
@@ -268,7 +267,7 @@ class AiacEventConsumer:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # The Controller start sequence (the enforcement side, start check #4, then the resync) runs
+    # The Controller start sequence (start check #4, then the resync) runs
     # FIRST, before the NATS consumer starts and before uvicorn serves: a failure raises here, so
     # uvicorn exits and the pod restarts. It is synchronous (k8s and PDP calls), so it runs in a thread.
     await asyncio.to_thread(run_start_sequence)

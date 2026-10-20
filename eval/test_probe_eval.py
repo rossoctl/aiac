@@ -1,13 +1,13 @@
-"""Offline tests of ``probe_eval.rego``, the generalized outbound probe of
+"""Offline tests of ``probe_eval.rego``, the generalized tool-call probe of
 ``test_policy_pipeline_eval.py`` (spec: ``docs/evaluation/policy-eval-scenarios.md``).
 
-The probe reads the agent outbound package that the writer renders
-(``aiac.pdp.service.policy.opa.rego.generate_outbound_rego``). These tests render a real package
-from a small APM and evaluate the probe against it with ``opa eval``, so a change of the rendered
-shape that the probe does not follow fails here, and not only in the live eval lane. The parity
-test also evaluates the deployed gate (``authbridge.client.outbound.request.allow``) on each cell:
-the probe must give the same decision, deny gates included, with only the soft match of the name
-added.
+The probe reads the inbound package of the callee that the writer renders
+(``aiac.pdp.service.policy.opa.rego.render_target_side``). These tests render a real tool inbound
+from a small tool SPM and evaluate the probe against it with ``opa eval``, so a change of the
+rendered shape that the probe does not follow fails here, and not only in the live eval lane. The
+parity test also evaluates the deployed gate (``authbridge.client.inbound.request.allow``) on each
+cell: the probe must give the same decision, deny gates included, with only the soft match of the
+name added.
 
 Unmarked: an offline test of an eval harness helper runs in the unit lane
 (``docs/testing/testing-strategy.md``). Skips cleanly when ``opa`` is not on PATH.
@@ -19,51 +19,124 @@ import json
 import shutil
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from aiac.idp.configuration.models import Role, RoleKind, Scope
-from aiac.pdp.service.policy.opa.rego import generate_outbound_rego
-from aiac.policy.model.models import AgentPolicyModel, PolicyRule, RuleEffect
-from eval.test_policy_pipeline_eval import reformat_function_name
+from aiac.idp.configuration.models import Role, RoleKind, Scope, ServiceType
+from aiac.pdp.service.policy.opa.rego import render_target_side
+from aiac.policy.model.models import PolicyRule, RuleEffect, ServicePolicyModel
+from eval.test_policy_pipeline_eval import _callee_decision, expected_agent_call, reformat_function_name
 
 pytestmark = pytest.mark.skipif(not shutil.which("opa"), reason="opa binary not on PATH")
 
 PROBE = Path(__file__).resolve().parent / "probe_eval.rego"
-QUERY = "data.probe.outbound_eval.allow"
-REAL_QUERY = "data.authbridge.client.outbound.request.allow"
+QUERY = "data.probe.inbound_eval.allow"
+REAL_QUERY = "data.authbridge.client.inbound.request.allow"
 
-# The eval scenarios key a target by its scenario id (``_scope_owner``), the serviceId of its scopes.
-REPO_TOOL = "repo-tool"
-TRACKER_TOOL = "tracker-tool"
+# The eval scenarios give each service its scenario id as clientId (the serviceId of its scopes).
+REPO_TOOL = "team1/repo-tool"
+TRACKER_TOOL = "team1/tracker-tool"
+AGENT = "team1/repo-agent"
+UNKNOWN_AGENT = "team1/unknown-agent"
+BROKER_AGENT = "team1/broker-agent"
 
 
 def _user_role(name: str, *users: str) -> Role:
     return Role(id=f"role-{name}", name=name, composite=False, kind=RoleKind.USER, actorIds=list(users))
 
 
+def _agent_role(name: str, *clients: str) -> Role:
+    return Role(id=f"role-{name}", name=name, composite=False, kind=RoleKind.AGENT, actorIds=list(clients))
+
+
 def _scope(name: str, service_id: str) -> Scope:
     return Scope(id=f"scope-{service_id}-{name}", name=name, serviceId=service_id)
 
 
-def _outbound_rego(tmp_path: Path) -> Path:
+def _allow(role: Role, scope: Scope) -> PolicyRule:
+    return PolicyRule(role=role, scope=scope, effect=RuleEffect.ALLOW)
+
+
+def _deny(role: Role, scope: Scope) -> PolicyRule:
+    return PolicyRule(role=role, scope=scope, effect=RuleEffect.DENY)
+
+
+def _tool_inbound(tmp_path: Path, spm: ServicePolicyModel) -> Path:
+    """Write the tool inbound package of ``spm``, as the writer renders it, to a file."""
+    path = tmp_path / spm.service_id.replace("/", "_") / "inbound.rego"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(render_target_side(spm).inbound)
+    return path
+
+
+def _tool_spm(
+    service_id: str, scopes: list[Scope], allow: list[PolicyRule], deny: list[PolicyRule]
+) -> ServicePolicyModel:
+    return ServicePolicyModel(
+        service_id=service_id,
+        service_type=ServiceType.TOOL,
+        owned_roles=[],
+        owned_scopes=scopes,
+        inbound_allow_rules=allow,
+        inbound_deny_rules=deny,
+    )
+
+
+def _grant_regos(tmp_path: Path) -> dict[str, Path]:
     """alice (``user-role-developer``) is granted ``tool-scope-read`` on repo-tool only. tracker-tool
-    has a different scope with the same name, and the agent may call both tools (LIM-02)."""
+    has a different scope with the same name. The agent may call both tools."""
     developer = _user_role("user-role-developer", "alice")
+    agent_role = _agent_role("agent-role-repo", AGENT)
     on_repo = _scope("tool-scope-read", REPO_TOOL)
     on_tracker = _scope("tool-scope-read", TRACKER_TOOL)
-    apm = AgentPolicyModel(
-        agent_id="team1/repo-agent",
-        agent_roles=[],
-        agent_scopes=[],
-        source_roles={},
-        subject_roles={"alice": [developer]},
-        target_allow_scopes={REPO_TOOL: [on_repo], TRACKER_TOOL: [on_tracker]},
-        outbound_subject_allow_rules=[PolicyRule(role=developer, scope=on_repo, effect=RuleEffect.ALLOW)],
+    return {
+        REPO_TOOL: _tool_inbound(
+            tmp_path, _tool_spm(REPO_TOOL, [on_repo], [_allow(developer, on_repo), _allow(agent_role, on_repo)], [])
+        ),
+        TRACKER_TOOL: _tool_inbound(
+            tmp_path, _tool_spm(TRACKER_TOOL, [on_tracker], [_allow(agent_role, on_tracker)], [])
+        ),
+    }
+
+
+def _deny_regos(tmp_path: Path) -> dict[str, Path]:
+    """Grants and denies that the real gate combines (deny-overrides).
+
+    * alice holds ``user-role-developer`` and ``user-role-tester``. The tester role is granted
+      ``tool-scope-write`` on repo-tool, and the developer role is denied it there: the deny of one
+      role of the subject blocks the grant of another role.
+    * carol holds only ``user-role-tester``, so the same grant admits her.
+    * Both user roles are granted ``tool-scope-read`` on repo-tool. The agent holds
+      ``agent-role-repo``, which is granted ``tool-scope-read`` and ``tool-scope-write`` there, and
+      ``agent-role-restricted``, which is denied ``tool-scope-read`` there: the calling-agent deny
+      blocks every subject's grant.
+    * tracker-tool has its own ``tool-scope-write``: the developer deny on repo-tool decides nothing
+      on it.
+    """
+    developer = _user_role("user-role-developer", "alice")
+    tester = _user_role("user-role-tester", "alice", "carol")
+    agent_role = _agent_role("agent-role-repo", AGENT)
+    restricted = _agent_role("agent-role-restricted", AGENT)
+    repo_read = _scope("tool-scope-read", REPO_TOOL)
+    repo_write = _scope("tool-scope-write", REPO_TOOL)
+    tracker_write = _scope("tool-scope-write", TRACKER_TOOL)
+    repo = _tool_spm(
+        REPO_TOOL,
+        [repo_read, repo_write],
+        [
+            _allow(tester, repo_write),
+            _allow(developer, repo_read),
+            _allow(tester, repo_read),
+            _allow(agent_role, repo_read),
+            _allow(agent_role, repo_write),
+        ],
+        [_deny(developer, repo_write), _deny(restricted, repo_read)],
     )
-    path = tmp_path / "outbound.rego"
-    path.write_text(generate_outbound_rego(apm))
-    return path
+    tracker = _tool_spm(
+        TRACKER_TOOL, [tracker_write], [_allow(tester, tracker_write), _allow(agent_role, tracker_write)], []
+    )
+    return {REPO_TOOL: _tool_inbound(tmp_path, repo), TRACKER_TOOL: _tool_inbound(tmp_path, tracker)}
 
 
 def _opa_eval(paths: list[Path], query: str, input_doc: dict) -> bool:
@@ -78,113 +151,147 @@ def _opa_eval(paths: list[Path], query: str, input_doc: dict) -> bool:
     return json.loads(out)["result"][0]["expressions"][0]["value"]
 
 
-def _probe(rego: Path, subject: str, target: str, function_name: str) -> bool:
-    return _opa_eval([rego, PROBE], QUERY, {"subject": subject, "target": target, "function_name": function_name})
+def _probe(rego: Path, subject: str, function_name: str, client_id: str = AGENT) -> bool:
+    return _opa_eval([rego, PROBE], QUERY, {"subject": subject, "client_id": client_id, "function_name": function_name})
 
 
-def _real_gate(rego: Path, subject: str, target: str, tool: str) -> bool:
-    """The deployed outbound decision for a ``tools/call`` of ``tool`` (the exact bare name)."""
+def _real_gate(rego: Path, subject: str, client_id: str, tool: str) -> bool:
+    """The deployed tool inbound decision for a ``tools/call`` of ``tool`` (the exact bare name)."""
     return _opa_eval(
         [rego],
         REAL_QUERY,
         {
-            "identity": {"subject": subject, "service_id": target},
+            "identity": {"subject": subject, "client_id": client_id},
             "mcp": {"method": "tools/call", "params": {"name": tool}},
         },
     )
 
 
-def _deny_rego(tmp_path: Path) -> Path:
-    """Grants and denies that the real gate combines (deny-overrides, LIM-02 keys).
-
-    * alice holds ``user-role-developer`` and ``user-role-tester``. The tester role is granted
-      ``tool-scope-write`` on repo-tool, and the developer role is denied it there: the deny of one
-      role of the subject blocks the grant of another role.
-    * carol holds only ``user-role-tester``, so the same grant admits her.
-    * Both roles are granted ``tool-scope-read`` on repo-tool, and the target denies it there.
-    * tracker-tool has its own ``tool-scope-write``: the developer deny on repo-tool decides nothing
-      on it.
-    """
-    developer = _user_role("user-role-developer", "alice")
-    tester = _user_role("user-role-tester", "alice", "carol")
-    repo_read = _scope("tool-scope-read", REPO_TOOL)
-    repo_write = _scope("tool-scope-write", REPO_TOOL)
-    tracker_write = _scope("tool-scope-write", TRACKER_TOOL)
-    apm = AgentPolicyModel(
-        agent_id="team1/repo-agent",
-        agent_roles=[],
-        agent_scopes=[],
-        source_roles={},
-        subject_roles={"alice": [developer, tester], "carol": [tester]},
-        target_allow_scopes={REPO_TOOL: [repo_read, repo_write], TRACKER_TOOL: [tracker_write]},
-        target_deny_scopes={REPO_TOOL: [repo_read]},
-        outbound_subject_allow_rules=[
-            PolicyRule(role=tester, scope=repo_write, effect=RuleEffect.ALLOW),
-            PolicyRule(role=tester, scope=tracker_write, effect=RuleEffect.ALLOW),
-            PolicyRule(role=developer, scope=repo_read, effect=RuleEffect.ALLOW),
-            PolicyRule(role=tester, scope=repo_read, effect=RuleEffect.ALLOW),
-        ],
-        outbound_subject_deny_rules=[PolicyRule(role=developer, scope=repo_write, effect=RuleEffect.DENY)],
-    )
-    path = tmp_path / "outbound-deny.rego"
-    path.write_text(generate_outbound_rego(apm))
-    return path
-
-
-def test_probe_compiles_against_the_rendered_outbound(tmp_path: Path) -> None:
-    rego = _outbound_rego(tmp_path)
+def test_probe_compiles_against_the_rendered_tool_inbound(tmp_path: Path) -> None:
+    rego = _grant_regos(tmp_path)[REPO_TOOL]
     subprocess.run(
         [shutil.which("opa"), "check", "--strict", str(rego), str(PROBE)], capture_output=True, text=True, check=True
     )
 
 
-def test_probe_allows_a_tool_granted_on_its_target(tmp_path: Path) -> None:
-    """The soft match (``Tool.Scope.Read``) reaches the grant on the target that has it."""
-    assert _probe(_outbound_rego(tmp_path), "alice", REPO_TOOL, "Tool.Scope.Read") is True
+def test_probe_allows_a_tool_granted_on_its_tool(tmp_path: Path) -> None:
+    """The soft match (``Tool.Scope.Read``) reaches the grant on the tool that has it."""
+    assert _probe(_grant_regos(tmp_path)[REPO_TOOL], "alice", "Tool.Scope.Read") is True
 
 
-def test_probe_denies_a_tool_granted_on_another_target_only(tmp_path: Path) -> None:
+def test_probe_denies_a_tool_granted_on_another_tool_only(tmp_path: Path) -> None:
     """The grant on repo-tool decides nothing on tracker-tool, which has a tool of the same name."""
-    assert _probe(_outbound_rego(tmp_path), "alice", TRACKER_TOOL, "Tool.Scope.Read") is False
+    assert _probe(_grant_regos(tmp_path)[TRACKER_TOOL], "alice", "Tool.Scope.Read") is False
 
 
 def test_probe_denies_a_subject_with_no_role(tmp_path: Path) -> None:
-    assert _probe(_outbound_rego(tmp_path), "mallory", REPO_TOOL, "Tool.Scope.Read") is False
+    assert _probe(_grant_regos(tmp_path)[REPO_TOOL], "mallory", "Tool.Scope.Read") is False
 
 
-def test_probe_denies_a_tool_that_another_role_of_the_subject_denies_on_the_target(tmp_path: Path) -> None:
-    """The real gate requires ``not subject_deny_ok``: a deny of one role blocks a grant of another."""
-    rego = _deny_rego(tmp_path)
-    assert _probe(rego, "alice", REPO_TOOL, "Tool.Scope.Write") is False
-    assert _probe(rego, "carol", REPO_TOOL, "Tool.Scope.Write") is True
+def test_probe_denies_a_caller_with_no_role(tmp_path: Path) -> None:
+    """The calling-agent gate is mandatory: a grant to the subject does not admit an unknown caller."""
+    assert _probe(_grant_regos(tmp_path)[REPO_TOOL], "alice", "Tool.Scope.Read", client_id=UNKNOWN_AGENT) is False
 
 
-def test_probe_applies_a_subject_deny_only_on_the_target_that_it_is_keyed_by(tmp_path: Path) -> None:
-    assert _probe(_deny_rego(tmp_path), "alice", TRACKER_TOOL, "Tool.Scope.Write") is True
+def test_probe_denies_a_tool_that_another_role_of_the_subject_denies(tmp_path: Path) -> None:
+    """The real gate requires ``not subject_denies``: a deny of one role blocks a grant of another."""
+    rego = _deny_regos(tmp_path)[REPO_TOOL]
+    assert _probe(rego, "alice", "Tool.Scope.Write") is False
+    assert _probe(rego, "carol", "Tool.Scope.Write") is True
 
 
-def test_probe_denies_a_tool_that_the_target_denies(tmp_path: Path) -> None:
-    """The real gate requires ``not target_deny_ok``: a target deny blocks every subject's grant."""
-    rego = _deny_rego(tmp_path)
-    assert _probe(rego, "alice", REPO_TOOL, "Tool.Scope.Read") is False
-    assert _probe(rego, "carol", REPO_TOOL, "Tool.Scope.Read") is False
+def test_probe_applies_a_subject_deny_only_on_the_tool_that_has_it(tmp_path: Path) -> None:
+    assert _probe(_deny_regos(tmp_path)[TRACKER_TOOL], "alice", "Tool.Scope.Write") is True
 
 
-@pytest.mark.parametrize("apm_rego", [_outbound_rego, _deny_rego])
-def test_probe_decides_as_the_real_gate(tmp_path: Path, apm_rego) -> None:
-    """On every (subject, target, tool) cell, the probe with the eval's soft-match rendering of the
-    tool name gives the decision of the deployed gate with the exact name."""
-    rego = apm_rego(tmp_path)
+def test_probe_denies_a_tool_that_the_calling_agent_is_denied(tmp_path: Path) -> None:
+    """The real gate requires ``not source_denies``: a deny of one role of the caller blocks every
+    subject's grant."""
+    rego = _deny_regos(tmp_path)[REPO_TOOL]
+    assert _probe(rego, "alice", "Tool.Scope.Read") is False
+    assert _probe(rego, "carol", "Tool.Scope.Read") is False
+
+
+@pytest.mark.parametrize("tool_regos", [_grant_regos, _deny_regos])
+def test_probe_decides_as_the_real_gate(tmp_path: Path, tool_regos) -> None:
+    """On every (tool, subject, caller, tool name) cell, the probe with the eval's soft-match
+    rendering of the tool name gives the decision of the deployed gate with the exact name."""
+    regos = tool_regos(tmp_path)
     cells = [
-        (subject, target, tool)
+        (target, subject, caller, tool)
+        for target in (REPO_TOOL, TRACKER_TOOL)
         for subject in ("alice", "carol", "mallory")
-        for target in (REPO_TOOL, TRACKER_TOOL, "unknown-target")
+        for caller in (AGENT, UNKNOWN_AGENT)
         for tool in ("tool-scope-read", "tool-scope-write")
     ]
     mismatches = []
-    for subject, target, tool in cells:
-        real = _real_gate(rego, subject, target, tool)
-        probe = _probe(rego, subject, target, reformat_function_name(tool))
+    for target, subject, caller, tool in cells:
+        real = _real_gate(regos[target], subject, caller, tool)
+        probe = _probe(regos[target], subject, reformat_function_name(tool), client_id=caller)
         if real != probe:
-            mismatches.append(((subject, target, tool), real, probe))
+            mismatches.append(((target, subject, caller, tool), real, probe))
     assert mismatches == []
+
+
+# --- the agent inbound (D26a): the deployed gate, not the per-scope probe -------------------------
+#
+# broker-agent owns two delegation scopes. alice's role is granted only the first one; repo-agent's
+# role is granted both. The deployed agent inbound is agent-level, so it admits alice for a call to
+# either scope. A per-scope probe would deny the call to the second scope.
+
+_BROKER_FIRST = "agent-scope-broker-first"
+_BROKER_SECOND = "agent-scope-broker-second"
+
+_AGENT_SCENARIO = SimpleNamespace(
+    USERS={"alice": "user-role-developer", "mallory": "user-role-guest"},
+    AGENTS={
+        AGENT: {"inbound_scopes": {}, "delegation_scopes": {}, "roles": {"agent-role-repo": ""}},
+        BROKER_AGENT: {"inbound_scopes": {}, "delegation_scopes": {_BROKER_FIRST: "", _BROKER_SECOND: ""}, "roles": {}},
+    },
+    TOOLS={},
+    INBOUND_PAIRS=[],
+    OUTBOUND_SUBJECT_PAIRS=[("user-role-developer", _BROKER_FIRST)],
+    OUTBOUND_PAIRS=[("agent-role-repo", _BROKER_FIRST), ("agent-role-repo", _BROKER_SECOND)],
+)
+
+
+def _agent_inbound(tmp_path: Path) -> Path:
+    """Write the agent inbound of broker-agent, as the writer renders it, to a file."""
+    developer = _user_role("user-role-developer", "alice")
+    agent_role = _agent_role("agent-role-repo", AGENT)
+    first = _scope(_BROKER_FIRST, BROKER_AGENT)
+    second = _scope(_BROKER_SECOND, BROKER_AGENT)
+    spm = ServicePolicyModel(
+        service_id=BROKER_AGENT,
+        service_type=ServiceType.AGENT,
+        owned_roles=[],
+        owned_scopes=[first, second],
+        inbound_allow_rules=[_allow(developer, first), _allow(agent_role, first), _allow(agent_role, second)],
+        inbound_deny_rules=[],
+    )
+    path = tmp_path / "broker_agent" / "inbound.rego"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(render_target_side(spm).inbound)
+    return path
+
+
+def test_a_call_to_an_agent_is_decided_by_the_agent_level_gate(tmp_path: Path) -> None:
+    """alice holds only the first scope of broker-agent, but the agent-level gate admits her call to
+    the second scope too. The decision and the truth table agree on every cell."""
+    rego = _agent_inbound(tmp_path)
+    cells = [
+        (subject, caller, scope)
+        for subject in ("alice", "mallory")
+        for caller in (AGENT, UNKNOWN_AGENT)
+        for scope in (_BROKER_FIRST, _BROKER_SECOND)
+    ]
+    got = {cell: _callee_decision(_AGENT_SCENARIO, rego, BROKER_AGENT, *cell) for cell in cells}
+    assert got[("alice", AGENT, _BROKER_SECOND)] is True
+    mismatches = [
+        (cell, decision)
+        for cell, decision in got.items()
+        if cell[1] in _AGENT_SCENARIO.AGENTS
+        and decision != expected_agent_call(_AGENT_SCENARIO, cell[0], cell[1], BROKER_AGENT)
+    ]
+    assert mismatches == []
+    assert [cell for cell, decision in got.items() if cell[1] == UNKNOWN_AGENT and decision] == []

@@ -6,12 +6,10 @@ cluster); every test patches that module-level ``_api`` with a ``MagicMock`` so
 no real Kubernetes API is contacted. The additive ``POLICY_WRITER_DUMP_REGO``
 local-dump toggle is covered here too (it never gates or replaces the CR write).
 
-The body of ``POST`` / ``PUT /policy`` is a tagged policy model; each entry is one
-CR (target side: each ``services[]`` SPM; agent side: each ``agents[]`` APM and each
-``pass_through[]`` tool id). A wrong or missing tag, a body that mixes the sides, and
-an agent that is also a pass-through are 422. The per-service delete takes the id
-with the ``{service_id:path}`` converter: the library percent-encodes the slashes of
-a clientId (``%2F``), and the server decodes them back before routing.
+The body of ``POST`` / ``PUT /policy`` is the policy model; each ``services[]``
+SPM is one CR. A body without ``services`` is 422. The per-service delete takes
+the id with the ``{service_id:path}`` converter: the library percent-encodes the
+slashes of a clientId (``%2F``), and the server decodes them back before routing.
 
 The end-to-end test runs ``opa eval`` on the CR content that the writer applied
 (skips without ``opa`` on PATH); its verdicts are hand-written from the spec.
@@ -32,18 +30,11 @@ from aiac.idp.configuration.models import Role, RoleKind, Scope, ServiceType
 from aiac.pdp.policy.library.api import _service_id_segment
 from aiac.pdp.service.policy.opa import main
 from aiac.pdp.service.policy.opa.main import app
-from aiac.policy.model.models import (
-    AgentPolicyModel,
-    AgentSidePolicyModel,
-    PolicyRule,
-    ServicePolicyModel,
-    TargetSidePolicyModel,
-)
+from aiac.policy.model.models import PolicyModel, PolicyRule, ServicePolicyModel
 
 TOOL = "spiffe://localtest.me/ns/team1/sa/github-tool"
 AGENT = "spiffe://localtest.me/ns/team1/sa/github-agent"
 LABEL = {"app.kubernetes.io/managed-by": "aiac-pdp-policy-writer"}
-PASS_THROUGH_INBOUND = "package authbridge.client.inbound.request\nimport rego.v1\n\nallow := true\n"
 PASS_THROUGH_OUTBOUND = "package authbridge.client.outbound.request\nimport rego.v1\n\nallow := true\n"
 
 
@@ -71,31 +62,9 @@ def _spm(service_id: str, service_type: ServiceType = ServiceType.TOOL) -> Servi
     )
 
 
-def _target_side(*spms: ServicePolicyModel) -> dict:
-    return TargetSidePolicyModel(services=list(spms)).model_dump(mode="json")
-
-
-def _apm(agent_id: str) -> AgentPolicyModel:
-    """dev-user (role developer) may call the agent (its one agent scope) and, through it, the tool
-    ``source-read`` of github-tool. No other grant."""
-    owner = agent_id.rsplit("/", 1)[-1]
-    agent_scope = Scope(id=f"{owner}-ops", name=f"{owner}.source_operations", serviceId=agent_id)
-    tool_scope = Scope(id="github-tool-s1", name="github-tool.source-read", serviceId=TOOL)
-    developer = Role(id="developer", name="developer", composite=False, kind=RoleKind.USER, actorIds=["dev-user"])
-    return AgentPolicyModel(
-        agent_id=agent_id,
-        agent_roles=[],
-        agent_scopes=[agent_scope],
-        subject_roles={"dev-user": [developer]},
-        source_roles={},
-        target_allow_scopes={TOOL: [tool_scope]},
-        inbound_subject_allow_rules=[PolicyRule(role=developer, scope=agent_scope)],
-        outbound_subject_allow_rules=[PolicyRule(role=developer, scope=tool_scope)],
-    )
-
-
-def _agent_side(*apms: AgentPolicyModel, pass_through: tuple[str, ...] = ()) -> dict:
-    return AgentSidePolicyModel(agents=list(apms), pass_through=list(pass_through)).model_dump(mode="json")
+def _body(*spms: ServicePolicyModel) -> dict:
+    """The JSON body of ``POST`` / ``PUT /policy``: the policy model of ``spms``."""
+    return PolicyModel(services=list(spms)).model_dump(mode="json")
 
 
 def _applied(api) -> list[dict]:
@@ -108,13 +77,13 @@ def _policies(cr: dict) -> dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# POST /policy (target side) -> one server-side apply per SPM
+# POST /policy -> one server-side apply per SPM
 # ---------------------------------------------------------------------------
 
 
-class TestPostTargetSide:
+class TestPost:
     def test_tool_cr_is_server_side_applied(self, api):
-        resp = TestClient(app).post("/policy", json=_target_side(_spm(TOOL)))
+        resp = TestClient(app).post("/policy", json=_body(_spm(TOOL)))
         assert resp.status_code == 204
         api.patch_namespaced_custom_object.assert_called_once()
         kwargs = api.patch_namespaced_custom_object.call_args.kwargs
@@ -127,7 +96,7 @@ class TestPostTargetSide:
         assert kwargs["_content_type"] == "application/apply-patch+yaml"
 
     def test_tool_cr_shape_and_both_request_packages(self, api):
-        TestClient(app).post("/policy", json=_target_side(_spm(TOOL)))
+        TestClient(app).post("/policy", json=_body(_spm(TOOL)))
         (cr,) = _applied(api)
         assert cr["apiVersion"] == "agent.rossoctl.dev/v1alpha1"
         assert cr["kind"] == "AuthorizationPolicy"
@@ -145,7 +114,7 @@ class TestPostTargetSide:
 
     def test_agent_cr_has_the_agent_inbound_and_the_pass_through_outbound(self, api, monkeypatch):
         monkeypatch.setenv("PLATFORM_SOURCE_CLIENTS", "rossoctl,argocd")
-        resp = TestClient(app).post("/policy", json=_target_side(_spm(AGENT, ServiceType.AGENT)))
+        resp = TestClient(app).post("/policy", json=_body(_spm(AGENT, ServiceType.AGENT)))
         assert resp.status_code == 204
         (cr,) = _applied(api)
         assert cr["metadata"] == {"name": "github-agent", "namespace": "team1", "labels": LABEL}
@@ -159,7 +128,7 @@ class TestPostTargetSide:
         assert policies["outbound/request.rego"] == PASS_THROUGH_OUTBOUND
 
     def test_batch_writes_one_cr_per_service_in_order(self, api):
-        body = _target_side(_spm(TOOL), _spm(AGENT, ServiceType.AGENT), _spm("team2/weather-tool"))
+        body = _body(_spm(TOOL), _spm(AGENT, ServiceType.AGENT), _spm("team2/weather-tool"))
         resp = TestClient(app).post("/policy", json=body)
         assert resp.status_code == 204
         refs = [(cr["metadata"]["namespace"], cr["metadata"]["name"]) for cr in _applied(api)]
@@ -167,7 +136,7 @@ class TestPostTargetSide:
 
     def test_a_bad_id_is_skipped_and_logged_and_the_other_entries_are_written(self, api, caplog):
         # "github-agent" has no derivable namespace: it cannot have a CR (D20 denies it).
-        body = _target_side(_spm("github-agent"), _spm(TOOL))
+        body = _body(_spm("github-agent"), _spm(TOOL))
         resp = TestClient(app).post("/policy", json=body)
         assert resp.status_code == 204
         assert [cr["metadata"]["name"] for cr in _applied(api)] == ["github-tool"]
@@ -175,90 +144,12 @@ class TestPostTargetSide:
 
     def test_api_exception_is_502(self, api):
         api.patch_namespaced_custom_object.side_effect = ApiException(status=500)
-        resp = TestClient(app).post("/policy", json=_target_side(_spm(TOOL)))
+        resp = TestClient(app).post("/policy", json=_body(_spm(TOOL)))
         assert resp.status_code == 502
         assert "error" in resp.json()
 
     def test_empty_model_writes_nothing(self, api):
-        resp = TestClient(app).post("/policy", json=_target_side())
-        assert resp.status_code == 204
-        api.patch_namespaced_custom_object.assert_not_called()
-
-
-# ---------------------------------------------------------------------------
-# POST /policy (agent side) -> one agent CR per APM, one pass-through CR per tool
-# ---------------------------------------------------------------------------
-
-
-class TestPostAgentSide:
-    def test_agent_cr_has_the_agent_inbound_and_the_agent_outbound(self, api, monkeypatch):
-        monkeypatch.setenv("PLATFORM_SOURCE_CLIENTS", "rossoctl,argocd")
-        resp = TestClient(app).post("/policy", json=_agent_side(_apm(AGENT)))
-        assert resp.status_code == 204
-        (cr,) = _applied(api)
-        assert cr["metadata"] == {"name": "github-agent", "namespace": "team1", "labels": LABEL}
-        assert cr["spec"]["scope"] == "client"
-        assert cr["spec"]["clientID"] == "github-agent"
-        assert [p["path"] for p in cr["spec"]["policies"]] == ["inbound/request.rego", "outbound/request.rego"]
-        policies = _policies(cr)
-        inbound = policies["inbound/request.rego"]
-        # The agent inbound (agent-level): the full scope names and the platform-client bypass.
-        assert inbound.startswith("package authbridge.client.inbound.request\nimport rego.v1\n")
-        assert 'agent_scopes := ["github-agent.source_operations"]' in inbound
-        assert 'source_allow_ok if { input.identity.client_id == "argocd" }' in inbound
-        outbound = policies["outbound/request.rego"]
-        # The agent outbound: the per-tool checks (the full target id, the bare tool name) and the
-        # MCP session rule.
-        assert outbound.startswith("package authbridge.client.outbound.request\nimport rego.v1\n")
-        assert f'    "{TOOL}": ["source-read"],' in outbound
-        assert 'session_methods := {"initialize", "notifications/initialized", "ping", "tools/list"}' in outbound
-        assert "default allow := false" in outbound
-
-    def test_each_pass_through_id_gets_a_pass_through_cr(self, api):
-        resp = TestClient(app).post("/policy", json=_agent_side(pass_through=(TOOL, "team2/weather-tool")))
-        assert resp.status_code == 204
-        crs = _applied(api)
-        assert [cr["metadata"] for cr in crs] == [
-            {"name": "github-tool", "namespace": "team1", "labels": LABEL},
-            {"name": "weather-tool", "namespace": "team2", "labels": LABEL},
-        ]
-        for cr in crs:
-            assert cr["spec"]["scope"] == "client"
-            assert cr["spec"]["clientID"] == cr["metadata"]["name"]
-            assert _policies(cr) == {
-                "inbound/request.rego": PASS_THROUGH_INBOUND,
-                "outbound/request.rego": PASS_THROUGH_OUTBOUND,
-            }
-
-    def test_batch_writes_the_agent_crs_then_the_pass_through_crs_in_order(self, api):
-        body = _agent_side(_apm(AGENT), _apm("team2/weather-agent"), pass_through=(TOOL, "team2/weather-tool"))
-        resp = TestClient(app).post("/policy", json=body)
-        assert resp.status_code == 204
-        refs = [(cr["metadata"]["namespace"], cr["metadata"]["name"]) for cr in _applied(api)]
-        assert refs == [
-            ("team1", "github-agent"),
-            ("team2", "weather-agent"),
-            ("team1", "github-tool"),
-            ("team2", "weather-tool"),
-        ]
-
-    @pytest.mark.parametrize(
-        "body",
-        [
-            _agent_side(_apm(AGENT), _apm("github-agent")),
-            _agent_side(_apm(AGENT), pass_through=("github-agent",)),
-        ],
-        ids=["agent-id", "pass-through-id"],
-    )
-    def test_a_bad_id_is_skipped_and_logged_and_the_other_entries_are_written(self, api, caplog, body):
-        # "github-agent" has no derivable namespace: it cannot have a CR (D20 denies it).
-        resp = TestClient(app).post("/policy", json=body)
-        assert resp.status_code == 204
-        assert [cr["metadata"]["name"] for cr in _applied(api)] == ["github-agent"]
-        assert "'github-agent'" in caplog.text
-
-    def test_empty_model_writes_nothing(self, api):
-        resp = TestClient(app).post("/policy", json=_agent_side())
+        resp = TestClient(app).post("/policy", json=_body())
         assert resp.status_code == 204
         api.patch_namespaced_custom_object.assert_not_called()
 
@@ -279,74 +170,99 @@ def _opa_allows(rego: str, tier: str, input_doc: dict) -> bool:
     return json.loads(out)["result"][0]["expressions"][0]["value"]
 
 
-def _tool_call(subject: str, tool: str, target: str = TOOL) -> dict:
+def _tool_call(subject: str, tool: str, client_id: str = AGENT) -> dict:
     return {
-        "identity": {"subject": subject, "service_id": target},
+        "identity": {"subject": subject, "client_id": client_id},
         "mcp": {"method": "tools/call", "params": {"name": tool}},
     }
 
 
-# The verdicts that the spec gives for the CRs of the agent-side body {agents: [github-agent],
-# pass_through: [github-tool]}, where dev-user (developer) may call github-agent and, through it,
-# github-tool's source-read; nothing else is granted.
-_AGENT_SIDE_VERDICTS = [
-    # the agent outbound: the per-tool checks
-    ("github-agent", "outbound", _tool_call("dev-user", "source-read"), True),
-    ("github-agent", "outbound", _tool_call("dev-user", "issues-read"), False),
-    ("github-agent", "outbound", _tool_call("test-user", "source-read"), False),
+def _end_to_end_body() -> dict:
+    """dev-user (role developer) may call github-agent (its one agent scope). dev-user and
+    github-agent (role github-caller) may call the tool ``source-read`` of github-tool. github-tool
+    also owns ``issues-read``, with no grant. No other grant."""
+    developer = Role(id="developer", name="developer", composite=False, kind=RoleKind.USER, actorIds=["dev-user"])
+    caller = Role(id="github-caller", name="github-caller", composite=False, kind=RoleKind.AGENT, actorIds=[AGENT])
+    agent_scope = Scope(id="github-agent-ops", name="github-agent.source_operations", serviceId=AGENT)
+    source_read = Scope(id="github-tool-s1", name="github-tool.source-read", serviceId=TOOL)
+    issues_read = Scope(id="github-tool-s2", name="github-tool.issues-read", serviceId=TOOL)
+    agent = ServicePolicyModel(
+        service_id=AGENT,
+        service_type=ServiceType.AGENT,
+        owned_roles=[caller],
+        owned_scopes=[agent_scope],
+        inbound_allow_rules=[PolicyRule(role=developer, scope=agent_scope)],
+    )
+    tool = ServicePolicyModel(
+        service_id=TOOL,
+        service_type=ServiceType.TOOL,
+        owned_roles=[],
+        owned_scopes=[source_read, issues_read],
+        inbound_allow_rules=[PolicyRule(role=developer, scope=source_read), PolicyRule(role=caller, scope=source_read)],
+    )
+    return _body(agent, tool)
+
+
+# The verdicts that the spec gives for the CRs of ``_end_to_end_body``.
+_VERDICTS = [
+    # the tool inbound: the per-tool check, both gates mandatory (D26)
+    ("github-tool", "inbound", _tool_call("dev-user", "source-read"), True),
+    ("github-tool", "inbound", _tool_call("dev-user", "issues-read"), False),
+    ("github-tool", "inbound", _tool_call("test-user", "source-read"), False),
     (
-        "github-agent",
-        "outbound",
-        _tool_call("dev-user", "source-read", "spiffe://localtest.me/ns/team1/sa/other-tool"),
+        "github-tool",
+        "inbound",
+        _tool_call("dev-user", "source-read", "spiffe://localtest.me/ns/team1/sa/other-agent"),
         False,
     ),
-    # the agent outbound: the MCP session rule
+    # the tool inbound: no platform-client bypass, and no "no calling agent" open
+    ("github-tool", "inbound", _tool_call("dev-user", "source-read", "rossoctl"), False),
     (
-        "github-agent",
-        "outbound",
-        {"identity": {"subject": "dev-user", "service_id": TOOL}, "mcp": {"method": "tools/list"}},
+        "github-tool",
+        "inbound",
+        {"identity": {"subject": "dev-user"}, "mcp": {"method": "tools/call", "params": {"name": "source-read"}}},
+        False,
+    ),
+    # the tool inbound: the MCP session rule and the self-discovery rule of the tool's own client
+    (
+        "github-tool",
+        "inbound",
+        {"identity": {"subject": "dev-user", "client_id": AGENT}, "mcp": {"method": "tools/list"}},
         True,
     ),
     (
-        "github-agent",
-        "outbound",
-        {"identity": {"subject": "test-user", "service_id": TOOL}, "mcp": {"method": "initialize"}},
+        "github-tool",
+        "inbound",
+        {"identity": {"subject": "test-user", "client_id": AGENT}, "mcp": {"method": "initialize"}},
         False,
     ),
-    # the agent outbound: the known limit (b435aa1) — A2A and LLM calls are denied
+    ("github-tool", "inbound", {"identity": {"client_id": TOOL}, "mcp": {"method": "tools/list"}}, True),
+    # the tool inbound: a request that is not an MCP message, and a request with no identity, are denied
     (
-        "github-agent",
-        "outbound",
-        {"identity": {"subject": "dev-user", "service_id": TOOL}, "a2a": {"method": "message/send"}},
+        "github-tool",
+        "inbound",
+        {"identity": {"subject": "dev-user", "client_id": AGENT}, "a2a": {"method": "message/send"}},
         False,
     ),
-    ("github-agent", "outbound", {"identity": {"subject": "dev-user", "service_id": TOOL}}, False),
+    ("github-tool", "inbound", {}, False),
     # the agent inbound (agent-level): a granted user, the platform client; no role or no identity is denied
     ("github-agent", "inbound", {"identity": {"subject": "dev-user"}, "a2a": {"method": "message/send"}}, True),
     ("github-agent", "inbound", {"identity": {"subject": "dev-user", "client_id": "rossoctl"}}, True),
     ("github-agent", "inbound", {"identity": {"subject": "test-user"}, "a2a": {"method": "message/send"}}, False),
     ("github-agent", "inbound", {}, False),
-    # the pass-through CR of the tool: both tiers allow every request (D24)
-    ("github-tool", "inbound", {}, True),
-    (
-        "github-tool",
-        "inbound",
-        {
-            "identity": {"subject": "test-user", "client_id": AGENT},
-            "mcp": {"method": "tools/call", "params": {"name": "issues-write"}},
-        },
-        True,
-    ),
+    # the outbound of each CR: a pass-through that allows every request (D24)
+    ("github-agent", "outbound", {}, True),
+    ("github-agent", "outbound", _tool_call("test-user", "issues-write", TOOL), True),
     ("github-tool", "outbound", {}, True),
     ("github-tool", "outbound", {"identity": {"subject": "test-user"}, "a2a": {"method": "message/send"}}, True),
 ]
 
 
 @pytest.mark.skipif(not shutil.which("opa"), reason="opa binary not on PATH")
-@pytest.mark.parametrize("cr_name, tier, input_doc, allowed", _AGENT_SIDE_VERDICTS)
-def test_agent_side_crs_end_to_end(api, cr_name, tier, input_doc, allowed):
+@pytest.mark.parametrize("cr_name, tier, input_doc, allowed", _VERDICTS)
+def test_the_applied_crs_end_to_end(api, cr_name, tier, input_doc, allowed):
     # The Rego under test is the CR content that the writer applied, not a generator output.
-    resp = TestClient(app).post("/policy", json=_agent_side(_apm(AGENT), pass_through=(TOOL,)))
+    resp = TestClient(app).post("/policy", json=_end_to_end_body())
     assert resp.status_code == 204
     contents = {cr["metadata"]["name"]: _policies(cr) for cr in _applied(api)}
     assert _opa_allows(contents[cr_name][f"{tier}/request.rego"], tier, input_doc) is allowed
@@ -374,7 +290,7 @@ class TestPut:
         api.list_cluster_custom_object.return_value = _listing(
             ("team1", "github-tool"), ("team1", "old-agent"), ("team1", "github-agent"), ("team2", "gone-tool")
         )
-        body = _target_side(_spm(TOOL), _spm(AGENT, ServiceType.AGENT))
+        body = _body(_spm(TOOL), _spm(AGENT, ServiceType.AGENT))
         resp = TestClient(app).put("/policy", json=body)
         assert resp.status_code == 204
         assert [cr["metadata"]["name"] for cr in _applied(api)] == ["github-tool", "github-agent"]
@@ -391,7 +307,7 @@ class TestPut:
 
     def test_deletes_run_only_after_every_upsert(self, api):
         api.list_cluster_custom_object.return_value = _listing(("team1", "old-agent"))
-        TestClient(app).put("/policy", json=_target_side(_spm(TOOL), _spm(AGENT, ServiceType.AGENT)))
+        TestClient(app).put("/policy", json=_body(_spm(TOOL), _spm(AGENT, ServiceType.AGENT)))
         calls = [name for name, _, _ in api.method_calls]
         assert calls == [
             "patch_namespaced_custom_object",
@@ -403,7 +319,7 @@ class TestPut:
     def test_a_failed_upsert_deletes_nothing(self, api):
         api.patch_namespaced_custom_object.side_effect = [None, ApiException(status=500)]
         api.list_cluster_custom_object.return_value = _listing(("team1", "old-agent"))
-        resp = TestClient(app).put("/policy", json=_target_side(_spm(TOOL), _spm(AGENT, ServiceType.AGENT)))
+        resp = TestClient(app).put("/policy", json=_body(_spm(TOOL), _spm(AGENT, ServiceType.AGENT)))
         assert resp.status_code == 502
         api.list_cluster_custom_object.assert_not_called()
         api.delete_namespaced_custom_object.assert_not_called()
@@ -411,7 +327,7 @@ class TestPut:
     def test_a_bad_id_is_skipped_and_the_rest_is_replaced(self, api, caplog):
         # A bad id cannot have a CR. One bad stored SPM must not stop the resync at every start.
         api.list_cluster_custom_object.return_value = _listing(("team1", "github-tool"), ("team1", "old-agent"))
-        resp = TestClient(app).put("/policy", json=_target_side(_spm("github-agent"), _spm(TOOL)))
+        resp = TestClient(app).put("/policy", json=_body(_spm("github-agent"), _spm(TOOL)))
         assert resp.status_code == 204
         assert _upserted(api) == [("team1", "github-tool")]
         assert _deleted(api) == [("team1", "old-agent")]
@@ -419,7 +335,7 @@ class TestPut:
 
     def test_an_empty_model_deletes_every_labelled_cr(self, api):
         api.list_cluster_custom_object.return_value = _listing(("team1", "github-tool"), ("team1", "github-agent"))
-        resp = TestClient(app).put("/policy", json=_target_side())
+        resp = TestClient(app).put("/policy", json=_body())
         assert resp.status_code == 204
         api.patch_namespaced_custom_object.assert_not_called()
         assert sorted(_deleted(api)) == [("team1", "github-agent"), ("team1", "github-tool")]
@@ -427,48 +343,15 @@ class TestPut:
     def test_a_concurrent_delete_404_is_success(self, api):
         api.list_cluster_custom_object.return_value = _listing(("team1", "old-agent"))
         api.delete_namespaced_custom_object.side_effect = ApiException(status=404)
-        resp = TestClient(app).put("/policy", json=_target_side(_spm(TOOL)))
+        resp = TestClient(app).put("/policy", json=_body(_spm(TOOL)))
         assert resp.status_code == 204
 
     def test_a_failed_delete_is_502(self, api):
         api.list_cluster_custom_object.return_value = _listing(("team1", "old-agent"))
         api.delete_namespaced_custom_object.side_effect = ApiException(status=500)
-        resp = TestClient(app).put("/policy", json=_target_side(_spm(TOOL)))
+        resp = TestClient(app).put("/policy", json=_body(_spm(TOOL)))
         assert resp.status_code == 502
         assert "error" in resp.json()
-
-    def test_agent_side_keeps_the_agent_and_pass_through_crs_and_deletes_the_rest(self, api):
-        # A CR of the other side: github-tool still has its target-side CR. The PUT writes it again as a
-        # pass-through CR (spec.policies is atomic, so one write replaces both packages) and never
-        # deletes it; only the CRs that are in no entry go.
-        api.list_cluster_custom_object.return_value = _listing(
-            ("team1", "github-agent"), ("team1", "github-tool"), ("team1", "old-tool"), ("team2", "gone-agent")
-        )
-        resp = TestClient(app).put("/policy", json=_agent_side(_apm(AGENT), pass_through=(TOOL,)))
-        assert resp.status_code == 204
-        agent_cr, tool_cr = _applied(api)
-        assert (agent_cr["metadata"]["name"], tool_cr["metadata"]["name"]) == ("github-agent", "github-tool")
-        assert _policies(agent_cr)["outbound/request.rego"] != PASS_THROUGH_OUTBOUND
-        assert _policies(tool_cr) == {
-            "inbound/request.rego": PASS_THROUGH_INBOUND,
-            "outbound/request.rego": PASS_THROUGH_OUTBOUND,
-        }
-        assert sorted(_deleted(api)) == [("team1", "old-tool"), ("team2", "gone-agent")]
-
-    def test_agent_side_bad_id_is_skipped_and_the_rest_is_replaced(self, api, caplog):
-        api.list_cluster_custom_object.return_value = _listing(("team1", "old-tool"))
-        resp = TestClient(app).put("/policy", json=_agent_side(_apm(AGENT), pass_through=("github-tool",)))
-        assert resp.status_code == 204
-        assert _upserted(api) == [("team1", "github-agent")]
-        assert _deleted(api) == [("team1", "old-tool")]
-        assert "github-tool" in caplog.text
-
-    def test_an_empty_agent_side_model_deletes_every_labelled_cr(self, api):
-        api.list_cluster_custom_object.return_value = _listing(("team1", "github-tool"), ("team1", "github-agent"))
-        resp = TestClient(app).put("/policy", json=_agent_side())
-        assert resp.status_code == 204
-        api.patch_namespaced_custom_object.assert_not_called()
-        assert sorted(_deleted(api)) == [("team1", "github-agent"), ("team1", "github-tool")]
 
 
 # ---------------------------------------------------------------------------
@@ -510,89 +393,18 @@ class TestDeleteService:
         api.delete_namespaced_custom_object.assert_not_called()
 
 
-@pytest.mark.parametrize("method", ["post", "delete"])
-def test_the_per_agent_routes_are_retired(api, method):
-    resp = getattr(TestClient(app), method)(f"/policy/agents/{_service_id_segment(AGENT)}")
-    assert resp.status_code in (404, 405)
-    api.patch_namespaced_custom_object.assert_not_called()
-    api.delete_namespaced_custom_object.assert_not_called()
-
-
 # ---------------------------------------------------------------------------
-# The policy-model tag: a wrong or missing tag, or a body that mixes the sides, is a 422
-# (nothing is written, nothing is deleted)
+# A body without services is a 422 (nothing is written, nothing is deleted)
 # ---------------------------------------------------------------------------
 
 
-_SERVICES = [_spm(TOOL).model_dump(mode="json")]
-_AGENTS = [_apm(AGENT).model_dump(mode="json")]
-
-
-def _assert_nothing_changed(api) -> None:
+@pytest.mark.parametrize("method", ["post", "put"])
+def test_a_body_without_services_is_422_and_writes_nothing(api, method):
+    resp = getattr(TestClient(app), method)("/policy", json={})
+    assert resp.status_code == 422
     api.patch_namespaced_custom_object.assert_not_called()
     api.list_cluster_custom_object.assert_not_called()
     api.delete_namespaced_custom_object.assert_not_called()
-
-
-# The plain discriminated union (no Body wrapper) rejects these bodies: the tag is mandatory.
-@pytest.mark.parametrize("method", ["post", "put"])
-@pytest.mark.parametrize(
-    "body",
-    [
-        {"services": _SERVICES},  # no tag
-        {"agents": _AGENTS, "pass_through": [TOOL]},  # no tag
-        {"enforcement_side": "both-sides", "services": _SERVICES},  # an unknown tag
-        {"enforcement_side": "agent-side", "services": _SERVICES},  # the tag of another side
-        {"enforcement_side": "target-side", "agents": _AGENTS},  # the tag of another side
-        {"agents": []},  # the retired per-agent shape (no tag)
-    ],
-    ids=[
-        "missing-tag-target",
-        "missing-tag-agent",
-        "unknown-tag",
-        "agent-tag-on-services",
-        "target-tag-on-agents",
-        "retired-shape",
-    ],
-)
-def test_a_wrong_or_missing_tag_is_422(api, method, body):
-    resp = getattr(TestClient(app), method)("/policy", json=body)
-    assert resp.status_code == 422
-    _assert_nothing_changed(api)
-
-
-@pytest.mark.parametrize("method", ["post", "put"])
-@pytest.mark.parametrize(
-    "body",
-    [
-        {"enforcement_side": "agent-side", "agents": _AGENTS, "pass_through": [TOOL], "services": _SERVICES},
-        {"enforcement_side": "agent-side", "agents": [], "services": []},
-        {"enforcement_side": "target-side", "services": _SERVICES, "agents": _AGENTS},
-        {"enforcement_side": "target-side", "services": _SERVICES, "pass_through": [TOOL]},
-    ],
-    ids=[
-        "agent-side-with-services",
-        "agent-side-with-empty-services",
-        "target-side-with-agents",
-        "target-side-with-pass-through",
-    ],
-)
-def test_a_body_that_mixes_the_sides_is_422(api, method, body):
-    # The models ignore unknown fields, so without this check the entries of the other side would be
-    # dropped without a word, and a PUT would then delete their CRs.
-    resp = getattr(TestClient(app), method)("/policy", json=body)
-    assert resp.status_code == 422
-    _assert_nothing_changed(api)
-
-
-@pytest.mark.parametrize("method", ["post", "put"])
-def test_an_agent_that_is_also_a_pass_through_is_422(api, method):
-    # Fail closed: a pass-through CR must never replace the agent CR of the same service.
-    body = {"enforcement_side": "agent-side", "agents": _AGENTS, "pass_through": [TOOL, AGENT]}
-    resp = getattr(TestClient(app), method)("/policy", json=body)
-    assert resp.status_code == 422
-    assert AGENT in resp.text
-    _assert_nothing_changed(api)
 
 
 # ---------------------------------------------------------------------------
@@ -656,7 +468,7 @@ class TestDumpToggle:
         return tmp_path
 
     def test_dump_on_writes_both_packages_and_still_patches(self, api, dump):
-        resp = TestClient(app).post("/policy", json=_target_side(_spm(TOOL)))
+        resp = TestClient(app).post("/policy", json=_body(_spm(TOOL)))
         assert resp.status_code == 204
         api.patch_namespaced_custom_object.assert_called_once()
         tree = dump / "team1" / "github-tool"
@@ -666,7 +478,7 @@ class TestDumpToggle:
     def test_dump_off_writes_no_files_but_still_patches(self, api, tmp_path, monkeypatch):
         # Toggle unset (deleted by the api fixture); REGO_OUTPUT_DIR set but unused.
         monkeypatch.setenv("REGO_OUTPUT_DIR", str(tmp_path))
-        resp = TestClient(app).post("/policy", json=_target_side(_spm(TOOL)))
+        resp = TestClient(app).post("/policy", json=_body(_spm(TOOL)))
         assert resp.status_code == 204
         api.patch_namespaced_custom_object.assert_called_once()
         assert list(tmp_path.rglob("*.rego")) == []
@@ -677,14 +489,14 @@ class TestDumpToggle:
         blocker.write_text("x")
         monkeypatch.setenv("POLICY_WRITER_DUMP_REGO", "1")
         monkeypatch.setenv("REGO_OUTPUT_DIR", str(blocker / "out"))
-        resp = TestClient(app).post("/policy", json=_target_side(_spm(TOOL)))
+        resp = TestClient(app).post("/policy", json=_body(_spm(TOOL)))
         assert resp.status_code == 502
         assert "error" in resp.json()
         # The SSA write happened before the additive dump failed.
         api.patch_namespaced_custom_object.assert_called_once()
 
     def test_dump_on_service_delete_removes_its_tree(self, api, dump):
-        TestClient(app).post("/policy", json=_target_side(_spm(TOOL)))
+        TestClient(app).post("/policy", json=_body(_spm(TOOL)))
         tree = dump / "team1" / "github-tool"
         assert tree.exists()
         resp = TestClient(app).delete(f"/policy/services/{_service_id_segment(TOOL)}")
@@ -692,9 +504,9 @@ class TestDumpToggle:
         assert not tree.exists()
 
     def test_dump_on_put_removes_the_stale_tree_and_keeps_the_entries(self, api, dump):
-        TestClient(app).post("/policy", json=_target_side(_spm(TOOL), _spm(AGENT, ServiceType.AGENT)))
+        TestClient(app).post("/policy", json=_body(_spm(TOOL), _spm(AGENT, ServiceType.AGENT)))
         api.list_cluster_custom_object.return_value = _listing(("team1", "github-tool"), ("team1", "github-agent"))
-        resp = TestClient(app).put("/policy", json=_target_side(_spm(TOOL)))
+        resp = TestClient(app).put("/policy", json=_body(_spm(TOOL)))
         assert resp.status_code == 204
         assert (dump / "team1" / "github-tool").exists()
         assert not (dump / "team1" / "github-agent").exists()

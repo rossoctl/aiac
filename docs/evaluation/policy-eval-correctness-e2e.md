@@ -16,7 +16,8 @@
   [policy-eval-correctness-prb.md § Scorer design](policy-eval-correctness-prb.md#scorer-design)
   for the scorer itself; this spec does not repeat it.
 - `aiac/eval/correctness_e2e_helpers.py` — this suite's own pure-logic helpers (`_pairs_from_map`,
-  `_user_role_rows`, `_accumulate_agent_gates`); `aiac/eval/test_correctness_e2e_helpers.py` —
+  `_user_role_rows`, `_owned_pairs`, `_on_target_scopes`, `_accumulate_service_gates`);
+  `aiac/eval/test_correctness_e2e_helpers.py` —
   their unmarked unit tests, runs in the default fast pass. Mirrors
   `eval/correctness_scorer.py`/`eval/test_correctness_scorer.py`'s logic-module/test-module split.
 - `aiac/eval/test_policy_pipeline_correctness_e2e.py` — the suite itself,
@@ -26,7 +27,8 @@
   [Best-effort proposals](#best-effort-proposals).
 - Reuses, unmodified, from `eval.test_policy_pipeline_eval`: `SCENARIOS`, the `pipeline` fixture
   (re-exported by import — see [Runbook](#runbook)), `_require_scenario`, `_rego_path`,
-  `_user_role_names`, `opa_bin`, `opa_eval`, `truth`.
+  `_scope_owner`, `_agent_inbound_scope_names`, `_agent_delegation_scope_names`,
+  `_tool_scope_names`, `_user_role_names`, `opa_bin`, `opa_eval`, `truth`.
 
 ## Description
 
@@ -45,37 +47,52 @@ over-grants, under-grants/incorrect denials reported only.
 
 ### Scoring source: the rendered Rego data maps, not per-pair decision probing
 
-`opa eval` is queried directly against the plain data documents the Rego generator already
-declares — `subject_role_allow_scopes`/`subject_role_deny_scopes` (inbound and outbound-subject)
-and `agent_role_scopes` (outbound-target, ALLOW only) — rather than exhaustively probing every
-`(role, scope)` pair's `allow`/`deny_ok` decision. Two `opa eval` calls per agent for inbound, and
-three for outbound, return the entire role→scopes table in one shot. `_pairs_from_map` flattens
-each flat `{role: [scope, ...]}` map (the inbound maps and `agent_role_scopes`) into `(role, scope)` pairs.
-The two outbound subject maps are keyed by role and then by the full target service id (LIM-02):
-`{role: {target: [tool, ...]}}`. `_pairs_from_target_map` flattens them: a tool keyed by its owner gives
-`(role, tool)`, and a tool keyed by another target gives `(role, "<tool>@<target>")`, which no truth
-table has, so it is scored as an over-grant. Both readers raise `TypeError` on the other shape, so a
-reader on the wrong shape cannot score pairs with no error. `_accumulate_agent_gates` unions every agent's pairs into the three top-level
-gate buckets `score_scenario` expects. The outbound maps are de-prefixed; the inbound maps keep the
-full scope names. The scenario scope names have no `<owner>.` prefix, so both match the names the
-truth tables use — no re-prefixing logic is needed.
+Each callee checks the access to itself in its own inbound OPA, from its own CR. So each rule is
+in the inbound Rego of the service (agent or tool) that owns its scope. `opa eval` queries the
+plain data documents of that inbound package (`data.authbridge.client.inbound.request`, no input)
+directly, and does not probe the `allow` decision of each `(role, scope)` pair. One `opa eval`
+call for each agent and each tool gives all the role→scopes maps of that service. Each map is
+flat, `{role: [scope, ...]}`: the callee's own CR is the key, so a map is keyed by role only.
+`_pairs_from_map` flattens a map into `(role, scope)` pairs. It raises `TypeError` when a row is
+not a list, so a reader on a nested shape cannot score pairs with no error. `_user_role_rows`
+keeps only the subject-map rows whose role is a user role of the scenario (a guard: a correct
+render has only user roles in the subject maps).
 
-| Gate | Direction | ALLOW map | DENY map |
+`_accumulate_service_gates` unions the pairs of each service into the three top-level gate buckets
+that `score_scenario` expects. A target scope is a tool scope or an agent delegation scope.
+
+| Gate | Source | ALLOW map | DENY map |
 |---|---|---|---|
-| `inbound` | inbound rego | `subject_role_allow_scopes` | `subject_role_deny_scopes` |
-| `outbound_subject` | outbound rego | `subject_role_allow_scopes` | `subject_role_deny_scopes` |
-| `outbound_target` | outbound rego | `agent_role_scopes` (deprefixed `outbound_target_allow_rules`) | **none queried** — see below |
+| `inbound` | the inbound Rego of each agent, every row | `subject_role_allow_scopes` | `subject_role_deny_scopes` |
+| `outbound_subject` | the inbound Rego of each agent and tool, the rows on a target scope | `subject_role_allow_scopes` | `subject_role_deny_scopes` |
+| `outbound_target` | the inbound Rego of each agent and tool, every row | `source_role_allow_scopes` | `source_role_deny_scopes` |
 
-### Known gap: `outbound_target` denial is not scored
+The inbound renders `source_role_deny_scopes` (the calling-agent DENY gate), so the
+`outbound_target` gate also has a deny side.
 
-`AgentPolicyModel.outbound_target_deny_rules` is computed by the PCE, and
-`aiac.pdp.service.policy.opa.rego.generate_outbound_rego` renders it only as the service-keyed
-`target_deny_scopes` map. There is no role-keyed counterpart of `agent_role_scopes`, and this suite
-does not query `target_deny_scopes`. So for the `outbound_target` gate,
-`denied` is always `set()`, and that gate's `denial_precision` reads vacuously `1.0`.
-`over_grants`/`under_grants` for `outbound_target` are unaffected (they depend only on
-`granted`/`expected`, not `denied`). **This is a scoring gap of this suite, not fixed by it** — see
-[Out of Scope](#out-of-scope).
+**A source row on an agent inbound scope.** The truth tables pair an agent role with a target
+scope only. The agent inbound is agent-level (D26a), so a source row on an ordinary inbound scope
+of an agent lets the calling agent call that agent. So `outbound_target` keeps every source row,
+and the suite scores such a row as an over-grant.
+
+**The owner of each row.** The suite checks each row against the owner of its scope
+(`_scope_owners` in the test module, built with `_scope_owner`). A row on a scope that the service
+does not own, or on a scope with no owner (a writer or PCE regression that puts the rule in the
+wrong inbound), gives `(role, "<scope>@<service_id>")` (`_owned_pairs`). No truth table has that
+pair, so a grant there is an over-grant, and the owner's `(role, scope)` pair is an under-grant.
+So a rule that the PCE routes to the wrong service is never a true positive. An outbound bucket
+keeps such a row whatever its scope is (`_on_target_scopes`), so the suite never drops a misrouted
+row.
+
+**Scope names.** The tool inbound maps are de-prefixed; the agent inbound maps keep the full scope
+names. The scenario scope names have no `<owner>.` prefix, so both match the names that the truth
+tables use — no re-prefixing logic is needed.
+
+**A delegation scope.** A delegation scope is a scope of an agent, so its subject rows go to
+`inbound` and to `outbound_subject`. The truth tables put such a pair only in
+`OUTBOUND_SUBJECT_PAIRS`. So in `agent_delegation` a correct render also gives
+`(user-role-shipment-coordinator, agent-scope-broker)` in `inbound`, and the suite scores it as an
+`inbound` over-grant.
 
 ## Configuration (env)
 
@@ -165,7 +182,9 @@ suite — this suite never false-passes when its infra isn't available.
 ## Expected output
 
 Parametrized over all 8 scenario names (`sorted(SCENARIOS)`); expects all 8 to pass (zero
-over-grants) given a healthy Keycloak instance and a well-behaved LLM endpoint. Before
+over-grants) given a healthy Keycloak instance and a well-behaved LLM endpoint (but see the
+delegation-scope note in [Scoring source](#scoring-source-the-rendered-rego-data-maps-not-per-pair-decision-probing)
+for `agent_delegation`). Before
 `best_effort=True` was wired in (see [Best-effort proposals](#best-effort-proposals)), a real run
 against the rossoctl kind cluster showed 6/8 passing and 2/8 failing at the *setup* stage, from the
 pre-existing PRB audit/retry-convergence bug (see [Out of Scope](#out-of-scope)). With
@@ -235,10 +254,6 @@ This is **one** integration-test spec among several indexed by the master PRD
   is *reported* (scored with a caveat instead of "setup failed") — it does not fix the underlying
   bug. The user has already deferred fixing `graph.py` itself as a separate follow-up — not this
   ticket's job.
-- **Scoring the `outbound_target` denial side** (the service-keyed `target_deny_scopes` map that
-  `aiac.pdp.service.policy.opa.rego.generate_outbound_rego` renders) — see
-  [Known gap](#known-gap-outbound_target-denial-is-not-scored). The gap is documented and reported
-  (vacuous `denial_precision=1.0` for that one gate), not silently hidden.
 - **An under-grant tolerance threshold.** Still TBD per the originating spec; under-grants are
   tracked/reported only, never gated.
 - **New scenarios.** Reuses the existing 8-scenario corpus unmodified — see

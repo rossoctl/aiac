@@ -32,10 +32,11 @@ Two independent groups of files, split by cost tier:
   which directory the source lives in — see `eval/scenarios_digested/__init__.py` and
   `docs/specs/digested-policy.md`), since production feeds the PRB only digested policy. These
   digested files **are** load-bearing at runtime, unlike the two light-scenario `.md` files below.
-- `eval/probe_eval.rego` — a generalized outbound probe over the fixed
-  `authbridge.client.outbound.request` package (input `subject`/`target`/`function_name`), loaded
-  beside each agent's own outbound Rego, serving every agent in every heavy scenario (see
-  [Testing Decisions](#testing-decisions)).
+- `eval/probe_eval.rego` — a generalized tool-call probe (package `probe.inbound_eval`) over the
+  fixed `authbridge.client.inbound.request` package (input `subject`/`client_id`/`function_name`),
+  loaded beside the inbound Rego of the scope owner (the callee), serving every callee in every
+  heavy scenario (see [Testing Decisions](#testing-decisions)). `eval/test_probe_eval.py`
+  (unmarked, so it runs in the unit lane) tests it offline against a real rendered tool inbound.
 - `eval/conftest.py` — writes a per-run pass/fail/skip/error report
   (`reports/report_<DD_MM_HH_MM_SS>.md`, UTC by default, `EVAL_REPORT_TZ` to change it) after
   every session that collects at least one `eval/test_policy_pipeline_*.py` test (see
@@ -123,27 +124,44 @@ per session, each against its own realm):
    Agent-to-agent target scopes (Scenario 3: `agent-scope-broker`, owned by `customs-agent`) are
    folded into the same "target" candidate set as tool scopes — from the PRB/PCE's perspective a
    target scope owned by another agent is handled identically to one owned by a tool.
-5. **Run the PCE** (`compute_and_apply`) and assert every expected `.rego` file actually landed on
-   disk — **except** agents a scenario declares in `EXPECT_NO_REGO` (Scenario 4's `billing-agent`).
+5. **Run the PCE** (`compute_and_apply`) and assert that the `.rego` files of each scope owner
+   (agent or tool) that has a rule actually landed on disk. The PCE deploys a CR only for a service
+   whose SPM the run touched (a rule routed to its scopes). The check excuses the agents that a
+   scenario declares in `EXPECT_NO_REGO` (Scenario 4's `billing-agent`).
    `compute_and_apply` re-raises dependency errors; this check also turns a run that completes but
    leaves an expected file missing into a clear `RuntimeError` naming the missing file(s), rather
    than a confusing wall of unrelated per-test failures.
-6. **Assert the truth table with `opa eval`**, with each `.rego` path derived from the agent id's
-   `<ns>/<name>` (`<rego_dir>/<ns>/<name>/{inbound,outbound}/request.rego`) and queries against the
-   fixed `authbridge.client.{inbound,outbound}.request` packages:
-   - **Inbound** — one node per `(scenario × agent × subject)`, against
-     `data.authbridge.client.inbound.request.allow` with input `{"identity": {"subject": ...}}`.
-   - **Outbound** — one node per `(scenario × agent × subject × scope)`, via the generalized probe
-     `data.probe.outbound_eval.allow` (`probe_eval.rego`), which is loaded beside each agent's own
-     outbound Rego so a single probe file serves every agent across every heavy scenario. It uses a
-     token soft-match (see [Testing Decisions](#testing-decisions)).
+6. **Assert the truth table with `opa eval`**, with each `.rego` path derived from the service
+   id's `<ns>/<name>` (`<rego_dir>/<ns>/<name>/{inbound,outbound}/request.rego`) and queries against
+   the fixed `authbridge.client.inbound.request` package. Each callee checks the access to itself in
+   its own inbound; the outbound of every service is a pass-through, so no test evaluates it:
+   - **Inbound** — one node per `(scenario × agent × subject)`, against the agent's own
+     `data.authbridge.client.inbound.request.allow` with input `{"identity": {"subject": ...}}` (no
+     `client_id`: end-user traffic, so the source gate of the agent inbound passes).
+   - **Outbound** — one node per `(scenario × agent × subject × scope)`: a call by the subject
+     through the agent to a target scope. The callee is the scope owner (`_scope_owner`: a tool, or
+     the agent that owns a delegation scope). On a tool, the node evaluates the generalized probe
+     `data.probe.inbound_eval.allow` (`probe_eval.rego`), loaded beside the tool's own inbound
+     Rego, with input `{subject, client_id: <the agent>, function_name}`, so a single probe file
+     serves every tool across every heavy scenario. It uses a token soft-match (see
+     [Testing Decisions](#testing-decisions)). On an agent (a delegation scope), the node evaluates
+     the deployed gate `data.authbridge.client.inbound.request.allow` with input
+     `{"identity": {subject, client_id: <the agent>}}`, because the agent inbound is agent-level
+     (D26a) and has no per-scope check. Its expected value is `expected_agent_call`: the subject may
+     call the callee agent (`expected_inbound`), and a role of the calling agent is granted a scope
+     of the callee agent (`OUTBOUND_PAIRS`). When the scope owner has no inbound Rego (the run
+     routed no rule to its scopes, so it has no CR and every call to it is denied), the node asserts
+     that ground truth agrees no one reaches that scope.
    - **Grant-set equivalence** (`test_grant_set_matches_truth_table`) — the PRB's raw
      `list[PolicyRule]`, classified into `inbound`/`outbound_subject`/`outbound_target` grant sets,
      must equal the scenario's pair-lists exactly. This catches verdict-neutral under/over-grants the coarse `opa eval` truth table
      cannot see.
-   - **Unknown-target and soft-match-overbreadth guards** — one node per `(scenario × agent)`
-     asserting an otherwise-plausible call to an unknown target, or a function name matching no
-     scope, is denied.
+   - **Unknown-caller and soft-match-overbreadth guards** — one node per `(scenario × agent)`.
+     `test_outbound_unknown_caller_denied`: each call that the truth table allows through the agent
+     is denied when an unknown client (`team1/unknown-agent`) makes it, because the calling-agent
+     gate of the scope owner's inbound finds no role for that client.
+     `test_outbound_soft_match_not_overbroad`: a function name that matches no scope
+     (`delete_everything`) is denied by the inbound Rego of every service that has one.
    - **Identity-confusion probes** (Scenario 9, `confusable_agents`, only) —
      `scenario.IDENTITY_CONFUSION_PROBES`, asserted via `test_identity_confusion_probes`; skipped
      for scenarios that define none.
@@ -213,17 +231,19 @@ deny-by-default, mirroring UC1's own `devops-user`.
 `tool-scope-repo-read`/`tool-scope-repo-write`/`tool-scope-tracker-read`; `user-role-tester` reaches `tool-scope-tracker-read`/`tool-scope-tracker-write`; `user-role-devops`
 reaches nothing.
 
-Files left on disk per agent under `eval/rego_out/policy_pipeline_eval/baseline/`:
-`team1/repo-agent/{inbound,outbound}/request.rego`, `team1/tracker-agent/{inbound,outbound}/request.rego`.
+Files left on disk under `eval/rego_out/policy_pipeline_eval/baseline/`, one pair for each scope
+owner that has a rule (the outbound is a pass-through):
+`team1/repo-agent/{inbound,outbound}/request.rego`, `team1/tracker-agent/{inbound,outbound}/request.rego`,
+`team1/repo-tool/{inbound,outbound}/request.rego`, `team1/tracker-tool/{inbound,outbound}/request.rego`.
 
 ### Scenario 3 — agent-to-agent delegation
 
 Realm `aiac-pp-eval-agent-delegation`. 2 users, 2 agents (`dispatch-agent`, `customs-agent`), 1
 tool (`manifest-tool`). `customs-agent` deliberately has **zero `inbound_scopes` of its own** —
 its only scope, `agent-scope-broker`, is a `delegation_scopes` entry on `customs-agent`'s own
-fixture definition, delegated through `dispatch-agent` (it also appears in `dispatch-agent`'s
-**derived** `AgentPolicyModel.target_allow_scopes` map, keyed by `customs-agent`'s service id — the
-production, caller's-perspective sense of that name). `user-role-shipment-coordinator` holds
+fixture definition, delegated through `dispatch-agent` (the rules on it are stored on the SPM of
+`customs-agent`, its owner, so `customs-agent`'s own inbound checks both the user and the calling
+agent `dispatch-agent` on it). `user-role-shipment-coordinator` holds
 `agent-scope-broker` as a subject; `user-role-dock-worker` does not.
 
 Because `agent-scope-broker` is one of `customs-agent`'s owned Keycloak-client scopes regardless of
@@ -239,13 +259,15 @@ Realm `aiac-pp-eval-unreachable-resources`. 1 user (`user-role-front-desk-clerk`
 
 - **`billing-agent` produces no `.rego` at all** (`EXPECT_NO_REGO`) — provisioned like any other
   agent (real client, inbound scope, client role) but never mentioned in the policy document's
-  grant sections, and no other agent has a `target_allow_scopes` entry pointing at it. `test_inbound`/
-  `test_outbound` special-case this: when the expected `.rego` file is absent, they assert ground
-  truth agrees no one reaches it, rather than skipping silently.
+  grant sections. So no rule names its scope (`agent-scope-biller`), the run does not touch its
+  SPM, and the writer makes no CR for it. `test_inbound` special-cases this: when the agent's
+  `.rego` file is absent, it asserts ground truth agrees no one reaches it, rather than skipping
+  silently.
 - **`insurance-tool`** exists with a real scope (`tool-scope-insurance-verify`) that no agent role is ever
-  granted anywhere in the policy text — unreachable, but `insurance-tool` isn't itself an agent, so
-  there's no `.rego` file for it to be missing from; the scope simply never appears in any
-  `target_allow_scopes` map.
+  granted anywhere in the policy text — unreachable. When no rule names that scope, the run does
+  not touch the tool's SPM, so the tool has no CR and no `.rego`. The setup check does not expect
+  one (it expects Rego only for a scope owner that has a rule), and `test_outbound` asserts that
+  ground truth agrees no one reaches the scope.
 
 ### Scenario 6 — ambiguous clause
 
@@ -266,8 +288,8 @@ subject side.
 Realm `aiac-pp-eval-wildcard-grant`. 1 user (`user-role-inventory-manager`), 1 agent (`inventory-agent`), 1
 tool (`inventory-tool`, scopes `tool-scope-inventory-check`/`tool-scope-inventory-adjust`/`tool-scope-inventory-reorder`). Both the
 user-facing and agent-facing grant text use the wildcard phrase "all inventory operations" rather
-than an enumerated list. Ground truth expands the phrase to all three concrete scopes on both
-sides of the per-scope AND gate, checking whether the real PRB expands a wildcard phrase correctly.
+than an enumerated list. Ground truth expands the phrase to all three concrete scopes on the two
+gates of the per-scope AND check, checking whether the real PRB expands a wildcard phrase correctly.
 
 ### Scenario 8 — misleading descriptions
 
@@ -307,7 +329,7 @@ absence either.
 
 ### Scenarios 2 and 5
 
-No `.rego`, no Keycloak realm, no truth table — see [What it does](#what-it-does---light-scenarios-2-5)
+No `.rego`, no Keycloak realm, no truth table — see [What it does](#what-it-does--light-scenarios-2-5)
 above for the exact assertions.
 
 ## Scenario
@@ -348,7 +370,7 @@ or OPA URLs, no `opa` binary.
 #   test_inbound[baseline-team1/repo-agent-test-user] — expected allow, opa denied
 # .rego left on disk per scenario for eyeballing:
 #   eval/rego_out/policy_pipeline_eval/{baseline,agent_delegation,unreachable_resources,
-#     ambiguous_clause,wildcard_grant,misleading_descriptions,confusable_agents,empty_descriptions}/team1/<agent>/{inbound,outbound}/request.rego
+#     ambiguous_clause,wildcard_grant,misleading_descriptions,confusable_agents,empty_descriptions}/team1/<service>/{inbound,outbound}/request.rego
 # A pass/fail/skip/error report for the run is written alongside it:
 #   eval/reports/report_<DD_MM_HH_MM_SS>.md (UTC by default; see Test report below)
 
@@ -399,7 +421,7 @@ marker.
     show the LLM's actual reasoning for a cross-grant, not just an assert diff.
 
   The other four tests in this file (`test_grant_set_matches_truth_table`,
-  `test_outbound_unknown_target_denied`, `test_outbound_soft_match_not_overbroad`,
+  `test_outbound_unknown_caller_denied`, `test_outbound_soft_match_not_overbroad`,
   `test_identity_confusion_probes`) don't correspond to one LLM decision or one truth-table cell,
   so they keep the docstring + crash/skip-reason format described above, unchanged.
 - **Not source of truth, not committed:** like `rego_out/`, the `reports/` directory is
@@ -417,27 +439,40 @@ scenarios; the heavy scenarios additionally need Keycloak + `opa`, same discover
   serving as an independent regression baseline — a break in either suite is unrelated to a break in
   the other by construction.
 - **Namespace/name paths and fixed packages, not hardcoded ids.** Because this harness runs eight
-  scenarios with many agents each, every `.rego` path is derived from each scenario's own agent id
-  through its `<ns>/<name>` split (`<rego_dir>/<ns>/<name>/{inbound,outbound}/request.rego`, the
-  same split `identity_ref()` in `src/aiac/pdp/service/policy/opa/rego.py` does), and every
-  `opa eval` query uses the fixed `authbridge.client.{inbound,outbound}.request` packages.
-- **A generalized probe, one file for every agent.** `probe_eval.rego` reads the fixed
-  `data.authbridge.client.outbound.request` package and takes `input.subject`/`input.target`/
-  `input.function_name`; it is loaded beside each agent's own outbound Rego, so one probe file
-  serves every agent across all eight heavy scenarios rather than needing one probe per agent. It
-  uses a token soft-match (split on `[._-]+`, lowercase, set equality). `allow` needs both
-  `subject_ok` (a role of the subject, via `subject_roles` and
-  `subject_role_allow_scopes[role][input.target]`, matches the function name; the outbound subject
-  maps are keyed by role and then by target, LIM-02) and `target_ok`
-  (`target_allow_scopes[input.target]` matches it), and no deny gate may match the same name
-  (`subject_role_deny_scopes[role][input.target]`, `target_deny_scopes[input.target]`), as in the
-  real gate. A target
-  scope owned by another agent is in `target_allow_scopes` exactly like a tool's scope (see the next
-  point), so a single probe covers both mechanisms uniformly.
+  scenarios with many agents and tools each, every `.rego` path is derived from each scenario's own
+  service id (agent or tool) through its `<ns>/<name>` split
+  (`<rego_dir>/<ns>/<name>/{inbound,outbound}/request.rego`, the same split `identity_ref()` in
+  `src/aiac/pdp/service/policy/opa/rego.py` does), and every `opa eval` query uses the fixed
+  `authbridge.client.inbound.request` package. Every tool id is `team1/<tool>`, as every agent id:
+  the writer derives the CR of a service from this split, and it makes no CR for an id with no
+  namespace.
+- **A generalized probe, one file for every callee.** `probe_eval.rego` (package
+  `probe.inbound_eval`) reads the fixed `data.authbridge.client.inbound.request` package of the
+  callee and takes `input.subject`/`input.client_id`/`input.function_name`; it is loaded beside the
+  inbound Rego of each scope owner, so one probe file serves every callee across all eight heavy
+  scenarios rather than needing one probe per service. The outbound nodes use it on a tool inbound
+  only (see the next paragraphs for an agent inbound). It uses a token soft-match (split on
+  `[._-]+`, lowercase, set equality). Each map is flat (keyed by role): the callee's own CR is the
+  key. `allow` needs both `subject_ok` (a role of the subject, via `subject_roles` and
+  `subject_role_allow_scopes[role]`, matches the function name) and `source_ok` (a role of the
+  calling agent, via `source_roles[input.client_id]` and `source_role_allow_scopes[role]`, matches
+  it), and no deny gate may match the same name (`subject_role_deny_scopes[role]`,
+  `source_role_deny_scopes[role]`), as in the real gate. A target scope owned by another agent (a
+  delegation scope) is in the maps of that agent's inbound, as a tool's scope is in the maps of the
+  tool's inbound (see the next point). But the deployed agent inbound is agent-level (D26a): it
+  allows a call when one scope of the agent passes. A per-scope probe on an agent inbound can deny a
+  call that the deployed gate admits (a subject granted only one of two scopes of the agent). So on
+  an agent inbound the outbound nodes evaluate the deployed gate, not the probe
+  (`_callee_decision`). `eval/test_probe_eval.py` (unmarked, so it runs in the unit lane) renders a
+  real tool inbound with `render_target_side` and checks that the probe gives the same decision as
+  `data.authbridge.client.inbound.request.allow` on each cell, deny gates included. It also renders
+  a real agent inbound and checks that `_callee_decision` agrees with `expected_agent_call` on each
+  cell.
 - **`delegation_scopes` and `inbound_scopes` are indistinguishable at the real system's data-model
-  level — this is a property of the system, not a scenario defect.** The PCE resolves an agent's
-  `agent_scopes` (the inbound audience gate) directly from the IdP `Service` record's owned scopes
-  (`engine.py`: `apm.agent_scopes = list(sa.owned_scopes)`), and the `Service`/`Scope` Pydantic
+  level — this is a property of the system, not a scenario defect.** The PCE seeds the
+  `owned_scopes` of each SPM directly from the IdP `Service` record's `aiac.managed` scopes
+  (`engine.py`, `_seed_identity`), and the writer renders the `owned_scopes` of an agent as the
+  `agent_scopes` list of its inbound (the audience gate, `render_target_side`). The `Service`/`Scope` Pydantic
   models (`idp/configuration/models.py`) carry no scope-kind discriminator — a scope is just "a scope
   this client owns," full stop. Because provisioning necessarily maps both an agent's
   `inbound_scopes` and its `delegation_scopes` onto the **same** Keycloak client (there is no second

@@ -21,7 +21,7 @@ POLICY_FILE = "policy.eval_empty_descriptions_perturbed.md"
 # --- Agents -------------------------------------------------------------------------------------
 
 AGENTS: dict[str, dict] = {
-    "irrigation-agent": {
+    "team1/irrigation-agent": {
         "description": "",
         "inbound_scopes": {
             "agent-scope-grounds-worker": "",
@@ -35,8 +35,9 @@ AGENTS: dict[str, dict] = {
 
 # --- Tools --------------------------------------------------------------------------------------
 
+# Each tool id is "<namespace>/<name>", as each agent id: the writer derives the CR of the tool from it.
 TOOLS: dict[str, dict] = {
-    "valve-tool": {
+    "team1/valve-tool": {
         "description": "",
         "scopes": {
             "tool-scope-valve-open": "",

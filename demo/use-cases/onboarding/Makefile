@@ -21,8 +21,8 @@
 # per managed service (D20), no /rego file dump. So `make agent`/`tool` read the Rego straight from
 # the `authorizationpolicies.agent.rossoctl.dev/github-agent` and `.../github-tool` CRs
 # (spec.policies[].content) into generated/<snapshot>/team1/<name>/{inbound,outbound}/request.rego,
-# and `make clear` deletes both CRs. Under target side (the default) the tool's inbound decides each
-# tool call and every outbound is a pass-through. No demo-only deployment overlay is needed (we do
+# and `make clear` deletes both CRs. The tool's inbound decides each tool call, and every outbound
+# is a pass-through. No demo-only deployment overlay is needed (we do
 # NOT enable POLICY_WRITER_DUMP_REGO).
 #
 # Prereqs: a rossoctl/kind cluster with SPIRE + Keycloak + the rossoctl operator (see

@@ -10,13 +10,13 @@ handling, or state assembly lives here. Two routes call the PCE directly instead
 ``/apply/offboard/...`` (``decommission``) and ``/apply/role-members/{role_id}``
 (``rerender_role``, a role-membership change, D32).
 
-``GET /policy/services/{service_id:path}`` is a read-only view (D18): the policy model of the
-current side with only the entry of one service (by its clientId), or 404 if it has no SPM. It
-calls the PCE ``policy_model_for`` and writes nothing.
+``GET /policy/services/{service_id:path}`` is a read-only view (D18): the policy model with only
+the entry of one service (by its clientId), or 404 if it has no SPM. It calls the PCE
+``policy_model_for`` and writes nothing.
 
-The app's lifespan (``eventbus.consumer.lifespan``) runs the start sequence first — the enforcement
-side (``AIAC_ENFORCEMENT_SIDE``), start check #4 and the PCE resync (see ``controller.start``) — then
-starts the NATS consumer. A failed step (also an unknown side) stops the Controller before it serves.
+The app's lifespan (``eventbus.consumer.lifespan``) runs the start sequence first — start check #4
+and the PCE resync (see ``controller.start``) — then starts the NATS consumer. A failed step stops
+the Controller before it serves.
 
 Responses are bare HTTP status codes: ``200 OK`` on success (no body). Upstream
 failures are raised as FastAPI ``HTTPException``s by the handlers; the status
@@ -211,11 +211,11 @@ def apply_offboard(service_id: str) -> Response:
     return Response(status_code=200)
 
 
-# A read-only view for tests and debugging (D18): the policy model of the current side with only the
-# entry of one service, as JSON in the shape of the writer's POST /policy body. Keyed by the clientId
-# (the SPM key), as on the offboard path, so the {service_id:path} converter carries a slash-bearing
-# SPIFFE URI. 404 if the service has no SPM (it is not in the managed set). It takes no PCE lock and
-# writes nothing.
+# A read-only view for tests and debugging (D18): the policy model with only the entry of one
+# service, as JSON in the shape of the writer's POST /policy body. Keyed by the clientId (the SPM
+# key), as on the offboard path, so the {service_id:path} converter carries a slash-bearing SPIFFE
+# URI. 404 if the service has no SPM (it is not in the managed set). It takes no PCE lock and writes
+# nothing.
 @app.get("/policy/services/{service_id:path}")
 def get_service_policy_model(service_id: str) -> JSONResponse:
     model = policy_model_for(ClientId(service_id))

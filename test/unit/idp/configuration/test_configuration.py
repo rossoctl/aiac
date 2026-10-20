@@ -1526,7 +1526,7 @@ class TestGetServicesByScope:
 
 
 # ---------------------------------------------------------------------------
-# handoff 03 — SPM/APM field pass-through through the library deserialization
+# handoff 03 — SPM field pass-through through the library deserialization
 #
 # handoff 01 declares Role.kind / Role.actorIds / Scope.serviceId; handoff 02
 # makes the IdP *service* populate them. The Configuration library is a thin
