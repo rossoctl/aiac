@@ -22,14 +22,16 @@ AIAC enforces a strict three-layer model:
 | **Policy Enforcement (PEP)** | AuthBridge | Intercepts traffic; exchanges tokens; carries no policy knowledge |
 
 The AIAC Agent subscribes to an event stream (NATS JetStream) and reacts to entity lifecycle
-events — new services, role changes, policy updates — by consulting a Policy Rules Builder
+events — new services, role changes — by consulting a Policy Rules Builder
 (LangGraph, LLM-backed) and applying the minimal resulting diff through a two-layer policy stack
 (policy model + Policy Computation Engine). Policy intent lives entirely in the PDP, never in
 per-pod configuration.
 
 The use cases live under `src/aiac/agent/uc/`. Service onboarding, policy update and role update
-each have an event trigger and a spec in
-[docs/specs/components/aiac-agent/](docs/specs/components/aiac-agent/). A role-membership change
+each have a spec in [docs/specs/components/aiac-agent/](docs/specs/components/aiac-agent/).
+Service onboarding and role update have an event trigger. Policy update has no event trigger yet:
+nothing publishes `aiac.apply.policy.build`, so a policy change starts a rebuild only when someone
+calls `POST /apply/policy/build` or `POST /apply/policy/rebuild`. A role-membership change
 (`aiac.apply.role-members.*`, D32) is a trigger with no use case: the consumer sends it to the
 Policy Computation Engine's `rerender_role`, which gives the role's CRs the current holders and
 does not run the Policy Rules Builder. Offboarding is also a use
@@ -71,8 +73,7 @@ put a new test: [docs/testing/testing-strategy.md](docs/testing/testing-strategy
 
 The build and deploy flow is in [k8s/aiac-deployment-guide.md](k8s/aiac-deployment-guide.md). Its
 "Platform preconditions" section lists the two checks of every deploy: the OPA pipeline with the
-AIAC combiner, and the Keycloak event-listener SPI. The deploy-time parameters, such as the
-enforcement side, are in [docs/agents/deploy.md](docs/agents/deploy.md).
+AIAC combiner, and the Keycloak event-listener SPI.
 
 ## Demo — onboarding an agent and a tool
 
@@ -86,31 +87,10 @@ proves two claims:
 - **AIAC enforced a natural language policy in rossoctl** — verdicts come from the live OPA plugin, not from
   evaluating a file on the side.
 
-Before you start, make sure that you have:
-
-- A Kind cluster named `rossoctl` with the rossoctl platform (SPIRE, Keycloak, the operator).
-- The `team1` namespace.
-- `kubectl`, `helm`, `kind`, `curl`, `python3`, and `docker` or `podman` on `PATH`. `make demo`
-  also needs the `opa` binary on `PATH` (or `OPA_BIN`).
-- The project `.venv` with its dependencies installed (see [Getting started](#getting-started)).
-  The Makefile's Python targets run `../../../.venv/bin/python`, not `python3`.
-- Sibling clones of `rossoctl/operator`, `rossoctl/rossoctl` and `rossoctl/cortex`.
-- Two secrets: `team1/openai-secret` and `aiac-system/keycloak-admin-secret`. Create the
-  `aiac-system` namespace and its Secret yourself, before you install AIAC: the install creates the
-  namespace and, in the same run, a Deployment that mounts the Secret. Without it, `aiac-interface`
-  stays in `ContainerCreating`. The commands are in
-  [Two secrets to create first](demo/use-cases/onboarding/demo.md#two-secrets-to-create-first).
-- An LLM endpoint for the key in `team1/openai-secret`. `make enable` uses
-  `LLM_BASE_URL=https://api.openai.com/v1` and `LLM_MODEL=gpt-4o-mini` by default. For a different
-  endpoint, set both: `LLM_BASE_URL=... LLM_MODEL=... make enable`. If they do not match the key,
-  onboarding fails with a 401 error.
-- On a new realm, the one-time
-  [Keycloak realm fix-up](demo/use-cases/onboarding/demo.md#one-time-keycloak-realm-fix-up)
-  (Direct Access Grants on the `rossoctl` client). Without it, token minting fails with
-  `unauthorized_client`.
-- No `github-agent` or `github-tool` deployed in `team1`. Their first-time deploy is the trigger. A
-  clean system-lane run removes them at teardown. After an earlier demo run or an aborted
-  system-lane run, run `make restore` first.
+The prerequisites (cluster, tools, sibling clones, the two secrets, the LLM endpoint, the one-time
+Keycloak realm fix-up, and no demo workloads already deployed) are in
+[Before you start](demo/use-cases/onboarding/demo.md#before-you-start). This README copies none of
+them.
 
 Then run the steps of [demo/use-cases/onboarding/demo.md](demo/use-cases/onboarding/demo.md), in
 the order it gives, from that directory. Each step is a `make` target, and `make help` lists them

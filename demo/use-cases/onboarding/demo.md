@@ -173,7 +173,13 @@ location. Override only if a clone lives elsewhere, and then use an **absolute**
 
 **`github-agent`/`github-tool` must NOT already be deployed in `team1`.** Step 4's whole point is
 that a first-time deploy triggers onboarding. If you have run this demo before, `make restore`
+first. A clean `-m system` run removes them at teardown; after an aborted one, also `make restore`
 first.
+
+**The project `.venv`** with its dependencies installed (see the
+[README's Getting started](../../../README.md#getting-started)). The Makefile's Python targets run
+`../../../.venv/bin/python`, not `python3`. `make demo` also needs the `opa` binary on `PATH` (or
+`OPA_BIN`).
 
 ### Two secrets to create first
 
