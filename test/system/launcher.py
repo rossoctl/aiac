@@ -46,7 +46,7 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterator
+from typing import Callable, Iterator, Mapping
 
 import requests
 
@@ -537,31 +537,39 @@ def inbound_probe(
         "-H 'Content-Type: application/json' -H \"Authorization: Bearer $TOK\" "
         '-d \'{"jsonrpc":"2.0","id":"1","method":"ping/nonexistent","params":{}}\''
     )
-    pod_name = f"probe-inbound-{uuid.uuid4().hex[:8]}"
     try:
-        out = kubectl(
-            "run",
-            pod_name,
-            "-n",
-            namespace,
-            "--image",
-            _CURL_IMAGE,
-            "--restart=Never",
-            "--rm",
-            "--attach",
-            "--quiet",
-            f"--env=TOK={token}",
-            "--command",
-            "--",
-            "sh",
-            "-c",
-            script,
-            timeout=timeout,
-        )
+        out = curl_pod(namespace, script, name="probe-inbound", env={"TOK": token}, timeout=timeout)
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
         stderr = getattr(exc, "stderr", "") or getattr(exc, "output", "") or str(exc)
         return None, f"inbound probe pod failed: {stderr}".strip()
     return _parse_curl_output(out)
+
+
+def curl_pod(
+    namespace: str, script: str, *, name: str, env: Mapping[str, str] | None = None, timeout: float = 120.0
+) -> str:
+    """Run ``script`` (``sh -c``) in a throwaway ``curlimages/curl`` pod in ``namespace`` and return its
+    stdout; the pod is removed after it ends. ``--command`` overrides the image entrypoint robustly (a
+    deliberate deviation from the runbook's bare ``-- sh -c``). Raises like ``kubectl`` on a failure."""
+    return kubectl(
+        "run",
+        f"{name}-{uuid.uuid4().hex[:8]}",
+        "-n",
+        namespace,
+        "--image",
+        _CURL_IMAGE,
+        "--restart=Never",
+        "--rm",
+        "--attach",
+        "--quiet",
+        *(f"--env={key}={value}" for key, value in (env or {}).items()),
+        "--command",
+        "--",
+        "sh",
+        "-c",
+        script,
+        timeout=timeout,
+    )
 
 
 def outbound_probe(

@@ -96,9 +96,21 @@ Preconditions:
 - An LLM key that the endpoint accepts, in the Controller's Secret
   `aiac-system/aiac-agent-secret`. The in-cluster Controller does not read
   `.env`. If the endpoint refuses the key, each onboarding rolls back, and the
-  fixtures time out with "agent did not converge" or "tool did not converge".
-  The Controller log then shows `LLMCredentialsError`. To check or change the
-  key: `k8s/aiac-deployment-guide.md`, step 3b, "Check or change the API key".
+  fixtures fail with "its client is disabled: the onboarding failed and rolled
+  back". The Controller log then shows `LLMCredentialsError`. To check or change
+  the key: `k8s/aiac-deployment-guide.md`, step 3b, "Check or change the API key".
+- An `aiac-agent` image with the not-ready naks (`AgentCardNotReadyError`,
+  `WorkloadNotReadyError`). An older image can stall an onboarding for
+  `ACK_WAIT` (600 s), longer than the onboarded gate.
+
+Each gate of the stack helper names the step that is stuck: the operator did not
+register the client, the workload is not on the operator's final template, the
+workload is not onboarded, OPA does not enforce its CR, or a CR does not have
+the expected roles and scopes. The message ends with a state dump (the operator,
+bundle-service from the namespace, the Deployment, the AgentCard, the client
+and its SPM, the CR content). The lane writes the CR captures and the
+Controller logs to `test/system/artifacts/` (gitignored): a log before each
+Controller roll and one at teardown.
 
 Do **not** deploy the demo `github-agent` / `github-tool` yourself. The stack
 helper (`onboarded_stack` or `pristine_stack` in `test/system/uc1_onboard.py`)
