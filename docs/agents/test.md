@@ -62,11 +62,8 @@ link it into the worktree first, or every live lane skips.
 The integration tests make several AIAC units work together in one process, with
 no cluster, no Keycloak and no LLM endpoint. So they need no env and no `.env`,
 and they do not skip. The default `addopts` deselects them, so a bare `pytest`
-does not run them. The tests wire the real focal resolver, Service Policy
-Builder (with the LLM seam stubbed), PCE and PDP Policy Writer render — for
-example the D32 shared roles and scopes, quarantine lift, shared decommission
-and snapshot repair. Fakes stand in for Keycloak, the Policy Model Store and the
-Kubernetes API (`fakes.py` next to the tests).
+does not run them. What they cover: `docs/testing/testing-strategy.md` →
+Testing levels.
 
 ```bash
 .venv/bin/pytest -m integration
@@ -74,13 +71,9 @@ Kubernetes API (`fakes.py` next to the tests).
 
 ## `llm` lane
 
-The live-LLM Policy Rules Builder tests
-(`test/unit/agent/policy_rules_builder/test_graph_live_llm.py`) run the **real**
-LLM end-to-end. They assert that the emitted `(name, effect)` rule set matches
-the policy text: for allow-only policies, and for policies with explicit and
-description-driven denies. The tests mock only the role/scope
-descriptions and the policy source. The `_structured_call` LLM seam stays live.
-The lane needs only `LLM_BASE_URL` / `LLM_MODEL` / `LLM_API_KEY`.
+The tests that call a real LLM but need no cluster (see
+`docs/testing/testing-strategy.md` → The `llm` tag). The lane needs only
+`LLM_BASE_URL` / `LLM_MODEL` / `LLM_API_KEY`.
 
 ```bash
 set -a; . .env; set +a

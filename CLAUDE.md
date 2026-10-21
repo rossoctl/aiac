@@ -1,7 +1,5 @@
 # AIAC Codebase Guide
 
-All paths below are relative to the repository root.
-
 ## Requirements / PRD docs
 
 Read these before you change a component's behavior or requirements:
@@ -12,22 +10,15 @@ Read these before you change a component's behavior or requirements:
 
 Write each per-task handoff document to `docs/handoffs/`: one markdown file per task, named with the next free number prefix (e.g. `01-update-issues.md`, `02-update-source-and-tests.md`).
 Make each handoff self-contained: background, task, exact files, and acceptance criteria. A fresh session must be able to execute it without the originating conversation.
+This overrides the `handoff` skill's temp-dir default.
 
 ## Tests
 
-Two trees: `test/` and `eval/`. Select tests with markers only, never with a
-path. A bare `.venv/bin/pytest` runs the offline unit lane.
-
-- To run a lane (unit, integration, llm, system, eval), see `docs/agents/test.md`.
-- To write a new test (placement, markers, clean-skip), see
-  `docs/testing/testing-strategy.md`.
-
-**Dependency direction.** "Depend" means import, read, or link. Tests of any type
-(`test/`, `eval/`) and their harness (fixtures, helpers, `conftest.py`) must not
-depend on `demo/` or on a demo doc (for example `demo.md`); they set up what they
-need themselves. The demo may use the harness.
-One exception: the system tests deploy the `github-agent` and `github-tool`
-workloads, so they may depend on `demo/assets/` and on nothing else under `demo/`.
+- Before you run any `pytest` command, even for one file, read
+  `docs/agents/test.md` (selection, lanes, env).
+- Before you write or change a test or its harness, read
+  `docs/testing/testing-strategy.md` (placement, markers, clean-skip,
+  dependency direction).
 
 ## Python environment
 
@@ -38,8 +29,8 @@ user and wait.
 ## Kubernetes & builds
 
 Read these when a task builds images or deploys to a cluster:
-- Build and deploy: `k8s/aiac-deployment-guide.md`. Deploy preconditions:
-  `docs/agents/deploy.md`.
+- Build, deploy, and platform preconditions: `k8s/aiac-deployment-guide.md`.
+  Deploy parameters (for the `deploy` skill): `docs/agents/deploy.md`.
 
 ## External references
 
@@ -47,6 +38,6 @@ Read these when a task builds images or deploys to a cluster:
 
 ## Agent skill overrides
 
-- **Issue tracker**: GitHub issues in `rossoctl/aiac`. Label every new issue `aiac` plus the `area:<path>` label of its component. Add it to board **AIAC #12** and set its `Triage Status`. See `docs/agents/issue-tracker.md`.
+- **Issue tracker**: GitHub issues in `rossoctl/aiac`. Before you create or change an issue, read `docs/agents/issue-tracker.md`.
 - **Triage labels**: every state label has the `status:` prefix and is mirrored on the board's `Triage Status` field. See `docs/agents/triage-labels.md`.
-- **Domain docs**: single-context. `GLOSSARY.md` is the glossary; design decisions live in the specs under `docs/specs/`. Consult a design decision only when the task touches its area. See `docs/agents/domain.md`.
+- **Domain docs**: single-context. `GLOSSARY.md` is the glossary; design decisions live in the specs under `docs/specs/`. See `docs/agents/domain.md`.

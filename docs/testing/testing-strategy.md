@@ -13,18 +13,6 @@ AIAC's automated checks split into two top-level trees, each its own pytest coll
   recall, robustness, consistency over a scenario corpus. See the
   [evaluation strategy](../evaluation/evaluation-strategy.md).
 
-## Selection is marker-only
-
-**No path is ever passed to `pytest`.** `testpaths` collects both trees; selection is by marker.
-The default `addopts` deselects every live-infra / eval marker:
-
-```
-addopts = ["-m", "not integration and not system and not llm and not eval"]
-```
-
-so a bare `pytest` is the offline unit suite. A command-line `-m` overrides that default (last
-`-m` wins): `-m integration`, `-m system`, `-m llm`, `-m eval`.
-
 ## Testing levels (scope-based)
 
 The `test/` tree has three levels, distinguished by **what a test needs to run**, not by what it
@@ -32,8 +20,8 @@ covers:
 
 | Level | Marker | Location | Needs |
 |---|---|---|---|
-| **unit** | *(untagged)* | `test/unit/` (mirrors `src/aiac/`) | Nothing external — in-process, a single unit under test — **except a live LLM endpoint when the test also carries the orthogonal `llm` tag** (see below); those are deselected by the default `pytest`. Runs in the default `pytest`. |
-| **integration** | `integration` | `test/integration/` (mirrors `src/aiac/`) | Several AIAC units cooperating in-process on a laptop, **no cluster**, no LLM endpoint. Deselected by the default `pytest`; run with `-m integration`. The first test is the D32 test of shared roles and scopes (`test/integration/policy/computation/test_shared_roles.py`). Three more files use its harness: `test_quarantine_lift.py`, `test_decommission_shared.py` and `test_snapshot_repair.py` (same directory). |
+| **unit** | *(untagged)* | `test/unit/` (mirrors `src/aiac/`) | Nothing external — in-process, a single unit under test — **except a live LLM endpoint when the test also carries the orthogonal `llm` tag** (see below). |
+| **integration** | `integration` | `test/integration/` (mirrors `src/aiac/`) | Several AIAC units cooperating in-process on a laptop, **no cluster**, no LLM endpoint. The tests wire the real focal resolver, Service Policy Builder (LLM seam stubbed), PCE and PDP Policy Writer render. Fakes stand in for Keycloak, the Policy Model Store and the Kubernetes API (`fakes.py` next to the tests). The first test is the D32 test of shared roles and scopes (`test/integration/policy/computation/test_shared_roles.py`). Three more files use its harness: `test_quarantine_lift.py`, `test_decommission_shared.py` and `test_snapshot_repair.py` (same directory). |
 | **system** | `system` | `test/system/` | A live Kind cluster / Rosso / deployed AIAC — see [`k8s/opa-kind-runbook.md`](../../k8s/opa-kind-runbook.md). Closes the real OPA evaluation loop through AuthBridge. |
 
 ## The `llm` tag (orthogonal)
@@ -45,8 +33,9 @@ needs **no cluster**. It lets a cluster-free live-LLM test be selected on its ow
 tree's otherwise "nothing external" rule.
 The live-LLM Policy Rules Builder suite
 (`test/unit/agent/policy_rules_builder/test_graph_live_llm.py`) is the canonical example: it drives
-the real LLM end-to-end but mocks only the role/scope descriptions and policy source in-process, so
-it needs an LLM endpoint and nothing else. It **skips cleanly** when `LLM_BASE_URL` / `LLM_MODEL` /
+the real LLM end-to-end (the `_structured_call` seam stays live) and asserts that the emitted
+`(name, effect)` rule set matches the policy text. It mocks only the role/scope descriptions and
+policy source in-process, so it needs an LLM endpoint and nothing else. It **skips cleanly** when `LLM_BASE_URL` / `LLM_MODEL` /
 `LLM_API_KEY` are unset.
 
 ## Clean-skip discipline
@@ -93,6 +82,15 @@ Rules of thumb:
   `Path(__file__).resolve().parents[N]`. **Count N from the actual location of the
   file**: a file in `test/unit/pdp/policy/` is 4 levels below the repo root.
 - Each test above the unit level skips cleanly when its infra is not available.
+
+### Dependency direction
+
+"Depend" means import, read, or link. Tests of any type (`test/`, `eval/`) and
+their harness (fixtures, helpers, `conftest.py`) must not depend on `demo/` or on
+a demo doc (for example `demo.md`); they set up what they need themselves. The
+demo may use the harness.
+One exception: the system tests deploy the `github-agent` and `github-tool`
+workloads, so they may depend on `demo/assets/` and on nothing else under `demo/`.
 
 To run each lane, see [`../agents/test.md`](../agents/test.md).
 

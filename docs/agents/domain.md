@@ -42,9 +42,3 @@ section in a PRD/spec — surface it explicitly rather than silently overriding:
 
 > _Contradicts "identify conflicts, never reconcile" in policy-rules-builder.md —
 > but worth reopening because…_
-
-## Relationship to `docs/specs/`
-
-`CLAUDE.md` documents `docs/specs/PRD.md` and `docs/specs/components/` as the
-requirements source. `GLOSSARY.md` is a different layer — domain vocabulary, not
-requirements.
