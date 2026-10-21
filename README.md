@@ -117,7 +117,7 @@ The demo workloads live under [demo/assets/](demo/assets/). See
 
 - [docs/specs/PRD.md](docs/specs/PRD.md) — master PRD
 - [docs/specs/components/](docs/specs/components/) — per-component specs (design decisions live embedded here)
-- [CONTEXT.md](CONTEXT.md) — domain glossary
+- [GLOSSARY.md](GLOSSARY.md) — domain glossary
 - [demo/use-cases/onboarding/demo.md](demo/use-cases/onboarding/demo.md) — end-to-end onboarding demo
 - [k8s/aiac-deployment-guide.md](k8s/aiac-deployment-guide.md) — Kubernetes install guide
 - [k8s/opa-kind-runbook.md](k8s/opa-kind-runbook.md) — local OPA/Kind integration setup
