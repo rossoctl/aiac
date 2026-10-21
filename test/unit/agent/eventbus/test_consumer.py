@@ -3,6 +3,7 @@
 Covers subject-based dispatch and the ack/DLQ contract: ack on success,
 no ack (implicit redelivery) on failure below MAX_DELIVER, a delayed nak for a
 not-ready failure (``ServiceNotVisibleError``: the IdP does not show the service yet;
+``WorkloadNotReadyError``: the rollout of the workload is not complete;
 ``AgentCardNotReadyError``: the agent's AgentCard is not ``Synced=True`` yet), and DLQ
 publish + term() once MAX_DELIVER is reached. A role-membership subject
 (``aiac.apply.role-members.{role-id}``) goes to the PCE ``rerender_role``, with no
@@ -44,7 +45,7 @@ from aiac.agent.policy_rules_builder.graph import (
 )
 from aiac.agent.uc.onboarding.orchestrator import ServiceNotVisibleError
 from aiac.agent.uc.onboarding.preconditions import EnforcementPreconditionError
-from aiac.agent.uc.onboarding.provision.nodes import AgentCardNotReadyError
+from aiac.agent.uc.onboarding.provision.nodes import AgentCardNotReadyError, WorkloadNotReadyError
 
 
 def _fake_msg(subject: str, num_delivered: int = 1, seq: int = 1) -> MagicMock:
@@ -436,8 +437,20 @@ def _card_not_ready() -> AgentCardNotReadyError:
     return AgentCardNotReadyError("AgentCard of workload 'weather' is Synced=False (FetchFailed)")
 
 
-# Both not-ready failures share the nak contract below.
-NOT_READY = pytest.mark.parametrize("not_ready", [_not_visible, _card_not_ready], ids=["not_visible", "card_not_ready"])
+# The rollout of the workload is not complete after the pod wait of the precondition checks: the
+# operator can finish it some seconds later, so the consumer naks it with the same short delay.
+def _workload_not_ready() -> WorkloadNotReadyError:
+    return WorkloadNotReadyError(
+        "workload 'weather' in namespace 'team1': the rollout of its Deployment is not complete"
+    )
+
+
+# The not-ready failures share the nak contract below.
+NOT_READY = pytest.mark.parametrize(
+    "not_ready",
+    [_not_visible, _workload_not_ready, _card_not_ready],
+    ids=["not_visible", "workload_not_ready", "card_not_ready"],
+)
 
 
 @NOT_READY
@@ -509,15 +522,17 @@ def test_dispatch_does_not_nak_another_http_502():
     nc.jetstream.assert_not_called()
 
 
-def test_the_redelivery_after_a_card_not_ready_nak_waits_for_the_client():
-    # Only a not-visible nak makes the redelivery read the client with no wait: the card nak gave the
-    # client no time to become visible (it was visible already), so the consumer does not record it.
+@pytest.mark.parametrize("not_ready", [_workload_not_ready, _card_not_ready], ids=["workload", "card"])
+def test_the_redelivery_after_a_workload_or_card_not_ready_nak_waits_for_the_client(not_ready):
+    # Only a not-visible nak makes the redelivery read the client with no wait: the workload and card
+    # naks gave the client no time to become visible (it was visible already), so the consumer does
+    # not record them.
     consumer = AiacEventConsumer()
     consumer._nc = _fake_nc()
     first = _fake_msg("aiac.apply.service.svc-1", num_delivered=1, seq=7)
     again = _fake_msg("aiac.apply.service.svc-1", num_delivered=2, seq=7)
 
-    with patch("aiac.agent.eventbus.consumer.onboard_and_apply", side_effect=[_card_not_ready(), None]) as onboard:
+    with patch("aiac.agent.eventbus.consumer.onboard_and_apply", side_effect=[not_ready(), None]) as onboard:
         asyncio.run(consumer._dispatch(first))
         assert consumer._not_visible_seqs == set()
         asyncio.run(consumer._dispatch(again))

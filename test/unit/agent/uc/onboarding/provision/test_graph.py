@@ -17,6 +17,19 @@ from aiac.idp.configuration.models import Role, Scope, Service, ServiceType
 ENTITY = "svc-1"
 
 
+@pytest.fixture(autouse=True)
+def _rollout_complete():
+    # classify_service's pod wait reads the workload's Deployment first: a complete rollout.
+    apps = MagicMock()
+    apps.read_namespaced_deployment.return_value = SimpleNamespace(
+        metadata=SimpleNamespace(generation=1),
+        spec=SimpleNamespace(replicas=1, template=None),
+        status=SimpleNamespace(observed_generation=1, replicas=1, updated_replicas=1, available_replicas=1),
+    )
+    with patch.object(kube, "_apps_v1", return_value=apps):
+        yield apps
+
+
 def _get(result, key):
     return result[key] if isinstance(result, dict) else getattr(result, key)
 

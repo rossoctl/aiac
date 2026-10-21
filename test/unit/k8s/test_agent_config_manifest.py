@@ -1,4 +1,4 @@
-"""Manifest-content tests for the agent's ``aiac-agent-config`` ConfigMap.
+"""Manifest-content tests for the agent's ``aiac-agent-config`` ConfigMap and its ClusterRole.
 
 The shared agent LLM seam reads its own dedicated retry cadence from the
 environment (``aiac.agent.llm.load_llm_settings()`` — ``LLM_MAX_RETRIES`` / ``LLM_RETRY_BACKOFF_MIN`` /
@@ -61,3 +61,21 @@ def test_the_bundle_service_namespace_is_on_the_config_map():
     names."""
     data = _agent_config_data()
     assert data.get("AIAC_BUNDLE_SERVICE_NAMESPACE") == "rossoctl-system"
+
+
+def _cluster_role_rules(name: str) -> list[dict]:
+    """The ``rules`` of the ClusterRole ``name`` in the manifest."""
+    for doc in yaml.safe_load_all(_MANIFEST.read_text()):
+        if doc and doc.get("kind") == "ClusterRole" and doc.get("metadata", {}).get("name") == name:
+            return doc.get("rules", [])
+    raise AssertionError(f"ClusterRole {name!r} not found in agent-deployment.yaml")
+
+
+def test_the_agent_can_read_the_rollout_of_a_deployment():
+    """The UC1 precondition checks read the workload's Deployment before its pods (the rollout gate).
+    Read-only: ``get`` only."""
+    rules = [r for r in _cluster_role_rules("aiac-agent") if "deployments" in r.get("resources", [])]
+    assert len(rules) == 1
+    assert rules[0]["apiGroups"] == ["apps"]
+    assert rules[0]["verbs"] == ["get"]
+    assert "resourceNames" not in rules[0]

@@ -1,12 +1,12 @@
 """Kubernetes access seam for the Service Provision sub-agent (UC1), the UC1 precondition checks
 (D30) and the Controller start check #4.
 
-Owns the `kubernetes` client seams (`_core_v1`, `_custom_objects`, `_load_kube_config`) and
-exposes the small set of read operations the callers need. Each operation wraps its
+Owns the `kubernetes` client seams (`_core_v1`, `_apps_v1`, `_custom_objects`, `_load_kube_config`)
+and exposes the small set of read operations the callers need. Each operation wraps its
 client call in ``run_upstream`` so transient API failures are retried at the transport
 boundary — the callers call these plainly and only map the final failure (``HTTPException(502)``
 in UC1). A 404 is not retried (``is_transient``); ``is_not_found`` tells it apart. Unit tests
-patch the ``_core_v1`` / ``_custom_objects`` seams here.
+patch the ``_core_v1`` / ``_apps_v1`` / ``_custom_objects`` seams here.
 """
 
 from kubernetes import client, config
@@ -36,6 +36,12 @@ def _core_v1():
     return client.CoreV1Api()
 
 
+def _apps_v1():
+    """AppsV1Api client (Deployments)."""
+    _load_kube_config()
+    return client.AppsV1Api()
+
+
 def _custom_objects():
     """CustomObjectsApi client (AgentCard and AuthorizationPolicy CRs)."""
     _load_kube_config()
@@ -48,6 +54,11 @@ def _custom_objects():
 def list_pods(namespace: str | None):
     """Pods in ``namespace`` (the ``.items`` list), with bounded transport retries."""
     return run_upstream(lambda: _core_v1().list_namespaced_pod(namespace).items)
+
+
+def read_deployment(name: str, namespace: str):
+    """A single Deployment by name (its ``.spec`` and ``.status``), with bounded transport retries."""
+    return run_upstream(lambda: _apps_v1().read_namespaced_deployment(name, namespace))
 
 
 def read_service(name: str | None, namespace: str | None):

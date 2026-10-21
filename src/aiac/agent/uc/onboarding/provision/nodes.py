@@ -6,7 +6,7 @@ All nodes are **non-LLM**. Graph:
 
 IdP access is via the **idp-library** `Configuration` (the `_config` seam), never the IdP
 service directly. Kubernetes access is via the `kube` seam module (`list_pods`,
-`read_service`, `list_agentcards`), which retries internally. Any upstream failure surfaces
+`read_deployment`, `read_service`, `list_agentcards`), which retries internally. Any upstream failure surfaces
 as an `HTTPException(502, ...)` whose message names the workload and the specific
 missing/invalid label — actionable, never silent.
 """
@@ -22,7 +22,7 @@ from aiac.idp.configuration.models import ServiceType
 from aiac.shared.env import env_num
 from aiac.shared.upstream import run_upstream
 
-from .kube import list_agentcards, list_pods, read_service
+from .kube import is_not_found, list_agentcards, list_pods, read_deployment, read_service
 from .state import OnboardingProvisionState
 from .types import RoleDefinition, ScopeDefinition, ServiceProvision
 
@@ -50,7 +50,11 @@ class WaitConfig:
 # label is therefore a transient not-ready state, re-polled before we give up with a 502. Budgeted at
 # 30 attempts after a ~30s budget was observed losing this race by about a second: a tool's pod was
 # created at 14:28:17Z and the wait gave up at 14:28:46Z, because the operator had not yet reconciled
-# its AgentRuntime. Still well under the NATS ACK_WAIT; tests set fast.
+# its AgentRuntime. The same budget covers the wait for the rollout of the workload's Deployment: the
+# operator rolls it more than once after a deploy (the type label, then the client-credentials annotation),
+# and the event comes before the last rollout. A wait that ends not ready raises ``WorkloadNotReadyError``,
+# which the NATS consumer naks, so a later delivery waits again. Still well under the NATS ACK_WAIT; tests
+# set fast.
 _LABEL_WAIT = WaitConfig("ONBOARD_LABEL_WAIT_ATTEMPTS", "ONBOARD_LABEL_WAIT_BACKOFF", 30, 2.0)
 
 # Deploy->onboard race tolerance for the AgentCard sync — a SECOND, later race than the label one above.
@@ -264,30 +268,85 @@ def classify_service(state: OnboardingProvisionState) -> dict:
     }
 
 
+class WorkloadNotReadyError(HTTPException):
+    """The workload is still not ready for the pod checks after the bounded pod wait (see
+    :func:`await_labelled_pods`): the rollout of its Deployment is not complete, or it has no live pod
+    with the ``rossoctl.io/type`` label. It is an ``HTTPException(502)``, so the HTTP route answers
+    ``502``, and the NATS consumer naks it with a delay. ``template`` is the Deployment's pod template
+    when the last look found the rollout not complete (the precondition checks run #6 on it), else
+    ``None``."""
+
+    def __init__(self, detail: str, template=None) -> None:
+        super().__init__(502, detail)
+        self.template = template
+
+
+def _rollout_pending(deployment) -> str | None:
+    """``None`` when the rollout of ``deployment`` is complete, else its counters. The test is the
+    Deployment controller's own ``DeploymentComplete``: the controller saw the latest generation, and
+    every replica is updated and available, with no old pod left. ``status.replicas`` does not count a
+    terminating pod, so the caller still skips those. The API omits a zero counter (``None`` here)."""
+    status = deployment.status
+    generation = deployment.metadata.generation or 0
+    observed = getattr(status, "observed_generation", None) or 0
+    # The API server defaults a missing spec.replicas to 1.
+    want = deployment.spec.replicas if deployment.spec.replicas is not None else 1
+    replicas = getattr(status, "replicas", None) or 0
+    updated = getattr(status, "updated_replicas", None) or 0
+    available = getattr(status, "available_replicas", None) or 0
+    if observed >= generation and updated == want and replicas == updated and available == want:
+        return None
+    return (
+        f"the rollout of its Deployment is not complete (generation {generation}, observedGeneration "
+        f"{observed}, spec.replicas {want}, replicas {replicas}, updatedReplicas {updated}, "
+        f"availableReplicas {available})"
+    )
+
+
 def await_labelled_pods(
     namespace: str, workload_name: str, settled: Callable[[ServiceType, list], bool] | None = None
 ) -> tuple[ServiceType, list]:
     """The service type (from the operator's ``rossoctl.io/type`` pod label) and the live (not
-    terminating) pods of ``workload_name``, tolerating the deploy->onboard RACE (the pod or its label
-    may not be there yet — see the module knobs above).
+    terminating) pods of ``workload_name``, tolerating the deploy->onboard RACE (the rollout may not be
+    complete, and the pod or its label may not be there yet — see the module knobs above).
 
-    A briefly-absent label — or a not-yet-created pod — is a transient not-ready state, re-polled
-    a bounded number of times. A label present with an INVALID value (not ``agent``/``tool``) is a
-    real misconfiguration that no wait can fix, so it fails immediately. The poll ends at the first
-    look that finds a labelled pod for which ``settled(service_type, pods)`` is true (with no
-    ``settled``, at the first labelled pod). Retries exhausted -> the labelled ``(service_type,
-    pods)`` of the last look if it had one (the caller reports them), else 502 naming the workload
-    and the label (unchanged contract for a genuinely never-labelled workload). Provision's
-    ``classify_service`` and the UC1 precondition checks (D30) share this wait."""
+    Each look reads the workload's Deployment first. The operator rolls it more than once after a
+    deploy, so the pods are read only when its rollout is complete (``_rollout_pending``); then they are
+    the pods of the final template. A Deployment that is not there (``404``: a StatefulSet or a
+    ``Sandbox``, or a Deployment deleted since the event) gives the pod list with no rollout gate. Any
+    other Deployment read error, a pod LIST failure, or a label present with an INVALID value (not
+    ``agent``/``tool``) is a real failure that no wait can fix: a plain ``HTTPException(502)`` at once.
+    A rollout in progress, a not-yet-created pod or a briefly-absent label is a not-ready state,
+    re-polled a bounded number of times. The poll ends at the first look that finds a labelled pod for
+    which ``settled(service_type, pods)`` is true (with no ``settled``, at the first labelled pod).
+    Retries exhausted -> the labelled ``(service_type, pods)`` of the last look if it had one (the
+    caller reports them), else :class:`WorkloadNotReadyError`, which names the state of the last look.
+    Provision's ``classify_service`` and the UC1 precondition checks (D30) share this wait."""
     no_pod_detail = f"no pod owned by workload {workload_name!r} in namespace {namespace!r}"
     detail = no_pod_detail
     last: tuple[ServiceType, list] | None = None
+    template = None
 
     def _probe():
-        nonlocal detail, last
+        nonlocal detail, last, template
         # Re-derive per attempt so the exhausted wait reflects the LAST-seen state: a pod that
         # disappears mid-poll must report "no pod", not a stale "label missing" from an earlier attempt.
-        detail, last = no_pod_detail, None
+        detail, last, template = no_pod_detail, None, None
+        # The Deployment first: a pod list read before the status can be older than that status.
+        try:
+            deployment = read_deployment(workload_name, namespace)
+        except Exception as e:
+            if not is_not_found(e):
+                raise HTTPException(
+                    502, f"Kubernetes Deployment GET failed for {workload_name!r} in namespace {namespace!r}: {e}"
+                )
+            deployment = None
+        if deployment is not None:
+            pending = _rollout_pending(deployment)
+            if pending:
+                detail = f"workload {workload_name!r} in namespace {namespace!r}: {pending}"
+                template = deployment.spec.template
+                return None
         try:
             items = list_pods(namespace)
         except Exception as e:
@@ -309,7 +368,7 @@ def await_labelled_pods(
         return ready
     if last is not None:
         return last
-    raise HTTPException(502, detail)
+    raise WorkloadNotReadyError(detail, template)
 
 
 class AgentCardNotReadyError(HTTPException):

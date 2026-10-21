@@ -24,15 +24,20 @@ each type, see above). The type is read from the pod label, because the Orchestr
 the bootstrap of a tool's CR (the catalog type is not set before Provision).
 
 The checks find the pods of the service and its type as Provision's ``classify_service`` does: the
-``client.name`` split, the pod selection by ``ownerReferences``, the ``rossoctl.io/type`` label and
-the same bounded re-poll (``ONBOARD_LABEL_WAIT_*``). A pod or a label that is not there yet is a
-deploy->onboard race, not a failed check: an exhausted wait is ``HTTPException(502)``, as in
-Provision. A pod that fails #1 or #6 is re-polled in the same window too, because the operator can
-still roll the workload onto the AuthBridge-injected template (an old pod without the sidecar is
-then still there); a terminating pod is not checked. A Kubernetes API failure is a ``502``.
+``client.name`` split, the rollout of the workload's Deployment, the pod selection by
+``ownerReferences``, the ``rossoctl.io/type`` label and the same bounded re-poll
+(``ONBOARD_LABEL_WAIT_*``). The operator rolls the Deployment more than once after a deploy, so the
+pods are read only when its rollout is complete. A rollout in progress, or a pod or a label that is
+not there yet, is a deploy->onboard race, not a failed check: an exhausted wait is
+``WorkloadNotReadyError`` (a ``502`` that the NATS consumer naks). A pod that fails #1 or #6 is
+re-polled in the same window too; a terminating pod is not checked. A rollout that is never complete
+can be a #6 failure (an ``httpGet`` probe through the sidecar keeps the pod not Ready), so #6 also runs
+on the Deployment's pod template at the end of such a wait. A Kubernetes API failure is a ``502``.
 
 A failed check raises :class:`EnforcementPreconditionError`, which names each failed check.
 """
+
+from types import SimpleNamespace
 
 import yaml
 from fastapi import HTTPException
@@ -40,7 +45,7 @@ from fastapi import HTTPException
 from aiac.idp.configuration.models import Service, ServiceType
 
 from .provision.kube import is_not_found, read_configmap
-from .provision.nodes import await_labelled_pods, split_client_name
+from .provision.nodes import WorkloadNotReadyError, await_labelled_pods, split_client_name
 
 SIDECAR_CONTAINER = "authbridge-proxy"
 PIPELINE_CONFIGMAP = "authbridge-runtime-config"
@@ -85,14 +90,26 @@ def _await_pods(namespace: str, workload: str) -> tuple[ServiceType, list]:
     """The type and the live (not terminating) pods of ``workload``, with Provision's bounded
     re-poll (:func:`await_labelled_pods`).
 
-    The poll ends early when a labelled pod is there and every pod passes #1 and #6. When the
-    budget ends, the last-seen pods are returned (so #1 / #6 report them), or, if no labelled pod
-    was seen at the last look, ``HTTPException(502)`` (as ``classify_service``)."""
+    The poll ends early when the rollout is complete, a labelled pod is there and every pod passes
+    #1 and #6. When the budget ends, the last-seen pods are returned (so #1 / #6 report them), or, if
+    the last look found no labelled pod of a complete rollout, :class:`WorkloadNotReadyError`. When
+    that look found the rollout not complete, #6 runs on the Deployment's pod template first: the
+    operator does not change the probes, so a failure there is a failed check, not a race."""
 
     def _settled(service_type: ServiceType, pods: list) -> bool:
         return not (_check_sidecar(pods, namespace) or _check_probes(pods))
 
-    return await_labelled_pods(namespace, workload, _settled)
+    try:
+        return await_labelled_pods(namespace, workload, _settled)
+    except WorkloadNotReadyError as e:
+        if e.template is None:
+            raise
+        # The template has no pod name: name it after the workload in the #6 failure.
+        template = SimpleNamespace(metadata=SimpleNamespace(name=f"{workload} (pod template)"), spec=e.template.spec)
+        failures = _check_probes([template])
+        if failures:
+            raise EnforcementPreconditionError(failures) from e
+        raise
 
 
 def _pod_name(pod) -> str:

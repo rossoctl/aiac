@@ -14,7 +14,8 @@ and terminated at the FIRST delivery. On any other failure the message is left u
 redelivers after ``ACK_WAIT_SECONDS``) until ``num_delivered`` reaches ``MAX_DELIVER``, at which
 point it is republished to the DLQ subject and terminated (stops redelivery on this consumer). The
 not-ready failures (see ``_NAK_ERRORS``) are nak'd instead of left unacked:
-``ServiceNotVisibleError`` (the IdP does not show a new service yet, the event-before-commit race)
+``ServiceNotVisibleError`` (the IdP does not show a new service yet, the event-before-commit race),
+``WorkloadNotReadyError`` (the rollout of the workload is not complete, or it has no labelled pod yet)
 and ``AgentCardNotReadyError`` (the agent's AgentCard is not ``Synced=True`` yet). NATS redelivers
 them after a short delay (``AIAC_NOT_VISIBLE_NAK_DELAY_SECONDS``), not after ``ACK_WAIT_SECONDS``.
 
@@ -56,7 +57,7 @@ from aiac.agent.policy_rules_builder.graph import (
 from aiac.agent.shared.error_logging import log_by_type
 from aiac.agent.uc.onboarding.orchestrator import ServiceNotVisibleError, onboard_and_apply
 from aiac.agent.uc.onboarding.preconditions import EnforcementPreconditionError
-from aiac.agent.uc.onboarding.provision.nodes import AgentCardNotReadyError
+from aiac.agent.uc.onboarding.provision.nodes import AgentCardNotReadyError, WorkloadNotReadyError
 from aiac.agent.uc.policy_update.build import build_policy
 from aiac.agent.uc.role_update.role import update_role
 from aiac.idp.configuration.models import ServiceUuid
@@ -96,13 +97,14 @@ _PERMANENT_ERRORS: tuple[type[Exception], ...] = (
 )
 
 # The not-ready failures, after the orchestrator's bounded waits: the IdP can still answer 404 for a
-# new service (``ServiceNotVisibleError``, the event-before-commit race, D33 in docs/specs/PRD.md), or
-# the agent's AgentCard can still be not ``Synced=True`` (``AgentCardNotReadyError``). Each can become
+# new service (``ServiceNotVisibleError``, the event-before-commit race, D33 in docs/specs/PRD.md), the
+# rollout of the workload can still be in progress or its pod not labelled yet (``WorkloadNotReadyError``),
+# or the agent's AgentCard can still be not ``Synced=True`` (``AgentCardNotReadyError``). Each can become
 # ready in some seconds, so the consumer naks that message with this delay instead of leaving it
 # unacked: the redelivery then comes after the delay, not after ACK_WAIT (600 s). Each nak uses one of the
 # MAX_DELIVER deliveries. Only the classes in _NAK_ERRORS are nak'd; ACK_WAIT stays sized for long LLM
 # onboardings (see stream.py). Read from the env at call time; keep it well below ACK_WAIT.
-_NAK_ERRORS: tuple[type[Exception], ...] = (ServiceNotVisibleError, AgentCardNotReadyError)
+_NAK_ERRORS: tuple[type[Exception], ...] = (ServiceNotVisibleError, WorkloadNotReadyError, AgentCardNotReadyError)
 _NOT_VISIBLE_NAK_DELAY_ENV = "AIAC_NOT_VISIBLE_NAK_DELAY_SECONDS"
 _NOT_VISIBLE_NAK_DELAY_DEFAULT = 30.0
 
