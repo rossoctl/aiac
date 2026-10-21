@@ -9,20 +9,31 @@ import pytest
 from fastapi import HTTPException
 
 from aiac.agent.uc.onboarding.provision import kube, nodes
+from aiac.agent.uc.onboarding.provision.nodes import AgentCardNotReadyError
 from aiac.agent.uc.onboarding.provision.state import OnboardingProvisionState, Trigger
 
 NS = "team-a"
 WORKLOAD = "weather"
+SYNCED = {"type": "Synced", "status": "True", "reason": "SyncSucceeded", "message": "Successfully fetched"}
 
 
 def _state():
     return OnboardingProvisionState(trigger=Trigger(entity_id="svc-123"), namespace=NS, workload_name=WORKLOAD)
 
 
-def _card(name=WORKLOAD, skills=None):
+def _card(name=WORKLOAD, skills=None, synced=SYNCED):
     """An AgentCard CR as the operator syncs it: the fetched A2A card lives under ``status.card``,
-    and each skill carries a machine ``id`` (a stable identifier) plus a display ``name``."""
-    return {"metadata": {"name": name}, "status": {"card": {"skills": skills or []}}}
+    and each skill carries a machine ``id`` (a stable identifier) plus a display ``name``. The
+    operator writes the card and its ``Synced`` condition in one status update; ``synced=None``
+    gives a card with no ``Synced`` condition yet."""
+    status = {"card": {"skills": skills or []}}
+    if synced is not None:
+        status["conditions"] = [synced]
+    return {"metadata": {"name": name}, "status": status}
+
+
+def _not_synced(reason, message="not yet"):
+    return {"type": "Synced", "status": "False", "reason": reason, "message": message}
 
 
 @pytest.fixture(autouse=True)
@@ -72,7 +83,10 @@ class TestAnalyzeAgentFound:
         card = {
             "metadata": {"name": f"{WORKLOAD}-deployment-card"},
             "spec": {"targetRef": {"kind": "Deployment", "name": WORKLOAD}},
-            "status": {"card": {"skills": [{"id": "forecast", "name": "F", "description": "d"}]}},
+            "status": {
+                "card": {"skills": [{"id": "forecast", "name": "F", "description": "d"}]},
+                "conditions": [SYNCED],
+            },
         }
         provision = _run(items=[card])["service_provision"]
 
@@ -80,38 +94,65 @@ class TestAnalyzeAgentFound:
         assert "derived from AgentCard: 1 skills" == provision.reasoning
 
 
-class TestAnalyzeAgentLegacyFallback:
-    def test_no_agentcard_yields_default_access_scope_and_partial_reasoning(self):
-        provision = _run(items=[])["service_provision"]
+class TestAnalyzeAgentNoSkillsFallback:
+    def test_synced_card_with_no_skills_yields_default_access_scope_and_partial_reasoning(self):
+        # The operator fetched the card (Synced=True) and it has no skills: a real "no skills", so a
+        # default operator role mirrors the default access scope.
+        provision = _run(items=[_card(skills=[])])["service_provision"]
 
-        # No-skills fallback: a default operator role mirrors the default access scope.
         assert [r.name for r in provision.roles] == [f"{WORKLOAD}.access"]
         assert provision.roles[0].description == "Default access scope"
         assert [s.name for s in provision.scopes] == [f"{WORKLOAD}.access"]
         assert provision.scopes[0].description == "Default access scope"
-        assert "partial: no AgentCard found" in provision.reasoning
+        assert provision.reasoning == "partial: AgentCard has no synced skills, default scope assigned"
 
-    def test_agentcard_present_but_no_name_match_is_legacy_fallback(self):
-        provision = _run(items=[_card(name="other-agent", skills=[{"id": "x", "name": "X", "description": "y"}])])[
-            "service_provision"
-        ]
-        assert [s.name for s in provision.scopes] == [f"{WORKLOAD}.access"]
-        assert "partial: no AgentCard found" in provision.reasoning
-
-    def test_agentcard_present_but_no_synced_skills_is_fallback(self):
-        # The CR exists but its ``status.card`` has not synced any skills yet (e.g. the operator has
-        # not fetched the A2A card): fall back to a default access scope rather than provision none.
-        provision = _run(items=[_card(skills=[])])["service_provision"]
+    def test_synced_card_with_no_skills_key_is_the_same_fallback(self):
+        # ``status.card.skills`` is omitempty in the CRD, so a card with no skills can have no key.
+        card = {"metadata": {"name": WORKLOAD}, "status": {"card": {}, "conditions": [SYNCED]}}
+        provision = _run(items=[card])["service_provision"]
         assert [s.name for s in provision.scopes] == [f"{WORKLOAD}.access"]
         assert "no synced skills" in provision.reasoning
 
 
+class TestAnalyzeAgentNotReady:
+    """A card that is not ``Synced=True`` after the budget is not ready: ``AgentCardNotReadyError``
+    (a retryable ``502``), never a default role. Skills alone are not proof of a sync."""
+
+    def _raises(self, items):
+        with pytest.raises(AgentCardNotReadyError) as ei:
+            _run(items=items)
+        assert ei.value.status_code == 502
+        assert repr(WORKLOAD) in ei.value.detail and repr(NS) in ei.value.detail
+        return ei.value.detail
+
+    def test_no_agentcard_is_not_ready(self):
+        detail = self._raises([])
+        assert "no AgentCard targets the workload" in detail
+
+    def test_agentcard_of_another_workload_is_no_agentcard(self):
+        detail = self._raises([_card(name="other-agent", skills=[{"id": "x", "name": "X", "description": "y"}])])
+        assert "no AgentCard targets the workload" in detail
+
+    def test_card_with_skills_but_no_synced_condition_is_not_ready(self):
+        detail = self._raises([_card(skills=[{"id": "x", "name": "X", "description": "y"}], synced=None)])
+        assert "no Synced condition" in detail
+
+    def test_card_with_skills_and_synced_false_is_not_ready(self):
+        # The operator writes the card, then Synced=False, on a failed signature check: the skills are
+        # there, but they are not a sync.
+        card = _card(
+            skills=[{"id": "x", "name": "X", "description": "y"}], synced=_not_synced("SignatureInvalid", "bad sig")
+        )
+        detail = self._raises([card])
+        assert "Synced=False (SignatureInvalid): bad sig" in detail
+
+
 class TestAnalyzeAgentCardSyncRace:
-    """The operator syncs the fetched A2A card onto ``status.card.skills`` only AFTER the agent pod is
-    Ready — later than the Keycloak-registration event that triggers onboarding — so this node can run
-    while the skills are still empty. A briefly-empty skill list is a transient race, re-polled a
-    bounded number of times before falling back to a default access scope (unlike a genuinely
-    card-less legacy deployment, which converges on the fallback only after the budget is spent)."""
+    """The operator syncs the fetched A2A card onto ``status.card`` (with ``Synced=True``) only AFTER
+    the workload is Available and a fetch succeeds — later than the Keycloak-registration event that
+    triggers onboarding — so this node can run before the card is synced. A card that is not
+    ``Synced=True`` yet is re-polled a bounded number of times; after the budget it is not ready
+    (``AgentCardNotReadyError``), never a default access scope."""
 
     def _run_with_client(self, monkeypatch, *, attempts, side_effect=None, return_value=None):
         # monkeypatch.setattr (not a with-block) so the seam stays patched through the test body,
@@ -126,25 +167,36 @@ class TestAnalyzeAgentCardSyncRace:
         monkeypatch.setattr(kube, "_custom_objects", MagicMock(return_value=client))
         return client
 
-    def test_skills_synced_late_are_retried_then_succeed(self, monkeypatch):
+    def test_card_synced_late_is_retried_then_succeeds(self, monkeypatch):
         client = self._run_with_client(
             monkeypatch,
-            attempts=3,
+            attempts=4,
             side_effect=[
-                {"items": [_card(skills=[])]},  # operator has not synced the A2A card onto status yet
+                {"items": [_card(synced=_not_synced("WorkloadNotReady"))]},  # the workload is not Available yet
+                {"items": [_card(synced=_not_synced("FetchFailed", "connection reset by peer"))]},  # port not up
                 {"items": [_card(skills=[{"id": "forecast", "name": "F", "description": "Get forecast"}])]},  # synced
             ],
         )
         provision = nodes.analyze_agent(_state())["service_provision"]
         assert [s.name for s in provision.scopes] == [f"{WORKLOAD}.forecast"]
         assert "derived from AgentCard: 1 skills" == provision.reasoning
-        assert client.list_namespaced_custom_object.call_count == 2  # re-polled once, then succeeded
+        assert client.list_namespaced_custom_object.call_count == 3  # re-polled twice, then succeeded
 
-    def test_never_synced_falls_back_after_exhausting_the_attempt_budget(self, monkeypatch):
-        client = self._run_with_client(monkeypatch, attempts=3, return_value={"items": [_card(skills=[])]})
-        provision = nodes.analyze_agent(_state())["service_provision"]
-        assert [s.name for s in provision.scopes] == [f"{WORKLOAD}.access"]
-        assert "no synced skills" in provision.reasoning
+    def test_never_synced_is_not_ready_after_exhausting_the_attempt_budget(self, monkeypatch):
+        client = self._run_with_client(
+            monkeypatch,
+            attempts=3,
+            side_effect=[
+                {"items": [_card(synced=_not_synced("WorkloadNotReady"))]},
+                {"items": [_card(synced=_not_synced("WorkloadNotReady"))]},
+                {"items": [_card(synced=_not_synced("FetchFailed", "connection reset by peer"))]},
+            ],
+        )
+        with pytest.raises(AgentCardNotReadyError) as ei:
+            nodes.analyze_agent(_state())
+        # The detail names the state of the LAST look, not an earlier one.
+        assert "Synced=False (FetchFailed): connection reset by peer" in ei.value.detail
+        assert "ONBOARD_CARD_WAIT_ATTEMPTS" in ei.value.detail
         assert client.list_namespaced_custom_object.call_count == 3  # polled the full budget, then gave up
 
 
@@ -154,3 +206,5 @@ class TestAnalyzeAgent502:
         with pytest.raises(HTTPException) as ei:
             _run(list_exc=RuntimeError("apiserver down"))
         assert ei.value.status_code == 502
+        # A real failure, not a race: a plain 502, which the NATS consumer does not nak.
+        assert not isinstance(ei.value, AgentCardNotReadyError)

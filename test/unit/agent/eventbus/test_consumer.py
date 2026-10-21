@@ -2,7 +2,8 @@
 
 Covers subject-based dispatch and the ack/DLQ contract: ack on success,
 no ack (implicit redelivery) on failure below MAX_DELIVER, a delayed nak for a
-service that the IdP does not show yet (``ServiceNotVisibleError``), and DLQ
+not-ready failure (``ServiceNotVisibleError``: the IdP does not show the service yet;
+``AgentCardNotReadyError``: the agent's AgentCard is not ``Synced=True`` yet), and DLQ
 publish + term() once MAX_DELIVER is reached. A role-membership subject
 (``aiac.apply.role-members.{role-id}``) goes to the PCE ``rerender_role``, with no
 use-case handler and no ``compute_and_apply``.
@@ -43,6 +44,7 @@ from aiac.agent.policy_rules_builder.graph import (
 )
 from aiac.agent.uc.onboarding.orchestrator import ServiceNotVisibleError
 from aiac.agent.uc.onboarding.preconditions import EnforcementPreconditionError
+from aiac.agent.uc.onboarding.provision.nodes import AgentCardNotReadyError
 
 
 def _fake_msg(subject: str, num_delivered: int = 1, seq: int = 1) -> MagicMock:
@@ -428,13 +430,24 @@ def _not_visible() -> ServiceNotVisibleError:
     return ServiceNotVisibleError("IdP has no service svc-1 yet")
 
 
+# The agent's AgentCard is still not Synced=True after the card wait: the operator can sync it some
+# seconds later, so the consumer naks it with the same short delay.
+def _card_not_ready() -> AgentCardNotReadyError:
+    return AgentCardNotReadyError("AgentCard of workload 'weather' is Synced=False (FetchFailed)")
+
+
+# Both not-ready failures share the nak contract below.
+NOT_READY = pytest.mark.parametrize("not_ready", [_not_visible, _card_not_ready], ids=["not_visible", "card_not_ready"])
+
+
+@NOT_READY
 @pytest.mark.parametrize("num_delivered", [1, MAX_DELIVER - 1])
-def test_dispatch_naks_not_visible_service_with_delay_below_max_deliver(monkeypatch, num_delivered):
+def test_dispatch_naks_a_not_ready_failure_with_delay_below_max_deliver(monkeypatch, num_delivered, not_ready):
     monkeypatch.delenv(_NOT_VISIBLE_NAK_DELAY_ENV, raising=False)
     consumer = AiacEventConsumer()
     consumer._nc = nc = _fake_nc()
     msg = _fake_msg("aiac.apply.service.svc-1", num_delivered=num_delivered)
-    exc = _not_visible()
+    exc = not_ready()
 
     with (
         patch("aiac.agent.eventbus.consumer.onboard_and_apply", side_effect=exc),
@@ -449,26 +462,28 @@ def test_dispatch_naks_not_visible_service_with_delay_below_max_deliver(monkeypa
     log.assert_called_once_with(exc)
 
 
-def test_dispatch_naks_not_visible_service_with_the_configured_delay(monkeypatch):
+@NOT_READY
+def test_dispatch_naks_a_not_ready_failure_with_the_configured_delay(monkeypatch, not_ready):
     monkeypatch.setenv(_NOT_VISIBLE_NAK_DELAY_ENV, "5")
     consumer = AiacEventConsumer()
     consumer._nc = _fake_nc()
     msg = _fake_msg("aiac.apply.service.svc-1", num_delivered=1)
 
-    with patch("aiac.agent.eventbus.consumer.onboard_and_apply", side_effect=_not_visible()):
+    with patch("aiac.agent.eventbus.consumer.onboard_and_apply", side_effect=not_ready()):
         asyncio.run(consumer._dispatch(msg))
 
     msg.nak.assert_called_once_with(delay=5.0)
 
 
-def test_dispatch_routes_not_visible_service_to_dlq_at_max_deliver():
-    # At MAX_DELIVER the not-visible service goes to the DLQ like every other retryable failure: no
+@NOT_READY
+def test_dispatch_routes_a_not_ready_failure_to_dlq_at_max_deliver(not_ready):
+    # At MAX_DELIVER a not-ready failure goes to the DLQ like every other retryable failure: no
     # nak (a nak would ask for a delivery that the consumer's max_deliver does not allow).
     consumer = AiacEventConsumer()
     consumer._nc = nc = _fake_nc()
     msg = _fake_msg("aiac.apply.service.svc-1", num_delivered=MAX_DELIVER)
 
-    with patch("aiac.agent.eventbus.consumer.onboard_and_apply", side_effect=_not_visible()):
+    with patch("aiac.agent.eventbus.consumer.onboard_and_apply", side_effect=not_ready()):
         asyncio.run(consumer._dispatch(msg))
 
     msg.nak.assert_not_called()
@@ -478,7 +493,7 @@ def test_dispatch_routes_not_visible_service_to_dlq_at_max_deliver():
 
 
 def test_dispatch_does_not_nak_another_http_502():
-    # Only the not-visible class is nak'd. Another 502 from onboard_and_apply (for example an IdP
+    # Only the not-ready classes are nak'd. Another 502 from onboard_and_apply (for example an IdP
     # outage) keeps the old behaviour: no ack and no nak, so NATS redelivers after ACK_WAIT.
     consumer = AiacEventConsumer()
     consumer._nc = nc = _fake_nc()
@@ -492,6 +507,38 @@ def test_dispatch_does_not_nak_another_http_502():
     msg.ack.assert_not_called()
     msg.term.assert_not_called()
     nc.jetstream.assert_not_called()
+
+
+def test_the_redelivery_after_a_card_not_ready_nak_waits_for_the_client():
+    # Only a not-visible nak makes the redelivery read the client with no wait: the card nak gave the
+    # client no time to become visible (it was visible already), so the consumer does not record it.
+    consumer = AiacEventConsumer()
+    consumer._nc = _fake_nc()
+    first = _fake_msg("aiac.apply.service.svc-1", num_delivered=1, seq=7)
+    again = _fake_msg("aiac.apply.service.svc-1", num_delivered=2, seq=7)
+
+    with patch("aiac.agent.eventbus.consumer.onboard_and_apply", side_effect=[_card_not_ready(), None]) as onboard:
+        asyncio.run(consumer._dispatch(first))
+        assert consumer._not_visible_seqs == set()
+        asyncio.run(consumer._dispatch(again))
+
+    assert [c.kwargs["wait_for_client"] for c in onboard.call_args_list] == [True, True]
+    first.nak.assert_called_once()
+    again.ack.assert_called_once()
+
+
+def test_the_nak_log_names_the_not_ready_failure(caplog):
+    consumer = AiacEventConsumer()
+    consumer._nc = _fake_nc()
+    msg = _fake_msg("aiac.apply.service.svc-1", num_delivered=1)
+
+    with (
+        patch("aiac.agent.eventbus.consumer.onboard_and_apply", side_effect=_card_not_ready()),
+        caplog.at_level("INFO", logger="aiac.agent.eventbus.consumer"),
+    ):
+        asyncio.run(consumer._dispatch(msg))
+
+    assert any("nak'd" in r.getMessage() and "AgentCardNotReadyError" in r.getMessage() for r in caplog.records)
 
 
 def test_dispatch_survives_a_failed_nak(caplog):

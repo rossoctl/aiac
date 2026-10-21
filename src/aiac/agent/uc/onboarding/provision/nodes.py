@@ -53,11 +53,14 @@ class WaitConfig:
 # its AgentRuntime. Still well under the NATS ACK_WAIT; tests set fast.
 _LABEL_WAIT = WaitConfig("ONBOARD_LABEL_WAIT_ATTEMPTS", "ONBOARD_LABEL_WAIT_BACKOFF", 30, 2.0)
 
-# Deploy->onboard race tolerance for the AgentCard skill sync — a SECOND, later race than the label one
-# above. The operator syncs the fetched A2A card onto ``status.card.skills`` only AFTER the agent pod is
-# Ready, which lags the Keycloak-client registration that triggers onboarding. So ``analyze_agent`` can
-# run while ``status.card.skills`` is still empty. An absent card / empty skill list is therefore a
-# transient not-ready state, re-polled before we fall back to a default access scope. Same ≈30s slack.
+# Deploy->onboard race tolerance for the AgentCard sync — a SECOND, later race than the label one above.
+# The operator fetches the agent's A2A card only AFTER the workload is Available, and writes it onto
+# ``status.card`` together with the card's ``Synced=True`` condition. That lags the Keycloak-client
+# registration that triggers onboarding (after a failed fetch the operator tries again after 1 min, or
+# earlier on a watch event). So ``analyze_agent`` can run before the card is synced, and it waits for
+# ``Synced=True``. This budget bounds ONE delivery's wait, not the correctness of the role set: a card
+# that is still not synced raises ``AgentCardNotReadyError``, which the NATS consumer naks, and the
+# redelivery waits again. ≈28s; tests set fast.
 _CARD_WAIT = WaitConfig("ONBOARD_CARD_WAIT_ATTEMPTS", "ONBOARD_CARD_WAIT_BACKOFF", 15, 2.0)
 
 # Deploy->onboard race tolerance for the tool's MCP manifest — the THIRD race. A tool can answer
@@ -309,17 +312,27 @@ def await_labelled_pods(
     raise HTTPException(502, detail)
 
 
-def _await_agent_skills(namespace: str, workload: str):
-    """Resolve an agent's AgentCard + its synced skills, tolerating the deploy->onboard RACE on the
-    card sync (see the module knobs above).
+class AgentCardNotReadyError(HTTPException):
+    """The agent's AgentCard is still not ``Synced=True`` after the bounded card wait (see
+    :func:`_await_agent_skills`). It is an ``HTTPException(502)``, so the HTTP route answers ``502``,
+    and the NATS consumer can tell it from the other retryable failures (it naks it with a delay)."""
 
-    The operator syncs the fetched A2A card onto ``status.card.skills`` only AFTER the agent pod is
-    Ready — a DIFFERENT, later operator action than the Keycloak-client registration that triggers
-    onboarding. So this node can run before the skills are synced. An absent card, or a card whose
-    ``status.card.skills`` is still empty, is therefore a transient not-ready state, re-polled a
-    bounded number of times. Returns ``(card, skills)`` as soon as skills are present, or the
-    last-seen ``(card, [])`` once the attempt budget is exhausted — the caller then applies the
-    legacy card-less / skill-less fallback (a genuinely card-less workload never converges here)."""
+    def __init__(self, detail: str) -> None:
+        super().__init__(502, detail)
+
+
+def _await_agent_skills(namespace: str, workload: str) -> list[dict]:
+    """The skills of an agent's synced AgentCard, tolerating the deploy->onboard RACE on the card sync
+    (see the module knobs above).
+
+    The operator writes the fetched A2A card onto ``status.card`` and sets the card's ``Synced``
+    condition in one status update, only AFTER the workload is Available and a fetch succeeds — a
+    DIFFERENT, later operator action than the Keycloak-client registration that triggers onboarding.
+    So the card is ready only when ``Synced`` is ``True``. Skills alone are not proof: a card keeps its
+    old skills when a later fetch fails, and holds the rejected skills on a failed signature check. An
+    absent card, or a card that is not ``Synced=True`` (for any reason), is a not-ready state, re-polled
+    a bounded number of times. Returns the skills of the first ``Synced=True`` look (the list may be
+    empty). Budget exhausted -> :class:`AgentCardNotReadyError`, naming the state of the last look."""
 
     # Link the card to the workload by its ``spec.targetRef`` (the Deployment it describes), since the
     # operator names the CR after the Deployment (e.g. ``<workload>-deployment-card``), not the
@@ -328,21 +341,42 @@ def _await_agent_skills(namespace: str, workload: str):
         target = ((c.get("spec") or {}).get("targetRef") or {}).get("name")
         return target == workload or (c.get("metadata") or {}).get("name") == workload
 
-    last_card = None
+    detail = ""
 
     def _probe():
-        nonlocal last_card
+        nonlocal detail
         try:
             resp = list_agentcards(namespace)
         except Exception as e:
             raise HTTPException(502, f"Kubernetes AgentCard LIST failed in namespace {namespace!r}: {e}")
 
-        last_card = next((c for c in resp.get("items", []) if _targets_workload(c)), None)
-        skills = (((last_card or {}).get("status") or {}).get("card") or {}).get("skills", [])
-        return (last_card, skills) if skills else None
+        card = next((c for c in resp.get("items", []) if _targets_workload(c)), None)
+        if card is None:
+            detail = (
+                "no AgentCard targets the workload (the operator creates one only for a workload with the "
+                "'rossoctl.io/type=agent' label and a 'protocol.rossoctl.io/<name>' label)"
+            )
+            return None
+        name = (card.get("metadata") or {}).get("name")
+        status = card.get("status") or {}
+        synced = next((c for c in status.get("conditions") or [] if c.get("type") == "Synced"), None)
+        if synced is None:
+            detail = f"AgentCard {name!r} has no Synced condition yet"
+            return None
+        if synced.get("status") != "True":
+            detail = (
+                f"AgentCard {name!r} is Synced={synced.get('status')} ({synced.get('reason')}): {synced.get('message')}"
+            )
+            return None
+        return (status.get("card") or {}).get("skills") or []
 
-    result = poll_until_ready(_probe, _CARD_WAIT)
-    return result if result is not None else (last_card, [])
+    skills = poll_until_ready(_probe, _CARD_WAIT)
+    if skills is None:
+        raise AgentCardNotReadyError(
+            f"AgentCard of workload {workload!r} in namespace {namespace!r} is not Synced=True within the "
+            f"{_CARD_WAIT.attempts_env} budget: {detail}"
+        )
+    return skills
 
 
 def analyze_agent(state: OnboardingProvisionState) -> dict:
@@ -355,22 +389,20 @@ def analyze_agent(state: OnboardingProvisionState) -> dict:
     scope (same name + description): the role's description is what the PRB capability-match reads to
     confine and grant the agent's outbound access on a domain basis.
 
-    Because the operator syncs the card only after the agent pod is Ready — later than the event that
-    triggers onboarding — the skills are awaited with a bounded retry (``_await_agent_skills``). Falls
-    back to a default access scope + a default operator role only once that wait is exhausted: for a
-    genuinely card-less legacy deployment, or a CR whose skills never sync."""
+    Because the operator syncs the card only after the workload is Available and a fetch succeeds —
+    later than the event that triggers onboarding — the card is awaited with a bounded retry until it
+    is ``Synced=True`` (``_await_agent_skills``). A card that is still not synced (or no card) raises
+    :class:`AgentCardNotReadyError`, which the NATS consumer naks, so a later delivery waits again.
+    Falls back to a default access scope + a default operator role only for a ``Synced=True`` card
+    with no skills."""
     namespace, workload = state.namespace, state.workload_name
 
-    card, skills = _await_agent_skills(namespace, workload)
+    skills = _await_agent_skills(namespace, workload)
     if not skills:
         provision = ServiceProvision(
             roles=[RoleDefinition(name=f"{workload}.access", description="Default access scope")],
             scopes=[ScopeDefinition(name=f"{workload}.access", description="Default access scope")],
-            reasoning=(
-                "partial: no AgentCard found, default scope assigned"
-                if card is None
-                else "partial: AgentCard has no synced skills, default scope assigned"
-            ),
+            reasoning="partial: AgentCard has no synced skills, default scope assigned",
         )
         return {"service_provision": provision}
 
