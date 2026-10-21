@@ -15,9 +15,8 @@ Make each handoff self-contained: background, task, exact files, and acceptance 
 
 ## Tests
 
-Two trees: `test/` (testing) and `eval/` (evaluation). Selection is
-**marker-only**: select tests with markers, never with a path. A bare
-`.venv/bin/pytest` runs the offline unit lane.
+Two trees: `test/` and `eval/`. Select tests with markers only, never with a
+path. A bare `.venv/bin/pytest` runs the offline unit lane.
 
 - To run a lane (unit, integration, llm, system, eval), see `docs/agents/test.md`.
 - To write a new test (placement, markers, clean-skip), see
@@ -39,8 +38,8 @@ user and wait.
 ## Kubernetes & builds
 
 Read these when a task builds images or deploys to a cluster:
-- Build and deploy: `k8s/aiac-deployment-guide.md`. The OPA pipeline on Kind:
-  `k8s/opa-kind-runbook.md`. Deploy preconditions: `docs/agents/deploy.md`.
+- Build and deploy: `k8s/aiac-deployment-guide.md`. Deploy preconditions:
+  `docs/agents/deploy.md`.
 
 ## External references
 
@@ -48,6 +47,6 @@ Read these when a task builds images or deploys to a cluster:
 
 ## Agent skill overrides
 
-- **Issue tracker**: GitHub issues in `rossoctl/aiac`. Label every new issue `aiac` plus the `area:<path>` label of its component. Board: **AIAC #12**. See `docs/agents/issue-tracker.md`.
+- **Issue tracker**: GitHub issues in `rossoctl/aiac`. Label every new issue `aiac` plus the `area:<path>` label of its component. Add it to board **AIAC #12** and set its `Triage Status`. See `docs/agents/issue-tracker.md`.
 - **Triage labels**: every state label has the `status:` prefix and is mirrored on the board's `Triage Status` field. See `docs/agents/triage-labels.md`.
 - **Domain docs**: single-context. `GLOSSARY.md` is the glossary; design decisions live in the specs under `docs/specs/`. Consult a design decision only when the task touches its area. See `docs/agents/domain.md`.

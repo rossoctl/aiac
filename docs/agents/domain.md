@@ -7,11 +7,11 @@ when exploring the codebase. The repo (`rossoctl/aiac`) is a single context.
 
 - **`GLOSSARY.md`** at the repo root.
 
-**Gotcha — decisions do not go in `docs/adr/`.** The engineering skills
+**Gotcha — decisions live in the specs.** The engineering skills
 (mattpocock-skills 1.3 and later, including `domain-modeling` and the
-user-invoked `/grill-with-docs`) record decisions under `docs/adr/`. This repo
-does not. Wherever a skill says ADR, record a "Design decision: …" section in
-the relevant spec (next section). Never create `docs/adr/`.
+user-invoked `/grill-with-docs`) record decisions as ADRs. Wherever a skill says
+ADR, record a "Design decision: …" section in the relevant spec (next section)
+instead.
 
 ## Design decisions — consult on demand, not up front
 

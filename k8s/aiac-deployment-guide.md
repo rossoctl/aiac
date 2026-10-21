@@ -26,7 +26,8 @@ fails, install that precondition, then deploy.
 ### OPA on the Kind platform
 
 AIAC needs OPA in the AuthBridge pipeline, `bundle-service`, and the changed global combiner
-(D20). Without them the AIAC Controller does not start.
+(D20). Without them the AIAC Controller does not start. The full runbook for the OPA
+pipeline on Kind is [`opa-kind-runbook.md`](opa-kind-runbook.md).
 
 | | |
 |---|---|
