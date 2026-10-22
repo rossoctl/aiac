@@ -7,11 +7,10 @@ unprefixed labels. **This repo prefixes every state label with `status:`.**
 Each state is recorded in **two places**, and both must be updated together:
 
 1. The `status:<role>` issue label — `gh issue edit <n> -R rossoctl/aiac --remove-label "<old>" --add-label "<new>"`.
-2. The **`Triage Status`** single-select field on Project board **#12**
-   (`rossoctl`). This is a custom field (id `PVTSSF_lADODC4bxc4Bi_vFzhh1vWg`),
-   **not** the board's built-in `Status` field, which is unused. `gh issue edit`
-   does not move it — see `docs/agents/issue-tracker.md` → "Project board" for
-   the `gh project item-edit` command and how to discover the option ids.
+2. The **`Triage Status`** field on Project board **#12** (`rossoctl`).
+   `gh issue edit` does not move it — see `docs/agents/issue-tracker.md` →
+   "Project board" for the field, the `gh project item-edit` command, and how
+   to discover the option ids.
 
 ## State roles
 

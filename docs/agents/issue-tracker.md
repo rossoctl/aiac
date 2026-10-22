@@ -11,14 +11,6 @@ This file exists so the engineering skills (`to-tickets`, `to-spec`, `triage`,
 `close-issue`, `code-review`) have a single place to read the convention from.
 The triage-role → label/board mapping is in `docs/agents/triage-labels.md`.
 
-> **Migration note (2026-09-09).** The `aiac`-labelled issues were migrated here
-> from `s-and-p-team/cortex`. GitHub cannot transfer issues across orgs, so they
-> were **copied** (authored by the migrating account, dated at copy time, with a
-> provenance line linking each copy back to its `cortex` original); the originals
-> in `cortex` were then closed with pointer comments. Issue numbers changed on
-> copy, so `#NNN` cross-references in the migrated bodies/titles were rewritten to
-> the new numbers. Full-URL links back to `cortex` were left intact.
-
 ## Conventions
 
 - **Create an issue**: `gh issue create -R rossoctl/aiac --title "..." --body "..." --label aiac`.
@@ -58,7 +50,7 @@ or update an `aiac` issue, add it to the board and set its status:
 
 - **Add to the board**: `gh project item-add 12 --owner rossoctl --url <issue-url>`
   (returns the item id; requires the `project` OAuth scope).
-- **Set the status**: the migrated triage state lives on a **custom
+- **Set the status**: the triage state lives on a **custom
   single-select field named `Triage Status`** (field id
   `PVTSSF_lADODC4bxc4Bi_vFzhh1vWg`), **not** the board's built-in `Status` field
   (which is left unused / auto-driven by open-closed). Set it with
@@ -67,10 +59,6 @@ or update an `aiac` issue, add it to the board and set its status:
   Discover item and option ids with
   `gh project item-list 12 --owner rossoctl --format json --limit 300` and
   `gh project field-list 12 --owner rossoctl --format json`.
-
-The `Triage Status` field options are `needs-triage`, `needs-info`,
-`ready-for-agent`, `ready-for-human`, `blocked`, `deferred`, `resolved`,
-`wontfix`.
 
 ## When a skill says "publish to the issue tracker"
 
@@ -83,13 +71,7 @@ Run `gh issue view <number> -R rossoctl/aiac --comments`.
 
 ## When a skill mentions triage roles
 
-The five canonical roles (`needs-triage`, `needs-info`, `ready-for-agent`,
-`ready-for-human`, `wontfix`) map to **both** a `status:<role>` issue label
-**and** the matching option on the board's `Triage Status` field (see Project
-board above); the board adds `blocked` / `deferred` / `resolved` beyond the five.
-Apply the `status:<role>` label with `gh issue edit` and set the `Triage Status`
-field to the same value. The full mapping (including the terminal values
-`close-issue` sets) is in `docs/agents/triage-labels.md`.
+See `docs/agents/triage-labels.md`.
 
 Filtered web list:
 <https://github.com/rossoctl/aiac/issues?q=is%3Aissue+label%3Aaiac>

@@ -813,7 +813,7 @@ Detail: [`k8s/opa-kind-runbook.md`](../../k8s/opa-kind-runbook.md).
 
 ## 9. Testing
 
-Tests live in `test/` (Testing) and `eval/` (Evaluation); selection is marker-only.
+Tests live in `test/` (Testing) and `eval/` (Evaluation); selection is marker-only. To run a lane, see [`docs/agents/test.md`](../agents/test.md).
 
 ### Unit tests
 
@@ -837,7 +837,7 @@ Tests live in `test/` (Testing) and `eval/` (Evaluation); selection is marker-on
 
 ### Integration tests
 
-Offline: several AIAC units in one process, with no cluster, no Keycloak and no LLM endpoint. The tests live under `test/integration/` (a mirror of `src/aiac/`) and have `pytestmark = pytest.mark.integration`. Run them with `pytest -m integration`.
+Offline: several AIAC units in one process, with no cluster, no Keycloak and no LLM endpoint. The tests live under `test/integration/` (a mirror of `src/aiac/`) and have `pytestmark = pytest.mark.integration`.
 
 | Target | What to mock | What to assert |
 |--------|-------------|----------------|
@@ -859,16 +859,6 @@ Require a live rossoctl/Kind cluster with the AuthBridge OPA pipeline wired in (
 | `AIAC_TEST_REALM` | Optional: realm of the live stack (default from the scenario) |
 
 System tests onboard through the in-cluster Controller and assert the deployed OPA plugin's allow/deny on real HTTP requests through AuthBridge. They skip cleanly when the cluster or the env is missing. The own inbound OPA of github-tool decides the tool calls, and the outbound of the agent is a pass-through. A service that has no CR is denied, and a quarantine deletes the CR. After each workload converges, `require_subject_scope` checks that its client links `aiac-username-sub` as a default scope (D31); a missing link is a failure, not a skip. `require_subject_scope` also checks that the login client `rossoctl` links the scope as a default scope (a missing login client, a missing link or an optional link only is a failure). Rung 2 also checks the scope and the links of `rossoctl`, `github-agent` and `github-tool`, that `rossoctl` has no client mapper that writes `sub`, and that the `rossoctl` login token of `dev-user` has `sub` = `dev-user` (`test_subject_scope_linked`), and the `sub` of an exchanged token (`test_exchanged_token_subject_is_username`: the harness exchanges as the agent client with its client secret, the identity that `k8s/opa-kind-enable.sh` gives AuthBridge; it skips only if the agent client uses another client authenticator). `verify_login_subject` checks the login token through `rossoctl`: the fixture first enables Direct Access Grants on `rossoctl` and skips with the cause when it cannot (a missing realm or `rossoctl`, or an admin that cannot manage clients); it skips when it still cannot mint the token, and fails when `sub` is not the username, because the link is an AIAC step. Rung 5 checks that the rollback keeps the scope (`test_rollback_keeps_the_subject_scope`).
-
-Selection is marker-only — no path argument. `integration` (several units in-process, no cluster), `system`, `llm` (real LLM, no cluster) and `eval` are opt-in markers:
-
-```bash
-pytest                # unit only (the default)
-pytest -m integration # integration only (offline, several units)
-pytest -m system      # system only
-pytest -m llm         # live-LLM tests only
-pytest -m eval        # evaluation suite only
-```
 
 ### Test & evaluation specifications
 

@@ -302,7 +302,7 @@ authoring layer cannot see.
   never as a cross-source precedence. The engine's identify-never-reconcile
   principle is unchanged and unaffected by this reservation.
 - "Conflict" without qualification continues to mean the **engine-layer**
-  `(role, scope)` collision (see `CONTEXT.md`). The within-policy notion is always
+  `(role, scope)` collision (see `GLOSSARY.md`). The within-policy notion is always
   written **authoring-layer conflict** to keep the two from being confused.
 
 ## Design decision: digestion is produced out of band
@@ -335,7 +335,7 @@ cheap and gives conflict detection a single gate.
 
 - The conversion capability carries **no I/O, persistence, or flow wiring** —
   those live in the standalone unit. Its sole contract with everything downstream
-  is **faithfulness** (see `CONTEXT.md`): the digest adds, drops, or broadens no
+  is **faithfulness** (see `GLOSSARY.md`): the digest adds, drops, or broadens no
   access relative to its source.
 - Nothing on the onboarding/update path changes to consume a digest — the swap is
   entirely a matter of what the policy source resolves to. The Policy Rules
