@@ -26,7 +26,11 @@ fails, install that precondition, then deploy.
 ### OPA on the Kind platform
 
 AIAC needs OPA in the AuthBridge pipeline, `bundle-service`, and the changed global combiner
-(D20). Without them the AIAC Controller does not start.
+(D20). Without them the AIAC Controller does not start. Each tool pod also needs the
+AuthBridge sidecar (`injectTools=true`), and the inbound pipeline of the namespace needs
+`jwt-validation`, `mcp-parser` and `opa`, or the onboarding of the tool fails with `409`
+(check #1 or #2, D30). `opa-kind-enable.sh` sets all of these. The full runbook for the OPA
+pipeline on Kind is [`opa-kind-runbook.md`](opa-kind-runbook.md).
 
 | | |
 |---|---|

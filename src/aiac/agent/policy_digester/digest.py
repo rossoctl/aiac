@@ -4,7 +4,7 @@
 text and does nothing else. It reads no files, no env, and persists nothing: the caller
 (a future standalone policy-digester unit, or the ``convert_scenarios`` CLI) owns reading
 the source and storing the digest. See ``docs/specs/digested-policy.md`` (the design
-decision "digestion is produced out of band") and ``CONTEXT.md`` (Policy Digester,
+decision "digestion is produced out of band") and ``GLOSSARY.md`` (Policy Digester,
 Faithfulness).
 
 The digest is produced as FREE TEXT (the model's ``.content``), not a structured schema:

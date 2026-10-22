@@ -75,8 +75,28 @@ image_exists() {
   "$RUNTIME" image exists "$1" >/dev/null 2>&1 || "$RUNTIME" image inspect "$1" >/dev/null 2>&1
 }
 
+node_has_image() {
+  # True when the Kind node already holds $1 with the same creation time as the local image.
+  # `kind load` compares image IDs, and these never match when docker uses the containerd image
+  # store (docker reports the manifest digest, the node's crictl reports the config digest), so it
+  # re-imports a multi-GB image on every run. That disk write can stall etcd on a busy host. The
+  # creation time is the same on both sides, so it is a reliable "already loaded" test.
+  # Docker only: for podman, or when anything cannot be read, return false and load as before.
+  local image="$1" local_created node_created
+  [ "$RUNTIME" = "docker" ] || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  local_created="$("$RUNTIME" image inspect "$image" --format '{{.Created}}' 2>/dev/null)" || return 1
+  node_created="$("$RUNTIME" exec "${CLUSTER_NAME}-control-plane" crictl inspecti "$image" 2>/dev/null \
+    | jq -r '.info.imageSpec.created // empty')" || return 1
+  [ -n "$local_created" ] && [ "$local_created" = "$node_created" ]
+}
+
 load_image_to_kind() {
   local image="$1"
+  if [ "$REBUILD" -eq 0 ] && node_has_image "$image"; then
+    log "Image '$image' already on the kind node (same creation time), skipping load."
+    return 0
+  fi
   # `kind load docker-image` shells out to the docker binary and does not work with podman;
   # for podman, save to an archive and use `kind load image-archive` instead.
   if [ "$RUNTIME" = "podman" ]; then
