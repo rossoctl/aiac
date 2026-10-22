@@ -120,7 +120,7 @@ On handler failure, the consumer classifies the exception by **type**, not by HT
   - If the nak itself fails (for example, a dropped connection), the consumer logs the error and returns. The callback does not crash. The message stays unacked, so NATS redelivers it after `AckWait`.
   - The consumer naks only the not-ready errors (`_NAK_ERRORS` in `consumer.py`). Each is a subclass of `HTTPException(502)`, and the consumer checks the type, not the status: a different `HTTPException(502)` (for example, an IdP outage) stays in the class above, with the redelivery after `AckWait`. `AckWait` stays `600` s, because it is sized for long LLM onboardings (`stream.py`).
 
-  A failure after the tool's bootstrap also removes the CR, on either branch of the Orchestrator (`orchestrator.py:406-418`): a rollback error runs the quarantine, which deletes it, and any other failure drops it (`_drop_bootstrap`). It stays absent until the redelivery writes it again (deferred, PRD layer 7). This is not a nak path.
+  A failure after the tool's bootstrap also removes the CR, on either branch of the Orchestrator (`orchestrator.py:406-418`): a rollback error runs the quarantine, which deletes it, and any other failure drops it (`_drop_bootstrap`). A PCE failure after the Orchestrator returns drops it too (`orchestrator.py:285-289`). It stays absent until the redelivery writes it again (deferred, PRD layer 7). This is not a nak path.
 
 Both entry paths log through the shared `log_by_type` helper (`agent/shared/error_logging.py`), because FastAPI exception handlers do **not** fire on the NATS path.
 

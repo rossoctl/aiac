@@ -41,15 +41,15 @@ The file checks:
   agent scopes binding, or no agent CR at all, is a problem. A tool CR with the agent roles, or with some of them, has no
   problem; a tool CR with no calling-agent role is a problem, a tool CR that grants the default access
   role is named, and a tool CR with other owned tools is a problem.
-- **The inbound and outbound hints.** `probe_hint` names the cause from the answer: a 503 from an OPA
+- **The inbound hint.** `probe_hint` names the cause from the answer: a 503 from an OPA
   with no bundle points at the bundle service; an OPA 403 points at the CR; a 403 that is not from OPA
   says so; no answer points at the probe pod or the service; another 503 names its plugin; a 200 has
   no hint.
 - **The report.** `signals_report` prints the last observation with its raw answer and hint. A signal
   that the poll never observed says so.
-- **The onboarding log lines.** `onboarding_lines` keeps the dead-letter move of this client and each
-  `nak'd` line of this client, and ignores the lines of another client. Many naks keep the
-  dead-letter move.
+- **The onboarding log lines.** `onboarding_lines` keeps the last `keep` lines of this client, with the
+  dead-letter move last, and ignores the lines of another client. With nine naks and `keep=3`, it keeps
+  the last three, and the dead-letter move is the last of them.
 
 It does not check the cluster behaviour of the gates. That is the system lane's job
 ([uc1-onboarding-pipeline.md](uc1-onboarding-pipeline.md)).

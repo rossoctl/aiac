@@ -20,7 +20,7 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent  # test/unit/agent/uc/onboarding/
-REPO_ROOT = HERE.parents[4]  # -> aiac/
+REPO_ROOT = HERE.parents[5]  # -> repo root
 sys.path.insert(0, str(REPO_ROOT))  # so ``import test.system.*`` resolves
 
 from test.system import uc1_onboard as uc1  # noqa: E402
