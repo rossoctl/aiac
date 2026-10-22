@@ -830,7 +830,7 @@ def await_final_rollout(admin, workload: str, *, context: dict) -> None:
     def _final() -> bool:
         try:
             _, seen["reason"] = _read_rollout(workload)
-        except Exception as exc:  # noqa: BLE001 — a read failure is a reason, so the poll goes on
+        except Exception as exc:  # a read failure is a reason, so the poll goes on
             seen["reason"] = f"read failed: {_exc_text(exc, 300)}"
         return seen["reason"] is None
 
@@ -883,7 +883,7 @@ def await_onboarded(admin, workload: str, *, context: dict, deployed_at: datetim
     def _poll() -> bool:
         try:
             return _onboarded()
-        except Exception as exc:  # noqa: BLE001 — keep the last read error for the message
+        except Exception as exc:  # keep the last read error for the message
             seen["error"] = _exc_text(exc, 300)
             return False
 
@@ -934,7 +934,7 @@ def controller_onboarding_lines(admin, workload: str, *, since: datetime) -> str
         client = workload_client(admin, workload)
         start = since - timedelta(seconds=CONTROLLER_LOG_SLACK_SECONDS)
         text = controller_logs(since=start, tail=CONTROLLER_LOG_TAIL)
-    except Exception as exc:  # noqa: BLE001 — best-effort: never replace the gate's own error
+    except Exception as exc:  # best-effort: never replace the gate's own error
         return f"(Controller log not read: {_exc_text(exc, 200)})"
     lines = onboarding_lines(text, service_uuid=client.get("id") if client else None)
     if not lines:
@@ -992,7 +992,7 @@ def stack_diagnosis(admin, workload: str, *, context: dict) -> str:
     def _part(name: str, read) -> None:
         try:
             parts.append(f"{name}: {read()}")
-        except Exception as exc:  # noqa: BLE001 — one failed read must not hide the others or the gate error
+        except Exception as exc:  # one failed read must not hide the others or the gate error
             parts.append(f"{name}: not read ({_exc_text(exc, 200)})")
 
     def _operator() -> str:
@@ -1571,7 +1571,7 @@ def hold_direct_access_grants(admin, realm: str, client_id: str = KEYCLOAK_CLIEN
         return
     try:
         client = login_client(admin, realm, client_id)
-    except Exception as exc:  # noqa: BLE001 — any read failure is a prerequisite gap: skip with the cause
+    except Exception as exc:  # any read failure is a prerequisite gap: skip with the cause
         pytest.skip(_login_client_read_skip(realm, client_id, exc))
     if client is None:
         pytest.skip(
@@ -1611,7 +1611,7 @@ def hold_direct_access_grants(admin, realm: str, client_id: str = KEYCLOAK_CLIEN
                 "attributes": {DAG_MARKER_ATTRIBUTE: _marker_value({**others, me: _now() + _dag_hold_ttl()})},
             },
         )
-    except Exception as exc:  # noqa: BLE001 — a refused write or a lost response: undo if applied, then skip
+    except Exception as exc:  # a refused write or a lost response: undo if applied, then skip
         _release_one(key)
         pytest.skip(
             f"cannot enable Direct Access Grants on the login client {client_id!r} in realm {realm!r}: "
@@ -1664,7 +1664,7 @@ def _release_one(key: tuple[str, str]) -> None:
         _update_client(
             admin, realm, client_uuid, {"directAccessGrantsEnabled": False, "attributes": {DAG_MARKER_ATTRIBUTE: ""}}
         )
-    except Exception as exc:  # noqa: BLE001 — best-effort teardown: log, never mask the real failure
+    except Exception as exc:  # best-effort teardown: log, never mask the real failure
         log.error(
             "cannot release Direct Access Grants on the login client %r in realm %r: %s. The marker %r "
             "stays, so its holder %r expires and a later run turns the grant off.",
@@ -2060,7 +2060,7 @@ def poll_signals(
         for sig in signals:
             try:
                 last[sig.label()] = sig.observe(ctx)
-            except Exception as exc:  # noqa: BLE001 — keep the error, so the message can name it
+            except Exception as exc:  # keep the error, so the message can name it
                 last[sig.label()] = Observation(error=f"{type(exc).__name__}: {str(exc)[:200]}")
         return all(last[sig.label()].decision == sig.expected for sig in signals)
 
@@ -2886,12 +2886,12 @@ def capture_aiac_crs(phase: str, *, label: str | None = None, root: Path | None 
         for source, read in sources:
             try:
                 items += read()
-            except Exception as exc:  # noqa: BLE001 — a failed read must not stop the capture or the teardown
+            except Exception as exc:  # a failed read must not stop the capture or the teardown
                 detail = _exc_text(exc, 300)
                 errors.append(f"{source}: {detail}")
                 log.warning("CR capture (%s): cannot read the %s: %s", phase, source, detail)
         target = _write_cr_capture(items, root or CR_CAPTURE_DIR, label=label, phase=phase, errors=errors)
-    except Exception as exc:  # noqa: BLE001 — best-effort: never mask the test failure or stop the teardown
+    except Exception as exc:  # best-effort: never mask the test failure or stop the teardown
         log.warning("CR capture (%s) failed, nothing written; the teardown goes on: %s", phase, exc)
         return None
     count = len({_cr_key(item) for item in items})
@@ -2943,7 +2943,7 @@ def capture_pod_logs(
                     "logs", "-n", namespace, name, "-c", container, "--timestamps", *extra, timeout=60
                 )
                 (target / f"{_name_part(name, 'pod')}.{suffix}").write_text(text if ok else f"(not read: {err})\n")
-    except Exception as exc:  # noqa: BLE001 — best-effort: never mask the test failure or stop a roll
+    except Exception as exc:  # best-effort: never mask the test failure or stop a roll
         log.warning("pod log capture (%s) failed: %s", phase, exc)
         return None
     log.warning("pod log capture (%s): %d pod(s) of %s written to %s", phase, len(pods), selector, target)
@@ -3150,12 +3150,12 @@ def controller_commit_race_hint(since: datetime | None = None, *, admin=None, wo
         try:
             client = workload_client(admin, workload)
             uuid = client.get("id") if client else None
-        except Exception as exc:  # noqa: BLE001 — best-effort: without the UUID every line counts
+        except Exception as exc:  # best-effort: without the UUID every line counts
             log.warning("race hint: the client lookup of %r failed, so every line counts: %s", workload, exc)
     start = since - timedelta(seconds=CONTROLLER_LOG_SLACK_SECONDS) if since is not None else None
     try:
         return commit_race_hint(controller_logs(since=start, tail=CONTROLLER_LOG_TAIL), service_uuid=uuid)
-    except Exception as exc:  # noqa: BLE001 — best-effort: a hint never replaces the gate's own error
+    except Exception as exc:  # best-effort: a hint never replaces the gate's own error
         detail = (getattr(exc, "stderr", "") or str(exc)).strip()[:300]
         log.warning("race hint: could not read the Controller log: %s", detail)
         return ""
