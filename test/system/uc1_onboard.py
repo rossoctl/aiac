@@ -845,29 +845,37 @@ def await_onboarded(admin, workload: str, *, context: dict, deployed_at: datetim
     )
 
 
-# The Controller's lines of one onboarding that say why it did not end: the not-ready naks (handoffs 01
-# and 02), a permanent D30 failure, a dead-letter move.
-_ONBOARDING_LINE = re.compile(
-    r"AgentCardNotReadyError|WorkloadNotReadyError|EnforcementPreconditionError|nak'd|moved .* to .*DLQ|DLQ"
-)
+# The consumer's lines of one onboarding that say why it did not end (``aiac.agent.eventbus.consumer``):
+# a not-ready nak (handoffs 01 and 02, ``nak'd <subject> (<error>, delivery N)``) and the dead-letter move
+# (``moved <subject> to aiac.apply.dlq (...)``). Each names the event subject, so the client UUID.
+_ONBOARDING_LINE = re.compile(r"nak'd |moved \S+ to \S*dlq", re.IGNORECASE)
 
 
-def controller_onboarding_lines(admin, workload: str, *, since: datetime, keep: int = 5) -> str:
-    """The last ``keep`` Controller lines since ``since`` that match ``_ONBOARDING_LINE`` and name the
-    workload's client UUID (all such lines when the client is gone), as one sentence; best-effort."""
+def onboarding_lines(log_text: str, *, service_uuid: str | None, keep: int = 5) -> list[str]:
+    """The last ``keep`` consumer lines of ``log_text`` that match ``_ONBOARDING_LINE`` and name
+    ``service_uuid`` (every such line when it is ``None``), each cut to ``_HINT_LINE_CHARS``. **Pure.**
+    A nak line names the not-ready error; the dead-letter move is the last line of a failed onboarding."""
+    lines = [
+        ln.strip()[:_HINT_LINE_CHARS]
+        for ln in log_text.splitlines()
+        if _ONBOARDING_LINE.search(ln) and (service_uuid is None or service_uuid in ln)
+    ]
+    return lines[-keep:]
+
+
+def controller_onboarding_lines(admin, workload: str, *, since: datetime) -> str:
+    """``onboarding_lines`` over the live Controller log from ``since`` for the workload's client, as
+    one sentence. Best-effort: a failed read says so, never raises."""
     try:
         client = workload_client(admin, workload)
-        uuid = client.get("id") if client else None
         start = since - timedelta(seconds=CONTROLLER_LOG_SLACK_SECONDS)
         text = controller_logs(since=start, tail=CONTROLLER_LOG_TAIL)
     except Exception as exc:  # noqa: BLE001 — best-effort: never replace the gate's own error
         return f"(Controller log not read: {str(getattr(exc, 'stderr', None) or exc).strip()[:200]})"
-    lines = [
-        ln.strip()[:_HINT_LINE_CHARS]
-        for ln in text.splitlines()
-        if _ONBOARDING_LINE.search(ln) and (uuid is None or uuid in ln or workload in ln)
-    ]
-    return f"Controller lines: {lines[-keep:]}." if lines else "The Controller log has no nak, DLQ or D30 line for it."
+    lines = onboarding_lines(text, service_uuid=client.get("id") if client else None)
+    if not lines:
+        return "The Controller log has no nak or dead-letter line for it."
+    return f"Controller lines (the not-ready error is in each nak): {lines}."
 
 
 def bundle_service_probe(workload: str) -> tuple[str, str]:

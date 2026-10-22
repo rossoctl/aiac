@@ -330,3 +330,41 @@ def test_a_signal_the_poll_never_observed_says_so() -> None:
     sig = uc1.ReadySignal("inbound", "devops-user", "deny")
     report = uc1.signals_report([sig], {sig.label(): {"error": "HTTPError: 401"}})
     assert "inbound(devops-user)" in report and "not observed" in report and "401" in report
+
+
+# ======================================================================================
+# controller_onboarding_lines — the Controller's lines that say why an onboarding did not end
+# ======================================================================================
+
+_UUID = "7e1af22a-f83f-481a-ad37-3fd075d5ab2b"
+_LOG = "\n".join(
+    [
+        "2026-10-21T23:40:00Z INFO:aiac.onboarding:onboarding started",
+        f"2026-10-21T23:43:28Z INFO:aiac.agent.eventbus.consumer:nak'd aiac.apply.service.{_UUID} "
+        "(AgentCardNotReadyError, delivery 4); redelivery in 30s",
+        f"2026-10-21T23:44:26Z ERROR:aiac.agent.eventbus.consumer:moved aiac.apply.service.{_UUID} to "
+        "aiac.apply.dlq (retryable failure after 5 deliveries)",
+        "2026-10-21T23:44:27Z INFO:aiac.agent.eventbus.consumer:nak'd aiac.apply.service.other-uuid "
+        "(WorkloadNotReadyError, delivery 1); redelivery in 30s",
+    ]
+)
+
+
+def test_the_dead_letter_move_of_this_client_is_named() -> None:
+    """The consumer's DLQ line has the stream subject in lower case (``aiac.apply.dlq``)."""
+    lines = uc1.onboarding_lines(_LOG, service_uuid=_UUID)
+    assert any("aiac.apply.dlq" in ln for ln in lines) and any("nak'd" in ln for ln in lines)
+
+
+def test_the_lines_of_another_client_do_not_count() -> None:
+    assert not any("other-uuid" in ln for ln in uc1.onboarding_lines(_LOG, service_uuid=_UUID))
+
+
+def test_the_dead_letter_move_is_kept_when_there_are_many_naks() -> None:
+    """The last line that matters most is the DLQ move: keep it even after many nak lines."""
+    many = "\n".join(
+        [f"INFO:aiac.agent.eventbus.consumer:nak'd aiac.apply.service.{_UUID} (x, delivery {n})" for n in range(9)]
+        + [f"ERROR:aiac.agent.eventbus.consumer:moved aiac.apply.service.{_UUID} to aiac.apply.dlq (after 5)"]
+    )
+    lines = uc1.onboarding_lines(many, service_uuid=_UUID, keep=3)
+    assert len(lines) == 3 and "aiac.apply.dlq" in lines[-1]
