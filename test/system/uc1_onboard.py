@@ -1,6 +1,6 @@
 """Shared harness for the UC-1 onboarding integration-test ladder (rungs 1–3 and 5–6).
 
-Spec: ``docs/testing/uc1-onboarding-pipeline.md``; live loop shape (handoff 08):
+Spec: ``docs/testing/uc1-onboarding-pipeline.md``; live loop shape:
 ``k8s/opa-kind-runbook.md``. The evaluator is now the **deployed AuthBridge OPA plugin**, not a
 standalone OPA-CLI run over dumped ``.rego`` — there is no ``.rego`` dump and no ``opa`` binary here.
 
@@ -77,7 +77,7 @@ This module owns:
   failure injection, restored on exit after a CR capture), ``publish_service_event`` (re-fire the
   onboarding trigger for an existing client), and the quarantine readers (``workload_client``,
   ``spm_present``, ``controller_logs``) plus the MCP session probe ``mcp_session_decisions``.
-* **The event-before-commit race hint (handoff 20, D33)** — the pure ``commit_race_hint`` (Controller
+* **The event-before-commit race hint (D33)** — the pure ``commit_race_hint`` (Controller
   log text in, hint out: a line with Keycloak's 404 ``Could not find client`` or the Controller's
   ``ServiceNotVisibleError``, optionally only for one client UUID) and its live reader
   ``controller_commit_race_hint`` (a bounded ``kubectl logs`` from just before the deploy; read-only and
@@ -151,6 +151,12 @@ from test.system.launcher import (  # noqa: E402
 
 log = logging.getLogger(__name__)
 
+
+def _exc_text(exc: BaseException, limit: int) -> str:
+    """The text of ``exc`` for a message: a failed ``kubectl``'s stderr, else ``str(exc)``, cut to ``limit``."""
+    return str(getattr(exc, "stderr", None) or exc).strip()[:limit]
+
+
 # --- Config (env) — spec § Configuration; single stack (no variants) ------------------------
 TEST_REALM = os.environ.get("AIAC_TEST_REALM", scn.REALM_DEFAULT)
 NAMESPACE = os.environ.get("AIAC_DEMO_NAMESPACE", scn.DEMO_NAMESPACE_DEFAULT)
@@ -196,7 +202,7 @@ COMBINER_CR_NAME = "default"
 # subdirectory per capture under this root. Default: the gitignored ``test/system/artifacts/cr-captures/``.
 CR_CAPTURE_DIR = Path(os.environ.get("AIAC_CR_CAPTURE_DIR") or HERE / "artifacts" / "cr-captures").expanduser()
 
-# --- Live-cluster loop knobs (handoff 08) ---------------------------------------------------
+# --- Live-cluster loop knobs ---------------------------------------------------------------
 
 # The workload Deployment to restart after Part B so it reloads the new outbound route (and, on its
 # OPA sidecar's next poll, the recomposed bundle). Defaults to the agent workload name.
@@ -224,7 +230,7 @@ DEPLOY_TIMEOUT = float(os.environ.get("AIAC_DEPLOY_TIMEOUT", "180"))
 # to ``AIAC_MCP_DISCOVERY_READY_TIMEOUT``, default 180 s, for the bundle poll), Provision, and the real
 # PRB (LLM). The onboarded gate (``await_onboarded``) polls up to this budget for both kinds
 # (``AIAC_ONBOARD_TIMEOUT``, seconds): a workload that is not ready yet is nak'd up to MAX_DELIVER (5)
-# times with a 30 s delay (handoffs 01 and 02), so its last try can start minutes after the event.
+# times with a 30 s delay (the not-ready naks), so its last try can start minutes after the event.
 ONBOARD_TIMEOUT = float(os.environ.get("AIAC_ONBOARD_TIMEOUT", "600"))
 
 # After the client is registered, the operator writes the credentials Secret and annotates the pod
@@ -243,14 +249,14 @@ ENFORCED_TIMEOUT = float(os.environ.get("AIAC_ENFORCED_TIMEOUT", "180"))
 CR_CONTENT_TIMEOUT = float(os.environ.get("AIAC_CR_CONTENT_TIMEOUT", "60"))
 
 # Both deploy gates (the agent's on ``BUNDLE_TIMEOUT``, the tool's on ``ONBOARD_TIMEOUT``) hold with the
-# defaults when the handoff-20 fix (D33) is deployed: the SPI image that publishes after the commit, or
+# defaults when the D33 fix is deployed: the SPI image that publishes after the commit, or
 # both the IdP Configuration Service that keeps a Keycloak 404 and the Controller that reads a new client
 # again for a bounded time. Without it, the SPI can publish ``CLIENT_CREATED`` before Keycloak commits
 # the new client: the Controller's first IdP read gets 404 and the onboarding waits for the NATS
 # redelivery after ``ACK_WAIT`` (600 s), so one race hit fails the gate. With the fix deployed, do not
 # raise the budgets for this race: a gate that times out says when the Controller log shows it
-# (``controller_commit_race_hint``). Verified live on 2026-10-07 with the fix in all three images (handoff 20:
-# rungs 1, 2 twice and 3 passed with these defaults; the bounded wait and the nak did not trigger).
+# (``controller_commit_race_hint``). Verified live on 2026-10-07 with the fix in all three images
+# (rungs 1, 2 twice and 3 passed with these defaults; the bounded wait and the nak did not trigger).
 
 # The demo manifests each workload deploys, in apply order (agent: ConfigMaps THEN Deployment; tool:
 # a single Deployment manifest). ``deploy.sh`` (demo/assets) applies this same set + order — keep the
@@ -689,23 +695,46 @@ def final_rollout_reason(deployment: dict, pods: Sequence[dict], *, kind: str) -
     return None
 
 
+def rollout_counters(deployment: dict) -> str:
+    """The template marks and every rollout counter of ``deployment``, for the state dump. **Pure.**
+    The API omits a zero counter, so a missing one prints 0."""
+    meta = (deployment.get("spec", {}).get("template", {}) or {}).get("metadata", {}) or {}
+    status = deployment.get("status", {}) or {}
+    has_secret = "yes" if (meta.get("annotations") or {}).get(CREDENTIALS_ANNOTATION) else "no"
+    return (
+        f"template {TYPE_LABEL}={(meta.get('labels') or {}).get(TYPE_LABEL)!r}, credentials annotation: {has_secret}; "
+        f"generation {deployment.get('metadata', {}).get('generation') or 0}, "
+        f"observedGeneration {status.get('observedGeneration') or 0}, "
+        f"spec.replicas {deployment.get('spec', {}).get('replicas', 1)}, replicas {status.get('replicas') or 0}, "
+        f"updatedReplicas {status.get('updatedReplicas') or 0}, availableReplicas {status.get('availableReplicas') or 0}"
+    )
+
+
 # The rossoctl operator (``../operator``, ``cmd/main.go``): one replica with ``--leader-elect``. On a lost
 # lease the manager exits, so its container restarts in the same pod (``restartCount`` + 1). A deleted or
 # evicted pod comes back as a new pod with ``restartCount`` 0, so the count alone misses it; the pod UID,
-# the container start and the Lease holder (``<pod>_<uuid>``, new for each process) catch both. The label
-# ``control-plane=controller-manager`` alone also matches pods of other operators, so read in the namespace.
+# the container start and the Lease holder (``<pod>_<uuid>``, new for each process) catch both. The pods
+# are the ones that the operator Deployment's own selector matches.
 OPERATOR_NAMESPACE = os.environ.get("AIAC_OPERATOR_NAMESPACE", "rossoctl-system")
-OPERATOR_SELECTOR = os.environ.get(
-    "AIAC_OPERATOR_SELECTOR", "app.kubernetes.io/name=operator-chart,control-plane=controller-manager"
-)
+OPERATOR_DEPLOYMENT = os.environ.get("AIAC_OPERATOR_DEPLOYMENT", "rossoctl-controller-manager")
 OPERATOR_LEASE = os.environ.get("AIAC_OPERATOR_LEASE", "b7c4ae34.rossoctl.dev")
 OPERATOR_CONTAINER = "manager"
 
 
-def operator_identity(pods: Sequence[dict], lease: dict | None) -> dict:
-    """The rossoctl operator's identity from its pods and its leader-election Lease: per pod
-    ``(name, uid, restartCount, startedAt)`` of the manager container, and the Lease holder and
-    transitions. **Pure**; compare two of them with ``operator_change_note``."""
+@dataclass(frozen=True)
+class OperatorIdentity:
+    """The rossoctl operator's identity: per pod ``(name, uid, restartCount, startedAt)`` of the manager
+    container, the Lease holder and transitions, and the read error when the pods could not be read."""
+
+    pods: tuple[tuple, ...] = ()
+    holder: str | None = None
+    transitions: int | None = None
+    error: str | None = None
+
+
+def operator_identity(pods: Sequence[dict], lease: dict | None) -> OperatorIdentity:
+    """The rossoctl operator's identity from its pods and its leader-election Lease. **Pure**; compare
+    two of them with ``operator_change_note``."""
     found = []
     for pod in pods:
         meta = pod.get("metadata", {})
@@ -715,37 +744,65 @@ def operator_identity(pods: Sequence[dict], lease: dict | None) -> dict:
         started = (status.get("state", {}).get("running") or {}).get("startedAt")
         found.append((meta.get("name"), meta.get("uid"), status.get("restartCount", 0), started))
     spec = (lease or {}).get("spec", {})
-    return {"pods": sorted(found), "holder": spec.get("holderIdentity"), "transitions": spec.get("leaseTransitions")}
+    return OperatorIdentity(tuple(sorted(found)), spec.get("holderIdentity"), spec.get("leaseTransitions"))
 
 
-def _operator_pods_text(identity: dict) -> str:
-    pods = identity.get("pods") or []
-    if not pods:
+def _operator_pods_text(identity: OperatorIdentity) -> str:
+    if not identity.pods:
         return "no operator pod"
-    return "; ".join(f"pod {name}, restarts {restarts}, started {started}" for name, _, restarts, started in pods)
+    return "; ".join(
+        f"pod {name}, restarts {restarts}, started {started}" for name, _, restarts, started in identity.pods
+    )
 
 
-def operator_change_note(before: dict, after: dict) -> str | None:
+def operator_change_note(before: OperatorIdentity, after: OperatorIdentity) -> str | None:
     """``None`` when the operator is the same process as at ``before``, else one line that gives both
     states. **Pure.** A restart is a note for a failure message, never a failure on its own."""
     if before == after:
         return None
     return (
         f"the rossoctl operator restarted or was replaced during the run (was {_operator_pods_text(before)}, "
-        f"Lease holder {before.get('holder')}; now {_operator_pods_text(after)}, Lease holder {after.get('holder')}). "
+        f"Lease holder {before.holder}; now {_operator_pods_text(after)}, Lease holder {after.holder}). "
         "Each start waits about 66 s before it reconciles, and while it is down the injection webhook "
         "(failurePolicy Fail) refuses new labelled pods."
     )
 
 
-def read_operator_identity() -> dict:
+def _operator_selector() -> tuple[str | None, str]:
+    """``(selector, error)``: the operator Deployment's ``matchLabels`` as a ``kubectl -l`` selector, or
+    ``None`` and why it could not be read."""
+    ok, out, err = _kubectl_try("get", "deployment", OPERATOR_DEPLOYMENT, "-n", OPERATOR_NAMESPACE, "-o", "json")
+    if not ok:
+        return None, err
+    labels = json.loads(out).get("spec", {}).get("selector", {}).get("matchLabels") or {}
+    if not labels:
+        return None, f"deployment/{OPERATOR_DEPLOYMENT} has no spec.selector.matchLabels"
+    return ",".join(f"{k}={v}" for k, v in sorted(labels.items())), ""
+
+
+def read_operator_identity() -> OperatorIdentity:
     """The live ``operator_identity``: the operator's pods and its Lease. A read failure gives an
     identity with an ``error``, so a later compare reports it, never raises."""
-    ok, pods_out, err = _kubectl_try("get", "pods", "-n", OPERATOR_NAMESPACE, "-l", OPERATOR_SELECTOR, "-o", "json")
+    selector, err = _operator_selector()
+    if selector is None:
+        return OperatorIdentity(error=err)
+    ok, pods_out, err = _kubectl_try("get", "pods", "-n", OPERATOR_NAMESPACE, "-l", selector, "-o", "json")
     if not ok:
-        return {"pods": [], "holder": None, "transitions": None, "error": err}
+        return OperatorIdentity(error=err)
     ok, lease_out, _ = _kubectl_try("get", "lease", OPERATOR_LEASE, "-n", OPERATOR_NAMESPACE, "-o", "json")
     return operator_identity(json.loads(pods_out).get("items", []), json.loads(lease_out) if ok else None)
+
+
+def capture_operator_logs(before: OperatorIdentity, after: OperatorIdentity) -> None:
+    """Save the operator's log (and ``--previous`` after a container restart in the same pod) next to the
+    Controller logs when it changed since ``before``. Best-effort: it never raises."""
+    if operator_change_note(before, after) is None:
+        return
+    selector, err = _operator_selector()
+    if selector is None:
+        log.warning("operator log capture: %s", err)
+        return
+    capture_pod_logs("operator-changed", namespace=OPERATOR_NAMESPACE, selector=selector, container=OPERATOR_CONTAINER)
 
 
 def _workload_pods(workload: str) -> list[dict]:
@@ -754,20 +811,24 @@ def _workload_pods(workload: str) -> list[dict]:
     return json.loads(out).get("items", [])
 
 
+def _read_rollout(workload: str) -> tuple[dict, str | None]:
+    """The live Deployment of ``workload`` and its ``final_rollout_reason`` (raises on a read failure)."""
+    deployment = json.loads(kubectl("get", "deployment", workload, "-n", NAMESPACE, "-o", "json", timeout=30))
+    return deployment, final_rollout_reason(deployment, _workload_pods(workload), kind=WORKLOAD_KIND[workload])
+
+
 def await_final_rollout(admin, workload: str, *, context: dict) -> None:
     """Block until ``workload`` runs the operator's final template on pods that all have the AuthBridge
     sidecar (``final_rollout_reason``), or raise ``RuntimeError`` with the last reason, the workload's
     ReplicaSet events, and the state dump. Call it after ``wait_for_registration`` and before any
     probe or onboarding check of ``workload``: before it, a probe can reach a pod with no sidecar."""
-    kind = WORKLOAD_KIND[workload]
     seen = {"reason": "not checked"}
 
     def _final() -> bool:
         try:
-            deployment = json.loads(kubectl("get", "deployment", workload, "-n", NAMESPACE, "-o", "json", timeout=30))
-            seen["reason"] = final_rollout_reason(deployment, _workload_pods(workload), kind=kind)
+            _, seen["reason"] = _read_rollout(workload)
         except Exception as exc:  # noqa: BLE001 — a read failure is a reason, so the poll goes on
-            seen["reason"] = f"read failed: {str(getattr(exc, 'stderr', None) or exc).strip()[:300]}"
+            seen["reason"] = f"read failed: {_exc_text(exc, 300)}"
         return seen["reason"] is None
 
     if poll_until(_final, timeout=ROLLOUT_TIMEOUT, interval=3):
@@ -820,7 +881,7 @@ def await_onboarded(admin, workload: str, *, context: dict, deployed_at: datetim
         try:
             return _onboarded()
         except Exception as exc:  # noqa: BLE001 — keep the last read error for the message
-            seen["error"] = str(getattr(exc, "stderr", None) or exc).strip()[:300]
+            seen["error"] = _exc_text(exc, 300)
             return False
 
     reached = poll_until(_poll, timeout=ONBOARD_TIMEOUT, interval=5)
@@ -846,7 +907,7 @@ def await_onboarded(admin, workload: str, *, context: dict, deployed_at: datetim
 
 
 # The consumer's lines of one onboarding that say why it did not end (``aiac.agent.eventbus.consumer``):
-# a not-ready nak (handoffs 01 and 02, ``nak'd <subject> (<error>, delivery N)``) and the dead-letter move
+# a not-ready nak (``nak'd <subject> (<error>, delivery N)``) and the dead-letter move
 # (``moved <subject> to aiac.apply.dlq (...)``). Each names the event subject, so the client UUID.
 _ONBOARDING_LINE = re.compile(r"nak'd |moved \S+ to \S*dlq", re.IGNORECASE)
 
@@ -871,7 +932,7 @@ def controller_onboarding_lines(admin, workload: str, *, since: datetime) -> str
         start = since - timedelta(seconds=CONTROLLER_LOG_SLACK_SECONDS)
         text = controller_logs(since=start, tail=CONTROLLER_LOG_TAIL)
     except Exception as exc:  # noqa: BLE001 — best-effort: never replace the gate's own error
-        return f"(Controller log not read: {str(getattr(exc, 'stderr', None) or exc).strip()[:200]})"
+        return f"(Controller log not read: {_exc_text(exc, 200)})"
     lines = onboarding_lines(text, service_uuid=client.get("id") if client else None)
     if not lines:
         return "The Controller log has no nak or dead-letter line for it."
@@ -921,16 +982,19 @@ def stack_diagnosis(admin, workload: str, *, context: dict) -> str:
         try:
             parts.append(f"{name}: {read()}")
         except Exception as exc:  # noqa: BLE001 — one failed read must not hide the others or the gate error
-            parts.append(f"{name}: not read ({str(getattr(exc, 'stderr', None) or exc).strip()[:200]})")
+            parts.append(f"{name}: not read ({_exc_text(exc, 200)})")
 
-    _part("operator", lambda: operator_change_note(context["operator"], read_operator_identity()) or "unchanged")
-    _part("bundle-service from %s (readyz, bundle)" % NAMESPACE, lambda: bundle_service_probe(workload))
+    def _operator() -> str:
+        now = read_operator_identity()
+        capture_operator_logs(context["operator"], now)  # the --previous log of a restart in the same pod
+        return operator_change_note(context["operator"], now) or "unchanged"
+
+    _part("operator", _operator)
+    _part(f"bundle-service from {NAMESPACE} (readyz, bundle)", lambda: bundle_service_probe(workload))
 
     def _deployment() -> str:
-        dep = json.loads(kubectl("get", "deployment", workload, "-n", NAMESPACE, "-o", "json", timeout=30))
-        return (
-            final_rollout_reason(dep, _workload_pods(workload), kind=WORKLOAD_KIND[workload]) or "final and rolled out"
-        )
+        deployment, reason = _read_rollout(workload)
+        return f"{reason or 'final and rolled out'} ({rollout_counters(deployment)})"
 
     _part("deployment", _deployment)
     if workload == scn.AGENT_WORKLOAD:
@@ -978,7 +1042,7 @@ def tool_scopes_present(admin) -> bool:
     return all(scope in names for scope in scn.TOOL_SCOPES)
 
 
-def tool_onboarding_state(admin) -> dict[str, bool]:
+def tool_onboarding_state(admin) -> dict[str, bool | None]:
     """The three facts of the tool's convergence gate, each ``True`` when it holds:
 
     * ``scopes`` — every ``github-tool.*`` client scope is provisioned (Provision ran);
@@ -990,13 +1054,19 @@ def tool_onboarding_state(admin) -> dict[str, bool]:
     The bootstrap CR is present before Provision, so the CR alone does not prove the final CR; with
     the SPM it does (the PCE writes the CR right after the store write). A live decision on github-tool's
     inbound needs the outbound token-exchange leg, which the fixture prepares later, so this gate reads
-    state; the live proof is the final convergence poll."""
-    client = workload_client(admin, scn.TOOL_WORKLOAD)
-    return {
+    state; the live proof is the final convergence poll.
+
+    The SPM read needs a port-forward, so it runs only when the cheap facts hold; ``spm`` is ``None``
+    (not read) before that."""
+    state: dict[str, bool | None] = {
         "scopes": tool_scopes_present(admin),
-        "spm": bool(client) and spm_present(client["clientId"]),
         "cr": cr_has_request_packages(authpolicy_policies(scn.TOOL_WORKLOAD)),
+        "spm": None,
     }
+    if state["scopes"] and state["cr"]:
+        client = workload_client(admin, scn.TOOL_WORKLOAD)
+        state["spm"] = bool(client) and spm_present(client["clientId"])
+    return state
 
 
 def delete_workload_registrations(admin, realm: str) -> None:
@@ -1871,6 +1941,17 @@ def outbound_deny_probe(ctx: dict, user: str, tool_bare: str) -> dict:
 
 
 @dataclass(frozen=True)
+class Observation:
+    """What one probe of a ``ReadySignal`` saw: the classified ``decision`` and the raw ``(code, body)``,
+    or the ``error`` when the probe raised (then ``decision`` is ``None``)."""
+
+    decision: str | None = None
+    code: int | None = None
+    body: str = ""
+    error: str | None = None
+
+
+@dataclass(frozen=True)
 class ReadySignal:
     """One convergence probe: a live decision this run must reach a **definitive** verdict on before
     any assertion. ``onboarded_stack`` polls the whole signal set until every one matches, so each
@@ -1900,14 +1981,14 @@ class ReadySignal:
             return inbound_decision(ctx, self.subject)
         return outbound_decision(ctx, self.subject, self.tool_bare)
 
-    def observe(self, ctx: dict) -> dict:
-        """Send this signal's live probe and return ``{"decision", "code", "body"}``: the classified
-        verdict and the raw answer, so a failure message can print what the poll saw last."""
+    def observe(self, ctx: dict) -> Observation:
+        """Send this signal's live probe and return the classified verdict and the raw answer, so a
+        failure message can print what the poll saw last."""
         if self.kind == "inbound":
             code, body = inbound_raw(ctx, self.subject)
-            return {"decision": inbound_outcome(code), "code": code, "body": body}
+            return Observation(inbound_outcome(code), code, body)
         code, body = outbound_raw(ctx, self.subject, self.tool_bare)
-        return {"decision": outbound_outcome(code, body), "code": code, "body": body}
+        return Observation(outbound_outcome(code, body), code, body)
 
     def label(self) -> str:
         """Short human-readable probe name for the raw-diagnostics message."""
@@ -1956,37 +2037,38 @@ def _default_ready_signals(tool_onboarded: bool) -> list[ReadySignal]:
     return signals
 
 
-def poll_signals(signals: Sequence[ReadySignal], ctx: dict, *, timeout: float, interval: float) -> tuple[bool, dict]:
+def poll_signals(
+    signals: Sequence[ReadySignal], ctx: dict, *, timeout: float, interval: float
+) -> tuple[bool, dict[str, Observation]]:
     """Poll every signal in each round (no short-circuit) until all reach their ``expected`` verdict.
-    Return ``(reached, last)``: ``last`` maps each label to the last observation (``ReadySignal.observe``)
-    or to ``{"error": ...}`` when its probe raised, so the failure message needs no new probe."""
-    last: dict[str, dict] = {}
+    Return ``(reached, last)``: ``last`` maps each label to the last ``Observation`` (with its ``error``
+    when the probe raised), so the failure message needs no new probe."""
+    last: dict[str, Observation] = {}
 
     def _round() -> bool:
         for sig in signals:
             try:
                 last[sig.label()] = sig.observe(ctx)
             except Exception as exc:  # noqa: BLE001 — keep the error, so the message can name it
-                last[sig.label()] = {"error": f"{type(exc).__name__}: {str(exc)[:200]}"}
-        return all(last[sig.label()].get("decision") == sig.expected for sig in signals)
+                last[sig.label()] = Observation(error=f"{type(exc).__name__}: {str(exc)[:200]}")
+        return all(last[sig.label()].decision == sig.expected for sig in signals)
 
     return poll_until(_round, timeout=timeout, interval=interval), last
 
 
-def signals_report(signals: Sequence[ReadySignal], last: Mapping[str, dict]) -> str:
+def signals_report(signals: Sequence[ReadySignal], last: Mapping[str, Observation]) -> str:
     """One line per signal from ``last`` (``poll_signals``): the decision against the expected one, the
     raw answer, and what it means (``probe_hint`` for an inbound answer). **Pure** — no new probe."""
     lines = []
     for sig in signals:
-        seen = last.get(sig.label()) or {}
-        if "decision" not in seen:
-            lines.append(f"{sig.label()} not observed ({seen.get('error', 'no probe ran')})")
+        seen = last.get(sig.label())
+        if seen is None or seen.decision is None:
+            lines.append(f"{sig.label()} not observed ({seen.error if seen else 'no probe ran'})")
             continue
         line = (
-            f"{sig.label()}={seen['decision']!r} (want {sig.expected!r}) "
-            f"[HTTP {seen['code']}, body={str(seen['body'])[:300]!r}]"
+            f"{sig.label()}={seen.decision!r} (want {sig.expected!r}) [HTTP {seen.code}, body={str(seen.body)[:300]!r}]"
         )
-        hint = probe_hint(seen["code"], seen["body"]) if sig.kind == "inbound" else ""
+        hint = probe_hint(seen.code, seen.body) if sig.kind == "inbound" else ""
         lines.append(f"{line} {hint}".rstrip())
     return "; ".join(lines)
 
@@ -2079,7 +2161,7 @@ def _clean_slate(admin, workloads: Sequence[str], *, keycloak_url: str) -> Itera
             msg = (
                 f"teardown did not restore pristine: Keycloak client(s) still present="
                 f"{workload_clients_present(admin)}, AuthorizationPolicy CR(s) remain={not no_authpolicies_remain()} "
-                f"in {NAMESPACE!r}. See handoff 03 teardown (full-to-pristine)."
+                f"in {NAMESPACE!r}. See docs/testing/uc1-onboarding-pipeline.md, step 6 (Teardown → pristine)."
             )
             if sys.exc_info()[0] is not None:
                 log.error("%s [suppressed — a prior error is propagating]", msg)
@@ -2177,7 +2259,7 @@ def onboarded_stack(
         # SPI -> NATS -> consumer). The order is the rung's ordering proof. Each gate ends on a positive
         # fact, in the order the platform makes them, and names the step that is stuck.
         for workload in workloads:
-            deployed_at = datetime.now(timezone.utc)  # the log window of the race hint (handoff 20)
+            deployed_at = datetime.now(timezone.utc)  # the log window of the race hint
             deploy_workload(workload)
             if not wait_for_registration(admin, workload):
                 raise RuntimeError(
@@ -2558,7 +2640,7 @@ def cr_matches(policies: dict[str, str] | None, kind: str) -> bool:
     return not cr_mismatches(policies, kind)
 
 
-# The analyze_agent fallback role and scope for an agent whose card has no skills (handoff 01): with it,
+# The analyze_agent fallback role and scope for an agent whose card has no skills: with it,
 # the PRB has no agent role to match a tool scope, so every agent -> tool call is denied.
 def default_access_scope(workload: str) -> str:
     return f"{workload}.access"
@@ -2579,7 +2661,7 @@ def agent_cr_content_problems(policies: dict[str, str] | None) -> list[str]:
     if fallback in scopes:
         problems.append(
             f"agent_scopes has the default {fallback!r}: the agent was onboarded with no AgentCard skills "
-            "(the analyze_agent fallback, handoff 01)"
+            "(the analyze_agent fallback)"
         )
     if set(scopes) != set(scn.AGENT_SCOPES):
         problems.append(f"agent_scopes is {sorted(scopes)} (want {sorted(scn.AGENT_SCOPES)})")
@@ -2794,7 +2876,7 @@ def capture_aiac_crs(phase: str, *, label: str | None = None, root: Path | None 
             try:
                 items += read()
             except Exception as exc:  # noqa: BLE001 — a failed read must not stop the capture or the teardown
-                detail = str(getattr(exc, "stderr", None) or exc).strip()[:300]
+                detail = _exc_text(exc, 300)
                 errors.append(f"{source}: {detail}")
                 log.warning("CR capture (%s): cannot read the %s: %s", phase, source, detail)
         target = _write_cr_capture(items, root or CR_CAPTURE_DIR, label=label, phase=phase, errors=errors)
@@ -2822,10 +2904,9 @@ def capture_pod_logs(
     selector: str | None = None,
     container: str | None = None,
     label: str | None = None,
-    root: Path | None = None,
 ) -> Path | None:
     """Write the log of each pod that matches ``selector`` (default: the Controller's) in
-    ``namespace`` to a new directory under ``root`` (default ``POD_LOG_DIR``), named like a CR capture
+    ``namespace`` to a new directory under ``POD_LOG_DIR``, named like a CR capture
     (the UTC time, ``label``, ``phase``): ``<pod>.log`` with ``--timestamps``, and ``<pod>.previous.log``
     when the container has restarted in the same pod. Read-only and best-effort: it never raises.
     Returns the directory, or ``None`` when nothing was written."""
@@ -2838,7 +2919,7 @@ def capture_pod_logs(
             return None
         pods = json.loads(out).get("items", [])
         target = _new_capture_dir(
-            root or POD_LOG_DIR, _capture_dir_name(datetime.now(timezone.utc), label or _capture_label(), phase)
+            POD_LOG_DIR, _capture_dir_name(datetime.now(timezone.utc), label or _capture_label(), phase)
         )
         for pod in pods:
             name = pod.get("metadata", {}).get("name", "")
@@ -2992,8 +3073,8 @@ def controller_logs(*, since: datetime | None = None, tail: int | None = None) -
     return kubectl(*args, timeout=60)
 
 
-# --- The event-before-commit race (handoff 20, D33) — the hint for a deploy gate that times out -----
-# Before handoff 20 the ``aiac-event-listener`` SPI published ``CLIENT_CREATED`` inside Keycloak's admin
+# --- The event-before-commit race (D33) — the hint for a deploy gate that times out ----------------
+# Before the D33 fix the ``aiac-event-listener`` SPI published ``CLIENT_CREATED`` inside Keycloak's admin
 # request, before the commit. The Controller's first IdP read could then get Keycloak's 404 "Could not
 # find client", and the onboarding started only with the NATS redelivery after ``ACK_WAIT`` (600 s).
 # Now the SPI publishes after the commit and the Controller reads a new client again for a bounded time
@@ -3011,7 +3092,7 @@ _HINT_LINE_CHARS = 400
 
 
 def commit_race_hint(log_text: str, *, service_uuid: str | None = None) -> str:
-    """The gate-message hint for the event-before-commit race (handoff 20, D33), from the Controller log
+    """The gate-message hint for the event-before-commit race (D33), from the Controller log
     text ``log_text``: ``""`` when no line shows the race, else one paragraph with the number of
     matching lines, the first one (cut to ``_HINT_LINE_CHARS``), the probable cause and what to check.
 
@@ -3031,7 +3112,7 @@ def commit_race_hint(log_text: str, *, service_uuid: str | None = None) -> str:
     return (
         f"The Controller log has {len(lines)} line(s) that show Keycloak's 404 'Could not find client' "
         f"(or ServiceNotVisibleError) {which}, first: {first!r}. The onboarding event probably "
-        "came before Keycloak committed the new client (the event-before-commit race, handoff 20 / D33): "
+        "came before Keycloak committed the new client (the event-before-commit race, D33): "
         "the first IdP read got 404, so the onboarding waited for a NATS redelivery. Check that the "
         "Keycloak image has the aiac-event-listener SPI that publishes after the commit, and that the "
         "Controller has the bounded wait on its first read (ONBOARD_CLIENT_WAIT_ATTEMPTS / "

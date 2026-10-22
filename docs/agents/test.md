@@ -110,7 +110,8 @@ the expected roles and scopes. The message ends with a state dump (the operator,
 bundle-service from the namespace, the Deployment, the AgentCard, the client
 and its SPM, the CR content). The lane writes the CR captures and the
 Controller logs to `test/system/artifacts/` (gitignored): a log before each
-Controller roll and one at teardown.
+Controller roll and one at teardown. When the operator restarted or was replaced
+during the run, a gate failure also saves the operator's log there.
 
 Do **not** deploy the demo `github-agent` / `github-tool` yourself. The stack
 helper (`onboarded_stack` or `pristine_stack` in `test/system/uc1_onboard.py`)

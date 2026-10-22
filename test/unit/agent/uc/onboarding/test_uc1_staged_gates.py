@@ -1,4 +1,4 @@
-"""The staged gates of the UC-1 system-test harness (handoff 03) — pure unit tests.
+"""The staged gates of the UC-1 system-test harness — pure unit tests.
 
 ``onboarded_stack`` gates each workload on positive facts, in the order the platform makes them: the
 operator registers the client, then rolls the Deployment to its final template (the ``rossoctl.io/type``
@@ -110,6 +110,15 @@ def test_a_rollout_with_old_or_unavailable_replicas_is_not_complete() -> None:
         assert reason is not None and "rollout" in reason
 
 
+def test_the_rollout_counters_name_every_counter_and_the_template_marks() -> None:
+    """The state dump prints every counter, also when the first reason is about the template."""
+    counters = uc1.rollout_counters(_deployment(secret=None, updated=None))
+    for part in ("rossoctl.io/type='agent'", "credentials annotation: no", "generation 3", "observedGeneration 3"):
+        assert part in counters
+    for part in ("spec.replicas 1", "replicas 1", "updatedReplicas 0", "availableReplicas 1"):
+        assert part in counters
+
+
 def test_a_live_pod_without_the_sidecar_is_named() -> None:
     reason = uc1.final_rollout_reason(_deployment(), [_pod("github-agent-78cf-x", sidecar=False)], kind="agent")
     assert reason is not None and "github-agent-78cf-x" in reason and "authbridge-proxy" in reason
@@ -183,6 +192,40 @@ def test_no_operator_pod_now_is_noted() -> None:
     after = uc1.operator_identity([], None)
     note = uc1.operator_change_note(before, after)
     assert note is not None and "no operator pod" in note
+
+
+def _operator_deployment_read(*args, **_):
+    assert args[:2] == ("get", "deployment")
+    return True, '{"spec": {"selector": {"matchLabels": {"control-plane": "controller-manager", "a": "b"}}}}', ""
+
+
+def test_a_changed_operator_has_its_logs_saved_with_the_deployment_selector(monkeypatch) -> None:
+    """The log capture saves ``--previous`` after a container restart in the same pod."""
+    calls = []
+    monkeypatch.setattr(uc1, "_kubectl_try", _operator_deployment_read)
+    monkeypatch.setattr(uc1, "capture_pod_logs", lambda phase, **kw: calls.append((phase, kw)))
+    before = uc1.operator_identity([_operator_pod(restarts=5)], _lease())
+    after = uc1.operator_identity([_operator_pod(restarts=6)], _lease())
+    uc1.capture_operator_logs(before, after)
+    assert calls == [
+        (
+            "operator-changed",
+            {
+                "namespace": uc1.OPERATOR_NAMESPACE,
+                "selector": "a=b,control-plane=controller-manager",
+                "container": "manager",
+            },
+        )
+    ]
+
+
+def test_an_unchanged_operator_has_no_log_capture(monkeypatch) -> None:
+    calls = []
+    monkeypatch.setattr(uc1, "_kubectl_try", _operator_deployment_read)
+    monkeypatch.setattr(uc1, "capture_pod_logs", lambda phase, **kw: calls.append(phase))
+    same = uc1.operator_identity([_operator_pod()], _lease())
+    uc1.capture_operator_logs(same, same)
+    assert calls == []
 
 
 # ======================================================================================
@@ -320,7 +363,7 @@ def test_a_200_has_no_hint() -> None:
 
 def test_the_report_prints_the_last_observation_with_its_raw_answer_and_hint() -> None:
     sig = uc1.ReadySignal("inbound", "dev-user", "allow")
-    last = {sig.label(): {"decision": "error", "code": 503, "body": _OPA_NOT_READY}}
+    last = {sig.label(): uc1.Observation("error", 503, _OPA_NOT_READY)}
     report = uc1.signals_report([sig], last)
     assert "inbound(dev-user)='error' (want 'allow')" in report
     assert "HTTP 503" in report and "no bundle" in report
@@ -328,7 +371,7 @@ def test_the_report_prints_the_last_observation_with_its_raw_answer_and_hint() -
 
 def test_a_signal_the_poll_never_observed_says_so() -> None:
     sig = uc1.ReadySignal("inbound", "devops-user", "deny")
-    report = uc1.signals_report([sig], {sig.label(): {"error": "HTTPError: 401"}})
+    report = uc1.signals_report([sig], {sig.label(): uc1.Observation(error="HTTPError: 401")})
     assert "inbound(devops-user)" in report and "not observed" in report and "401" in report
 
 

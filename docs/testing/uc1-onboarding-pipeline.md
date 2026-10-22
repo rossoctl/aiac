@@ -76,7 +76,7 @@ restarts. They import three shared modules:
   `subject_scope_link_problems`, and `require_subject_scope` (see *[Per-rung flow](#per-rung-flow)*,
   step 2). The rung-2 `sub` probes are `login_subject` (a password-grant token through `rossoctl`) and
   `exchanged_subject` (a token exchanged as the agent client to the tool audience). The race hint
-  (handoff 20, D33) is the pure helper `commit_race_hint`, its live reader
+  (D33) is the pure helper `commit_race_hint`, its live reader
   `controller_commit_race_hint`, and `append_hint` (see *[Per-rung flow](#per-rung-flow)*, step 2).
   Resolution-by-`name` (`"{ns}/github-agent"` / `"{ns}/github-tool"`) is still how the harness
   **reads back** Keycloak state; it no longer resolves an internal UUID to trigger onboarding (except
@@ -256,7 +256,7 @@ real requests + assert → full teardown.**
    trigger:
    the operator registers the Keycloak client (`client.name = "{ns}/{workload}"`), Keycloak emits
    `CLIENT_CREATED`, the SPI publishes over NATS, and the Agent's consumer runs `onboard_and_apply`.
-   - **The gates, in order (handoff 03).** Each ends on a positive fact, in the order the platform makes
+   - **The gates, in order.** Each ends on a positive fact, in the order the platform makes
      them, and names the step that is stuck:
      1. `wait_for_registration` — the operator registered the client.
      2. `await_final_rollout` — the Deployment's pod template has the operator's `rossoctl.io/type`
@@ -284,8 +284,9 @@ real requests + assert → full teardown.**
      `AIAC_CR_CONTENT_TIMEOUT`. With the tool alone that gate is `{}`, so the check waits for both.
    - **The state dump.** Each gate failure ends with `stack_diagnosis`: the operator's change since the
      fixture start (pod, restart count, start time, Lease holder; a restart is a note, never a failure on
-     its own), bundle-service `/readyz` and `/bundles` from the namespace (`000` = not reachable through
-     ztunnel), the Deployment's template marks and rollout, the AgentCard's `Synced` condition (agent),
+     its own; the pods are the ones that the operator Deployment's selector matches, and a change saves the
+     operator's log, with `--previous` after a container restart in the same pod), bundle-service `/readyz` and `/bundles` from the namespace (`000` = not reachable through
+     ztunnel), the Deployment's template marks and every rollout counter, the AgentCard's `Synced` condition (agent),
      the client (`enabled`, `client.type`) and its SPM, and the CR content check. A failure message
      prints what the poll saw last (each probe's raw `(code, body)` and what it means, `probe_hint`),
      never a new probe.
@@ -319,14 +320,14 @@ real requests + assert → full teardown.**
    - **The gate budgets.** `AIAC_ROLLOUT_TIMEOUT` (default 180 s) covers one operator restart (each
      start waits about 66 s before it reconciles: a 30 s SPIRE timeout and a 15 s lease wait) and the
      last rollout (about 35 s). `AIAC_ONBOARD_TIMEOUT` (default 600 s, both kinds) covers the not-ready
-     naks of handoffs 01 and 02: a workload that is not ready yet is nak'd up to `MAX_DELIVER` (5) times
+     naks (`AgentCardNotReadyError`, `WorkloadNotReadyError`): a workload that is not ready yet is nak'd up to `MAX_DELIVER` (5) times
      with a 30 s delay, so its last try can start several minutes after the event, before the PRB's LLM
      calls. `AIAC_ENFORCED_TIMEOUT` (default 180 s) covers the agent sidecar's bundle poll (up to about
      144 s) and one probe round. `AIAC_CR_CONTENT_TIMEOUT` (default 60 s): the PCE writes the CRs in
      clientId order, so a read right after the agent's SPM can still see the tool's old CR. The final
      poll keeps `AIAC_BUNDLE_TIMEOUT` (default 300 s): after Part B, the tool's OPA is not restarted, so
      it can need a full poll for a CR the agent's onboarding rewrote. Rungs 5 and 6 use it too.
-   - **The event-before-commit race (handoff 20, D33).** An SPI without the handoff-20 fix publishes `CLIENT_CREATED` before Keycloak commits the
+   - **The event-before-commit race (D33).** An SPI without the D33 fix publishes `CLIENT_CREATED` before Keycloak commits the
      new client. Then the Controller's first IdP read gets Keycloak's `404 "Could not find client"`,
      and the onboarding starts only with the NATS redelivery after `ACK_WAIT` (600 s), so one race hit
      fails the gate. The fix has two layers. The Keycloak image with the SPI that publishes after the
@@ -343,8 +344,9 @@ real requests + assert → full teardown.**
      unit tests cover them. The run did not test the case where only the IdP Configuration Service and
      the Controller images have the fix.
    - **The race hint in a gate failure.** When the onboarded gate (`await_onboarded`) times out, its
-     `RuntimeError` message names the Controller lines of this onboarding (`AgentCardNotReadyError`,
-     `WorkloadNotReadyError`, `EnforcementPreconditionError`, a nak or a DLQ move) and ends with a hint if
+     `RuntimeError` message names the Controller lines of this onboarding: each nak names its not-ready
+     error (`AgentCardNotReadyError`, `WorkloadNotReadyError`), and the DLQ move names the error that ended
+     it (for example `EnforcementPreconditionError`). It ends with a hint if
      the Controller log shows the race:
      `controller_commit_race_hint` reads the Controller log (`kubectl logs`, the current
      `app=aiac-agent` pod in `aiac-system`, container `aiac-agent`) from 30 s before the deploy, at most
@@ -354,7 +356,7 @@ real requests + assert → full teardown.**
      its lookup fails, every such line counts). So a redelivery for a client of an earlier run gives no hint.
      The hint gives the number of
      these lines and the first one, says that the onboarding event probably came before the Keycloak
-     commit (handoff 20 / D33), and tells what to check: that the Keycloak image has the
+     commit (D33), and tells what to check: that the Keycloak image has the
      `aiac-event-listener` SPI that publishes after the commit, and that the Controller has the bounded
      wait (`ONBOARD_CLIENT_WAIT_*`). With no such line there is no hint. The read is read-only and
      best-effort: a failure gives a warning and no hint, never an exception, so the gate's own error
@@ -545,7 +547,7 @@ changed combiner denies a pod that has no client CR, so a deleted CR means deny.
   granted user (a user who holds a grant on at least one tool of the target, here `dev-user`);
   `initialize`, `tools/list` and `tools/call` are denied for `devops-user` (no grant).
   github-tool's inbound decides the session (D26), and the agent's outbound passes it through.
-- **The race hint (handoff 20, D33).** A failed onboarding that does not settle (the failed agent and
+- **The race hint (D33).** A failed onboarding that does not settle (the failed agent and
   the failed tool), and a tool that does not converge on the happy path, add the event-before-commit
   race hint to their message (see *[Per-rung flow](#per-rung-flow)*, step 2). The rung reads the hint
   while the Controller pod that ran the onboarding still runs, because the restore of the injection
@@ -710,13 +712,13 @@ The suite reads its config from the repo-root `.env` (gitignored); source it bef
 > (`AIAC_POLICY_CONFIGMAP` / `AIAC_POLICY_MOUNT_PATH`), the agent Deployment to restart
 > (`AIAC_AGENT_DEPLOYMENT`), the Kind cluster name (`AIAC_KIND_CLUSTER`), the timeouts (`AIAC_DEPLOY_TIMEOUT`,
 > `AIAC_BUNDLE_TIMEOUT`, `AIAC_ONBOARD_TIMEOUT`, `AIAC_BUNDLE_POLL_INTERVAL`; defaults 180 s, 300 s, 600 s
-> and 10 s; with the handoff-20 fix deployed, do not raise them for the event-before-commit race,
+> and 10 s; with the D33 fix deployed, do not raise them for the event-before-commit race,
 > see *[Per-rung flow](#per-rung-flow)*, step 2), the gate timeouts (`AIAC_ROLLOUT_TIMEOUT`,
 > `AIAC_ENFORCED_TIMEOUT`, `AIAC_CR_CONTENT_TIMEOUT`; defaults 180 s, 180 s, 60 s), the Controller restart
 > budget (`AIAC_CONTROLLER_RESTART_TIMEOUT`, 300 s), the bundle-service namespace
 > (`AIAC_BUNDLE_SERVICE_NAMESPACE`, `rossoctl-system`), the rossoctl operator (`AIAC_OPERATOR_NAMESPACE` /
-> `AIAC_OPERATOR_SELECTOR` / `AIAC_OPERATOR_LEASE`, defaults `rossoctl-system` /
-> `app.kubernetes.io/name=operator-chart,control-plane=controller-manager` / `b7c4ae34.rossoctl.dev`), the
+> `AIAC_OPERATOR_DEPLOYMENT` / `AIAC_OPERATOR_LEASE`, defaults `rossoctl-system` /
+> `rossoctl-controller-manager` / `b7c4ae34.rossoctl.dev`), the
 > pod log directory (`AIAC_POD_LOG_DIR`, the gitignored `test/system/artifacts/pod-logs`), and the rung-5 knobs (`AIAC_ROLLBACK_SETTLE_TIMEOUT`,
 > `AIAC_ROLLBACK_LIFT_TIMEOUT`, `AIAC_UNUSABLE_LLM_BASE_URL`). Single stack — one Controller, one policy; the two-variant env
 > (`AIAC_EXPLICIT_URL`/`AIAC_ABSTRACT_URL`, per-variant OPA pods) is gone with the two-stack topology.
@@ -825,7 +827,7 @@ Rung 6 restarts the Controller twice, so it takes several minutes.
     never deletes it; `test_uc1_subject_scope.py` covers the harness helpers `subject_scope_problems`,
     `subject_scope_link_problems`, `require_subject_scope`, `exchange_token` and `exchanged_subject`
     (the login client `rossoctl` must link the scope as a default scope).
-    For handoff 20 (D33): `test_uc1_commit_race_hint.py` covers the harness race hint
+    For D33: `test_uc1_commit_race_hint.py` covers the harness race hint
     (`commit_race_hint`, `append_hint`, `controller_commit_race_hint` and the bounded `controller_logs`
     read), with `kubectl` stubbed.
   - `test/unit/idp/` — the subject scope (D31): `POST /services/{service_id}/subject-scope` creates

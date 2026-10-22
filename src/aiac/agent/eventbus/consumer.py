@@ -84,7 +84,7 @@ _POLICY_BUILD_SUBJECT = "aiac.apply.policy.build"
 # DLQ'd + term()ed on the FIRST delivery. Everything else — LLMAccessError (a transient LLM
 # outage that may clear) and genuinely unknown/transient errors — is RETRYABLE: left
 # unacked to redeliver until MAX_DELIVER, then DLQ'd (the not-ready errors in _NAK_ERRORS are nak'd
-# with a short delay instead; see _NOT_VISIBLE_NAK_DELAY_ENV below). LLMAccessError is a sibling of the
+# with a short delay instead; see _NAK_DELAY_ENV below). LLMAccessError is a sibling of the
 # permanent PRB errors under PolicyRulesBuilderBaseError, so isinstance() below correctly
 # excludes it from the permanent set.
 _PERMANENT_ERRORS: tuple[type[Exception], ...] = (
@@ -103,16 +103,17 @@ _PERMANENT_ERRORS: tuple[type[Exception], ...] = (
 # ready in some seconds, so the consumer naks that message with this delay instead of leaving it
 # unacked: the redelivery then comes after the delay, not after ACK_WAIT (600 s). Each nak uses one of the
 # MAX_DELIVER deliveries. Only the classes in _NAK_ERRORS are nak'd; ACK_WAIT stays sized for long LLM
-# onboardings (see stream.py). Read from the env at call time; keep it well below ACK_WAIT.
+# onboardings (see stream.py). Read from the env at call time; keep it well below ACK_WAIT. The env name
+# says "not visible" because ServiceNotVisibleError was the first such class; it sets the delay of all of them.
 _NAK_ERRORS: tuple[type[Exception], ...] = (ServiceNotVisibleError, WorkloadNotReadyError, AgentCardNotReadyError)
-_NOT_VISIBLE_NAK_DELAY_ENV = "AIAC_NOT_VISIBLE_NAK_DELAY_SECONDS"
-_NOT_VISIBLE_NAK_DELAY_DEFAULT = 30.0
+_NAK_DELAY_ENV = "AIAC_NOT_VISIBLE_NAK_DELAY_SECONDS"
+_NAK_DELAY_DEFAULT = 30.0
 
 
-def _not_visible_nak_delay() -> float:
+def _nak_delay() -> float:
     """The nak delay in seconds for a not-ready failure; an unset, non-numeric, non-finite, zero
     or negative value falls back to the default (nats-py sends a plain nak, with no delay, for 0)."""
-    return env_num(_NOT_VISIBLE_NAK_DELAY_ENV, _NOT_VISIBLE_NAK_DELAY_DEFAULT, float, minimum=0.0, exclusive=True)
+    return env_num(_NAK_DELAY_ENV, _NAK_DELAY_DEFAULT, float, minimum=0.0, exclusive=True)
 
 
 async def _nak_not_ready(msg: Msg, exc: Exception) -> None:
@@ -120,7 +121,7 @@ async def _nak_not_ready(msg: Msg, exc: Exception) -> None:
     not-ready failure, named in the log. A failed nak (for example a dropped connection) must not
     crash the callback: it is logged, and the message stays unacked, so NATS redelivers it after
     ACK_WAIT."""
-    delay = _not_visible_nak_delay()
+    delay = _nak_delay()
     try:
         await msg.nak(delay=delay)
     except Exception:
@@ -257,10 +258,11 @@ class AiacEventConsumer:
                 await self._nc.jetstream().publish(DLQ_SUBJECT, msg.data)
                 await msg.term()
                 logger.error(
-                    "moved %s to %s (%s failure after %d deliveries)",
+                    "moved %s to %s (%s %s failure after %d deliveries)",
                     msg.subject,
                     DLQ_SUBJECT,
                     "permanent" if permanent else "retryable",
+                    type(exc).__name__,
                     msg.metadata.num_delivered,
                 )
             elif isinstance(exc, _NAK_ERRORS):

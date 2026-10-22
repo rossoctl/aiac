@@ -37,8 +37,6 @@ on the Deployment's pod template at the end of such a wait. A Kubernetes API fai
 A failed check raises :class:`EnforcementPreconditionError`, which names each failed check.
 """
 
-from types import SimpleNamespace
-
 import yaml
 from fastapi import HTTPException
 
@@ -79,7 +77,7 @@ def check_preconditions(service: Service) -> ServiceType:
     failures = [
         *_check_sidecar(pods, namespace),
         *_check_pipeline(namespace, service_type),
-        *_check_probes(pods),
+        *_check_probes(_pod_specs(pods)),
     ]
     if failures:
         raise EnforcementPreconditionError(failures)
@@ -97,7 +95,7 @@ def _await_pods(namespace: str, workload: str) -> tuple[ServiceType, list]:
     operator does not change the probes, so a failure there is a failed check, not a race."""
 
     def _settled(service_type: ServiceType, pods: list) -> bool:
-        return not (_check_sidecar(pods, namespace) or _check_probes(pods))
+        return not (_check_sidecar(pods, namespace) or _check_probes(_pod_specs(pods)))
 
     try:
         return await_labelled_pods(namespace, workload, _settled)
@@ -105,8 +103,7 @@ def _await_pods(namespace: str, workload: str) -> tuple[ServiceType, list]:
         if e.template is None:
             raise
         # The template has no pod name: name it after the workload in the #6 failure.
-        template = SimpleNamespace(metadata=SimpleNamespace(name=f"{workload} (pod template)"), spec=e.template.spec)
-        failures = _check_probes([template])
+        failures = _check_probes([(f"{workload} (pod template)", e.template.spec)])
         if failures:
             raise EnforcementPreconditionError(failures) from e
         raise
@@ -127,16 +124,22 @@ def _check_sidecar(pods, namespace: str) -> list[str]:
     ]
 
 
-def _check_probes(pods) -> list[str]:
-    """#6: no app container (every container except ``authbridge-proxy``) has an ``httpGet`` probe."""
+def _pod_specs(pods) -> list[tuple[str, object]]:
+    """``(name, spec)`` of each pod, the input of :func:`_check_probes`."""
+    return [(_pod_name(pod), pod.spec) for pod in pods]
+
+
+def _check_probes(specs) -> list[str]:
+    """#6: no app container (every container except ``authbridge-proxy``) has an ``httpGet`` probe.
+    ``specs`` is ``(name, pod spec)`` pairs: the live pods, or the Deployment's pod template."""
     found = []
-    for pod in pods:
-        for c in pod.spec.containers or []:
+    for name, spec in specs:
+        for c in spec.containers or []:
             if c.name == SIDECAR_CONTAINER:
                 continue
             kinds = [kind for attr, kind in _PROBE_ATTRS if getattr(getattr(c, attr, None), "http_get", None)]
             if kinds:
-                found.append(f"container {c.name!r} of pod {_pod_name(pod)!r} ({', '.join(kinds)})")
+                found.append(f"container {c.name!r} of pod {name!r} ({', '.join(kinds)})")
     if not found:
         return []
     return [f"#6 probes: httpGet probes on app containers: {'; '.join(found)} (use tcpSocket or exec probes)"]
