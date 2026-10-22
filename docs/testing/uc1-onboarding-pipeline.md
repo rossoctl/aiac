@@ -317,9 +317,8 @@ real requests + assert → full teardown.**
 
      Sequential deploy-and-wait is what keeps rung order meaningful (rung 2: agent→tool; rung 3:
      tool→agent) and the order-independence proof intact.
-   - **The gate budgets.** `AIAC_ROLLOUT_TIMEOUT` (default 180 s) covers one operator restart (each
-     start waits about 66 s before it reconciles: a 30 s SPIRE timeout and a 15 s lease wait) and the
-     last rollout (about 35 s). `AIAC_ONBOARD_TIMEOUT` (default 600 s, both kinds) covers the not-ready
+   - **The gate budgets.** `AIAC_ROLLOUT_TIMEOUT` (default 180 s) covers one operator restart and the last
+     rollout. `AIAC_ONBOARD_TIMEOUT` (default 600 s, both kinds) covers the not-ready
      naks (`AgentCardNotReadyError`, `WorkloadNotReadyError`): a workload that is not ready yet is nak'd up to `MAX_DELIVER` (5) times
      with a 30 s delay, so its last try can start several minutes after the event, before the PRB's LLM
      calls. `AIAC_ENFORCED_TIMEOUT` (default 180 s) covers the agent sidecar's bundle poll (up to about
@@ -830,6 +829,12 @@ Rung 6 restarts the Controller twice, so it takes several minutes.
     For D33: `test_uc1_commit_race_hint.py` covers the harness race hint
     (`commit_race_hint`, `append_hint`, `controller_commit_race_hint` and the bounded `controller_logs`
     read), with `kubectl` stubbed.
+    For the staged gates: `test_uc1_staged_gates.py` covers the harness gate deciders
+    (`final_rollout_reason`, `rollout_counters`, `operator_identity`, `operator_change_note`,
+    `_agentcard_state`, `rego_binding_value`, `agent_cr_content_problems`, `tool_cr_content_problems`,
+    `probe_hint`, `signals_report`, `onboarding_lines`) and the operator log capture gate
+    (`capture_operator_logs`, with its I/O monkeypatched), with no cluster. It imports the harness, which
+    does no cluster I/O at import time.
   - `test/unit/idp/` — the subject scope (D31): `POST /services/{service_id}/subject-scope` creates
     `aiac-username-sub` and its mapper with no marker (idempotent, also after a `409` from a
     concurrent onboarding), changes a wrong `username-to-sub` mapper back, gives `409` on a scope that
