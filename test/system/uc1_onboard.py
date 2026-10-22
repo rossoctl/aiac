@@ -236,7 +236,7 @@ ONBOARD_TIMEOUT = float(os.environ.get("AIAC_ONBOARD_TIMEOUT", "600"))
 # After the client is registered, the operator writes the credentials Secret and annotates the pod
 # template, which rolls the workload once more. The final-rollout gate (``await_final_rollout``) polls up
 # to this budget (seconds) until the template is final, rolled out, and every pod has the sidecar. It
-# covers one operator restart (about 66 s before it reconciles) and the last rollout (about 35 s).
+# covers one operator restart and the last rollout.
 ROLLOUT_TIMEOUT = float(os.environ.get("AIAC_ROLLOUT_TIMEOUT", "180"))
 
 # The agent's live inbound gate after it is onboarded: its OPA must poll the new bundle (up to about
