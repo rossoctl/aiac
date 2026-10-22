@@ -12,7 +12,7 @@ asserts the **real OPA plugin's** allow/deny against the scenario's role→acces
 (``scenario_uc1.py``). A wrong LLM/PCE mapping fails the exact ``subject[ / tool]`` cell.
 
 The evaluator is the **deployed plugin**, not a standalone OPA-CLI run over dumped ``.rego``: there is
-no ``.rego`` dump and no ``opa`` binary here anymore (handoff 08). Both gates are exercised through AuthBridge's own parsers
+no ``.rego`` dump and no ``opa`` binary here anymore. Both gates are exercised through AuthBridge's own parsers
 — ``jwt-validation`` builds ``input.identity`` for the inbound gate; ``token-exchange`` + ``mcp-parser``
 build the outbound ``input.identity`` + ``input.mcp.params.name`` (the **bare** tool name) — so the
 test never hand-builds an input document.

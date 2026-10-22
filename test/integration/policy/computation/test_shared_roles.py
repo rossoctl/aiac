@@ -1,4 +1,4 @@
-"""Shared roles and shared scopes, from onboarding to the rendered CR (handoff 19, D32) — integration lane.
+"""Shared roles and shared scopes, from onboarding to the rendered CR (D32) — integration lane.
 
 D32: one policy for the whole realm, so services in different namespaces (or an admin, in one
 namespace) share a realm role or a client scope by name. Every holder of a shared role must get the

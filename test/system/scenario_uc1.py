@@ -22,7 +22,7 @@ populated and probed.
 
 **Prefixed provisioned names vs. bare runtime names.** The pair-lists above hold the **prefixed**
 names UC-1 provisions and the PCE writes into the CR's data maps (``github-tool.source-read`` …).
-But the writer **de-prefixes** those into the generated Rego (handoff 01), and at runtime AuthBridge's
+But the writer **de-prefixes** those into the generated Rego (Q9 in ``docs/specs/components/pdp-policy-writer-opa.md``), and at runtime AuthBridge's
 ``mcp-parser`` puts the **bare** invoked tool name into ``input.mcp.params.name`` (``source-read``).
 So the *provisioned* truth stays prefixed here, while the *request the test crafts and the outcome
 it expects* are keyed on the bare names. ``bare()`` and the ``*_BARE`` sets below derive those bare

@@ -14,7 +14,7 @@ conflicts, so a clean apply makes ZERO explain-LLM calls (the explain seam is
 once against the candidate ``policy_text``. On ANY quote-validation failure the conflict is KEPT
 with ``quotes_verified=False`` and the explanation falls back to the structural synthesized
 description (identify-never-reconcile design decision: surface, never drop — reversing
-handoff-07 Q15/Q16, which had decided the on-``/apply`` report would be quote-less / no-LLM).
+the earlier settled design Q15/Q16, which had decided the on-``/apply`` report would be quote-less / no-LLM).
 """
 
 from aiac.policy.model.models import PolicyRule

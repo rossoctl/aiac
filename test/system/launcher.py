@@ -20,7 +20,7 @@ Two halves, both live here so a single module import serves every launcher:
   namespace) still allows a pod that has no client CR (D20, ``combiner_reason``).
 
 The evaluator is now the deployed plugin, not a standalone OPA-CLI run over dumped ``.rego``: there is
-deliberately no ``opa`` binary dependency and no ``.rego``-dump oracle here anymore (handoff 08).
+deliberately no ``opa`` binary dependency and no ``.rego``-dump oracle here anymore.
 
 At import time it imports only the standard library and ``requests`` — never ``aiac`` — so a
 launcher may import it *before* setting the environment variables the aiac libraries read at import
@@ -363,7 +363,7 @@ def port_forward(
 
 
 # ======================================================================================
-# Live AuthBridge probes — the real OPA plugin is the evaluator (handoff 08)
+# Live AuthBridge probes — the real OPA plugin is the evaluator
 # ======================================================================================
 #
 # The integration suite no longer evaluates ``.rego`` with a standalone ``opa`` binary. It onboards
@@ -820,7 +820,7 @@ def poll_until(predicate: Callable[[], bool], *, timeout: float, interval: float
 
     Exceptions from ``predicate`` (a probe against an ephemeral pod / a bundle still rebuilding) are
     swallowed and retried — the point is to wait out ``bundle-service``'s rebuild + OPA poll latency
-    without ``sleep``-and-hope (handoff 08 §2.2)."""
+    without ``sleep``-and-hope."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:

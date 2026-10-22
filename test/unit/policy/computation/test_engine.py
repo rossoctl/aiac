@@ -659,7 +659,7 @@ def test_dependency_exception_propagates(caplog):
 
 
 # --------------------------------------------------------------------------- #
-# Reconcile — drift GC (Handoff 10). Keycloak UUIDs churn on delete/recreate,   #
+# Reconcile — drift GC. Keycloak UUIDs churn on delete/recreate,                #
 # so an append-only merge would grow stale edges beside their superseded         #
 # generations (issue 6.3 / RC-A: SPM(github-agent) held 53 edges). On every      #
 # compute the engine reconciles each TOUCHED SPM against the current             #
@@ -1883,7 +1883,7 @@ def test_a_run_that_waits_for_the_pce_lock_reads_the_idp_after_it_takes_the_lock
 
 
 # =========================================================================== #
-# Render-time role holders (D32; handoff 19, Bug 1 and Bug 4). A stored edge   #
+# Render-time role holders (D32). A stored edge                                #
 # keeps a copy of ``Role.actorIds`` from the run that built it (a snapshot).   #
 # Every render uses the current holders instead: an Agent-kind role is held by #
 # each live service in the catalog that has it, and a User-kind role by the    #

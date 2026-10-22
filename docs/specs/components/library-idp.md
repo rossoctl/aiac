@@ -67,10 +67,10 @@ Represents a role. Per Assumption 3 (policy-model spec), **user** roles are Keyc
 | `childRoles` | `list[Role]` | `composites.realm` | `[]` |
 | `attributes` | `dict[str, Any]` | `attributes` | `{}` |
 | `kind` | `RoleKind` | _(set per endpoint by the IdP service — see above; resolved at the IdP boundary)_ | `RoleKind.USER` |
-| `actorIds` | `list[str]` | _(member **usernames** of a user-kind (realm) role, or the owning agent's `serviceId`(s) for an agent-kind role; populated service-side, user-kind values aligned with `get_subjects_by_role`, handoff 02)_ | `[]` |
+| `actorIds` | `list[str]` | _(member **usernames** of a user-kind (realm) role, or the owning agent's `serviceId`(s) for an agent-kind role; populated service-side, user-kind values aligned with `get_subjects_by_role`)_ | `[]` |
 
-> **Field pass-through (handoff 03 audit).** `kind`, `actorIds`, and `Scope.serviceId` are declared
-> on the models by **handoff 01** and populated by the **IdP service** (handoff 02). The
+> **Field pass-through.** `kind`, `actorIds`, and `Scope.serviceId` are declared
+> on the models in `aiac.idp.configuration.models` and populated by the **IdP service**. The
 > `Configuration` library deserializes them **automatically** — `model_validate` picks up any declared
 > field present in the service JSON, and there is no hand-rolled field mapping that would omit them.
 > `kind` is **authoritative**: the library never re-derives a role's user/agent kind client-side
@@ -120,9 +120,9 @@ Represents a service scope (Keycloak: `client scope`).
 | `name` | `str` | `name` |
 | `description` | `str \| None` | `description` |
 | `attributes` | `dict[str, Any]` | `attributes` |
-| `serviceId` | `str` (default `""`) | _(the `serviceId`/`clientId` of the service that exposes this copy of the scope; a scope that several services share has one copy for each owner, D32; declared by handoff 01, populated service-side by handoff 02)_ |
+| `serviceId` | `str` (default `""`) | _(the `serviceId`/`clientId` of the service that exposes this copy of the scope; a scope that several services share has one copy for each owner, D32; declared in `aiac.idp.configuration.models`, populated service-side by the IdP service)_ |
 
-> **Field pass-through (handoff 03 audit).** `Scope.serviceId` round-trips through the library's
+> **Field pass-through.** `Scope.serviceId` round-trips through the library's
 > deserialization automatically (same `model_validate` pass-through as `Role.kind`/`actorIds`). It makes
 > a scope's exposing service an explicit field read rather than something the client must infer.
 
@@ -146,7 +146,7 @@ HTTP client library that wraps the IdP Configuration Service REST API. Provides 
 
 All Keycloak interactions are consolidated here; the PDP Policy Writer (OPA) does not touch Keycloak directly.
 
-> **Handoff 03 audit outcome (amended).** Most read paths surface `Role.kind` / `Role.actorIds` /
+> **Audit outcome (amended).** Most read paths surface `Role.kind` / `Role.actorIds` /
 > `Scope.serviceId` faithfully as a thin `model_validate` pass-through with no code change, and the P1
 > client-side filter in `get_services_by_role` / `get_services_by_scope` was already an `id`-membership
 > read (not an inference) needing no simplification. **Exception — `_build_service` (nested
@@ -371,7 +371,7 @@ The PCE calls `get_roles()` one time for each operation, next to `get_services()
 
 > **Performance note:** because both methods delegate to `get_services()`, each call inherits its full fan-out cost (see the `get_services()` performance note above — `2N + 1 + roles` HTTP requests for N services). Acceptable for ad-hoc callers: no runtime path of AIAC calls these methods (only tests do). If it becomes a bottleneck, the right fix is a real server-side `role_id` / `scope_id` filter on `GET /services`.
 
-> **P1 client-side filter — handoff 03 audit (no change required).** With ownership now explicit on
+> **P1 client-side filter — audit (no change required).** With ownership now explicit on
 > the entities (`Role.kind`/`actorIds`, `Scope.serviceId`), the P1 client-side filter was audited for
 > possible simplification. **Outcome: the filter is retained as-is.** `get_services_by_role` /
 > `get_services_by_scope` already select owners/exposers by **`id`-membership** in each service's
@@ -394,8 +394,8 @@ The PCE calls `get_roles()` one time for each operation, next to `get_services()
 
 > **Note:** This method returns only subjects with a **direct** assignment of the given role. Composite role traversal (resolving `childRoles` and querying each) is the caller's responsibility. The PCE does no flattening: its rules arrive pre-flattened.
 
-> **`actorIds` consistency — handoff 03 audit.** The subject/username set this method reports is the
-> same set the **IdP service** uses to populate a user-kind role's `Role.actorIds` (handoff 02). The
+> **`actorIds` consistency.** The subject/username set this method reports is the
+> same set the **IdP service** uses to populate a user-kind role's `Role.actorIds`. The
 > library surfaces both from the same service-side source, so there is **no divergence** between the
 > `actorIds` carried on a returned `Role` and the subjects `get_subjects_by_role(role)` reports. The
 > library does not recompute `actorIds` client-side.

@@ -25,8 +25,8 @@ class RoleKind(str, Enum):
       owning agent ``serviceId``(s) (usually one).
 
     The client/realm ⇔ agent/user invariant (Assumption 3) and the cross-kind invariant
-    (Assumption 1) are enforced upstream at the Keycloak IdP construction boundary (handoff 02),
-    not by the local ``Role`` validator."""
+    (Assumption 1) are enforced upstream at the Keycloak IdP construction boundary (the IdP configuration
+    service), not by the local ``Role`` validator."""
 
     USER = "User"
     AGENT = "Agent"
@@ -77,8 +77,8 @@ class Role(BaseModel):
     attributes: dict[str, Any] = {}
     # SPM routing metadata. ``kind`` distinguishes a user-held realm role from an agent-held
     # client role; ``actorIds`` are the holder usernames (USER) or owning agent serviceId(s)
-    # (AGENT). Populated deeply from Keycloak at the IdP construction boundary (handoff 02);
-    # defaulted here so Wave 1 stays backward-compatible with existing Role construction sites.
+    # (AGENT). Populated deeply from Keycloak at the IdP construction boundary (the IdP configuration
+    # service); defaulted here so Wave 1 stays backward-compatible with existing Role construction sites.
     kind: RoleKind = RoleKind.USER
     actorIds: list[str] = []
 
@@ -92,7 +92,7 @@ class Role(BaseModel):
         """Enforce the invariants visible locally: ``kind`` is a valid ``RoleKind`` and
         ``actorIds`` is a ``list[str]``. The cross-kind invariant (Assumption 1) and the
         client/realm ⇔ agent/user invariant (Assumption 3) require raw Keycloak facts and are
-        enforced upstream at construction (handoff 02), not here."""
+        enforced upstream at construction (the IdP configuration service), not here."""
         if not isinstance(self.kind, RoleKind):
             raise ValueError("Role.kind must be a RoleKind")
         if not isinstance(self.actorIds, list) or not all(isinstance(a, str) for a in self.actorIds):
@@ -167,7 +167,7 @@ class Scope(BaseModel):
     # The serviceId of the owner of this copy — the SPM routing key: a rule ``(role, scope)``
     # routes to ``SPM(scope.serviceId)``. A shared scope (D32) has one copy for each owner (the
     # same ``id``, another ``serviceId``), and each copy routes to its owner's SPM.
-    # Populated at the IdP construction boundary (handoff 02); defaulted here so Wave 1 stays
+    # Populated at the IdP construction boundary (the IdP configuration service); defaulted here so Wave 1 stays
     # backward-compatible with existing Scope construction sites.
     serviceId: str = ""
 

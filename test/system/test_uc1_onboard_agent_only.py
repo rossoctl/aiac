@@ -7,7 +7,7 @@ emits ``CLIENT_CREATED`` → the AIAC SPI ``aiac-event-listener`` publishes on N
 consumer runs ``onboard_and_apply`` — the same handler the removed ``POST /apply`` once called). The
 ``github-tool`` is **not deployed** (deploying it would onboard it), so no tool is onboarded. Then
 assert the agent's outcome by driving **real HTTP requests through AuthBridge** and reading the
-**real OPA plugin's** allow/deny (handoff 08; live loop shape in ``k8s/opa-kind-runbook.md``). Proves
+**real OPA plugin's** allow/deny (live loop shape in ``k8s/opa-kind-runbook.md``). Proves
 agent discovery + inbound policy generation stand alone.
 
 **Rung 1 asserts the inbound gate only.** The outbound leg is deliberately NOT probed here: with no

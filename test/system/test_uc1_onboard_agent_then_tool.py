@@ -5,7 +5,7 @@ Issue ``testing/5.4.2-uc1-onboard-agent-then-tool.md``; spec
 workload **first** and the ``github-tool`` workload **second** (each deploy → operator registers a
 Keycloak client → ``CLIENT_CREATED`` → ``aiac-event-listener`` SPI → NATS → the agent consumer runs
 ``onboard_and_apply``), then assert the **full** truth table at the end by driving **real HTTP requests
-through AuthBridge** and reading the **real OPA plugin's** allow/deny (handoff 08; live loop shape in
+through AuthBridge** and reading the **real OPA plugin's** allow/deny (live loop shape in
 ``k8s/opa-kind-runbook.md``).
 
 This rung proves the key reconciliation property: onboarding the tool **after** the agent completes
