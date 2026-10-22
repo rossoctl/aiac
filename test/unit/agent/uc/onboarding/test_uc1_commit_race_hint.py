@@ -1,4 +1,4 @@
-"""The event-before-commit race hint of the UC-1 system-test harness (handoff 20, D33) — pure unit tests.
+"""The event-before-commit race hint of the UC-1 system-test harness (D33) — pure unit tests.
 
 Keycloak calls the ``aiac-event-listener`` SPI inside the admin request. Before the fix the SPI
 published ``CLIENT_CREATED`` before Keycloak committed the new client, so the Controller's first IdP
@@ -47,12 +47,12 @@ _KEYCLOAK_404 = (
 
 
 def _before_fix(uuid: str = UUID) -> str:
-    """The Controller line before handoff 20: the IdP service answered 502, the library tried once."""
+    """The Controller line before the D33 fix: the IdP service answered 502, the library tried once."""
     return f"HTTPException: 502: IdP config unavailable resolving service {uuid!r}: HTTP 502: {_KEYCLOAK_404}"
 
 
 def _after_wait(uuid: str = UUID) -> str:
-    """The Controller line after handoff 20, when the client is still not visible after the bounded wait."""
+    """The Controller line after the D33 fix, when the client is still not visible after the bounded wait."""
     return (
         f"ServiceNotVisibleError: 502: IdP config unavailable resolving service {uuid!r}: the client is not "
         f"visible after 15 reads (ONBOARD_CLIENT_WAIT_*): HTTP 404: {_KEYCLOAK_404}"
@@ -81,12 +81,12 @@ def test_no_hint_for_a_clean_log() -> None:
 @pytest.mark.parametrize("line", [_before_fix(), _after_wait()], ids=["before-fix-502", "after-wait-404"])
 def test_hint_for_could_not_find_client(line: str) -> None:
     """A Controller line with Keycloak's ``Could not find client`` gives the hint: what the log shows,
-    the probable cause (the event came before the Keycloak commit, handoff 20 / D33), and what to check
+    the probable cause (the event came before the Keycloak commit, D33), and what to check
     (the SPI image publishes after the commit; the Controller's bounded wait ``ONBOARD_CLIENT_WAIT_*``)."""
     hint = uc1.commit_race_hint(f"{NOISE}\n{line}\n{NOISE}")
     assert "Could not find client" in hint
     assert "before" in hint and "commit" in hint
-    assert "handoff 20" in hint and "D33" in hint
+    assert "D33" in hint and "handoff" not in hint
     assert "aiac-event-listener" in hint and "after the commit" in hint
     assert "ONBOARD_CLIENT_WAIT_ATTEMPTS" in hint and "ONBOARD_CLIENT_WAIT_BACKOFF" in hint
 

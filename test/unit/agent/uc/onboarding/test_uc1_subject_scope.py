@@ -352,17 +352,37 @@ def test_require_subject_scope_passes_for_the_correct_state() -> None:
     uc1.require_subject_scope(_admin(), [scn.AGENT_WORKLOAD, scn.TOOL_WORKLOAD])
 
 
+def _typed(admin: MagicMock, uuid: str, service_type: str | None) -> MagicMock:
+    """``admin`` with the ``client.type`` attribute of client ``uuid`` set (Provision ended) or absent."""
+    for client in admin.get_clients.return_value:
+        if client["id"] == uuid:
+            client["attributes"] = {"client.type": service_type} if service_type else {}
+    return admin
+
+
 def test_require_subject_scope_raises_naming_the_workload_and_the_fix() -> None:
     """A missing link is AIAC's own fault, so it raises (never skips), names the workload's client, and
-    points at D31 and the likely cause: the workload converged, so Provision ran without the link — a
-    stale aiac-agent image (a failed link would have failed Provision before this check)."""
-    admin = _admin(defaults={TOOL_UUID: [PROFILE_ID]})
+    points at D31. The client has ``client.type``, so Provision ended without the link: the message names
+    the images whose Provision or IdP service does not link."""
+    admin = _typed(_admin(defaults={TOOL_UUID: [PROFILE_ID]}), TOOL_UUID, "Tool")
     with pytest.raises(RuntimeError) as info:
         uc1.require_subject_scope(admin, scn.TOOL_WORKLOAD)
     message = str(info.value)
     assert TOOL_NAME in message and uc1.SUBJECT_SCOPE in message
     assert "D31" in message and "aiac-agent" in message and "link_subject_scope" in message
-    assert "/subject-scope" in message
+    assert "/subject-scope" in message and "aiac-pdp-config" in message
+    assert "client.type" in message and "Provision ended" in message
+
+
+def test_require_subject_scope_says_when_provision_has_not_ended() -> None:
+    """With no ``client.type`` on the client, Provision did not reach its last call, so a missing link
+    is not a stale image yet: the message says that and gives no image to rebuild."""
+    admin = _typed(_admin(defaults={TOOL_UUID: [PROFILE_ID]}), TOOL_UUID, None)
+    with pytest.raises(RuntimeError) as info:
+        uc1.require_subject_scope(admin, scn.TOOL_WORKLOAD)
+    message = str(info.value)
+    assert "D31" in message and TOOL_NAME in message
+    assert "has not ended" in message and "rebuild" not in message
 
 
 def test_require_subject_scope_names_aiac_pdp_config_for_a_login_link() -> None:

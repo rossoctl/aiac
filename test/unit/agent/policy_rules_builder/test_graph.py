@@ -793,7 +793,7 @@ def test_policy_block_labels_baseline_grants_only_and_scenario():
 
 
 # --------------------------------------------------------------------------- #
-# Shared scope (D32, handoff 19 Bug 2). A scope that two services share has     #
+# Shared scope (D32). A scope that two services share has                       #
 # one copy for each owner in ``other_scopes``: the same id and name, another    #
 # ``serviceId``. The LLM decides the scope once, so the proposer and the        #
 # auditor see it one time; the build node still emits one rule for each copy,  #

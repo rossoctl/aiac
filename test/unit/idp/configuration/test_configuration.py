@@ -700,7 +700,7 @@ class TestCreateServiceRole:
         assert was_created is False  # a reuse is not in the created-manifest
 
     # A reused role is shared (D32): it keeps its first description, Keycloak is not updated, and a
-    # different new description is logged as a WARNING (handoff 19 Bug 3).
+    # different new description is logged as a WARNING.
     def _reuse(self, cfg, existing, role_def):
         svc = self._svc()
         with (
@@ -878,7 +878,7 @@ class TestCreateServiceScope:
         assert was_created is False  # a reuse is not in the created-manifest
 
     # A reused scope is shared (D32): it keeps its first description, Keycloak is not updated, and a
-    # different new description is logged as a WARNING (handoff 19 Bug 3).
+    # different new description is logged as a WARNING.
     def _reuse(self, cfg, existing, scope_def):
         svc = self._svc()
         with (
@@ -1440,7 +1440,7 @@ class TestGetSubjectsByRole:
             Configuration.for_realm(REALM).get_subjects_by_role(role)
         assert m.call_count == 1
 
-    # handoff 03 — actorIds consistency. The subject/username set this method
+    # actorIds consistency. The subject/username set this method
     # reports is the same set the IdP service uses to populate a user-kind role's
     # actorIds. Both come from the service, so they must agree and the library
     # must not recompute actorIds client-side.
@@ -1526,10 +1526,10 @@ class TestGetServicesByScope:
 
 
 # ---------------------------------------------------------------------------
-# handoff 03 — SPM field pass-through through the library deserialization
+# SPM field pass-through through the library deserialization
 #
-# handoff 01 declares Role.kind / Role.actorIds / Scope.serviceId; handoff 02
-# makes the IdP *service* populate them. The Configuration library is a thin
+# aiac.idp.configuration.models declares Role.kind / Role.actorIds / Scope.serviceId;
+# the IdP *service* populates them. The Configuration library is a thin
 # pass-through (model_validate), so these fields must survive onto the returned
 # models with no hand-rolled mapping dropping them and no client-side derivation.
 # These tests stub the HTTP layer with a service response carrying the new

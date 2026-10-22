@@ -21,7 +21,7 @@ with ``-m llm`` (env sourced).
 Each fixture asserts **exact set equality** of the emitted ``{(counterpart.name, effect)}``
 pairs against a hand-verified expected set — a subset check would let over-/under-grants
 pass. Expected sets are derived by hand from the SCENARIO-layer deny triggers documented
-in ``docs/handoffs/03/04-*.md`` and ``prompts.py`` (_DENY_RULES): explicit prohibition
+in ``prompts.py`` (_DENY_RULES): explicit prohibition
 ("must not" / "read-only") -> DENY; a prohibition stated only in the FOCAL entity's own
 description -> DENY (a *candidate*'s description disclaimer is a silent non-grant, never a
 DENY). A digested policy states each prohibition explicitly per pair — there is no "only …"

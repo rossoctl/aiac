@@ -50,7 +50,7 @@ class TestGetRoles:
         admin.get_realm_roles.return_value = [{"id": "r1", "name": "admin"}]
         resp = _make_client(admin).get(f"/roles?realm={REALM}")
         assert resp.status_code == 200
-        # Realm roles are user roles (clientRole == false) -> kind=User (handoff 02).
+        # Realm roles are user roles (clientRole == false) -> kind=User.
         assert resp.json() == [{"id": "r1", "name": "admin", "kind": "User"}]
 
     def test_requests_full_representation_for_attributes(self):
@@ -266,7 +266,7 @@ class TestListServiceRoles:
 
 
 # ---------------------------------------------------------------------------
-# Assumption 1 (no cross-kind role) — fail loud (handoff 02)
+# Assumption 1 (no cross-kind role) — fail loud
 # ---------------------------------------------------------------------------
 
 

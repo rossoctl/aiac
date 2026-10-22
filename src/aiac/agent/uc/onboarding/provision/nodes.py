@@ -6,7 +6,7 @@ All nodes are **non-LLM**. Graph:
 
 IdP access is via the **idp-library** `Configuration` (the `_config` seam), never the IdP
 service directly. Kubernetes access is via the `kube` seam module (`list_pods`,
-`read_service`, `list_agentcards`), which retries internally. Any upstream failure surfaces
+`read_deployment`, `read_service`, `list_agentcards`), which retries internally. Any upstream failure surfaces
 as an `HTTPException(502, ...)` whose message names the workload and the specific
 missing/invalid label — actionable, never silent.
 """
@@ -22,7 +22,7 @@ from aiac.idp.configuration.models import ServiceType
 from aiac.shared.env import env_num
 from aiac.shared.upstream import run_upstream
 
-from .kube import list_agentcards, list_pods, read_service
+from .kube import is_not_found, list_agentcards, list_pods, read_deployment, read_service
 from .state import OnboardingProvisionState
 from .types import RoleDefinition, ScopeDefinition, ServiceProvision
 
@@ -50,14 +50,21 @@ class WaitConfig:
 # label is therefore a transient not-ready state, re-polled before we give up with a 502. Budgeted at
 # 30 attempts after a ~30s budget was observed losing this race by about a second: a tool's pod was
 # created at 14:28:17Z and the wait gave up at 14:28:46Z, because the operator had not yet reconciled
-# its AgentRuntime. Still well under the NATS ACK_WAIT; tests set fast.
+# its AgentRuntime. The same budget covers the wait for the rollout of the workload's Deployment: the
+# operator rolls it more than once after a deploy (the type label, then the client-credentials annotation),
+# and the event comes before the last rollout. A wait that ends not ready raises ``WorkloadNotReadyError``,
+# which the NATS consumer naks, so a later delivery waits again. Still well under the NATS ACK_WAIT; tests
+# set fast.
 _LABEL_WAIT = WaitConfig("ONBOARD_LABEL_WAIT_ATTEMPTS", "ONBOARD_LABEL_WAIT_BACKOFF", 30, 2.0)
 
-# Deploy->onboard race tolerance for the AgentCard skill sync — a SECOND, later race than the label one
-# above. The operator syncs the fetched A2A card onto ``status.card.skills`` only AFTER the agent pod is
-# Ready, which lags the Keycloak-client registration that triggers onboarding. So ``analyze_agent`` can
-# run while ``status.card.skills`` is still empty. An absent card / empty skill list is therefore a
-# transient not-ready state, re-polled before we fall back to a default access scope. Same ≈30s slack.
+# Deploy->onboard race tolerance for the AgentCard sync — a SECOND, later race than the label one above.
+# The operator fetches the agent's A2A card only AFTER the workload is Available, and writes it onto
+# ``status.card`` together with the card's ``Synced=True`` condition. That lags the Keycloak-client
+# registration that triggers onboarding (after a failed fetch the operator tries again after 1 min, or
+# earlier on a watch event). So ``analyze_agent`` can run before the card is synced, and it waits for
+# ``Synced=True``. This budget bounds ONE delivery's wait, not the correctness of the role set: a card
+# that is still not synced raises ``AgentCardNotReadyError``, which the NATS consumer naks, and the
+# redelivery waits again. ≈28s; tests set fast.
 _CARD_WAIT = WaitConfig("ONBOARD_CARD_WAIT_ATTEMPTS", "ONBOARD_CARD_WAIT_BACKOFF", 15, 2.0)
 
 # Deploy->onboard race tolerance for the tool's MCP manifest — the THIRD race. A tool can answer
@@ -261,30 +268,98 @@ def classify_service(state: OnboardingProvisionState) -> dict:
     }
 
 
+class WorkloadNotReadyError(HTTPException):
+    """The workload is still not ready for the pod checks after the bounded pod wait (see
+    :func:`await_labelled_pods`): the rollout of its Deployment is not complete, or it has no live pod
+    with the ``rossoctl.io/type`` label. It is an ``HTTPException(502)``, so the HTTP route answers
+    ``502``, and the NATS consumer naks it with a delay. ``template`` is the Deployment's pod template
+    when the last look found the rollout not complete (the precondition checks run #6 on it), else
+    ``None``."""
+
+    def __init__(self, detail: str, template=None) -> None:
+        super().__init__(502, detail)
+        self.template = template
+
+
+def _rollout_pending(deployment) -> str | None:
+    """``None`` when the rollout of ``deployment`` is complete, else its counters. The test is the
+    Deployment controller's own ``DeploymentComplete``: the controller saw the latest generation, and
+    every replica is updated and available, with no old pod left. ``status.replicas`` does not count a
+    terminating pod, so the caller still skips those. The API omits a zero counter (``None`` here)."""
+    status = deployment.status
+    generation = deployment.metadata.generation or 0
+    observed = getattr(status, "observed_generation", None) or 0
+    # The API server defaults a missing spec.replicas to 1.
+    want = deployment.spec.replicas if deployment.spec.replicas is not None else 1
+    replicas = getattr(status, "replicas", None) or 0
+    updated = getattr(status, "updated_replicas", None) or 0
+    available = getattr(status, "available_replicas", None) or 0
+    if observed >= generation and updated == want and replicas == updated and available == want:
+        return None
+    detail = (
+        f"the rollout of its Deployment is not complete (generation {generation}, observedGeneration "
+        f"{observed}, spec.replicas {want}, replicas {replicas}, updatedReplicas {updated}, "
+        f"availableReplicas {available})"
+    )
+    # Name a rollout that waits for a person, not for time: still not ready (nak'd), but the DLQ cause is clear.
+    if getattr(deployment.spec, "paused", None):
+        detail += "; the Deployment is paused (spec.paused)"
+    progressing = next(
+        (c for c in getattr(status, "conditions", None) or [] if c.type == "Progressing" and c.status == "False"), None
+    )
+    if progressing is not None:
+        detail += f"; Progressing=False ({progressing.reason}): {progressing.message}"
+    return detail
+
+
 def await_labelled_pods(
     namespace: str, workload_name: str, settled: Callable[[ServiceType, list], bool] | None = None
 ) -> tuple[ServiceType, list]:
     """The service type (from the operator's ``rossoctl.io/type`` pod label) and the live (not
-    terminating) pods of ``workload_name``, tolerating the deploy->onboard RACE (the pod or its label
-    may not be there yet — see the module knobs above).
+    terminating) pods of ``workload_name``, tolerating the deploy->onboard RACE (the rollout may not be
+    complete, and the pod or its label may not be there yet — see the module knobs above).
 
-    A briefly-absent label — or a not-yet-created pod — is a transient not-ready state, re-polled
-    a bounded number of times. A label present with an INVALID value (not ``agent``/``tool``) is a
-    real misconfiguration that no wait can fix, so it fails immediately. The poll ends at the first
-    look that finds a labelled pod for which ``settled(service_type, pods)`` is true (with no
-    ``settled``, at the first labelled pod). Retries exhausted -> the labelled ``(service_type,
-    pods)`` of the last look if it had one (the caller reports them), else 502 naming the workload
-    and the label (unchanged contract for a genuinely never-labelled workload). Provision's
-    ``classify_service`` and the UC1 precondition checks (D30) share this wait."""
+    Each look reads the workload's Deployment first. The operator rolls it more than once after a
+    deploy, so the pods are read only when its rollout is complete (``_rollout_pending``); then they are
+    the pods of its current template. That is not always the operator's last template: its last write
+    (the client-credentials annotation) comes after the event, and a look can see the rollout before it
+    complete when that patch fails and the operator tries again. The last write adds only that
+    annotation and the Secret volume, so the checks give the same result on both. A Deployment that
+    is not there (``404``: a StatefulSet or a ``Sandbox``, or a Deployment deleted since the event)
+    gives the pod list with no rollout gate. Any
+    other Deployment read error, a pod LIST failure, or a label present with an INVALID value (not
+    ``agent``/``tool``) is a real failure that no wait can fix: a plain ``HTTPException(502)`` at once.
+    A rollout in progress, a not-yet-created pod or a briefly-absent label is a not-ready state,
+    re-polled a bounded number of times. The poll ends at the first look that finds a labelled pod for
+    which ``settled(service_type, pods)`` is true (with no ``settled``, at the first labelled pod).
+    Retries exhausted -> the labelled ``(service_type, pods)`` of the last look if it had one (the
+    caller reports them), else :class:`WorkloadNotReadyError`, which names the state of the last look.
+    Provision's ``classify_service`` and the UC1 precondition checks (D30) share this wait."""
     no_pod_detail = f"no pod owned by workload {workload_name!r} in namespace {namespace!r}"
     detail = no_pod_detail
     last: tuple[ServiceType, list] | None = None
+    template = None
 
     def _probe():
-        nonlocal detail, last
+        nonlocal detail, last, template
         # Re-derive per attempt so the exhausted wait reflects the LAST-seen state: a pod that
         # disappears mid-poll must report "no pod", not a stale "label missing" from an earlier attempt.
-        detail, last = no_pod_detail, None
+        detail, last, template = no_pod_detail, None, None
+        # The Deployment first: a pod list read before the status can be older than that status.
+        try:
+            deployment = read_deployment(workload_name, namespace)
+        except Exception as e:
+            if not is_not_found(e):
+                raise HTTPException(
+                    502, f"Kubernetes Deployment GET failed for {workload_name!r} in namespace {namespace!r}: {e}"
+                )
+            deployment = None
+        if deployment is not None:
+            pending = _rollout_pending(deployment)
+            if pending:
+                detail = f"workload {workload_name!r} in namespace {namespace!r}: {pending}"
+                template = deployment.spec.template
+                return None
         try:
             items = list_pods(namespace)
         except Exception as e:
@@ -292,6 +367,8 @@ def await_labelled_pods(
 
         pods = [p for p in _owned_pods(items, workload_name) if getattr(p.metadata, "deletion_timestamp", None) is None]
         if not pods:
+            if deployment is not None and deployment.spec.replicas == 0:
+                detail = f"{no_pod_detail}: its Deployment has spec.replicas 0"
             return None
         # Present but not agent/tool raises now: a real misconfiguration, never a race.
         service_type = _pod_service_type(pods[0], workload_name)
@@ -306,20 +383,30 @@ def await_labelled_pods(
         return ready
     if last is not None:
         return last
-    raise HTTPException(502, detail)
+    raise WorkloadNotReadyError(detail, template)
 
 
-def _await_agent_skills(namespace: str, workload: str):
-    """Resolve an agent's AgentCard + its synced skills, tolerating the deploy->onboard RACE on the
-    card sync (see the module knobs above).
+class AgentCardNotReadyError(HTTPException):
+    """The agent's AgentCard is still not ``Synced=True`` after the bounded card wait (see
+    :func:`_await_agent_skills`). It is an ``HTTPException(502)``, so the HTTP route answers ``502``,
+    and the NATS consumer can tell it from the other retryable failures (it naks it with a delay)."""
 
-    The operator syncs the fetched A2A card onto ``status.card.skills`` only AFTER the agent pod is
-    Ready — a DIFFERENT, later operator action than the Keycloak-client registration that triggers
-    onboarding. So this node can run before the skills are synced. An absent card, or a card whose
-    ``status.card.skills`` is still empty, is therefore a transient not-ready state, re-polled a
-    bounded number of times. Returns ``(card, skills)`` as soon as skills are present, or the
-    last-seen ``(card, [])`` once the attempt budget is exhausted — the caller then applies the
-    legacy card-less / skill-less fallback (a genuinely card-less workload never converges here)."""
+    def __init__(self, detail: str) -> None:
+        super().__init__(502, detail)
+
+
+def _await_agent_skills(namespace: str, workload: str) -> list[dict]:
+    """The skills of an agent's synced AgentCard, tolerating the deploy->onboard RACE on the card sync
+    (see the module knobs above).
+
+    The operator writes the fetched A2A card onto ``status.card`` and sets the card's ``Synced``
+    condition in one status update, only AFTER the workload is Available and a fetch succeeds — a
+    DIFFERENT, later operator action than the Keycloak-client registration that triggers onboarding.
+    So the card is ready only when ``Synced`` is ``True``. Skills alone are not proof: a card keeps its
+    old skills when a later fetch fails, and holds the rejected skills on a failed signature check. An
+    absent card, or a card that is not ``Synced=True`` (for any reason), is a not-ready state, re-polled
+    a bounded number of times. Returns the skills of the first ``Synced=True`` look (the list may be
+    empty). Budget exhausted -> :class:`AgentCardNotReadyError`, naming the state of the last look."""
 
     # Link the card to the workload by its ``spec.targetRef`` (the Deployment it describes), since the
     # operator names the CR after the Deployment (e.g. ``<workload>-deployment-card``), not the
@@ -328,21 +415,47 @@ def _await_agent_skills(namespace: str, workload: str):
         target = ((c.get("spec") or {}).get("targetRef") or {}).get("name")
         return target == workload or (c.get("metadata") or {}).get("name") == workload
 
-    last_card = None
+    def _synced(c: dict) -> dict | None:
+        return next((s for s in (c.get("status") or {}).get("conditions") or [] if s.get("type") == "Synced"), None)
+
+    detail = ""
 
     def _probe():
-        nonlocal last_card
+        nonlocal detail
         try:
             resp = list_agentcards(namespace)
         except Exception as e:
             raise HTTPException(502, f"Kubernetes AgentCard LIST failed in namespace {namespace!r}: {e}")
 
-        last_card = next((c for c in resp.get("items", []) if _targets_workload(c)), None)
-        skills = (((last_card or {}).get("status") or {}).get("card") or {}).get("skills", [])
-        return (last_card, skills) if skills else None
+        cards = [c for c in resp.get("items", []) if _targets_workload(c)]
+        if not cards:
+            detail = (
+                "no AgentCard targets the workload (the operator creates one only for a workload with the "
+                "'rossoctl.io/type=agent' label and a 'protocol.rossoctl.io/<name>' label)"
+            )
+            return None
+        # A stale card (for example a legacy one named after the workload) must not hide a synced one.
+        card = next((c for c in cards if (_synced(c) or {}).get("status") == "True"), cards[0])
+        name = (card.get("metadata") or {}).get("name")
+        status = card.get("status") or {}
+        synced = _synced(card)
+        if synced is None:
+            detail = f"AgentCard {name!r} has no Synced condition yet"
+            return None
+        if synced.get("status") != "True":
+            detail = (
+                f"AgentCard {name!r} is Synced={synced.get('status')} ({synced.get('reason')}): {synced.get('message')}"
+            )
+            return None
+        return (status.get("card") or {}).get("skills") or []
 
-    result = poll_until_ready(_probe, _CARD_WAIT)
-    return result if result is not None else (last_card, [])
+    skills = poll_until_ready(_probe, _CARD_WAIT)
+    if skills is None:
+        raise AgentCardNotReadyError(
+            f"AgentCard of workload {workload!r} in namespace {namespace!r} is not Synced=True within the "
+            f"{_CARD_WAIT.attempts_env} budget: {detail}"
+        )
+    return skills
 
 
 def analyze_agent(state: OnboardingProvisionState) -> dict:
@@ -355,22 +468,20 @@ def analyze_agent(state: OnboardingProvisionState) -> dict:
     scope (same name + description): the role's description is what the PRB capability-match reads to
     confine and grant the agent's outbound access on a domain basis.
 
-    Because the operator syncs the card only after the agent pod is Ready — later than the event that
-    triggers onboarding — the skills are awaited with a bounded retry (``_await_agent_skills``). Falls
-    back to a default access scope + a default operator role only once that wait is exhausted: for a
-    genuinely card-less legacy deployment, or a CR whose skills never sync."""
+    Because the operator syncs the card only after the workload is Available and a fetch succeeds —
+    later than the event that triggers onboarding — the card is awaited with a bounded retry until it
+    is ``Synced=True`` (``_await_agent_skills``). A card that is still not synced (or no card) raises
+    :class:`AgentCardNotReadyError`, which the NATS consumer naks, so a later delivery waits again.
+    Falls back to a default access scope + a default operator role only for a ``Synced=True`` card
+    with no skills."""
     namespace, workload = state.namespace, state.workload_name
 
-    card, skills = _await_agent_skills(namespace, workload)
+    skills = _await_agent_skills(namespace, workload)
     if not skills:
         provision = ServiceProvision(
             roles=[RoleDefinition(name=f"{workload}.access", description="Default access scope")],
             scopes=[ScopeDefinition(name=f"{workload}.access", description="Default access scope")],
-            reasoning=(
-                "partial: no AgentCard found, default scope assigned"
-                if card is None
-                else "partial: AgentCard has no synced skills, default scope assigned"
-            ),
+            reasoning="partial: AgentCard has no synced skills, default scope assigned",
         )
         return {"service_provision": provision}
 

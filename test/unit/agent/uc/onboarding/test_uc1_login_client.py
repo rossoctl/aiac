@@ -380,6 +380,7 @@ def test_a_release_with_nothing_held_does_nothing() -> None:
 _SLATE_STEPS = (
     "hold_direct_access_grants",
     "capture_aiac_crs",
+    "capture_pod_logs",
     "undeploy_workload",
     "_scrub_to_pristine",
     "reenable_provisioned_clients",

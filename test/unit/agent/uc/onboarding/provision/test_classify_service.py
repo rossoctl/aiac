@@ -1,7 +1,9 @@
 """Unit tests for the Service Provision `classify_service` node (UC1, issue 4.3).
 
 The idp-library `Configuration` (via the `_config` seam) and the Kubernetes API (via the
-`_core_v1` seam) are mocked — no live services. All provision nodes are non-LLM.
+`_core_v1` and `_apps_v1` seams) are mocked — no live services. All provision nodes are non-LLM.
+The workload's Deployment has a complete rollout here; the rollout gate is tested with the
+precondition checks (``test_preconditions.py``), which share the pod wait.
 """
 
 from types import SimpleNamespace
@@ -38,6 +40,19 @@ def _core(pods):
     core = MagicMock()
     core.list_namespaced_pod.return_value = SimpleNamespace(items=pods)
     return core
+
+
+@pytest.fixture(autouse=True)
+def _rollout_complete():
+    # The pod wait reads the workload's Deployment first: a complete rollout.
+    apps = MagicMock()
+    apps.read_namespaced_deployment.return_value = SimpleNamespace(
+        metadata=SimpleNamespace(generation=1),
+        spec=SimpleNamespace(replicas=1, template=None),
+        status=SimpleNamespace(observed_generation=1, replicas=1, updated_replicas=1, available_replicas=1),
+    )
+    with patch.object(kube, "_apps_v1", return_value=apps):
+        yield apps
 
 
 @pytest.fixture(autouse=True)

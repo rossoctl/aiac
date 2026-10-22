@@ -12,10 +12,12 @@ policy conflict or contradiction, a PRB fault, an unparseable LLM response, LLM 
 endpoint refused, or a failed UC1 precondition check) the message is republished to the DLQ subject
 and terminated at the FIRST delivery. On any other failure the message is left unacked (NATS
 redelivers after ``ACK_WAIT_SECONDS``) until ``num_delivered`` reaches ``MAX_DELIVER``, at which
-point it is republished to the DLQ subject and terminated (stops redelivery on this consumer). One
-retryable failure is nak'd instead of left unacked: ``ServiceNotVisibleError`` (the IdP does not show
-a new service yet, the event-before-commit race), so NATS redelivers it after a short delay
-(``AIAC_NOT_VISIBLE_NAK_DELAY_SECONDS``), not after ``ACK_WAIT_SECONDS``.
+point it is republished to the DLQ subject and terminated (stops redelivery on this consumer). The
+not-ready failures (see ``_NAK_ERRORS``) are nak'd instead of left unacked:
+``ServiceNotVisibleError`` (the IdP does not show a new service yet, the event-before-commit race),
+``WorkloadNotReadyError`` (the rollout of the workload is not complete, or it has no labelled pod yet)
+and ``AgentCardNotReadyError`` (the agent's AgentCard is not ``Synced=True`` yet). NATS redelivers
+them after a short delay (``AIAC_NOT_VISIBLE_NAK_DELAY_SECONDS``), not after ``ACK_WAIT_SECONDS``.
 
 Also owns the FastAPI ``lifespan``: it runs the Controller start sequence (start check #4, then
 the PCE resync; see ``controller.start``) and starts the consumer only after it. A failed step
@@ -55,6 +57,7 @@ from aiac.agent.policy_rules_builder.graph import (
 from aiac.agent.shared.error_logging import log_by_type
 from aiac.agent.uc.onboarding.orchestrator import ServiceNotVisibleError, onboard_and_apply
 from aiac.agent.uc.onboarding.preconditions import EnforcementPreconditionError
+from aiac.agent.uc.onboarding.provision.nodes import AgentCardNotReadyError, WorkloadNotReadyError
 from aiac.agent.uc.policy_update.build import build_policy
 from aiac.agent.uc.role_update.role import update_role
 from aiac.idp.configuration.models import ServiceUuid
@@ -80,8 +83,8 @@ _POLICY_BUILD_SUBJECT = "aiac.apply.policy.build"
 # or a failed UC1 precondition check — those two need a fix in the cluster first), so they are
 # DLQ'd + term()ed on the FIRST delivery. Everything else — LLMAccessError (a transient LLM
 # outage that may clear) and genuinely unknown/transient errors — is RETRYABLE: left
-# unacked to redeliver until MAX_DELIVER, then DLQ'd (ServiceNotVisibleError is nak'd with a
-# short delay instead; see _NOT_VISIBLE_NAK_DELAY_ENV below). LLMAccessError is a sibling of the
+# unacked to redeliver until MAX_DELIVER, then DLQ'd (the not-ready errors in _NAK_ERRORS are nak'd
+# with a short delay instead; see _NAK_DELAY_ENV below). LLMAccessError is a sibling of the
 # permanent PRB errors under PolicyRulesBuilderBaseError, so isinstance() below correctly
 # excludes it from the permanent set.
 _PERMANENT_ERRORS: tuple[type[Exception], ...] = (
@@ -93,35 +96,41 @@ _PERMANENT_ERRORS: tuple[type[Exception], ...] = (
     EnforcementPreconditionError,
 )
 
-# The event-before-commit race (D33 in docs/specs/PRD.md): the IdP can still answer 404 for a new
-# service after the orchestrator's bounded wait (``ServiceNotVisibleError``). The client can become
-# visible in some seconds, so the consumer naks that message with this delay instead of leaving it
+# The not-ready failures, after the orchestrator's bounded waits: the IdP can still answer 404 for a
+# new service (``ServiceNotVisibleError``, the event-before-commit race, D33 in docs/specs/PRD.md), the
+# rollout of the workload can still be in progress or its pod not labelled yet (``WorkloadNotReadyError``),
+# or the agent's AgentCard can still be not ``Synced=True`` (``AgentCardNotReadyError``). Each can become
+# ready in some seconds, so the consumer naks that message with this delay instead of leaving it
 # unacked: the redelivery then comes after the delay, not after ACK_WAIT (600 s). Each nak uses one of the
-# MAX_DELIVER deliveries. Only this error class is nak'd; ACK_WAIT stays sized for long LLM
-# onboardings (see stream.py). Read from the env at call time; keep it well below ACK_WAIT.
-_NOT_VISIBLE_NAK_DELAY_ENV = "AIAC_NOT_VISIBLE_NAK_DELAY_SECONDS"
-_NOT_VISIBLE_NAK_DELAY_DEFAULT = 30.0
+# MAX_DELIVER deliveries. Only the classes in _NAK_ERRORS are nak'd; ACK_WAIT stays sized for long LLM
+# onboardings (see stream.py). Read from the env at call time; keep it well below ACK_WAIT. The env name
+# says "not visible" because ServiceNotVisibleError was the first such class; it sets the delay of all of them.
+_NAK_ERRORS: tuple[type[Exception], ...] = (ServiceNotVisibleError, WorkloadNotReadyError, AgentCardNotReadyError)
+_NAK_DELAY_ENV = "AIAC_NOT_VISIBLE_NAK_DELAY_SECONDS"
+_NAK_DELAY_DEFAULT = 30.0
 
 
-def _not_visible_nak_delay() -> float:
-    """The nak delay in seconds for a not-visible service; an unset, non-numeric, non-finite, zero
+def _nak_delay() -> float:
+    """The nak delay in seconds for a not-ready failure; an unset, non-numeric, non-finite, zero
     or negative value falls back to the default (nats-py sends a plain nak, with no delay, for 0)."""
-    return env_num(_NOT_VISIBLE_NAK_DELAY_ENV, _NOT_VISIBLE_NAK_DELAY_DEFAULT, float, minimum=0.0, exclusive=True)
+    return env_num(_NAK_DELAY_ENV, _NAK_DELAY_DEFAULT, float, minimum=0.0, exclusive=True)
 
 
-async def _nak_not_visible(msg: Msg) -> None:
-    """Nak ``msg`` with the not-visible delay (nats-py takes the delay in seconds). A failed nak (for
-    example a dropped connection) must not crash the callback: it is logged, and the message stays
-    unacked, so NATS redelivers it after ACK_WAIT."""
-    delay = _not_visible_nak_delay()
+async def _nak_not_ready(msg: Msg, exc: Exception) -> None:
+    """Nak ``msg`` with the not-ready delay (nats-py takes the delay in seconds); ``exc`` is the
+    not-ready failure, named in the log. A failed nak (for example a dropped connection) must not
+    crash the callback: it is logged, and the message stays unacked, so NATS redelivers it after
+    ACK_WAIT."""
+    delay = _nak_delay()
     try:
         await msg.nak(delay=delay)
     except Exception:
         logger.exception("nak of %s failed; NATS redelivers it after ACK_WAIT", msg.subject)
         return
     logger.info(
-        "nak'd %s (service not visible yet, delivery %d); redelivery in %.0fs",
+        "nak'd %s (%s, delivery %d); redelivery in %.0fs",
         msg.subject,
+        type(exc).__name__,
         msg.metadata.num_delivered,
         delay,
     )
@@ -249,17 +258,20 @@ class AiacEventConsumer:
                 await self._nc.jetstream().publish(DLQ_SUBJECT, msg.data)
                 await msg.term()
                 logger.error(
-                    "moved %s to %s (%s failure after %d deliveries)",
+                    "moved %s to %s (%s %s failure after %d deliveries)",
                     msg.subject,
                     DLQ_SUBJECT,
                     "permanent" if permanent else "retryable",
+                    type(exc).__name__,
                     msg.metadata.num_delivered,
                 )
-            elif isinstance(exc, ServiceNotVisibleError):
-                # Retryable + still under MAX_DELIVER, and the IdP does not show the new service yet:
-                # nak with a short delay, so the redelivery comes after the delay, not after ACK_WAIT.
-                self._not_visible_seqs.add(msg.metadata.sequence.stream)
-                await _nak_not_visible(msg)
+            elif isinstance(exc, _NAK_ERRORS):
+                # Retryable + still under MAX_DELIVER, and not ready yet: nak with a short delay, so
+                # the redelivery comes after the delay, not after ACK_WAIT. Only a not-visible service
+                # makes the redelivery read the client with no wait.
+                if isinstance(exc, ServiceNotVisibleError):
+                    self._not_visible_seqs.add(msg.metadata.sequence.stream)
+                await _nak_not_ready(msg, exc)
             # Any other retryable failure still under MAX_DELIVER: leave unacked so NATS redelivers.
             return
         await msg.ack()

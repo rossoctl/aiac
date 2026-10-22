@@ -75,6 +75,11 @@ rules:
   - apiGroups: [""]
     resources: ["services"]
     verbs: ["get"]
+  # UC1 precondition checks (D30): the rollout status of the service's
+  # Deployment, read before its pods are checked.
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get"]
   # UC1 onboarding check #2 (D30): the namespace pipeline of the service, in
   # any service namespace. Read-only, and only this ConfigMap name.
   - apiGroups: [""]
