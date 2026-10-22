@@ -20,7 +20,7 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent  # test/unit/agent/uc/onboarding/
-REPO_ROOT = HERE.parents[5]  # -> repo root
+REPO_ROOT = HERE.parents[4]  # -> repo root
 sys.path.insert(0, str(REPO_ROOT))  # so ``import test.system.*`` resolves
 
 from test.system import uc1_onboard as uc1  # noqa: E402
@@ -451,6 +451,11 @@ def test_the_dead_letter_move_of_this_client_is_named() -> None:
 
 def test_the_lines_of_another_client_do_not_count() -> None:
     assert not any("other-uuid" in ln for ln in uc1.onboarding_lines(_LOG, service_uuid=_UUID))
+
+
+def test_with_no_client_the_lines_of_every_client_are_kept() -> None:
+    lines = uc1.onboarding_lines(_LOG, service_uuid=None)
+    assert any("other-uuid" in ln for ln in lines) and any(_UUID in ln for ln in lines)
 
 
 def test_the_dead_letter_move_is_kept_when_there_are_many_naks() -> None:

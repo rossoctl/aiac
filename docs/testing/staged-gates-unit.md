@@ -48,7 +48,8 @@ The file checks:
 - **The report.** `signals_report` prints the last observation with its raw answer and hint. A signal
   that the poll never observed says so.
 - **The onboarding log lines.** `onboarding_lines` keeps the last `keep` lines of this client, with the
-  dead-letter move last, and ignores the lines of another client. With nine naks and `keep=3`, it keeps
+  dead-letter move last, and ignores the lines of another client. With no client (`service_uuid` is
+  `None`), it keeps the lines of every client. With nine naks and `keep=3`, it keeps
   the last three, and the dead-letter move is the last of them.
 
 It does not check the cluster behaviour of the gates. That is the system lane's job
