@@ -146,6 +146,13 @@ class TestAnalyzeAgentNotReady:
         detail = self._raises([card])
         assert "Synced=False (SignatureInvalid): bad sig" in detail
 
+    def test_a_stale_legacy_card_does_not_hide_a_synced_operator_card(self):
+        legacy = _card(skills=[{"id": "old", "name": "O", "description": "o"}], synced=_not_synced("FetchFailed"))
+        operator_card = _card(name=f"{WORKLOAD}-deployment-card", skills=[{"id": "x", "name": "X", "description": "y"}])
+        operator_card["spec"] = {"targetRef": {"kind": "Deployment", "name": WORKLOAD}}
+        provision = _run(items=[legacy, operator_card])["service_provision"]
+        assert [s.name for s in provision.scopes] == [f"{WORKLOAD}.x"]
+
 
 class TestAnalyzeAgentCardSyncRace:
     """The operator syncs the fetched A2A card onto ``status.card`` (with ``Synced=True``) only AFTER

@@ -111,14 +111,18 @@ def deployment(
     updated_replicas: int | None = 1,
     available_replicas: int | None = 1,
     containers=None,
+    paused: bool | None = None,
+    conditions=None,
 ):
     """The workload's Deployment. By default its rollout is complete (one replica, updated and
     available, the latest generation observed). ``None`` for a counter is a counter that the API
-    omits (zero). ``containers`` is the pod template's container list (default: the passing pod's)."""
+    omits (zero). ``containers`` is the pod template's container list (default: the passing pod's).
+    ``conditions`` is the ``status.conditions`` list (see ``condition``)."""
     return SimpleNamespace(
         metadata=SimpleNamespace(name=WORKLOAD, generation=generation),
         spec=SimpleNamespace(
             replicas=replicas,
+            paused=paused,
             template=SimpleNamespace(
                 metadata=SimpleNamespace(name=None),
                 spec=SimpleNamespace(
@@ -131,8 +135,14 @@ def deployment(
             replicas=status_replicas,
             updated_replicas=updated_replicas,
             available_replicas=available_replicas,
+            conditions=conditions,
         ),
     )
+
+
+def condition(type_: str, status: str, reason: str, message: str = ""):
+    """A Deployment status condition."""
+    return SimpleNamespace(type=type_, status=status, reason=reason, message=message)
 
 
 def rolling_out(**kwargs):

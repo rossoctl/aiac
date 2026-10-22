@@ -296,11 +296,20 @@ def _rollout_pending(deployment) -> str | None:
     available = getattr(status, "available_replicas", None) or 0
     if observed >= generation and updated == want and replicas == updated and available == want:
         return None
-    return (
+    detail = (
         f"the rollout of its Deployment is not complete (generation {generation}, observedGeneration "
         f"{observed}, spec.replicas {want}, replicas {replicas}, updatedReplicas {updated}, "
         f"availableReplicas {available})"
     )
+    # Name a rollout that waits for a person, not for time: still not ready (nak'd), but the DLQ cause is clear.
+    if getattr(deployment.spec, "paused", None):
+        detail += "; the Deployment is paused (spec.paused)"
+    progressing = next(
+        (c for c in getattr(status, "conditions", None) or [] if c.type == "Progressing" and c.status == "False"), None
+    )
+    if progressing is not None:
+        detail += f"; Progressing=False ({progressing.reason}): {progressing.message}"
+    return detail
 
 
 def await_labelled_pods(
@@ -312,8 +321,12 @@ def await_labelled_pods(
 
     Each look reads the workload's Deployment first. The operator rolls it more than once after a
     deploy, so the pods are read only when its rollout is complete (``_rollout_pending``); then they are
-    the pods of the final template. A Deployment that is not there (``404``: a StatefulSet or a
-    ``Sandbox``, or a Deployment deleted since the event) gives the pod list with no rollout gate. Any
+    the pods of its current template. That is not always the operator's last template: its last write
+    (the client-credentials annotation) comes after the event, and a look can see the rollout before it
+    complete when that patch fails and the operator tries again. The last write adds only that
+    annotation and the Secret volume, so the checks give the same result on both. A Deployment that
+    is not there (``404``: a StatefulSet or a ``Sandbox``, or a Deployment deleted since the event)
+    gives the pod list with no rollout gate. Any
     other Deployment read error, a pod LIST failure, or a label present with an INVALID value (not
     ``agent``/``tool``) is a real failure that no wait can fix: a plain ``HTTPException(502)`` at once.
     A rollout in progress, a not-yet-created pod or a briefly-absent label is a not-ready state,
@@ -354,6 +367,8 @@ def await_labelled_pods(
 
         pods = [p for p in _owned_pods(items, workload_name) if getattr(p.metadata, "deletion_timestamp", None) is None]
         if not pods:
+            if deployment is not None and deployment.spec.replicas == 0:
+                detail = f"{no_pod_detail}: its Deployment has spec.replicas 0"
             return None
         # Present but not agent/tool raises now: a real misconfiguration, never a race.
         service_type = _pod_service_type(pods[0], workload_name)
@@ -400,6 +415,9 @@ def _await_agent_skills(namespace: str, workload: str) -> list[dict]:
         target = ((c.get("spec") or {}).get("targetRef") or {}).get("name")
         return target == workload or (c.get("metadata") or {}).get("name") == workload
 
+    def _synced(c: dict) -> dict | None:
+        return next((s for s in (c.get("status") or {}).get("conditions") or [] if s.get("type") == "Synced"), None)
+
     detail = ""
 
     def _probe():
@@ -409,16 +427,18 @@ def _await_agent_skills(namespace: str, workload: str) -> list[dict]:
         except Exception as e:
             raise HTTPException(502, f"Kubernetes AgentCard LIST failed in namespace {namespace!r}: {e}")
 
-        card = next((c for c in resp.get("items", []) if _targets_workload(c)), None)
-        if card is None:
+        cards = [c for c in resp.get("items", []) if _targets_workload(c)]
+        if not cards:
             detail = (
                 "no AgentCard targets the workload (the operator creates one only for a workload with the "
                 "'rossoctl.io/type=agent' label and a 'protocol.rossoctl.io/<name>' label)"
             )
             return None
+        # A stale card (for example a legacy one named after the workload) must not hide a synced one.
+        card = next((c for c in cards if (_synced(c) or {}).get("status") == "True"), cards[0])
         name = (card.get("metadata") or {}).get("name")
         status = card.get("status") or {}
-        synced = next((c for c in status.get("conditions") or [] if c.get("type") == "Synced"), None)
+        synced = _synced(card)
         if synced is None:
             detail = f"AgentCard {name!r} has no Synced condition yet"
             return None

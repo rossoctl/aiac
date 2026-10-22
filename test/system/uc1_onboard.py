@@ -757,7 +757,10 @@ def _operator_pods_text(identity: OperatorIdentity) -> str:
 
 def operator_change_note(before: OperatorIdentity, after: OperatorIdentity) -> str | None:
     """``None`` when the operator is the same process as at ``before``, else one line that gives both
-    states. **Pure.** A restart is a note for a failure message, never a failure on its own."""
+    states. **Pure.** A restart is a note for a failure message, never a failure on its own. A failed read
+    on either side is not evidence of a change: the note then says that the operator was not read."""
+    if before.error or after.error:
+        return f"not compared: the operator could not be read ({before.error or after.error})"
     if before == after:
         return None
     return (
@@ -796,7 +799,7 @@ def read_operator_identity() -> OperatorIdentity:
 def capture_operator_logs(before: OperatorIdentity, after: OperatorIdentity) -> None:
     """Save the operator's log (and ``--previous`` after a container restart in the same pod) next to the
     Controller logs when it changed since ``before``. Best-effort: it never raises."""
-    if operator_change_note(before, after) is None:
+    if before.error or after.error or operator_change_note(before, after) is None:
         return
     selector, err = _operator_selector()
     if selector is None:
@@ -959,13 +962,21 @@ def _agentcard_state(workload: str) -> str:
     ok, out, err = _kubectl_try("get", "agentcards.agent.rossoctl.dev", "-n", NAMESPACE, "-o", "json")
     if not ok:
         return f"not read ({err})"
-    card = next(
-        (c for c in json.loads(out).get("items", []) if c.get("spec", {}).get("targetRef", {}).get("name") == workload),
-        None,
-    )
+    # The Controller's match (``_await_agent_skills``): the card's targetRef, or a legacy card named after the
+    # workload; a synced card wins over a stale one.
+    cards = [
+        c
+        for c in json.loads(out).get("items", [])
+        if workload in (c.get("spec", {}).get("targetRef", {}).get("name"), c.get("metadata", {}).get("name"))
+    ]
+
+    def _synced(c: dict) -> dict | None:
+        return next((s for s in c.get("status", {}).get("conditions", []) if s.get("type") == "Synced"), None)
+
+    card = next((c for c in cards if (_synced(c) or {}).get("status") == "True"), cards[0] if cards else None)
     if card is None:
         return f"no AgentCard (the operator makes one only after it puts {TYPE_LABEL}=agent on the Deployment)"
-    synced = next((c for c in card.get("status", {}).get("conditions", []) if c.get("type") == "Synced"), None)
+    synced = _synced(card)
     if synced is None:
         return f"{card['metadata']['name']} has no Synced condition yet"
     return f"{card['metadata']['name']} Synced={synced.get('status')} ({synced.get('reason')}): {synced.get('message')}"

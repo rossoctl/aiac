@@ -15,6 +15,7 @@ They import the system harness like ``test_uc1_cr_capture.py`` does
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -194,6 +195,23 @@ def test_no_operator_pod_now_is_noted() -> None:
     assert note is not None and "no operator pod" in note
 
 
+def test_a_failed_read_is_not_noted_as_a_restart() -> None:
+    """A kubectl failure gives an identity with no pods: that is not evidence of a restart."""
+    before = uc1.operator_identity([_operator_pod()], _lease())
+    after = uc1.OperatorIdentity(error="connection refused")
+    note = uc1.operator_change_note(before, after)
+    assert note is not None and "restarted" not in note and "connection refused" in note
+
+
+def test_a_failed_read_has_no_log_capture(monkeypatch) -> None:
+    calls = []
+    monkeypatch.setattr(uc1, "_kubectl_try", _operator_deployment_read)
+    monkeypatch.setattr(uc1, "capture_pod_logs", lambda phase, **kw: calls.append(phase))
+    before = uc1.operator_identity([_operator_pod()], _lease())
+    uc1.capture_operator_logs(before, uc1.OperatorIdentity(error="connection refused"))
+    assert calls == []
+
+
 def _operator_deployment_read(*args, **_):
     assert args[:2] == ("get", "deployment")
     return True, '{"spec": {"selector": {"matchLabels": {"control-plane": "controller-manager", "a": "b"}}}}', ""
@@ -226,6 +244,38 @@ def test_an_unchanged_operator_has_no_log_capture(monkeypatch) -> None:
     same = uc1.operator_identity([_operator_pod()], _lease())
     uc1.capture_operator_logs(same, same)
     assert calls == []
+
+
+# ======================================================================================
+# _agentcard_state — the same card match as the Controller
+# ======================================================================================
+
+
+def _agentcard(name: str, *, target: str | None = None, synced: str | None = "True") -> dict:
+    card = {"metadata": {"name": name}, "status": {"conditions": []}}
+    if target is not None:
+        card["spec"] = {"targetRef": {"name": target}}
+    if synced is not None:
+        card["status"]["conditions"] = [{"type": "Synced", "status": synced, "reason": "R", "message": "m"}]
+    return card
+
+
+def _agentcard_list(monkeypatch, *cards: dict) -> None:
+    monkeypatch.setattr(uc1, "_kubectl_try", lambda *a, **_: (True, json.dumps({"items": list(cards)}), ""))
+
+
+def test_a_legacy_card_named_after_the_workload_is_found(monkeypatch) -> None:
+    _agentcard_list(monkeypatch, _agentcard("github-agent", synced="False"))
+    assert uc1._agentcard_state("github-agent").startswith("github-agent Synced=False")
+
+
+def test_a_synced_card_wins_over_a_stale_legacy_card(monkeypatch) -> None:
+    _agentcard_list(
+        monkeypatch,
+        _agentcard("github-agent", synced="False"),
+        _agentcard("github-agent-deployment-card", target="github-agent"),
+    )
+    assert uc1._agentcard_state("github-agent").startswith("github-agent-deployment-card Synced=True")
 
 
 # ======================================================================================

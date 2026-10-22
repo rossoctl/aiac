@@ -332,6 +332,30 @@ class TestTheRollout:
         core.list_namespaced_pod.assert_not_called()
         core.read_namespaced_config_map.assert_not_called()
 
+    @pytest.mark.parametrize(
+        "dep, want",
+        [
+            (
+                kf.rolling_out(
+                    conditions=[kf.condition("Progressing", "False", "ProgressDeadlineExceeded", "timed out")]
+                ),
+                "Progressing=False (ProgressDeadlineExceeded): timed out",
+            ),
+            (kf.rolling_out(paused=True), "paused"),
+        ],
+        ids=["progress-deadline-exceeded", "paused"],
+    )
+    def test_a_rollout_that_waits_for_a_person_is_not_ready_and_says_why(self, dep, want):
+        with pytest.raises(WorkloadNotReadyError) as ei:
+            _check(kf.core_v1(), kf.apps_v1(dep))
+        assert want in ei.value.detail
+
+    def test_a_deployment_scaled_to_zero_is_not_ready_and_says_why(self):
+        dep = kf.deployment(replicas=0, status_replicas=None, updated_replicas=None, available_replicas=None)
+        with pytest.raises(WorkloadNotReadyError) as ei:
+            _check(kf.core_v1(pods=[]), kf.apps_v1(dep))
+        assert "spec.replicas 0" in ei.value.detail
+
     def test_an_old_pod_with_no_sidecar_at_the_end_of_the_wait_is_not_a_failed_check(self, monkeypatch):
         # W2: the budget ends during the rollout, with a labelled new pod and a live old pod that has no
         # sidecar. That pod is about to be replaced: not ready (nak'd), not a permanent #1.
