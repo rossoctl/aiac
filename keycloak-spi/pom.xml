@@ -30,9 +30,9 @@
              org.keycloak.models.* (server-spi), and org.keycloak.events.*
              (server-spi-private). It is a test-scope dependency only (see
              below). -->
-        <keycloak.version>26.7.3</keycloak.version>
+        <keycloak.version>26.8.1</keycloak.version>
         <!-- Verify against Maven Central at implementation/upgrade time. -->
-        <jnats.version>2.20.6</jnats.version>
+        <jnats.version>2.26.4</jnats.version>
         <!-- jboss-logging is Keycloak's logging facade, on its runtime classpath;
              provided-scope so it isn't shaded. Was previously pulled transitively
              via keycloak-services (dropped). -->
@@ -78,7 +78,7 @@
         <dependency>
             <groupId>org.junit.jupiter</groupId>
             <artifactId>junit-jupiter</artifactId>
-            <version>5.11.3</version>
+            <version>6.1.3</version>
             <scope>test</scope>
         </dependency>
         <dependency>
@@ -121,7 +121,7 @@
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-compiler-plugin</artifactId>
-                <version>3.13.0</version>
+                <version>3.16.0</version>
             </plugin>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
