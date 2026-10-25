@@ -1,4 +1,4 @@
-# token-exchange-aiac vs token-exchange: what changes 
+# token-exchange-aiac vs token-exchange: what changes
 ## 1. No routes, no Keycloak config
 
 | | token-exchange | token-exchange-aiac |
@@ -7,7 +7,7 @@
 | The target's client exists, but it isn't granted to the agent | Passed through, not exchanged | **403** `plugin: "token-exchange-aiac"`. OPA is not consulted. |
 
 **What you notice:** a call that used to go through untouched now fails with 403 if the target has
-a Keycloak client. 
+a Keycloak client.
 
 ## 2. Routes specified, Keycloak configured
 
@@ -34,7 +34,7 @@ Keycloak configured means all of the following:
 
 ## 4. Bearer token
 
-Both plugins read the bearer the same way: the same `Bearer ` parsing, the same
+Both plugins read the bearer the same way: the same parsing of the `Bearer` prefix, the same
 `no_token_policy` values (`allow`, `deny`, `client-credentials`) and default
 (`deny`), and the same `resolve_placeholders` option.
 
