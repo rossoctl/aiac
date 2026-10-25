@@ -202,18 +202,21 @@ def _prefixed(admin, prefix: str) -> dict[str, list[str]]:
 
 def _outbound_block(ctx: dict, user: str, tool_bare: str) -> tuple[str, int | None, str]:
     """One live outbound ``tools/call``; classify it as ``"deny"`` (an OPA verdict: github-tool's
-    inbound 403), ``"refused"``
-    (an exchange error frame — Keycloak refused the exchange before OPA, see the module
-    docstring), ``"allow"``, or ``"error"``. Returns ``(class, http_code, body)``."""
+    inbound 403), ``"refused"`` (an exchange error frame or reject body — Keycloak refused the exchange
+    before OPA, see the module docstring), ``"allow"``, or ``"error"``. Returns ``(class, http_code, body)``."""
     code, body = uc1.outbound_raw(ctx, user, tool_bare)
     decision = uc1.outbound_outcome(code, body)
-    if decision == "error" and code == 200:
+    if decision == "error":
+        # Either shape of a refusal: an error frame (HTTP 200) or a plain reject body (403 / 503).
         try:
-            data = (json.loads(body).get("error") or {}).get("data") or {}
-        except (ValueError, AttributeError):
-            data = {}
-        if uc1.is_exchange_refusal(data):
-            return "refused", code, body
+            doc = json.loads(body)
+        except (ValueError, TypeError):
+            doc = None
+        if isinstance(doc, dict):
+            err = doc.get("error")
+            data = err.get("data") if isinstance(err, dict) else None
+            if uc1.is_exchange_refusal(data) or uc1.is_exchange_refusal(doc):
+                return "refused", code, body
     return decision, code, body
 
 

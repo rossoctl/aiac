@@ -75,8 +75,8 @@ over the fully onboarded stack.
 
 1. **Skip gates first — before any cluster mutation.** `require_pipeline` skips cleanly if the live
    AuthBridge OPA pipeline is not wired (no `kubectl`, `AuthorizationPolicy` CRD not served,
-   `bundle-service` not Running, the `opa` plugin not on **both** legs, no `discovery-exchange` on the
-   outbound leg, or the global combiner — the
+   `bundle-service` not Running, the `opa` plugin not on **both** legs, not exactly one
+   `discovery-exchange` and no `token-exchange` (`exchange_plugin_reason`), or the global combiner — the
    `default` CR in `rossoctl-system` — still allows a pod that has no client CR, D20);
    `require_env_or_skip` skips if `KEYCLOAK_URL` / admin creds are unset; `require_event_path` skips if
    the NATS broker is not Running or the realm does not have the `aiac-event-listener` listener with

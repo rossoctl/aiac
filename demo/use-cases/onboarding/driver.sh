@@ -569,8 +569,12 @@ phase_wire_outbound() {
   [ -n "$SCOPE_ID" ] || die "client-scope '${tool_aud}' not found — has github-tool onboarded yet?"
   # Keycloak silently skips a default link of a scope already linked as optional (an earlier run of
   # this driver granted it as optional), so drop any optional link first (404 = none, fine).
-  curl -s -o /dev/null -X DELETE -H "Authorization: Bearer ${ADMIN}" \
-    "${KC}/admin/realms/${REALM}/clients/${AGENT_UUID}/optional-client-scopes/${SCOPE_ID}" || true
+  DEL_HTTP=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE -H "Authorization: Bearer ${ADMIN}" \
+    "${KC}/admin/realms/${REALM}/clients/${AGENT_UUID}/optional-client-scopes/${SCOPE_ID}")
+  case "$DEL_HTTP" in
+    204|404) ;;
+    *) die "removing the optional client-scope link returned HTTP ${DEL_HTTP} (expected 204 or 404)" ;;
+  esac
   SCOPE_HTTP=$(curl -s -o /dev/null -w "%{http_code}" -X PUT -H "Authorization: Bearer ${ADMIN}" \
     "${KC}/admin/realms/${REALM}/clients/${AGENT_UUID}/default-client-scopes/${SCOPE_ID}")
   case "$SCOPE_HTTP" in

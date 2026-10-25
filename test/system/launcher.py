@@ -35,6 +35,7 @@ import base64
 import json
 import logging
 import os
+import re
 import shutil
 import signal
 import socket
@@ -729,9 +730,10 @@ EXCHANGE_FAILED_ERROR = "upstream.token-exchange-failed"
 def is_exchange_refusal(doc: object) -> bool:
     """True when ``doc`` (a parsed rejection body, or the ``error.data`` of a JSON-RPC error frame) is
     a refusal of the outbound token exchange — the request never reached OPA."""
-    return isinstance(doc, dict) and (
-        doc.get("plugin") in EXCHANGE_PLUGINS or doc.get("error") == EXCHANGE_FAILED_ERROR
-    )
+    if not isinstance(doc, dict):
+        return False
+    plugin = doc.get("plugin")
+    return (isinstance(plugin, str) and plugin in EXCHANGE_PLUGINS) or doc.get("error") == EXCHANGE_FAILED_ERROR
 
 
 def _json_or_none(body: str) -> object:
@@ -915,12 +917,28 @@ def combiner_reason(default_cr: dict | None, *, namespace: str = BUNDLE_SERVICE_
     return None
 
 
+def exchange_plugin_reason(config_yaml: str, *, namespace: str) -> str | None:
+    """Return ``None`` when the AuthBridge runtime config ``config_yaml`` (``authbridge-runtime-config``
+    ``config.yaml`` of ``namespace``) names ``discovery-exchange`` once and ``token-exchange`` not at
+    all, else a skip reason. **Pure.** The rule of ``k8s/opa-kind-verify.sh`` (Verify 1): the harness
+    adds no outbound route, so only ``discovery-exchange`` exchanges the agent's call to the tool, and
+    a ``token-exchange`` entry means the pipeline predates the switch."""
+    dx = len(re.findall(r"name:\s*[\"']?discovery-exchange\b", config_yaml))
+    tx = len(re.findall(r"name:\s*[\"']?token-exchange\b", config_yaml))
+    if dx == 1 and tx == 0:
+        return None
+    return (
+        f"outbound exchange plugins in {namespace}: discovery-exchange={dx}, token-exchange={tx} "
+        "(want 1/0, an older pipeline) — run k8s/opa-kind-enable.sh"
+    )
+
+
 def pipeline_unwired_reason(*, namespace: str, workloads: list[str]) -> str | None:
     """Return ``None`` when the live AuthBridge OPA pipeline is fully wired for ``namespace``, else a
     human-readable reason the suite should skip. Checks (cheap -> specific): ``kubectl`` present, the
     ``AuthorizationPolicy`` CRD served, ``bundle-service`` Running, the global combiner changed (D20,
     ``combiner_reason``), the ``opa`` plugin on **both** legs of ``namespace``'s AuthBridge runtime
-    config, ``discovery-exchange`` on its outbound leg, and each ``workloads`` pod Running."""
+    config, its outbound exchange plugin (``exchange_plugin_reason``), and each ``workloads`` pod Running."""
     if shutil.which("kubectl") is None:
         return "kubectl not on PATH"
 
@@ -969,9 +987,9 @@ def pipeline_unwired_reason(*, namespace: str, workloads: list[str]) -> str | No
     wired = out.count("name: opa")
     if wired < 2:
         return f"OPA plugin not wired into both legs in {namespace} (found {wired} of 2) — run k8s/opa-kind-enable.sh"
-    # The harness adds no outbound route: only discovery-exchange exchanges the agent's call to the tool.
-    if "name: discovery-exchange" not in out:
-        return f"outbound discovery-exchange not wired in {namespace} (an older pipeline) — run k8s/opa-kind-enable.sh"
+    reason = exchange_plugin_reason(out, namespace=namespace)
+    if reason:
+        return reason
 
     for workload in workloads:
         ok, out, err = _kubectl_try(

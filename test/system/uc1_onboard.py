@@ -1216,11 +1216,12 @@ def grant_exchange_scope(admin) -> None:
             f"client scope {aud_scope!r} not found in realm {TEST_REALM!r} — is {scn.TOOL_WORKLOAD} "
             "deployed + registered by the operator?"
         )
+    # Keycloak silently skips a default link of a scope already linked as optional (the old
+    # optional grant of this harness), so move an optional link to default first. A failed read or
+    # delete raises: the default link would then be skipped too, and every exchange refused.
+    if any(s.get("id") == scope["id"] for s in admin.get_client_optional_client_scopes(client_uuid)):
+        admin.delete_client_optional_client_scope(client_uuid, scope["id"])
     try:
-        # Keycloak silently skips a default link of a scope already linked as optional (the old
-        # optional grant of this harness), so move an optional link to default first.
-        if any(s.get("id") == scope["id"] for s in admin.get_client_optional_client_scopes(client_uuid)):
-            admin.delete_client_optional_client_scope(client_uuid, scope["id"])
         admin.add_client_default_client_scope(client_uuid, scope["id"], {})
     except KeycloakError as exc:
         log.info("grant_exchange_scope: assign %r returned (benign if already assigned): %s", aud_scope, exc)
