@@ -20,7 +20,7 @@ Two halves, both live here so a single module import serves every launcher:
   namespace) still allows a pod that has no client CR (D20, ``combiner_reason``).
 
 The evaluator is now the deployed plugin, not a standalone OPA-CLI run over dumped ``.rego``: there is
-deliberately no ``opa`` binary dependency and no ``.rego``-dump oracle here anymore (handoff 08).
+deliberately no ``opa`` binary dependency and no ``.rego``-dump oracle here anymore.
 
 At import time it imports only the standard library and ``requests`` — never ``aiac`` — so a
 launcher may import it *before* setting the environment variables the aiac libraries read at import
@@ -46,7 +46,7 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterator
+from typing import Callable, Iterator, Mapping
 
 import requests
 
@@ -276,25 +276,6 @@ def select_live_pod(items: list[dict]) -> str | None:
     return chosen.get("metadata", {}).get("name")
 
 
-# The AuthBridge sidecar the operator injects (``preconditions.SIDECAR_CONTAINER``; the harness never
-# imports ``aiac``).
-AUTHBRIDGE_CONTAINER = "authbridge-proxy"
-
-
-def sidecar_rollout_done(items: list[dict]) -> bool:
-    """True when every live (not terminating) pod of a ``kubectl get pods`` ``items`` list has the
-    ``authbridge-proxy`` container and is Ready, and there is at least one such pod. Pure — no I/O.
-
-    The operator injects the sidecar only after the first pod of a fresh deploy is up (it registers
-    the client, patches the Deployment and rolls out a new pod), so ``kubectl rollout status`` can
-    pass on that plain first pod. Until it is gone, its Service can route a probe to it, past OPA."""
-    live = [p for p in items if not p.get("metadata", {}).get("deletionTimestamp")]
-    return bool(live) and all(
-        _pod_is_ready(p) and any(c.get("name") == AUTHBRIDGE_CONTAINER for c in p.get("spec", {}).get("containers", []))
-        for p in live
-    )
-
-
 def resolve_pod(selector: str, *, namespace: str) -> str:
     """Return the name of the **newest live** pod matching a label ``selector`` (e.g. ``app=aiac-opa``).
 
@@ -382,7 +363,7 @@ def port_forward(
 
 
 # ======================================================================================
-# Live AuthBridge probes — the real OPA plugin is the evaluator (handoff 08)
+# Live AuthBridge probes — the real OPA plugin is the evaluator
 # ======================================================================================
 #
 # The integration suite no longer evaluates ``.rego`` with a standalone ``opa`` binary. It onboards
@@ -559,31 +540,39 @@ def inbound_probe(
         "-H 'Content-Type: application/json' -H \"Authorization: Bearer $TOK\" "
         '-d \'{"jsonrpc":"2.0","id":"1","method":"ping/nonexistent","params":{}}\''
     )
-    pod_name = f"probe-inbound-{uuid.uuid4().hex[:8]}"
     try:
-        out = kubectl(
-            "run",
-            pod_name,
-            "-n",
-            namespace,
-            "--image",
-            _CURL_IMAGE,
-            "--restart=Never",
-            "--rm",
-            "--attach",
-            "--quiet",
-            f"--env=TOK={token}",
-            "--command",
-            "--",
-            "sh",
-            "-c",
-            script,
-            timeout=timeout,
-        )
+        out = curl_pod(namespace, script, name="probe-inbound", env={"TOK": token}, timeout=timeout)
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
         stderr = getattr(exc, "stderr", "") or getattr(exc, "output", "") or str(exc)
         return None, f"inbound probe pod failed: {stderr}".strip()
     return _parse_curl_output(out)
+
+
+def curl_pod(
+    namespace: str, script: str, *, name: str, env: Mapping[str, str] | None = None, timeout: float = 120.0
+) -> str:
+    """Run ``script`` (``sh -c``) in a throwaway ``curlimages/curl`` pod in ``namespace`` and return its
+    stdout; the pod is removed after it ends. ``--command`` overrides the image entrypoint robustly (a
+    deliberate deviation from the runbook's bare ``-- sh -c``). Raises like ``kubectl`` on a failure."""
+    return kubectl(
+        "run",
+        f"{name}-{uuid.uuid4().hex[:8]}",
+        "-n",
+        namespace,
+        "--image",
+        _CURL_IMAGE,
+        "--restart=Never",
+        "--rm",
+        "--attach",
+        "--quiet",
+        *(f"--env={key}={value}" for key, value in (env or {}).items()),
+        "--command",
+        "--",
+        "sh",
+        "-c",
+        script,
+        timeout=timeout,
+    )
 
 
 def outbound_probe(
@@ -854,7 +843,7 @@ def poll_until(predicate: Callable[[], bool], *, timeout: float, interval: float
 
     Exceptions from ``predicate`` (a probe against an ephemeral pod / a bundle still rebuilding) are
     swallowed and retried — the point is to wait out ``bundle-service``'s rebuild + OPA poll latency
-    without ``sleep``-and-hope (handoff 08 §2.2)."""
+    without ``sleep``-and-hope."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:

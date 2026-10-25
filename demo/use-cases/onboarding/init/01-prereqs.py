@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Verify (and, where safe, install) everything the onboarding demo needs before ``make
-setup`` touches Keycloak. Two classes of check, per the handoff:
+setup`` touches Keycloak. Two classes of check:
 
   1. VERIFY ONLY, else abort with a pointer to the installer: cluster reachable, the
      ``agentruntimes``/``agentcards`` CRDs, Keycloak reachable, namespace ``team1``, SPIRE.
@@ -10,8 +10,7 @@ setup`` touches Keycloak. Two classes of check, per the handoff:
 
 Then the real readiness condition: poll Keycloak until both the ``team1/github-agent`` and
 ``team1/github-tool`` clients exist (registration is async — "rollout complete" is not "ready to
-onboard"), and assert the tool Service carries the ``protocol.rossoctl.io/mcp`` LABEL (the handoff's
-own spec text calls it an annotation; it is not).
+onboard"), and assert the tool Service carries the ``protocol.rossoctl.io/mcp`` LABEL (not an annotation).
 """
 
 from __future__ import annotations

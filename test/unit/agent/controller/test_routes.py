@@ -268,7 +268,7 @@ def test_handler_upstream_error_surfaces_status_and_skips_pce():
 
 
 def test_service_not_visible_after_the_wait_surfaces_502_and_skips_pce():
-    # Handoff 20: the IdP still answers 404 for the new client after the bounded wait on the first
+    # The IdP still answers 404 for the new client after the bounded wait on the first
     # read. ServiceNotVisibleError is an HTTPException(502) subclass, so the route answers 502 with
     # its detail, as for the other failed reads. The route does not call the PCE.
     detail = "IdP config unavailable resolving service 'svc-new': the client is not visible after the wait"

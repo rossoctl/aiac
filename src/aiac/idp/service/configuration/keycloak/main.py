@@ -765,7 +765,7 @@ def list_roles(realm: str = Query(...), admin: KeycloakAdmin = Depends(get_admin
         roles = admin.get_realm_roles(brief_representation=False)
         # Keycloak's auto-assigned default composite is the sole path to built-ins
         # (offline_access, uma_authorization, view-profile, account roles) -- drop it so
-        # those built-ins never surface in AIAC policy (see handoff 01).
+        # those built-ins never surface in AIAC policy.
         default_composite = f"default-roles-{realm}"
         roles = [r for r in roles if r.get("name") != default_composite]
         for role in roles:

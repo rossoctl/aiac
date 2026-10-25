@@ -7,12 +7,27 @@ external seams (idp-library `Configuration`, Kubernetes, MCP) mocked.
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from aiac.agent.uc.onboarding.provision import graph as graph_mod
 from aiac.agent.uc.onboarding.provision import kube, nodes
 from aiac.agent.uc.onboarding.provision.state import OnboardingProvisionState, Trigger
 from aiac.idp.configuration.models import Role, Scope, Service, ServiceType
 
 ENTITY = "svc-1"
+
+
+@pytest.fixture(autouse=True)
+def _rollout_complete():
+    # classify_service's pod wait reads the workload's Deployment first: a complete rollout.
+    apps = MagicMock()
+    apps.read_namespaced_deployment.return_value = SimpleNamespace(
+        metadata=SimpleNamespace(generation=1),
+        spec=SimpleNamespace(replicas=1, template=None),
+        status=SimpleNamespace(observed_generation=1, replicas=1, updated_replicas=1, available_replicas=1),
+    )
+    with patch.object(kube, "_apps_v1", return_value=apps):
+        yield apps
 
 
 def _get(result, key):
@@ -74,7 +89,10 @@ class TestEndToEnd:
                 "items": [
                     {
                         "metadata": {"name": "weather"},
-                        "status": {"card": {"skills": [{"id": "forecast", "name": "F", "description": "d"}]}},
+                        "status": {
+                            "card": {"skills": [{"id": "forecast", "name": "F", "description": "d"}]},
+                            "conditions": [{"type": "Synced", "status": "True", "reason": "SyncSucceeded"}],
+                        },
                     }
                 ]
             }
@@ -89,6 +107,38 @@ class TestEndToEnd:
         # This run created both objects, so both are in the created-manifest.
         assert [r.name for r in _get(result, "created_roles")] == ["weather.forecast"]
         assert [s.name for s in _get(result, "created_scopes")] == ["weather.forecast"]
+
+    def test_agent_path_with_a_card_never_synced_raises_and_writes_nothing(self, monkeypatch):
+        # The graph re-raises the node's AgentCardNotReadyError as it is (the consumer naks it by type),
+        # and provision_service does not run: no role, no scope and no type is written.
+        monkeypatch.setenv("ONBOARD_CARD_WAIT_ATTEMPTS", "1")
+        monkeypatch.setenv("ONBOARD_CARD_WAIT_BACKOFF", "0")
+        with (
+            patch.object(nodes, "_config") as cfg,
+            patch.object(kube, "_core_v1") as core_v1,
+            patch.object(kube, "_custom_objects") as co,
+        ):
+            _idp(cfg)
+            core = MagicMock()
+            core.list_namespaced_pod.return_value = SimpleNamespace(items=[_pod("agent")])
+            core_v1.return_value = core
+            co.return_value.list_namespaced_custom_object.return_value = {
+                "items": [
+                    {
+                        "metadata": {"name": "weather"},
+                        "status": {
+                            "card": {"skills": [{"id": "forecast", "name": "F", "description": "d"}]},
+                            "conditions": [{"type": "Synced", "status": "False", "reason": "FetchFailed"}],
+                        },
+                    }
+                ]
+            }
+            with pytest.raises(nodes.AgentCardNotReadyError):
+                self._invoke()
+
+        cfg.return_value.create_service_role.assert_not_called()
+        cfg.return_value.create_service_scope.assert_not_called()
+        cfg.return_value.set_service_type.assert_not_called()
 
     def test_tool_path_end_to_end(self):
         with (

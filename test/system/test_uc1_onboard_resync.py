@@ -1,7 +1,7 @@
 """Rung 6 of the UC-1 onboarding ladder — a Controller restart: the resync and the no-CR deny.
 
 Spec ``docs/testing/uc1-onboarding-pipeline.md`` (§ *Controller restart — the resync and the no-CR deny
-(rung 6)*); decisions D20 and D28 of ``docs/handoffs/12-target-side-ac-and-method-switch.md``.
+(rung 6)*); decisions D20 and D28 of ``docs/specs/PRD.md``.
 
 At each start the Controller runs the start check #4 (the changed combiner), and then runs the
 **resync** under the PCE lock, before it serves (D28): ``PUT /policy`` with the full policy model —

@@ -1,11 +1,13 @@
 """Fake Kubernetes objects for the UC1 precondition-check tests (D30).
 
-The checks read the pods of the workload (``list_namespaced_pod``) and the namespace ConfigMap
+The checks read the workload's Deployment (``read_namespaced_deployment``, through the
+``kube._apps_v1`` seam), its pods (``list_namespaced_pod``) and the namespace ConfigMap
 ``authbridge-runtime-config`` (``read_namespaced_config_map``) through the ``kube._core_v1`` seam.
 These builders give objects with the attributes of the real ``kubernetes`` client models that the
-checks read. By default they describe a service that passes every check: an ``authbridge-proxy``
-sidecar (with its own ``httpGet`` probe, which #6 ignores), an app container with a ``tcpSocket``
-probe, and an inbound pipeline with ``jwt-validation``, ``mcp-parser`` and ``opa``.
+checks read. By default they describe a service that passes every check: a Deployment whose rollout
+is complete, an ``authbridge-proxy`` sidecar (with its own ``httpGet`` probe, which #6 ignores), an
+app container with a ``tcpSocket`` probe, and an inbound pipeline with ``jwt-validation``,
+``mcp-parser`` and ``opa``.
 """
 
 from types import SimpleNamespace
@@ -98,3 +100,60 @@ def core_v1(pods=None, configmap=None):
 
 def pod_list(*pods):
     return SimpleNamespace(items=list(pods))
+
+
+def deployment(
+    *,
+    replicas: int | None = 1,
+    generation: int = 2,
+    observed_generation: int | None = 2,
+    status_replicas: int | None = 1,
+    updated_replicas: int | None = 1,
+    available_replicas: int | None = 1,
+    containers=None,
+    paused: bool | None = None,
+    conditions=None,
+):
+    """The workload's Deployment. By default its rollout is complete (one replica, updated and
+    available, the latest generation observed). ``None`` for a counter is a counter that the API
+    omits (zero). ``containers`` is the pod template's container list (default: the passing pod's).
+    ``conditions`` is the ``status.conditions`` list (see ``condition``)."""
+    return SimpleNamespace(
+        metadata=SimpleNamespace(name=WORKLOAD, generation=generation),
+        spec=SimpleNamespace(
+            replicas=replicas,
+            paused=paused,
+            template=SimpleNamespace(
+                metadata=SimpleNamespace(name=None),
+                spec=SimpleNamespace(
+                    containers=containers if containers is not None else [app_container(), sidecar_container()]
+                ),
+            ),
+        ),
+        status=SimpleNamespace(
+            observed_generation=observed_generation,
+            replicas=status_replicas,
+            updated_replicas=updated_replicas,
+            available_replicas=available_replicas,
+            conditions=conditions,
+        ),
+    )
+
+
+def condition(type_: str, status: str, reason: str, message: str = ""):
+    """A Deployment status condition."""
+    return SimpleNamespace(type=type_, status=status, reason=reason, message=message)
+
+
+def rolling_out(**kwargs):
+    """A Deployment whose rollout is not complete: the new replica is not available yet, and the old
+    pod is still there."""
+    return deployment(status_replicas=2, updated_replicas=1, available_replicas=1, **kwargs)
+
+
+def apps_v1(dep=None):
+    """A fake ``AppsV1Api``: ``dep`` (default: a complete rollout). Pass a list of Deployments as
+    ``read_namespaced_deployment.side_effect`` for a re-poll."""
+    apps = MagicMock()
+    apps.read_namespaced_deployment.return_value = dep if dep is not None else deployment()
+    return apps

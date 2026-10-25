@@ -1,8 +1,7 @@
 """Rung 5 of the UC-1 onboarding ladder — a **failed** onboarding: compensating rollback + PCE quarantine.
 
-Spec ``docs/testing/uc1-onboarding-pipeline.md`` (§ Failure path); plan
-``docs/handoffs/04-uc1-onboarding-prb-failure-rollback-coverage.md``, with the assertions of handoff 11
-(Group 8) as changed by handoff 12 (D20: the quarantine **deletes** the CR — there is no no-rules CR).
+Spec ``docs/testing/uc1-onboarding-pipeline.md`` (§ Failure path), with decision D20 of
+``docs/specs/PRD.md`` (the quarantine **deletes** the CR — there is no no-rules CR).
 Rungs 1–3 prove the happy path; this rung proves what a build failure leaves behind. Service Provision
 succeeds and writes the service's roles/scopes, then ``ServicePolicyBuilder.build`` raises one of
 ``orchestrator._ROLLBACK_ERRORS``. The Orchestrator runs ``_rollback`` (delete only this run's
@@ -133,7 +132,7 @@ def _injected_error_line() -> str:
 
 def _dlq_line(uuid: str) -> str:
     """The consumer's dead-letter log line for ``uuid`` (``consumer._dispatch``), up to its cause."""
-    return f"moved aiac.apply.service.{uuid} to {DLQ_SUBJECT} (permanent failure"
+    return f"moved aiac.apply.service.{uuid} to {DLQ_SUBJECT} (permanent {INJECTED_ERROR} failure"
 
 
 # ======================================================================================
@@ -170,7 +169,7 @@ def _settle_failed(admin, workload: str, settled: Callable[[dict], bool], *, sin
     consumer a short window to log the dead-letter move. Returns ``{"settled", "client", "logs",
     "race_hint"}``, read while the injected Controller pod (the one that holds the failure log) is still
     running. ``race_hint`` is ``""``, or, when the state did not settle, the event-before-commit race hint
-    over the Controller log from ``since`` (the trigger; ``uc1.controller_commit_race_hint``, handoff 20)."""
+    over the Controller log from ``since`` (the trigger; ``uc1.controller_commit_race_hint``)."""
     seen: dict = {"client": None}
 
     def _terminal() -> bool:
@@ -242,7 +241,7 @@ def _run_phases(ctx: dict, run: dict) -> None:
 
     # --- Phase 1 — a failed first onboarding of the agent ---------------------------------------
     with uc1.controller_llm_unusable():
-        deployed_at = datetime.now(timezone.utc)  # the log window of the race hint (handoff 20)
+        deployed_at = datetime.now(timezone.utc)  # the log window of the race hint
         uc1.deploy_workload(AGENT)  # fires CLIENT_CREATED -> onboard_and_apply -> build raises
         agent = _registered_client(admin, AGENT)
         # Terminal: disabled (rollback) AND no CR (the quarantine deletes it; an agent gets no bootstrap

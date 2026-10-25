@@ -24,12 +24,15 @@ each type, see above). The type is read from the pod label, because the Orchestr
 the bootstrap of a tool's CR (the catalog type is not set before Provision).
 
 The checks find the pods of the service and its type as Provision's ``classify_service`` does: the
-``client.name`` split, the pod selection by ``ownerReferences``, the ``rossoctl.io/type`` label and
-the same bounded re-poll (``ONBOARD_LABEL_WAIT_*``). A pod or a label that is not there yet is a
-deploy->onboard race, not a failed check: an exhausted wait is ``HTTPException(502)``, as in
-Provision. A pod that fails #1 or #6 is re-polled in the same window too, because the operator can
-still roll the workload onto the AuthBridge-injected template (an old pod without the sidecar is
-then still there); a terminating pod is not checked. A Kubernetes API failure is a ``502``.
+``client.name`` split, the rollout of the workload's Deployment, the pod selection by
+``ownerReferences``, the ``rossoctl.io/type`` label and the same bounded re-poll
+(``ONBOARD_LABEL_WAIT_*``). The operator rolls the Deployment more than once after a deploy, so the
+pods are read only when its rollout is complete. A rollout in progress, or a pod or a label that is
+not there yet, is a deploy->onboard race, not a failed check: an exhausted wait is
+``WorkloadNotReadyError`` (a ``502`` that the NATS consumer naks). A pod that fails #1 or #6 is
+re-polled in the same window too; a terminating pod is not checked. A rollout that is never complete
+can be a #6 failure (an ``httpGet`` probe through the sidecar keeps the pod not Ready), so #6 also runs
+on the Deployment's pod template at the end of such a wait. A Kubernetes API failure is a ``502``.
 
 A failed check raises :class:`EnforcementPreconditionError`, which names each failed check.
 """
@@ -40,7 +43,7 @@ from fastapi import HTTPException
 from aiac.idp.configuration.models import Service, ServiceType
 
 from .provision.kube import is_not_found, read_configmap
-from .provision.nodes import await_labelled_pods, split_client_name
+from .provision.nodes import WorkloadNotReadyError, await_labelled_pods, split_client_name
 
 SIDECAR_CONTAINER = "authbridge-proxy"
 PIPELINE_CONFIGMAP = "authbridge-runtime-config"
@@ -74,7 +77,7 @@ def check_preconditions(service: Service) -> ServiceType:
     failures = [
         *_check_sidecar(pods, namespace),
         *_check_pipeline(namespace, service_type),
-        *_check_probes(pods),
+        *_check_probes(_pod_specs(pods)),
     ]
     if failures:
         raise EnforcementPreconditionError(failures)
@@ -85,14 +88,25 @@ def _await_pods(namespace: str, workload: str) -> tuple[ServiceType, list]:
     """The type and the live (not terminating) pods of ``workload``, with Provision's bounded
     re-poll (:func:`await_labelled_pods`).
 
-    The poll ends early when a labelled pod is there and every pod passes #1 and #6. When the
-    budget ends, the last-seen pods are returned (so #1 / #6 report them), or, if no labelled pod
-    was seen at the last look, ``HTTPException(502)`` (as ``classify_service``)."""
+    The poll ends early when the rollout is complete, a labelled pod is there and every pod passes
+    #1 and #6. When the budget ends, the last-seen pods are returned (so #1 / #6 report them), or, if
+    the last look found no labelled pod of a complete rollout, :class:`WorkloadNotReadyError`. When
+    that look found the rollout not complete, #6 runs on the Deployment's pod template first: the
+    operator does not change the probes, so a failure there is a failed check, not a race."""
 
     def _settled(service_type: ServiceType, pods: list) -> bool:
-        return not (_check_sidecar(pods, namespace) or _check_probes(pods))
+        return not (_check_sidecar(pods, namespace) or _check_probes(_pod_specs(pods)))
 
-    return await_labelled_pods(namespace, workload, _settled)
+    try:
+        return await_labelled_pods(namespace, workload, _settled)
+    except WorkloadNotReadyError as e:
+        if e.template is None:
+            raise
+        # The template has no pod name: name it after the workload in the #6 failure.
+        failures = _check_probes([(f"{workload} (pod template)", e.template.spec)])
+        if failures:
+            raise EnforcementPreconditionError(failures) from e
+        raise
 
 
 def _pod_name(pod) -> str:
@@ -110,16 +124,22 @@ def _check_sidecar(pods, namespace: str) -> list[str]:
     ]
 
 
-def _check_probes(pods) -> list[str]:
-    """#6: no app container (every container except ``authbridge-proxy``) has an ``httpGet`` probe."""
+def _pod_specs(pods) -> list[tuple[str, object]]:
+    """``(name, spec)`` of each pod, the input of :func:`_check_probes`."""
+    return [(_pod_name(pod), pod.spec) for pod in pods]
+
+
+def _check_probes(specs) -> list[str]:
+    """#6: no app container (every container except ``authbridge-proxy``) has an ``httpGet`` probe.
+    ``specs`` is ``(name, pod spec)`` pairs: the live pods, or the Deployment's pod template."""
     found = []
-    for pod in pods:
-        for c in pod.spec.containers or []:
+    for name, spec in specs:
+        for c in spec.containers or []:
             if c.name == SIDECAR_CONTAINER:
                 continue
             kinds = [kind for attr, kind in _PROBE_ATTRS if getattr(getattr(c, attr, None), "http_get", None)]
             if kinds:
-                found.append(f"container {c.name!r} of pod {_pod_name(pod)!r} ({', '.join(kinds)})")
+                found.append(f"container {c.name!r} of pod {name!r} ({', '.join(kinds)})")
     if not found:
         return []
     return [f"#6 probes: httpGet probes on app containers: {'; '.join(found)} (use tcpSocket or exec probes)"]

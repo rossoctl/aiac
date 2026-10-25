@@ -108,7 +108,7 @@ def test_ensure_agent_policy_defaults_to_policy_a_abstract() -> None:
 def test_onboarded_stack_new_params_default_to_policy_a_behavior() -> None:
     """``onboarded_stack`` gains ``policy_md`` / ``ready_signals`` but every new parameter defaults
     to today's Policy-A behavior, so the rung callers stay unchanged. There is no ``default_effect``
-    parameter: the default is always DENY (handoff 11 B3)."""
+    parameter: the default is always DENY."""
     params = inspect.signature(uc1.onboarded_stack).parameters
     assert params["policy_md"].default == scn.POLICY_ABSTRACT
     assert params["ready_signals"].default is None

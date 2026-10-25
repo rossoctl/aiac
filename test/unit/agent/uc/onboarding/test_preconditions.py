@@ -1,6 +1,7 @@
 """Unit tests for the UC1 enforcement precondition checks (D30, ``check_preconditions``).
 
-The checks read Kubernetes through the ``kube._core_v1`` seam, faked here (see ``kube_fakes``). The
+The checks read Kubernetes through the ``kube._apps_v1`` and ``kube._core_v1`` seams, faked here (see
+``kube_fakes``). The
 Orchestrator-level contract (the checks run first, before Provision and the PRB, with no rollback)
 is in ``test_orchestrator.py``; this file covers what each check reads and when it fails.
 """
@@ -13,6 +14,7 @@ from kubernetes.client.exceptions import ApiException
 
 from aiac.agent.uc.onboarding.preconditions import EnforcementPreconditionError, check_preconditions
 from aiac.agent.uc.onboarding.provision import kube
+from aiac.agent.uc.onboarding.provision.nodes import WorkloadNotReadyError
 from aiac.idp.configuration.models import Service, ServiceType
 from test.unit.agent.uc.onboarding import kube_fakes as kf
 
@@ -29,14 +31,19 @@ def _service(name=kf.SERVICE_NAME):
     return Service(id="svc-uuid", serviceId="spiffe://example.org/ns/team1/sa/svc-1", name=name, enabled=True)
 
 
-def _check(core):
-    with patch.object(kube, "_core_v1", return_value=core):
+def _check(core, apps=None):
+    """Run the checks on ``core`` (pods, ConfigMap) and ``apps`` (the Deployment; default: a complete
+    rollout)."""
+    with (
+        patch.object(kube, "_core_v1", return_value=core),
+        patch.object(kube, "_apps_v1", return_value=apps if apps is not None else kf.apps_v1()),
+    ):
         return check_preconditions(_service())
 
 
-def _failures(core) -> list[str]:
+def _failures(core, apps=None) -> list[str]:
     with pytest.raises(EnforcementPreconditionError) as ei:
-        _check(core)
+        _check(core, apps)
     return ei.value.failures
 
 
@@ -189,6 +196,7 @@ class TestCheck2Pipeline:
         core.read_namespaced_config_map.side_effect = ApiException(status=status, reason="boom")
         with pytest.raises(HTTPException) as ei:
             _check(core)
+        assert type(ei.value) is HTTPException  # a real failure, not the nak'd not-ready class
         assert ei.value.status_code == 502
 
 
@@ -226,17 +234,18 @@ class TestThePodRace:
         assert _check(core) is ServiceType.AGENT
         assert core.list_namespaced_pod.call_count == 3
 
-    def test_no_pod_after_the_wait_is_a_502_not_a_failed_check(self, monkeypatch):
+    def test_no_pod_after_the_wait_is_not_ready_not_a_failed_check(self, monkeypatch):
         monkeypatch.setenv("ONBOARD_LABEL_WAIT_ATTEMPTS", "2")
         core = kf.core_v1(pods=[])
-        with pytest.raises(HTTPException) as ei:
+        with pytest.raises(WorkloadNotReadyError) as ei:
             _check(core)
         assert ei.value.status_code == 502
         assert kf.WORKLOAD in ei.value.detail
+        assert ei.value.template is None
         core.read_namespaced_config_map.assert_not_called()
 
-    def test_no_label_after_the_wait_is_a_502(self):
-        with pytest.raises(HTTPException) as ei:
+    def test_no_label_after_the_wait_is_not_ready(self):
+        with pytest.raises(WorkloadNotReadyError) as ei:
             _check(kf.core_v1(pods=[kf.pod(type_label=None)]))
         assert ei.value.status_code == 502
         assert "rossoctl.io/type" in ei.value.detail
@@ -246,6 +255,7 @@ class TestThePodRace:
         core = kf.core_v1(pods=[kf.pod(type_label="sidecar")])
         with pytest.raises(HTTPException) as ei:
             _check(core)
+        assert type(ei.value) is HTTPException  # a misconfiguration: not nak'd, unlike WorkloadNotReadyError
         assert ei.value.status_code == 502
         assert core.list_namespaced_pod.call_count == 1
 
@@ -269,14 +279,141 @@ class TestThePodRace:
         core.list_namespaced_pod.side_effect = ApiException(status=500, reason="boom")
         with pytest.raises(HTTPException) as ei:
             _check(core)
+        assert type(ei.value) is HTTPException
         assert ei.value.status_code == 502
 
     def test_a_client_name_with_no_slash_is_a_502(self):
-        with patch.object(kube, "_core_v1", return_value=kf.core_v1()) as core_v1:
+        with (
+            patch.object(kube, "_core_v1", return_value=kf.core_v1()) as core_v1,
+            patch.object(kube, "_apps_v1", return_value=kf.apps_v1()) as apps_v1,
+        ):
             with pytest.raises(HTTPException) as ei:
                 check_preconditions(_service(name="no-slash"))
         assert ei.value.status_code == 502
         core_v1.assert_not_called()
+        apps_v1.assert_not_called()
+
+
+class TestTheRollout:
+    """The operator rolls the Deployment more than once after a deploy, and the onboarding event comes
+    before the last rollout: the pods are checked only when the rollout is complete."""
+
+    def test_the_checks_run_on_the_final_pods_after_the_rollout(self, monkeypatch):
+        # Look 1: the rollout is in progress (the old pod with no sidecar is still live), so the pods
+        # are not read. Look 2: the rollout is complete, and only the final pod is left.
+        monkeypatch.setenv("ONBOARD_LABEL_WAIT_ATTEMPTS", "3")
+        apps = kf.apps_v1()
+        apps.read_namespaced_deployment.side_effect = [kf.rolling_out(), kf.deployment()]
+        core = kf.core_v1(pods=[kf.pod(name="new")])
+        assert _check(core, apps) is ServiceType.AGENT
+        assert apps.read_namespaced_deployment.call_count == 2
+        assert core.list_namespaced_pod.call_count == 1
+
+    @pytest.mark.parametrize(
+        "dep",
+        [
+            kf.rolling_out(),  # an old pod is left (replicas > updatedReplicas)
+            kf.deployment(updated_replicas=None, available_replicas=None),  # no new pod yet
+            kf.deployment(available_replicas=None),  # the new pod is not available yet
+            kf.deployment(generation=3, observed_generation=2),  # the controller has not seen the change
+            kf.deployment(
+                observed_generation=None, status_replicas=None, updated_replicas=None, available_replicas=None
+            ),
+        ],
+        ids=["old-pod-left", "not-updated", "not-available", "generation-not-observed", "no-status"],
+    )
+    def test_a_rollout_that_is_not_complete_is_not_ready(self, dep):
+        core = kf.core_v1()
+        with pytest.raises(WorkloadNotReadyError) as ei:
+            _check(core, kf.apps_v1(dep))
+        assert ei.value.status_code == 502
+        assert "rollout" in ei.value.detail and kf.WORKLOAD in ei.value.detail
+        assert "updatedReplicas" in ei.value.detail and "observedGeneration" in ei.value.detail
+        core.list_namespaced_pod.assert_not_called()
+        core.read_namespaced_config_map.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "dep, want",
+        [
+            (
+                kf.rolling_out(
+                    conditions=[kf.condition("Progressing", "False", "ProgressDeadlineExceeded", "timed out")]
+                ),
+                "Progressing=False (ProgressDeadlineExceeded): timed out",
+            ),
+            (kf.rolling_out(paused=True), "paused"),
+        ],
+        ids=["progress-deadline-exceeded", "paused"],
+    )
+    def test_a_rollout_that_waits_for_a_person_is_not_ready_and_says_why(self, dep, want):
+        with pytest.raises(WorkloadNotReadyError) as ei:
+            _check(kf.core_v1(), kf.apps_v1(dep))
+        assert want in ei.value.detail
+
+    def test_a_deployment_scaled_to_zero_is_not_ready_and_says_why(self):
+        dep = kf.deployment(replicas=0, status_replicas=None, updated_replicas=None, available_replicas=None)
+        with pytest.raises(WorkloadNotReadyError) as ei:
+            _check(kf.core_v1(pods=[]), kf.apps_v1(dep))
+        assert "spec.replicas 0" in ei.value.detail
+
+    def test_an_old_pod_with_no_sidecar_at_the_end_of_the_wait_is_not_a_failed_check(self, monkeypatch):
+        # W2: the budget ends during the rollout, with a labelled new pod and a live old pod that has no
+        # sidecar. That pod is about to be replaced: not ready (nak'd), not a permanent #1.
+        monkeypatch.setenv("ONBOARD_LABEL_WAIT_ATTEMPTS", "2")
+        old = kf.pod(
+            name="svc-1-78cf9dffd5-a", owner_name="svc-1-78cf9dffd5", type_label=None, containers=[kf.app_container()]
+        )
+        new = kf.pod(name="svc-1-7565d64dcc-b", owner_name="svc-1-7565d64dcc")
+        with pytest.raises(WorkloadNotReadyError):
+            _check(kf.core_v1(pods=[new, old]), kf.apps_v1(kf.rolling_out()))
+
+    @pytest.mark.parametrize("kind", ["readiness", "startup"])
+    def test_a_rollout_that_is_not_complete_with_an_http_get_probe_is_a_failed_check(self, kind):
+        # An httpGet probe goes through the sidecar, which denies it, so the pod never becomes Ready and
+        # the rollout never completes. The webhook does not change probes: #6 runs on the pod template.
+        app = kf.app_container(**{kind: kf.http_get_probe()})
+        dep = kf.rolling_out(containers=[app, kf.sidecar_container()])
+        failures = _failures(kf.core_v1(), kf.apps_v1(dep))
+        assert len(failures) == 1
+        assert failures[0].startswith("#6") and kind in failures[0] and "pod template" in failures[0]
+
+    def test_a_complete_rollout_with_no_sidecar_is_a_failed_check(self):
+        failures = _failures(kf.core_v1(pods=[kf.pod(containers=[kf.app_container()])]), kf.apps_v1())
+        assert [f[:2] for f in failures] == ["#1"]
+
+    def test_a_complete_rollout_with_no_pod_is_not_ready(self):
+        with pytest.raises(WorkloadNotReadyError) as ei:
+            _check(kf.core_v1(pods=[]), kf.apps_v1())
+        assert "no pod owned by workload" in ei.value.detail
+        assert ei.value.template is None
+
+    def test_no_deployment_uses_the_pod_list(self):
+        # A StatefulSet or a Sandbox has no Deployment of the workload's name: the pod list decides.
+        apps = kf.apps_v1()
+        apps.read_namespaced_deployment.side_effect = kf.not_found()
+        assert _check(kf.core_v1(), apps) is ServiceType.AGENT
+
+    def test_no_deployment_and_no_pod_is_not_ready(self):
+        apps = kf.apps_v1()
+        apps.read_namespaced_deployment.side_effect = kf.not_found()
+        with pytest.raises(WorkloadNotReadyError) as ei:
+            _check(kf.core_v1(pods=[]), apps)
+        assert "no pod owned by workload" in ei.value.detail
+
+    @pytest.mark.parametrize("status", [403, 500])
+    def test_a_deployment_read_failure_is_a_502_at_once(self, monkeypatch, status):
+        # A 403 is a missing RBAC rule (k8s/agent-deployment.yaml), not a race: not nak'd.
+        monkeypatch.setenv("ONBOARD_LABEL_WAIT_ATTEMPTS", "5")
+        apps = kf.apps_v1()
+        apps.read_namespaced_deployment.side_effect = ApiException(status=status, reason="boom")
+        core = kf.core_v1()
+        with pytest.raises(HTTPException) as ei:
+            _check(core, apps)
+        assert type(ei.value) is HTTPException
+        assert ei.value.status_code == 502
+        assert "Deployment GET failed" in ei.value.detail
+        assert apps.read_namespaced_deployment.call_count == 1
+        core.list_namespaced_pod.assert_not_called()
 
 
 class TestScope:

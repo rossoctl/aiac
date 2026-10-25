@@ -394,9 +394,9 @@ identify-and-report.
   it is not merged into the cross-pass detector, only re-shaped to the same 422
   report body at the boundary (Q15).
 
-### Addendum (#2503): verbatim-quoted reports on `/apply` — reversing handoff-07 Q15/Q16
+### Addendum (#2503): verbatim-quoted reports on `/apply` — reversing Q15/Q16
 
-Handoff 07 settled the on-`/apply` conflict report as **quote-less / no-LLM**:
+An earlier decision settled the on-`/apply` conflict report as **quote-less / no-LLM**:
 
 - **Q15** ("Boundary unification") decided to *"unify the report shape, not the
   payload"* — one new structural exception carrying a `ConflictReport`, and
@@ -416,9 +416,9 @@ the re-homed diagnostic `explain` machinery) runs over exactly the pairs the
 detector surfaced, classifying each `kind` (`direct`/`coarse_scope`) and
 extracting **substring-validated** quotes from the candidate policy text. A clean
 apply stays fast and **LLM-free** (the explain seam never fires), so the gating —
-not the report's fidelity — is what preserves handoff 07's performance intent.
+not the report's fidelity — is what preserves that earlier decision's performance intent.
 
-Unchanged from handoff 07: the SCOPE-side focal anchoring (Q16), the identify-
+Unchanged from that earlier decision: the SCOPE-side focal anchoring (Q16), the identify-
 never-reconcile principle above, and Q15's *shape* unification — both
 `PolicyConflictError` (now enriched) and `PolicyContradictionError` (mapped
 shallow, still **no LLM** at the boundary, `quotes_verified=false`) yield one 422

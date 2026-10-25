@@ -12,14 +12,14 @@ consumer) builds an `_Onboarded` (rules, client_id, bootstrapped) and then makes
 Issue 171 adds a compensating rollback (UC1-only): on any of the four typed build
 failures the Orchestrator tears down exactly what Provision *created this run* (the
 created-manifest) and disables the client (failed-service marker). The client type is
-kept (handoff 11 B2). Then it calls the PCE's ``quarantine`` (the policy teardown) and
+kept. Then it calls the PCE's ``quarantine`` (the policy teardown) and
 re-raises. `onboard_and_apply` re-enables the client after a successful apply (idempotent).
 
-Handoff 12 (D30, checkpoint B1) adds the enforcement precondition checks, which run first (before
+D30 adds the enforcement precondition checks, which run first (before
 Provision and the PRB), and the bootstrap CR of a tool, which the PCE writes after the checks and
-before Provision. The checks read Kubernetes through the ``kube._core_v1`` seam, which is faked here
-for every test (by default a service that passes every check); the PCE ``bootstrap`` is patched at
-its import site.
+before Provision. The checks read Kubernetes through the ``kube._core_v1`` and ``kube._apps_v1``
+seams, which are faked here for every test (by default a service that passes every check); the PCE
+``bootstrap`` is patched at its import site.
 """
 
 import ast
@@ -97,13 +97,13 @@ def bootstrap():
 
 @pytest.fixture(autouse=True)
 def k8s(monkeypatch):
-    """The Kubernetes seam of the precondition checks (D30): by default one agent pod and a pipeline
-    that pass every check. Tests that change the cluster request this fixture by name. The
-    deploy->onboard re-poll is one look with no sleep, unless a test sets it."""
+    """The Kubernetes seam of the precondition checks (D30): by default a complete rollout, one agent
+    pod and a pipeline that pass every check. Tests that change the cluster request this fixture by
+    name. The deploy->onboard re-poll is one look with no sleep, unless a test sets it."""
     monkeypatch.setenv("ONBOARD_LABEL_WAIT_ATTEMPTS", "1")
     monkeypatch.setenv("ONBOARD_LABEL_WAIT_BACKOFF", "0")
     core = kf.core_v1()
-    with patch.object(kube, "_core_v1", return_value=core):
+    with patch.object(kube, "_core_v1", return_value=core), patch.object(kube, "_apps_v1", return_value=kf.apps_v1()):
         yield core
 
 
@@ -241,7 +241,7 @@ def _not_found() -> IdPHTTPError:
 
 
 class TestFirstReadWaitsForANewClient:
-    """Handoff 20 (the event-before-commit race): the Keycloak SPI event can come before Keycloak
+    """The event-before-commit race: the Keycloak SPI event can come before Keycloak
     commits the new client, so the first ``get_service`` answers 404. The Orchestrator reads again
     for a bounded budget (``ONBOARD_CLIENT_WAIT_*``) and then onboards the service. A client that is
     still not visible after the budget raises ``ServiceNotVisibleError`` (a 502). Any other read

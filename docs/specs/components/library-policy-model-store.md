@@ -116,7 +116,7 @@ cross-service conflict check (`get_service_policy`, read only).
 ### Why by-role must be a store query (not an IdP lookup)
 
 `get_service_policies_by_role` must return **stored** rows — including stale role→service mappings
-that the live IdP no longer reflects. The Policy Computation Engine's override-purge (handoff 05)
+that the live IdP no longer reflects. The Policy Computation Engine's override-purge ([Merge Semantics](policy-computation-engine.md#merge-semantics))
 depends on seeing exactly those stale rows so it can remove them. Because the SPM store is the
 source of truth and the IdP is not, this query cannot be answered from the IdP; it is a query over
 persisted SPMs. It may start as a full scan and later gain a `role.id -> {service_id}` index behind
