@@ -451,7 +451,7 @@ _EXCHANGE_FORM = {
 
 
 def test_exchange_token_sends_the_rfc8693_request(monkeypatch: pytest.MonkeyPatch) -> None:
-    """With no ``scope``, the request of AuthBridge's ``discovery-exchange``: audience only, so only
+    """With no ``scope``, the request of AuthBridge's ``token-exchange-aiac``: audience only, so only
     the client's default scopes apply."""
     calls = _stub_post(monkeypatch, _Response(200, {"access_token": "exchanged-jwt"}))
     assert _exchange() == "exchanged-jwt"
@@ -534,7 +534,7 @@ def _secret_admin(secret: object = "s3cret") -> MagicMock:
 
 
 def test_exchanged_subject_exchanges_as_the_agent_to_the_tool_audience(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The request of AuthBridge's ``discovery-exchange``: the agent client and the tool's SPIFFE
+    """The request of AuthBridge's ``token-exchange-aiac``: the agent client and the tool's SPIFFE
     audience, no ``scope``; the result is the exchanged token's ``sub``."""
     calls = _stub_exchange(monkeypatch, _jwt({"sub": "dev-user"}))
     admin = _secret_admin()

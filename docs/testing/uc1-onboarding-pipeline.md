@@ -76,7 +76,7 @@ restarts. They import three shared modules:
   `subject_scope_link_problems`, and `require_subject_scope` (see *[Per-rung flow](#per-rung-flow)*,
   step 2). The rung-2 `sub` probes are `login_subject` (a password-grant token through `rossoctl`) and
   `exchanged_subject` (a token exchanged as the agent client to the tool audience, with no `scope`
-  parameter, as `discovery-exchange` sends it). The race hint
+  parameter, as `token-exchange-aiac` sends it). The race hint
   (D33) is the pure helper `commit_race_hint`, its live reader
   `controller_commit_race_hint`, and `append_hint` (see *[Per-rung flow](#per-rung-flow)*, step 2).
   Resolution-by-`name` (`"{ns}/github-agent"` / `"{ns}/github-tool"`) is still how the harness
@@ -85,7 +85,7 @@ restarts. They import three shared modules:
 - `launcher.py` — the shared live-cluster half: `kubectl` wrappers, `port_forward`, `resolve_pod`,
   `mint_token`, `exchange_token` (an RFC 8693 token exchange as a client; it raises
   `TokenExchangeError`), `jwt_claim`, `inbound_probe` / `outbound_probe`, `inbound_outcome` / `outbound_outcome`
-  (classified by body, not status: an OPA denial → `deny`, an exchange refusal from `discovery-exchange`
+  (classified by body, not status: an OPA denial → `deny`, an exchange refusal from `token-exchange-aiac`
   or `token-exchange` → `error`),
   `poll_until`, and the skip gates (`require_pipeline`,
   `require_env_or_skip`, `require_event_path`, `verify_login_subject`). There is **no** `opa_eval`, no `kubectl_cp` of
@@ -125,12 +125,12 @@ Live enforcement is now **in scope and is the whole point**: each rung onboards,
 token-exchange leg where a tool is present (Part B), waits for `bundle-service` + the AuthBridge OPA
 sidecars to recompose and reload the bundle, then drives real requests through AuthBridge on the **inbound
 leg always** — plus the **outbound leg only where a tool is onboarded** (rungs 2/3, 5–6)
-(`jwt-validation` builds `input.identity` inbound; `discovery-exchange` + `mcp-parser` build the outbound
+(`jwt-validation` builds `input.identity` inbound; `token-exchange-aiac` + `mcp-parser` build the outbound
 `input.identity` + `input.mcp.params.name`). The agent's outbound is a
 pass-through (D24), and github-tool's own inbound OPA decides each tool call: on github-tool's inbound,
 `jwt-validation` builds `input.identity` from the exchanged token (`subject` = the user, `client_id` =
 the calling agent) and `mcp-parser` builds `input.mcp.params.name`. Rung 1 (agent only) probes the **inbound leg only**: with no
-tool onboarded there is no real `agent -> tool` call, and `discovery-exchange` settles the call before
+tool onboarded there is no real `agent -> tool` call, and `token-exchange-aiac` settles the call before
 OPA (no `github-tool` client, or no `github-tool` audience grant on the agent client), so an outbound probe
 would observe an exchange passthrough or refusal rather than the AIAC OPA policy the rung exists to prove. The agent's own CrewAI reasoning flow is
 **not** triggered — the probes are synthetic requests through AuthBridge (an inbound `ping/nonexistent` JSON-RPC call;
@@ -180,7 +180,7 @@ cleanly** when any of it is absent (they never stand it up, and never false-pass
 - **Pipeline wired.** The AuthBridge OPA plugin is wired into both legs (`k8s/opa-kind-enable.sh`);
   `require_pipeline` skips cleanly if not (no `kubectl`, `AuthorizationPolicy` CRD not served,
   `bundle-service` not Running, the `opa` plugin not present on both legs, not exactly one
-  `discovery-exchange` and no `token-exchange` (`exchange_plugin_reason`, the rule of
+  `token-exchange-aiac` and no `token-exchange` (`exchange_plugin_reason`, the rule of
   `opa-kind-verify.sh`: the harness adds no route, so an older `token-exchange` pipeline would send the
   tool call unexchanged), or the global combiner still allows a pod that has no client CR — see the
   next item).
@@ -381,16 +381,16 @@ real requests + assert → full teardown.**
    and 3). The harness gates the whole step on `has_outbound` (a rung has an outbound convergence signal),
    so on rung 1 the grant and restart are **both skipped** — rung 1 then asserts the exact bundle
    the live event-driven onboard produced, with no restart papering over a bad compose.
-   There are no routes: `discovery-exchange` derives the audience from the destination host
+   There are no routes: `token-exchange-aiac` derives the audience from the destination host
    (`github-tool` → `spiffe://<trust-domain>/ns/team1/sa/github-tool`) and requests no `scope`, so
    `grant_exchange_scope` grants the agent's client the `github-tool` audience scope
    (`agent-{ns}-github-tool-aud`) as a **default** client scope (an optional scope is never applied), and
-   `restart_agent` restarts the agent to clear discovery-exchange's 5-minute unknown-audience cache (and
+   `restart_agent` restarts the agent to clear token-exchange-aiac's 5-minute unknown-audience cache (and
    so its OPA sidecar re-fetches the recomposed bundle). Assigning the agent's `*-aud` scope is **not** operator-automatic,
    so it stays harness provisioning (the operator creates that `*-aud` scope only on **tool** deploy, so
-   it does not even exist on the tool-less rung). Without the grant `discovery-exchange` refuses the
-   call (403, `plugin: "discovery-exchange"`) and it never reaches OPA. The step is still necessary: the agent's outbound is a pass-through, but github-tool's inbound `jwt-validation`
-   accepts only a token whose audience is github-tool, so `discovery-exchange` must mint it.
+   it does not even exist on the tool-less rung). Without the grant `token-exchange-aiac` refuses the
+   call (403, `plugin: "token-exchange-aiac"`) and it never reaches OPA. The step is still necessary: the agent's outbound is a pass-through, but github-tool's inbound `jwt-validation`
+   accepts only a token whose audience is github-tool, so `token-exchange-aiac` must mint it.
 4. **Poll until the pipeline converges.** `poll_until` drives real decisions until this run's CR is
    reflected (inbound `dev-user` allow, `test-user` allow, `devops-user` deny; and, **only when a tool is
    onboarded** (rungs 2/3, 6), outbound `dev-user` `source-read` allow and `test-user` `issues-read` allow),
@@ -412,9 +412,9 @@ real requests + assert → full teardown.**
         inbound OPA decides: its reverse proxy rejects an ungranted call with HTTP
         403 and a plain JSON body (`error: "policy.forbidden"`, `plugin: "opa"`), and the agent's
         pass-through outbound relays that response. The harness classifies it as `deny`. An **exchange refusal** (`error.data.plugin`
-        `"discovery-exchange"` or `"token-exchange"` / `upstream.token-exchange-failed`) classifies as
+        `"token-exchange-aiac"` or `"token-exchange"` / `upstream.token-exchange-failed`) classifies as
         `"error"` — not `deny`, not `allow` — because the outbound authz decision was never reached
-        (only `plugin: "opa"` counts as an OPA deny, so a `discovery-exchange` 403 `policy.forbidden` is
+        (only `plugin: "opa"` counts as an OPA deny, so a `token-exchange-aiac` 403 `policy.forbidden` is
         an `error` too); this keeps a genuine token-exchange fault on rungs 2/3
         from masquerading as an `allow`. Expected from `expected_outbound_bare` — allowed iff the subject
         **and** some agent role both reach that tool's scope.
@@ -436,7 +436,7 @@ real requests + assert → full teardown.**
         the agent client to the tool audience gives `sub` = the username. It skips cleanly when
         the agent client uses a client authenticator other than `client-secret` (for example a SPIFFE
         JWT-SVID through `federated-jwt`). The harness exchanges with the agent's client secret, the
-        identity that `k8s/opa-kind-enable.sh` gives AuthBridge's `discovery-exchange`, so a refused secret
+        identity that `k8s/opa-kind-enable.sh` gives AuthBridge's `token-exchange-aiac`, so a refused secret
         is a failure. It is the one direct check of the exchanged `sub` (`test_outbound` reads it only
         through a decision).
 6. **Teardown → pristine.** Restore the cluster to its pre-test (no-workloads) state:

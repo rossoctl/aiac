@@ -9,7 +9,7 @@
 # (a2a-parser, mcp-parser, inference-parser) so OPA policies have input.a2a /
 # input.mcp / input.inference available on both legs, not just input.host.
 #
-# The outbound leg exchanges by default: discovery-exchange (no routes) mints a
+# The outbound leg exchanges by default: token-exchange-aiac (no routes) mints a
 # token for every in-cluster destination Keycloak has a client for, and OPA runs
 # AFTER it so policies can read input.identity / input.delegation (the target
 # audience + scopes the token was exchanged for). See the overlay comment in
@@ -53,7 +53,7 @@
 #   RELEASE_NAME        helm release name                 (default: rossoctl)
 #   RELEASE_NAMESPACE   namespace the chart is installed in (default: rossoctl-system)
 #   AGENT_NAMESPACE     namespace to restart agent and tool pods in; also the
-#                       namespace discovery-exchange assumes for short host
+#                       namespace token-exchange-aiac assumes for short host
 #                       names such as github-tool:9090   (default: team1)
 #   TRUST_DOMAIN        SPIFFE trust domain in the outbound exchange audience
 #                       spiffe://<td>/ns/<ns>/sa/<service> (default: localtest.me)
@@ -382,7 +382,7 @@ cat > "$OVERLAY_FILE" <<YAML
 #     input.mcp, input.inference) are always populated, even if a later
 #     gate denies the request.
 #   - opa runs after jwt-validation on inbound so input.identity is set.
-#   - OUTBOUND token exchange is ON by default, with no routes: discovery-exchange
+#   - OUTBOUND token exchange is ON by default, with no routes: token-exchange-aiac
 #     derives the audience from the destination host
 #     (spiffe://${TRUST_DOMAIN}/ns/{namespace}/sa/{service}; a short name uses
 #     namespace ${AGENT_NAMESPACE}) and asks Keycloak. A granted target gets a
@@ -391,7 +391,7 @@ cat > "$OVERLAY_FILE" <<YAML
 #     failure is 503. A request with no bearer is exchanged with the workload's
 #     own client-credentials token (no_token_policy: client-credentials), never
 #     passed through.
-#   - opa runs AFTER discovery-exchange so the exchange is visible to policy:
+#   - opa runs AFTER token-exchange-aiac so the exchange is visible to policy:
 #     each exchange appends a delegation hop, and OPA exposes it as
 #     input.delegation (origin, actor, depth, chain of {subject_id, audience,
 #     scopes, strategy, from_cache}) and as an outbound input.identity
@@ -406,7 +406,7 @@ cat > "$OVERLAY_FILE" <<YAML
 #   - The SPIFFE audience form requires the destination Service and its
 #     ServiceAccount to share a name; otherwise the derived audience names no
 #     client and the request passes through un-exchanged.
-#   - discovery-exchange rejects unknown config keys, so token-exchange-only
+#   - token-exchange-aiac rejects unknown config keys, so token-exchange-only
 #     keys (routes, default_policy, identity, token_scopes) must not appear.
 # NOTE: the rossoctl chart reads the pipeline from \`.Values.authBridge.pipeline\`
 # (a multiline string rendered via tpl() into the namespace
@@ -435,7 +435,7 @@ authBridge:
         - name: a2a-parser
         - name: mcp-parser
         - name: inference-parser
-        - name: discovery-exchange
+        - name: token-exchange-aiac
           config:
             keycloak_url: "http://keycloak-service.keycloak.svc:8080"
             keycloak_realm: "rossoctl"

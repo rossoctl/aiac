@@ -212,7 +212,7 @@ Manifests live under `demo/assets/agents/github_agent/k8s/`, adapted from the gi
     `rossoctl.io/type=agent`, registers a Keycloak client, injects the AuthBridge sidecar).
   - Image `localhost/github-agent:latest`, `imagePullPolicy: IfNotPresent` (kind-load; name is a documented knob).
 - **`configmaps.yaml`** — `authbridge-config` (Keycloak URL/realm/issuer) only. There is no
-  `authproxy-routes`: the outbound plugin `discovery-exchange` (wired by `k8s/opa-kind-enable.sh`) has no
+  `authproxy-routes`: the outbound plugin `token-exchange-aiac` (wired by `k8s/opa-kind-enable.sh`) has no
   routes. It derives the audience `spiffe://<trust-domain>/ns/<namespace>/sa/<host>` from the `MCP_URL`
   host and exchanges for it when the agent's client has that audience as a **default** client scope.
 - **Prerequisite (reused, not created here):** the existing **production** `github-tool` Deployment/Service

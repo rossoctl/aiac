@@ -41,7 +41,7 @@ live Kubernetes API — the agent's and the tool's, D20),
 enables the outbound token-exchange leg, waits for `bundle-service` + the AuthBridge OPA sidecars to
 recompose and reload the bundle, then asserts the **full happy-path matrix + negative controls** over
 the fully onboarded stack. Both gates are exercised through AuthBridge's own parsers: `jwt-validation`
-builds `input.identity` on the inbound leg; `discovery-exchange` + `mcp-parser` build the outbound
+builds `input.identity` on the inbound leg; `token-exchange-aiac` + `mcp-parser` build the outbound
 `input.identity` + `input.mcp.params.name` (the **bare** tool name) — so the test never hand-builds an
 input document and there is no standalone probe module. The agent's outbound is
 a pass-through (D24), and github-tool's own inbound OPA decides each tool call: there, `jwt-validation`
@@ -76,7 +76,7 @@ over the fully onboarded stack.
 1. **Skip gates first — before any cluster mutation.** `require_pipeline` skips cleanly if the live
    AuthBridge OPA pipeline is not wired (no `kubectl`, `AuthorizationPolicy` CRD not served,
    `bundle-service` not Running, the `opa` plugin not on **both** legs, not exactly one
-   `discovery-exchange` and no `token-exchange` (`exchange_plugin_reason`), or the global combiner — the
+   `token-exchange-aiac` and no `token-exchange` (`exchange_plugin_reason`), or the global combiner — the
    `default` CR in `rossoctl-system` — still allows a pod that has no client CR, D20);
    `require_env_or_skip` skips if `KEYCLOAK_URL` / admin creds are unset; `require_event_path` skips if
    the NATS broker is not Running or the realm does not have the `aiac-event-listener` listener with
@@ -122,14 +122,14 @@ over the fully onboarded stack.
    so a missing link **fails** the run; it does not skip. The UC-1 ladder also decodes an exchanged
    token and checks `sub` = the username (rung 2, see
    [uc1-onboarding-pipeline.md](uc1-onboarding-pipeline.md#per-rung-flow)).
-4. **Enable the outbound token-exchange leg (Part B).** There are no routes: `discovery-exchange`
+4. **Enable the outbound token-exchange leg (Part B).** There are no routes: `token-exchange-aiac`
    derives the audience from the destination host (`github-tool` →
    `spiffe://<trust-domain>/ns/team1/sa/github-tool`) and asks Keycloak. It requests no `scope`, so
    `grant_exchange_scope` grants the agent's Keycloak client the `github-tool` audience scope as a
    **default** client scope (an optional scope is never applied), and `restart_agent` restarts the
-   agent to clear discovery-exchange's 5-minute unknown-audience cache (and so its OPA sidecar
+   agent to clear token-exchange-aiac's 5-minute unknown-audience cache (and so its OPA sidecar
    re-fetches the recomposed bundle). Without the grant the exchange is refused with a 403 from
-   `discovery-exchange` and the call never reaches OPA. The agent's outbound is a pass-through, but the
+   `token-exchange-aiac` and the call never reaches OPA. The agent's outbound is a pass-through, but the
    leg is still necessary: github-tool's inbound `jwt-validation` accepts only a token whose audience is github-tool.
 5. **Wait for the pipeline to converge.** `poll_until` drives real decisions until this run's CR is
    reflected: `dev-user` and `test-user` reach the agent (inbound allow), `devops-user` is blocked (inbound deny —
@@ -145,13 +145,13 @@ over the fully onboarded stack.
      role may reach some agent scope. `jwt-validation` builds `input.identity`; the real OPA plugin
      decides (200 → `allow`, 403 → `deny`).
    - **Outbound** — one node per `(subject × bare tool name)`. A real MCP `tools/call` for the **bare**
-     tool through AuthBridge's forward proxy (discovery-exchange → OPA) is allowed iff **both** the subject
+     tool through AuthBridge's forward proxy (token-exchange-aiac → OPA) is allowed iff **both** the subject
      and some agent role are entitled to that tool's scope (the per-scope two-gate AND). `mcp-parser`
      surfaces `input.mcp.params.name`. github-tool's inbound OPA decides: its
      reverse proxy rejects an ungranted call with HTTP 403 and a plain JSON body
      (`error: "policy.forbidden"`, `plugin: "opa"`), and the agent's pass-through outbound relays that
      response. The harness (`outbound_outcome`) classifies it as `deny`. An exchange
-     refusal (`plugin` `"discovery-exchange"` or `"token-exchange"`, or `upstream.token-exchange-failed`)
+     refusal (`plugin` `"token-exchange-aiac"` or `"token-exchange"`, or `upstream.token-exchange-failed`)
      classifies as `"error"`, not `deny` — even when its body says `policy.forbidden` — because OPA was
      never reached.
    - The expected verdict for every cell is **computed from** the `scenario_uc1.py` pair-lists
@@ -314,10 +314,10 @@ decision logs (`k8s/opa-kind-runbook.md` "What OPA sees on each leg") and inspec
   copy or from the policy itself. A wrong role→scope mapping therefore fails the exact cell.
 - **Both gates go through AuthBridge's own parsers.** Inbound `input.identity` is built by
   `jwt-validation`; outbound `input.identity` + `input.mcp.params.name` (the **bare** tool name) are
-  built by `discovery-exchange` + `mcp-parser`. The test never hand-builds an input document and there is
+  built by `token-exchange-aiac` + `mcp-parser`. The test never hand-builds an input document and there is
   no standalone probe module — the deployed plugin sees exactly what production sees.
 - **Outbound needs the token-exchange leg live.** The outbound OPA gate is only reached if
-  `discovery-exchange` first exchanges the agent's call to `github-tool`; Part B (default client
+  `token-exchange-aiac` first exchanges the agent's call to `github-tool`; Part B (default client
   scope + agent restart) enables it, and the fixture polls real decisions until it
   settles before asserting. The agent's outbound is a pass-through, but the leg is
   still necessary: github-tool's inbound `jwt-validation` accepts only a token whose audience is

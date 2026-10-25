@@ -135,7 +135,7 @@ Every gate is evaluated by a deployed AuthBridge sidecar, in the request path:
 
 ```
 Inbound:   caller ─► jwt-validation ─► OPA ─► github-agent app
-Outbound:  github-agent app ─► discovery-exchange ─► OPA ─► github-tool
+Outbound:  github-agent app ─► token-exchange-aiac ─► OPA ─► github-tool
 Tool:      github-agent (outbound) ─► jwt-validation ─► OPA ─► github-tool app
 ```
 
@@ -144,7 +144,7 @@ tool's inbound. The tool's inbound has the rules, and the agent's outbound is a 
 
 Policies reach the plugin via the bundle service every AuthBridge workload polls
 (`http://bundle-service.rossoctl-system.svc.cluster.local:8080`). On the outbound leg OPA sits
-**after** `discovery-exchange`, which is what populates `input.identity` and the delegation chain on
+**after** `token-exchange-aiac`, which is what populates `input.identity` and the delegation chain on
 that leg (it records one delegation hop per exchange, so `input.identity` and `input.delegation` have
 the same shape as under the older route-based `token-exchange`). On the tool's inbound leg,
 `input.identity` comes from the exchanged token: `client_id` is the calling agent, and `subject` is the user (D31, see the
@@ -383,7 +383,7 @@ This is a **cluster-level, one-time** change owned by `k8s/`.
 
 Enforcement is an opt-in AuthBridge pipeline plugin. The script rebuilds the AuthBridge
 proxy-sidecar image from your `cortex` clone, loads it into Kind, and `helm upgrade`s the chart with
-a **temporary overlay** that wires `discovery-exchange` and then `opa` on the outbound leg — plus the
+a **temporary overlay** that wires `token-exchange-aiac` and then `opa` on the outbound leg — plus the
 parser set into the `team1` pipeline of every agent **and tool** (`injectTools=true` gives tool pods
 the sidecar). It does not modify `charts/rossoctl/values.yaml` on disk.
 
@@ -523,14 +523,14 @@ make enforce
 ### What happens
 
 **WIRE** configures AuthBridge's own outbound leg — the two things AIAC's onboarding does not do.
-There are no routes: `discovery-exchange` derives the audience from the destination host
+There are no routes: `token-exchange-aiac` derives the audience from the destination host
 (`github-tool` → `spiffe://<trust-domain>/ns/team1/sa/github-tool`) and asks Keycloak for it. That
 audience is what `github-tool`'s inbound validates.
 
 1. Grants `github-agent`'s Keycloak client the `agent-team1-github-tool-aud` audience as a
    **default** client scope. The plugin requests no `scope`, so an optional scope is never applied
-   and the exchange is refused (403, `plugin: "discovery-exchange"`).
-2. Restarts the agent pod, to clear the audience `discovery-exchange` may have cached as unknown
+   and the exchange is refused (403, `plugin: "token-exchange-aiac"`).
+2. Restarts the agent pod, to clear the audience `token-exchange-aiac` may have cached as unknown
    (for 5 minutes) before `github-tool`'s client existed.
 
 > The agent's default `MCP_URL` host is `github-tool-mcp` (the **production** tool), but the
@@ -566,10 +566,10 @@ A denial looks like this:
 |---|---|
 | Agent inbound | **HTTP 403**, body `{"error":"policy.forbidden","plugin":"opa"}` |
 | Tool inbound | **HTTP 403**, body `{"error":"policy.forbidden","plugin":"opa"}` — the tool's reverse proxy sends it and the agent's forward proxy relays it |
-| Exchange refused | Not an OPA verdict: `discovery-exchange` refuses an ungranted audience with `{"error":"policy.forbidden","plugin":"discovery-exchange"}` (for MCP, a JSON-RPC error frame at HTTP 200 with `error.data.plugin: "discovery-exchange"`), and any other IdP failure with `503` `upstream.token-exchange-failed`. OPA is never consulted |
+| Exchange refused | Not an OPA verdict: `token-exchange-aiac` refuses an ungranted audience with `{"error":"policy.forbidden","plugin":"token-exchange-aiac"}` (for MCP, a JSON-RPC error frame at HTTP 200 with `error.data.plugin: "token-exchange-aiac"`), and any other IdP failure with `503` `upstream.token-exchange-failed`. OPA is never consulted |
 
 So classify a tool call by the response **body**: a `result` frame is allowed; an `error` frame, or
-a `403` body that names `opa`, is denied; one that names `discovery-exchange` means the WIRE grant
+a `403` body that names `opa`, is denied; one that names `token-exchange-aiac` means the WIRE grant
 is missing. A denied request never reaches the `github-tool` app. The
 driver reports these as `ALLOWED_RESULT`, `DENIED_HTTP 403` and `DENIED_JSONRPC`.
 
@@ -708,7 +708,7 @@ each tool call, and `github-agent`'s outbound package is a pass-through (`allow 
 
 | Symptom | Cause / fix |
 |---|---|
-| **Every tool call denies, for every user** | If the deny names `plugin: "discovery-exchange"`, the default-scope grant is missing — run `make enforce`, which includes WIRE, rather than the enforce half alone. Otherwise one of the two onboardings did not finish, leaving the per-tool maps empty: `kubectl logs deployment/aiac-agent -n aiac-system \| grep -iE 'label missing\|MCP tools/list'`. JetStream redelivers after `ACK_WAIT` (600 s) and usually succeeds, so waiting then re-running `make enforce` often cures it. |
+| **Every tool call denies, for every user** | If the deny names `plugin: "token-exchange-aiac"`, the default-scope grant is missing — run `make enforce`, which includes WIRE, rather than the enforce half alone. Otherwise one of the two onboardings did not finish, leaving the per-tool maps empty: `kubectl logs deployment/aiac-agent -n aiac-system \| grep -iE 'label missing\|MCP tools/list'`. JetStream redelivers after `ACK_WAIT` (600 s) and usually succeeds, so waiting then re-running `make enforce` often cures it. |
 | **ENFORCE stops: a client does not link `aiac-username-sub` as a default scope** | The token keeps `sub` = the Keycloak user ID, so the rego cannot find the user (D31). For `rossoctl`, restart the IdP Configuration Service once Keycloak is ready: `kubectl rollout restart deployment/aiac-interface -n aiac-system`. For `github-agent`, let AIAC onboard it again. Do not add a `sub` mapper by hand. |
 | **The AIAC Controller does not start (start check #4)** | The global combiner is the stock one, which allows a pod that has no client CR. A `make opa-restore` or another bundle-service install brought it back. Run `make opa` again. |
 | **Onboarding fails with a `401` from the LLM** | `enable.sh` defaulted to OpenAI. Patch `aiac-agent-config` and `rollout restart` — see [step 1](#change-llm). The values come in via `envFrom`, so a patch without a restart does nothing. |
@@ -826,7 +826,7 @@ make teardown ARGS=--include-opa   # also revert step 2's overlay and combiner (
 - **step 2's OPA overlay**, unless you pass `--include-opa`.
 - **container images already in the Kind node.** Inert; the script prints the `docker image rm` line.
 
-> **No `authproxy-routes`.** `discovery-exchange` needs no routes, so the demo ships no
+> **No `authproxy-routes`.** `token-exchange-aiac` needs no routes, so the demo ships no
 > `authproxy-routes` ConfigMap. One that your platform seeds in `team1` is neither overwritten at
 > deploy time nor deleted by `teardown`.
 

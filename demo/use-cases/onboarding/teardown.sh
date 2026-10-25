@@ -238,7 +238,7 @@ step "Deleting the demo's team1 ConfigMap (authbridge-config)"
 # Symmetric inverse of deploy.sh: delete exactly what the demo's own manifest declares, the same way
 # restore.sh deletes the Deployment manifests. The CM is demo-owned
 # (demo/assets/agents/github_agent/k8s/configmaps.yaml, namespace team1). The demo ships no
-# authproxy-routes (discovery-exchange needs no routes), so a platform-seeded one is left alone.
+# authproxy-routes (token-exchange-aiac needs no routes), so a platform-seeded one is left alone.
 run kubectl delete -f "$ASSETS_DIR/agents/github_agent/k8s/configmaps.yaml" -n "$NS" --ignore-not-found
 pass "demo ConfigMap gone from ${NS} (the namespace itself is untouched)"
 fi

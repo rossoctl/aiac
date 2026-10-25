@@ -49,7 +49,7 @@ This module owns:
 * **Onboarding (event-driven)** — ``ensure_agent_policy`` (mount the PRB's ``policy.md``) +
   ``deploy_workload`` (deploy fires the trigger) / ``wait_for_registration`` / ``undeploy_workload``.
 * **Outbound-leg prep (Part B)** — ``grant_exchange_scope`` / ``restart_agent`` so
-  ``discovery-exchange`` mints the tool token and OPA is actually consulted on the outbound leg.
+  ``token-exchange-aiac`` mints the tool token and OPA is actually consulted on the outbound leg.
 * **The subject on every leg (D31)** — ``SUBJECT_SCOPE`` (``aiac-username-sub``) and its mapper
   expectation; the pure ``subject_scope_problems``; the live reader ``subject_scope_link_problems`` and
   ``require_subject_scope`` (the login client ``rossoctl`` and each onboarded client link the scope as
@@ -125,10 +125,10 @@ from test.system.launcher import (  # noqa: E402
     _kubectl_try,
     curl_pod,
     deny_origin,
+    exchange_refusal,  # noqa: F401 — re-exported: the rollback test classifies an exchange refusal with it
     exchange_token,
     inbound_outcome,
     inbound_probe,
-    is_exchange_refusal,  # noqa: F401 — re-exported: the rollback test classifies an exchange refusal with it
     is_opa_violation,
     jwt_claim,
     kubectl,
@@ -1165,7 +1165,7 @@ def delete_workload_crs() -> None:
 # Outbound token-exchange leg prep — so OPA is actually consulted outbound
 # ======================================================================================
 #
-# The tool check is only reached if ``discovery-exchange`` first exchanges the agent's call to
+# The tool check is only reached if ``token-exchange-aiac`` first exchanges the agent's call to
 # github-tool. It has no routes: it derives the audience ``spiffe://<td>/ns/<ns>/sa/github-tool`` from
 # the host and asks Keycloak, so the only prep is (B.1) the agent's Keycloak client granted the
 # github-tool audience scope as a **default** scope — the plugin requests no ``scope``, so an optional
@@ -1173,7 +1173,7 @@ def delete_workload_crs() -> None:
 # a github-tool audience it remembered as unknown before the tool's client existed (cached for 5 min)
 # is asked again. The leg is necessary: the agent's outbound is a pass-through, but github-tool's
 # inbound ``jwt-validation`` accepts only a token whose audience is github-tool, so
-# ``discovery-exchange`` must mint it.
+# ``token-exchange-aiac`` must mint it.
 
 
 def _tool_audience() -> str:
@@ -1188,11 +1188,11 @@ def _tool_aud_scope() -> str:
 
 def grant_exchange_scope(admin) -> None:
     """Grant the agent's Keycloak client the github-tool audience scope as a **default** scope, so
-    ``discovery-exchange``'s exchange to the github-tool audience (no ``scope`` requested) is granted.
+    ``token-exchange-aiac``'s exchange to the github-tool audience (no ``scope`` requested) is granted.
 
     Resolves the agent client by its SPIFFE ``clientId`` (``.../sa/github-agent``) or its
     ``name`` (``{ns}/github-agent``), and the client scope by name (``agent-{ns}-github-tool-aud``).
-    Idempotent — Keycloak's assign-default-scope is a PUT."""
+    Idempotent — Keycloak's assign-default-scope is a PUT. Raises ``RuntimeError`` on any Keycloak error."""
     from keycloak.exceptions import KeycloakError
 
     admin.change_current_realm(TEST_REALM)
@@ -1217,18 +1217,22 @@ def grant_exchange_scope(admin) -> None:
             "deployed + registered by the operator?"
         )
     # Keycloak silently skips a default link of a scope already linked as optional (the old
-    # optional grant of this harness), so move an optional link to default first. A failed read or
-    # delete raises: the default link would then be skipped too, and every exchange refused.
-    if any(s.get("id") == scope["id"] for s in admin.get_client_optional_client_scopes(client_uuid)):
-        admin.delete_client_optional_client_scope(client_uuid, scope["id"])
+    # optional grant of this harness), so move an optional link to default first. Every Keycloak error
+    # raises: the assign is an idempotent PUT, so none is benign, and without the default link every
+    # exchange is refused much later, far from this cause.
     try:
+        if any(s.get("id") == scope["id"] for s in admin.get_client_optional_client_scopes(client_uuid)):
+            admin.delete_client_optional_client_scope(client_uuid, scope["id"])
         admin.add_client_default_client_scope(client_uuid, scope["id"], {})
     except KeycloakError as exc:
-        log.info("grant_exchange_scope: assign %r returned (benign if already assigned): %s", aud_scope, exc)
+        raise RuntimeError(
+            f"could not link {aud_scope!r} to {NAMESPACE}/{scn.AGENT_WORKLOAD} as a default scope: {exc} — "
+            "without it token-exchange-aiac refuses every call to the tool"
+        ) from exc
 
 
 def restart_agent(namespace: str) -> None:
-    """Restart the agent Deployment so ``discovery-exchange`` starts with empty caches (an audience
+    """Restart the agent Deployment so ``token-exchange-aiac`` starts with empty caches (an audience
     it remembered as unknown is asked again) and its OPA sidecar re-fetches the recomposed bundle."""
     kubectl("rollout", "restart", f"deployment/{AGENT_DEPLOYMENT}", "-n", namespace, timeout=60)
     kubectl_rollout_status(f"deployment/{AGENT_DEPLOYMENT}", namespace=namespace, timeout=180)
@@ -1750,13 +1754,13 @@ def exchanged_subject(ctx: dict, user: str) -> str:
     comes from the agent's default scope ``aiac-username-sub``).
 
     Mints ``user``'s login token through ``rossoctl``, reads the agent client and its client secret
-    from the admin API, and sends the request that AuthBridge's ``discovery-exchange`` sends: a standard
+    from the admin API, and sends the request that AuthBridge's ``token-exchange-aiac`` sends: a standard
     token exchange to ``_tool_audience()`` with **no** ``scope`` (``exchange_token``), so only the agent's
     default scopes apply. The Keycloak standard token exchange builds the token for the requester
     (the agent), so its ``sub`` comes from the agent's scopes only.
 
     The harness can authenticate as the agent only with its client secret. AuthBridge's
-    ``discovery-exchange`` (``k8s/opa-kind-enable.sh``) uses the ``client-secret`` identity, so on that
+    ``token-exchange-aiac`` (``k8s/opa-kind-enable.sh``) uses the ``client-secret`` identity, so on that
     deployment the agent client uses the ``client-secret`` authenticator and the exchange must succeed:
     a refused client authentication then raises. ``pytest.skip`` only when the agent client uses
     another authenticator (``clientAuthenticatorType``, for example ``federated-jwt`` for a SPIFFE
@@ -1976,7 +1980,7 @@ def _default_ready_signals(tool_onboarded: bool) -> list[ReadySignal]:
 
     **Outbound signals exist only when a tool is onboarded.** The agent-only rung (rung 1) has no tool
     to gate, so there is no real ``agent -> tool`` call and its outbound leg is neither prepared (Part B
-    is skipped) nor probed nor asserted — on a tool-less rung discovery-exchange settles the call before OPA
+    is skipped) nor probed nor asserted — on a tool-less rung token-exchange-aiac settles the call before OPA
     (no ``github-tool`` audience grant), so an outbound "deny" there would be a Keycloak audience
     refusal, not an OPA verdict. Rung 1's empty tool check is instead asserted at the unit level
     (grant-set oracle) and by ``test_no_tool_scopes_provisioned``. So the tool-less signal set is
@@ -2159,8 +2163,8 @@ def onboarded_stack(
     client links the subject scope ``aiac-username-sub`` as a default scope (``require_subject_scope``,
     D31: AIAC makes this link at onboarding, so a missing link **fails** the run at once, with the
     problems listed, rather than as a deny in the final poll); enable the outbound leg
-    (Part B: route + optional client scope + agent restart); then **poll real decisions** until
-    ``bundle-service`` + OPA reflect this run's CR (and token-exchange has settled) before yielding.
+    (Part B: default client scope + agent restart, no route); then **poll real decisions** until
+    ``bundle-service`` + OPA reflect this run's CR (and the outbound exchange has settled) before yielding.
     Teardown first captures every AIAC CR and the global combiner to the pytest host
     (``capture_aiac_crs``, phase ``teardown``; best-effort, it never masks a failure), then is
     **full-to-pristine** — the workloads and every registration are removed and the removal is
@@ -2302,7 +2306,7 @@ def onboarded_stack(
         # live event-driven onboard produced (no restart papering over a bad compose).
         #
         # When there IS an outbound leg: grant the agent client the ``*-aud`` scope as a default scope
-        # (only ever present once the tool is deployed) so ``discovery-exchange`` mints the github-tool
+        # (only ever present once the tool is deployed) so ``token-exchange-aiac`` mints the github-tool
         # token and OPA is reached, then restart the agent. No route: the plugin derives the audience.
         has_outbound = any(sig.kind == "outbound" for sig in signals)
         if has_outbound:
@@ -2333,13 +2337,13 @@ def onboarded_stack(
             # collapses very different failures into ``"error"``, and the raw answer tells them apart.
             # On the outbound leg: ``code=None`` + ``"outbound probe exec failed: ..."`` is the probe's own
             # ``kubectl exec`` (a replaced agent pod); 503 or an exchange error frame is the
-            # ``discovery-exchange`` leg (OPA not reached);
+            # ``token-exchange-aiac`` leg (OPA not reached);
             # a real policy stall reads ``"deny"`` (github-tool's inbound 403 with an OPA body), never
             # ``"error"``, because the generated Rego carries ``default allow := false``.
             raise RuntimeError(
                 f"live pipeline did not converge within {BUNDLE_TIMEOUT:.0f}s after onboarding "
                 f"{workloads} + Part B: {signals_report(signals, last)}. Outbound: code=None + 'exec failed' "
-                "body = a stale/gone agent pod (harness); 503 / plugin=discovery-exchange = the exchange failed "
+                "body = a stale/gone agent pod (harness); 503 / plugin=token-exchange-aiac = the exchange failed "
                 "(OPA not reached); "
                 "a real policy stall reads 'deny', never 'error' — see k8s/opa-kind-runbook.md. "
                 + stack_diagnosis(admin, workloads[-1], context=context)
@@ -3184,7 +3188,7 @@ def mcp_session_frames(tool_bare: str) -> list[dict]:
 
 def mcp_session_decisions(ctx: dict, user: str, tool_bare: str) -> dict[str, tuple[str, int | None, str]]:
     """Mint a fresh ``user`` token, send one MCP session (``mcp_session_frames``) through the agent's
-    outbound (discovery-exchange, then the tool check in github-tool's inbound OPA), and return
+    outbound (token-exchange-aiac, then the tool check in github-tool's inbound OPA), and return
     ``{method: (decision, http_code, body)}``. A request frame is classified by its body
     (``outbound_outcome``: a ``result`` frame = allow, an OPA 403 or OPA error frame = deny); the
     notification by its status (``notification_outcome``: 202 = allow, 403 = deny)."""

@@ -1,7 +1,7 @@
 """How the UC-1 system-test harness classifies a live response — pure unit tests.
 
-An outbound refusal by the exchange plugin (``discovery-exchange``) means the request never reached
-OPA. ``discovery-exchange`` answers a target not granted to the caller with ``policy.forbidden``, the
+An outbound refusal by the exchange plugin (``token-exchange-aiac``) means the request never reached
+OPA. ``token-exchange-aiac`` answers a target not granted to the caller with ``policy.forbidden``, the
 same error code OPA uses, so the classifier must go by the named ``plugin`` and never report that
 refusal as an OPA ``deny`` (a false pass for a deny expectation).
 
@@ -30,8 +30,8 @@ def _frame(data: dict) -> str:
 
 
 OPA_DENY = {"error": "policy.forbidden", "plugin": "opa"}
-NOT_GRANTED = {"error": "policy.forbidden", "plugin": "discovery-exchange"}
-EXCHANGE_FAILED = {"error": "upstream.token-exchange-failed", "plugin": "discovery-exchange"}
+NOT_GRANTED = {"error": "policy.forbidden", "plugin": "token-exchange-aiac"}
+EXCHANGE_FAILED = {"error": "upstream.token-exchange-failed", "plugin": "token-exchange-aiac"}
 LEGACY_EXCHANGE_FAILED = {"error": "upstream.token-exchange-failed", "plugin": "token-exchange"}
 
 
@@ -59,7 +59,7 @@ def test_is_opa_violation_goes_by_the_named_plugin(doc: object, expected: bool) 
         ({"error": "upstream.token-exchange-failed"}, True),
         (OPA_DENY, False),
         ("not a dict", False),
-        ({"plugin": ["discovery-exchange"]}, False),  # an unhashable plugin value does not raise
+        ({"plugin": ["token-exchange-aiac"]}, False),  # an unhashable plugin value does not raise
         ({"plugin": {"name": "x"}}, False),
     ],
 )
@@ -90,28 +90,87 @@ def test_deny_origin_ignores_an_exchange_refusal() -> None:
     assert launcher.deny_origin(200, _frame(OPA_DENY)) == launcher.DENY_ORIGIN_AGENT_OUTBOUND
 
 
-# The outbound leg of ``authbridge-runtime-config`` as ``k8s/opa-kind-enable.sh`` renders it.
-_DX_LEG = "  outbound:\n    plugins:\n      - name: mcp-parser\n      - name: discovery-exchange\n      - name: opa\n"
-_TX_LEG = _DX_LEG.replace("discovery-exchange", "token-exchange")
+# ``authbridge-runtime-config`` as ``k8s/opa-kind-enable.sh`` renders it.
+_CONFIG = """pipeline:
+  inbound:
+    plugins:
+      - name: jwt-validation
+      - name: opa
+  outbound:
+    plugins:
+      - name: mcp-parser
+      - name: token-exchange-aiac
+        config:
+          namespace: "team1"
+      - name: opa
+"""
 
 
-@pytest.mark.parametrize(
-    "config",
-    [_DX_LEG, _DX_LEG.replace("name: discovery-exchange", 'name: "discovery-exchange"')],
-)
-def test_exchange_plugin_reason_passes_one_discovery_exchange(config: str) -> None:
-    assert launcher.exchange_plugin_reason(config, namespace="team1") is None
+def _legs(config: str) -> dict:
+    return launcher.pipeline_plugins(config)
+
+
+def test_pipeline_plugins_reads_each_leg() -> None:
+    assert _legs(_CONFIG) == {
+        "inbound": ["jwt-validation", "opa"],
+        "outbound": ["mcp-parser", "token-exchange-aiac", "opa"],
+    }
+
+
+@pytest.mark.parametrize("config", ["", "not: [yaml", "pipeline: 3"])
+def test_pipeline_plugins_of_a_bad_config_is_empty(config: str) -> None:
+    assert _legs(config) == {"inbound": [], "outbound": []}
 
 
 @pytest.mark.parametrize(
     "config",
     [
-        _TX_LEG,  # an older pipeline
-        _DX_LEG + "      - name: token-exchange\n",  # half migrated
-        _DX_LEG + "      - name: discovery-exchange\n",  # twice
+        _CONFIG,
+        _CONFIG.replace("name: token-exchange-aiac", 'name: "token-exchange-aiac"'),
+        _CONFIG + "# - name: token-exchange\n",  # a comment is not a plugin
+    ],
+)
+def test_exchange_plugin_reason_passes_one_aiac_exchange_outbound(config: str) -> None:
+    assert launcher.exchange_plugin_reason(_legs(config), namespace="team1") is None
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        _CONFIG.replace("name: token-exchange-aiac", "name: token-exchange"),  # an older pipeline
+        _CONFIG.replace("      - name: opa\n", "      - name: token-exchange\n      - name: opa\n", 2).replace(
+            "      - name: token-exchange\n      - name: opa\n", "      - name: opa\n", 1
+        ),  # half migrated
+        _CONFIG.replace(
+            "- name: token-exchange-aiac", "- name: token-exchange-aiac\n      - name: token-exchange-aiac"
+        ),
+        # only on the inbound leg, where it exchanges nothing the harness sends
+        _CONFIG.replace(
+            '      - name: token-exchange-aiac\n        config:\n          namespace: "team1"\n', ""
+        ).replace(
+            "      - name: jwt-validation\n", "      - name: jwt-validation\n      - name: token-exchange-aiac\n"
+        ),
         "",
     ],
 )
 def test_exchange_plugin_reason_skips_any_other_exchange_wiring(config: str) -> None:
-    reason = launcher.exchange_plugin_reason(config, namespace="team1")
+    reason = launcher.exchange_plugin_reason(_legs(config), namespace="team1")
     assert reason is not None and "k8s/opa-kind-enable.sh" in reason
+
+
+@pytest.mark.parametrize(
+    ("code", "body", "expected"),
+    [
+        (200, _frame(NOT_GRANTED), True),
+        (403, json.dumps(NOT_GRANTED), True),
+        # A failed exchange proves nothing about the caller's grants: not a refusal.
+        (200, _frame(EXCHANGE_FAILED), False),
+        (503, json.dumps(EXCHANGE_FAILED), False),
+        (200, _frame(OPA_DENY), False),
+        (403, json.dumps(OPA_DENY), False),
+        (None, "outbound probe exec failed", False),
+        (403, "not json", False),
+    ],
+)
+def test_exchange_refusal_is_only_keycloak_not_granting(code: int | None, body: str, expected: bool) -> None:
+    assert launcher.exchange_refusal(code, body) is expected

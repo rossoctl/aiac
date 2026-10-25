@@ -35,7 +35,6 @@ import base64
 import json
 import logging
 import os
-import re
 import shutil
 import signal
 import socket
@@ -410,7 +409,7 @@ def mint_token(
     return resp.json()["access_token"]
 
 
-# RFC 8693 token exchange — the request AuthBridge's ``discovery-exchange`` plugin sends on the outbound leg.
+# RFC 8693 token exchange — the request AuthBridge's ``token-exchange-aiac`` plugin sends on the outbound leg.
 TOKEN_EXCHANGE_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:token-exchange"
 ACCESS_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:access_token"
 
@@ -453,7 +452,7 @@ def exchange_token(
     """Exchange ``subject_token`` for an access token to ``audience`` (RFC 8693, the Keycloak standard
     token exchange) as the client ``client_id``, and return the new access token.
 
-    With ``scope`` left ``None``, the same request that AuthBridge's ``discovery-exchange`` plugin sends
+    With ``scope`` left ``None``, the same request that AuthBridge's ``token-exchange-aiac`` plugin sends
     on the agent's outbound leg: ``audience`` only, **no** ``scope`` (so only the client's default
     scopes apply), ``subject_token_type`` and ``requested_token_type`` = access token. The client
     authenticates with ``client_secret`` (form data, like ``mint_token``),
@@ -593,7 +592,7 @@ def outbound_probe(
     e.g. ``source-read``) instead of ``tools/list``, so AuthBridge's ``mcp-parser`` surfaces
     ``input.mcp.params.name`` and OPA's per-tool check in github-tool's inbound is actually exercised
     (the agent's outbound is a pass-through, PRD D24). The agent app container has
-    ``HTTP_PROXY=127.0.0.1:8081`` (the forward proxy) and ``python3``; ``discovery-exchange`` uses the
+    ``HTTP_PROXY=127.0.0.1:8081`` (the forward proxy) and ``python3``; ``token-exchange-aiac`` uses the
     carried ``dev-user`` bearer as the RFC 8693 subject token. It is a one-frame
     :func:`outbound_session_probe`. Any exec failure returns ``(None, <message>)`` -> ``"error"``."""
     frame = {"jsonrpc": "2.0", "id": "1", "method": "tools/call", "params": {"name": tool_name, "arguments": {}}}
@@ -622,7 +621,7 @@ def outbound_session_probe(
     ``notifications/initialized``, ``tools/list``, ``tools/call`` …) through AuthBridge's forward proxy,
     in order, from one ``kubectl exec`` into the agent pod; return one ``(http_code, body)`` per frame.
 
-    The forward proxy is ``127.0.0.1:8081``, the user bearer is the ``discovery-exchange`` subject token, and
+    The forward proxy is ``127.0.0.1:8081``, the user bearer is the ``token-exchange-aiac`` subject token, and
     the request carries the MCP ``Accept`` header. The frames are sent as given, so a method that
     carries no tool name reaches the MCP session rule of the tool check in github-tool's inbound (the
     agent's outbound is a pass-through, PRD D24); :func:`outbound_probe` sends one ``tools/call``
@@ -711,7 +710,7 @@ def is_opa_violation(doc: object) -> bool:
     """True when ``doc`` (a parsed rejection body, or the ``error.data`` of a JSON-RPC error frame)
     names the OPA plugin: ``plugin == "opa"``, or, when no ``plugin`` is named, ``error ==
     "policy.forbidden"`` (cortex ``pipeline.Violation.Render`` / ``httpx.MarshalMCPRejectionBody``).
-    A named non-OPA plugin never counts: ``discovery-exchange`` also answers ``policy.forbidden``
+    A named non-OPA plugin never counts: ``token-exchange-aiac`` also answers ``policy.forbidden``
     (a target not granted to the caller), and that refusal is not an OPA verdict."""
     if not isinstance(doc, dict):
         return False
@@ -722,8 +721,8 @@ def is_opa_violation(doc: object) -> bool:
 
 
 # The outbound exchange plugins, either of which may sit before OPA on the agent's outbound leg
-# (``k8s/opa-kind-enable.sh`` wires ``discovery-exchange``), and the error code of a failed exchange.
-EXCHANGE_PLUGINS = frozenset({"token-exchange", "discovery-exchange"})
+# (``k8s/opa-kind-enable.sh`` wires ``token-exchange-aiac``), and the error code of a failed exchange.
+EXCHANGE_PLUGINS = frozenset({"token-exchange", "token-exchange-aiac"})
 EXCHANGE_FAILED_ERROR = "upstream.token-exchange-failed"
 
 
@@ -734,6 +733,23 @@ def is_exchange_refusal(doc: object) -> bool:
         return False
     plugin = doc.get("plugin")
     return (isinstance(plugin, str) and plugin in EXCHANGE_PLUGINS) or doc.get("error") == EXCHANGE_FAILED_ERROR
+
+
+def exchange_refusal(code: int | None, body: str) -> bool:
+    """True when the outbound answer ``(code, body)`` is the exchange plugin's **refusal**: Keycloak
+    answered and did not grant the tool's audience to the caller (``policy.forbidden``, as a JSON-RPC
+    error frame in an HTTP 200 or as a plain 403 reject body). **Pure.** A failed exchange
+    (``upstream.token-exchange-failed``, an IdP that errored or was unreachable) is **not** a refusal:
+    it proves nothing about the caller's grants."""
+    doc = _json_or_none(body)
+    if not isinstance(doc, dict):
+        return False
+    if code == 200:
+        err = doc.get("error")
+        doc = err.get("data") if isinstance(err, dict) else None
+    elif code != 403:
+        return False
+    return is_exchange_refusal(doc) and doc.get("error") == "policy.forbidden"
 
 
 def _json_or_none(body: str) -> object:
@@ -768,7 +784,7 @@ def outbound_outcome(code: int | None, body: str) -> str:
         -> ``"deny"``. This is an OPA verdict, but not the tool check: the agent's outbound is a
         pass-through, so it comes only from a fault (for example the PRD D20 combiner deny).
         ``deny_origin`` tells it apart from the deny of the callee's inbound.
-      * the **exchange plugin** (``discovery-exchange``, or a legacy ``token-exchange``) refused to
+      * the **exchange plugin** (``token-exchange-aiac``, or a legacy ``token-exchange``) refused to
         mint the downstream token — ``error.data.plugin`` in ``EXCHANGE_PLUGINS``, or ``error.data.error
         == "upstream.token-exchange-failed"`` (``is_exchange_refusal``) -> ``"error"``,
         NOT ``"deny"``. A refused RFC 8693 exchange means the outbound authorization decision was
@@ -917,18 +933,39 @@ def combiner_reason(default_cr: dict | None, *, namespace: str = BUNDLE_SERVICE_
     return None
 
 
-def exchange_plugin_reason(config_yaml: str, *, namespace: str) -> str | None:
-    """Return ``None`` when the AuthBridge runtime config ``config_yaml`` (``authbridge-runtime-config``
-    ``config.yaml`` of ``namespace``) names ``discovery-exchange`` once and ``token-exchange`` not at
-    all, else a skip reason. **Pure.** The rule of ``k8s/opa-kind-verify.sh`` (Verify 1): the harness
-    adds no outbound route, so only ``discovery-exchange`` exchanges the agent's call to the tool, and
-    a ``token-exchange`` entry means the pipeline predates the switch."""
-    dx = len(re.findall(r"name:\s*[\"']?discovery-exchange\b", config_yaml))
-    tx = len(re.findall(r"name:\s*[\"']?token-exchange\b", config_yaml))
-    if dx == 1 and tx == 0:
+def pipeline_plugins(config_yaml: str) -> dict[str, list[str]]:
+    """The plugin names of each leg of the AuthBridge runtime config ``config_yaml``
+    (``authbridge-runtime-config`` ``config.yaml``), as ``{"inbound": [...], "outbound": [...]}``.
+    **Pure.** A leg the config does not have, or a config that is not YAML, gives an empty list.
+    PyYAML (a dependency of ``kubernetes``) is imported here, so the module keeps its stdlib +
+    ``requests`` imports."""
+    import yaml
+
+    try:
+        doc = yaml.safe_load(config_yaml)
+    except yaml.YAMLError:
+        doc = None
+    pipeline = doc.get("pipeline") if isinstance(doc, dict) else None
+    legs: dict[str, list[str]] = {}
+    for leg in ("inbound", "outbound"):
+        node = pipeline.get(leg) if isinstance(pipeline, dict) else None
+        plugins = node.get("plugins") if isinstance(node, dict) else None
+        legs[leg] = [p["name"] for p in plugins or [] if isinstance(p, dict) and isinstance(p.get("name"), str)]
+    return legs
+
+
+def exchange_plugin_reason(legs: dict[str, list[str]], *, namespace: str) -> str | None:
+    """Return ``None`` when the outbound leg of ``legs`` (``pipeline_plugins``) has
+    ``token-exchange-aiac`` once and ``token-exchange`` not at all, else a skip reason. **Pure.** The
+    rule of ``k8s/opa-kind-verify.sh`` (Verify 1), on the outbound leg only: the harness adds no
+    outbound route, so only ``token-exchange-aiac`` exchanges the agent's call to the tool, and a
+    ``token-exchange`` entry means the pipeline predates the switch."""
+    outbound = legs.get("outbound", [])
+    new, legacy = outbound.count("token-exchange-aiac"), outbound.count("token-exchange")
+    if new == 1 and legacy == 0:
         return None
     return (
-        f"outbound exchange plugins in {namespace}: discovery-exchange={dx}, token-exchange={tx} "
+        f"outbound exchange plugins in {namespace}: token-exchange-aiac={new}, token-exchange={legacy} "
         "(want 1/0, an older pipeline) — run k8s/opa-kind-enable.sh"
     )
 
@@ -984,10 +1021,11 @@ def pipeline_unwired_reason(*, namespace: str, workloads: list[str]) -> str | No
     )
     if not ok:
         return f"authbridge-runtime-config not found in {namespace} ({err})"
-    wired = out.count("name: opa")
+    legs = pipeline_plugins(out)
+    wired = sum("opa" in names for names in legs.values())
     if wired < 2:
         return f"OPA plugin not wired into both legs in {namespace} (found {wired} of 2) — run k8s/opa-kind-enable.sh"
-    reason = exchange_plugin_reason(out, namespace=namespace)
+    reason = exchange_plugin_reason(legs, namespace=namespace)
     if reason:
         return reason
 

@@ -44,7 +44,7 @@ shows what AIAC writes for `github-agent` and `github-tool`.
 
 ```
 Inbound:   caller ─► parsers ─► jwt-validation ─► opa ─► app
-Outbound:  app ─► parsers ─► discovery-exchange ─► opa ─► destination
+Outbound:  app ─► parsers ─► token-exchange-aiac ─► opa ─► destination
                                                     │
                     bundle-service ◄────────────────┘  (polls its bundle)
 ```
@@ -54,11 +54,11 @@ Outbound:  app ─► parsers ─► discovery-exchange ─► opa ─► destin
   matches that protocol.
 - Inbound, `opa` runs after `jwt-validation`, so `input.identity` comes from the
   validated JWT.
-- Outbound, token exchange is **on by default**. `discovery-exchange` needs no
+- Outbound, token exchange is **on by default**. `token-exchange-aiac` needs no
   routes: it derives the target audience from the destination host and lets
   Keycloak decide whether the destination is a target
   (see [Outbound token exchange](#outbound-token-exchange)).
-- Outbound, `opa` runs after `discovery-exchange`, so policies can read the
+- Outbound, `opa` runs after `token-exchange-aiac`, so policies can read the
   delegation chain and a synthesized `input.identity`
   (see [What OPA sees](#what-opa-sees-on-each-leg)).
 - Every sidecar polls its bundle from
@@ -118,10 +118,10 @@ kubectl get authorizationpolicy github-tool -n team1 \
     module root is elsewhere. An untracked `authbridge/` directory left over in
     an older clone is stale and can be ignored. Restore does not need this
     clone.
-    The checkout must contain the `discovery-exchange` plugin
-    (`core/plugins/discoveryexchange/`, including its delegation-hop
+    The checkout must contain the `token-exchange-aiac` plugin
+    (`core/plugins/tokenexchangeaiac/`, including its delegation-hop
     recording). Until it is merged to `main`, check out the
-    `feat/discovery-exchange` branch. An older checkout fails at sidecar start
+    `feat/token-exchange-aiac` branch. An older checkout fails at sidecar start
     with an unknown-plugin error.
 
   These paths are resolved against **your current directory**, not the script.
@@ -186,7 +186,7 @@ Expect two image builds, so allow a few minutes. The script runs six steps:
    `on_error: enforce`. Check #2 does not check the outbound leg. The overlay
    keeps `opa` there for the pass-through outbound package (D24) and the
    changed combiner (D20). `charts/rossoctl/values.yaml` is never modified.
-   The outbound `discovery-exchange` entry is configured with
+   The outbound `token-exchange-aiac` entry is configured with
    `audience_template: spiffe://$TRUST_DOMAIN/ns/{namespace}/sa/{service}`
    (`TRUST_DOMAIN`, default `localtest.me`), `namespace: $AGENT_NAMESPACE` for
    short host names, and `no_token_policy: client-credentials`.
@@ -224,9 +224,9 @@ It runs these checks. Each one can also be run by hand:
 # 1. OPA is in both legs of the namespace pipeline — expect 2
 kubectl get configmap authbridge-runtime-config -n team1 \
   -o jsonpath='{.data.config\.yaml}' | grep -c 'name: opa'
-# 1b. Outbound exchange is discovery-exchange — expect 1, then 0
+# 1b. Outbound exchange is token-exchange-aiac — expect 1, then 0
 kubectl get configmap authbridge-runtime-config -n team1 \
-  -o jsonpath='{.data.config\.yaml}' | grep -c 'name: discovery-exchange'
+  -o jsonpath='{.data.config\.yaml}' | grep -c 'name: token-exchange-aiac'
 kubectl get configmap authbridge-runtime-config -n team1 \
   -o jsonpath='{.data.config\.yaml}' | grep -c 'name: token-exchange'
 
@@ -445,7 +445,7 @@ kubectl logs -n <ns> <pod> -c authbridge-proxy --tail=500 \
 - Credential headers (`authorization`, `cookie`, …) are **redacted** from
   `headers`. Use `identity` for auth decisions.
 
-**Outbound** — there is no validated JWT on this leg. When `discovery-exchange`
+**Outbound** — there is no validated JWT on this leg. When `token-exchange-aiac`
 mints the downstream token, it records a delegation hop, and OPA builds
 `input.identity` **in the same shape as inbound**:
 
@@ -470,7 +470,7 @@ mints the downstream token, it records a delegation hop, and OPA builds
         "subject_id": "<delegating user>",
         "audience": "spiffe://<td>/ns/<ns>/sa/<destination>",
         "scopes": ["openid", "<exchanged scopes>"],
-        "strategy": "discovery-exchange",
+        "strategy": "token-exchange-aiac",
         "from_cache": false,
         "timestamp": "..."
       }
@@ -502,7 +502,7 @@ mints the downstream token, it records a delegation hop, and OPA builds
 
 ### Outbound token exchange
 
-`discovery-exchange` runs on every outbound request and has no routes and no
+`token-exchange-aiac` runs on every outbound request and has no routes and no
 `authproxy-routes` ConfigMap. Adding a target is a Keycloak change only, with no
 restart. Exchange is the default; passthrough happens in exactly two cases:
 
@@ -512,6 +512,7 @@ restart. Exchange is the default; passthrough happens in exactly two cases:
 | In-cluster, audience granted to the caller | `Authorization` replaced with a token narrowed to that audience | `modify / token_exchanged` (or `cache_hit`) |
 | In-cluster, Keycloak has **no client** for the derived audience | forwarded unchanged; remembered for 5 min | `skip / audience_unknown` |
 | In-cluster, client exists but is **not granted** to the caller | **403**, OPA not consulted | `deny / audience_not_granted` |
+| In-cluster, the destination's client is **disabled** (for example a quarantined service) | **403**, OPA not consulted | `deny / target_disabled` |
 | Keycloak down, timeout, bad credentials, any other error | **503**, OPA not consulted | `deny / exchange_failed` |
 | Sidecar credentials not yet in `/shared/` | **503** (pod held not-ready) | `deny / credentials_not_ready` |
 
@@ -543,7 +544,7 @@ one pipeline for every agent namespace, and the sidecar has no
 therefore call its targets by `service.namespace.svc` name. Otherwise its short
 names derive the wrong namespace and pass through.
 
-The full plugin reference is cortex `docs/discovery-exchange-plugin.md`.
+The full plugin reference is cortex `docs/token-exchange-aiac-plugin.md`.
 
 ### Reading a decision
 
@@ -552,8 +553,8 @@ The full plugin reference is cortex `docs/discovery-exchange-plugin.md`.
 | HTTP `403`, body `{"error":"policy.forbidden","plugin":"opa",...}` | OPA denied a plain HTTP or A2A request, or an inbound OPA denied an MCP request. A tool call that the tool's inbound OPA denies comes back this way: the tool's reverse proxy sends the `403`, and the agent's forward proxy relays it. |
 | HTTP `200`, JSON-RPC `error` frame with `error.code: -32000`, `error.data.plugin: "opa"` | An **outbound** OPA denied an **MCP** request (one with a `method` and an `id`). In an AIAC setup, the outbound package of a managed service is a pass-through (D24), so this is a call from a pod that has no client CR (D20). The forward proxy returns the deny as a JSON-RPC error, so the MCP client sees one failed call instead of a broken transport (`writeMCPRejection` in cortex `core/listener/httpx/render.go`). The request never reaches the destination. |
 | HTTP `200`, JSON-RPC `result` frame | Allowed. |
-| HTTP `403` (outbound), or an MCP error frame, with `plugin: "discovery-exchange"` | Keycloak has a client for the destination, but it is not granted to the caller as a default scope (`audience_not_granted`). OPA was never consulted. |
-| HTTP `503` (outbound), `error: "upstream.token-exchange-failed"` | `discovery-exchange` could not get a token (Keycloak error, timeout, credentials not loaded). OPA was never consulted. |
+| HTTP `403` (outbound), or an MCP error frame, with `plugin: "token-exchange-aiac"` | Keycloak has a client for the destination, but it is not granted to the caller as a default scope (`audience_not_granted`), or the destination's client is disabled (`target_disabled`, a quarantined service). OPA was never consulted. |
+| HTTP `503` (outbound), `error: "upstream.token-exchange-failed"` | `token-exchange-aiac` could not get a token (Keycloak error, timeout, credentials not loaded). OPA was never consulted. |
 | Allowed or denied by OPA as if no exchange ran, with no `identity` in the decision log | The destination passed through (`audience_unknown` / `host_not_in_cluster`). Check the Service/ServiceAccount naming and the Keycloak client. |
 
 For MCP traffic, classify by the response **body**, not the status code: a

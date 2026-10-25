@@ -33,7 +33,7 @@
 #   2. github-tool-secrets Secret (GitHub token used by the tool)
 #   3. authbridge-config ConfigMap (apply configmaps.yaml first)
 #
-# Token exchange (discovery-exchange, no routes): the audience is derived from
+# Token exchange (token-exchange-aiac, no routes): the audience is derived from
 # the MCP_URL host as spiffe://<td>/ns/<ns>/sa/<host>, so the tool's Service
 # name must equal its ServiceAccount (its Keycloak client) and the tool's
 # audience scope must be a DEFAULT client scope of github-agent. The default

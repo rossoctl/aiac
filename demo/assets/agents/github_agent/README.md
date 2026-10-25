@@ -79,11 +79,11 @@ See [`../../INSTALL.md`](../../INSTALL.md) — the single install guide for this
 A2A client ──(JSON-RPC /)──► github-agent (:8000)
                                  │  CrewAI: prereq extract → researcher
                                  └──(streamable-http, MCP_URL)──► github-tool-mcp:9090/mcp ──► GitHub
-      (AuthBridge sidecar: inbound JWT validation; outbound RFC-8693 token exchange via discovery-exchange,
+      (AuthBridge sidecar: inbound JWT validation; outbound RFC-8693 token exchange via token-exchange-aiac,
        audience derived from the MCP_URL host as spiffe://<trust-domain>/ns/<ns>/sa/<host>)
 ```
 
-`discovery-exchange` needs no route: it exchanges only when the agent's Keycloak client has the
+`token-exchange-aiac` needs no route: it exchanges only when the agent's Keycloak client has the
 target's audience as a **default** client scope (not granted → 403), and passes through unchanged when
 no Keycloak client matches the derived audience. The host `github-tool-mcp` derives an audience only
 if the tool's ServiceAccount (and so its client) is also named `github-tool-mcp`; the UC-1 stand-in

@@ -73,9 +73,11 @@ are real transitions, not an empty start.
 **Outbound "blocked".** After the quarantine github-tool has no CR. The combiner denies the call on
 github-tool's inbound (D20; an HTTP 403 with an OPA body, relayed by the agent's pass-through
 outbound). The tool's client is also disabled, so Keycloak may instead refuse the token exchange to
-its audience before OPA is consulted (a ``discovery-exchange`` error frame, ``uc1.is_exchange_refusal``). All of these mean the call
-never reaches the tool, so all count as blocked; the OPA-side proof is the CR assertion. Any other
-outcome (``allow``, a transport error) fails.
+its audience before OPA is consulted: ``token-exchange-aiac`` answers a disabled target with
+``policy.forbidden`` (``target_disabled``), as an error frame or a plain 403 body (``uc1.exchange_refusal``). All of these mean the call never reaches the tool, so all
+count as blocked; the OPA-side proof is the CR assertion. Any other outcome fails: ``allow``, a transport
+error, and a failed exchange (``upstream.token-exchange-failed``, an IdP error or outage), which proves
+nothing about the quarantine.
 
 Run (a live rossoctl/Kind cluster with the AIAC stack + AuthBridge OPA pipeline wired in — see
 ``k8s/opa-kind-runbook.md`` / ``k8s/opa-kind-enable.sh`` — the event path wired (NATS broker +
@@ -202,21 +204,13 @@ def _prefixed(admin, prefix: str) -> dict[str, list[str]]:
 
 def _outbound_block(ctx: dict, user: str, tool_bare: str) -> tuple[str, int | None, str]:
     """One live outbound ``tools/call``; classify it as ``"deny"`` (an OPA verdict: github-tool's
-    inbound 403), ``"refused"`` (an exchange error frame or reject body — Keycloak refused the exchange
-    before OPA, see the module docstring), ``"allow"``, or ``"error"``. Returns ``(class, http_code, body)``."""
+    inbound 403), ``"refused"`` (Keycloak refused the exchange to the disabled tool's audience before
+    OPA, ``uc1.exchange_refusal``; see the module docstring), ``"allow"``, or ``"error"``. A failed
+    exchange (an IdP error or outage) stays ``"error"``. Returns ``(class, http_code, body)``."""
     code, body = uc1.outbound_raw(ctx, user, tool_bare)
     decision = uc1.outbound_outcome(code, body)
-    if decision == "error":
-        # Either shape of a refusal: an error frame (HTTP 200) or a plain reject body (403 / 503).
-        try:
-            doc = json.loads(body)
-        except (ValueError, TypeError):
-            doc = None
-        if isinstance(doc, dict):
-            err = doc.get("error")
-            data = err.get("data") if isinstance(err, dict) else None
-            if uc1.is_exchange_refusal(data) or uc1.is_exchange_refusal(doc):
-                return "refused", code, body
+    if decision == "error" and uc1.exchange_refusal(code, body):
+        return "refused", code, body
     return decision, code, body
 
 

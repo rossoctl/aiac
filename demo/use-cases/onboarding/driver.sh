@@ -14,7 +14,7 @@
 #                         consumed both over NATS, and the two AuthorizationPolicy CRs AIAC wrote
 #                         (one per managed service, D20: github-agent AND github-tool).
 #   Phase WIRE            wire AuthBridge's own outbound leg (the github-tool audience as a DEFAULT
-#                         client-scope of github-agent; discovery-exchange needs no route) — demo-owned wiring the platform runbook
+#                         client-scope of github-agent; token-exchange-aiac needs no route) — demo-owned wiring the platform runbook
 #                         (k8s/opa-kind-runbook.md) leaves out; AIAC's own onboarding does not do this.
 #   Phase ENFORCE         real HTTP probes through the live AuthBridge OPA plugin, reproducing
 #                         #646's acceptance table.
@@ -568,13 +568,11 @@ phase_wire_outbound() {
   SCOPE_ID="$(scope_id_by_name "$tool_aud" "$ADMIN")"
   [ -n "$SCOPE_ID" ] || die "client-scope '${tool_aud}' not found — has github-tool onboarded yet?"
   # Keycloak silently skips a default link of a scope already linked as optional (an earlier run of
-  # this driver granted it as optional), so drop any optional link first (404 = none, fine).
+  # this driver granted it as optional), so drop any optional link first. Keycloak answers 204 also
+  # when the scope is not linked; SCOPE_ID was just read, so any other answer is a failure.
   DEL_HTTP=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE -H "Authorization: Bearer ${ADMIN}" \
     "${KC}/admin/realms/${REALM}/clients/${AGENT_UUID}/optional-client-scopes/${SCOPE_ID}")
-  case "$DEL_HTTP" in
-    204|404) ;;
-    *) die "removing the optional client-scope link returned HTTP ${DEL_HTTP} (expected 204 or 404)" ;;
-  esac
+  [ "$DEL_HTTP" = 204 ] || die "removing the optional client-scope link returned HTTP ${DEL_HTTP} (expected 204)"
   SCOPE_HTTP=$(curl -s -o /dev/null -w "%{http_code}" -X PUT -H "Authorization: Bearer ${ADMIN}" \
     "${KC}/admin/realms/${REALM}/clients/${AGENT_UUID}/default-client-scopes/${SCOPE_ID}")
   case "$SCOPE_HTTP" in
@@ -583,7 +581,7 @@ phase_wire_outbound() {
     *) die "assigning the default client-scope returned HTTP ${SCOPE_HTTP} (expected 204)" ;;
   esac
 
-  # discovery-exchange (k8s/opa-kind-enable.sh) derives the github-tool audience from the host —
+  # token-exchange-aiac (k8s/opa-kind-enable.sh) derives the github-tool audience from the host —
   # no route. It requests no scope, so the grant must be a DEFAULT scope. The restart clears the
   # audience it may have cached as unknown before github-tool's client existed (5 min).
   step "Restarting github-agent to clear its exchange caches"

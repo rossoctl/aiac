@@ -6,7 +6,7 @@
 # - authbridge-config: Keycloak connection, inbound validation, and outbound exchange settings
 #
 # The outbound exchange plugin wired by k8s/opa-kind-enable.sh is
-# discovery-exchange, which has no routes: it derives the audience from the
+# token-exchange-aiac, which has no routes: it derives the audience from the
 # destination host (spiffe://<td>/ns/<ns>/sa/<service>) and exchanges for every
 # in-cluster host Keycloak has a client for. Hosts outside the cluster (LLM
 # APIs, telemetry, etc.) and hosts with no matching client pass through. So

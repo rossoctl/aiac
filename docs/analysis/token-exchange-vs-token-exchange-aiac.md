@@ -1,13 +1,13 @@
-# `token-exchange` vs `discovery-exchange`
+# `token-exchange` vs `token-exchange-aiac`
 
 AuthBridge's outbound leg (`app → parsers → <exchange plugin> → opa → destination`) now uses
-`discovery-exchange` in place of `token-exchange`. `k8s/opa-kind-enable.sh` wires it.
-`k8s/opa-kind-verify.sh` checks that the outbound leg has exactly one `discovery-exchange` and no
+`token-exchange-aiac` in place of `token-exchange`. `k8s/opa-kind-enable.sh` wires it.
+`k8s/opa-kind-verify.sh` checks that the outbound leg has exactly one `token-exchange-aiac` and no
 `token-exchange`.
 
 ## The core difference
 
-| | `token-exchange` (before) | `discovery-exchange` (now) |
+| | `token-exchange` (before) | `token-exchange-aiac` (now) |
 |---|---|---|
 | Which hosts get exchanged | Only hosts listed in the `authproxy-routes` ConfigMap. Every other host passes through. | Every in-cluster host. Keycloak decides whether the host is a target. |
 | How the audience is chosen | The route's `target_audience` | Derived from the Host header: `spiffe://<TRUST_DOMAIN>/ns/<namespace>/sa/<service>` |
@@ -20,12 +20,12 @@ AuthBridge's outbound leg (`app → parsers → <exchange plugin> → opa → de
 
 ## Cases where behaviour changed
 
-| Case | Before (`token-exchange`) | Now (`discovery-exchange`) |
+| Case | Before (`token-exchange`) | Now (`token-exchange-aiac`) |
 |---|---|---|
 | In-cluster host with no route | Passed through, no `identity` or `delegation` | Exchanged if Keycloak grants the derived audience to the caller |
 | Host outside the cluster (LLM API, telemetry, IP literal) | Passed through (no route) | Passed through, Keycloak is not asked (`skip / host_not_in_cluster`) |
 | Keycloak has **no client** for the destination | Passed through when there was no route. With a route, the exchange failed (503). | Passed through and remembered for 5 min (`skip / audience_unknown`) |
-| Client exists but is **not granted** to the caller | Passed through when there was no route. With a route, 503. | **403**, `plugin: "discovery-exchange"`, `policy.forbidden`. OPA is not consulted. |
+| Client exists but is **not granted** to the caller | Passed through when there was no route. With a route, 503. | **403**, `plugin: "token-exchange-aiac"`, `policy.forbidden`. OPA is not consulted. |
 | Keycloak down, timeout, or bad credentials | 503 `upstream.token-exchange-failed` | 503 `upstream.token-exchange-failed` (`deny / exchange_failed`). Unchanged. |
 | Sidecar credentials not yet in `/shared/` | Not covered by the old docs | 503, and the pod is held not-ready (`credentials_not_ready`) |
 | Request with **no** bearer | Chart default (no `no_token_policy` was set). Under `client-credentials`, the `client_credentials` token itself is sent. | AIAC sets `client-credentials`: exchanged with the workload's own `client_credentials` token as the subject. It is never sent un-narrowed. Unset, the default `deny` answers 401 `auth.unauthorized` (`token-exchange` sends `upstream.token-exchange-failed` for the same 401). |
@@ -35,7 +35,7 @@ AuthBridge's outbound leg (`app → parsers → <exchange plugin> → opa → de
 | Short host name in a namespace other than `AGENT_NAMESPACE` | Not applicable (the route named the audience) | Wrong namespace is derived, so the call passes through. Use `service.namespace.svc`. |
 | Outbound `input.identity.subject` | Best-effort decode of the incoming bearer's `sub`, unverified, so the workload can choose it | `sub` of the token Keycloak issued: the user, or `service-account-<clientId>` when there was no bearer |
 | Outbound `input.identity.scopes` | Scopes of the minted token, per target | The issued token's `scope` claim. It lists **all** of the caller's default scopes, so don't treat it as per-target. |
-| `input.delegation` hop `strategy` | `"token-exchange"` | `"discovery-exchange"` |
+| `input.delegation` hop `strategy` | `"token-exchange"` | `"token-exchange-aiac"` |
 
 ## What changed in this repo
 
@@ -51,7 +51,7 @@ AuthBridge's outbound leg (`app → parsers → <exchange plugin> → opa → de
 - **Outcome classification** (`test/system/launcher.py`):
   - `is_exchange_refusal` accepts either plugin name, or `upstream.token-exchange-failed`, and
     classifies that as `error`.
-  - `is_opa_deny` counts only `plugin == "opa"`, because `discovery-exchange` also answers
+  - `is_opa_deny` counts only `plugin == "opa"`, because `token-exchange-aiac` also answers
     `policy.forbidden`.
 - **Docs**: the PRD, the OPA writer spec, the demo specs, the runbook (new *Outbound token exchange*
   section) and the testing docs now describe the route-less model.
