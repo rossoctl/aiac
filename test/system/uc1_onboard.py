@@ -1217,6 +1217,10 @@ def grant_exchange_scope(admin) -> None:
             "deployed + registered by the operator?"
         )
     try:
+        # Keycloak silently skips a default link of a scope already linked as optional (the old
+        # optional grant of this harness), so move an optional link to default first.
+        if any(s.get("id") == scope["id"] for s in admin.get_client_optional_client_scopes(client_uuid)):
+            admin.delete_client_optional_client_scope(client_uuid, scope["id"])
         admin.add_client_default_client_scope(client_uuid, scope["id"], {})
     except KeycloakError as exc:
         log.info("grant_exchange_scope: assign %r returned (benign if already assigned): %s", aud_scope, exc)
@@ -1881,7 +1885,7 @@ def outbound_raw(ctx: dict, user: str, tool_bare: str) -> tuple[int | None, str]
 def outbound_decision(ctx: dict, user: str, tool_bare: str) -> str:
     """Drive one outbound ``tools/call`` (``outbound_raw``) and return the real plugin's classified
     decision (``outbound_outcome``): ``"deny"`` for an OPA verdict (github-tool's inbound 403);
-    ``"allow"`` for a non-OPA 200; ``"error"`` for a token-exchange refusal, a 503 or a transport
+    ``"allow"`` for a non-OPA 200; ``"error"`` for an exchange refusal, a 503 or a transport
     failure."""
     return outbound_outcome(*outbound_raw(ctx, user, tool_bare))
 
@@ -1971,7 +1975,7 @@ def _default_ready_signals(tool_onboarded: bool) -> list[ReadySignal]:
 
     **Outbound signals exist only when a tool is onboarded.** The agent-only rung (rung 1) has no tool
     to gate, so there is no real ``agent -> tool`` call and its outbound leg is neither prepared (Part B
-    is skipped) nor probed nor asserted — on a tool-less rung token-exchange short-circuits before OPA
+    is skipped) nor probed nor asserted — on a tool-less rung discovery-exchange settles the call before OPA
     (no ``github-tool`` audience grant), so an outbound "deny" there would be a Keycloak audience
     refusal, not an OPA verdict. Rung 1's empty tool check is instead asserted at the unit level
     (grant-set oracle) and by ``test_no_tool_scopes_provisioned``. So the tool-less signal set is
@@ -3179,7 +3183,7 @@ def mcp_session_frames(tool_bare: str) -> list[dict]:
 
 def mcp_session_decisions(ctx: dict, user: str, tool_bare: str) -> dict[str, tuple[str, int | None, str]]:
     """Mint a fresh ``user`` token, send one MCP session (``mcp_session_frames``) through the agent's
-    outbound (token-exchange, then the tool check in github-tool's inbound OPA), and return
+    outbound (discovery-exchange, then the tool check in github-tool's inbound OPA), and return
     ``{method: (decision, http_code, body)}``. A request frame is classified by its body
     (``outbound_outcome``: a ``result`` frame = allow, an OPA 403 or OPA error frame = deny); the
     notification by its status (``notification_outcome``: 202 = allow, 403 = deny)."""

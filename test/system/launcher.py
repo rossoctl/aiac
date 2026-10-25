@@ -592,7 +592,7 @@ def outbound_probe(
     e.g. ``source-read``) instead of ``tools/list``, so AuthBridge's ``mcp-parser`` surfaces
     ``input.mcp.params.name`` and OPA's per-tool check in github-tool's inbound is actually exercised
     (the agent's outbound is a pass-through, PRD D24). The agent app container has
-    ``HTTP_PROXY=127.0.0.1:8081`` (the forward proxy) and ``python3``; ``token-exchange`` uses the
+    ``HTTP_PROXY=127.0.0.1:8081`` (the forward proxy) and ``python3``; ``discovery-exchange`` uses the
     carried ``dev-user`` bearer as the RFC 8693 subject token. It is a one-frame
     :func:`outbound_session_probe`. Any exec failure returns ``(None, <message>)`` -> ``"error"``."""
     frame = {"jsonrpc": "2.0", "id": "1", "method": "tools/call", "params": {"name": tool_name, "arguments": {}}}
@@ -621,7 +621,7 @@ def outbound_session_probe(
     ``notifications/initialized``, ``tools/list``, ``tools/call`` …) through AuthBridge's forward proxy,
     in order, from one ``kubectl exec`` into the agent pod; return one ``(http_code, body)`` per frame.
 
-    The forward proxy is ``127.0.0.1:8081``, the user bearer is the token-exchange subject token, and
+    The forward proxy is ``127.0.0.1:8081``, the user bearer is the ``discovery-exchange`` subject token, and
     the request carries the MCP ``Accept`` header. The frames are sent as given, so a method that
     carries no tool name reaches the MCP session rule of the tool check in github-tool's inbound (the
     agent's outbound is a pass-through, PRD D24); :func:`outbound_probe` sends one ``tools/call``
@@ -729,7 +729,9 @@ EXCHANGE_FAILED_ERROR = "upstream.token-exchange-failed"
 def is_exchange_refusal(doc: object) -> bool:
     """True when ``doc`` (a parsed rejection body, or the ``error.data`` of a JSON-RPC error frame) is
     a refusal of the outbound token exchange — the request never reached OPA."""
-    return isinstance(doc, dict) and (doc.get("plugin") in EXCHANGE_PLUGINS or doc.get("error") == EXCHANGE_FAILED_ERROR)
+    return isinstance(doc, dict) and (
+        doc.get("plugin") in EXCHANGE_PLUGINS or doc.get("error") == EXCHANGE_FAILED_ERROR
+    )
 
 
 def _json_or_none(body: str) -> object:
@@ -773,15 +775,15 @@ def outbound_outcome(code: int | None, body: str) -> str:
         tool-onboarded rung honestly instead of masking it as ``"allow"`` (its old fall-through) or
         mislabelling it ``"deny"``, and (b) keeps the classifier from ever standing in for OPA. The
         agent-only rung (rung 1) does not probe outbound at all — with no tool there is no real
-        ``agent -> tool`` call and token-exchange would short-circuit here anyway — so this frame is
+        ``agent -> tool`` call and the exchange would settle it before OPA anyway — so this frame is
         not an expected verdict on any rung; it always signals a fault worth surfacing.
 
     So: a plain ``403`` whose body names OPA (the callee's inbound; or the agent's own
     non-MCP-shaped rejection fallback) -> ``"deny"``; any other ``403`` -> ``"error"``; HTTP 200 with an
-    OPA error frame -> ``"deny"``; HTTP 200 with a token-exchange error frame -> ``"error"``; HTTP 200
+    OPA error frame -> ``"deny"``; HTTP 200 with an exchange error frame -> ``"error"``; HTTP 200
     with any other body (a ``result`` frame, or a tool-level error that means the call was *allowed*
     through) -> ``"allow"``; ``None`` or any other status (a transport break, a 401 from the callee's
-    ``jwt-validation``, a 503 before the first bundle loads, or a non-MCP token-exchange ``503``) ->
+    ``jwt-validation``, a 503 before the first bundle loads, or a non-MCP exchange ``503``) ->
     ``"error"``. Classify by the body, never the transport status alone."""
     if code is None:
         return "error"
@@ -798,7 +800,7 @@ def outbound_outcome(code: int | None, body: str) -> str:
             # OPA). Honest class is "error", never "deny" — it must not stand in for an OPA verdict.
             if is_exchange_refusal(data):
                 return "error"
-            # A real OPA verdict — token-exchange succeeded and the request reached the policy.
+            # A real OPA verdict — the exchange succeeded and the request reached the policy.
             if is_opa_violation(data):
                 return "deny"
     return "allow"
@@ -822,7 +824,7 @@ def deny_origin(code: int | None, body: str) -> str | None:
       * HTTP 200 with a JSON-RPC error frame whose ``error.data`` names OPA ->
         ``DENY_ORIGIN_AGENT_OUTBOUND``: the agent's forward proxy rejected the MCP-shaped request
         (``httpx.WriteRejectionForRequest``); a fault, because the agent's outbound is a pass-through.
-      * Anything else (an allow, a token-exchange refusal, a transport error) -> ``None``.
+      * Anything else (an allow, an exchange refusal, a transport error) -> ``None``.
 
     Only a request frame (``tools/call`` with an ``id``) has two distinct shapes. A notification gets a
     plain 403 from either proxy, so this helper does not apply to it."""
@@ -918,7 +920,7 @@ def pipeline_unwired_reason(*, namespace: str, workloads: list[str]) -> str | No
     human-readable reason the suite should skip. Checks (cheap -> specific): ``kubectl`` present, the
     ``AuthorizationPolicy`` CRD served, ``bundle-service`` Running, the global combiner changed (D20,
     ``combiner_reason``), the ``opa`` plugin on **both** legs of ``namespace``'s AuthBridge runtime
-    config, and each ``workloads`` pod Running."""
+    config, ``discovery-exchange`` on its outbound leg, and each ``workloads`` pod Running."""
     if shutil.which("kubectl") is None:
         return "kubectl not on PATH"
 
@@ -967,6 +969,9 @@ def pipeline_unwired_reason(*, namespace: str, workloads: list[str]) -> str | No
     wired = out.count("name: opa")
     if wired < 2:
         return f"OPA plugin not wired into both legs in {namespace} (found {wired} of 2) — run k8s/opa-kind-enable.sh"
+    # The harness adds no outbound route: only discovery-exchange exchanges the agent's call to the tool.
+    if "name: discovery-exchange" not in out:
+        return f"outbound discovery-exchange not wired in {namespace} (an older pipeline) — run k8s/opa-kind-enable.sh"
 
     for workload in workloads:
         ok, out, err = _kubectl_try(

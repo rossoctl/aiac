@@ -5,8 +5,8 @@ OPA. ``discovery-exchange`` answers a target not granted to the caller with ``po
 same error code OPA uses, so the classifier must go by the named ``plugin`` and never report that
 refusal as an OPA ``deny`` (a false pass for a deny expectation).
 
-They import the system harness like ``test_uc1_subject_scope.py`` does: it does no cluster I/O at
-import time.
+The module under test is test infra (``test/system/launcher.py``), so the file sits at the
+``test/unit/`` root, like ``test_launcher_combiner.py``. The harness does no cluster I/O at import time.
 """
 
 from __future__ import annotations
@@ -17,9 +17,9 @@ from pathlib import Path
 
 import pytest
 
-HERE = Path(__file__).resolve().parent  # test/unit/agent/uc/onboarding/
-REPO_ROOT = HERE.parents[4]  # -> aiac/
-sys.path.insert(0, str(REPO_ROOT))  # so ``import test.system.*`` resolves
+REPO_ROOT = Path(__file__).resolve().parents[2]  # -> aiac/
+if str(REPO_ROOT) not in sys.path:  # so ``import test.system.*`` resolves
+    sys.path.insert(0, str(REPO_ROOT))
 
 from test.system import launcher  # noqa: E402
 
@@ -78,9 +78,7 @@ def test_is_exchange_refusal(doc: object, expected: bool) -> None:
         (200, json.dumps({"jsonrpc": "2.0", "id": 1, "result": {}}), "allow"),
     ],
 )
-def test_outbound_outcome_never_reports_an_exchange_refusal_as_an_opa_deny(
-    code: int, body: str, expected: str
-) -> None:
+def test_outbound_outcome_never_reports_an_exchange_refusal_as_an_opa_deny(code: int, body: str, expected: str) -> None:
     assert launcher.outbound_outcome(code, body) == expected
 
 

@@ -179,8 +179,10 @@ cleanly** when any of it is absent (they never stand it up, and never false-pass
 
 - **Pipeline wired.** The AuthBridge OPA plugin is wired into both legs (`k8s/opa-kind-enable.sh`);
   `require_pipeline` skips cleanly if not (no `kubectl`, `AuthorizationPolicy` CRD not served,
-  `bundle-service` not Running, the `opa` plugin not present on both legs, or the global combiner
-  still allows a pod that has no client CR — see the next item).
+  `bundle-service` not Running, the `opa` plugin not present on both legs, no `discovery-exchange`
+  on the outbound leg (the harness adds no route, so an older `token-exchange` pipeline would send the
+  tool call unexchanged), or the global combiner still allows a pod that has no client CR — see the
+  next item).
 - **The changed global combiner (D20).** `k8s/opa-kind-enable.sh` applies a changed `default`
   `AuthorizationPolicy` CR in `rossoctl-system`. Its two request packages have no
   `client_ok if not data.authbridge.client.inbound.request` /

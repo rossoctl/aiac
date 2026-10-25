@@ -73,7 +73,7 @@ are real transitions, not an empty start.
 **Outbound "blocked".** After the quarantine github-tool has no CR. The combiner denies the call on
 github-tool's inbound (D20; an HTTP 403 with an OPA body, relayed by the agent's pass-through
 outbound). The tool's client is also disabled, so Keycloak may instead refuse the token exchange to
-its audience before OPA is consulted (a ``token-exchange`` error frame). All of these mean the call
+its audience before OPA is consulted (a ``discovery-exchange`` error frame, ``uc1.is_exchange_refusal``). All of these mean the call
 never reaches the tool, so all count as blocked; the OPA-side proof is the CR assertion. Any other
 outcome (``allow``, a transport error) fails.
 
@@ -203,7 +203,7 @@ def _prefixed(admin, prefix: str) -> dict[str, list[str]]:
 def _outbound_block(ctx: dict, user: str, tool_bare: str) -> tuple[str, int | None, str]:
     """One live outbound ``tools/call``; classify it as ``"deny"`` (an OPA verdict: github-tool's
     inbound 403), ``"refused"``
-    (a token-exchange error frame — Keycloak refused the exchange before OPA, see the module
+    (an exchange error frame — Keycloak refused the exchange before OPA, see the module
     docstring), ``"allow"``, or ``"error"``. Returns ``(class, http_code, body)``."""
     code, body = uc1.outbound_raw(ctx, user, tool_bare)
     decision = uc1.outbound_outcome(code, body)
@@ -519,7 +519,7 @@ def test_failed_tool_leaves_the_agent_cr_unchanged(run: dict) -> None:
 
 def test_failed_tool_outbound_call_denied(run: dict) -> None:
     """The ``dev-user`` call to the tool that phase 3 allowed is now blocked — an OPA deny (github-tool
-    has no CR, so the combiner denies on its inbound, D20), or a token-exchange refusal to the disabled
+    has no CR, so the combiner denies on its inbound, D20), or an exchange refusal to the disabled
     tool's audience (module docstring); never ``allow``, never a transport error."""
     decision, code, body = _failed(run, "tool_failed")["outbound"]
     assert decision in ("deny", "refused"), (
