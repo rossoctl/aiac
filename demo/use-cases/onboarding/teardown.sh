@@ -241,6 +241,12 @@ step "Deleting the demo's team1 ConfigMap (authbridge-config)"
 # authproxy-routes (token-exchange-aiac needs no routes), so a platform-seeded one is left alone.
 run kubectl delete -f "$ASSETS_DIR/agents/github_agent/k8s/configmaps.yaml" -n "$NS" --ignore-not-found
 pass "demo ConfigMap gone from ${NS} (the namespace itself is untouched)"
+# An older demo shipped authproxy-routes with a github-tool-mcp route. It carries no owner label, so it
+# cannot be told from a platform-seeded one: report it, never delete it.
+if kubectl get configmap authproxy-routes -n "$NS" -o jsonpath='{.data.routes\.yaml}' 2>/dev/null \
+     | grep -q 'host: "github-tool-mcp"'; then
+  warn "configmap ${NS}/authproxy-routes still has the github-tool-mcp route of an older demo; delete it if your platform did not seed it (token-exchange-aiac reads no routes)"
+fi
 fi
 
 # ── 3. The whole aiac-system namespace ────────────────────────────────────────

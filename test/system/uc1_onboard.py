@@ -3191,13 +3191,13 @@ def mcp_session_decisions(ctx: dict, user: str, tool_bare: str) -> dict[str, tup
     outbound (token-exchange-aiac, then the tool check in github-tool's inbound OPA), and return
     ``{method: (decision, http_code, body)}``. A request frame is classified by its body
     (``outbound_outcome``: a ``result`` frame = allow, an OPA 403 or OPA error frame = deny); the
-    notification by its status (``notification_outcome``: 202 = allow, 403 = deny)."""
+    notification by its status and body (``notification_outcome``: 202 = allow, an OPA 403 = deny)."""
     token = mint_token(user, scn.USER_PASSWORD, keycloak_url=ctx["keycloak_url"], realm=ctx["realm"])
     frames = mcp_session_frames(tool_bare)
     raw = outbound_session_probe(token, frames, namespace=ctx["namespace"], agent_pod=resolve_agent_pod())
     return {
         frame["method"]: (
-            (outbound_outcome(code, body) if "id" in frame else notification_outcome(code)),
+            (outbound_outcome(code, body) if "id" in frame else notification_outcome(code, body)),
             code,
             body,
         )

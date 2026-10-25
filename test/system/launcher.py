@@ -683,15 +683,16 @@ def outbound_session_probe(
     ]
 
 
-def notification_outcome(code: int | None) -> str:
+def notification_outcome(code: int | None, body: str = "") -> str:
     """Classify the response to a JSON-RPC **notification** (a frame with no ``id``, e.g.
     ``notifications/initialized``) sent through the outbound proxy. A notification has no JSON-RPC
     reply to carry an error frame, so AuthBridge renders a rejection as a plain HTTP ``403`` (runbook
-    B.4). HTTP 200/202 (the MCP server accepted it) -> ``"allow"``; 403 -> ``"deny"``; anything else
-    -> ``"error"``."""
+    B.4). HTTP 200/202 (the MCP server accepted it) -> ``"allow"``; a 403 whose body names OPA
+    (``is_opa_violation``) -> ``"deny"``; anything else -> ``"error"``, so an exchange refusal
+    (``token-exchange-aiac``'s 403 ``policy.forbidden``) is never reported as an OPA deny."""
     if code in (200, 202):
         return "allow"
-    if code == 403:
+    if code == 403 and is_opa_violation(_json_or_none(body)):
         return "deny"
     return "error"
 

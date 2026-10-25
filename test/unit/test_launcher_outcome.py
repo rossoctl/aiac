@@ -174,3 +174,20 @@ def test_exchange_plugin_reason_skips_any_other_exchange_wiring(config: str) -> 
 )
 def test_exchange_refusal_is_only_keycloak_not_granting(code: int | None, body: str, expected: bool) -> None:
     assert launcher.exchange_refusal(code, body) is expected
+
+
+@pytest.mark.parametrize(
+    ("code", "body", "expected"),
+    [
+        (202, "", "allow"),
+        (200, "", "allow"),
+        (403, json.dumps(OPA_DENY), "deny"),
+        # An exchange refusal of a notification is not an OPA verdict.
+        (403, json.dumps(NOT_GRANTED), "error"),
+        (403, "", "error"),
+        (503, json.dumps(EXCHANGE_FAILED), "error"),
+        (None, "", "error"),
+    ],
+)
+def test_notification_outcome_counts_only_an_opa_403_as_deny(code: int | None, body: str, expected: str) -> None:
+    assert launcher.notification_outcome(code, body) == expected

@@ -29,6 +29,10 @@ they automate.
 - Namespace **`team1`** already exists — created by the Rossoctl installer, not by
   anything in this repo. Nothing here creates cluster-owned resources.
 - `kubectl`, `kind`, and a container runtime (`docker` or `podman`) on `PATH`.
+- The AuthBridge outbound leg runs `token-exchange-aiac` (`k8s/opa-kind-enable.sh`; check with
+  `k8s/opa-kind-verify.sh`). The demo ships no `authproxy-routes`, so on the stock chart pipeline
+  (`token-exchange` with routes) the agent's calls to the tool go out unexchanged and the tool
+  rejects them.
 
 ## What gets deployed
 
