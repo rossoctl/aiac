@@ -25,7 +25,8 @@
 #   Verify 5   every existing agent and tool pod's authbridge-proxy runs IMAGE_TAG
 #              and is Ready (skipped when the namespace has no such pods)
 #
-# Requires: kubectl (kind, only to re-export a stale kubeconfig).
+# Requires: kubectl, python3 with PyYAML (Verify 1 parses the pipeline with
+# k8s/outbound-exchange-plugins.py); kind, only to re-export a stale kubeconfig.
 # Env vars (runbook defaults shown):
 #   NS             agent namespace                        (default: team1)
 #   SYS_NS         platform namespace                     (default: rossoctl-system)
@@ -42,6 +43,7 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NS="${NS:-team1}"
 SYS_NS="${SYS_NS:-rossoctl-system}"
 TRUST_DOMAIN="${TRUST_DOMAIN:-localtest.me}"
@@ -93,6 +95,7 @@ info "runbook: k8s/opa-kind-runbook.md   agent namespace: ${NS}   platform names
 
 step "Preflight — kubectl and cluster"
 command -v kubectl >/dev/null 2>&1 || die "kubectl not found on PATH"
+python3 -c 'import yaml' >/dev/null 2>&1 || die "python3 with PyYAML not found on PATH (Verify 1 parses the pipeline)"
 # A Kind node container reassigns its API-server host port on restart, which
 # leaves the previously exported kubeconfig pointing at a stale port ("connection
 # refused"). If the cluster is unreachable but the named Kind cluster exists,
@@ -121,11 +124,10 @@ pass "'name: opa' occurrences in authbridge-runtime-config: got '2' (expected '2
 # a leftover token-exchange entry means the pipeline predates the switch.
 PIPELINE_CFG=$(kubectl get configmap authbridge-runtime-config -n "$NS" \
                  -o jsonpath='{.data.config\.yaml}' 2>/dev/null || true)
-# Whole names: the legacy token-exchange is a prefix of token-exchange-aiac.
-DX_COUNT=$(grep -cE 'name: token-exchange-aiac\s*$' <<<"$PIPELINE_CFG" || true)
-TX_COUNT=$(grep -cE 'name: token-exchange\s*$' <<<"$PIPELINE_CFG" || true)
-[ "$DX_COUNT" = "1" ] && [ "$TX_COUNT" = "0" ] \
-  || die "outbound exchange plugins in authbridge-runtime-config: token-exchange-aiac='${DX_COUNT}', token-exchange='${TX_COUNT}', expected '1'/'0' — run k8s/opa-kind-enable.sh"
+# Parsed, outbound leg only: the same rule as the system harness's skip gate.
+EXCHANGE=$(python3 "$SCRIPT_DIR/outbound-exchange-plugins.py" <<<"$PIPELINE_CFG" 2>&1 || true)
+[ "$EXCHANGE" = "token-exchange-aiac=1 token-exchange=0" ] \
+  || die "outbound exchange plugins in authbridge-runtime-config: '${EXCHANGE}', expected 'token-exchange-aiac=1 token-exchange=0' — run k8s/opa-kind-enable.sh"
 pass "outbound exchange plugin: token-exchange-aiac (token-exchange absent)"
 
 # ── Verify 2 — CRD + global policy ───────────────────────────────────────────

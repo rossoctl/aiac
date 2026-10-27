@@ -359,6 +359,13 @@ kubectl get deployment aiac-event-broker -n "$AIAC_NS" >/dev/null 2>&1 \
 OPA_COUNT=$(kubectl get configmap authbridge-runtime-config -n "$NS" \
               -o jsonpath='{.data.config\.yaml}' 2>/dev/null | grep -c 'name: opa' || true)
 [ "$OPA_COUNT" = "2" ] || die "OPA not wired into both AuthBridge legs (got ${OPA_COUNT}, expected 2) — run k8s/opa-kind-enable.sh first"
+# The demo ships no authproxy-routes: only token-exchange-aiac exchanges the agent's call to the tool.
+# On the stock pipeline (token-exchange with routes) ENFORCE would see un-exchanged calls that github-tool
+# rejects, reported as policy failures. Same parsed rule as k8s/opa-kind-verify.sh (Verify 1).
+EXCHANGE=$(kubectl get configmap authbridge-runtime-config -n "$NS" -o jsonpath='{.data.config\.yaml}' 2>/dev/null \
+  | python3 "${SCRIPT_DIR}/../../../k8s/outbound-exchange-plugins.py" 2>&1 || true)
+[ "$EXCHANGE" = "token-exchange-aiac=1 token-exchange=0" ] \
+  || die "the outbound exchange plugin is not token-exchange-aiac (${EXCHANGE}, expected token-exchange-aiac=1 token-exchange=0) — run k8s/opa-kind-enable.sh first"
 # The changed combiner (D20): no request fallback rule, so a pod with no client CR is denied. The AIAC
 # Controller does not start without it (start check #4, D30).
 REQ_FALLBACK=$(kubectl get "$POLICY_CR" default -n "$SYS_NS" -o jsonpath='{.spec.policies[*].content}' 2>/dev/null \
@@ -569,7 +576,9 @@ phase_wire_outbound() {
   [ -n "$SCOPE_ID" ] || die "client-scope '${tool_aud}' not found — has github-tool onboarded yet?"
   # Keycloak silently skips a default link of a scope already linked as optional (an earlier run of
   # this driver granted it as optional), so drop any optional link first. Keycloak answers 204 also
-  # when the scope is not linked; SCOPE_ID was just read, so any other answer is a failure.
+  # when the scope is not linked; SCOPE_ID was just read, so any other answer is a failure. The same
+  # move as _link_default_scope in src/aiac/idp/service/configuration/keycloak/main.py (the harness
+  # calls that); this bash copy follows it.
   DEL_HTTP=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE -H "Authorization: Bearer ${ADMIN}" \
     "${KC}/admin/realms/${REALM}/clients/${AGENT_UUID}/optional-client-scopes/${SCOPE_ID}")
   [ "$DEL_HTTP" = 204 ] || die "removing the optional client-scope link returned HTTP ${DEL_HTTP} (expected 204)"

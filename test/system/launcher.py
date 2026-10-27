@@ -455,8 +455,9 @@ def exchange_token(
     With ``scope`` left ``None``, the same request that AuthBridge's ``token-exchange-aiac`` plugin sends
     on the agent's outbound leg: ``audience`` only, **no** ``scope`` (so only the client's default
     scopes apply), ``subject_token_type`` and ``requested_token_type`` = access token. The client
-    authenticates with ``client_secret`` (form data, like ``mint_token``),
-    as AuthBridge does with the ``client-secret`` identity that ``k8s/opa-kind-enable.sh`` sets. Raises ``TokenExchangeError`` on a non-2xx answer;
+    authenticates with ``client_secret`` (form data, like ``mint_token``), as ``token-exchange-aiac``
+    does: it reads the client secret the operator writes to ``/shared/client-secret.txt`` (its
+    default ``client_secret_file``) and has no other way to authenticate. Raises ``TokenExchangeError`` on a non-2xx answer;
     its ``client_auth_refused`` tells a refused client authentication from every other failure."""
     data = {
         "grant_type": TOKEN_EXCHANGE_GRANT_TYPE,
@@ -683,7 +684,7 @@ def outbound_session_probe(
     ]
 
 
-def notification_outcome(code: int | None, body: str = "") -> str:
+def notification_outcome(code: int | None, body: str) -> str:
     """Classify the response to a JSON-RPC **notification** (a frame with no ``id``, e.g.
     ``notifications/initialized``) sent through the outbound proxy. A notification has no JSON-RPC
     reply to carry an error frame, so AuthBridge renders a rejection as a plain HTTP ``403`` (runbook
@@ -692,7 +693,7 @@ def notification_outcome(code: int | None, body: str = "") -> str:
     (``token-exchange-aiac``'s 403 ``policy.forbidden``) is never reported as an OPA deny."""
     if code in (200, 202):
         return "allow"
-    if code == 403 and is_opa_violation(_json_or_none(body)):
+    if code == 403 and is_opa_violation(rejection_doc(code, body)):
         return "deny"
     return "error"
 
@@ -742,14 +743,7 @@ def exchange_refusal(code: int | None, body: str) -> bool:
     error frame in an HTTP 200 or as a plain 403 reject body). **Pure.** A failed exchange
     (``upstream.token-exchange-failed``, an IdP that errored or was unreachable) is **not** a refusal:
     it proves nothing about the caller's grants."""
-    doc = _json_or_none(body)
-    if not isinstance(doc, dict):
-        return False
-    if code == 200:
-        err = doc.get("error")
-        doc = err.get("data") if isinstance(err, dict) else None
-    elif code != 403:
-        return False
+    doc = rejection_doc(code, body)
     return is_exchange_refusal(doc) and doc.get("error") == "policy.forbidden"
 
 
@@ -759,6 +753,29 @@ def _json_or_none(body: str) -> object:
         return json.loads(body)
     except (ValueError, TypeError):
         return None
+
+
+def rejection_doc(code: int | None, body: str) -> dict | None:
+    """The rejection document of an outbound answer ``(code, body)``, the one place that knows the two
+    shapes AuthBridge renders a rejection in. **Pure.**
+
+      * HTTP 200 with a JSON-RPC error frame -> its ``error.data`` (the forward proxy renders a
+        rejection of an MCP-shaped request this way, ``writeMCPRejection``);
+      * HTTP 403 with a plain JSON body that is not a JSON-RPC frame -> the body
+        (``httpx.WriteRejection``);
+      * anything else (an allow, a ``result`` frame, a transport error, a non-JSON body) -> ``None``.
+
+    ``is_opa_violation`` and ``is_exchange_refusal`` then tell whose rejection it is."""
+    doc = _json_or_none(body)
+    if not isinstance(doc, dict):
+        return None
+    if code == 200:
+        err = doc.get("error")
+        data = err.get("data") if isinstance(err, dict) else None
+        return data if isinstance(data, dict) else None
+    if code == 403 and "jsonrpc" not in doc:
+        return doc
+    return None
 
 
 def outbound_outcome(code: int | None, body: str) -> str:
@@ -804,24 +821,18 @@ def outbound_outcome(code: int | None, body: str) -> str:
     through) -> ``"allow"``; ``None`` or any other status (a transport break, a 401 from the callee's
     ``jwt-validation``, a 503 before the first bundle loads, or a non-MCP exchange ``503``) ->
     ``"error"``. Classify by the body, never the transport status alone."""
-    if code is None:
-        return "error"
-    doc = _json_or_none(body)
+    doc = rejection_doc(code, body)
     if code == 403:
         return "deny" if is_opa_violation(doc) else "error"
-    if code != 200 or doc is None:
+    if code != 200 or _json_or_none(body) is None:
         return "error"
-    err = doc.get("error") if isinstance(doc, dict) else None
-    if isinstance(err, dict):
-        data = err.get("data")
-        if isinstance(data, dict):
-            # Exchange refusal = the outbound decision was never reached (exchange broke before
-            # OPA). Honest class is "error", never "deny" — it must not stand in for an OPA verdict.
-            if is_exchange_refusal(data):
-                return "error"
-            # A real OPA verdict — the exchange succeeded and the request reached the policy.
-            if is_opa_violation(data):
-                return "deny"
+    # Exchange refusal = the outbound decision was never reached (exchange broke before
+    # OPA). Honest class is "error", never "deny" — it must not stand in for an OPA verdict.
+    if is_exchange_refusal(doc):
+        return "error"
+    # A real OPA verdict — the exchange succeeded and the request reached the policy.
+    if is_opa_violation(doc):
+        return "deny"
     return "allow"
 
 
@@ -847,16 +858,9 @@ def deny_origin(code: int | None, body: str) -> str | None:
 
     Only a request frame (``tools/call`` with an ``id``) has two distinct shapes. A notification gets a
     plain 403 from either proxy, so this helper does not apply to it."""
-    doc = _json_or_none(body)
-    if not isinstance(doc, dict):
+    if not is_opa_violation(rejection_doc(code, body)):
         return None
-    if code == 403 and "jsonrpc" not in doc and is_opa_violation(doc):
-        return DENY_ORIGIN_TOOL_INBOUND
-    if code == 200:
-        err = doc.get("error")
-        if isinstance(err, dict) and is_opa_violation(err.get("data")):
-            return DENY_ORIGIN_AGENT_OUTBOUND
-    return None
+    return DENY_ORIGIN_TOOL_INBOUND if code == 403 else DENY_ORIGIN_AGENT_OUTBOUND
 
 
 def poll_until(predicate: Callable[[], bool], *, timeout: float, interval: float = 5.0) -> bool:

@@ -52,11 +52,7 @@
 #   CLUSTER_NAME        kind cluster name                 (default: rossoctl)
 #   RELEASE_NAME        helm release name                 (default: rossoctl)
 #   RELEASE_NAMESPACE   namespace the chart is installed in (default: rossoctl-system)
-#   AGENT_NAMESPACE     namespace to restart agent and tool pods in; also the
-#                       namespace token-exchange-aiac assumes for short host
-#                       names such as github-tool:9090   (default: team1)
-#   TRUST_DOMAIN        SPIFFE trust domain in the outbound exchange audience
-#                       spiffe://<td>/ns/<ns>/sa/<service> (default: localtest.me)
+#   AGENT_NAMESPACE     namespace to restart agent and tool pods in (default: team1)
 #   IMAGE_TAG           local tag for the authbridge proxy-sidecar image built
 #                       from cmd/cortex (default: localhost/authbridge:local).
 #                       The tag name stays "authbridge" because it feeds the
@@ -96,7 +92,6 @@ CLUSTER_NAME="${CLUSTER_NAME:-rossoctl}"
 RELEASE_NAME="${RELEASE_NAME:-rossoctl}"
 RELEASE_NAMESPACE="${RELEASE_NAMESPACE:-rossoctl-system}"
 AGENT_NAMESPACE="${AGENT_NAMESPACE:-team1}"
-TRUST_DOMAIN="${TRUST_DOMAIN:-localtest.me}"
 IMAGE_TAG="${IMAGE_TAG:-localhost/authbridge:local}"
 
 if [ -z "$OPERATOR_DIR" ] || [ ! -f "$OPERATOR_DIR/operator/Dockerfile" ] || [ ! -d "$OPERATOR_DIR/charts/operator/templates/bundleservice" ]; then
@@ -384,8 +379,8 @@ cat > "$OVERLAY_FILE" <<YAML
 #   - opa runs after jwt-validation on inbound so input.identity is set.
 #   - OUTBOUND token exchange is ON by default, with no routes: token-exchange-aiac
 #     derives the audience from the destination host
-#     (spiffe://${TRUST_DOMAIN}/ns/{namespace}/sa/{service}; a short name uses
-#     namespace ${AGENT_NAMESPACE}) and asks Keycloak. A granted target gets a
+#     (spiffe://<td>/ns/{namespace}/sa/{service}; a short name uses the pod's
+#     own namespace) and asks Keycloak. A granted target gets a
 #     token narrowed to it; a destination Keycloak has no client for is the ONLY
 #     passthrough; an existing-but-not-granted target is 403 and any other IdP
 #     failure is 503. A request with no bearer is exchanged with the workload's
@@ -406,6 +401,12 @@ cat > "$OVERLAY_FILE" <<YAML
 #   - The SPIFFE audience form requires the destination Service and its
 #     ServiceAccount to share a name; otherwise the derived audience names no
 #     client and the request passes through un-exchanged.
+#   - The chart renders this one pipeline into every agent namespace, so no
+#     per-namespace value is inlined. The trust domain is the chart's own
+#     operator-chart.signatureVerification.spireTrustDomain (resolved by tpl(),
+#     the value the operator names SPIFFE clients with), and the namespace for
+#     short names is read by each sidecar from its own service-account mount
+#     (namespace_file).
 #   - token-exchange-aiac rejects unknown config keys, so token-exchange-only
 #     keys (routes, default_policy, identity, token_scopes) must not appear.
 # NOTE: the rossoctl chart reads the pipeline from \`.Values.authBridge.pipeline\`
@@ -439,8 +440,8 @@ authBridge:
           config:
             keycloak_url: "http://keycloak-service.keycloak.svc:8080"
             keycloak_realm: "rossoctl"
-            audience_template: "spiffe://${TRUST_DOMAIN}/ns/{namespace}/sa/{service}"
-            namespace: "${AGENT_NAMESPACE}"
+            audience_template: "spiffe://{{ index .Values "operator-chart" "signatureVerification" "spireTrustDomain" | default "localtest.me" }}/ns/{namespace}/sa/{service}"
+            namespace_file: /var/run/secrets/kubernetes.io/serviceaccount/namespace
             no_token_policy: "client-credentials"
         - name: opa
           config:

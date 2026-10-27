@@ -1191,9 +1191,12 @@ def grant_exchange_scope(admin) -> None:
     ``token-exchange-aiac``'s exchange to the github-tool audience (no ``scope`` requested) is granted.
 
     Resolves the agent client by its SPIFFE ``clientId`` (``.../sa/github-agent``) or its
-    ``name`` (``{ns}/github-agent``), and the client scope by name (``agent-{ns}-github-tool-aud``).
-    Idempotent — Keycloak's assign-default-scope is a PUT. Raises ``RuntimeError`` on any Keycloak error."""
+    ``name`` (``{ns}/github-agent``), and the client scope by name (``agent-{ns}-github-tool-aud``),
+    and links it with ``_link_default_scope`` of the Keycloak IdP Configuration Service. Idempotent —
+    Keycloak's assign-default-scope is a PUT. Raises ``RuntimeError`` on any Keycloak error."""
     from keycloak.exceptions import KeycloakError
+
+    from aiac.idp.service.configuration.keycloak.main import _link_default_scope
 
     admin.change_current_realm(TEST_REALM)
     aud_scope = _tool_aud_scope()
@@ -1216,14 +1219,12 @@ def grant_exchange_scope(admin) -> None:
             f"client scope {aud_scope!r} not found in realm {TEST_REALM!r} — is {scn.TOOL_WORKLOAD} "
             "deployed + registered by the operator?"
         )
-    # Keycloak silently skips a default link of a scope already linked as optional (the old
-    # optional grant of this harness), so move an optional link to default first. Every Keycloak error
-    # raises: the assign is an idempotent PUT, so none is benign, and without the default link every
-    # exchange is refused much later, far from this cause.
+    # The link that AIAC's own onboarding makes: an optional link (the old optional grant of this
+    # harness) is moved to default first, since Keycloak silently skips a default link of a scope
+    # already linked as optional. Every Keycloak error raises: the assign is an idempotent PUT, so none
+    # is benign, and without the default link every exchange is refused much later, far from this cause.
     try:
-        if any(s.get("id") == scope["id"] for s in admin.get_client_optional_client_scopes(client_uuid)):
-            admin.delete_client_optional_client_scope(client_uuid, scope["id"])
-        admin.add_client_default_client_scope(client_uuid, scope["id"], {})
+        _link_default_scope(admin, client_uuid, scope["id"])
     except KeycloakError as exc:
         raise RuntimeError(
             f"could not link {aud_scope!r} to {NAMESPACE}/{scn.AGENT_WORKLOAD} as a default scope: {exc} — "
@@ -1760,8 +1761,9 @@ def exchanged_subject(ctx: dict, user: str) -> str:
     (the agent), so its ``sub`` comes from the agent's scopes only.
 
     The harness can authenticate as the agent only with its client secret. AuthBridge's
-    ``token-exchange-aiac`` (``k8s/opa-kind-enable.sh``) uses the ``client-secret`` identity, so on that
-    deployment the agent client uses the ``client-secret`` authenticator and the exchange must succeed:
+    ``token-exchange-aiac`` (``k8s/opa-kind-enable.sh``) authenticates the same way: it reads the secret
+    the operator writes to ``/shared/client-secret.txt`` and has no other way. So on that deployment the
+    agent client uses the ``client-secret`` authenticator and the exchange must succeed:
     a refused client authentication then raises. ``pytest.skip`` only when the agent client uses
     another authenticator (``clientAuthenticatorType``, for example ``federated-jwt`` for a SPIFFE
     JWT-SVID) or has no readable secret. Then no other check reads the exchanged ``sub`` directly; only

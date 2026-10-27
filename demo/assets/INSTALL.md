@@ -33,6 +33,11 @@ they automate.
   `k8s/opa-kind-verify.sh`). The demo ships no `authproxy-routes`, so on the stock chart pipeline
   (`token-exchange` with routes) the agent's calls to the tool go out unexchanged and the tool
   rejects them.
+- **Known limitation:** the agent's live GitHub calls go to the production tool at its default
+  `MCP_URL` host `github-tool-mcp`. Its Service name is not its ServiceAccount (Keycloak client
+  `…/sa/github-tool`), so those calls are not exchanged, and no token carries `github-full-access`
+  for the tool's PAT selection. The UC-1 onboarding demo is not affected: it calls the stub
+  `github-tool` directly.
 
 ## What gets deployed
 

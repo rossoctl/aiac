@@ -187,9 +187,12 @@ Expect two image builds, so allow a few minutes. The script runs six steps:
    keeps `opa` there for the pass-through outbound package (D24) and the
    changed combiner (D20). `charts/rossoctl/values.yaml` is never modified.
    The outbound `token-exchange-aiac` entry is configured with
-   `audience_template: spiffe://$TRUST_DOMAIN/ns/{namespace}/sa/{service}`
-   (`TRUST_DOMAIN`, default `localtest.me`), `namespace: $AGENT_NAMESPACE` for
-   short host names, and `no_token_policy: client-credentials`.
+   `audience_template: spiffe://<td>/ns/{namespace}/sa/{service}`, where `<td>`
+   is the chart's `operator-chart.signatureVerification.spireTrustDomain` (the
+   trust domain the operator names clients with), `namespace_file` set to the
+   pod's own service-account namespace file for short host names, and
+   `no_token_policy: client-credentials`. The chart renders the one pipeline
+   into every agent namespace, so neither value is a per-namespace literal.
 4. **Helm upgrade.** Applies the chart's `values.yaml` plus the overlay, with
    the sidecar image pointed at the locally built one.
    - It sets `operator-chart.featureGates.injectTools=true`. So the operator
@@ -224,11 +227,10 @@ It runs these checks. Each one can also be run by hand:
 # 1. OPA is in both legs of the namespace pipeline — expect 2
 kubectl get configmap authbridge-runtime-config -n team1 \
   -o jsonpath='{.data.config\.yaml}' | grep -c 'name: opa'
-# 1b. Outbound exchange is token-exchange-aiac — expect 1, then 0
+# 1b. The outbound leg runs token-exchange-aiac, not token-exchange
+#     — expect token-exchange-aiac=1 token-exchange=0 (parsed, outbound leg only)
 kubectl get configmap authbridge-runtime-config -n team1 \
-  -o jsonpath='{.data.config\.yaml}' | grep -c 'name: token-exchange-aiac'
-kubectl get configmap authbridge-runtime-config -n team1 \
-  -o jsonpath='{.data.config\.yaml}' | grep -c 'name: token-exchange'
+  -o jsonpath='{.data.config\.yaml}' | python3 k8s/outbound-exchange-plugins.py
 
 # 2. The CRD is served and the global combiner exists — expect 'default', scope global
 kubectl get crd authorizationpolicies.agent.rossoctl.dev
@@ -521,9 +523,9 @@ A request with **no** bearer is still exchanged, using the workload's own
 client-credentials`). It is never sent un-narrowed.
 
 The audience is derived from the Host header as
-`spiffe://<TRUST_DOMAIN>/ns/<namespace>/sa/<service>`. The namespace comes from
-the host (`github-tool.team1.svc[.cluster.local]`), or from `AGENT_NAMESPACE`
-for a short name (`github-tool:9090`). This makes two demands on workloads and
+`spiffe://<td>/ns/<namespace>/sa/<service>`. The namespace comes from
+the host (`github-tool.team1.svc[.cluster.local]`), or, for a short name
+(`github-tool:9090`), from the calling pod's own namespace (`namespace_file`). This makes two demands on workloads and
 Keycloak, which a use case (not this runbook) sets up:
 
 1. **Service name = ServiceAccount name.** The Host header carries the Service
@@ -538,11 +540,11 @@ Keycloak, which a use case (not this runbook) sets up:
      *optional* scope is never applied and the target answers 403. A **realm**
      default scope would grant every target to every caller.
 
-`AGENT_NAMESPACE` is baked into the pipeline at enable time. The chart renders
-one pipeline for every agent namespace, and the sidecar has no
-`POD_NAMESPACE` env to expand. A workload in another agent namespace must
-therefore call its targets by `service.namespace.svc` name. Otherwise its short
-names derive the wrong namespace and pass through.
+The chart renders one pipeline for every agent namespace, and the sidecar has
+no `POD_NAMESPACE` env to expand. So each sidecar reads its namespace from
+`/var/run/secrets/kubernetes.io/serviceaccount/namespace`, and a short name in
+`team2` derives a `team2` audience. A sidecar that cannot read that file
+refuses to start.
 
 The full plugin reference is cortex `docs/token-exchange-aiac-plugin.md`.
 

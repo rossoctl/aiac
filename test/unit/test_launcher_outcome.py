@@ -12,6 +12,7 @@ The module under test is test infra (``test/system/launcher.py``), so the file s
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -88,6 +89,26 @@ def test_deny_origin_ignores_an_exchange_refusal() -> None:
     assert launcher.deny_origin(200, _frame(NOT_GRANTED)) is None
     assert launcher.deny_origin(403, json.dumps(NOT_GRANTED)) is None
     assert launcher.deny_origin(200, _frame(OPA_DENY)) == launcher.DENY_ORIGIN_AGENT_OUTBOUND
+    assert launcher.deny_origin(403, json.dumps(OPA_DENY)) == launcher.DENY_ORIGIN_TOOL_INBOUND
+    # A 403 that carries a JSON-RPC frame is neither shape.
+    assert launcher.deny_origin(403, _frame(OPA_DENY)) is None
+
+
+@pytest.mark.parametrize(
+    ("code", "body", "expected"),
+    [
+        (200, _frame(OPA_DENY), OPA_DENY),
+        (403, json.dumps(NOT_GRANTED), NOT_GRANTED),
+        (403, _frame(OPA_DENY), None),  # a frame is rendered only at HTTP 200
+        (200, json.dumps({"jsonrpc": "2.0", "id": 1, "result": {}}), None),
+        (200, json.dumps({"jsonrpc": "2.0", "id": 1, "error": {"code": -32000}}), None),
+        (503, json.dumps(EXCHANGE_FAILED), None),
+        (403, "not json", None),
+        (None, "", None),
+    ],
+)
+def test_rejection_doc_unwraps_both_rejection_shapes(code: int | None, body: str, expected: dict | None) -> None:
+    assert launcher.rejection_doc(code, body) == expected
 
 
 # ``authbridge-runtime-config`` as ``k8s/opa-kind-enable.sh`` renders it.
@@ -101,7 +122,7 @@ _CONFIG = """pipeline:
       - name: mcp-parser
       - name: token-exchange-aiac
         config:
-          namespace: "team1"
+          namespace_file: /var/run/secrets/kubernetes.io/serviceaccount/namespace
       - name: opa
 """
 
@@ -122,40 +143,52 @@ def test_pipeline_plugins_of_a_bad_config_is_empty(config: str) -> None:
     assert _legs(config) == {"inbound": [], "outbound": []}
 
 
-@pytest.mark.parametrize(
-    "config",
-    [
-        _CONFIG,
-        _CONFIG.replace("name: token-exchange-aiac", 'name: "token-exchange-aiac"'),
-        _CONFIG + "# - name: token-exchange\n",  # a comment is not a plugin
-    ],
-)
+_PASSING = [
+    _CONFIG,
+    _CONFIG.replace("name: token-exchange-aiac", 'name: "token-exchange-aiac"'),
+    _CONFIG + "# - name: token-exchange\n",  # a comment is not a plugin
+]
+
+
+@pytest.mark.parametrize("config", _PASSING)
 def test_exchange_plugin_reason_passes_one_aiac_exchange_outbound(config: str) -> None:
     assert launcher.exchange_plugin_reason(_legs(config), namespace="team1") is None
 
 
-@pytest.mark.parametrize(
-    "config",
-    [
-        _CONFIG.replace("name: token-exchange-aiac", "name: token-exchange"),  # an older pipeline
-        _CONFIG.replace("      - name: opa\n", "      - name: token-exchange\n      - name: opa\n", 2).replace(
-            "      - name: token-exchange\n      - name: opa\n", "      - name: opa\n", 1
-        ),  # half migrated
-        _CONFIG.replace(
-            "- name: token-exchange-aiac", "- name: token-exchange-aiac\n      - name: token-exchange-aiac"
-        ),
-        # only on the inbound leg, where it exchanges nothing the harness sends
-        _CONFIG.replace(
-            '      - name: token-exchange-aiac\n        config:\n          namespace: "team1"\n', ""
-        ).replace(
-            "      - name: jwt-validation\n", "      - name: jwt-validation\n      - name: token-exchange-aiac\n"
-        ),
+_SKIPPING = [
+    _CONFIG.replace("name: token-exchange-aiac", "name: token-exchange"),  # an older pipeline
+    _CONFIG.replace("      - name: opa\n", "      - name: token-exchange\n      - name: opa\n", 2).replace(
+        "      - name: token-exchange\n      - name: opa\n", "      - name: opa\n", 1
+    ),  # half migrated
+    _CONFIG.replace("- name: token-exchange-aiac", "- name: token-exchange-aiac\n      - name: token-exchange-aiac"),
+    # only on the inbound leg, where it exchanges nothing the harness sends
+    _CONFIG.replace(
+        "      - name: token-exchange-aiac\n        config:\n"
+        "          namespace_file: /var/run/secrets/kubernetes.io/serviceaccount/namespace\n",
         "",
-    ],
-)
+    ).replace("      - name: jwt-validation\n", "      - name: jwt-validation\n      - name: token-exchange-aiac\n"),
+    "",
+]
+
+
+@pytest.mark.parametrize("config", _SKIPPING)
 def test_exchange_plugin_reason_skips_any_other_exchange_wiring(config: str) -> None:
     reason = launcher.exchange_plugin_reason(_legs(config), namespace="team1")
     assert reason is not None and "k8s/opa-kind-enable.sh" in reason
+
+
+_VERIFY_HELPER = REPO_ROOT / "k8s" / "outbound-exchange-plugins.py"
+
+
+@pytest.mark.parametrize("config", _PASSING + _SKIPPING)
+def test_verify_helper_agrees_with_the_harness_gate(config: str) -> None:
+    """``k8s/opa-kind-verify.sh`` (via ``outbound-exchange-plugins.py``) and the system lane's skip gate
+    give one verdict on every config."""
+    run = subprocess.run(
+        [sys.executable, "-I", str(_VERIFY_HELPER)], input=config, capture_output=True, text=True, check=False
+    )
+    verify_passes = run.stdout.strip() == "token-exchange-aiac=1 token-exchange=0"
+    assert verify_passes is (launcher.exchange_plugin_reason(_legs(config), namespace="team1") is None)
 
 
 @pytest.mark.parametrize(

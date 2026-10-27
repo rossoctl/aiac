@@ -10,7 +10,7 @@ AuthBridge's outbound leg (`app → parsers → <exchange plugin> → opa → de
 | | `token-exchange` (before) | `token-exchange-aiac` (now) |
 |---|---|---|
 | Which hosts get exchanged | Only hosts listed in the `authproxy-routes` ConfigMap. Every other host passes through. | Every in-cluster host. Keycloak decides whether the host is a target. |
-| How the audience is chosen | The route's `target_audience` | Derived from the Host header: `spiffe://<TRUST_DOMAIN>/ns/<namespace>/sa/<service>` |
+| How the audience is chosen | The route's `target_audience` | Derived from the Host header: `spiffe://<td>/ns/<namespace>/sa/<service>` |
 | `scope` in the RFC 8693 request | Sent when the route sets `token_scopes` | Never sent, so only the caller's **default** client scopes apply |
 | Config | `default_policy: passthrough`, `identity: client-secret`, plus routes | `audience_template`, `namespace` (for short host names), `no_token_policy: client-credentials` (the default is `deny`, as in `token-exchange`). Unknown keys are rejected. |
 | How to add a target | Edit `authproxy-routes`, then restart the agent (routes are read once at startup) | Change Keycloak only. No restart is needed, except to clear a cached "unknown audience" (5 min). |
@@ -32,7 +32,7 @@ AuthBridge's outbound leg (`app → parsers → <exchange plugin> → opa → de
 | Target granted only as an **optional** client scope | Worked, because the route asked for the scope through `token_scopes` | 403 (`audience_not_granted`). The scope must be a **default** scope. |
 | Extra scope the target reads (for example `github-full-access`) | Asked for in the route's `token_scopes` | Must be a default scope of the caller's client |
 | Service name ≠ ServiceAccount name (demo `MCP_URL` host `github-tool-mcp`, client `…/sa/github-tool`) | Exchanged through the route `github-tool-mcp → github-tool` | The derived audience names no client, so the call **passes through un-exchanged**. Point `MCP_URL` at `github-tool`. |
-| Short host name in a namespace other than `AGENT_NAMESPACE` | Not applicable (the route named the audience) | Wrong namespace is derived, so the call passes through. Use `service.namespace.svc`. |
+| Short host name | Not applicable (the route named the audience) | The namespace is the calling pod's own, read from its service-account mount (`namespace_file`) |
 | Outbound `input.identity.subject` | Best-effort decode of the incoming bearer's `sub`, unverified, so the workload can choose it | `sub` of the token Keycloak issued: the user, or `service-account-<clientId>` when there was no bearer |
 | Outbound `input.identity.scopes` | Scopes of the minted token, per target | The issued token's `scope` claim. It lists **all** of the caller's default scopes, so don't treat it as per-target. |
 | `input.delegation` hop `strategy` | `"token-exchange"` | `"token-exchange-aiac"` |
