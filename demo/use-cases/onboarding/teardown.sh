@@ -243,8 +243,9 @@ run kubectl delete -f "$ASSETS_DIR/agents/github_agent/k8s/configmaps.yaml" -n "
 pass "demo ConfigMap gone from ${NS} (the namespace itself is untouched)"
 # An older demo shipped authproxy-routes with a github-tool-mcp route. It carries no owner label, so it
 # cannot be told from a platform-seeded one: report it, never delete it.
-if kubectl get configmap authproxy-routes -n "$NS" -o jsonpath='{.data.routes\.yaml}' 2>/dev/null \
-     | grep -q 'host: "github-tool-mcp"'; then
+# Read into a variable first: under pipefail, `kubectl | grep -q` can fail on a match (SIGPIPE).
+OLD_ROUTES=$(kubectl get configmap authproxy-routes -n "$NS" -o jsonpath='{.data.routes\.yaml}' 2>/dev/null || true)
+if grep -q 'host: "github-tool-mcp"' <<<"$OLD_ROUTES"; then
   warn "configmap ${NS}/authproxy-routes still has the github-tool-mcp route of an older demo; delete it if your platform did not seed it (token-exchange-aiac reads no routes)"
 fi
 fi

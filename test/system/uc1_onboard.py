@@ -95,7 +95,6 @@ functions, so pytest does not collect it.
 from __future__ import annotations
 
 import base64
-import functools
 import json
 import logging
 import os
@@ -213,7 +212,7 @@ AGENT_DEPLOYMENT = os.environ.get("AIAC_AGENT_DEPLOYMENT", scn.AGENT_WORKLOAD)
 
 # SPIFFE trust domain the operator registers the demo workloads under (the ``spiffe://<td>/ns/...``
 # authority). Matches the rossoctl Kind cluster's default; override for a differently-named cluster.
-# The exchange audience reads the live leg's own trust domain instead (``_exchange_trust_domain``).
+# The exchange audience uses the live leg's own trust domain instead (``_exchange_trust_domain``).
 TRUST_DOMAIN = os.environ.get("AIAC_TRUST_DOMAIN", "localtest.me")
 
 # After a CR is upserted, ``bundle-service`` recomposes the namespace bundle and each pod's OPA polls
@@ -1179,21 +1178,26 @@ def delete_workload_crs() -> None:
 # ``token-exchange-aiac`` must mint it.
 
 
-@functools.cache
 def _exchange_trust_domain() -> str:
-    """The trust domain ``token-exchange-aiac`` exchanges for, read once from the live
-    ``authbridge-runtime-config`` of ``NAMESPACE`` (``exchange_trust_domain``); ``TRUST_DOMAIN`` when it
-    cannot be read. ``k8s/opa-kind-enable.sh`` takes it from the chart, so the two can differ."""
-    ok, out, _ = _kubectl_try(
+    """The trust domain ``token-exchange-aiac`` exchanges for, read from the live
+    ``authbridge-runtime-config`` of ``NAMESPACE`` (``exchange_trust_domain``). ``k8s/opa-kind-enable.sh``
+    takes it from the chart, so it can differ from ``TRUST_DOMAIN``. Raises ``RuntimeError`` when it
+    cannot be read: a guessed audience would fail far from this cause."""
+    ok, out, err = _kubectl_try(
         "get", "configmap", "authbridge-runtime-config", "-n", NAMESPACE, "-o", r"jsonpath={.data.config\.yaml}"
     )
-    return (exchange_trust_domain(out) if ok else None) or TRUST_DOMAIN
+    td = exchange_trust_domain(out) if ok else None
+    if td is None:
+        raise RuntimeError(
+            f"cannot read the trust domain of token-exchange-aiac's audience_template in "
+            f"{NAMESPACE}/authbridge-runtime-config ({err or 'no spiffe:// template'}) — run k8s/opa-kind-enable.sh"
+        )
+    return td
 
 
-def _tool_audience() -> str:
-    """The RFC 8693 ``audience`` for the github-tool exchange — its SPIFFE ID, in the trust domain the
-    live outbound leg exchanges for, so ``exchanged_subject`` asks for what AuthBridge asks for."""
-    return f"spiffe://{_exchange_trust_domain()}/ns/{NAMESPACE}/sa/{scn.TOOL_WORKLOAD}"
+def _tool_audience(trust_domain: str) -> str:
+    """The RFC 8693 ``audience`` for the github-tool exchange — its SPIFFE ID in ``trust_domain``."""
+    return f"spiffe://{trust_domain}/ns/{NAMESPACE}/sa/{scn.TOOL_WORKLOAD}"
 
 
 def _tool_aud_scope() -> str:
@@ -1772,7 +1776,7 @@ def exchanged_subject(ctx: dict, user: str) -> str:
 
     Mints ``user``'s login token through ``rossoctl``, reads the agent client and its client secret
     from the admin API, and sends the request that AuthBridge's ``token-exchange-aiac`` sends: a standard
-    token exchange to ``_tool_audience()`` with **no** ``scope`` (``exchange_token``), so only the agent's
+    token exchange to ``_tool_audience(ctx["trust_domain"])`` with **no** ``scope`` (``exchange_token``), so only the agent's
     default scopes apply. The Keycloak standard token exchange builds the token for the requester
     (the agent), so its ``sub`` comes from the agent's scopes only.
 
@@ -1818,7 +1822,7 @@ def exchanged_subject(ctx: dict, user: str) -> str:
             realm=ctx["realm"],
             client_id=agent["clientId"],
             client_secret=secret,
-            audience=_tool_audience(),
+            audience=_tool_audience(ctx["trust_domain"]),
         )
     except TokenExchangeError as exc:
         if exc.client_auth_refused:
@@ -2166,7 +2170,8 @@ def onboarded_stack(
 ) -> Iterator[dict]:
     """Run one rung's whole live flow and yield a probe ``ctx`` for its assertions.
 
-    ``ctx`` = ``{"admin", "namespace", "agent_pod", "keycloak_url", "realm", "tool_onboarded"}``.
+    ``ctx`` = ``{"admin", "namespace", "agent_pod", "keycloak_url", "realm", "tool_onboarded",
+    "trust_domain"}``.
 
     Flow (event-driven trigger): skip cleanly (never false-pass) if the OPA pipeline or the event path
     is not wired, or the integration env is unset; capture any leftover CR to the pytest host
@@ -2342,6 +2347,9 @@ def onboarded_stack(
             "keycloak_url": keycloak_url,
             "realm": TEST_REALM,
             "tool_onboarded": tool_onboarded,
+            # The trust domain the live outbound leg exchanges for: read once per stack, here, so a
+            # probe asks for the audience AuthBridge asks for (``exchanged_subject``).
+            "trust_domain": _exchange_trust_domain(),
         }
 
         # Wait for bundle-service + OPA to reflect THIS run's CR (and token-exchange to settle) before

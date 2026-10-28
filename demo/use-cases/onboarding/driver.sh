@@ -365,7 +365,7 @@ OPA_COUNT=$(kubectl get configmap authbridge-runtime-config -n "$NS" \
 # On the stock pipeline (token-exchange with routes) ENFORCE would see un-exchanged calls that github-tool
 # rejects, reported as policy failures. Same parsed rule as k8s/opa-kind-verify.sh (Verify 1).
 EXCHANGE=$(kubectl get configmap authbridge-runtime-config -n "$NS" -o jsonpath='{.data.config\.yaml}' 2>/dev/null \
-  | python3 "${SCRIPT_DIR}/../../../k8s/outbound-exchange-plugins.py" 2>&1 || true)
+  | python3 "${AIAC_DIR}/k8s/outbound-exchange-plugins.py" 2>&1 || true)
 [ "$EXCHANGE" = "token-exchange-aiac=1 token-exchange=0" ] \
   || die "the outbound exchange plugin is not token-exchange-aiac (${EXCHANGE}, expected token-exchange-aiac=1 token-exchange=0) — run k8s/opa-kind-enable.sh first"
 # The changed combiner (D20): no request fallback rule, so a pod with no client CR is denied. The AIAC

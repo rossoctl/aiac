@@ -82,6 +82,12 @@ def test_is_exchange_refusal(doc: object, expected: bool) -> None:
         # AuthBridge's minimal and constant fallback frames name no plugin: rejected, never an allow.
         (200, json.dumps({"jsonrpc": "2.0", "id": 1, "error": {"code": -32000, "message": "x"}}), "error"),
         (200, '{"jsonrpc":"2.0","id":null,"error":{"code":-32000,"message":"request rejected"}}', "error"),
+        # The full frame of a reject with no violation data: ``data`` is present, but null.
+        (
+            200,
+            json.dumps({"jsonrpc": "2.0", "id": 1, "error": {"code": -32000, "message": "x", "data": None}}),
+            "error",
+        ),
         # A JSON-RPC error of the tool itself (another code) means the call got through.
         (200, json.dumps({"jsonrpc": "2.0", "id": 1, "error": {"code": -32602, "message": "bad"}}), "allow"),
     ],
@@ -259,6 +265,11 @@ def test_target_disabled_refusal_is_only_a_disabled_target(code: int | None, bod
         ),
         (_CONFIG, None),  # no audience_template
         (_CONFIG.replace("        config:\n", '        config:\n          audience_template: "{service}"\n'), None),
+        (
+            _CONFIG.replace("        config:\n          namespace_file", "        config: x\n          namespace_file"),
+            None,
+        ),
+        ("pipeline:\n  outbound:\n    plugins:\n      - name: token-exchange-aiac\n        config: [1]\n", None),
         ("not: [yaml", None),
         ("", None),
     ],

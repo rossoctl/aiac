@@ -506,7 +506,12 @@ def _jwt(claims: dict) -> str:
 
 
 def _ctx(admin: MagicMock) -> dict:
-    return {"admin": admin, "keycloak_url": "http://kc.example:8080", "realm": "rossoctl"}
+    return {
+        "admin": admin,
+        "keycloak_url": "http://kc.example:8080",
+        "realm": "rossoctl",
+        "trust_domain": "example.org",
+    }
 
 
 def _stub_exchange(monkeypatch: pytest.MonkeyPatch, result: str | Exception) -> list[dict]:
@@ -547,9 +552,38 @@ def test_exchanged_subject_exchanges_as_the_agent_to_the_tool_audience(monkeypat
             "realm": "rossoctl",
             "client_id": AGENT_CLIENT_ID,
             "client_secret": "s3cret",
-            "audience": uc1._tool_audience(),
+            "audience": f"spiffe://example.org/ns/{uc1.NAMESPACE}/sa/github-tool",
         }
     ]
+
+
+@pytest.mark.parametrize(
+    ("kubectl_result", "expected"),
+    [
+        (
+            (
+                True,
+                "pipeline:\n  outbound:\n    plugins:\n      - name: token-exchange-aiac\n        config:\n"
+                '          audience_template: "spiffe://example.org/ns/{namespace}/sa/{service}"\n',
+                "",
+            ),
+            "example.org",
+        ),
+        ((True, "pipeline: {}\n", ""), None),
+        ((False, "", "connection refused"), None),
+    ],
+)
+def test_exchange_trust_domain_reads_the_live_leg_or_raises(
+    monkeypatch: pytest.MonkeyPatch, kubectl_result: tuple, expected: str | None
+) -> None:
+    """The trust domain comes from the live ``token-exchange-aiac`` template; when it cannot be read the
+    harness stops, instead of guessing an audience that fails later."""
+    monkeypatch.setattr(uc1, "_kubectl_try", lambda *args, **kwargs: kubectl_result)
+    if expected is None:
+        with pytest.raises(RuntimeError, match="k8s/opa-kind-enable.sh"):
+            uc1._exchange_trust_domain()
+    else:
+        assert uc1._exchange_trust_domain() == expected
 
 
 def test_exchanged_subject_gives_the_user_id_when_the_link_is_missing(monkeypatch: pytest.MonkeyPatch) -> None:
