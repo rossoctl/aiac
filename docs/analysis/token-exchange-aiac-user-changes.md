@@ -40,9 +40,10 @@ Both plugins read the bearer the same way: the same parsing of the `Bearer` pref
 
 | Request | token-exchange | token-exchange-aiac |
 |---|---|---|
-| No bearer, `no_token_policy` unset | 401 | 401 |
-| No bearer, `client-credentials` (AIAC's setting) | The workload's `client_credentials` token is sent | The workload's own token is **exchanged** for the target, so the target gets a token for its own audience only |
+| No bearer, `deny` (the default; AIAC's setting) | 401 | 401 to a target; a destination with no Keycloak client passes through |
+| No bearer, `client-credentials` (not used by AIAC) | The workload's `client_credentials` token is sent | The workload's own token is **exchanged** for the target, so the target gets a token for its own audience only |
 
-**What you notice:** nothing, as long as `no_token_policy: client-credentials`
-stays set. The 401 body names `auth.unauthorized` instead of
-`upstream.token-exchange-failed`.
+**What you notice:** nothing. A call with no bearer to a target is still a 401;
+its body names `auth.unauthorized` instead of `upstream.token-exchange-failed`.
+AIAC does not set `client-credentials`: under it, any process in the pod that
+sends no bearer would reach a target as the agent.

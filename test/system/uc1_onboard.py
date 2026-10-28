@@ -126,7 +126,6 @@ from test.system.launcher import (  # noqa: E402
     curl_pod,
     deny_origin,
     exchange_token,
-    exchange_trust_domain,
     inbound_outcome,
     inbound_probe,
     is_opa_violation,
@@ -210,10 +209,6 @@ CR_CAPTURE_DIR = Path(os.environ.get("AIAC_CR_CAPTURE_DIR") or HERE / "artifacts
 # OPA sidecar's next poll, the recomposed bundle). Defaults to the agent workload name.
 AGENT_DEPLOYMENT = os.environ.get("AIAC_AGENT_DEPLOYMENT", scn.AGENT_WORKLOAD)
 
-# SPIFFE trust domain the operator registers the demo workloads under (the ``spiffe://<td>/ns/...``
-# authority). Matches the rossoctl Kind cluster's default; override for a differently-named cluster.
-# The exchange audience uses the live leg's own trust domain instead (``_exchange_trust_domain``).
-TRUST_DOMAIN = os.environ.get("AIAC_TRUST_DOMAIN", "localtest.me")
 
 # After a CR is upserted, ``bundle-service`` recomposes the namespace bundle and each pod's OPA polls
 # it on its own interval (``polling_min_delay`` / ``polling_max_delay``, 10-120 s by default, up to about
@@ -945,12 +940,20 @@ def controller_onboarding_lines(admin, workload: str, *, since: datetime) -> str
     return f"Controller lines (the not-ready error is in each nak): {lines}."
 
 
-def bundle_service_probe(workload: str) -> tuple[str, str]:
+# The SPIFFE trust domain of the bundle-service probe of the diagnosis, when it differs from the one the
+# exchange uses (``AIAC_TRUST_DOMAIN``, as ``TRUST_DOMAIN`` of ``k8s/opa-kind-verify.sh``). Unset, the
+# probe uses the trust domain of the live outbound leg (``require_pipeline``).
+BUNDLE_TRUST_DOMAIN = os.environ.get("AIAC_TRUST_DOMAIN") or None
+
+
+def bundle_service_probe(workload: str, *, trust_domain: str) -> tuple[str, str]:
     """GET bundle-service ``/readyz`` and ``/bundles?spiffe=<td>/ns/<ns>/sa/<workload>`` from a
     throwaway curl pod in ``NAMESPACE`` (the ztunnel path the sidecars use, as ``opa-kind-verify.sh``
-    Verify 4 does); return the two HTTP codes as strings (``000`` = not reachable)."""
+    Verify 4 does); return the two HTTP codes as strings (``000`` = not reachable). ``<td>`` is
+    ``BUNDLE_TRUST_DOMAIN`` when set, else ``trust_domain``, the one the exchange uses
+    (``require_pipeline``, read once per stack)."""
     base = f"http://bundle-service.{BUNDLE_SERVICE_NAMESPACE}.svc.cluster.local:8080"
-    spiffe = f"{TRUST_DOMAIN}/ns/{NAMESPACE}/sa/{workload}"
+    spiffe = f"{BUNDLE_TRUST_DOMAIN or trust_domain}/ns/{NAMESPACE}/sa/{workload}"
     # ``; true``: a failed curl still prints its code (``000``), and the pod must exit 0 to keep the output.
     script = (
         f"curl -s -m 10 -o /dev/null -w 'readyz %{{http_code}}\\n' {base}/readyz; "
@@ -1004,7 +1007,10 @@ def stack_diagnosis(admin, workload: str, *, context: dict) -> str:
         return operator_change_note(context["operator"], now) or "unchanged"
 
     _part("operator", _operator)
-    _part(f"bundle-service from {NAMESPACE} (readyz, bundle)", lambda: bundle_service_probe(workload))
+    _part(
+        f"bundle-service from {NAMESPACE} (readyz, bundle)",
+        lambda: bundle_service_probe(workload, trust_domain=context["trust_domain"]),
+    )
 
     def _deployment() -> str:
         deployment, reason = _read_rollout(workload)
@@ -1176,23 +1182,6 @@ def delete_workload_crs() -> None:
 # is asked again. The leg is necessary: the agent's outbound is a pass-through, but github-tool's
 # inbound ``jwt-validation`` accepts only a token whose audience is github-tool, so
 # ``token-exchange-aiac`` must mint it.
-
-
-def _exchange_trust_domain() -> str:
-    """The trust domain ``token-exchange-aiac`` exchanges for, read from the live
-    ``authbridge-runtime-config`` of ``NAMESPACE`` (``exchange_trust_domain``). ``k8s/opa-kind-enable.sh``
-    takes it from the chart, so it can differ from ``TRUST_DOMAIN``. Raises ``RuntimeError`` when it
-    cannot be read: a guessed audience would fail far from this cause."""
-    ok, out, err = _kubectl_try(
-        "get", "configmap", "authbridge-runtime-config", "-n", NAMESPACE, "-o", r"jsonpath={.data.config\.yaml}"
-    )
-    td = exchange_trust_domain(out) if ok else None
-    if td is None:
-        raise RuntimeError(
-            f"cannot read the trust domain of token-exchange-aiac's audience_template in "
-            f"{NAMESPACE}/authbridge-runtime-config ({err or 'no spiffe:// template'}) — run k8s/opa-kind-enable.sh"
-        )
-    return td
 
 
 def _tool_audience(trust_domain: str) -> str:
@@ -2002,9 +1991,10 @@ def _default_ready_signals(tool_onboarded: bool) -> list[ReadySignal]:
 
     **Outbound signals exist only when a tool is onboarded.** The agent-only rung (rung 1) has no tool
     to gate, so there is no real ``agent -> tool`` call and its outbound leg is neither prepared (Part B
-    is skipped) nor probed nor asserted — on a tool-less rung token-exchange-aiac settles the call before OPA
-    (no ``github-tool`` audience grant), so an outbound "deny" there would be a Keycloak audience
-    refusal, not an OPA verdict. Rung 1's empty tool check is instead asserted at the unit level
+    is skipped) nor probed nor asserted — on a tool-less rung Keycloak has no ``github-tool`` client, so
+    token-exchange-aiac passes the call through un-exchanged (``audience_unknown``), and an outbound
+    "deny" there would be the agent's outbound OPA (a pass-through, D24) on a request that reaches no
+    tool, not the tool check. Rung 1's empty tool check is instead asserted at the unit level
     (grant-set oracle) and by ``test_no_tool_scopes_provisioned``. So the tool-less signal set is
     inbound-only.
 
@@ -2217,8 +2207,9 @@ def onboarded_stack(
     # no-workloads slate and deploys the workloads itself as the onboarding trigger, so requiring
     # them up front would skip every rung on a correctly-wired cluster. A missing/unloadable image or
     # a deploy that never converges surfaces later as a loud RuntimeError from the deploy/convergence
-    # poll below — never a skip, never a false pass.
-    require_pipeline(namespace=NAMESPACE, workloads=[])
+    # poll below — never a skip, never a false pass. The gate also gives the trust domain the live
+    # outbound leg exchanges for, from the same read of the config it approved.
+    trust_domain = require_pipeline(namespace=NAMESPACE, workloads=[])
     creds = require_env_or_skip("KEYCLOAK_URL", "KEYCLOAK_ADMIN_USERNAME", "KEYCLOAK_ADMIN_PASSWORD")
     keycloak_url = creds["KEYCLOAK_URL"]
 
@@ -2244,7 +2235,8 @@ def onboarded_stack(
         load_workload_images(workloads)
 
         # The operator's identity now: each gate failure says when it restarted or was replaced since.
-        context = {"operator": read_operator_identity()}
+        # The trust domain (``require_pipeline``): the probes and the diagnosis both use it.
+        context = {"operator": read_operator_identity(), "trust_domain": trust_domain}
         default_policy = policy_md == scn.POLICY_ABSTRACT  # the CR content checks assume Policy A's names
 
         # Deploy in the rung's ``workloads`` order, one at a time, onboarded before the next — each
@@ -2347,9 +2339,9 @@ def onboarded_stack(
             "keycloak_url": keycloak_url,
             "realm": TEST_REALM,
             "tool_onboarded": tool_onboarded,
-            # The trust domain the live outbound leg exchanges for: read once per stack, here, so a
-            # probe asks for the audience AuthBridge asks for (``exchanged_subject``).
-            "trust_domain": _exchange_trust_domain(),
+            # The trust domain the live outbound leg exchanges for, read once per stack by the skip gate,
+            # so a probe asks for the audience AuthBridge asks for (``exchanged_subject``).
+            "trust_domain": trust_domain,
         }
 
         # Wait for bundle-service + OPA to reflect THIS run's CR (and token-exchange to settle) before

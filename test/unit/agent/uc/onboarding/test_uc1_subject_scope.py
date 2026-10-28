@@ -43,7 +43,9 @@ TOOL_UUID = "tool-uuid"
 LOGIN_UUID = "login-uuid"
 AGENT_NAME = f"{uc1.NAMESPACE}/{scn.AGENT_WORKLOAD}"
 TOOL_NAME = f"{uc1.NAMESPACE}/{scn.TOOL_WORKLOAD}"
-AGENT_CLIENT_ID = f"spiffe://{uc1.TRUST_DOMAIN}/ns/{uc1.NAMESPACE}/sa/{scn.AGENT_WORKLOAD}"
+# The trust domain of the probe ``ctx`` (``_ctx``) and of the agent client's SPIFFE ID, one value.
+TRUST_DOMAIN = "example.org"
+AGENT_CLIENT_ID = f"spiffe://{TRUST_DOMAIN}/ns/{uc1.NAMESPACE}/sa/{scn.AGENT_WORKLOAD}"
 
 # The mapper as the IdP service creates it (the full D31 representation).
 SUBJECT_MAPPER = {
@@ -510,7 +512,7 @@ def _ctx(admin: MagicMock) -> dict:
         "admin": admin,
         "keycloak_url": "http://kc.example:8080",
         "realm": "rossoctl",
-        "trust_domain": "example.org",
+        "trust_domain": TRUST_DOMAIN,
     }
 
 
@@ -557,35 +559,6 @@ def test_exchanged_subject_exchanges_as_the_agent_to_the_tool_audience(monkeypat
     ]
 
 
-@pytest.mark.parametrize(
-    ("kubectl_result", "expected"),
-    [
-        (
-            (
-                True,
-                "pipeline:\n  outbound:\n    plugins:\n      - name: token-exchange-aiac\n        config:\n"
-                '          audience_template: "spiffe://example.org/ns/{namespace}/sa/{service}"\n',
-                "",
-            ),
-            "example.org",
-        ),
-        ((True, "pipeline: {}\n", ""), None),
-        ((False, "", "connection refused"), None),
-    ],
-)
-def test_exchange_trust_domain_reads_the_live_leg_or_raises(
-    monkeypatch: pytest.MonkeyPatch, kubectl_result: tuple, expected: str | None
-) -> None:
-    """The trust domain comes from the live ``token-exchange-aiac`` template; when it cannot be read the
-    harness stops, instead of guessing an audience that fails later."""
-    monkeypatch.setattr(uc1, "_kubectl_try", lambda *args, **kwargs: kubectl_result)
-    if expected is None:
-        with pytest.raises(RuntimeError, match="k8s/opa-kind-enable.sh"):
-            uc1._exchange_trust_domain()
-    else:
-        assert uc1._exchange_trust_domain() == expected
-
-
 def test_exchanged_subject_gives_the_user_id_when_the_link_is_missing(monkeypatch: pytest.MonkeyPatch) -> None:
     """The probe reports the ``sub`` as it is; the rung-2 test compares it with the username."""
     _stub_exchange(monkeypatch, _jwt({"sub": "2a4e729b-0000-4000-8000-000000000000"}))
@@ -603,9 +576,10 @@ def test_exchanged_subject_gives_the_user_id_when_the_link_is_missing(monkeypatc
 def test_exchanged_subject_fails_on_a_refused_client_secret_authentication(
     monkeypatch: pytest.MonkeyPatch, refusal: launcher.TokenExchangeError
 ) -> None:
-    """The agent client uses the ``client-secret`` authenticator (``k8s/opa-kind-enable.sh`` sets the
-    AuthBridge ``token-exchange`` identity to ``client-secret``), so a refused secret is a real fault:
-    a failure, never a skip that hides it."""
+    """The agent client uses the ``client-secret`` authenticator (AuthBridge's ``token-exchange-aiac``,
+    wired by ``k8s/opa-kind-enable.sh``, authenticates only with the client secret the operator writes
+    to ``/shared/client-secret.txt``), so a refused secret is a real fault: a failure, never a skip that
+    hides it."""
     _stub_exchange(monkeypatch, refusal)
     with pytest.raises(AssertionError, match="refused the client-secret authentication"):
         uc1.exchanged_subject(_ctx(_secret_admin()), "dev-user")

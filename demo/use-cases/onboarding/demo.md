@@ -365,11 +365,12 @@ of the `rossoctl` release reverts it. Undo it deliberately with `make restore AR
 
 ## Step 2 — Wire OPA into both AuthBridge legs
 
-Confirm OPA is **NOT** configured in any authbridge leg  — expect `0`:
+Confirm OPA is **NOT** configured in any authbridge leg — expect `0` (the number of legs that run
+`opa`, parsed per leg). Run it from this directory; the check needs `python3` with PyYAML:
 
 ```bash
 kubectl get configmap authbridge-runtime-config -n team1 \
-  -o jsonpath='{.data.config\.yaml}' | grep -c 'name: opa'
+  -o jsonpath='{.data.config\.yaml}' | python3 ../../../k8s/authbridge-pipeline-check.py --opa-legs
 ```
 
 Now insert opa in both inbound and outbound legs of AuthBridge
@@ -400,11 +401,12 @@ Expect two container image builds, so give it a few minutes.
 
 ### Verify
 
-Confirm OPA landed in **both** legs — expect `2`:
+Confirm OPA landed once on **each** leg, with `token-exchange-aiac` on the outbound leg — expect
+`ok trust_domain=<td>` (parsed per leg, the check `k8s/opa-kind-verify.sh` runs):
 
 ```bash
 kubectl get configmap authbridge-runtime-config -n team1 \
-  -o jsonpath='{.data.config\.yaml}' | grep -c 'name: opa'
+  -o jsonpath='{.data.config\.yaml}' | python3 ../../../k8s/authbridge-pipeline-check.py
 ```
 
 `make opa` finishes with `k8s/opa-kind-verify.sh`, which also checks the changed combiner.
@@ -568,10 +570,16 @@ A denial looks like this:
 | Tool inbound | **HTTP 403**, body `{"error":"policy.forbidden","plugin":"opa"}` — the tool's reverse proxy sends it and the agent's forward proxy relays it |
 | Exchange refused | Not an OPA verdict: `token-exchange-aiac` refuses an ungranted audience with `{"error":"policy.forbidden","plugin":"token-exchange-aiac"}` (for MCP, a JSON-RPC error frame at HTTP 200 with `error.data.plugin: "token-exchange-aiac"`), and any other IdP failure with `503` `upstream.token-exchange-failed`. OPA is never consulted |
 
-So classify a tool call by the response **body**: a `result` frame is allowed; an `error` frame, or
-a `403` body that names `opa`, is denied; one that names `token-exchange-aiac` means the WIRE grant
-is missing. A denied request never reaches the `github-tool` app. The
-driver reports these as `ALLOWED_RESULT`, `DENIED_HTTP 403` and `DENIED_JSONRPC`.
+So classify a tool call by the response **body**: a `result` frame (or the tool's own JSON-RPC error)
+is allowed; an `error` frame or a `403` body that names `opa` is denied; one that names
+`token-exchange-aiac` means the WIRE grant is missing. A denied request never reaches the
+`github-tool` app. The driver reports these as `ALLOWED_RESULT`, `DENIED_HTTP 403` and
+`DENIED_JSONRPC`, an exchange refusal or failure as `EXCHANGE_REFUSED <code> <error>`, and anything
+else (a `403` that names no OPA, AuthBridge's fallback frame that names no plugin, a `401`) as
+`UNEXPECTED`. The rule is `k8s/authbridge-rejection.py`, which the system harness uses too. Where it
+expects a deny, ENFORCE passes only `DENIED_HTTP 403`, github-tool's own OPA deny. A
+`DENIED_JSONRPC` is an OPA deny on the agent's outbound, which is a pass-through (D24), so it fails
+ENFORCE too: the tool check never ran.
 
 An inbound allow is also an HTTP 200 carrying a JSON-RPC `Method not found` error — the probe calls
 a deliberately nonexistent method, so reaching the app at all *is* the allow signal.
@@ -690,7 +698,7 @@ each tool call, and `github-agent`'s outbound package is a pass-through (`allow 
 | Signal | Where | Expected |
 |---|---|---|
 | AIAC stack is up | `kubectl get deploy,statefulset -n aiac-system` | 3 deployments + 1 statefulset ready |
-| OPA is wired into both legs | `grep -c 'name: opa'` on `authbridge-runtime-config` | `2` |
+| OPA is wired into both legs | `python3 ../../../k8s/authbridge-pipeline-check.py` on `authbridge-runtime-config` | `ok trust_domain=<td>` |
 | Onboarding was event-driven | `make trigger` output | VERIFY-TRIGGER passes all four checks |
 | A policy was generated | `kubectl get authorizationpolicy github-agent github-tool -n team1` | both exist, each with two `spec.policies[]` |
 | The per-tool check is populated | `github-tool`'s `source_roles` | non-empty |

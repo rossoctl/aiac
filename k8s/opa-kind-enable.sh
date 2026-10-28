@@ -383,9 +383,13 @@ cat > "$OVERLAY_FILE" <<YAML
 #     own namespace) and asks Keycloak. A granted target gets a
 #     token narrowed to it; a destination Keycloak has no client for is the ONLY
 #     passthrough; an existing-but-not-granted target is 403 and any other IdP
-#     failure is 503. A request with no bearer is exchanged with the workload's
-#     own client-credentials token (no_token_policy: client-credentials), never
-#     passed through.
+#     failure is 503. A request with no bearer to a target is denied with 401
+#     (no_token_policy: deny, the plugin default, which the route-based
+#     pipeline also left in place): the workload's own client-credentials token
+#     is never sent in its place, so a process in the pod cannot reach a target
+#     without a user token. A bearer-less request to a destination Keycloak has
+#     no client for still passes through: the plugin asks Keycloak with the
+#     workload's own token only to tell the two apart, and never forwards it.
 #   - opa runs AFTER token-exchange-aiac so the exchange is visible to policy:
 #     each exchange appends a delegation hop, and OPA exposes it as
 #     input.delegation (origin, actor, depth, chain of {subject_id, audience,
@@ -442,7 +446,7 @@ authBridge:
             keycloak_realm: "rossoctl"
             audience_template: "spiffe://{{ index .Values "operator-chart" "signatureVerification" "spireTrustDomain" | default "localtest.me" }}/ns/{namespace}/sa/{service}"
             namespace_file: /var/run/secrets/kubernetes.io/serviceaccount/namespace
-            no_token_policy: "client-credentials"
+            no_token_policy: "deny"
         - name: opa
           config:
             bundle_url: "http://bundle-service.${RELEASE_NAMESPACE}.svc.cluster.local:8080"

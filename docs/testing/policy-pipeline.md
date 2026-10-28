@@ -74,10 +74,17 @@ identity→policy→enforcement pipeline once; the individual tests then assert 
 over the fully onboarded stack.
 
 1. **Skip gates first — before any cluster mutation.** `require_pipeline` skips cleanly if the live
-   AuthBridge OPA pipeline is not wired (no `kubectl`, `AuthorizationPolicy` CRD not served,
-   `bundle-service` not Running, the `opa` plugin not on **both** legs, not exactly one
-   `token-exchange-aiac` and no `token-exchange` (`exchange_plugin_reason`), or the global combiner — the
-   `default` CR in `rossoctl-system` — still allows a pod that has no client CR, D20);
+   AuthBridge OPA pipeline is not wired:
+   - no `kubectl`, the `AuthorizationPolicy` CRD not served, or `bundle-service` not Running;
+   - the global combiner (the `default` CR in `rossoctl-system`) still allows a pod that has no
+     client CR (D20);
+   - the AuthBridge runtime config is not wired (`pipeline_check`, which applies
+     `k8s/authbridge-pipeline-check.py`): `opa` not once on **each** leg; not exactly one
+     `token-exchange-aiac` and no `token-exchange` on the outbound leg; a `token-exchange-aiac`
+     audience template that names no `spiffe://<td>` trust domain; or a `no_token_policy` other
+     than `deny`.
+
+   The gate returns that trust domain, which the harness exchanges for.
    `require_env_or_skip` skips if `KEYCLOAK_URL` / admin creds are unset; `require_event_path` skips if
    the NATS broker is not Running or the realm does not have the `aiac-event-listener` listener with
    `adminEventsEnabled`. The suite never false-passes.
@@ -260,7 +267,7 @@ The suite reads its config from the repo-root `.env` (gitignored); source it bef
 | `LLM_BASE_URL` / `LLM_MODEL` / `LLM_API_KEY` | PRB LLM (pinned `temperature=0`), consumed by the in-cluster AIAC pod | — (required) |
 | `AIAC_TEST_REALM` | Realm the tests resolve/provision against. **Must match the deployed AIAC stack's `KEYCLOAK_REALM`** — the in-cluster Controller resolves the onboarding trigger in *its own* realm | `rossoctl` |
 | `AIAC_DEMO_NAMESPACE` | Namespace the tests deploy (and tear down) the demo workloads into | `team1` |
-| `AIAC_TRUST_DOMAIN` | SPIFFE trust domain the operator registers the demo workloads under | `localtest.me` |
+| `AIAC_TRUST_DOMAIN` | SPIFFE trust domain of the bundle-service probe in a gate failure's state dump, when it differs from the one the exchange uses. The exchange always uses the trust domain of the live `token-exchange-aiac` audience template | the live template's |
 
 > Cluster/stack knobs the harness also honors, with defaults matching the deployed stack (rarely
 > overridden): the Controller namespace/Deployment/selector (`AIAC_CONTROLLER_NAMESPACE` /

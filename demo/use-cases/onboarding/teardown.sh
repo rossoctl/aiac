@@ -194,9 +194,17 @@ info "namespace ${AIAC_NS}:            $(kubectl get ns "$AIAC_NS" >/dev/null 2>
 info "deployment ${NS}/github-agent:   $(present deployment github-agent "$NS" | sed 's/yes/present/;s/no/absent/')"
 info "deployment ${NS}/github-tool:    $(present deployment github-tool "$NS" | sed 's/yes/present/;s/no/absent/')"
 info "configmap ${NS}/authbridge-config: $(present configmap authbridge-config "$NS" | sed 's/yes/present/;s/no/absent/')"
-OPA_COUNT=$(kubectl get configmap authbridge-runtime-config -n "$NS" \
-              -o jsonpath='{.data.config\.yaml}' 2>/dev/null | grep -c 'name: opa' || true)
-info "OPA legs wired in ${NS}:         ${OPA_COUNT:-0} (2 = both; teardown leaves this unless --include-opa)"
+# Parsed per leg by the shared wiring check (k8s/authbridge-pipeline-check.py), so a comment or a
+# duplicate entry on one leg does not count. It needs PyYAML; without it the count is unknown, not 0.
+if ! python3 -c 'import yaml' >/dev/null 2>&1; then
+  OPA_COUNT="unknown (python3 has no PyYAML)"
+elif ! RUNTIME_CFG=$(kubectl get configmap authbridge-runtime-config -n "$NS" -o jsonpath='{.data.config\.yaml}' 2>/dev/null); then
+  OPA_COUNT="unknown (cannot read authbridge-runtime-config in ${NS})"
+else
+  OPA_COUNT=$(python3 "${AIAC_DIR}/k8s/authbridge-pipeline-check.py" --opa-legs <<<"$RUNTIME_CFG" 2>/dev/null || true)
+  [ -n "$OPA_COUNT" ] || OPA_COUNT="unknown (k8s/authbridge-pipeline-check.py printed nothing)"
+fi
+info "OPA legs wired in ${NS}:         ${OPA_COUNT} (2 = both; teardown leaves this unless --include-opa)"
 
 if [ "$DRY_RUN" -eq 0 ] && [ "$ASSUME_YES" -eq 0 ]; then
   if [ "$AIAC_ONLY" -eq 1 ]; then

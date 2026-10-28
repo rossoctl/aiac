@@ -12,8 +12,8 @@ AuthBridge's outbound leg (`app → parsers → <exchange plugin> → opa → de
 | Which hosts get exchanged | Only hosts listed in the `authproxy-routes` ConfigMap. Every other host passes through. | Every in-cluster host. Keycloak decides whether the host is a target. |
 | How the audience is chosen | The route's `target_audience` | Derived from the Host header: `spiffe://<td>/ns/<namespace>/sa/<service>` |
 | `scope` in the RFC 8693 request | Sent when the route sets `token_scopes` | Never sent, so only the caller's **default** client scopes apply |
-| Config | `default_policy: passthrough`, `identity: client-secret`, plus routes | `audience_template`, `namespace` (for short host names), `no_token_policy: client-credentials` (the default is `deny`, as in `token-exchange`). Unknown keys are rejected. |
-| How to add a target | Edit `authproxy-routes`, then restart the agent (routes are read once at startup) | Change Keycloak only. No restart is needed, except to clear a cached "unknown audience" (5 min). |
+| Config | `default_policy: passthrough`, `identity: client-secret`, plus routes | `audience_template`, `namespace` (for short host names), `no_token_policy: deny` (the default, as in `token-exchange`). Unknown keys are rejected. |
+| How to add a target | Edit `authproxy-routes`, then restart the agent (routes are read once at startup) | Change Keycloak only. No restart is needed, except to clear a cached "unknown audience" (5 min): a caller that called the target before its client existed keeps passing through un-exchanged for up to 5 min, so restart it. |
 | Default behaviour | Pass through | Exchange |
 | Reading the bearer | `auth.ExtractBearer`, `resolve_placeholders` | The same: `auth.ExtractBearer`, `resolve_placeholders` |
 | `no_token_policy` | `allow` / `deny` / `client-credentials`, default `deny` | The same values and default |
@@ -28,7 +28,7 @@ AuthBridge's outbound leg (`app → parsers → <exchange plugin> → opa → de
 | Client exists but is **not granted** to the caller | Passed through when there was no route. With a route, 503. | **403**, `plugin: "token-exchange-aiac"`, `policy.forbidden`. OPA is not consulted. |
 | Keycloak down, timeout, or bad credentials | 503 `upstream.token-exchange-failed` | 503 `upstream.token-exchange-failed` (`deny / exchange_failed`). Unchanged. |
 | Sidecar credentials not yet in `/shared/` | Not covered by the old docs | 503, and the pod is held not-ready (`credentials_not_ready`) |
-| Request with **no** bearer | Chart default (no `no_token_policy` was set). Under `client-credentials`, the `client_credentials` token itself is sent. | AIAC sets `client-credentials`: exchanged with the workload's own `client_credentials` token as the subject. It is never sent un-narrowed. Unset, the default `deny` answers 401 `auth.unauthorized` (`token-exchange` sends `upstream.token-exchange-failed` for the same 401). |
+| Request with **no** bearer | Chart default (no `no_token_policy` was set): `deny`, 401. | AIAC sets `deny` (the default): a target answers 401 `auth.unauthorized` (`token-exchange` sends `upstream.token-exchange-failed` for the same 401). A destination with no Keycloak client still passes through. `client-credentials` is not used: it would let any process in the pod that sends no bearer reach a target as the agent. |
 | Target granted only as an **optional** client scope | Worked, because the route asked for the scope through `token_scopes` | 403 (`audience_not_granted`). The scope must be a **default** scope. |
 | Extra scope the target reads (for example `github-full-access`) | Asked for in the route's `token_scopes` | Must be a default scope of the caller's client |
 | Service name ≠ ServiceAccount name (demo `MCP_URL` host `github-tool-mcp`, client `…/sa/github-tool`) | Exchanged through the route `github-tool-mcp → github-tool` | The derived audience names no client, so the call **passes through un-exchanged**. Point `MCP_URL` at `github-tool`. |

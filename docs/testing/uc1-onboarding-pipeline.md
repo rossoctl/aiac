@@ -130,9 +130,10 @@ leg always** — plus the **outbound leg only where a tool is onboarded** (rungs
 pass-through (D24), and github-tool's own inbound OPA decides each tool call: on github-tool's inbound,
 `jwt-validation` builds `input.identity` from the exchanged token (`subject` = the user, `client_id` =
 the calling agent) and `mcp-parser` builds `input.mcp.params.name`. Rung 1 (agent only) probes the **inbound leg only**: with no
-tool onboarded there is no real `agent -> tool` call, and `token-exchange-aiac` settles the call before
-OPA (no `github-tool` client, or no `github-tool` audience grant on the agent client), so an outbound probe
-would observe an exchange passthrough or refusal rather than the AIAC OPA policy the rung exists to prove. The agent's own CrewAI reasoning flow is
+tool onboarded there is no real `agent -> tool` call: Keycloak has no `github-tool` client, so
+`token-exchange-aiac` passes the call through un-exchanged (`audience_unknown`), and an outbound probe
+would observe the agent's pass-through outbound OPA (D24) on a request that reaches no tool, rather than
+the tool check the rung exists to prove. The agent's own CrewAI reasoning flow is
 **not** triggered — the probes are synthetic requests through AuthBridge (an inbound `ping/nonexistent` JSON-RPC call;
 an outbound bare `tools/call`) — but the traffic is real and the deployed plugin enforces it.
 
@@ -177,13 +178,18 @@ Deployment and Keycloak registration are **no longer** preconditions — they ar
 *[Per-rung flow](#per-rung-flow)*). What the tests assume is the standing platform, and they **skip
 cleanly** when any of it is absent (they never stand it up, and never false-pass):
 
-- **Pipeline wired.** The AuthBridge OPA plugin is wired into both legs (`k8s/opa-kind-enable.sh`);
-  `require_pipeline` skips cleanly if not (no `kubectl`, `AuthorizationPolicy` CRD not served,
-  `bundle-service` not Running, the `opa` plugin not present on both legs, not exactly one
-  `token-exchange-aiac` and no `token-exchange` (`exchange_plugin_reason`, the rule of
-  `opa-kind-verify.sh`: the harness adds no route, so an older `token-exchange` pipeline would send the
-  tool call unexchanged), or the global combiner still allows a pod that has no client CR — see the
-  next item).
+- **Pipeline wired.** The AuthBridge OPA plugin is wired into both legs (`k8s/opa-kind-enable.sh`).
+  `require_pipeline` skips cleanly if not:
+  - no `kubectl`, the `AuthorizationPolicy` CRD not served, or `bundle-service` not Running;
+  - the global combiner still allows a pod that has no client CR (see the next item);
+  - the AuthBridge runtime config is not wired (`pipeline_check`, which applies
+    `k8s/authbridge-pipeline-check.py`, the file `opa-kind-verify.sh` runs): `opa` not once on each
+    leg; not exactly one `token-exchange-aiac` and no `token-exchange` on the outbound leg (the
+    harness adds no route, so an older `token-exchange` pipeline would send the tool call
+    unexchanged); a `token-exchange-aiac` audience template that names no `spiffe://<td>` trust
+    domain; or a `no_token_policy` other than `deny`.
+
+  The gate returns that trust domain, which the harness exchanges for.
 - **The changed global combiner (D20).** `k8s/opa-kind-enable.sh` applies a changed `default`
   `AuthorizationPolicy` CR in `rossoctl-system`. Its two request packages have no
   `client_ok if not data.authbridge.client.inbound.request` /
@@ -707,7 +713,7 @@ The suite reads its config from the repo-root `.env` (gitignored); source it bef
 | `LLM_BASE_URL` / `LLM_MODEL` / `LLM_API_KEY` | PRB LLM (pinned `temperature=0`); consumed by the in-cluster AIAC pod | — (required) |
 | `AIAC_TEST_REALM` | Realm the tests provision/read back against. **Must match the deployed AIAC stack's `KEYCLOAK_REALM`** — the in-cluster consumer onboards in *its own* realm off the `CLIENT_CREATED` event, so a harness that provisions roles in a different realm would leave onboarding unable to see them | `rossoctl` |
 | `AIAC_DEMO_NAMESPACE` | Namespace the tests deploy (and tear down) the demo workloads into | `team1` |
-| `AIAC_TRUST_DOMAIN` | SPIFFE trust domain the operator registers the demo workloads under | `localtest.me` |
+| `AIAC_TRUST_DOMAIN` | SPIFFE trust domain of the bundle-service probe in a gate failure's state dump, when it differs from the one the exchange uses. The exchange always uses the trust domain of the live `token-exchange-aiac` audience template | the live template's |
 | NATS Event Broker (not an env var) | Precondition. `require_event_path` skips unless pods labelled `app=aiac-event-broker` in `aiac-system` are Running; the harness has no env var for the broker | — (`k8s/event-broker-deployment.yaml`) |
 | SPI listener (realm `eventsListeners`) | Must contain `aiac-event-listener` (with `adminEventsEnabled: true`) so `CLIENT_CREATED` reaches NATS (precondition) | — (Helm/realm setup, per `keycloak-spi/README.md`) |
 

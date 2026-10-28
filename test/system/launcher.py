@@ -22,7 +22,8 @@ Two halves, both live here so a single module import serves every launcher:
 The evaluator is now the deployed plugin, not a standalone OPA-CLI run over dumped ``.rego``: there is
 deliberately no ``opa`` binary dependency and no ``.rego``-dump oracle here anymore.
 
-At import time it imports only the standard library and ``requests`` — never ``aiac`` — so a
+At import time it imports only the standard library and ``requests`` — never ``aiac``, and never the
+shared ``k8s/`` files, which load on first use (``_load_k8s_module``) — so a
 launcher may import it *before* setting the environment variables the aiac libraries read at import
 time. ``pytest`` is imported lazily inside the skip gates (only the live suite uses them, and only
 under pytest) so the module stays importable in the standalone launchers; the combiner gate
@@ -693,7 +694,8 @@ def notification_outcome(code: int | None, body: str) -> str:
     (``token-exchange-aiac``'s 403 ``policy.forbidden``) is never reported as an OPA deny."""
     if code in (200, 202):
         return "allow"
-    if code == 403 and is_opa_violation(rejection_doc(code, body)):
+    rej = _rejection()
+    if code == 403 and rej.is_opa_violation(rej.rejection_doc(code, body)):
         return "deny"
     return "error"
 
@@ -708,165 +710,50 @@ def inbound_outcome(code: int | None) -> str:
     return "error"
 
 
-def is_opa_violation(doc: object) -> bool:
-    """True when ``doc`` (a parsed rejection body, or the ``error.data`` of a JSON-RPC error frame)
-    names the OPA plugin: ``plugin == "opa"``, or, when no ``plugin`` is named, ``error ==
-    "policy.forbidden"`` (cortex ``pipeline.Violation.Render`` / ``httpx.MarshalMCPRejectionBody``).
-    A named non-OPA plugin never counts: ``token-exchange-aiac`` also answers ``policy.forbidden``
-    (a target not granted to the caller), and that refusal is not an OPA verdict."""
-    if not isinstance(doc, dict):
-        return False
-    plugin = doc.get("plugin")
-    if plugin is not None:
-        return plugin == "opa"
-    return doc.get("error") == "policy.forbidden"
+K8S_DIR = Path(__file__).resolve().parents[2] / "k8s"
 
 
-# The outbound exchange plugins, either of which may sit before OPA on the agent's outbound leg
-# (``k8s/opa-kind-enable.sh`` wires ``token-exchange-aiac``), and the error code of a failed exchange.
-EXCHANGE_PLUGINS = frozenset({"token-exchange", "token-exchange-aiac"})
-EXCHANGE_FAILED_ERROR = "upstream.token-exchange-failed"
+def _load_k8s_module(name: str):
+    """The module of ``k8s/<name>.py``, loaded by path, once. ``k8s/`` is not a package and its file
+    names have hyphens; each file is shared with a shell script that runs it. Raises ``ImportError``
+    naming the file when it is missing."""
+    key = "_aiac_k8s_" + name.replace("-", "_")
+    mod = sys.modules.get(key)
+    if mod is None:
+        import importlib.util
+
+        path = K8S_DIR / f"{name}.py"
+        if not path.is_file():
+            raise ImportError(f"{path} is missing: the harness shares it with the k8s/ and demo scripts")
+        spec = importlib.util.spec_from_file_location(key, path)
+        mod = importlib.util.module_from_spec(spec)
+        try:
+            spec.loader.exec_module(mod)
+        except ImportError:
+            raise
+        except Exception as exc:  # a broken file: name it, so a gate skips and an import says why
+            raise ImportError(f"{path} does not load: {type(exc).__name__}: {exc}") from exc
+        sys.modules[key] = mod
+    return mod
 
 
-def is_exchange_refusal(doc: object) -> bool:
-    """True when ``doc`` (a parsed rejection body, or the ``error.data`` of a JSON-RPC error frame) is
-    a refusal of the outbound token exchange — the request never reached OPA."""
-    if not isinstance(doc, dict):
-        return False
-    plugin = doc.get("plugin")
-    return (isinstance(plugin, str) and plugin in EXCHANGE_PLUGINS) or doc.get("error") == EXCHANGE_FAILED_ERROR
+# Whose rejection an outbound answer is: ``k8s/authbridge-rejection.py`` (standard library only), which the
+# onboarding demo driver sends into the agent pod with its probe, so the demo and the harness classify an
+# answer by one rule. Its public names are this module's too (``outbound_outcome``, ``rejection_doc``,
+# ``TARGET_DISABLED_MESSAGE`` …; their docstrings are there), through module ``__getattr__``: the file
+# loads on first use, so importing this module never needs ``k8s/``. ``pipeline_check`` loads it too, so
+# a missing or broken file skips the live suite up front instead of failing in a poll.
+def _rejection():
+    return _load_k8s_module("authbridge-rejection")
 
 
-def exchange_refusal(code: int | None, body: str) -> bool:
-    """True when the outbound answer ``(code, body)`` is the exchange plugin's **refusal**: Keycloak
-    answered and did not grant the tool's audience to the caller (``policy.forbidden``, as a JSON-RPC
-    error frame in an HTTP 200 or as a plain 403 reject body). **Pure.** A failed exchange
-    (``upstream.token-exchange-failed``, an IdP that errored or was unreachable) is **not** a refusal:
-    it proves nothing about the caller's grants."""
-    doc = rejection_doc(code, body)
-    return is_exchange_refusal(doc) and doc.get("error") == "policy.forbidden"
-
-
-# ``token-exchange-aiac`` answers both "not granted" and "target disabled" with ``policy.forbidden``; only
-# the message tells them apart (cortex ``core/plugins/tokenexchangeaiac/plugin.go``, the ``deny`` of
-# ``outcomeTargetDisabled``). The response carries no reason code, so a reworded message there must be
-# copied here; the rollback test then fails as ``error``, never passes wrongly.
-TARGET_DISABLED_MESSAGE = "the destination's client is disabled"
-
-
-def target_disabled_refusal(code: int | None, body: str) -> bool:
-    """True when the outbound answer ``(code, body)`` is the exchange plugin's refusal **because the
-    target's client is disabled** (``target_disabled``), not any other refusal. **Pure.** A refusal for a
-    target not granted to the caller (``audience_not_granted``) proves nothing about the target's
-    client, so it does not count."""
-    if not exchange_refusal(code, body):
-        return False
-    doc = _json_or_none(body)
-    # A frame at HTTP 200 carries the message in ``error.message`` (``httpx.MarshalMCPRejectionBody``);
-    # a plain 403 body carries it at the top (``pipeline.Violation.Render``).
-    holder = doc.get("error") if code == 200 else doc
-    return isinstance(holder, dict) and holder.get("message") == TARGET_DISABLED_MESSAGE
-
-
-def _json_or_none(body: str) -> object:
-    """``json.loads(body)``, or ``None`` when the body is not JSON."""
+def __getattr__(name: str):
+    if name.startswith("_"):
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
     try:
-        return json.loads(body)
-    except (ValueError, TypeError):
-        return None
-
-
-def rejection_doc(code: int | None, body: str) -> dict | None:
-    """The rejection document of an outbound answer ``(code, body)``, the one place that knows the two
-    shapes AuthBridge renders a rejection in. **Pure.**
-
-      * HTTP 200 with a JSON-RPC error frame -> its ``error.data`` (the forward proxy renders a
-        rejection of an MCP-shaped request this way, ``writeMCPRejection``);
-      * HTTP 403 with a plain JSON body that is not a JSON-RPC frame -> the body
-        (``httpx.WriteRejection``);
-      * anything else (an allow, a ``result`` frame, a transport error, a non-JSON body) -> ``None``.
-
-    ``is_opa_violation`` and ``is_exchange_refusal`` then tell whose rejection it is."""
-    doc = _json_or_none(body)
-    if not isinstance(doc, dict):
-        return None
-    if code == 200:
-        err = doc.get("error")
-        data = err.get("data") if isinstance(err, dict) else None
-        return data if isinstance(data, dict) else None
-    if code == 403 and "jsonrpc" not in doc:
-        return doc
-    return None
-
-
-# The JSON-RPC error code of every rejection AuthBridge's forward proxy renders (cortex
-# ``httpx.jsonRPCServerError``), its minimal fallback frames included.
-AUTHBRIDGE_RPC_ERROR = -32000
-
-
-def outbound_outcome(code: int | None, body: str) -> str:
-    """Classify an outbound probe by **body** (``k8s/opa-kind-runbook.md`` "Reading a decision").
-
-    A denied ``tools/call`` has one of two shapes:
-
-      * **The callee's inbound** — the agent's outbound is a pass-through (PRD D24), and the
-        **callee's inbound** OPA (github-tool's reverse proxy) decides. The reverse proxy renders a
-        rejection with ``httpx.WriteRejection``: **HTTP 403** and a plain JSON body
-        (``{"error": "policy.forbidden", "message": …, "plugin": "opa"}``). The agent's forward proxy
-        relays that response as it is. A 403 whose body names OPA -> ``"deny"``. A 403 with any other
-        body -> ``"error"``: it is not an OPA verdict, so it must not stand in for one.
-      * **The agent's forward proxy** — a plugin on the agent's outbound rejects the request (for
-        example the agent's OPA, with the PRD D20 combiner deny when the agent has no CR). On an
-        MCP-shaped request (a ``method`` + ``id``) AuthBridge's forward proxy renders **any**
-        rejection as a JSON-RPC error frame **at HTTP 200** (``writeMCPRejection`` — the MCP client
-        sees a single failed tool call, not a transport break), so the frame's ``error.data`` — not
-        the HTTP status — carries the reason.
-
-    The reason of a JSON-RPC error frame at HTTP 200 decides the class:
-
-      * **OPA** blocked it — ``error.data.plugin == "opa"`` / ``error.data.error == "policy.forbidden"``
-        -> ``"deny"``. This is an OPA verdict, but not the tool check: the agent's outbound is a
-        pass-through, so it comes only from a fault (for example the PRD D20 combiner deny).
-        ``deny_origin`` tells it apart from the deny of the callee's inbound.
-      * the **exchange plugin** (``token-exchange-aiac``, or a legacy ``token-exchange``) refused to
-        mint the downstream token — ``error.data.plugin`` in ``EXCHANGE_PLUGINS``, or ``error.data.error
-        == "upstream.token-exchange-failed"`` (``is_exchange_refusal``) -> ``"error"``,
-        NOT ``"deny"``. A refused RFC 8693 exchange means the outbound authorization decision was
-        **never reached** — the exchange broke *before* OPA — so it is not an OPA deny and must not be
-        reported as one. Reporting it as ``"error"`` (a) surfaces a genuine token-exchange fault on a
-        tool-onboarded rung honestly instead of masking it as ``"allow"`` (its old fall-through) or
-        mislabelling it ``"deny"``, and (b) keeps the classifier from ever standing in for OPA. The
-        agent-only rung (rung 1) does not probe outbound at all — with no tool there is no real
-        ``agent -> tool`` call and the exchange would settle it before OPA anyway — so this frame is
-        not an expected verdict on any rung; it always signals a fault worth surfacing.
-
-    So: a plain ``403`` whose body names OPA (the callee's inbound; or the agent's own
-    non-MCP-shaped rejection fallback) -> ``"deny"``; any other ``403`` -> ``"error"``; HTTP 200 with an
-    OPA error frame -> ``"deny"``; HTTP 200 with an exchange error frame, or AuthBridge's minimal fallback
-    frame (code ``AUTHBRIDGE_RPC_ERROR``, ``error.data`` absent or null, so no plugin named) -> ``"error"``; HTTP 200 with any other body (a ``result`` frame, or a tool-level error that means the call was *allowed*
-    through) -> ``"allow"``; ``None`` or any other status (a transport break, a 401 from the callee's
-    ``jwt-validation``, a 503 before the first bundle loads, or a non-MCP exchange ``503``) ->
-    ``"error"``. Classify by the body, never the transport status alone."""
-    doc = rejection_doc(code, body)
-    if code == 403:
-        return "deny" if is_opa_violation(doc) else "error"
-    frame = _json_or_none(body) if code == 200 else None
-    if not isinstance(frame, dict):
-        return "error"
-    err = frame.get("error")
-    if isinstance(err, dict) and err.get("data") is None and err.get("code") == AUTHBRIDGE_RPC_ERROR:
-        # AuthBridge's minimal or constant frame when it cannot render a rejection in full (cortex
-        # ``httpx.MarshalMCPRejectionBody``; its full frame sets ``data`` to null when it has none):
-        # rejected, but no plugin is named, so it is neither an OPA verdict nor an allow. A JSON-RPC error of the tool itself has another code.
-        return "error"
-    # Exchange refusal = the outbound decision was never reached (exchange broke before
-    # OPA). Honest class is "error", never "deny" — it must not stand in for an OPA verdict.
-    if is_exchange_refusal(doc):
-        return "error"
-    # A real OPA verdict — the exchange succeeded and the request reached the policy.
-    if is_opa_violation(doc):
-        return "deny"
-    return "allow"
+        return getattr(_rejection(), name)
+    except AttributeError:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from None
 
 
 # Where the deny of a ``tools/call`` comes from (``deny_origin``): the callee's own inbound OPA
@@ -891,7 +778,8 @@ def deny_origin(code: int | None, body: str) -> str | None:
 
     Only a request frame (``tools/call`` with an ``id``) has two distinct shapes. A notification gets a
     plain 403 from either proxy, so this helper does not apply to it."""
-    if not is_opa_violation(rejection_doc(code, body)):
+    rej = _rejection()
+    if not rej.is_opa_violation(rej.rejection_doc(code, body)):
         return None
     return DENY_ORIGIN_TOOL_INBOUND if code == 403 else DENY_ORIGIN_AGENT_OUTBOUND
 
@@ -971,78 +859,49 @@ def combiner_reason(default_cr: dict | None, *, namespace: str = BUNDLE_SERVICE_
     return None
 
 
-def _leg_plugins(config_yaml: str) -> dict[str, list[dict]]:
-    """The plugin entries (mappings) of each leg of the AuthBridge runtime config ``config_yaml``, as
-    ``{"inbound": [...], "outbound": [...]}``. **Pure.** A leg the config does not have, an entry that is
-    not a mapping, or a config that is not YAML gives nothing. PyYAML (a dependency of ``kubernetes``) is
-    imported here, so the module keeps its stdlib + ``requests`` imports."""
-    import yaml
+# ``pipeline_check`` applies the one wiring rule of the AuthBridge runtime config (opa on each leg, one
+# ``token-exchange-aiac`` and no ``token-exchange`` outbound, a ``spiffe://<td>/...`` audience template,
+# ``no_token_policy`` deny), ``k8s/authbridge-pipeline-check.py``, which ``k8s/opa-kind-verify.sh`` and the demo driver's preflight
+# run. It is loaded on first use (``_load_k8s_module``), so PyYAML (a dependency of ``kubernetes``) is
+# imported only then.
 
+
+def pipeline_check(config_yaml: str, *, namespace: str) -> tuple[str | None, str | None]:
+    """``(skip_reason, trust_domain)`` of the AuthBridge runtime config ``config_yaml``
+    (``authbridge-runtime-config`` ``config.yaml``) of ``namespace``, parsed once. It loads
+    ``k8s/authbridge-pipeline-check.py`` on first use; a missing file is a skip reason.
+    ``skip_reason`` is ``None`` when the config is wired for the harness: the rule of
+    ``k8s/authbridge-pipeline-check.py`` (``check``), the same file ``k8s/opa-kind-verify.sh`` (Verify 1)
+    runs — ``opa`` once on each leg, ``token-exchange-aiac`` once and ``token-exchange`` not at all on the
+    outbound leg, a ``spiffe://<td>/...`` audience template, and ``no_token_policy`` deny (or unset). ``trust_domain`` is that ``<td>``, the
+    trust domain the live leg exchanges for (``k8s/opa-kind-enable.sh`` takes it from the chart)."""
     try:
-        doc = yaml.safe_load(config_yaml)
-    except yaml.YAMLError:
-        doc = None
-    pipeline = doc.get("pipeline") if isinstance(doc, dict) else None
-    legs: dict[str, list[dict]] = {}
-    for leg in ("inbound", "outbound"):
-        node = pipeline.get(leg) if isinstance(pipeline, dict) else None
-        plugins = node.get("plugins") if isinstance(node, dict) else None
-        legs[leg] = [p for p in plugins or [] if isinstance(p, dict)]
-    return legs
+        check = _load_k8s_module("authbridge-pipeline-check").check
+        import yaml  # noqa: F401 — check() imports it when it parses: name a missing PyYAML up front
+
+        _rejection()  # the outbound classifiers' file: a missing or broken one skips here, not in a poll
+    except ImportError as exc:  # a shared file or PyYAML is missing: skip, never crash the gate
+        return f"cannot apply the shared wiring check: {exc}", None
+    problem, trust_domain = check(config_yaml)
+    if problem:
+        return f"{problem} in {namespace} — run k8s/opa-kind-enable.sh", None
+    return None, trust_domain
 
 
-def pipeline_plugins(config_yaml: str) -> dict[str, list[str]]:
-    """The plugin names of each leg of the AuthBridge runtime config ``config_yaml``
-    (``authbridge-runtime-config`` ``config.yaml``), as ``{"inbound": [...], "outbound": [...]}``.
-    **Pure.** A leg the config does not have, or a config that is not YAML, gives an empty list."""
-    return {
-        leg: [p["name"] for p in plugins if isinstance(p.get("name"), str)]
-        for leg, plugins in _leg_plugins(config_yaml).items()
-    }
-
-
-def exchange_trust_domain(config_yaml: str) -> str | None:
-    """The SPIFFE trust domain in the ``audience_template`` of the outbound ``token-exchange-aiac`` of
-    the AuthBridge runtime config ``config_yaml``, or ``None`` when there is none (no such plugin, a
-    template that is not ``spiffe://<td>/...``, a config that is not YAML). **Pure.** The trust domain
-    the live leg exchanges for, which ``k8s/opa-kind-enable.sh`` takes from the chart."""
-    for p in _leg_plugins(config_yaml)["outbound"]:
-        config = p.get("config")
-        if p.get("name") == "token-exchange-aiac" and isinstance(config, dict):
-            template = config.get("audience_template")
-            if isinstance(template, str) and template.startswith("spiffe://"):
-                return template[len("spiffe://") :].split("/", 1)[0] or None
-    return None
-
-
-def exchange_plugin_reason(legs: dict[str, list[str]], *, namespace: str) -> str | None:
-    """Return ``None`` when the outbound leg of ``legs`` (``pipeline_plugins``) has
-    ``token-exchange-aiac`` once and ``token-exchange`` not at all, else a skip reason. **Pure.** The
-    rule of ``k8s/opa-kind-verify.sh`` (Verify 1), on the outbound leg only: the harness adds no
-    outbound route, so only ``token-exchange-aiac`` exchanges the agent's call to the tool, and a
-    ``token-exchange`` entry means the pipeline predates the switch."""
-    outbound = legs.get("outbound", [])
-    new, legacy = outbound.count("token-exchange-aiac"), outbound.count("token-exchange")
-    if new == 1 and legacy == 0:
-        return None
-    return (
-        f"outbound exchange plugins in {namespace}: token-exchange-aiac={new}, token-exchange={legacy} "
-        "(want 1/0, an older pipeline) — run k8s/opa-kind-enable.sh"
-    )
-
-
-def pipeline_unwired_reason(*, namespace: str, workloads: list[str]) -> str | None:
-    """Return ``None`` when the live AuthBridge OPA pipeline is fully wired for ``namespace``, else a
-    human-readable reason the suite should skip. Checks (cheap -> specific): ``kubectl`` present, the
-    ``AuthorizationPolicy`` CRD served, ``bundle-service`` Running, the global combiner changed (D20,
-    ``combiner_reason``), the ``opa`` plugin on **both** legs of ``namespace``'s AuthBridge runtime
-    config, its outbound exchange plugin (``exchange_plugin_reason``), and each ``workloads`` pod Running."""
+def pipeline_unwired_reason(*, namespace: str, workloads: list[str]) -> tuple[str | None, str | None]:
+    """Return ``(None, trust_domain)`` when the live AuthBridge OPA pipeline is fully wired for
+    ``namespace``, else ``(reason, None)`` with a human-readable reason the suite should skip. Checks
+    (cheap -> specific): ``kubectl`` present, the ``AuthorizationPolicy`` CRD served, ``bundle-service``
+    Running, the global combiner changed (D20, ``combiner_reason``), the wiring of ``namespace``'s
+    AuthBridge runtime config (``pipeline_check``: ``opa`` on each leg, the outbound exchange plugin and
+    its trust domain), and each ``workloads`` pod Running. ``trust_domain`` comes from the same read of
+    the config that the check approved."""
     if shutil.which("kubectl") is None:
-        return "kubectl not on PATH"
+        return "kubectl not on PATH", None
 
     ok, _, err = _kubectl_try("get", "crd", "authorizationpolicies.agent.rossoctl.dev", "-o", "name")
     if not ok:
-        return f"AuthorizationPolicy CRD not served / cluster unreachable ({err or 'no output'})"
+        return f"AuthorizationPolicy CRD not served / cluster unreachable ({err or 'no output'})", None
 
     ns = BUNDLE_SERVICE_NAMESPACE
     ok, out, err = _kubectl_try(
@@ -1056,20 +915,20 @@ def pipeline_unwired_reason(*, namespace: str, workloads: list[str]) -> str | No
         "jsonpath={.items[*].status.phase}",
     )
     if not ok:
-        return f"cannot query bundle-service in {ns} ({err})"
+        return f"cannot query bundle-service in {ns} ({err})", None
     if "Running" not in out:
-        return f"bundle-service is not Running in {ns}"
+        return f"bundle-service is not Running in {ns}", None
 
     ok, out, err = _kubectl_try("get", "authorizationpolicy", "default", "-n", ns, "-o", "json", "--ignore-not-found")
     if not ok:
-        return f"cannot read the global combiner (AuthorizationPolicy 'default') in {ns} ({err})"
+        return f"cannot read the global combiner (AuthorizationPolicy 'default') in {ns} ({err})", None
     try:
         default_cr = json.loads(out) if out.strip() else None
     except ValueError:
-        return f"cannot parse the global combiner (AuthorizationPolicy 'default') in {ns}"
+        return f"cannot parse the global combiner (AuthorizationPolicy 'default') in {ns}", None
     reason = combiner_reason(default_cr, namespace=ns)
     if reason:
-        return reason
+        return reason, None
 
     ok, out, err = _kubectl_try(
         "get",
@@ -1081,14 +940,10 @@ def pipeline_unwired_reason(*, namespace: str, workloads: list[str]) -> str | No
         r"jsonpath={.data.config\.yaml}",
     )
     if not ok:
-        return f"authbridge-runtime-config not found in {namespace} ({err})"
-    legs = pipeline_plugins(out)
-    wired = sum("opa" in names for names in legs.values())
-    if wired < 2:
-        return f"OPA plugin not wired into both legs in {namespace} (found {wired} of 2) — run k8s/opa-kind-enable.sh"
-    reason = exchange_plugin_reason(legs, namespace=namespace)
+        return f"authbridge-runtime-config not found in {namespace} ({err})", None
+    reason, trust_domain = pipeline_check(out, namespace=namespace)
     if reason:
-        return reason
+        return reason, None
 
     for workload in workloads:
         ok, out, err = _kubectl_try(
@@ -1102,16 +957,17 @@ def pipeline_unwired_reason(*, namespace: str, workloads: list[str]) -> str | No
             "jsonpath={.items[*].status.phase}",
         )
         if not ok:
-            return f"cannot query workload {workload!r} in {namespace} ({err})"
+            return f"cannot query workload {workload!r} in {namespace} ({err})", None
         if "Running" not in out:
-            return f"workload {workload!r} is not Running in {namespace}"
+            return f"workload {workload!r} is not Running in {namespace}", None
 
-    return None
+    return None, trust_domain
 
 
-def require_pipeline(*, namespace: str, workloads: list[str]) -> None:
-    """``pytest.skip`` with a clear message when the live pipeline is not wired (acceptance #4)."""
-    reason = pipeline_unwired_reason(namespace=namespace, workloads=workloads)
+def require_pipeline(*, namespace: str, workloads: list[str]) -> str:
+    """``pytest.skip`` with a clear message when the live pipeline is not wired (acceptance #4); else
+    return the trust domain the live outbound leg exchanges for (``pipeline_unwired_reason``)."""
+    reason, trust_domain = pipeline_unwired_reason(namespace=namespace, workloads=workloads)
     if reason:
         import pytest
 
@@ -1119,6 +975,7 @@ def require_pipeline(*, namespace: str, workloads: list[str]) -> None:
             f"live AuthBridge OPA pipeline not wired: {reason}. Stand it up with "
             "k8s/opa-kind-enable.sh (see k8s/opa-kind-runbook.md)."
         )
+    return trust_domain
 
 
 def event_path_reason(*, broker_phase: str, realm_config: dict) -> str | None:

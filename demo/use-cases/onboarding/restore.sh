@@ -188,8 +188,8 @@ NOT reverted (additive infra, left in place — delete the namespace by hand for
 Also still in place: the Keycloak SPI listener + derived image from ./enable.sh — re-run this
 script with --include-infra to reverse those too.")
 
-Verify OPA count is unaffected by this restore (still 2 — this script never touches the OPA
-overlay from k8s/opa-kind-enable.sh):
+Verify the pipeline wiring is unaffected by this restore (still "ok trust_domain=..." — this
+script never touches the OPA overlay from k8s/opa-kind-enable.sh):
   kubectl get configmap authbridge-runtime-config -n ${NS} \\
-    -o jsonpath='{.data.config\.yaml}' | grep -c 'name: opa'
+    -o jsonpath='{.data.config\.yaml}' | python3 ${AIAC_DIR}/k8s/authbridge-pipeline-check.py
 EOF

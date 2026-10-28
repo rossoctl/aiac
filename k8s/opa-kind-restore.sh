@@ -100,10 +100,10 @@ kubectl delete pods -n "$AGENT_NAMESPACE" -l 'rossoctl.io/type in (agent,tool)' 
 cat <<EOF
 ==> Done.
 
-Verify the pipeline is back to its original state (count depends on what
-values.yaml originally shipped — 0 if it never had OPA):
+Verify the pipeline is back to its original state (the number of legs that run
+opa depends on what values.yaml originally shipped — 0 if it never had OPA):
   kubectl get configmap authbridge-runtime-config -n ${AGENT_NAMESPACE} \\
-    -o jsonpath='{.data.config\.yaml}' | grep -c 'name: opa'
+    -o jsonpath='{.data.config\.yaml}' | python3 ${SCRIPT_DIR}/authbridge-pipeline-check.py --opa-legs
 
 Verify the stock combiner is back (expect 2 request fallback rules):
   kubectl get authorizationpolicy default -n ${RELEASE_NAMESPACE} \\

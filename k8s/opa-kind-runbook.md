@@ -191,7 +191,7 @@ Expect two image builds, so allow a few minutes. The script runs six steps:
    is the chart's `operator-chart.signatureVerification.spireTrustDomain` (the
    trust domain the operator names clients with), `namespace_file` set to the
    pod's own service-account namespace file for short host names, and
-   `no_token_policy: client-credentials`. The chart renders the one pipeline
+   `no_token_policy: deny` (a call with no bearer to a target gets 401). The chart renders the one pipeline
    into every agent namespace, so neither value is a per-namespace literal.
 4. **Helm upgrade.** Applies the chart's `values.yaml` plus the overlay, with
    the sidecar image pointed at the locally built one.
@@ -224,13 +224,11 @@ Enable runs this for you. To check a cluster later (it changes nothing):
 It runs these checks. Each one can also be run by hand:
 
 ```bash
-# 1. OPA is in both legs of the namespace pipeline — expect 2
+# 1. OPA once on each leg of the namespace pipeline, and the outbound leg runs
+#    token-exchange-aiac (not token-exchange) with a spiffe://<td>/... audience
+#    template and no_token_policy deny — expect "ok trust_domain=<td>" (parsed, per leg)
 kubectl get configmap authbridge-runtime-config -n team1 \
-  -o jsonpath='{.data.config\.yaml}' | grep -c 'name: opa'
-# 1b. The outbound leg runs token-exchange-aiac, not token-exchange
-#     — expect token-exchange-aiac=1 token-exchange=0 (parsed, outbound leg only)
-kubectl get configmap authbridge-runtime-config -n team1 \
-  -o jsonpath='{.data.config\.yaml}' | python3 k8s/outbound-exchange-plugins.py
+  -o jsonpath='{.data.config\.yaml}' | python3 k8s/authbridge-pipeline-check.py
 
 # 2. The CRD is served and the global combiner exists — expect 'default', scope global
 kubectl get crd authorizationpolicies.agent.rossoctl.dev
@@ -482,10 +480,10 @@ mints the downstream token, it records a delegation hop, and OPA builds
 }
 ```
 
-- `subject` is the `sub` of the token Keycloak issued: the delegating user, or
-  the calling workload's service account when the request carried no bearer
-  (`no_token_policy: client-credentials`). The workload cannot choose it,
-  because it comes from the IdP's answer and not from the caller's bearer.
+- `subject` is the `sub` of the token Keycloak issued: the delegating user.
+  The workload cannot choose it, because it comes from the IdP's answer and not
+  from the caller's bearer. A request with no bearer to a target is denied
+  before OPA (`no_token_policy: deny`), so it never reaches this decision.
 - `client_id` is the **calling workload's own client**
   (`/shared/client-id.txt`), the party doing the exchange, not the target.
 - `scopes` is the issued token's `scope` claim. With default-scope grants
@@ -505,22 +503,33 @@ mints the downstream token, it records a delegation hop, and OPA builds
 ### Outbound token exchange
 
 `token-exchange-aiac` runs on every outbound request and has no routes and no
-`authproxy-routes` ConfigMap. Adding a target is a Keycloak change only, with no
-restart. Exchange is the default; passthrough happens in exactly two cases:
+`authproxy-routes` ConfigMap. Adding a target is a Keycloak change only. No
+restart is needed, with one exception: the plugin remembers an audience that
+Keycloak has no client for as unknown for 5 minutes (`unknown_audience_ttl`).
+So if the caller called the target before the target's client existed, its
+calls keep passing through un-exchanged (and the target answers 401) for up to
+5 minutes after the client and the grant exist. Restart the caller to end that
+at once (`kubectl rollout restart deployment/<caller> -n <ns>`); the onboarding
+demo's WIRE phase and the system harness both do. Exchange is the default;
+passthrough happens in exactly two cases:
 
 | Destination | Result | Session event |
 |---|---|---|
 | Outside the cluster (external host, IP literal, `svc.namespace` without `.svc`) | forwarded unchanged, Keycloak not asked | `skip / host_not_in_cluster` |
 | In-cluster, audience granted to the caller | `Authorization` replaced with a token narrowed to that audience | `modify / token_exchanged` (or `cache_hit`) |
-| In-cluster, Keycloak has **no client** for the derived audience | forwarded unchanged; remembered for 5 min | `skip / audience_unknown` |
+| In-cluster, Keycloak has **no client** for the derived audience | forwarded unchanged; remembered for 5 min (restart the caller to forget it) | `skip / audience_unknown` |
 | In-cluster, client exists but is **not granted** to the caller | **403**, OPA not consulted | `deny / audience_not_granted` |
 | In-cluster, the destination's client is **disabled** (for example a quarantined service) | **403**, OPA not consulted | `deny / target_disabled` |
 | Keycloak down, timeout, bad credentials, any other error | **503**, OPA not consulted | `deny / exchange_failed` |
 | Sidecar credentials not yet in `/shared/` | **503** (pod held not-ready) | `deny / credentials_not_ready` |
 
-A request with **no** bearer is still exchanged, using the workload's own
-`client_credentials` token as the subject (`no_token_policy:
-client-credentials`). It is never sent un-narrowed.
+A request with **no** bearer to a target is denied with **401**
+`auth.unauthorized` (`no_token_policy: deny`, the plugin default and the
+behaviour of the route-based pipeline). The workload's own
+`client_credentials` token is never sent in its place, so a process in the pod
+that sends no `Authorization` header cannot reach a target as the agent. A
+request with no bearer to a destination Keycloak has no client for still passes
+through.
 
 The audience is derived from the Host header as
 `spiffe://<td>/ns/<namespace>/sa/<service>`. The namespace comes from
@@ -539,6 +548,17 @@ Keycloak, which a use case (not this runbook) sets up:
      it, attached as a **default** scope. The plugin requests no `scope`, so an
      *optional* scope is never applied and the target answers 403. A **realm**
      default scope would grant every target to every caller.
+
+   > **Known limitation: creation order.** The rossoctl operator registers each
+   > workload's `agent-<ns>-<workload>-aud` scope as a **realm default** scope
+   > (`EnsureAudienceScope`, `operator/internal/keycloak/audience.go`), and
+   > Keycloak links the realm default scopes to every client created **later**.
+   > So an agent whose client is created after a tool's client already holds
+   > that tool's audience as a default scope, with no grant step: its calls to
+   > the tool are exchanged, not refused. The "not granted → 403" row above
+   > holds only for a caller created **before** the target (or after the scope
+   > was removed from the realm defaults). The tool's own inbound OPA still
+   > decides each call. Follow-up: #248.
 
 The chart renders one pipeline for every agent namespace, and the sidecar has
 no `POD_NAMESPACE` env to expand. So each sidecar reads its namespace from
