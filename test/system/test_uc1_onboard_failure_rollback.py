@@ -74,10 +74,12 @@ are real transitions, not an empty start.
 github-tool's inbound (D20; an HTTP 403 with an OPA body, relayed by the agent's pass-through
 outbound). The tool's client is also disabled, so Keycloak may instead refuse the token exchange to
 its audience before OPA is consulted: ``token-exchange-aiac`` answers a disabled target with
-``policy.forbidden`` (``target_disabled``), as an error frame or a plain 403 body (``uc1.exchange_refusal``). All of these mean the call never reaches the tool, so all
-count as blocked; the OPA-side proof is the CR assertion. Any other outcome fails: ``allow``, a transport
-error, and a failed exchange (``upstream.token-exchange-failed``, an IdP error or outage), which proves
-nothing about the quarantine.
+``policy.forbidden`` (``target_disabled``), as an error frame or a plain 403 body
+(``uc1.target_disabled_refusal``). Both mean the call never reaches the tool, so both count as blocked;
+the OPA-side proof is the CR assertion. Any other outcome fails: ``allow``, a transport error, a failed
+exchange (``upstream.token-exchange-failed``, an IdP error or outage), and the refusal of a target not
+granted to the agent (``audience_not_granted``, for example a lost default-scope link), none of which
+proves anything about the quarantine.
 
 Run (a live rossoctl/Kind cluster with the AIAC stack + AuthBridge OPA pipeline wired in — see
 ``k8s/opa-kind-runbook.md`` / ``k8s/opa-kind-enable.sh`` — the event path wired (NATS broker +
@@ -204,12 +206,12 @@ def _prefixed(admin, prefix: str) -> dict[str, list[str]]:
 
 def _outbound_block(ctx: dict, user: str, tool_bare: str) -> tuple[str, int | None, str]:
     """One live outbound ``tools/call``; classify it as ``"deny"`` (an OPA verdict: github-tool's
-    inbound 403), ``"refused"`` (Keycloak refused the exchange to the disabled tool's audience before
-    OPA, ``uc1.exchange_refusal``; see the module docstring), ``"allow"``, or ``"error"``. A failed
-    exchange (an IdP error or outage) stays ``"error"``. Returns ``(class, http_code, body)``."""
+    inbound 403), ``"refused"`` (Keycloak refused the exchange because the tool's client is disabled,
+    before OPA, ``uc1.target_disabled_refusal``; see the module docstring), ``"allow"``, or ``"error"``.
+    A failed exchange (an IdP error or outage) and a refusal for any other reason stay ``"error"``. Returns ``(class, http_code, body)``."""
     code, body = uc1.outbound_raw(ctx, user, tool_bare)
     decision = uc1.outbound_outcome(code, body)
-    if decision == "error" and uc1.exchange_refusal(code, body):
+    if decision == "error" and uc1.target_disabled_refusal(code, body):
         return "refused", code, body
     return decision, code, body
 
@@ -516,8 +518,9 @@ def test_failed_tool_leaves_the_agent_cr_unchanged(run: dict) -> None:
 
 def test_failed_tool_outbound_call_denied(run: dict) -> None:
     """The ``dev-user`` call to the tool that phase 3 allowed is now blocked — an OPA deny (github-tool
-    has no CR, so the combiner denies on its inbound, D20), or an exchange refusal to the disabled
-    tool's audience (module docstring); never ``allow``, never a transport error."""
+    has no CR, so the combiner denies on its inbound, D20), or an exchange refusal because the tool's
+    client is disabled (module docstring); never ``allow``, never a transport error, never a refusal
+    for another reason."""
     decision, code, body = _failed(run, "tool_failed")["outbound"]
     assert decision in ("deny", "refused"), (
         f"dev-user outbound {PROBE_TOOL} to the quarantined tool: {decision!r} (HTTP {code}, body={body[:300]!r})"

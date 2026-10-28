@@ -345,6 +345,8 @@ step "Preflight"
 for c in kubectl curl python3; do
   command -v "$c" >/dev/null 2>&1 || die "missing required command on PATH: $c"
 done
+python3 -c 'import yaml' >/dev/null 2>&1 \
+  || die "python3 has no PyYAML (the preflight parses the AuthBridge pipeline with k8s/outbound-exchange-plugins.py)"
 if ! kubectl cluster-info >/dev/null 2>&1; then
   if command -v kind >/dev/null 2>&1 && kind get clusters 2>/dev/null | grep -qx "$KIND_CLUSTER"; then
     info "cluster unreachable — re-exporting kubeconfig for Kind cluster '${KIND_CLUSTER}'"
@@ -577,8 +579,8 @@ phase_wire_outbound() {
   # Keycloak silently skips a default link of a scope already linked as optional (an earlier run of
   # this driver granted it as optional), so drop any optional link first. Keycloak answers 204 also
   # when the scope is not linked; SCOPE_ID was just read, so any other answer is a failure. The same
-  # move as _link_default_scope in src/aiac/idp/service/configuration/keycloak/main.py (the harness
-  # calls that); this bash copy follows it.
+  # move as _link_default_scope in src/aiac/idp/service/configuration/keycloak/main.py; this bash copy
+  # (and the harness's grant_exchange_scope) follows it.
   DEL_HTTP=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE -H "Authorization: Bearer ${ADMIN}" \
     "${KC}/admin/realms/${REALM}/clients/${AGENT_UUID}/optional-client-scopes/${SCOPE_ID}")
   [ "$DEL_HTTP" = 204 ] || die "removing the optional client-scope link returned HTTP ${DEL_HTTP} (expected 204)"

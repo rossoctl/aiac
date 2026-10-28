@@ -79,6 +79,11 @@ def test_is_exchange_refusal(doc: object, expected: bool) -> None:
         (200, _frame(LEGACY_EXCHANGE_FAILED), "error"),
         (503, json.dumps(EXCHANGE_FAILED), "error"),
         (200, json.dumps({"jsonrpc": "2.0", "id": 1, "result": {}}), "allow"),
+        # AuthBridge's minimal and constant fallback frames name no plugin: rejected, never an allow.
+        (200, json.dumps({"jsonrpc": "2.0", "id": 1, "error": {"code": -32000, "message": "x"}}), "error"),
+        (200, '{"jsonrpc":"2.0","id":null,"error":{"code":-32000,"message":"request rejected"}}', "error"),
+        # A JSON-RPC error of the tool itself (another code) means the call got through.
+        (200, json.dumps({"jsonrpc": "2.0", "id": 1, "error": {"code": -32602, "message": "bad"}}), "allow"),
     ],
 )
 def test_outbound_outcome_never_reports_an_exchange_refusal_as_an_opa_deny(code: int, body: str, expected: str) -> None:
@@ -207,6 +212,59 @@ def test_verify_helper_agrees_with_the_harness_gate(config: str) -> None:
 )
 def test_exchange_refusal_is_only_keycloak_not_granting(code: int | None, body: str, expected: bool) -> None:
     assert launcher.exchange_refusal(code, body) is expected
+
+
+def _disabled(code: int) -> str:
+    """``token-exchange-aiac``'s refusal of a disabled target, as cortex renders it at ``code``."""
+    msg = launcher.TARGET_DISABLED_MESSAGE
+    if code == 200:
+        return json.dumps({"jsonrpc": "2.0", "id": 1, "error": {"code": -32000, "message": msg, "data": NOT_GRANTED}})
+    return json.dumps({**NOT_GRANTED, "message": msg})
+
+
+def _not_granted(code: int) -> str:
+    """The same refusal for a target not granted to the caller."""
+    msg = "this workload is not granted the destination's audience"
+    if code == 200:
+        return json.dumps({"jsonrpc": "2.0", "id": 1, "error": {"code": -32000, "message": msg, "data": NOT_GRANTED}})
+    return json.dumps({**NOT_GRANTED, "message": msg})
+
+
+@pytest.mark.parametrize(
+    ("code", "body", "expected"),
+    [
+        (200, _disabled(200), True),
+        (403, _disabled(403), True),
+        # Not granted (for example a lost default-scope link) proves nothing about the target's client.
+        (200, _not_granted(200), False),
+        (403, _not_granted(403), False),
+        (200, _frame(EXCHANGE_FAILED), False),
+        (403, json.dumps({**OPA_DENY, "message": launcher.TARGET_DISABLED_MESSAGE}), False),
+        (None, "", False),
+    ],
+)
+def test_target_disabled_refusal_is_only_a_disabled_target(code: int | None, body: str, expected: bool) -> None:
+    assert launcher.target_disabled_refusal(code, body) is expected
+
+
+@pytest.mark.parametrize(
+    ("config", "expected"),
+    [
+        (
+            _CONFIG.replace(
+                "        config:\n",
+                '        config:\n          audience_template: "spiffe://example.org/ns/{namespace}/sa/{service}"\n',
+            ),
+            "example.org",
+        ),
+        (_CONFIG, None),  # no audience_template
+        (_CONFIG.replace("        config:\n", '        config:\n          audience_template: "{service}"\n'), None),
+        ("not: [yaml", None),
+        ("", None),
+    ],
+)
+def test_exchange_trust_domain_reads_the_outbound_template(config: str, expected: str | None) -> None:
+    assert launcher.exchange_trust_domain(config) == expected
 
 
 @pytest.mark.parametrize(

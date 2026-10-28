@@ -747,6 +747,25 @@ def exchange_refusal(code: int | None, body: str) -> bool:
     return is_exchange_refusal(doc) and doc.get("error") == "policy.forbidden"
 
 
+# ``token-exchange-aiac`` answers both "not granted" and "target disabled" with ``policy.forbidden``; only
+# the message tells them apart (cortex ``core/plugins/tokenexchangeaiac/plugin.go``).
+TARGET_DISABLED_MESSAGE = "the destination's client is disabled"
+
+
+def target_disabled_refusal(code: int | None, body: str) -> bool:
+    """True when the outbound answer ``(code, body)`` is the exchange plugin's refusal **because the
+    target's client is disabled** (``target_disabled``), not any other refusal. **Pure.** A refusal for a
+    target not granted to the caller (``audience_not_granted``) proves nothing about the target's
+    client, so it does not count."""
+    if not exchange_refusal(code, body):
+        return False
+    doc = _json_or_none(body)
+    # A frame at HTTP 200 carries the message in ``error.message`` (``httpx.MarshalMCPRejectionBody``);
+    # a plain 403 body carries it at the top (``pipeline.Violation.Render``).
+    holder = doc.get("error") if code == 200 else doc
+    return isinstance(holder, dict) and holder.get("message") == TARGET_DISABLED_MESSAGE
+
+
 def _json_or_none(body: str) -> object:
     """``json.loads(body)``, or ``None`` when the body is not JSON."""
     try:
@@ -776,6 +795,11 @@ def rejection_doc(code: int | None, body: str) -> dict | None:
     if code == 403 and "jsonrpc" not in doc:
         return doc
     return None
+
+
+# The JSON-RPC error code of every rejection AuthBridge's forward proxy renders (cortex
+# ``httpx.jsonRPCServerError``), its minimal fallback frames included.
+AUTHBRIDGE_RPC_ERROR = -32000
 
 
 def outbound_outcome(code: int | None, body: str) -> str:
@@ -816,15 +840,22 @@ def outbound_outcome(code: int | None, body: str) -> str:
 
     So: a plain ``403`` whose body names OPA (the callee's inbound; or the agent's own
     non-MCP-shaped rejection fallback) -> ``"deny"``; any other ``403`` -> ``"error"``; HTTP 200 with an
-    OPA error frame -> ``"deny"``; HTTP 200 with an exchange error frame -> ``"error"``; HTTP 200
-    with any other body (a ``result`` frame, or a tool-level error that means the call was *allowed*
+    OPA error frame -> ``"deny"``; HTTP 200 with an exchange error frame, or AuthBridge's minimal fallback
+    frame (code ``AUTHBRIDGE_RPC_ERROR``, no ``error.data``, so no plugin named) -> ``"error"``; HTTP 200 with any other body (a ``result`` frame, or a tool-level error that means the call was *allowed*
     through) -> ``"allow"``; ``None`` or any other status (a transport break, a 401 from the callee's
     ``jwt-validation``, a 503 before the first bundle loads, or a non-MCP exchange ``503``) ->
     ``"error"``. Classify by the body, never the transport status alone."""
     doc = rejection_doc(code, body)
     if code == 403:
         return "deny" if is_opa_violation(doc) else "error"
-    if code != 200 or _json_or_none(body) is None:
+    frame = _json_or_none(body) if code == 200 else None
+    if not isinstance(frame, dict):
+        return "error"
+    err = frame.get("error")
+    if isinstance(err, dict) and "data" not in err and err.get("code") == AUTHBRIDGE_RPC_ERROR:
+        # AuthBridge's minimal or constant frame when it cannot render a rejection in full (cortex
+        # ``httpx.MarshalMCPRejectionBody``): rejected, but no plugin is named, so it is neither an
+        # OPA verdict nor an allow. A JSON-RPC error of the tool itself has another code.
         return "error"
     # Exchange refusal = the outbound decision was never reached (exchange broke before
     # OPA). Honest class is "error", never "deny" — it must not stand in for an OPA verdict.
@@ -957,6 +988,28 @@ def pipeline_plugins(config_yaml: str) -> dict[str, list[str]]:
         plugins = node.get("plugins") if isinstance(node, dict) else None
         legs[leg] = [p["name"] for p in plugins or [] if isinstance(p, dict) and isinstance(p.get("name"), str)]
     return legs
+
+
+def exchange_trust_domain(config_yaml: str) -> str | None:
+    """The SPIFFE trust domain in the ``audience_template`` of the outbound ``token-exchange-aiac`` of
+    the AuthBridge runtime config ``config_yaml``, or ``None`` when there is none (no such plugin, a
+    template that is not ``spiffe://<td>/...``, a config that is not YAML). **Pure.** The trust domain
+    the live leg exchanges for, which ``k8s/opa-kind-enable.sh`` takes from the chart."""
+    import yaml
+
+    try:
+        doc = yaml.safe_load(config_yaml)
+    except yaml.YAMLError:
+        return None
+    pipeline = doc.get("pipeline") if isinstance(doc, dict) else None
+    node = pipeline.get("outbound") if isinstance(pipeline, dict) else None
+    plugins = node.get("plugins") if isinstance(node, dict) else None
+    for p in plugins or []:
+        if isinstance(p, dict) and p.get("name") == "token-exchange-aiac":
+            template = (p.get("config") or {}).get("audience_template")
+            if isinstance(template, str) and template.startswith("spiffe://"):
+                return template[len("spiffe://") :].split("/", 1)[0] or None
+    return None
 
 
 def exchange_plugin_reason(legs: dict[str, list[str]], *, namespace: str) -> str | None:

@@ -95,6 +95,7 @@ functions, so pytest does not collect it.
 from __future__ import annotations
 
 import base64
+import functools
 import json
 import logging
 import os
@@ -125,8 +126,8 @@ from test.system.launcher import (  # noqa: E402
     _kubectl_try,
     curl_pod,
     deny_origin,
-    exchange_refusal,  # noqa: F401 — re-exported: the rollback test classifies an exchange refusal with it
     exchange_token,
+    exchange_trust_domain,
     inbound_outcome,
     inbound_probe,
     is_opa_violation,
@@ -147,6 +148,7 @@ from test.system.launcher import (  # noqa: E402
     require_event_path,
     require_pipeline,
     resolve_pod,
+    target_disabled_refusal,  # noqa: F401 — re-exported: the rollback test proves the quarantine with it
     verify_login_subject,
 )
 
@@ -211,6 +213,7 @@ AGENT_DEPLOYMENT = os.environ.get("AIAC_AGENT_DEPLOYMENT", scn.AGENT_WORKLOAD)
 
 # SPIFFE trust domain the operator registers the demo workloads under (the ``spiffe://<td>/ns/...``
 # authority). Matches the rossoctl Kind cluster's default; override for a differently-named cluster.
+# The exchange audience reads the live leg's own trust domain instead (``_exchange_trust_domain``).
 TRUST_DOMAIN = os.environ.get("AIAC_TRUST_DOMAIN", "localtest.me")
 
 # After a CR is upserted, ``bundle-service`` recomposes the namespace bundle and each pod's OPA polls
@@ -1176,9 +1179,21 @@ def delete_workload_crs() -> None:
 # ``token-exchange-aiac`` must mint it.
 
 
+@functools.cache
+def _exchange_trust_domain() -> str:
+    """The trust domain ``token-exchange-aiac`` exchanges for, read once from the live
+    ``authbridge-runtime-config`` of ``NAMESPACE`` (``exchange_trust_domain``); ``TRUST_DOMAIN`` when it
+    cannot be read. ``k8s/opa-kind-enable.sh`` takes it from the chart, so the two can differ."""
+    ok, out, _ = _kubectl_try(
+        "get", "configmap", "authbridge-runtime-config", "-n", NAMESPACE, "-o", r"jsonpath={.data.config\.yaml}"
+    )
+    return (exchange_trust_domain(out) if ok else None) or TRUST_DOMAIN
+
+
 def _tool_audience() -> str:
-    """The RFC 8693 ``audience`` for the github-tool exchange — its SPIFFE ID."""
-    return f"spiffe://{TRUST_DOMAIN}/ns/{NAMESPACE}/sa/{scn.TOOL_WORKLOAD}"
+    """The RFC 8693 ``audience`` for the github-tool exchange — its SPIFFE ID, in the trust domain the
+    live outbound leg exchanges for, so ``exchanged_subject`` asks for what AuthBridge asks for."""
+    return f"spiffe://{_exchange_trust_domain()}/ns/{NAMESPACE}/sa/{scn.TOOL_WORKLOAD}"
 
 
 def _tool_aud_scope() -> str:
@@ -1191,12 +1206,9 @@ def grant_exchange_scope(admin) -> None:
     ``token-exchange-aiac``'s exchange to the github-tool audience (no ``scope`` requested) is granted.
 
     Resolves the agent client by its SPIFFE ``clientId`` (``.../sa/github-agent``) or its
-    ``name`` (``{ns}/github-agent``), and the client scope by name (``agent-{ns}-github-tool-aud``),
-    and links it with ``_link_default_scope`` of the Keycloak IdP Configuration Service. Idempotent —
-    Keycloak's assign-default-scope is a PUT. Raises ``RuntimeError`` on any Keycloak error."""
+    ``name`` (``{ns}/github-agent``), and the client scope by name (``agent-{ns}-github-tool-aud``).
+    Idempotent — Keycloak's assign-default-scope is a PUT. Raises ``RuntimeError`` on any Keycloak error."""
     from keycloak.exceptions import KeycloakError
-
-    from aiac.idp.service.configuration.keycloak.main import _link_default_scope
 
     admin.change_current_realm(TEST_REALM)
     aud_scope = _tool_aud_scope()
@@ -1219,12 +1231,16 @@ def grant_exchange_scope(admin) -> None:
             f"client scope {aud_scope!r} not found in realm {TEST_REALM!r} — is {scn.TOOL_WORKLOAD} "
             "deployed + registered by the operator?"
         )
-    # The link that AIAC's own onboarding makes: an optional link (the old optional grant of this
-    # harness) is moved to default first, since Keycloak silently skips a default link of a scope
-    # already linked as optional. Every Keycloak error raises: the assign is an idempotent PUT, so none
-    # is benign, and without the default link every exchange is refused much later, far from this cause.
+    # The same move as _link_default_scope in src/aiac/idp/service/configuration/keycloak/main.py: an
+    # optional link (the old optional grant of this harness) is moved to default first, since Keycloak
+    # silently skips a default link of a scope already linked as optional. Copied, not imported:
+    # importing that module configures the root logger and builds its FastAPI app in the test process.
+    # Every Keycloak error raises: the assign is an idempotent PUT, so none is benign, and without the
+    # default link every exchange is refused much later, far from this cause.
     try:
-        _link_default_scope(admin, client_uuid, scope["id"])
+        if any(s.get("id") == scope["id"] for s in admin.get_client_optional_client_scopes(client_uuid)):
+            admin.delete_client_optional_client_scope(client_uuid, scope["id"])
+        admin.add_client_default_client_scope(client_uuid, scope["id"], {})
     except KeycloakError as exc:
         raise RuntimeError(
             f"could not link {aud_scope!r} to {NAMESPACE}/{scn.AGENT_WORKLOAD} as a default scope: {exc} — "
