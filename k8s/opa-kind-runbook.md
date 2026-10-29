@@ -120,9 +120,9 @@ kubectl get authorizationpolicy github-tool -n team1 \
     clone.
     The checkout must contain the `token-exchange-aiac` plugin
     (`core/plugins/tokenexchangeaiac/`, including its delegation-hop
-    recording). Until it is merged to `main`, check out the
-    `feat/token-exchange-aiac` branch. An older checkout fails at sidecar start
-    with an unknown-plugin error.
+    recording): cortex `main` at or after merge commit `ef5ac5f8`
+    (rossoctl/cortex#1496). An older checkout fails at sidecar start with an
+    unknown-plugin error.
 
   These paths are resolved against **your current directory**, not the script.
   Pass absolute paths unless you run from the repo root.
@@ -224,9 +224,10 @@ Enable runs this for you. To check a cluster later (it changes nothing):
 It runs these checks. Each one can also be run by hand:
 
 ```bash
-# 1. OPA once on each leg of the namespace pipeline, and the outbound leg runs
-#    token-exchange-aiac (not token-exchange) with a spiffe://<td>/... audience
-#    template and no_token_policy deny — expect "ok trust_domain=<td>" (parsed, per leg)
+# 1. OPA once on each leg, after the identity plugin (and, inbound, mcp-parser); the outbound
+#    leg runs token-exchange-aiac (not token-exchange) with a
+#    spiffe://<td>/...{namespace}...{service}... audience template and
+#    no_token_policy deny — expect "ok trust_domain=<td>" (parsed, per leg)
 kubectl get configmap authbridge-runtime-config -n team1 \
   -o jsonpath='{.data.config\.yaml}' | python3 k8s/authbridge-pipeline-check.py
 
@@ -540,8 +541,11 @@ Keycloak, which a use case (not this runbook) sets up:
 1. **Service name = ServiceAccount name.** The Host header carries the Service
    name. If it differs from the ServiceAccount, the derived audience names no
    client and the request **passes through un-exchanged**. For example, the
-   demo agent's default `MCP_URL` host is `github-tool-mcp`, but the client is
-   `…/sa/github-tool`.
+   demo agent's default `MCP_URL` host is `github-tool-mcp`, but the production
+   tool's client is the plain client ID `github-tool` that the cortex demo's
+   `setup_keycloak.py` makes by hand (not the UC-1 stub's SPIFFE client
+   `…/sa/github-tool`), until its cortex manifest runs it under a ServiceAccount
+   `github-tool-mcp` (rossoctl/cortex#1540).
 2. **Keycloak grants**, on the caller's client:
    - standard token exchange enabled (`standard.token.exchange.enabled=true`);
    - each target granted through a client scope with an audience mapper for

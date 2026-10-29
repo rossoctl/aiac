@@ -15,9 +15,11 @@
 #
 # Checks, mirroring the runbook 1:1:
 #   Preflight  kubectl present, cluster reachable, agent namespace present
-#   Verify 1   authbridge-runtime-config, parsed per leg: opa once on each leg, and
-#              the outbound leg carries token-exchange-aiac (not token-exchange)
-#              with a spiffe://<td>/... audience template and no_token_policy deny
+#   Verify 1   authbridge-runtime-config, parsed per leg: opa once on each leg, after
+#              the identity plugin (and, inbound, mcp-parser); the outbound leg carries
+#              token-exchange-aiac (not token-exchange) with a
+#              spiffe://<td>/...{namespace}...{service}... audience template and
+#              no_token_policy deny
 #   Verify 2   AuthorizationPolicy CRD established + global 'default' CR present,
 #              and it is the changed combiner (D20): 0 request fallback rules (a
 #              pod with no client CR is denied), 2 response fallback rules
@@ -117,12 +119,13 @@ pass "cluster reachable, namespace ${NS} present"
 
 # ── Verify 1 — pipeline wiring ───────────────────────────────────────────────
 step "Verify 1 — OPA on both pipeline legs, token-exchange-aiac on the outbound leg"
-# Parsed, per leg: opa once on each leg; outbound token-exchange-aiac once, token-exchange
-# absent (no routes; a leftover token-exchange means the pipeline predates the switch); a
-# spiffe://<td>/... audience template; no_token_policy deny. The helper reads the ConfigMap itself
-# (kubectl's stderr kept apart from the YAML), and the system harness's skip gate loads the same file.
-# The helper prints one verdict line on stdout, also when it fails; stderr (a python3 warning) is not
-# the verdict.
+# Parsed, per leg (the rule of k8s/authbridge-pipeline-check.py, its docstring lists it): opa once
+# on each leg, after the identity plugin (and, inbound, mcp-parser); outbound token-exchange-aiac once,
+# token-exchange absent (no routes; a leftover token-exchange means the pipeline predates the
+# switch); a spiffe://<td>/...{namespace}...{service}... audience template; no_token_policy deny.
+# The helper reads the ConfigMap itself (kubectl's stderr kept apart from the YAML), and the system
+# harness's skip gate loads the same file. It prints one verdict line on stdout, also when it fails;
+# stderr (a python3 warning) is not the verdict.
 WIRING=$(python3 "$SCRIPT_DIR/authbridge-pipeline-check.py" --namespace "$NS" 2>/dev/null || true)
 case "$WIRING" in
   "ok trust_domain="*) pass "authbridge-runtime-config: opa on each leg, outbound token-exchange-aiac (${WIRING#ok })" ;;

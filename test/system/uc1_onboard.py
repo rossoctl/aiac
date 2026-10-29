@@ -95,6 +95,7 @@ functions, so pytest does not collect it.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -946,10 +947,11 @@ def controller_onboarding_lines(admin, workload: str, *, since: datetime) -> str
 BUNDLE_TRUST_DOMAIN = os.environ.get("AIAC_TRUST_DOMAIN") or None
 
 
-def bundle_service_probe(workload: str, *, trust_domain: str) -> tuple[str, str]:
+def bundle_service_probe(workload: str, *, trust_domain: str) -> tuple[str, str, str]:
     """GET bundle-service ``/readyz`` and ``/bundles?spiffe=<td>/ns/<ns>/sa/<workload>`` from a
     throwaway curl pod in ``NAMESPACE`` (the ztunnel path the sidecars use, as ``opa-kind-verify.sh``
-    Verify 4 does); return the two HTTP codes as strings (``000`` = not reachable). ``<td>`` is
+    Verify 4 does); return the two HTTP codes as strings (``000`` = not reachable) and the SPIFFE ID it
+    asked for. ``<td>`` is
     ``BUNDLE_TRUST_DOMAIN`` when set, else ``trust_domain``, the one the exchange uses
     (``require_pipeline``, read once per stack)."""
     base = f"http://bundle-service.{BUNDLE_SERVICE_NAMESPACE}.svc.cluster.local:8080"
@@ -961,7 +963,7 @@ def bundle_service_probe(workload: str, *, trust_domain: str) -> tuple[str, str]
     )
     out = curl_pod(NAMESPACE, script, name="probe-bundle")
     codes = dict(line.split(" ", 1) for line in out.splitlines() if line.startswith(("readyz ", "bundle ")))
-    return codes.get("readyz", "none"), codes.get("bundle", "none")
+    return codes.get("readyz", "none"), codes.get("bundle", "none"), spiffe
 
 
 def _agentcard_state(workload: str) -> str:
@@ -988,6 +990,20 @@ def _agentcard_state(workload: str) -> str:
     return f"{card['metadata']['name']} Synced={synced.get('status')} ({synced.get('reason')}): {synced.get('message')}"
 
 
+def _bundle_probe_note(workload: str, context: dict) -> str:
+    """``bundle_service_probe``'s codes, with the trust domain it probed. When ``AIAC_TRUST_DOMAIN``
+    differs from the trust domain the exchange uses (``context["trust_domain"]``), say so: a 404 then
+    may be the override's, not the cluster's."""
+    live = context["trust_domain"]
+    readyz, bundle, spiffe = bundle_service_probe(workload, trust_domain=live)
+    note = f"readyz {readyz}, bundle {bundle} for spiffe={spiffe}"
+    if BUNDLE_TRUST_DOMAIN and BUNDLE_TRUST_DOMAIN != live:
+        note += (
+            f" (AIAC_TRUST_DOMAIN={BUNDLE_TRUST_DOMAIN} differs from the live token-exchange-aiac trust domain {live})"
+        )
+    return note
+
+
 def stack_diagnosis(admin, workload: str, *, context: dict) -> str:
     """The state dump that every gate failure appends: the operator change since the fixture start
     (``context["operator"]``), bundle-service reachability from the namespace, the Deployment's template
@@ -1007,10 +1023,7 @@ def stack_diagnosis(admin, workload: str, *, context: dict) -> str:
         return operator_change_note(context["operator"], now) or "unchanged"
 
     _part("operator", _operator)
-    _part(
-        f"bundle-service from {NAMESPACE} (readyz, bundle)",
-        lambda: bundle_service_probe(workload, trust_domain=context["trust_domain"]),
-    )
+    _part(f"bundle-service from {NAMESPACE} (readyz, bundle)", lambda: _bundle_probe_note(workload, context))
 
     def _deployment() -> str:
         deployment, reason = _read_rollout(workload)
@@ -1089,6 +1102,20 @@ def tool_onboarding_state(admin) -> dict[str, bool | None]:
     return state
 
 
+def workload_aud_scope(workload: str) -> str:
+    """The operator's audience client scope of ``workload`` in ``NAMESPACE`` (rossoctl/operator
+    ``keycloak.AudienceScopeName`` of ``<ns>/<workload>``)."""
+    return f"agent-{NAMESPACE}-{workload}-aud"
+
+
+def client_credentials_secret_name(workload: str) -> str:
+    """The client-credentials Secret the operator writes for ``workload`` in ``NAMESPACE`` (rossoctl/operator
+    ``clientreg.KeycloakClientCredentialsSecretName``; ``demo/use-cases/onboarding/restore.sh`` names it
+    the same way)."""
+    key = f"{NAMESPACE}\0{workload}\0rossoctl-keycloak-client-credentials"
+    return "rossoctl-keycloak-client-credentials-" + hashlib.sha256(key.encode()).hexdigest()[:16]
+
+
 def delete_workload_registrations(admin, realm: str) -> None:
     """Explicitly delete both workloads' Keycloak footprint — their clients, their ``*-aud`` audience
     client scopes, and the operator's client-credentials Secret — so teardown does not trust an
@@ -1097,8 +1124,11 @@ def delete_workload_registrations(admin, realm: str) -> None:
 
     ``cleanup_provisioned`` only clears the ``github-agent.`` / ``github-tool.``-**prefixed** roles and
     scopes; the operator's ``*-aud`` scopes (e.g. ``agent-team1-github-tool-aud``, no ``.`` after the
-    workload) and the dynamically-named ``rossoctl-keycloak-client-credentials-<hash>`` Secret are not
-    covered there, so this sweep handles them by suffix / prefix."""
+    workload) and the ``rossoctl-keycloak-client-credentials-<hash>`` Secrets are not covered there. This
+    sweep removes them by their **exact** names (``workload_aud_scope``,
+    ``client_credentials_secret_name``): other workloads in the namespace have theirs there too, for
+    example the production tool's ``agent-team1-github-tool-mcp-aud``, which a substring match would
+    take."""
     from keycloak.exceptions import KeycloakError
 
     admin.change_current_realm(realm)
@@ -1110,22 +1140,21 @@ def delete_workload_registrations(admin, realm: str) -> None:
             except KeycloakError as exc:
                 log.warning("teardown: delete client %r failed: %s", client.get("name"), exc)
 
+    workloads = (scn.AGENT_WORKLOAD, scn.TOOL_WORKLOAD)
+    aud_scopes = {workload_aud_scope(w) for w in workloads}
     for scope in admin.get_client_scopes():
         name = scope.get("name", "")
-        if name.endswith("-aud") and (scn.AGENT_WORKLOAD in name or scn.TOOL_WORKLOAD in name):
+        if name in aud_scopes:
             try:
                 admin.delete_client_scope(scope["id"])
             except KeycloakError as exc:
                 log.warning("teardown: delete audience client scope %r failed: %s", name, exc)
 
-    # The operator mints a ``rossoctl-keycloak-client-credentials-<hash>`` Secret per client (dynamic
-    # hash); sweep by prefix so the namespace is left with none. Tolerant — a query failure or an
-    # already-absent Secret is not a teardown error.
-    ok, out, _ = _kubectl_try("get", "secret", "-n", NAMESPACE, "-o", "name")
-    if ok:
-        for ref in out.split():
-            if ref.startswith("secret/rossoctl-keycloak-client-credentials-"):
-                _kubectl_try("delete", ref, "-n", NAMESPACE, "--ignore-not-found")
+    # The operator mints one ``rossoctl-keycloak-client-credentials-<hash>`` Secret per client, named
+    # from (namespace, workload). Tolerant — an already-absent Secret is not a teardown error.
+    for workload in workloads:
+        secret = client_credentials_secret_name(workload)
+        _kubectl_try("delete", "secret", secret, "-n", NAMESPACE, "--ignore-not-found")
 
 
 def sweep_authpolicies() -> None:
@@ -1191,7 +1220,7 @@ def _tool_audience(trust_domain: str) -> str:
 
 def _tool_aud_scope() -> str:
     """The realm client-scope whose audience mapper stamps the github-tool audience."""
-    return f"agent-{NAMESPACE}-{scn.TOOL_WORKLOAD}-aud"
+    return workload_aud_scope(scn.TOOL_WORKLOAD)
 
 
 def grant_exchange_scope(admin) -> None:
@@ -3227,13 +3256,14 @@ def mcp_session_decisions(ctx: dict, user: str, tool_bare: str) -> dict[str, tup
 def pristine_stack(workloads: Sequence[str], *, policy_md: str = scn.POLICY_ABSTRACT) -> Iterator[dict]:
     """The slate + teardown half of ``onboarded_stack`` with NO deploy and NO convergence poll, for a
     flow whose onboarding is meant to fail (``onboarded_stack`` would wait for a happy-path allow that
-    never comes). Yields ``ctx = {"admin", "namespace", "keycloak_url", "realm"}``; the caller deploys.
+    never comes). Yields ``ctx = {"admin", "namespace", "keycloak_url", "realm", "trust_domain"}``, the keys
+    of ``onboarded_stack`` that need no deploy; the caller deploys.
 
     Same skip gates (pipeline wiring, env, event path), the same slate and teardown (``_clean_slate``:
     Direct Access Grants on the login client, the no-workloads slate, realm users and roles, the ``sub``
     check; at exit full-to-pristine, verified), then the ``policy.md`` mount and the image load for
     ``workloads``."""
-    require_pipeline(namespace=NAMESPACE, workloads=[])
+    trust_domain = require_pipeline(namespace=NAMESPACE, workloads=[])
     creds = require_env_or_skip("KEYCLOAK_URL", "KEYCLOAK_ADMIN_USERNAME", "KEYCLOAK_ADMIN_PASSWORD")
     keycloak_url = creds["KEYCLOAK_URL"]
     admin = connect_admin()
@@ -3246,4 +3276,5 @@ def pristine_stack(workloads: Sequence[str], *, policy_md: str = scn.POLICY_ABST
             "namespace": NAMESPACE,
             "keycloak_url": keycloak_url,
             "realm": TEST_REALM,
+            "trust_domain": trust_domain,
         }

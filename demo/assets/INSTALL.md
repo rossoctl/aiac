@@ -34,9 +34,15 @@ they automate.
   (`token-exchange` with routes) the agent's calls to the tool go out unexchanged and the tool
   rejects them.
 - **Known limitation:** the agent's live GitHub calls go to the production tool at its default
-  `MCP_URL` host `github-tool-mcp`. Its Service name is not its ServiceAccount (Keycloak client
-  `…/sa/github-tool`), so those calls are not exchanged, and no token carries `github-full-access`
-  for the tool's PAT selection. The UC-1 onboarding demo is not affected: it calls the stub
+  `MCP_URL` host `github-tool-mcp`. They are exchanged only for a Keycloak client named
+  `…/sa/github-tool-mcp`. The production tool's cortex manifest does not yet run it under a
+  ServiceAccount of that name, or enroll it
+  ([rossoctl/cortex#1540](https://github.com/rossoctl/cortex/issues/1540)). Until it does, those calls
+  are not exchanged. Once it does, the UC-1 onboarding demo's WIRE phase grants github-agent the
+  tool's audience scope as a default scope. It does not grant `github-full-access`, the scope the tool
+  reads to pick its privileged PAT: as a default scope it would be in every token github-agent
+  exchanges, so every user would get the privileged PAT. So the tool uses its public PAT; a per-user
+  grant is part of cortex#1540. The UC-1 onboarding demo is not affected: it calls the stub
   `github-tool` directly.
 
 ## What gets deployed

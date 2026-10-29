@@ -29,16 +29,25 @@
 # AgentRuntime CR (at the end of this file) is created.
 #
 # Prerequisites (NOT created by this file — must exist before applying):
-#   1. github-tool Deployment + Service named "github-tool-mcp" (the MCP tool server)
+#   1. The production GitHub tool: Service "github-tool-mcp" (the MCP tool server,
+#      cortex demos/github-issue), registered as .../sa/github-tool-mcp (cortex#1540)
 #   2. github-tool-secrets Secret (GitHub token used by the tool)
 #   3. authbridge-config ConfigMap (apply configmaps.yaml first)
 #
 # Token exchange (token-exchange-aiac, no routes): the audience is derived from
 # the MCP_URL host as spiffe://<td>/ns/<ns>/sa/<host>, so the tool's Service
-# name must equal its ServiceAccount (its Keycloak client) and the tool's
-# audience scope must be a DEFAULT client scope of github-agent. The default
-# host "github-tool-mcp" names no client, so those calls pass through
-# un-exchanged; point MCP_URL at "github-tool" to have them exchanged.
+# name must equal its ServiceAccount (its Keycloak client), and the tool's
+# audience scope must be a DEFAULT client scope of github-agent. The host
+# "github-tool-mcp" is that target: the production tool keeps its Service name
+# and gets a matching ServiceAccount, enrolled so the operator registers
+# .../sa/github-tool-mcp (rossoctl/cortex#1540). Until then the host names no
+# client, and these calls pass through un-exchanged. The UC-1 onboarding
+# demo's WIRE phase grants agent-<ns>-github-tool-mcp-aud as a default scope
+# once it exists. It does not grant github-full-access (the scope the tool
+# reads to pick its privileged PAT): as a default scope it would be in every
+# token github-agent exchanges, so every user would get the privileged PAT.
+# Do not point MCP_URL at "github-tool": that is the UC-1 stub (4 stub tools,
+# no GitHub access).
 #
 # Usage:
 #   kubectl apply -f configmaps.yaml
@@ -134,9 +143,10 @@ spec:
             - name: LOG_LEVEL
               value: "DEBUG"
 
-            # MCP Tool endpoint - the GitHub tool service
+            # MCP Tool endpoint - the production GitHub tool service
             # AuthBridge exchanges the token for the audience derived from this
-            # host — see the token-exchange note in the header above.
+            # host (.../sa/github-tool-mcp) — see the token-exchange note in the
+            # header above.
             - name: MCP_URL
               value: "http://github-tool-mcp:9090/mcp"
 

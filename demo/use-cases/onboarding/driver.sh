@@ -65,6 +65,9 @@
 #                         after that, so a smaller value makes the failure unrecoverable in-run. Each
 #                         phase still breaks the instant its condition is met, so a healthy run is fast.
 #   DEPLOY_WAIT_SECS      max seconds to wait for pods to become Ready after deploy   (default: 180)
+#   BUNDLE_WAIT_SECS      max seconds ENFORCE waits for the OPAs of github-tool and github-agent to load
+#                         their last bundles before dev-user's allow is a failure (default: 180, one
+#                         bundle poll cycle; whole seconds)
 #   TRIGGER_WAIT_SECS     max seconds --only-replay-trigger waits for the operator to re-register
 #                         fresh Keycloak client uuids                          (default: 180)
 #   KIND_CLUSTER          name of the Kind cluster                             (default: rossoctl)
@@ -95,6 +98,9 @@ USER_PASSWORD="${USER_PASSWORD:-password}"
 # minutes BEFORE the retry it was waiting for — observed 2026-09-30, where onboarding self-healed at
 # 14:38 having failed at 14:28, but the run had already died at 14:33. 720s leaves room for one.
 POLL_SECS="${POLL_SECS:-720}"
+BUNDLE_WAIT_SECS="${BUNDLE_WAIT_SECS:-180}"
+# Whole seconds, no leading zero: bash arithmetic reads "090" as octal, and fails on it.
+case "$BUNDLE_WAIT_SECS" in ''|*[!0-9]*|0?*) echo "BUNDLE_WAIT_SECS must be a whole number of seconds, got '${BUNDLE_WAIT_SECS}'" >&2; exit 2 ;; esac
 DEPLOY_WAIT_SECS="${DEPLOY_WAIT_SECS:-180}"
 TRIGGER_WAIT_SECS="${TRIGGER_WAIT_SECS:-180}"
 KIND_CLUSTER="${KIND_CLUSTER:-rossoctl}"
@@ -217,11 +223,23 @@ client_uuid_by_name() {
     | CLIENT_NAME="$name" json_eval 'next((c["id"] for c in d if c.get("name") == os.environ["CLIENT_NAME"]), "")'
 }
 
-# scope_id_by_name <name> <admin_token> — the realm client-scope's id, or "" if absent (caller checks).
+# scope_id_by_name <name> <admin_token> — the realm client-scope's id; "absent" when the realm's scope
+# list was read and has no such scope; "" when the list could not be read (caller checks both), so a
+# failed read never reads as "not there".
 scope_id_by_name() {
   local name="$1" admin="$2"
-  curl -s -H "Authorization: Bearer ${admin}" "${KC}/admin/realms/${REALM}/client-scopes" \
-    | SCOPE_NAME="$name" json_eval 'next((s["id"] for s in d if s.get("name") == os.environ["SCOPE_NAME"]), "")'
+  realm_client_scopes "$admin" | scope_id_in "$name"
+}
+
+# realm_client_scopes <admin_token> — the realm's client-scopes as JSON ("" when the read fails); read
+# it once and look several names up in it with scope_id_in.
+realm_client_scopes() {
+  curl -s -H "Authorization: Bearer $1" "${KC}/admin/realms/${REALM}/client-scopes" || true
+}
+
+# scope_id_in <name> — scope_id_by_name's answer, from the client-scopes JSON on stdin.
+scope_id_in() {
+  SCOPE_NAME="$1" json_eval 'next((s["id"] for s in d if s.get("name") == os.environ["SCOPE_NAME"]), "absent") if isinstance(d, list) else ""'
 }
 
 latest_pod() {
@@ -230,9 +248,10 @@ latest_pod() {
 
 # check_pipeline_wiring — read authbridge-runtime-config once and check it, parsed per leg, with
 # k8s/authbridge-pipeline-check.py --namespace (the rule of k8s/opa-kind-verify.sh Verify 1 and of the system
-# harness's skip gate): opa once on each leg, outbound token-exchange-aiac once and token-exchange not
-# at all, a spiffe://<td>/... audience template, no_token_policy deny. Sets WIRING to the helper's line;
-# fails unless it is ok.
+# harness's skip gate; its docstring lists the rule): opa once on each leg, after the identity plugin
+# (and, inbound, mcp-parser); outbound token-exchange-aiac once and token-exchange not at all; a
+# spiffe://<td>/...{namespace}...{service}... audience template; no_token_policy deny. Sets WIRING to
+# the helper's line; fails unless it is ok.
 # The demo ships no authproxy-routes, so on the stock pipeline (token-exchange with routes) ENFORCE
 # would see un-exchanged calls that github-tool rejects, reported as policy failures.
 check_pipeline_wiring() {
@@ -569,6 +588,41 @@ print("yes" if os.environ["SCOPE"] in names else "")' 2>/dev/null || true)
   kubectl get "$POLICY_CR" github-tool -n "$NS" -o jsonpath='{.spec.policies[*].content}' | sed 's/^/    /'
 }
 
+# grant_default_scope <scope-name> <scope-id> — link the client scope to github-agent's client
+# ($AGENT_UUID, admin token $ADMIN) as a DEFAULT scope. token-exchange-aiac requests no scope, so only a
+# default scope grants a target. Keycloak silently skips a default link of a scope already linked as
+# optional (an earlier run of this driver granted it as optional), so drop an optional link first —
+# only when the scope IS listed as optional: Keycloak's DELETE of an optional link also removes a
+# default link, so a blind DELETE on a re-run would drop the live grant until the PUT below, and
+# refuse exchanges in between. The same move as _link_default_scope in
+# src/aiac/idp/service/configuration/keycloak/main.py, which this bash copy (and the harness's
+# grant_exchange_scope) follows.
+# With a third argument "best-effort", a failure warns and returns 1 instead of stopping the driver.
+grant_default_scope() {
+  local scope="$1" scope_id="$2" fail=die optional del_http put_http
+  [ "${3:-}" = best-effort ] && fail=warn
+  optional="$(scope_linked "$ADMIN" "$AGENT_UUID" optional "$scope")"
+  if [ "$optional" = error ]; then
+    "$fail" "could not read the optional client-scopes of ${NS}/github-agent"
+    return 1
+  fi
+  if [ "$optional" = "yes" ]; then
+    del_http=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE -H "Authorization: Bearer ${ADMIN}" \
+      "${KC}/admin/realms/${REALM}/clients/${AGENT_UUID}/optional-client-scopes/${scope_id}" || true)
+    if [ "$del_http" != 204 ]; then
+      "$fail" "removing the optional link of '${scope}' returned HTTP ${del_http} (expected 204)"
+      return 1
+    fi
+  fi
+  put_http=$(curl -s -o /dev/null -w "%{http_code}" -X PUT -H "Authorization: Bearer ${ADMIN}" \
+    "${KC}/admin/realms/${REALM}/clients/${AGENT_UUID}/default-client-scopes/${scope_id}" || true)
+  case "$put_http" in
+    204) pass "assigned '${scope}' as a default client-scope of github-agent: HTTP 204" ;;
+    409) warn "'${scope}' is already a default client-scope of github-agent (HTTP 409) — idempotent, continuing" ;;
+    *) "$fail" "assigning '${scope}' as a default client-scope returned HTTP ${put_http} (expected 204)"; return 1 ;;
+  esac
+}
+
 # ── Phase WIRE ────────────────────────────────────────────────────────────────
 phase_wire_outbound() {
   printf '\n%s%s====== Phase WIRE — AuthBridge outbound leg (default client scope, no routes) ======%s\n' "$C_BLD" "$C_CYN" "$C_RST"
@@ -578,29 +632,30 @@ phase_wire_outbound() {
   [ -n "$ADMIN" ] || die "could not obtain a Keycloak master admin token"
   AGENT_UUID="$(client_uuid_by_name "${NS}/github-agent" "$ADMIN")"
   [ -n "$AGENT_UUID" ] || die "could not resolve the Keycloak client uuid for ${NS}/github-agent"
-  local tool_aud="agent-${NS}-github-tool-aud"
-  SCOPE_ID="$(scope_id_by_name "$tool_aud" "$ADMIN")"
-  [ -n "$SCOPE_ID" ] || die "client-scope '${tool_aud}' not found — has github-tool onboarded yet?"
-  # Keycloak silently skips a default link of a scope already linked as optional (an earlier run of
-  # this driver granted it as optional), so drop an optional link first — only when the scope IS
-  # listed as optional: Keycloak's DELETE of an optional link also removes a default link, so a blind
-  # DELETE on a re-run would drop the live grant until the PUT below, and refuse exchanges in between.
-  # The same move as _link_default_scope in src/aiac/idp/service/configuration/keycloak/main.py; this
-  # bash copy (and the harness's grant_exchange_scope) follows it.
-  OPTIONAL="$(scope_linked "$ADMIN" "$AGENT_UUID" optional "$tool_aud")"
-  [ "$OPTIONAL" != error ] || die "could not read the optional client-scopes of ${NS}/github-agent"
-  if [ "$OPTIONAL" = "yes" ]; then
-    DEL_HTTP=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE -H "Authorization: Bearer ${ADMIN}" \
-      "${KC}/admin/realms/${REALM}/clients/${AGENT_UUID}/optional-client-scopes/${SCOPE_ID}")
-    [ "$DEL_HTTP" = 204 ] || die "removing the optional client-scope link returned HTTP ${DEL_HTTP} (expected 204)"
+  local tool_aud="agent-${NS}-github-tool-aud" scopes
+  scopes="$(realm_client_scopes "$ADMIN")"  # read once: both scopes below are looked up in it
+  SCOPE_ID="$(scope_id_in "$tool_aud" <<<"$scopes")"
+  [ -n "$SCOPE_ID" ] || die "could not read the realm's client-scopes"
+  [ "$SCOPE_ID" != absent ] || die "client-scope '${tool_aud}' not found — has github-tool onboarded yet?"
+  grant_default_scope "$tool_aud" "$SCOPE_ID"
+
+  # The agent's own MCP_URL targets the production tool, github-tool-mcp (the cortex github-issue demo,
+  # not part of this demo). Its calls are exchanged once that tool is registered as
+  # .../sa/github-tool-mcp (rossoctl/cortex#1540): then grant its audience scope, as a DEFAULT scope (the
+  # plugin requests no scope). Absent, it is skipped: this demo's probes call the stub github-tool only.
+  # github-full-access, the scope the tool reads to pick its privileged PAT, is NOT granted: as a default
+  # scope it would be in every token github-agent exchanges, so every user would get the privileged PAT.
+  # A per-user grant is the cortex demo's design question (rossoctl/cortex#1540).
+  local mcp_aud="agent-${NS}-github-tool-mcp-aud" mcp_id
+  mcp_id="$(scope_id_in "$mcp_aud" <<<"$scopes")"  # the list was read above, and read fine
+  if [ "$mcp_id" != absent ]; then
+    # Best effort: this demo never probes the production tool, so a failed grant warns, never stops WIRE.
+    grant_default_scope "$mcp_aud" "$mcp_id" best-effort \
+      || warn "github-tool-mcp's calls from github-agent stay un-exchanged"
+    info "github-full-access is not granted: github-tool-mcp uses its public PAT for every user (rossoctl/cortex#1540)"
+  else
+    info "client-scope '${mcp_aud}' not found — the production github-tool-mcp is not registered (rossoctl/cortex#1540); skipped"
   fi
-  SCOPE_HTTP=$(curl -s -o /dev/null -w "%{http_code}" -X PUT -H "Authorization: Bearer ${ADMIN}" \
-    "${KC}/admin/realms/${REALM}/clients/${AGENT_UUID}/default-client-scopes/${SCOPE_ID}")
-  case "$SCOPE_HTTP" in
-    204) pass "assigned default client-scope: HTTP 204" ;;
-    409) warn "default client-scope already assigned (HTTP 409) — idempotent, continuing" ;;
-    *) die "assigning the default client-scope returned HTTP ${SCOPE_HTTP} (expected 204)" ;;
-  esac
 
   # token-exchange-aiac (k8s/opa-kind-enable.sh) derives the github-tool audience from the host —
   # no route. It requests no scope, so the grant must be a DEFAULT scope. The restart clears the
@@ -744,7 +799,8 @@ phase_enforce() {
     | json_eval 'd[0]["id"]')"
   [ -n "$ROPC_UUID" ] || die "ROPC client '${ROPC_CLIENT_ID}' not found in realm '${REALM}'"
   AUD_SCOPE_ID="$(scope_id_by_name "$AUD_SCOPE" "$ADMIN")"
-  [ -n "$AUD_SCOPE_ID" ] || die "client-scope '${AUD_SCOPE}' not found — has github-agent onboarded yet?"
+  [ -n "$AUD_SCOPE_ID" ] || die "could not read the realm's client-scopes"
+  [ "$AUD_SCOPE_ID" != absent ] || die "client-scope '${AUD_SCOPE}' not found — has github-agent onboarded yet?"
   ALREADY="$(curl -s -H "Authorization: Bearer ${ADMIN}" "${KC}/admin/realms/${REALM}/clients/${ROPC_UUID}/default-client-scopes" \
     | AUD_SCOPE="$AUD_SCOPE" json_eval '"yes" if any(s.get("name") == os.environ["AUD_SCOPE"] for s in d) else "no"')"
   if [ "$ALREADY" = "yes" ]; then
@@ -782,19 +838,47 @@ phase_enforce() {
   probe_agent test-user   200 "$POLL_SECS" "test-user -> github-agent (inbound)"
   probe_agent devops-user 403 "$POLL_SECS" "devops-user -> github-agent (inbound, expected denied)"
 
-  step "Tool calls through github-agent — per-tool matrix for dev-user and test-user (reported; source-read is a hard check)"
+  # Wait for the final bundles BEFORE the matrix, so it shows the enforced policy. github-tool's and the
+  # agent's OPAs poll bundle-service every 10-120 s (about 144 s after a fetch error), so the bundle the
+  # last onboarding wrote can land after the restart. Until it does, a pod runs its bootstrap CR, which
+  # denies every call (github-tool: DENIED_HTTP 403; the agent's outbound: DENIED_JSONRPC), or, with no
+  # bundle at all, answers upstream.unreachable (github-tool: UNEXPECTED 503; the agent's outbound, for this
+  # MCP request: a JSON-RPC frame at 200, UNEXPECTED 200). Right after the restart the agent's sidecar may
+  # also not have read its credentials yet (EXCHANGE_REFUSED ... upstream.token-exchange-failed).
+  # dev-user -> source-read is the allow that proves all of it is current. Poll it for one bundle cycle
+  # (BUNDLE_WAIT_SECS), so these are waited out, but a real deny is still reported within minutes. A
+  # refusal of the audience or the bearer, or an exec error, never clears by waiting: it stops at once.
+  step "Waiting for the final bundles: dev-user -> source-read allowed [up to ${BUNDLE_WAIT_SECS}s]"
+  local dev_deadline=$((SECONDS + BUNDLE_WAIT_SECS))
+  while :; do
+    DEV_SOURCE_READ="$(probe_tool dev-user source-read)"
+    [ "$DEV_SOURCE_READ" = "ALLOWED_RESULT" ] && break
+    case "$DEV_SOURCE_READ" in
+      "DENIED_HTTP 403" | DENIED_JSONRPC | "UNEXPECTED 503"* | "UNEXPECTED 200"*upstream.unreachable* \
+        | "EXCHANGE_REFUSED "*" upstream.token-exchange-failed") ;;
+      *) break ;;
+    esac
+    [ "$SECONDS" -lt "$dev_deadline" ] || break
+    info "dev-user -> source-read: ${DEV_SOURCE_READ} — an OPA may not have its last bundle yet; retrying"
+    sleep 10
+  done
+  [ "$DEV_SOURCE_READ" = "ALLOWED_RESULT" ] \
+    && pass "dev-user -> source-read: ALLOWED_RESULT" \
+    || die "dev-user -> source-read: got '${DEV_SOURCE_READ}', expected ALLOWED_RESULT (after one bundle cycle, ${BUNDLE_WAIT_SECS}s)"
+
+  step "Tool calls through github-agent — per-tool matrix for dev-user and test-user (reported; test-user -> source-read is a hard check)"
   local user tool verdict
   printf '     %-12s %-14s %s\n' "user" "tool" "verdict"
   for user in dev-user test-user; do
     for tool in source-read source-write issues-read issues-write; do
-      verdict="$(probe_tool "$user" "$tool")"
+      if [ "$user/$tool" = dev-user/source-read ]; then
+        verdict="$DEV_SOURCE_READ"  # just probed by the bundle wait above
+      else
+        verdict="$(probe_tool "$user" "$tool")"
+      fi
       printf '     %-12s %-14s %s\n' "$user" "$tool" "${verdict:-<none>}"
     done
   done
-  DEV_SOURCE_READ="$(probe_tool dev-user source-read)"
-  [ "$DEV_SOURCE_READ" = "ALLOWED_RESULT" ] \
-    && pass "dev-user -> source-read: ALLOWED_RESULT" \
-    || die "dev-user -> source-read: got '${DEV_SOURCE_READ}', expected ALLOWED_RESULT"
   TEST_SOURCE_READ="$(probe_tool test-user source-read)"
   # Only github-tool's inbound OPA deny passes (the tool check, relayed as a 403). An OPA deny on the
   # agent's own outbound (DENIED_JSONRPC) is a fault — the outbound is a pass-through (D24), for example

@@ -694,8 +694,7 @@ def notification_outcome(code: int | None, body: str) -> str:
     (``token-exchange-aiac``'s 403 ``policy.forbidden``) is never reported as an OPA deny."""
     if code in (200, 202):
         return "allow"
-    rej = _rejection()
-    if code == 403 and rej.is_opa_violation(rej.rejection_doc(code, body)):
+    if code == 403 and is_opa_violation(rejection_doc(code, body)):
         return "deny"
     return "error"
 
@@ -739,21 +738,48 @@ def _load_k8s_module(name: str):
 
 # Whose rejection an outbound answer is: ``k8s/authbridge-rejection.py`` (standard library only), which the
 # onboarding demo driver sends into the agent pod with its probe, so the demo and the harness classify an
-# answer by one rule. Its public names are this module's too (``outbound_outcome``, ``rejection_doc``,
-# ``TARGET_DISABLED_MESSAGE`` …; their docstrings are there), through module ``__getattr__``: the file
-# loads on first use, so importing this module never needs ``k8s/``. ``pipeline_check`` loads it too, so
-# a missing or broken file skips the live suite up front instead of failing in a poll.
+# answer by one rule. The functions below are thin wrappers, with their docstrings in that file. They are
+# real functions, not lazy module attributes: ``from test.system.launcher import outbound_outcome`` binds
+# one and loads nothing. The file loads on the first call, so importing this module (or a test module
+# that imports these names) never needs ``k8s/``, and ``pipeline_check`` loads it, so a missing or
+# broken file skips the live suite up front.
 def _rejection():
     return _load_k8s_module("authbridge-rejection")
 
 
-def __getattr__(name: str):
-    if name.startswith("_"):
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    try:
-        return getattr(_rejection(), name)
-    except AttributeError:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from None
+def is_opa_violation(doc: object) -> bool:
+    """See ``k8s/authbridge-rejection.py``."""
+    return _rejection().is_opa_violation(doc)
+
+
+def is_exchange_refusal(doc: object) -> bool:
+    """See ``k8s/authbridge-rejection.py``."""
+    return _rejection().is_exchange_refusal(doc)
+
+
+def rejection_doc(code: int | None, body: str) -> dict | None:
+    """See ``k8s/authbridge-rejection.py``."""
+    return _rejection().rejection_doc(code, body)
+
+
+def outbound_outcome(code: int | None, body: str) -> str:
+    """See ``k8s/authbridge-rejection.py``."""
+    return _rejection().outbound_outcome(code, body)
+
+
+def exchange_refusal(code: int | None, body: str) -> bool:
+    """See ``k8s/authbridge-rejection.py``."""
+    return _rejection().exchange_refusal(code, body)
+
+
+def target_disabled_refusal(code: int | None, body: str) -> bool:
+    """See ``k8s/authbridge-rejection.py``."""
+    return _rejection().target_disabled_refusal(code, body)
+
+
+def target_disabled_message() -> str:
+    """``TARGET_DISABLED_MESSAGE`` of ``k8s/authbridge-rejection.py`` (a call, so the file loads lazily)."""
+    return _rejection().TARGET_DISABLED_MESSAGE
 
 
 # Where the deny of a ``tools/call`` comes from (``deny_origin``): the callee's own inbound OPA
@@ -778,8 +804,7 @@ def deny_origin(code: int | None, body: str) -> str | None:
 
     Only a request frame (``tools/call`` with an ``id``) has two distinct shapes. A notification gets a
     plain 403 from either proxy, so this helper does not apply to it."""
-    rej = _rejection()
-    if not rej.is_opa_violation(rej.rejection_doc(code, body)):
+    if not is_opa_violation(rejection_doc(code, body)):
         return None
     return DENY_ORIGIN_TOOL_INBOUND if code == 403 else DENY_ORIGIN_AGENT_OUTBOUND
 
@@ -859,11 +884,10 @@ def combiner_reason(default_cr: dict | None, *, namespace: str = BUNDLE_SERVICE_
     return None
 
 
-# ``pipeline_check`` applies the one wiring rule of the AuthBridge runtime config (opa on each leg, one
-# ``token-exchange-aiac`` and no ``token-exchange`` outbound, a ``spiffe://<td>/...`` audience template,
-# ``no_token_policy`` deny), ``k8s/authbridge-pipeline-check.py``, which ``k8s/opa-kind-verify.sh`` and the demo driver's preflight
-# run. It is loaded on first use (``_load_k8s_module``), so PyYAML (a dependency of ``kubernetes``) is
-# imported only then.
+# ``pipeline_check`` applies the one wiring rule of the AuthBridge runtime config,
+# ``k8s/authbridge-pipeline-check.py`` (its docstring lists the rule), which ``k8s/opa-kind-verify.sh``
+# and the demo driver's preflight run. It is loaded on first use (``_load_k8s_module``), so PyYAML (a
+# dependency of ``kubernetes``) is imported only then.
 
 
 def pipeline_check(config_yaml: str, *, namespace: str) -> tuple[str | None, str | None]:
@@ -873,7 +897,9 @@ def pipeline_check(config_yaml: str, *, namespace: str) -> tuple[str | None, str
     ``skip_reason`` is ``None`` when the config is wired for the harness: the rule of
     ``k8s/authbridge-pipeline-check.py`` (``check``), the same file ``k8s/opa-kind-verify.sh`` (Verify 1)
     runs — ``opa`` once on each leg, ``token-exchange-aiac`` once and ``token-exchange`` not at all on the
-    outbound leg, a ``spiffe://<td>/...`` audience template, and ``no_token_policy`` deny (or unset). ``trust_domain`` is that ``<td>``, the
+    outbound leg, ``opa`` after the identity plugin (and inbound mcp-parser) on each leg, a
+    ``spiffe://<td>/...{namespace}...{service}...`` audience template, and ``no_token_policy`` deny
+    (or unset). ``trust_domain`` is that ``<td>``, the
     trust domain the live leg exchanges for (``k8s/opa-kind-enable.sh`` takes it from the chart)."""
     try:
         check = _load_k8s_module("authbridge-pipeline-check").check

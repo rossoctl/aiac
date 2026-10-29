@@ -82,20 +82,32 @@ client_uuid_by_name() {
     | CLIENT_NAME="$1" json_eval 'next((c["id"] for c in d if c.get("name") == os.environ["CLIENT_NAME"]), "")'
 }
 
-echo "==> 1. Removing the github-tool audience client-scope from github-agent (default or optional, if present)"
+echo "==> 1. Removing the client-scopes WIRE linked to github-agent (default or optional, if present)"
+# The audience scopes WIRE links: the stub github-tool's, and the production github-tool-mcp's when that
+# tool is registered. Step 2 deletes the client anyway, which drops every link; this step says what was
+# granted. The realm's client-scopes are read once, and each name looked up in them: "absent" when the
+# realm has none, "" when the read failed (the same answers as driver.sh's scope_id_by_name). A failed
+# read skips this step; step 2 still runs.
 ADMIN="$(admin_token)"
 if [ -n "$ADMIN" ]; then
   AGENT_UUID="$(client_uuid_by_name "${NS}/github-agent")"
-  SCOPE_ID=$(curl -s -H "Authorization: Bearer ${ADMIN}" "${KC}/admin/realms/${REALM}/client-scopes" \
-    | SCOPE_NAME="agent-${NS}-github-tool-aud" json_eval 'next((s["id"] for s in d if s.get("name") == os.environ["SCOPE_NAME"]), "")')
-  if [ -n "$AGENT_UUID" ] && [ -n "$SCOPE_ID" ]; then
-    for kind in default optional; do
-      curl -s -o /dev/null -w "    remove ${kind} scope HTTP %{http_code}\n" -X DELETE \
-        -H "Authorization: Bearer ${ADMIN}" \
-        "${KC}/admin/realms/${REALM}/clients/${AGENT_UUID}/${kind}-client-scopes/${SCOPE_ID}"
+  REALM_SCOPES="$(curl -s -H "Authorization: Bearer ${ADMIN}" "${KC}/admin/realms/${REALM}/client-scopes" || true)"
+  if [ -n "$AGENT_UUID" ]; then
+    for scope in "agent-${NS}-github-tool-aud" "agent-${NS}-github-tool-mcp-aud"; do
+      SCOPE_ID="$(SCOPE_NAME="$scope" json_eval 'next((s["id"] for s in d if s.get("name") == os.environ["SCOPE_NAME"]), "absent") if isinstance(d, list) else ""' <<<"$REALM_SCOPES")"
+      case "$SCOPE_ID" in
+        absent) echo "    ${scope}: not in the realm — nothing to remove"; continue ;;
+        "") echo "    ${scope}: the realm's client-scopes could not be read — skipped"; continue ;;
+      esac
+      for kind in default optional; do
+        # || true: a failed DELETE must not stop restore before step 2 deletes the clients.
+        curl -s -o /dev/null -w "    ${scope}: remove ${kind} link HTTP %{http_code}\n" -X DELETE \
+          -H "Authorization: Bearer ${ADMIN}" \
+          "${KC}/admin/realms/${REALM}/clients/${AGENT_UUID}/${kind}-client-scopes/${SCOPE_ID}" || true
+      done
     done
   else
-    echo "    (client or scope not found — nothing to remove)"
+    echo "    (client not found — nothing to remove)"
   fi
 
   echo "==> 2. Deleting the Keycloak clients ${NS}/github-agent, ${NS}/github-tool"
@@ -103,7 +115,7 @@ if [ -n "$ADMIN" ]; then
     UUID="$(client_uuid_by_name "$name")"
     if [ -n "$UUID" ]; then
       curl -s -o /dev/null -w "    delete ${name} HTTP %{http_code}\n" -X DELETE \
-        -H "Authorization: Bearer ${ADMIN}" "${KC}/admin/realms/${REALM}/clients/${UUID}"
+        -H "Authorization: Bearer ${ADMIN}" "${KC}/admin/realms/${REALM}/clients/${UUID}" || true
     else
       echo "    (${name} not registered — nothing to delete)"
     fi
@@ -118,22 +130,24 @@ echo "     see aiac/src/aiac/idp/service/configuration/keycloak/main.py's create
 echo "     so a stale scope/role from a prior onboarding cycle causes a 409/502 on the next one.)"
 if [ -n "$ADMIN" ]; then
   for component in github-agent github-tool; do
-    SCOPE_IDS=$(curl -s -H "Authorization: Bearer ${ADMIN}" "${KC}/admin/realms/${REALM}/client-scopes" \
+    # A fresh read, not step 1's list: the workloads run until step 5, so an onboarding still in flight can
+    # create scopes after step 1. "|| true": a failed read deletes nothing here, and restore goes on.
+    SCOPE_IDS=$( { curl -s -H "Authorization: Bearer ${ADMIN}" "${KC}/admin/realms/${REALM}/client-scopes" || true; } \
       | COMPONENT="$component" AUD_NAME="agent-${NS}-${component}-aud" json_eval '"\n".join(
     s["id"] for s in d
     if s.get("name", "").startswith(os.environ["COMPONENT"] + ".") or s.get("name") == os.environ["AUD_NAME"])')
     for id in $SCOPE_IDS; do
       curl -s -o /dev/null -w "    delete client-scope (${component}) ${id} HTTP %{http_code}\n" -X DELETE \
-        -H "Authorization: Bearer ${ADMIN}" "${KC}/admin/realms/${REALM}/client-scopes/${id}"
+        -H "Authorization: Bearer ${ADMIN}" "${KC}/admin/realms/${REALM}/client-scopes/${id}" || true
     done
 
-    ROLE_NAMES=$(curl -s -H "Authorization: Bearer ${ADMIN}" "${KC}/admin/realms/${REALM}/roles" \
+    ROLE_NAMES=$( { curl -s -H "Authorization: Bearer ${ADMIN}" "${KC}/admin/realms/${REALM}/roles" || true; } \
       | COMPONENT="$component" json_eval '"\n".join(
     r["name"] for r in d if r.get("name", "").startswith(os.environ["COMPONENT"] + "."))')
     while IFS= read -r role; do
       [ -n "$role" ] || continue
       curl -s -o /dev/null -w "    delete role ${role} HTTP %{http_code}\n" -X DELETE \
-        -H "Authorization: Bearer ${ADMIN}" "${KC}/admin/realms/${REALM}/roles/${role}"
+        -H "Authorization: Bearer ${ADMIN}" "${KC}/admin/realms/${REALM}/roles/${role}" || true
     done <<< "$ROLE_NAMES"
   done
 else

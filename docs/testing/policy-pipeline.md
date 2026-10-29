@@ -79,9 +79,9 @@ over the fully onboarded stack.
    - the global combiner (the `default` CR in `rossoctl-system`) still allows a pod that has no
      client CR (D20);
    - the AuthBridge runtime config is not wired (`pipeline_check`, which applies
-     `k8s/authbridge-pipeline-check.py`): `opa` not once on **each** leg; not exactly one
+     `k8s/authbridge-pipeline-check.py`): `opa` not once on **each** leg, or not after the identity plugin (and, inbound, mcp-parser); not exactly one
      `token-exchange-aiac` and no `token-exchange` on the outbound leg; a `token-exchange-aiac`
-     audience template that names no `spiffe://<td>` trust domain; or a `no_token_policy` other
+     audience template that is not `spiffe://<td>/...{namespace}...{service}...`; or a `no_token_policy` other
      than `deny`.
 
    The gate returns that trust domain, which the harness exchanges for.

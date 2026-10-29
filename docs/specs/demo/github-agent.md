@@ -216,17 +216,28 @@ Manifests live under `demo/assets/agents/github_agent/k8s/`, adapted from the gi
   routes. It derives the audience `spiffe://<trust-domain>/ns/<namespace>/sa/<host>` from the `MCP_URL`
   host and exchanges for it when the agent's client has that audience as a **default** client scope.
 - **Prerequisite (reused, not created here):** the existing **production** `github-tool` Deployment/Service
-  (`authbridge/demos/github-issue/k8s/github-tool-deployment.yaml`, Service name `github-tool-mcp`) +
+  (`authbridge/demos/github-issue/k8s/github-tool-deployment.yaml`, Service name `github-tool-mcp`; to be
+  exchanged it needs a ServiceAccount `github-tool-mcp` and an enrollment, rossoctl/cortex#1540) +
   `github-tool-secrets`, a running rossoctl cluster (Keycloak realm `rossoctl`, namespace `team1` —
   installer-provided and enrolled for AuthBridge injection).
   The sibling UC-1 stub at `demo/assets/tools/github_tool/` (Service `github-tool`) is a separate deployment
   for AIAC onboarding discovery and is **not** a runtime dependency of this agent.
 
 **Wiring invariant:** for a tool call to be exchanged, the agent `MCP_URL` host == the tool's Service name
-== its ServiceAccount name, and the derived `spiffe://…/sa/<host>` == the tool's Keycloak client ID (its
-`AUDIENCE`). The shipped default does not meet it: the host `github-tool-mcp` derives an audience that
-names no client (the production tool's audience is `github-tool`), so those calls pass through
-un-exchanged. The UC-1 stub (`github-tool`, Service = ServiceAccount = `github-tool`) meets it.
+== its ServiceAccount name, the derived `spiffe://…/sa/<host>` == the tool's Keycloak client ID, and the
+tool's audience scope `agent-<ns>-<host>-aud` is a **default** client scope of `github-agent`. A scope the
+tool reads (`github-full-access`, for the production tool's PAT choice) reaches the token only as a default
+scope of `github-agent` too, and then it is in **every** token the agent exchanges, whoever the user is. So
+it is not granted: the production tool uses its public PAT, and a per-user grant is part of
+rossoctl/cortex#1540. The agent keeps `MCP_URL` at `github-tool-mcp`, and the production tool keeps that
+Service name. The name `github-tool` is the UC-1 stub's (Service = ServiceAccount = `github-tool`), so the
+two cannot share it. The production tool meets the invariant once its cortex manifest gives it a
+ServiceAccount `github-tool-mcp` and enrolls it (rossoctl/cortex#1540). Until then the cortex demo's
+`setup_keycloak.py` gives it a hand-made plain client ID `github-tool` (not a SPIFFE ID, so it is not
+the UC-1 stub's operator-registered `…/sa/github-tool`); the host names no client, and those calls pass
+through un-exchanged. The UC-1
+onboarding demo's WIRE phase links `agent-<ns>-github-tool-mcp-aud` as a default scope of `github-agent`
+when it exists, and skips it otherwise. It never links `github-full-access`.
 
 ---
 

@@ -7,19 +7,28 @@ kept apart, so a kubectl warning cannot break the parse; a failed read is
 reported). Prints ``ok trust_domain=<td>`` when the wiring is right, else one
 line that says what is wrong. The wiring is right when:
 
-- ``opa`` runs once on each leg;
+- ``opa`` runs once on each leg, **after** the plugins that set what AIAC's Rego
+  reads there: inbound, ``jwt-validation`` (``input.identity``) and
+  ``mcp-parser`` (``input.mcp``, which a tool's inbound package reads); outbound,
+  ``token-exchange-aiac`` (``input.identity``, ``input.delegation``). AIAC's
+  outbound package is a pass-through (D24) and reads no ``input.mcp``. Other
+  parsers may run anywhere: no AIAC policy reads their signals;
 - the **outbound** leg runs ``token-exchange-aiac`` once and ``token-exchange``
   not at all;
 - that ``token-exchange-aiac`` has an ``audience_template`` of the form
-  ``spiffe://<td>/...{service}...`` (``<td>`` is the trust domain it exchanges
-  for; a template without ``{service}`` names one audience for every call);
+  ``spiffe://<td>/...{namespace}...{service}...`` (``<td>`` is the trust domain
+  it exchanges for). Without ``{service}`` it names one audience for every call;
+  without ``{namespace}``, every agent namespace the chart renders this one
+  pipeline into would derive one namespace's audiences;
 - its ``no_token_policy`` is ``deny`` or unset (the plugin default, ``deny``): a
   request with no bearer to a target is refused, never exchanged with the
   workload's own token. ``k8s/opa-kind-enable.sh`` once set
   ``client-credentials``; a cluster still on that overlay must re-run it.
 
-It parses the YAML and counts whole plugin names per leg, so quoting, comments
-and the other leg do not change the verdict.
+It parses the YAML and reads whole plugin names per leg, in order, so quoting,
+comments, the other leg and the bare-string entry form (``- opa``, which cortex
+reads as ``{name: opa}``) do not change the verdict; the order of the plugins
+does.
 
 The rule lives here once. ``k8s/opa-kind-verify.sh`` (Verify 1), the onboarding
 demo driver's preflight and its teardown run this file; the system harness loads
@@ -47,10 +56,10 @@ LEGS = ("inbound", "outbound")
 
 
 def leg_plugins(config_yaml: str) -> dict[str, list[dict]] | None:
-    """The plugin entries (mappings) of each leg of ``config_yaml``, as ``{"inbound": [...],
-    "outbound": [...]}``, or ``None`` when ``config_yaml`` is not a YAML mapping. **Pure.** A leg the
-    config does not have, a ``plugins`` that is not a list, or an entry that is not a mapping, gives
-    nothing."""
+    """The plugin entries of each leg of ``config_yaml``, as mappings (``{"inbound": [...],
+    "outbound": [...]}``), or ``None`` when ``config_yaml`` is not a YAML mapping. **Pure.** A bare
+    string entry is ``{"name": <string>}``, as cortex reads it (``config.PluginEntry``). A leg the config
+    does not have, a ``plugins`` that is not a list, or an entry that is neither, gives nothing."""
     import yaml
 
     try:
@@ -64,7 +73,8 @@ def leg_plugins(config_yaml: str) -> dict[str, list[dict]] | None:
     for leg in LEGS:
         node = pipeline.get(leg) if isinstance(pipeline, dict) else None
         plugins = node.get("plugins") if isinstance(node, dict) else None
-        legs[leg] = [p for p in plugins if isinstance(p, dict)] if isinstance(plugins, list) else []
+        entries = plugins if isinstance(plugins, list) else []
+        legs[leg] = [{"name": p} if isinstance(p, str) else p for p in entries if isinstance(p, (dict, str))]
     return legs
 
 
@@ -85,13 +95,16 @@ def _exchange_config(legs: dict[str, list[dict]]) -> dict:
 def trust_domain(legs: dict[str, list[dict]]) -> str | None:
     """The SPIFFE trust domain in the ``audience_template`` of the outbound ``token-exchange-aiac`` of
     ``legs`` (``leg_plugins``), or ``None`` when there is none (no such plugin, or a template that is
-    not ``spiffe://<td>/...``). **Pure.**"""
+    not ``spiffe://<td>/...{namespace}...{service}...``). **Pure.**"""
     template = _exchange_config(legs).get("audience_template")
     if not isinstance(template, str) or not template.startswith("spiffe://"):
         return None
     authority, _, path = template[len("spiffe://") :].partition("/")
-    # A template whose path does not carry ``{service}`` names one audience for every call.
-    return authority if authority and "{service}" in path else None
+    # Without ``{service}`` the template names one audience for every call; without ``{namespace}``,
+    # the one pipeline the chart renders into every agent namespace derives one namespace's audiences.
+    # The operator names a workload ``.../ns/<ns>/sa/<sa>``, so ``{namespace}`` comes first.
+    ns_at, svc_at = path.find("{namespace}"), path.find("{service}")
+    return authority if authority and 0 <= ns_at < svc_at else None
 
 
 def problem(legs: dict[str, list[dict]], td: str | None) -> str | None:
@@ -109,8 +122,23 @@ def problem(legs: dict[str, list[dict]], td: str | None) -> str | None:
             f"outbound exchange plugins: token-exchange-aiac={new}, token-exchange={legacy} "
             "(want 1/0; an older pipeline)"
         )
+    # OPA must run after the plugins that set what AIAC's Rego reads on that leg, or it decides with
+    # them undefined: inbound, input.identity (jwt-validation) and input.mcp (mcp-parser, read by a
+    # tool's inbound package); outbound, input.identity (token-exchange-aiac). The outbound package is a
+    # pass-through (D24) and reads no input.mcp, and no AIAC policy reads the other parsers' signals
+    # (input.a2a, input.inference), so their place is free.
+    for leg, needed in (("inbound", ("jwt-validation", "mcp-parser")), ("outbound", ("token-exchange-aiac",))):
+        for plugin in needed:
+            if plugin not in names[leg]:
+                return f"the {leg} leg has no {plugin} (it sets what the {leg} opa reads)"
+        late = [n for n in names[leg][names[leg].index("opa") + 1 :] if n in needed]
+        if late:
+            return f"{leg} plugin order {names[leg]}: opa must run after {' and '.join(needed)}"
     if td is None:
-        return "the outbound token-exchange-aiac has no spiffe://<trust-domain>/...{service}... audience_template"
+        return (
+            "the outbound token-exchange-aiac has no spiffe://<trust-domain>/...{namespace}...{service}... "
+            "audience_template"
+        )
     # Unset, or an empty value (YAML null, ""): the plugin applies its default, deny. Anything else must
     # be the string "deny" (``false`` or ``0`` is not unset).
     policy = _exchange_config(legs).get("no_token_policy")

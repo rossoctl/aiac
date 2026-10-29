@@ -145,6 +145,7 @@ def test_rejection_doc_unwraps_both_rejection_shapes(code: int | None, body: str
 _CONFIG = """pipeline:
   inbound:
     plugins:
+      - name: mcp-parser
       - name: jwt-validation
       - name: opa
   outbound:
@@ -183,15 +184,52 @@ _PASSING = [
     _CONFIG.replace("name: token-exchange-aiac", 'name: "token-exchange-aiac"'),
     _CONFIG.replace("name: opa", 'name: "opa"'),
     _CONFIG + "# - name: token-exchange\n# - name: opa\n",  # a comment is not a plugin
+    # bare-string entries, which cortex reads as {name: <string>}
+    _CONFIG.replace("      - name: jwt-validation\n      - name: opa\n", "      - jwt-validation\n      - opa\n"),
+    _CONFIG.replace("      - name: mcp-parser\n", "      - mcp-parser\n").replace(
+        _AIAC_ENTRY + "      - name: opa\n", _AIAC_ENTRY + "      - opa\n"
+    ),
 ]
 
 
 @pytest.mark.parametrize("config", _PASSING)
 def test_pipeline_check_passes_the_enabled_wiring(config: str) -> None:
+    if config is not _PASSING[0]:
+        assert config != _CONFIG, "this case's replace no longer matches the fixture: it tests nothing"
     assert launcher.pipeline_check(config, namespace="team1") == (None, "localtest.me")
 
 
 _SKIPPING = [
+    # opa before the plugin that sets its identity: OPA decides with no input.identity / input.delegation
+    _CONFIG.replace(_AIAC_ENTRY + "      - name: opa\n", "      - name: opa\n" + _AIAC_ENTRY),
+    _CONFIG.replace(
+        "      - name: jwt-validation\n      - name: opa\n", "      - name: opa\n      - name: jwt-validation\n"
+    ),
+    # inbound: mcp-parser after opa, or a second jwt-validation after it
+    _CONFIG.replace(
+        "      - name: mcp-parser\n      - name: jwt-validation\n      - name: opa\n",
+        "      - name: jwt-validation\n      - name: opa\n      - name: mcp-parser\n",
+    ),
+    _CONFIG.replace(
+        "      - name: jwt-validation\n      - name: opa\n",
+        "      - name: jwt-validation\n      - name: opa\n      - name: jwt-validation\n",
+    ),
+    # no mcp-parser inbound: input.mcp, which a tool's inbound package reads, is undefined
+    _CONFIG.replace(
+        "    plugins:\n      - name: mcp-parser\n      - name: jwt-validation\n",
+        "    plugins:\n      - name: jwt-validation\n",
+    ),
+    # no jwt-validation inbound at all
+    _CONFIG.replace("      - name: jwt-validation\n      - name: opa\n", "      - name: opa\n"),
+    # a template without {namespace}: every agent namespace would derive one namespace's audiences
+    _CONFIG.replace(
+        '"spiffe://localtest.me/ns/{namespace}/sa/{service}"', '"spiffe://localtest.me/ns/team1/sa/{service}"'
+    ),
+    _CONFIG.replace('"spiffe://localtest.me/ns/{namespace}/sa/{service}"', '"spiffe://localtest.me/sa/{service}"'),
+    # {namespace} after {service}: matches no operator-registered client (.../ns/<ns>/sa/<sa>)
+    _CONFIG.replace(
+        '"spiffe://localtest.me/ns/{namespace}/sa/{service}"', '"spiffe://localtest.me/sa/{service}/ns/{namespace}"'
+    ),
     _CONFIG.replace("name: token-exchange-aiac", "name: token-exchange"),  # an older pipeline
     _CONFIG.replace(_AIAC_ENTRY, _AIAC_ENTRY + "      - name: token-exchange\n"),  # half migrated
     _CONFIG.replace(_AIAC_ENTRY, _AIAC_ENTRY + _AIAC_ENTRY),  # duplicated
@@ -201,14 +239,15 @@ _SKIPPING = [
     ),
     # opa twice on the outbound leg and not on the inbound leg: still two by substring
     _CONFIG.replace("      - name: jwt-validation\n      - name: opa\n", "      - name: jwt-validation\n").replace(
-        "      - name: mcp-parser\n", "      - name: mcp-parser\n      - name: opa\n"
+        _AIAC_ENTRY + "      - name: opa\n", _AIAC_ENTRY + "      - name: opa\n      - name: opa\n"
     ),
     _CONFIG.replace(
         "      - name: jwt-validation\n      - name: opa\n", "      - name: jwt-validation\n"
     ),  # no inbound opa
     # a ``plugins`` that is not a list gives no plugins on that leg, never a crash
     _CONFIG.replace(
-        "  inbound:\n    plugins:\n      - name: jwt-validation\n      - name: opa\n", "  inbound:\n    plugins: 3\n"
+        "  inbound:\n    plugins:\n      - name: mcp-parser\n      - name: jwt-validation\n      - name: opa\n",
+        "  inbound:\n    plugins: 3\n",
     ),
     # a falsy no_token_policy is not unset
     _CONFIG.replace("          namespace_file:", "          no_token_policy: false\n          namespace_file:"),
@@ -230,6 +269,7 @@ _SKIPPING = [
 
 @pytest.mark.parametrize("config", _SKIPPING)
 def test_pipeline_check_skips_any_other_wiring(config: str) -> None:
+    assert config != _CONFIG, "this case's replace no longer matches the fixture: it tests nothing"
     reason, trust_domain = launcher.pipeline_check(config, namespace="team1")
     assert reason is not None and "k8s/opa-kind-enable.sh" in reason
     assert trust_domain is None  # a skipped run never gets a trust domain to exchange for
@@ -255,7 +295,7 @@ def test_exchange_refusal_is_only_keycloak_not_granting(code: int | None, body: 
 
 def _disabled(code: int) -> str:
     """``token-exchange-aiac``'s refusal of a disabled target, as cortex renders it at ``code``."""
-    msg = launcher.TARGET_DISABLED_MESSAGE
+    msg = launcher.target_disabled_message()
     if code == 200:
         return json.dumps({"jsonrpc": "2.0", "id": 1, "error": {"code": -32000, "message": msg, "data": NOT_GRANTED}})
     return json.dumps({**NOT_GRANTED, "message": msg})
@@ -278,7 +318,7 @@ def _not_granted(code: int) -> str:
         (200, _not_granted(200), False),
         (403, _not_granted(403), False),
         (200, _frame(EXCHANGE_FAILED), False),
-        (403, json.dumps({**OPA_DENY, "message": launcher.TARGET_DISABLED_MESSAGE}), False),
+        (403, json.dumps({**OPA_DENY, "message": launcher.target_disabled_message()}), False),
         (None, "", False),
     ],
 )
@@ -436,9 +476,18 @@ def test_importing_the_launcher_does_not_need_k8s(tmp_path: Path) -> None:
     (copy / "test" / "__init__.py").write_text("")
     (copy / "test" / "system" / "__init__.py").write_text("")
     (copy / "test" / "system" / "launcher.py").write_text((REPO_ROOT / "test" / "system" / "launcher.py").read_text())
-    script = "from test.system import launcher; print(launcher.require_env_or_skip.__name__)"
+    # Importing the classifier names (as uc1_onboard does) binds wrappers and loads nothing; only a call
+    # needs the file, and then fails naming it.
+    script = (
+        "from test.system.launcher import require_env_or_skip, outbound_outcome, target_disabled_refusal\n"
+        "print(require_env_or_skip.__name__)\n"
+        "try:\n"
+        "    outbound_outcome(403, '{}')\n"
+        "except ImportError as exc:\n"
+        "    print('call:', 'authbridge-rejection.py is missing' in str(exc))\n"
+    )
     run = subprocess.run([sys.executable, "-c", script], cwd=copy, capture_output=True, text=True, check=True)
-    assert run.stdout.strip() == "require_env_or_skip"
+    assert run.stdout.split() == ["require_env_or_skip", "call:", "True"]
 
 
 @pytest.mark.parametrize(
@@ -496,3 +545,10 @@ def test_a_tool_error_with_data_is_still_an_allow() -> None:
     assert launcher.outbound_outcome(200, json.dumps(tool_error)) == "allow"
     plugin_code = {"jsonrpc": "2.0", "id": "1", "error": {"code": -32099, "data": {"plugin": "cpex", "error": "y"}}}
     assert launcher.outbound_outcome(200, json.dumps(plugin_code)) == "error"
+
+
+def test_pipeline_check_names_a_missing_jwt_validation() -> None:
+    """A leg without its identity plugin is reported as missing, not as a plugin-order problem."""
+    config = _CONFIG.replace("      - name: jwt-validation\n      - name: opa\n", "      - name: opa\n")
+    reason = _reason(config)
+    assert reason is not None and "has no jwt-validation" in reason

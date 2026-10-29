@@ -89,7 +89,8 @@ def exchange_refusal(code: int | None, body: str) -> bool:
 # ``token-exchange-aiac`` answers both "not granted" and "target disabled" with ``policy.forbidden``; only
 # the message tells them apart (cortex ``core/plugins/tokenexchangeaiac/plugin.go``, the ``deny`` of
 # ``outcomeTargetDisabled``). The response carries no reason code, so a reworded message there must be
-# copied here; the rollback test then fails as ``error``, never passes wrongly.
+# copied here; the rollback test then fails as ``error``, never passes wrongly. Key on a machine-readable
+# reason once cortex puts one in the rejection (rossoctl/cortex#1570).
 TARGET_DISABLED_MESSAGE = "the destination's client is disabled"
 
 

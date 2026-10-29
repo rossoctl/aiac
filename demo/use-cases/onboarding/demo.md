@@ -535,10 +535,16 @@ audience is what `github-tool`'s inbound validates.
 2. Restarts the agent pod, to clear the audience `token-exchange-aiac` may have cached as unknown
    (for 5 minutes) before `github-tool`'s client existed.
 
-> The agent's default `MCP_URL` host is `github-tool-mcp` (the **production** tool), but the
-> stand-in tool's ServiceAccount and client are `github-tool`. A call to `github-tool-mcp` derives an
-> audience that has no Keycloak client, so it passes through **un-exchanged**. The driver therefore
-> probes `github-tool:9090` directly.
+> The agent's default `MCP_URL` host is `github-tool-mcp`, the **production** tool, which this demo
+> does not deploy. The stand-in tool's ServiceAccount and client are `github-tool`. A call to
+> `github-tool-mcp` derives `…/sa/github-tool-mcp`, which has no Keycloak client until the production
+> tool is registered under that name
+> ([rossoctl/cortex#1540](https://github.com/rossoctl/cortex/issues/1540)), so it passes through
+> **un-exchanged**. The driver therefore probes `github-tool:9090` directly. WIRE also links
+> `agent-team1-github-tool-mcp-aud` as a default scope of `github-agent` when it exists (a production
+> tool registered under that name), and skips it otherwise. It does not link `github-full-access`:
+> as a default scope it would be in every token the agent exchanges, so every user would get the
+> production tool's privileged PAT.
 
 **ENFORCE** first checks (read only) that the login client `rossoctl` and `github-agent` link the
 client scope `aiac-username-sub` as a default scope (D31, see the
@@ -861,8 +867,8 @@ lives in `team1`, not `aiac-system`.)
 - **Step 6's token exchange stops short of a call.** `run-*.py` performs a real RFC 8693 exchange to
   prove the flow, but does not feed the exchanged token into a live call against `github-tool`.
 - **The agent's own `MCP_URL` targets the production tool** (`github-tool-mcp`), which this install
-  path does not deploy; a call there would pass through un-exchanged, since no Keycloak client matches
-  that host's derived audience. The demo probes the tool directly through the sidecar's forward proxy, so
+  path does not deploy; a call there passes through un-exchanged until the production tool is
+  registered as `…/sa/github-tool-mcp` (rossoctl/cortex#1540). The demo probes the tool directly through the sidecar's forward proxy, so
   enforcement is proven, but the agent autonomously calling a tool is not exercised here.
 
 ---

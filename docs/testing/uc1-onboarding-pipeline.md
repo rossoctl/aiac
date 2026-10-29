@@ -184,10 +184,9 @@ cleanly** when any of it is absent (they never stand it up, and never false-pass
   - the global combiner still allows a pod that has no client CR (see the next item);
   - the AuthBridge runtime config is not wired (`pipeline_check`, which applies
     `k8s/authbridge-pipeline-check.py`, the file `opa-kind-verify.sh` runs): `opa` not once on each
-    leg; not exactly one `token-exchange-aiac` and no `token-exchange` on the outbound leg (the
+    leg, or not after the identity plugin (and, inbound, mcp-parser); not exactly one `token-exchange-aiac` and no `token-exchange` on the outbound leg (the
     harness adds no route, so an older `token-exchange` pipeline would send the tool call
-    unexchanged); a `token-exchange-aiac` audience template that names no `spiffe://<td>` trust
-    domain; or a `no_token_policy` other than `deny`.
+    unexchanged); a `token-exchange-aiac` audience template that is not `spiffe://<td>/...{namespace}...{service}...`; or a `no_token_policy` other than `deny`.
 
   The gate returns that trust domain, which the harness exchanges for.
 - **The changed global combiner (D20).** `k8s/opa-kind-enable.sh` applies a changed `default`
