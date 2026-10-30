@@ -31,7 +31,9 @@
 # second `helm upgrade -f` — Helm layers -f files left-to-right, so the repo
 # file is only ever read, never written. Run opa-kind-restore.sh to revert.
 #
-# Requires: kubectl, helm, kind, docker (or podman), python3 not needed here.
+# Requires: kubectl, helm, kind, docker (or podman), and python3 with PyYAML (Step 6
+# runs k8s/opa-kind-verify.sh, whose Verify 1 parses the pipeline). Checked before
+# any cluster change.
 # Env vars:
 #   OPERATOR_DIR        path to the rossoctl/operator repo clone; Step 1 builds
 #                       the operator image from operator/Dockerfile and renders
@@ -164,6 +166,11 @@ if [ ! -f "$VALUES_FILE" ]; then
   echo "ERROR: ${VALUES_FILE} not found — check ROSSOCTL_DIR" >&2
   exit 1
 fi
+
+# Step 6 verifies with k8s/opa-kind-verify.sh, which parses the pipeline with python3 + PyYAML. Check it
+# now, before the image builds and the helm upgrade, not after the cluster has changed.
+python3 -c 'import yaml' >/dev/null 2>&1 \
+  || { echo "ERROR: python3 with PyYAML not found (Step 6, k8s/opa-kind-verify.sh, parses the pipeline)" >&2; exit 1; }
 
 if [ "${KIND_EXPERIMENTAL_PROVIDER:-}" = "podman" ]; then
   CONTAINER_RUNTIME="${CONTAINER_RUNTIME:-podman}"

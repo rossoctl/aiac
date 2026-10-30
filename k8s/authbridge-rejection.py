@@ -55,16 +55,14 @@ def _rejection_doc(code: int | None, doc: object) -> dict | None:
 
 def is_opa_violation(doc: object) -> bool:
     """True when ``doc`` (a rejection document) is an OPA **policy verdict**: ``error ==
-    "policy.forbidden"`` and ``plugin == "opa"``, or no ``plugin`` named (cortex
-    ``pipeline.Violation.Render`` / ``httpx.MarshalMCPRejectionBody``). A named non-OPA plugin never
-    counts: ``token-exchange-aiac`` also answers ``policy.forbidden`` (a target not granted to the
-    caller), and that refusal is not an OPA verdict. Nor does an OPA answer with another error: OPA
-    with no bundle yet answers ``upstream.unreachable`` ("opa policy engine not initialized", cortex
-    ``core/plugins/opa``), which decides nothing."""
-    if not isinstance(doc, dict) or doc.get("error") != "policy.forbidden":
-        return False
-    plugin = doc.get("plugin")
-    return plugin is None or plugin == "opa"
+    "policy.forbidden"`` and ``plugin == "opa"``. cortex's pipeline names the plugin on every rejection
+    (``pipeline.stampPluginName``), so a document that names none is not AuthBridge's OPA: it is another
+    hop's body (a gateway, the tool's own handler). A named non-OPA plugin never counts either:
+    ``token-exchange-aiac`` also answers ``policy.forbidden`` (a target not granted to the caller), and
+    that refusal is not an OPA verdict. Nor does an OPA answer with another error: OPA with no bundle yet
+    answers ``upstream.unreachable`` ("opa policy engine not initialized", cortex ``core/plugins/opa``),
+    which decides nothing."""
+    return isinstance(doc, dict) and doc.get("error") == "policy.forbidden" and doc.get("plugin") == "opa"
 
 
 def is_exchange_refusal(doc: object) -> bool:
@@ -154,14 +152,13 @@ def _outcome(code: int | None, parsed: object) -> str:
     err = frame.get("error")
     if not isinstance(err, dict):
         return "allow"  # a result frame
-    if is_opa_violation(doc):
-        return "deny"
-    # Any other AuthBridge rejection: its code, or — when a plugin set its own code — a ``data`` that names
-    # the plugin (the pipeline always fills it in). Neither a policy verdict nor an allow. A ``data`` with
-    # only an ``error`` key is the tool's own (FastMCP), not AuthBridge's.
-    if err.get("code") == AUTHBRIDGE_RPC_ERROR or (isinstance(doc, dict) and doc.get("plugin") is not None):
-        return "error"
-    return "allow"  # a JSON-RPC error of the tool itself: the call was let through
+    # An AuthBridge rejection frame: its code, or — when a plugin set its own code — a ``data`` that names
+    # the plugin (the pipeline always fills it in). Anything else is a JSON-RPC error of the tool itself
+    # (FastMCP), even one whose ``data`` happens to say ``policy.forbidden``: the call was let through.
+    authbridge = err.get("code") == AUTHBRIDGE_RPC_ERROR or (isinstance(doc, dict) and doc.get("plugin") is not None)
+    if not authbridge:
+        return "allow"
+    return "deny" if is_opa_violation(doc) else "error"  # an OPA verdict, or another AuthBridge rejection
 
 
 def classify(code: int | None, body: str) -> tuple[str, dict | None]:
@@ -187,8 +184,9 @@ def verdict(code: int | None, body: str) -> str:
     * ``DENIED_HTTP 403`` — an OPA verdict in a plain 403 (github-tool's inbound; the agent relays it);
     * ``DENIED_JSONRPC`` — an OPA verdict in a frame at HTTP 200 (the agent's own outbound OPA);
     * ``ALLOWED_RESULT`` — let through;
-    * ``UNEXPECTED <code> <body>`` — anything else (a 403 that names no OPA, OPA with no bundle yet,
-      AuthBridge's fallback frame, a 401 of github-tool's ``jwt-validation``)."""
+    * ``UNEXPECTED <code> <error> <body>`` — anything else (a 403 that names no OPA, OPA with no bundle
+      yet, AuthBridge's fallback frame, a 401 of github-tool's ``jwt-validation``). ``<error>`` is the
+      rejection's parsed ``error`` code (``-`` when there is none), then the first 200 characters."""
     outcome, failure = classify(code, body)
     if failure is not None:
         return f"EXCHANGE_REFUSED {code} {failure.get('error')}"
@@ -196,4 +194,11 @@ def verdict(code: int | None, body: str) -> str:
         return "DENIED_HTTP 403" if code == 403 else "DENIED_JSONRPC"
     if outcome == "allow":
         return "ALLOWED_RESULT"
-    return f"UNEXPECTED {code} {body[:200]}"
+    # The parsed error code first, so a caller can match it however long the body is (cortex marshals the
+    # keys sorted, so ``description`` and ``details`` come before ``error``), then the start of the body.
+    doc = _rejection_doc(code, json_or_none(body))
+    if doc is None and code not in (None, 200):
+        plain = json_or_none(body)
+        doc = plain if isinstance(plain, dict) else None
+    error = doc.get("error") if isinstance(doc, dict) else None
+    return f"UNEXPECTED {code} {error or '-'} {body[:200]}"

@@ -164,12 +164,10 @@ kubectl delete -f "$ASSETS_DIR/tools/github_tool/k8s/github-tool-deployment.yaml
 echo "==> 6. Deleting the github-agent/github-tool client-credentials Secrets in '${NS}'"
 # Only the demo's two Secrets, not every rossoctl-keycloak-client-credentials-* in the namespace
 # (other workloads have theirs there too). The operator names them deterministically from
-# (namespace, workload) — mirror of clientreg.KeycloakClientCredentialsSecretName in rossoctl/operator.
+# (namespace, workload): k8s/operator-names.py computes it as rossoctl/operator does, the one copy that
+# the system harness also uses.
 for workload in github-agent github-tool; do
-  secret=$(NS="$NS" WORKLOAD="$workload" python3 -c '
-import hashlib, os
-key = os.environ["NS"] + "\0" + os.environ["WORKLOAD"] + "\0rossoctl-keycloak-client-credentials"
-print("rossoctl-keycloak-client-credentials-" + hashlib.sha256(key.encode()).hexdigest()[:16])')
+  secret="$(python3 "$AIAC_DIR/k8s/operator-names.py" secret "$NS" "$workload")"
   kubectl delete secret "$secret" -n "$NS" --ignore-not-found
 done
 

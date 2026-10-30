@@ -844,7 +844,10 @@ phase_enforce() {
   # denies every call (github-tool: DENIED_HTTP 403; the agent's outbound: DENIED_JSONRPC), or, with no
   # bundle at all, answers upstream.unreachable (github-tool: UNEXPECTED 503; the agent's outbound, for this
   # MCP request: a JSON-RPC frame at 200, UNEXPECTED 200). Right after the restart the agent's sidecar may
-  # also not have read its credentials yet (EXCHANGE_REFUSED ... upstream.token-exchange-failed).
+  # also not have read its credentials yet (EXCHANGE_REFUSED ... upstream.token-exchange-failed). And when
+  # ENFORCE runs alone, with no WIRE restart just before it, the agent may still pass github-tool's
+  # audience through as unknown (cached for 5 min), which github-tool's jwt-validation answers with 401
+  # (UNEXPECTED 401); BUNDLE_WAIT_SECS then needs to be above that cache's TTL (300).
   # dev-user -> source-read is the allow that proves all of it is current. Poll it for one bundle cycle
   # (BUNDLE_WAIT_SECS), so these are waited out, but a real deny is still reported within minutes. A
   # refusal of the audience or the bearer, or an exec error, never clears by waiting: it stops at once.
@@ -854,8 +857,8 @@ phase_enforce() {
     DEV_SOURCE_READ="$(probe_tool dev-user source-read)"
     [ "$DEV_SOURCE_READ" = "ALLOWED_RESULT" ] && break
     case "$DEV_SOURCE_READ" in
-      "DENIED_HTTP 403" | DENIED_JSONRPC | "UNEXPECTED 503"* | "UNEXPECTED 200"*upstream.unreachable* \
-        | "EXCHANGE_REFUSED "*" upstream.token-exchange-failed") ;;
+      "DENIED_HTTP 403" | DENIED_JSONRPC | "UNEXPECTED 503 "* | "UNEXPECTED 200 upstream.unreachable "* \
+        | "UNEXPECTED 401 "* | "EXCHANGE_REFUSED "*" upstream.token-exchange-failed") ;;
       *) break ;;
     esac
     [ "$SECONDS" -lt "$dev_deadline" ] || break

@@ -447,15 +447,13 @@ def exchange_token(
     client_id: str,
     client_secret: str,
     audience: str,
-    scope: str | None = None,
     timeout: float = 30.0,
 ) -> str:
     """Exchange ``subject_token`` for an access token to ``audience`` (RFC 8693, the Keycloak standard
     token exchange) as the client ``client_id``, and return the new access token.
 
-    With ``scope`` left ``None``, the same request that AuthBridge's ``token-exchange-aiac`` plugin sends
-    on the agent's outbound leg: ``audience`` only, **no** ``scope`` (so only the client's default
-    scopes apply), ``subject_token_type`` and ``requested_token_type`` = access token. The client
+    The same request that AuthBridge's ``token-exchange-aiac`` plugin sends on the agent's outbound leg:
+    ``audience`` only, **no** ``scope`` (so only the client's default scopes apply), ``subject_token_type`` and ``requested_token_type`` = access token. The client
     authenticates with ``client_secret`` (form data, like ``mint_token``), as ``token-exchange-aiac``
     does: it reads the client secret the operator writes to ``/shared/client-secret.txt`` (its
     default ``client_secret_file``) and has no other way to authenticate. Raises ``TokenExchangeError`` on a non-2xx answer;
@@ -469,8 +467,6 @@ def exchange_token(
         "client_id": client_id,
         "client_secret": client_secret,
     }
-    if scope is not None:
-        data["scope"] = scope
     resp = requests.post(
         f"{keycloak_url.rstrip('/')}/realms/{realm}/protocol/openid-connect/token",
         data=data,
@@ -804,7 +800,7 @@ def deny_origin(code: int | None, body: str) -> str | None:
 
     Only a request frame (``tools/call`` with an ``id``) has two distinct shapes. A notification gets a
     plain 403 from either proxy, so this helper does not apply to it."""
-    if not is_opa_violation(rejection_doc(code, body)):
+    if outbound_outcome(code, body) != "deny":  # an OPA verdict only: never a tool's own lookalike error
         return None
     return DENY_ORIGIN_TOOL_INBOUND if code == 403 else DENY_ORIGIN_AGENT_OUTBOUND
 

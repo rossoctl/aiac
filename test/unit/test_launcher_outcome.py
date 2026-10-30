@@ -23,6 +23,10 @@ if str(REPO_ROOT) not in sys.path:  # so ``import test.system.*`` resolves
     sys.path.insert(0, str(REPO_ROOT))
 
 from test.system import launcher  # noqa: E402
+from test.unit.pipeline_configs import CONFIG as _CONFIG  # noqa: E402
+from test.unit.pipeline_configs import PASSING as _PASSING  # noqa: E402
+from test.unit.pipeline_configs import SKIPPING as _SKIPPING  # noqa: E402
+from test.unit.pipeline_configs import TEMPLATE as _TEMPLATE  # noqa: E402
 
 
 def _frame(data: dict) -> str:
@@ -40,7 +44,8 @@ LEGACY_EXCHANGE_FAILED = {"error": "upstream.token-exchange-failed", "plugin": "
     ("doc", "expected"),
     [
         (OPA_DENY, True),
-        ({"error": "policy.forbidden"}, True),  # no plugin named: the OPA error code alone
+        # no plugin named: not AuthBridge's OPA (cortex stamps the plugin on every rejection)
+        ({"error": "policy.forbidden"}, False),
         ({"error": "upstream.unreachable", "plugin": "opa"}, False),  # OPA with no bundle: no verdict
         ({"plugin": "opa"}, False),
         (NOT_GRANTED, False),
@@ -141,29 +146,6 @@ def test_rejection_doc_unwraps_both_rejection_shapes(code: int | None, body: str
     assert launcher.rejection_doc(code, body) == expected
 
 
-# ``authbridge-runtime-config`` as ``k8s/opa-kind-enable.sh`` renders it.
-_CONFIG = """pipeline:
-  inbound:
-    plugins:
-      - name: mcp-parser
-      - name: jwt-validation
-      - name: opa
-  outbound:
-    plugins:
-      - name: mcp-parser
-      - name: token-exchange-aiac
-        config:
-          audience_template: "spiffe://localtest.me/ns/{namespace}/sa/{service}"
-          namespace_file: /var/run/secrets/kubernetes.io/serviceaccount/namespace
-      - name: opa
-"""
-_AIAC_ENTRY = (
-    "      - name: token-exchange-aiac\n        config:\n"
-    '          audience_template: "spiffe://localtest.me/ns/{namespace}/sa/{service}"\n'
-    "          namespace_file: /var/run/secrets/kubernetes.io/serviceaccount/namespace\n"
-)
-
-
 def _reason(config: str) -> str | None:
     return launcher.pipeline_check(config, namespace="team1")[0]
 
@@ -176,95 +158,11 @@ def test_pipeline_check_names_a_config_that_is_not_yaml(config: str) -> None:
     assert reason is not None and "not a YAML mapping" in reason
 
 
-_PASSING = [
-    _CONFIG,
-    _CONFIG.replace("          namespace_file:", '          no_token_policy: "deny"\n          namespace_file:'),
-    # an empty value: the plugin applies its default, deny
-    _CONFIG.replace("          namespace_file:", "          no_token_policy:\n          namespace_file:"),
-    _CONFIG.replace("name: token-exchange-aiac", 'name: "token-exchange-aiac"'),
-    _CONFIG.replace("name: opa", 'name: "opa"'),
-    _CONFIG + "# - name: token-exchange\n# - name: opa\n",  # a comment is not a plugin
-    # bare-string entries, which cortex reads as {name: <string>}
-    _CONFIG.replace("      - name: jwt-validation\n      - name: opa\n", "      - jwt-validation\n      - opa\n"),
-    _CONFIG.replace("      - name: mcp-parser\n", "      - mcp-parser\n").replace(
-        _AIAC_ENTRY + "      - name: opa\n", _AIAC_ENTRY + "      - opa\n"
-    ),
-]
-
-
 @pytest.mark.parametrize("config", _PASSING)
 def test_pipeline_check_passes_the_enabled_wiring(config: str) -> None:
     if config is not _PASSING[0]:
         assert config != _CONFIG, "this case's replace no longer matches the fixture: it tests nothing"
     assert launcher.pipeline_check(config, namespace="team1") == (None, "localtest.me")
-
-
-_SKIPPING = [
-    # opa before the plugin that sets its identity: OPA decides with no input.identity / input.delegation
-    _CONFIG.replace(_AIAC_ENTRY + "      - name: opa\n", "      - name: opa\n" + _AIAC_ENTRY),
-    _CONFIG.replace(
-        "      - name: jwt-validation\n      - name: opa\n", "      - name: opa\n      - name: jwt-validation\n"
-    ),
-    # inbound: mcp-parser after opa, or a second jwt-validation after it
-    _CONFIG.replace(
-        "      - name: mcp-parser\n      - name: jwt-validation\n      - name: opa\n",
-        "      - name: jwt-validation\n      - name: opa\n      - name: mcp-parser\n",
-    ),
-    _CONFIG.replace(
-        "      - name: jwt-validation\n      - name: opa\n",
-        "      - name: jwt-validation\n      - name: opa\n      - name: jwt-validation\n",
-    ),
-    # no mcp-parser inbound: input.mcp, which a tool's inbound package reads, is undefined
-    _CONFIG.replace(
-        "    plugins:\n      - name: mcp-parser\n      - name: jwt-validation\n",
-        "    plugins:\n      - name: jwt-validation\n",
-    ),
-    # no jwt-validation inbound at all
-    _CONFIG.replace("      - name: jwt-validation\n      - name: opa\n", "      - name: opa\n"),
-    # a template without {namespace}: every agent namespace would derive one namespace's audiences
-    _CONFIG.replace(
-        '"spiffe://localtest.me/ns/{namespace}/sa/{service}"', '"spiffe://localtest.me/ns/team1/sa/{service}"'
-    ),
-    _CONFIG.replace('"spiffe://localtest.me/ns/{namespace}/sa/{service}"', '"spiffe://localtest.me/sa/{service}"'),
-    # {namespace} after {service}: matches no operator-registered client (.../ns/<ns>/sa/<sa>)
-    _CONFIG.replace(
-        '"spiffe://localtest.me/ns/{namespace}/sa/{service}"', '"spiffe://localtest.me/sa/{service}/ns/{namespace}"'
-    ),
-    _CONFIG.replace("name: token-exchange-aiac", "name: token-exchange"),  # an older pipeline
-    _CONFIG.replace(_AIAC_ENTRY, _AIAC_ENTRY + "      - name: token-exchange\n"),  # half migrated
-    _CONFIG.replace(_AIAC_ENTRY, _AIAC_ENTRY + _AIAC_ENTRY),  # duplicated
-    # only on the inbound leg, where it exchanges nothing the harness sends
-    _CONFIG.replace(_AIAC_ENTRY, "").replace(
-        "      - name: jwt-validation\n", "      - name: jwt-validation\n" + _AIAC_ENTRY
-    ),
-    # opa twice on the outbound leg and not on the inbound leg: still two by substring
-    _CONFIG.replace("      - name: jwt-validation\n      - name: opa\n", "      - name: jwt-validation\n").replace(
-        _AIAC_ENTRY + "      - name: opa\n", _AIAC_ENTRY + "      - name: opa\n      - name: opa\n"
-    ),
-    _CONFIG.replace(
-        "      - name: jwt-validation\n      - name: opa\n", "      - name: jwt-validation\n"
-    ),  # no inbound opa
-    # a ``plugins`` that is not a list gives no plugins on that leg, never a crash
-    _CONFIG.replace(
-        "  inbound:\n    plugins:\n      - name: mcp-parser\n      - name: jwt-validation\n      - name: opa\n",
-        "  inbound:\n    plugins: 3\n",
-    ),
-    # a falsy no_token_policy is not unset
-    _CONFIG.replace("          namespace_file:", "          no_token_policy: false\n          namespace_file:"),
-    _CONFIG.replace("          namespace_file:", "          no_token_policy: 0\n          namespace_file:"),
-    # a template with no path names no service: every call would exchange for one audience
-    _CONFIG.replace('"spiffe://localtest.me/ns/{namespace}/sa/{service}"', '"spiffe://localtest.me"'),
-    _CONFIG.replace('"spiffe://localtest.me/ns/{namespace}/sa/{service}"', '"spiffe://localtest.me/"'),
-    # an audience template that names no trust domain
-    _CONFIG.replace('"spiffe://localtest.me/ns/{namespace}/sa/{service}"', '"{service}"'),
-    # the overlay before the switch to deny: a bearer-less call is exchanged with the workload's own token
-    _CONFIG.replace(
-        "          namespace_file:", '          no_token_policy: "client-credentials"\n          namespace_file:'
-    ),
-    _CONFIG.replace("          namespace_file:", '          no_token_policy: "allow"\n          namespace_file:'),
-    "pipeline: 3",  # a mapping with no legs
-    "",
-]
 
 
 @pytest.mark.parametrize("config", _SKIPPING)
@@ -324,9 +222,6 @@ def _not_granted(code: int) -> str:
 )
 def test_target_disabled_refusal_is_only_a_disabled_target(code: int | None, body: str, expected: bool) -> None:
     assert launcher.target_disabled_refusal(code, body) is expected
-
-
-_TEMPLATE = '"spiffe://localtest.me/ns/{namespace}/sa/{service}"'
 
 
 @pytest.mark.parametrize(
@@ -503,12 +398,28 @@ def test_importing_the_launcher_does_not_need_k8s(tmp_path: Path) -> None:
         (403, json.dumps(OPA_DENY), "DENIED_HTTP 403"),
         (200, _frame(OPA_DENY), "DENIED_JSONRPC"),
         (200, json.dumps({"jsonrpc": "2.0", "id": "1", "result": {}}), "ALLOWED_RESULT"),
-        (403, "RBAC: access denied", "UNEXPECTED 403 RBAC: access denied"),
+        (403, "RBAC: access denied", "UNEXPECTED 403 - RBAC: access denied"),
+        # the parsed error code comes first, so a long body cannot push it out of the verdict
+        (
+            200,
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "1",
+                    "error": {
+                        "code": -32000,
+                        "data": {"description": "x" * 300, "error": "upstream.unreachable", "plugin": "opa"},
+                    },
+                }
+            ),
+            "UNEXPECTED 200 upstream.unreachable ",
+        ),
     ],
 )
 def test_verdict_is_one_mapping_for_both_demo_probes(code: int, body: str, expected: str) -> None:
     """The demo driver's two probes print ``verdict``; a deny is an OPA verdict only, never a refusal."""
-    assert launcher._rejection().verdict(code, body) == expected
+    got = launcher._rejection().verdict(code, body)
+    assert got.startswith(expected) if expected.endswith(" ") else got == expected
 
 
 def test_pipeline_check_skips_when_the_classifier_file_is_missing(
@@ -545,6 +456,10 @@ def test_a_tool_error_with_data_is_still_an_allow() -> None:
     assert launcher.outbound_outcome(200, json.dumps(tool_error)) == "allow"
     plugin_code = {"jsonrpc": "2.0", "id": "1", "error": {"code": -32099, "data": {"plugin": "cpex", "error": "y"}}}
     assert launcher.outbound_outcome(200, json.dumps(plugin_code)) == "error"
+    # The tool's own error whose data happens to say policy.forbidden is still the tool's, not OPA's.
+    lookalike = {"jsonrpc": "2.0", "id": "1", "error": {"code": -32602, "data": {"error": "policy.forbidden"}}}
+    assert launcher.outbound_outcome(200, json.dumps(lookalike)) == "allow"
+    assert launcher.deny_origin(200, json.dumps(lookalike)) is None
 
 
 def test_pipeline_check_names_a_missing_jwt_validation() -> None:
@@ -552,3 +467,25 @@ def test_pipeline_check_names_a_missing_jwt_validation() -> None:
     config = _CONFIG.replace("      - name: jwt-validation\n      - name: opa\n", "      - name: opa\n")
     reason = _reason(config)
     assert reason is not None and "has no jwt-validation" in reason
+
+
+def test_grant_exchange_scope_takes_a_409_as_an_existing_link(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The operator's realm default scope can link the tool's audience at the agent's creation (#248), so
+    Keycloak may answer the default-link PUT with 409: that is an existing link, not a failure."""
+    from unittest.mock import MagicMock
+
+    from keycloak.exceptions import KeycloakError
+
+    from test.system import uc1_onboard as uc1
+
+    admin = MagicMock()
+    agent_cid = f"spiffe://localtest.me/ns/{uc1.NAMESPACE}/sa/{uc1.scn.AGENT_WORKLOAD}"
+    admin.get_clients.return_value = [{"id": "agent-uuid", "clientId": agent_cid}]
+    admin.get_client_scopes.return_value = [{"id": "s1", "name": uc1.workload_aud_scope(uc1.scn.TOOL_WORKLOAD)}]
+    admin.get_client_optional_client_scopes.return_value = []
+    admin.add_client_default_client_scope.side_effect = KeycloakError("Conflict", response_code=409)
+    uc1.grant_exchange_scope(admin)  # no raise
+
+    admin.add_client_default_client_scope.side_effect = KeycloakError("Server error", response_code=500)
+    with pytest.raises(RuntimeError, match="could not link"):
+        uc1.grant_exchange_scope(admin)

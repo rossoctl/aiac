@@ -95,7 +95,6 @@ functions, so pytest does not collect it.
 from __future__ import annotations
 
 import base64
-import hashlib
 import json
 import logging
 import os
@@ -124,6 +123,7 @@ from test.system.launcher import (  # noqa: E402
     KEYCLOAK_CLIENT_ID,
     TokenExchangeError,
     _kubectl_try,
+    _load_k8s_module,
     curl_pod,
     deny_origin,
     exchange_token,
@@ -1103,17 +1103,14 @@ def tool_onboarding_state(admin) -> dict[str, bool | None]:
 
 
 def workload_aud_scope(workload: str) -> str:
-    """The operator's audience client scope of ``workload`` in ``NAMESPACE`` (rossoctl/operator
-    ``keycloak.AudienceScopeName`` of ``<ns>/<workload>``)."""
-    return f"agent-{NAMESPACE}-{workload}-aud"
+    """The operator's audience client scope of ``workload`` in ``NAMESPACE`` (``k8s/operator-names.py``)."""
+    return _load_k8s_module("operator-names").aud_scope_name(NAMESPACE, workload)
 
 
 def client_credentials_secret_name(workload: str) -> str:
-    """The client-credentials Secret the operator writes for ``workload`` in ``NAMESPACE`` (rossoctl/operator
-    ``clientreg.KeycloakClientCredentialsSecretName``; ``demo/use-cases/onboarding/restore.sh`` names it
-    the same way)."""
-    key = f"{NAMESPACE}\0{workload}\0rossoctl-keycloak-client-credentials"
-    return "rossoctl-keycloak-client-credentials-" + hashlib.sha256(key.encode()).hexdigest()[:16]
+    """The client-credentials Secret the operator writes for ``workload`` in ``NAMESPACE``
+    (``k8s/operator-names.py``, which ``demo/use-cases/onboarding/restore.sh`` runs too)."""
+    return _load_k8s_module("operator-names").client_credentials_secret_name(NAMESPACE, workload)
 
 
 def delete_workload_registrations(admin, realm: str) -> None:
@@ -1151,10 +1148,21 @@ def delete_workload_registrations(admin, realm: str) -> None:
                 log.warning("teardown: delete audience client scope %r failed: %s", name, exc)
 
     # The operator mints one ``rossoctl-keycloak-client-credentials-<hash>`` Secret per client, named
-    # from (namespace, workload). Tolerant — an already-absent Secret is not a teardown error.
+    # from (namespace, workload). Only these two: other workloads in the namespace (the production
+    # github-tool-mcp) have theirs there too. Tolerant — an already-absent Secret is not a teardown error.
     for workload in workloads:
         secret = client_credentials_secret_name(workload)
         _kubectl_try("delete", "secret", secret, "-n", NAMESPACE, "--ignore-not-found")
+    # The Secrets carry the workload in the operator's owner reference, so one left over (the naming
+    # changed, or the agent ran under another Deployment) is named here instead of passing in silence.
+    ok, out, _ = _kubectl_try(
+        "get", "secret", "-n", NAMESPACE, "-o",
+        r'jsonpath={range .items[*]}{.metadata.name}{"\t"}{.metadata.ownerReferences[*].name}{"\n"}{end}',
+    )  # fmt: skip
+    for line in out.splitlines() if ok else []:
+        name, _, owners = line.partition("\t")
+        if name.startswith("rossoctl-keycloak-client-credentials-") and set(owners.split()) & set(workloads):
+            log.warning("teardown: client-credentials Secret %s of %s survived the delete", name, owners)
 
 
 def sweep_authpolicies() -> None:
@@ -1218,11 +1226,6 @@ def _tool_audience(trust_domain: str) -> str:
     return f"spiffe://{trust_domain}/ns/{NAMESPACE}/sa/{scn.TOOL_WORKLOAD}"
 
 
-def _tool_aud_scope() -> str:
-    """The realm client-scope whose audience mapper stamps the github-tool audience."""
-    return workload_aud_scope(scn.TOOL_WORKLOAD)
-
-
 def grant_exchange_scope(admin) -> None:
     """Grant the agent's Keycloak client the github-tool audience scope as a **default** scope, so
     ``token-exchange-aiac``'s exchange to the github-tool audience (no ``scope`` requested) is granted.
@@ -1233,7 +1236,7 @@ def grant_exchange_scope(admin) -> None:
     from keycloak.exceptions import KeycloakError
 
     admin.change_current_realm(TEST_REALM)
-    aud_scope = _tool_aud_scope()
+    aud_scope = workload_aud_scope(scn.TOOL_WORKLOAD)
 
     client_uuid = None
     for client in admin.get_clients():
@@ -1257,13 +1260,17 @@ def grant_exchange_scope(admin) -> None:
     # optional link (the old optional grant of this harness) is moved to default first, since Keycloak
     # silently skips a default link of a scope already linked as optional. Copied, not imported:
     # importing that module configures the root logger and builds its FastAPI app in the test process.
-    # Every Keycloak error raises: the assign is an idempotent PUT, so none is benign, and without the
-    # default link every exchange is refused much later, far from this cause.
+    # A 409 is an existing default link (the operator's realm default scope can link it at the agent's
+    # creation, #248): success, as in driver.sh's grant_default_scope. Any other Keycloak error raises:
+    # without the default link every exchange is refused much later, far from this cause.
     try:
         if any(s.get("id") == scope["id"] for s in admin.get_client_optional_client_scopes(client_uuid)):
             admin.delete_client_optional_client_scope(client_uuid, scope["id"])
         admin.add_client_default_client_scope(client_uuid, scope["id"], {})
     except KeycloakError as exc:
+        if exc.response_code == 409:
+            log.info("grant_exchange_scope: %r is already a default scope of %s", aud_scope, scn.AGENT_WORKLOAD)
+            return
         raise RuntimeError(
             f"could not link {aud_scope!r} to {NAMESPACE}/{scn.AGENT_WORKLOAD} as a default scope: {exc} — "
             "without it token-exchange-aiac refuses every call to the tool"

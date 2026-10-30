@@ -462,12 +462,6 @@ def test_exchange_token_sends_the_rfc8693_request(monkeypatch: pytest.MonkeyPatc
     assert calls[0]["data"] == _EXCHANGE_FORM
 
 
-def test_exchange_token_sends_an_explicit_scope(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls = _stub_post(monkeypatch, _Response(200, {"access_token": "exchanged-jwt"}))
-    _exchange(scope="openid extra")
-    assert calls[0]["data"] == {**_EXCHANGE_FORM, "scope": "openid extra"}
-
-
 @pytest.mark.parametrize(
     ("status", "body", "refused"),
     [

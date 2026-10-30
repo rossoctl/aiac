@@ -3,8 +3,8 @@
 ``k8s/authbridge-pipeline-check.py`` (the wiring check of ``k8s/opa-kind-verify.sh``, the demo driver and
 the system lane's skip gate) and ``k8s/authbridge-rejection.py`` (the outbound classifier the demo driver
 sends into the agent pod) are scripts: each test runs one in an isolated interpreter, as a script calls
-it, and checks its output and exit code. The configs are those of ``test/unit/test_launcher_outcome.py``,
-which tests the same rules through the harness, so that both agree on one set of cases.
+it, and checks its output and exit code. The configs are ``test/unit/pipeline_configs.py``, which
+``test/unit/test_launcher_outcome.py`` also checks through the harness, so both agree on one set of cases.
 """
 
 from __future__ import annotations
@@ -20,7 +20,15 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:  # so ``import test.*`` resolves
     sys.path.insert(0, str(REPO_ROOT))
 
-from test.unit.test_launcher_outcome import _CONFIG, _PASSING, _SKIPPING, _reason  # noqa: E402
+from test.system import launcher  # noqa: E402
+from test.unit.pipeline_configs import CONFIG as _CONFIG  # noqa: E402
+from test.unit.pipeline_configs import PASSING as _PASSING  # noqa: E402
+from test.unit.pipeline_configs import SKIPPING as _SKIPPING  # noqa: E402
+
+
+def _reason(config: str) -> str | None:
+    return launcher.pipeline_check(config, namespace="team1")[0]
+
 
 _PIPELINE_CHECK = REPO_ROOT / "k8s" / "authbridge-pipeline-check.py"
 _REJECTION = REPO_ROOT / "k8s" / "authbridge-rejection.py"
@@ -137,3 +145,21 @@ def test_pipeline_check_script_does_not_wait_on_a_terminal() -> None:
     assert pty  # the forkpty below needs a POSIX pty
     run = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=20, check=True)
     assert run.stdout.strip() == "2"
+
+
+_OPERATOR_NAMES = REPO_ROOT / "k8s" / "operator-names.py"
+
+
+@pytest.mark.parametrize(
+    ("args", "expected"),
+    [
+        # Checked against rossoctl/operator clientreg.KeycloakClientCredentialsSecretName (Go) on 2026-10-29.
+        (["secret", "team1", "github-agent"], "rossoctl-keycloak-client-credentials-2a23a7de2f325a39"),
+        (["secret", "team1", "github-tool"], "rossoctl-keycloak-client-credentials-77333ecf97e04bea"),
+        (["aud-scope", "team1", "github-tool"], "agent-team1-github-tool-aud"),
+    ],
+)
+def test_operator_names_match_the_operator(args: list[str], expected: str) -> None:
+    """``restore.sh`` and the harness name the operator's objects with this one file."""
+    run = subprocess.run([sys.executable, "-I", str(_OPERATOR_NAMES), *args], capture_output=True, text=True)
+    assert (run.returncode, run.stdout.strip()) == (0, expected)
