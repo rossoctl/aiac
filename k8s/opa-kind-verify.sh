@@ -15,7 +15,11 @@
 #
 # Checks, mirroring the runbook 1:1:
 #   Preflight  kubectl present, cluster reachable, agent namespace present
-#   Verify 1   'name: opa' appears twice in authbridge-runtime-config (both legs)
+#   Verify 1   authbridge-runtime-config, parsed per leg: opa once on each leg, after
+#              the identity plugin (and, inbound, mcp-parser); the outbound leg carries
+#              token-exchange-aiac (not token-exchange) with a
+#              spiffe://<td>/...{namespace}...{service}... audience template and
+#              no_token_policy deny
 #   Verify 2   AuthorizationPolicy CRD established + global 'default' CR present,
 #              and it is the changed combiner (D20): 0 request fallback rules (a
 #              pod with no client CR is denied), 2 response fallback rules
@@ -24,11 +28,13 @@
 #   Verify 5   every existing agent and tool pod's authbridge-proxy runs IMAGE_TAG
 #              and is Ready (skipped when the namespace has no such pods)
 #
-# Requires: kubectl (kind, only to re-export a stale kubeconfig).
+# Requires: kubectl, python3 with PyYAML (Verify 1 parses the pipeline with
+# k8s/authbridge-pipeline-check.py); kind, only to re-export a stale kubeconfig.
 # Env vars (runbook defaults shown):
 #   NS             agent namespace                        (default: team1)
 #   SYS_NS         platform namespace                     (default: rossoctl-system)
-#   TRUST_DOMAIN   SPIFFE trust domain for the bundle probe (default: localtest.me)
+#   TRUST_DOMAIN   SPIFFE trust domain for the bundle probe (default: the one
+#                  token-exchange-aiac's audience template names, read in Verify 1)
 #   IMAGE_TAG      expected authbridge sidecar image      (default: localhost/authbridge:local)
 #   READY_SECS     max seconds to wait for bundle-service readiness (default: 120)
 #   KIND_CLUSTER   name of the Kind cluster                (default: rossoctl).
@@ -41,9 +47,10 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NS="${NS:-team1}"
 SYS_NS="${SYS_NS:-rossoctl-system}"
-TRUST_DOMAIN="${TRUST_DOMAIN:-localtest.me}"
+TRUST_DOMAIN="${TRUST_DOMAIN:-}"
 IMAGE_TAG="${IMAGE_TAG:-localhost/authbridge:local}"
 READY_SECS="${READY_SECS:-120}"
 KIND_CLUSTER="${KIND_CLUSTER:-rossoctl}"
@@ -92,6 +99,7 @@ info "runbook: k8s/opa-kind-runbook.md   agent namespace: ${NS}   platform names
 
 step "Preflight — kubectl and cluster"
 command -v kubectl >/dev/null 2>&1 || die "kubectl not found on PATH"
+python3 -c 'import yaml' >/dev/null 2>&1 || die "python3 with PyYAML not found on PATH (Verify 1 parses the pipeline)"
 # A Kind node container reassigns its API-server host port on restart, which
 # leaves the previously exported kubeconfig pointing at a stale port ("connection
 # refused"). If the cluster is unreachable but the named Kind cluster exists,
@@ -109,13 +117,22 @@ kubectl get namespace "$NS" >/dev/null 2>&1 \
   || die "agent namespace '${NS}' does not exist — the rossoctl platform install creates it"
 pass "cluster reachable, namespace ${NS} present"
 
-# ── Verify 1 — OPA in both legs ──────────────────────────────────────────────
-step "Verify 1 — OPA wired into both pipeline legs"
-OPA_COUNT=$(kubectl get configmap authbridge-runtime-config -n "$NS" \
-              -o jsonpath='{.data.config\.yaml}' 2>/dev/null | grep -c 'name: opa' || true)
-[ "$OPA_COUNT" = "2" ] \
-  || die "'name: opa' occurrences in authbridge-runtime-config: got '${OPA_COUNT}', expected '2' — run k8s/opa-kind-enable.sh"
-pass "'name: opa' occurrences in authbridge-runtime-config: got '2' (expected '2')"
+# ── Verify 1 — pipeline wiring ───────────────────────────────────────────────
+step "Verify 1 — OPA on both pipeline legs, token-exchange-aiac on the outbound leg"
+# Parsed, per leg (the rule of k8s/authbridge-pipeline-check.py, its docstring lists it): opa once
+# on each leg, after the identity plugin (and, inbound, mcp-parser); outbound token-exchange-aiac once,
+# token-exchange absent (no routes; a leftover token-exchange means the pipeline predates the
+# switch); a spiffe://<td>/...{namespace}...{service}... audience template; no_token_policy deny.
+# The helper reads the ConfigMap itself (kubectl's stderr kept apart from the YAML), and the system
+# harness's skip gate loads the same file. It prints one verdict line on stdout, also when it fails;
+# stderr (a python3 warning) is not the verdict.
+WIRING=$(python3 "$SCRIPT_DIR/authbridge-pipeline-check.py" --namespace "$NS" 2>/dev/null || true)
+case "$WIRING" in
+  "ok trust_domain="*) pass "authbridge-runtime-config: opa on each leg, outbound token-exchange-aiac (${WIRING#ok })" ;;
+  *) die "authbridge-runtime-config in ${NS}: ${WIRING:-python3 could not run k8s/authbridge-pipeline-check.py} — run k8s/opa-kind-enable.sh" ;;
+esac
+# The bundle probe (Verify 4) asks for the trust domain the exchange uses, unless TRUST_DOMAIN is set.
+TRUST_DOMAIN="${TRUST_DOMAIN:-${WIRING#ok trust_domain=}}"
 
 # ── Verify 2 — CRD + global policy ───────────────────────────────────────────
 step "Verify 2 — AuthorizationPolicy CRD and the changed global combiner (D20)"

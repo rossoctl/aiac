@@ -43,7 +43,9 @@ TOOL_UUID = "tool-uuid"
 LOGIN_UUID = "login-uuid"
 AGENT_NAME = f"{uc1.NAMESPACE}/{scn.AGENT_WORKLOAD}"
 TOOL_NAME = f"{uc1.NAMESPACE}/{scn.TOOL_WORKLOAD}"
-AGENT_CLIENT_ID = f"spiffe://{uc1.TRUST_DOMAIN}/ns/{uc1.NAMESPACE}/sa/{scn.AGENT_WORKLOAD}"
+# The trust domain of the probe ``ctx`` (``_ctx``) and of the agent client's SPIFFE ID, one value.
+TRUST_DOMAIN = "example.org"
+AGENT_CLIENT_ID = f"spiffe://{TRUST_DOMAIN}/ns/{uc1.NAMESPACE}/sa/{scn.AGENT_WORKLOAD}"
 
 # The mapper as the IdP service creates it (the full D31 representation).
 SUBJECT_MAPPER = {
@@ -427,7 +429,7 @@ def _stub_post(monkeypatch: pytest.MonkeyPatch, response: _Response) -> list[dic
     return calls
 
 
-def _exchange() -> str:
+def _exchange(**kwargs: str) -> str:
     return launcher.exchange_token(
         "subject-jwt",
         keycloak_url="http://kc.example:8080/",
@@ -435,25 +437,29 @@ def _exchange() -> str:
         client_id=AGENT_CLIENT_ID,
         client_secret="s3cret",
         audience="spiffe://x/ns/team1/sa/github-tool",
-        scope="openid agent-team1-github-tool-aud",
+        **kwargs,
     )
 
 
+_EXCHANGE_FORM = {
+    "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+    "subject_token": "subject-jwt",
+    "subject_token_type": "urn:ietf:params:oauth:token-type:access_token",
+    "requested_token_type": "urn:ietf:params:oauth:token-type:access_token",
+    "audience": "spiffe://x/ns/team1/sa/github-tool",
+    "client_id": AGENT_CLIENT_ID,
+    "client_secret": "s3cret",
+}
+
+
 def test_exchange_token_sends_the_rfc8693_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With no ``scope``, the request of AuthBridge's ``token-exchange-aiac``: audience only, so only
+    the client's default scopes apply."""
     calls = _stub_post(monkeypatch, _Response(200, {"access_token": "exchanged-jwt"}))
     assert _exchange() == "exchanged-jwt"
     assert len(calls) == 1
     assert calls[0]["url"] == "http://kc.example:8080/realms/rossoctl/protocol/openid-connect/token"
-    assert calls[0]["data"] == {
-        "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
-        "subject_token": "subject-jwt",
-        "subject_token_type": "urn:ietf:params:oauth:token-type:access_token",
-        "requested_token_type": "urn:ietf:params:oauth:token-type:access_token",
-        "audience": "spiffe://x/ns/team1/sa/github-tool",
-        "scope": "openid agent-team1-github-tool-aud",
-        "client_id": AGENT_CLIENT_ID,
-        "client_secret": "s3cret",
-    }
+    assert calls[0]["data"] == _EXCHANGE_FORM
 
 
 @pytest.mark.parametrize(
@@ -496,7 +502,12 @@ def _jwt(claims: dict) -> str:
 
 
 def _ctx(admin: MagicMock) -> dict:
-    return {"admin": admin, "keycloak_url": "http://kc.example:8080", "realm": "rossoctl"}
+    return {
+        "admin": admin,
+        "keycloak_url": "http://kc.example:8080",
+        "realm": "rossoctl",
+        "trust_domain": TRUST_DOMAIN,
+    }
 
 
 def _stub_exchange(monkeypatch: pytest.MonkeyPatch, result: str | Exception) -> list[dict]:
@@ -524,8 +535,8 @@ def _secret_admin(secret: object = "s3cret") -> MagicMock:
 
 
 def test_exchanged_subject_exchanges_as_the_agent_to_the_tool_audience(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The request of AuthBridge's route: the agent client, the tool's SPIFFE audience, and
-    ``openid`` + the tool's audience scope; the result is the exchanged token's ``sub``."""
+    """The request of AuthBridge's ``token-exchange-aiac``: the agent client and the tool's SPIFFE
+    audience, no ``scope``; the result is the exchanged token's ``sub``."""
     calls = _stub_exchange(monkeypatch, _jwt({"sub": "dev-user"}))
     admin = _secret_admin()
     assert uc1.exchanged_subject(_ctx(admin), "dev-user") == "dev-user"
@@ -537,8 +548,7 @@ def test_exchanged_subject_exchanges_as_the_agent_to_the_tool_audience(monkeypat
             "realm": "rossoctl",
             "client_id": AGENT_CLIENT_ID,
             "client_secret": "s3cret",
-            "audience": uc1._tool_audience(),
-            "scope": f"openid {uc1._tool_aud_scope()}",
+            "audience": f"spiffe://example.org/ns/{uc1.NAMESPACE}/sa/github-tool",
         }
     ]
 
@@ -560,9 +570,10 @@ def test_exchanged_subject_gives_the_user_id_when_the_link_is_missing(monkeypatc
 def test_exchanged_subject_fails_on_a_refused_client_secret_authentication(
     monkeypatch: pytest.MonkeyPatch, refusal: launcher.TokenExchangeError
 ) -> None:
-    """The agent client uses the ``client-secret`` authenticator (``k8s/opa-kind-enable.sh`` sets the
-    AuthBridge ``token-exchange`` identity to ``client-secret``), so a refused secret is a real fault:
-    a failure, never a skip that hides it."""
+    """The agent client uses the ``client-secret`` authenticator (AuthBridge's ``token-exchange-aiac``,
+    wired by ``k8s/opa-kind-enable.sh``, authenticates only with the client secret the operator writes
+    to ``/shared/client-secret.txt``), so a refused secret is a real fault: a failure, never a skip that
+    hides it."""
     _stub_exchange(monkeypatch, refusal)
     with pytest.raises(AssertionError, match="refused the client-secret authentication"):
         uc1.exchanged_subject(_ctx(_secret_admin()), "dev-user")

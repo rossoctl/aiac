@@ -73,9 +73,13 @@ are real transitions, not an empty start.
 **Outbound "blocked".** After the quarantine github-tool has no CR. The combiner denies the call on
 github-tool's inbound (D20; an HTTP 403 with an OPA body, relayed by the agent's pass-through
 outbound). The tool's client is also disabled, so Keycloak may instead refuse the token exchange to
-its audience before OPA is consulted (a ``token-exchange`` error frame). All of these mean the call
-never reaches the tool, so all count as blocked; the OPA-side proof is the CR assertion. Any other
-outcome (``allow``, a transport error) fails.
+its audience before OPA is consulted: ``token-exchange-aiac`` answers a disabled target with
+``policy.forbidden`` (``target_disabled``), as an error frame or a plain 403 body
+(``uc1.target_disabled_refusal``). Both mean the call never reaches the tool, so both count as blocked;
+the OPA-side proof is the CR assertion. Any other outcome fails: ``allow``, a transport error, a failed
+exchange (``upstream.token-exchange-failed``, an IdP error or outage), and the refusal of a target not
+granted to the agent (``audience_not_granted``, for example a lost default-scope link), none of which
+proves anything about the quarantine.
 
 Run (a live rossoctl/Kind cluster with the AIAC stack + AuthBridge OPA pipeline wired in — see
 ``k8s/opa-kind-runbook.md`` / ``k8s/opa-kind-enable.sh`` — the event path wired (NATS broker +
@@ -202,18 +206,13 @@ def _prefixed(admin, prefix: str) -> dict[str, list[str]]:
 
 def _outbound_block(ctx: dict, user: str, tool_bare: str) -> tuple[str, int | None, str]:
     """One live outbound ``tools/call``; classify it as ``"deny"`` (an OPA verdict: github-tool's
-    inbound 403), ``"refused"``
-    (a token-exchange error frame — Keycloak refused the exchange before OPA, see the module
-    docstring), ``"allow"``, or ``"error"``. Returns ``(class, http_code, body)``."""
+    inbound 403), ``"refused"`` (Keycloak refused the exchange because the tool's client is disabled,
+    before OPA, ``uc1.target_disabled_refusal``; see the module docstring), ``"allow"``, or ``"error"``.
+    A failed exchange (an IdP error or outage) and a refusal for any other reason stay ``"error"``. Returns ``(class, http_code, body)``."""
     code, body = uc1.outbound_raw(ctx, user, tool_bare)
     decision = uc1.outbound_outcome(code, body)
-    if decision == "error" and code == 200:
-        try:
-            data = (json.loads(body).get("error") or {}).get("data") or {}
-        except (ValueError, AttributeError):
-            data = {}
-        if data.get("plugin") == "token-exchange" or data.get("error") == "upstream.token-exchange-failed":
-            return "refused", code, body
+    if decision == "error" and uc1.target_disabled_refusal(code, body):
+        return "refused", code, body
     return decision, code, body
 
 
@@ -290,7 +289,6 @@ def _run_phases(ctx: dict, run: dict) -> None:
     deployed_at = datetime.now(timezone.utc)
     uc1.deploy_workload(TOOL)
     tool = _registered_client(admin, TOOL)
-    uc1.ensure_github_tool_route(uc1.NAMESPACE)
     uc1.grant_exchange_scope(admin)
     uc1.restart_agent(uc1.NAMESPACE)
     outbound = _poll_decision(lambda: uc1.outbound_decision(ctx, "dev-user", PROBE_TOOL), "allow", LIFT_TIMEOUT)
@@ -520,8 +518,9 @@ def test_failed_tool_leaves_the_agent_cr_unchanged(run: dict) -> None:
 
 def test_failed_tool_outbound_call_denied(run: dict) -> None:
     """The ``dev-user`` call to the tool that phase 3 allowed is now blocked — an OPA deny (github-tool
-    has no CR, so the combiner denies on its inbound, D20), or a token-exchange refusal to the disabled
-    tool's audience (module docstring); never ``allow``, never a transport error."""
+    has no CR, so the combiner denies on its inbound, D20), or an exchange refusal because the tool's
+    client is disabled (module docstring); never ``allow``, never a transport error, never a refusal
+    for another reason."""
     decision, code, body = _failed(run, "tool_failed")["outbound"]
     assert decision in ("deny", "refused"), (
         f"dev-user outbound {PROBE_TOOL} to the quarantined tool: {decision!r} (HTTP {code}, body={body[:300]!r})"

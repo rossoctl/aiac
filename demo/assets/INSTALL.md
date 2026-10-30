@@ -29,13 +29,28 @@ they automate.
 - Namespace **`team1`** already exists — created by the Rossoctl installer, not by
   anything in this repo. Nothing here creates cluster-owned resources.
 - `kubectl`, `kind`, and a container runtime (`docker` or `podman`) on `PATH`.
+- The AuthBridge outbound leg runs `token-exchange-aiac` (`k8s/opa-kind-enable.sh`; check with
+  `k8s/opa-kind-verify.sh`). The demo ships no `authproxy-routes`, so on the stock chart pipeline
+  (`token-exchange` with routes) the agent's calls to the tool go out unexchanged and the tool
+  rejects them.
+- **Known limitation:** the agent's live GitHub calls go to the production tool at its default
+  `MCP_URL` host `github-tool-mcp`. They are exchanged only for a Keycloak client named
+  `…/sa/github-tool-mcp`. The production tool's cortex manifest does not yet run it under a
+  ServiceAccount of that name, or enroll it
+  ([rossoctl/cortex#1540](https://github.com/rossoctl/cortex/issues/1540)). Until it does, those calls
+  are not exchanged. Once it does, the UC-1 onboarding demo's WIRE phase grants github-agent the
+  tool's audience scope as a default scope. It does not grant `github-full-access`, the scope the tool
+  reads to pick its privileged PAT: as a default scope it would be in every token github-agent
+  exchanges, so every user would get the privileged PAT. So the tool uses its public PAT; a per-user
+  grant is part of cortex#1540. The UC-1 onboarding demo is not affected: it calls the stub
+  `github-tool` directly.
 
 ## What gets deployed
 
 | Workload | Image | Manifests, in order | Objects created (ns `team1`) |
 |---|---|---|---|
 | tool | `localhost/github-tool:latest` | `tools/github_tool/k8s/github-tool-deployment.yaml` | ServiceAccount + Deployment + Service `github-tool` (`:9090`) + `AgentRuntime` `github-tool` (`type: tool`) |
-| agent | `localhost/github-agent:latest` | `agents/github_agent/k8s/configmaps.yaml`, **then** `agents/github_agent/k8s/github-agent-deployment.yaml` | ServiceAccount + Deployment + Service `github-agent` (`:8001`, `:8080`) + `AgentRuntime` `github-agent` (`type: agent`); the ConfigMaps are `authbridge-config` + `authproxy-routes` |
+| agent | `localhost/github-agent:latest` | `agents/github_agent/k8s/configmaps.yaml`, **then** `agents/github_agent/k8s/github-agent-deployment.yaml` | ServiceAccount + Deployment + Service `github-agent` (`:8001`, `:8080`) + `AgentRuntime` `github-agent` (`type: agent`); the ConfigMap is `authbridge-config` (no `authproxy-routes`: the `token-exchange-aiac` that `k8s/opa-kind-enable.sh` wires derives the outbound audience from the destination host) |
 
 Per workload: phase 1 (`kind-load.sh`) builds the image → `kind load docker-image <image> --name
 <cluster>`; phase 2 (`deploy.sh`) applies the manifests **in the order above** → `kubectl rollout

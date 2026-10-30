@@ -4,11 +4,13 @@
 # spiffe-helper-config, and envoy-config (with the rossoctl realm). This file
 # overrides:
 # - authbridge-config: Keycloak connection, inbound validation, and outbound exchange settings
-# - authproxy-routes: per-target token exchange routes
 #
-# Authbridge defaults to "passthrough" for outbound traffic, meaning
-# requests to unknown hosts (LLM APIs, telemetry, etc.) pass through without
-# token exchange. Only hosts listed in authproxy-routes get token exchange.
+# The outbound exchange plugin wired by k8s/opa-kind-enable.sh is
+# token-exchange-aiac, which has no routes: it derives the audience from the
+# destination host (spiffe://<td>/ns/<ns>/sa/<service>) and exchanges for every
+# in-cluster host Keycloak has a client for. Hosts outside the cluster (LLM
+# APIs, telemetry, etc.) and hosts with no matching client pass through. So
+# this demo ships no authproxy-routes ConfigMap.
 #
 # Usage:
 #   kubectl apply -f configmaps.yaml
@@ -43,23 +45,3 @@ data:
   ISSUER: "http://keycloak.localtest.me:8080/realms/rossoctl"
   # Audience validation is automatic — uses CLIENT_ID from /shared/client-id.txt
   # (written by client-registration or operator). No manual configuration needed.
-
----
-# authproxy-routes ConfigMap - Per-target token exchange routes
-#
-# Defines which outbound hosts should get token exchange. All other hosts
-# pass through unchanged (the default outbound policy is "passthrough").
-# This allows the agent to call LLM APIs, telemetry endpoints, and other
-# services without interference from the token exchange proxy.
-#
-# Update the host pattern if the github-tool service name or namespace changes.
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: authproxy-routes
-  namespace: team1
-data:
-  routes.yaml: |
-    - host: "github-tool-mcp"
-      target_audience: "github-tool"
-      token_scopes: "openid github-tool-aud github-full-access"

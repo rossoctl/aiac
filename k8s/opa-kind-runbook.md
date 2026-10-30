@@ -33,7 +33,7 @@ outbound of every service is a pass-through (D24). See
 To see OPA **enforce** a real policy for real users, run a use case on top of
 this setup. For example, the onboarding use case
 ([`demo/use-cases/onboarding/demo.md`](../demo/use-cases/onboarding/demo.md))
-deploys its own workloads, users, outbound routes and policy. The onboarding use
+deploys its own workloads, users, Keycloak grants and policy. The onboarding use
 case's system tests list their extra platform prerequisites (event broker,
 Keycloak SPI) in
 [`docs/testing/uc1-onboarding-pipeline.md`](../docs/testing/uc1-onboarding-pipeline.md#preconditions-the-wired-platform--not-stood-up-by-the-tests).
@@ -44,9 +44,9 @@ shows what AIAC writes for `github-agent` and `github-tool`.
 
 ```
 Inbound:   caller ─► parsers ─► jwt-validation ─► opa ─► app
-Outbound:  app ─► parsers ─► token-exchange ─► opa ─► destination
-                                                │
-                    bundle-service ◄────────────┘  (polls its bundle)
+Outbound:  app ─► parsers ─► token-exchange-aiac ─► opa ─► destination
+                                                    │
+                    bundle-service ◄────────────────┘  (polls its bundle)
 ```
 
 - The parsers (`a2a-parser`, `mcp-parser`, `inference-parser`) run first, so
@@ -54,7 +54,11 @@ Outbound:  app ─► parsers ─► token-exchange ─► opa ─► destinatio
   matches that protocol.
 - Inbound, `opa` runs after `jwt-validation`, so `input.identity` comes from the
   validated JWT.
-- Outbound, `opa` runs after `token-exchange`, so policies can read the
+- Outbound, token exchange is **on by default**. `token-exchange-aiac` needs no
+  routes: it derives the target audience from the destination host and lets
+  Keycloak decide whether the destination is a target
+  (see [Outbound token exchange](#outbound-token-exchange)).
+- Outbound, `opa` runs after `token-exchange-aiac`, so policies can read the
   delegation chain and a synthesized `input.identity`
   (see [What OPA sees](#what-opa-sees-on-each-leg)).
 - Every sidecar polls its bundle from
@@ -114,6 +118,11 @@ kubectl get authorizationpolicy github-tool -n team1 \
     module root is elsewhere. An untracked `authbridge/` directory left over in
     an older clone is stale and can be ignored. Restore does not need this
     clone.
+    The checkout must contain the `token-exchange-aiac` plugin
+    (`core/plugins/tokenexchangeaiac/`, including its delegation-hop
+    recording): cortex `main` at or after merge commit `ef5ac5f8`
+    (rossoctl/cortex#1496). An older checkout fails at sidecar start with an
+    unknown-plugin error.
 
   These paths are resolved against **your current directory**, not the script.
   Pass absolute paths unless you run from the repo root.
@@ -177,6 +186,13 @@ Expect two image builds, so allow a few minutes. The script runs six steps:
    `on_error: enforce`. Check #2 does not check the outbound leg. The overlay
    keeps `opa` there for the pass-through outbound package (D24) and the
    changed combiner (D20). `charts/rossoctl/values.yaml` is never modified.
+   The outbound `token-exchange-aiac` entry is configured with
+   `audience_template: spiffe://<td>/ns/{namespace}/sa/{service}`, where `<td>`
+   is the chart's `operator-chart.signatureVerification.spireTrustDomain` (the
+   trust domain the operator names clients with), `namespace_file` set to the
+   pod's own service-account namespace file for short host names, and
+   `no_token_policy: deny` (a call with no bearer to a target gets 401). The chart renders the one pipeline
+   into every agent namespace, so neither value is a per-namespace literal.
 4. **Helm upgrade.** Applies the chart's `values.yaml` plus the overlay, with
    the sidecar image pointed at the locally built one.
    - It sets `operator-chart.featureGates.injectTools=true`. So the operator
@@ -208,9 +224,12 @@ Enable runs this for you. To check a cluster later (it changes nothing):
 It runs these checks. Each one can also be run by hand:
 
 ```bash
-# 1. OPA is in both legs of the namespace pipeline — expect 2
+# 1. OPA once on each leg, after the identity plugin (and, inbound, mcp-parser); the outbound
+#    leg runs token-exchange-aiac (not token-exchange) with a
+#    spiffe://<td>/...{namespace}...{service}... audience template and
+#    no_token_policy deny — expect "ok trust_domain=<td>" (parsed, per leg)
 kubectl get configmap authbridge-runtime-config -n team1 \
-  -o jsonpath='{.data.config\.yaml}' | grep -c 'name: opa'
+  -o jsonpath='{.data.config\.yaml}' | python3 k8s/authbridge-pipeline-check.py
 
 # 2. The CRD is served and the global combiner exists — expect 'default', scope global
 kubectl get crd authorizationpolicies.agent.rossoctl.dev
@@ -427,7 +446,7 @@ kubectl logs -n <ns> <pod> -c authbridge-proxy --tail=500 \
 - Credential headers (`authorization`, `cookie`, …) are **redacted** from
   `headers`. Use `identity` for auth decisions.
 
-**Outbound** — there is no validated JWT on this leg. When `token-exchange`
+**Outbound** — there is no validated JWT on this leg. When `token-exchange-aiac`
 mints the downstream token, it records a delegation hop, and OPA builds
 `input.identity` **in the same shape as inbound**:
 
@@ -452,7 +471,7 @@ mints the downstream token, it records a delegation hop, and OPA builds
         "subject_id": "<delegating user>",
         "audience": "spiffe://<td>/ns/<ns>/sa/<destination>",
         "scopes": ["openid", "<exchanged scopes>"],
-        "strategy": "token-exchange",
+        "strategy": "token-exchange-aiac",
         "from_cache": false,
         "timestamp": "..."
       }
@@ -462,20 +481,96 @@ mints the downstream token, it records a delegation hop, and OPA builds
 }
 ```
 
-- `subject` is the delegated caller, decoded on a best-effort basis from the
-  incoming bearer's `sub`.
+- `subject` is the `sub` of the token Keycloak issued: the delegating user.
+  The workload cannot choose it, because it comes from the IdP's answer and not
+  from the caller's bearer. A request with no bearer to a target is denied
+  before OPA (`no_token_policy: deny`), so it never reaches this decision.
 - `client_id` is the **calling workload's own client**
   (`/shared/client-id.txt`), the party doing the exchange, not the target.
-- `scopes` are the scopes the downstream token was minted with (the last hop).
-- `service_id` is the exchange target (the last hop's `audience`). It is the
-  outbound counterpart of the inbound token audience. No AIAC package reads
-  it: the outbound package is a pass-through (D24).
-- `token-exchange` only runs for hosts that have a route in the namespace's
-  `authproxy-routes` ConfigMap. Routes are read once at sidecar startup.
-  Traffic to a host with no route is passed through with **no** `identity` and
-  no `delegation`, so a policy keyed on them falls to its default.
+- `scopes` is the issued token's `scope` claim. With default-scope grants
+  Keycloak lists **all** of the caller's scope names there, even though `aud`
+  names one target. So don't treat `scopes` as per-target.
+- `service_id` is the exchange target (the last hop's `audience`, the derived
+  `spiffe://…/sa/<service>`). It is the outbound counterpart of the inbound
+  token audience. No AIAC package reads it: the outbound package is a
+  pass-through (D24).
+- Only an **exchanged** request (`token_exchanged` or `cache_hit`) carries
+  `identity` and `delegation`. A destination that is passed through (out of
+  cluster, or no Keycloak client) has neither, so a policy keyed on them falls
+  to its default (deny, for AIAC's generated policy).
 - Parser sections (`mcp` / `a2a` / `inference`) appear **only** when the body
   matches that protocol.
+
+### Outbound token exchange
+
+`token-exchange-aiac` runs on every outbound request and has no routes and no
+`authproxy-routes` ConfigMap. Adding a target is a Keycloak change only. No
+restart is needed, with one exception: the plugin remembers an audience that
+Keycloak has no client for as unknown for 5 minutes (`unknown_audience_ttl`).
+So if the caller called the target before the target's client existed, its
+calls keep passing through un-exchanged (and the target answers 401) for up to
+5 minutes after the client and the grant exist. Restart the caller to end that
+at once (`kubectl rollout restart deployment/<caller> -n <ns>`); the onboarding
+demo's WIRE phase and the system harness both do. Exchange is the default;
+passthrough happens in exactly two cases:
+
+| Destination | Result | Session event |
+|---|---|---|
+| Outside the cluster (external host, IP literal, `svc.namespace` without `.svc`) | forwarded unchanged, Keycloak not asked | `skip / host_not_in_cluster` |
+| In-cluster, audience granted to the caller | `Authorization` replaced with a token narrowed to that audience | `modify / token_exchanged` (or `cache_hit`) |
+| In-cluster, Keycloak has **no client** for the derived audience | forwarded unchanged; remembered for 5 min (restart the caller to forget it) | `skip / audience_unknown` |
+| In-cluster, client exists but is **not granted** to the caller | **403**, OPA not consulted | `deny / audience_not_granted` |
+| In-cluster, the destination's client is **disabled** (for example a quarantined service) | **403**, OPA not consulted | `deny / target_disabled` |
+| Keycloak down, timeout, bad credentials, any other error | **503**, OPA not consulted | `deny / exchange_failed` |
+| Sidecar credentials not yet in `/shared/` | **503** (pod held not-ready) | `deny / credentials_not_ready` |
+
+A request with **no** bearer to a target is denied with **401**
+`auth.unauthorized` (`no_token_policy: deny`, the plugin default and the
+behaviour of the route-based pipeline). The workload's own
+`client_credentials` token is never sent in its place, so a process in the pod
+that sends no `Authorization` header cannot reach a target as the agent. A
+request with no bearer to a destination Keycloak has no client for still passes
+through.
+
+The audience is derived from the Host header as
+`spiffe://<td>/ns/<namespace>/sa/<service>`. The namespace comes from
+the host (`github-tool.team1.svc[.cluster.local]`), or, for a short name
+(`github-tool:9090`), from the calling pod's own namespace (`namespace_file`). This makes two demands on workloads and
+Keycloak, which a use case (not this runbook) sets up:
+
+1. **Service name = ServiceAccount name.** The Host header carries the Service
+   name. If it differs from the ServiceAccount, the derived audience names no
+   client and the request **passes through un-exchanged**. For example, the
+   demo agent's default `MCP_URL` host is `github-tool-mcp`, but the production
+   tool's client is the plain client ID `github-tool` that the cortex demo's
+   `setup_keycloak.py` makes by hand (not the UC-1 stub's SPIFFE client
+   `…/sa/github-tool`), until its cortex manifest runs it under a ServiceAccount
+   `github-tool-mcp` (rossoctl/cortex#1540).
+2. **Keycloak grants**, on the caller's client:
+   - standard token exchange enabled (`standard.token.exchange.enabled=true`);
+   - each target granted through a client scope with an audience mapper for
+     it, attached as a **default** scope. The plugin requests no `scope`, so an
+     *optional* scope is never applied and the target answers 403. A **realm**
+     default scope would grant every target to every caller.
+
+   > **Known limitation: creation order.** The rossoctl operator registers each
+   > workload's `agent-<ns>-<workload>-aud` scope as a **realm default** scope
+   > (`EnsureAudienceScope`, `operator/internal/keycloak/audience.go`), and
+   > Keycloak links the realm default scopes to every client created **later**.
+   > So an agent whose client is created after a tool's client already holds
+   > that tool's audience as a default scope, with no grant step: its calls to
+   > the tool are exchanged, not refused. The "not granted → 403" row above
+   > holds only for a caller created **before** the target (or after the scope
+   > was removed from the realm defaults). The tool's own inbound OPA still
+   > decides each call. Follow-up: #248.
+
+The chart renders one pipeline for every agent namespace, and the sidecar has
+no `POD_NAMESPACE` env to expand. So each sidecar reads its namespace from
+`/var/run/secrets/kubernetes.io/serviceaccount/namespace`, and a short name in
+`team2` derives a `team2` audience. A sidecar that cannot read that file
+refuses to start.
+
+The full plugin reference is cortex `docs/token-exchange-aiac-plugin.md`.
 
 ### Reading a decision
 
@@ -484,7 +579,9 @@ mints the downstream token, it records a delegation hop, and OPA builds
 | HTTP `403`, body `{"error":"policy.forbidden","plugin":"opa",...}` | OPA denied a plain HTTP or A2A request, or an inbound OPA denied an MCP request. A tool call that the tool's inbound OPA denies comes back this way: the tool's reverse proxy sends the `403`, and the agent's forward proxy relays it. |
 | HTTP `200`, JSON-RPC `error` frame with `error.code: -32000`, `error.data.plugin: "opa"` | An **outbound** OPA denied an **MCP** request (one with a `method` and an `id`). In an AIAC setup, the outbound package of a managed service is a pass-through (D24), so this is a call from a pod that has no client CR (D20). The forward proxy returns the deny as a JSON-RPC error, so the MCP client sees one failed call instead of a broken transport (`writeMCPRejection` in cortex `core/listener/httpx/render.go`). The request never reaches the destination. |
 | HTTP `200`, JSON-RPC `result` frame | Allowed. |
-| HTTP `503` (outbound) | `token-exchange` failed. OPA was never consulted. |
+| HTTP `403` (outbound), or an MCP error frame, with `plugin: "token-exchange-aiac"` | Keycloak has a client for the destination, but it is not granted to the caller as a default scope (`audience_not_granted`), or the destination's client is disabled (`target_disabled`, a quarantined service). OPA was never consulted. |
+| HTTP `503` (outbound), `error: "upstream.token-exchange-failed"` | `token-exchange-aiac` could not get a token (Keycloak error, timeout, credentials not loaded). OPA was never consulted. |
+| Allowed or denied by OPA as if no exchange ran, with no `identity` in the decision log | The destination passed through (`audience_unknown` / `host_not_in_cluster`). Check the Service/ServiceAccount naming and the Keycloak client. |
 
 For MCP traffic, classify by the response **body**, not the status code: a
 `result` frame is allowed; an `error` frame or a `403` body that names `opa` is

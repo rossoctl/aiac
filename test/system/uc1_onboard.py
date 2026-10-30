@@ -23,7 +23,7 @@ pipeline wired into both legs:
         CR of each affected service on the live API), converging before the next
       → right after each workload converges, check that its client links the subject scope
         ``aiac-username-sub`` as a default scope (``require_subject_scope``, D31; a missing link fails)
-      → enable the outbound token-exchange leg (Part B: route + optional client scope + agent restart)
+      → enable the outbound token-exchange leg (Part B: default client scope + agent restart)
       → poll bundle-service + OPA until this run's CR is reflected in real decisions
       → drive REAL HTTP requests through AuthBridge and assert the real plugin's allow/deny
       → capture every AIAC CR + the global combiner to the pytest host (``teardown``) — the first
@@ -48,8 +48,8 @@ This module owns:
   other CR in the namespace) / ``delete_authpolicy`` (one CR, raising).
 * **Onboarding (event-driven)** — ``ensure_agent_policy`` (mount the PRB's ``policy.md``) +
   ``deploy_workload`` (deploy fires the trigger) / ``wait_for_registration`` / ``undeploy_workload``.
-* **Outbound-leg prep (Part B)** — ``ensure_github_tool_route`` / ``grant_exchange_scope`` /
-  ``restart_agent`` so ``token-exchange`` runs and OPA is actually consulted on the outbound leg.
+* **Outbound-leg prep (Part B)** — ``grant_exchange_scope`` / ``restart_agent`` so
+  ``token-exchange-aiac`` mints the tool token and OPA is actually consulted on the outbound leg.
 * **The subject on every leg (D31)** — ``SUBJECT_SCOPE`` (``aiac-username-sub``) and its mapper
   expectation; the pure ``subject_scope_problems``; the live reader ``subject_scope_link_problems`` and
   ``require_subject_scope`` (the login client ``rossoctl`` and each onboarded client link the scope as
@@ -123,6 +123,7 @@ from test.system.launcher import (  # noqa: E402
     KEYCLOAK_CLIENT_ID,
     TokenExchangeError,
     _kubectl_try,
+    _load_k8s_module,
     curl_pod,
     deny_origin,
     exchange_token,
@@ -146,6 +147,7 @@ from test.system.launcher import (  # noqa: E402
     require_event_path,
     require_pipeline,
     resolve_pod,
+    target_disabled_refusal,  # noqa: F401 — re-exported: the rollback test proves the quarantine with it
     verify_login_subject,
 )
 
@@ -208,9 +210,6 @@ CR_CAPTURE_DIR = Path(os.environ.get("AIAC_CR_CAPTURE_DIR") or HERE / "artifacts
 # OPA sidecar's next poll, the recomposed bundle). Defaults to the agent workload name.
 AGENT_DEPLOYMENT = os.environ.get("AIAC_AGENT_DEPLOYMENT", scn.AGENT_WORKLOAD)
 
-# SPIFFE trust domain the operator registers the demo workloads under (the ``spiffe://<td>/ns/...``
-# authority). Matches the rossoctl Kind cluster's default; override for a differently-named cluster.
-TRUST_DOMAIN = os.environ.get("AIAC_TRUST_DOMAIN", "localtest.me")
 
 # After a CR is upserted, ``bundle-service`` recomposes the namespace bundle and each pod's OPA polls
 # it on its own interval (``polling_min_delay`` / ``polling_max_delay``, 10-120 s by default, up to about
@@ -942,12 +941,21 @@ def controller_onboarding_lines(admin, workload: str, *, since: datetime) -> str
     return f"Controller lines (the not-ready error is in each nak): {lines}."
 
 
-def bundle_service_probe(workload: str) -> tuple[str, str]:
+# The SPIFFE trust domain of the bundle-service probe of the diagnosis, when it differs from the one the
+# exchange uses (``AIAC_TRUST_DOMAIN``, as ``TRUST_DOMAIN`` of ``k8s/opa-kind-verify.sh``). Unset, the
+# probe uses the trust domain of the live outbound leg (``require_pipeline``).
+BUNDLE_TRUST_DOMAIN = os.environ.get("AIAC_TRUST_DOMAIN") or None
+
+
+def bundle_service_probe(workload: str, *, trust_domain: str) -> tuple[str, str, str]:
     """GET bundle-service ``/readyz`` and ``/bundles?spiffe=<td>/ns/<ns>/sa/<workload>`` from a
     throwaway curl pod in ``NAMESPACE`` (the ztunnel path the sidecars use, as ``opa-kind-verify.sh``
-    Verify 4 does); return the two HTTP codes as strings (``000`` = not reachable)."""
+    Verify 4 does); return the two HTTP codes as strings (``000`` = not reachable) and the SPIFFE ID it
+    asked for. ``<td>`` is
+    ``BUNDLE_TRUST_DOMAIN`` when set, else ``trust_domain``, the one the exchange uses
+    (``require_pipeline``, read once per stack)."""
     base = f"http://bundle-service.{BUNDLE_SERVICE_NAMESPACE}.svc.cluster.local:8080"
-    spiffe = f"{TRUST_DOMAIN}/ns/{NAMESPACE}/sa/{workload}"
+    spiffe = f"{BUNDLE_TRUST_DOMAIN or trust_domain}/ns/{NAMESPACE}/sa/{workload}"
     # ``; true``: a failed curl still prints its code (``000``), and the pod must exit 0 to keep the output.
     script = (
         f"curl -s -m 10 -o /dev/null -w 'readyz %{{http_code}}\\n' {base}/readyz; "
@@ -955,7 +963,7 @@ def bundle_service_probe(workload: str) -> tuple[str, str]:
     )
     out = curl_pod(NAMESPACE, script, name="probe-bundle")
     codes = dict(line.split(" ", 1) for line in out.splitlines() if line.startswith(("readyz ", "bundle ")))
-    return codes.get("readyz", "none"), codes.get("bundle", "none")
+    return codes.get("readyz", "none"), codes.get("bundle", "none"), spiffe
 
 
 def _agentcard_state(workload: str) -> str:
@@ -982,6 +990,20 @@ def _agentcard_state(workload: str) -> str:
     return f"{card['metadata']['name']} Synced={synced.get('status')} ({synced.get('reason')}): {synced.get('message')}"
 
 
+def _bundle_probe_note(workload: str, context: dict) -> str:
+    """``bundle_service_probe``'s codes, with the trust domain it probed. When ``AIAC_TRUST_DOMAIN``
+    differs from the trust domain the exchange uses (``context["trust_domain"]``), say so: a 404 then
+    may be the override's, not the cluster's."""
+    live = context["trust_domain"]
+    readyz, bundle, spiffe = bundle_service_probe(workload, trust_domain=live)
+    note = f"readyz {readyz}, bundle {bundle} for spiffe={spiffe}"
+    if BUNDLE_TRUST_DOMAIN and BUNDLE_TRUST_DOMAIN != live:
+        note += (
+            f" (AIAC_TRUST_DOMAIN={BUNDLE_TRUST_DOMAIN} differs from the live token-exchange-aiac trust domain {live})"
+        )
+    return note
+
+
 def stack_diagnosis(admin, workload: str, *, context: dict) -> str:
     """The state dump that every gate failure appends: the operator change since the fixture start
     (``context["operator"]``), bundle-service reachability from the namespace, the Deployment's template
@@ -1001,7 +1023,7 @@ def stack_diagnosis(admin, workload: str, *, context: dict) -> str:
         return operator_change_note(context["operator"], now) or "unchanged"
 
     _part("operator", _operator)
-    _part(f"bundle-service from {NAMESPACE} (readyz, bundle)", lambda: bundle_service_probe(workload))
+    _part(f"bundle-service from {NAMESPACE} (readyz, bundle)", lambda: _bundle_probe_note(workload, context))
 
     def _deployment() -> str:
         deployment, reason = _read_rollout(workload)
@@ -1080,6 +1102,17 @@ def tool_onboarding_state(admin) -> dict[str, bool | None]:
     return state
 
 
+def workload_aud_scope(workload: str) -> str:
+    """The operator's audience client scope of ``workload`` in ``NAMESPACE`` (``k8s/operator-names.py``)."""
+    return _load_k8s_module("operator-names").aud_scope_name(NAMESPACE, workload)
+
+
+def client_credentials_secret_name(workload: str) -> str:
+    """The client-credentials Secret the operator writes for ``workload`` in ``NAMESPACE``
+    (``k8s/operator-names.py``, which ``demo/use-cases/onboarding/restore.sh`` runs too)."""
+    return _load_k8s_module("operator-names").client_credentials_secret_name(NAMESPACE, workload)
+
+
 def delete_workload_registrations(admin, realm: str) -> None:
     """Explicitly delete both workloads' Keycloak footprint — their clients, their ``*-aud`` audience
     client scopes, and the operator's client-credentials Secret — so teardown does not trust an
@@ -1088,8 +1121,11 @@ def delete_workload_registrations(admin, realm: str) -> None:
 
     ``cleanup_provisioned`` only clears the ``github-agent.`` / ``github-tool.``-**prefixed** roles and
     scopes; the operator's ``*-aud`` scopes (e.g. ``agent-team1-github-tool-aud``, no ``.`` after the
-    workload) and the dynamically-named ``rossoctl-keycloak-client-credentials-<hash>`` Secret are not
-    covered there, so this sweep handles them by suffix / prefix."""
+    workload) and the ``rossoctl-keycloak-client-credentials-<hash>`` Secrets are not covered there. This
+    sweep removes them by their **exact** names (``workload_aud_scope``,
+    ``client_credentials_secret_name``): other workloads in the namespace have theirs there too, for
+    example the production tool's ``agent-team1-github-tool-mcp-aud``, which a substring match would
+    take."""
     from keycloak.exceptions import KeycloakError
 
     admin.change_current_realm(realm)
@@ -1101,22 +1137,32 @@ def delete_workload_registrations(admin, realm: str) -> None:
             except KeycloakError as exc:
                 log.warning("teardown: delete client %r failed: %s", client.get("name"), exc)
 
+    workloads = (scn.AGENT_WORKLOAD, scn.TOOL_WORKLOAD)
+    aud_scopes = {workload_aud_scope(w) for w in workloads}
     for scope in admin.get_client_scopes():
         name = scope.get("name", "")
-        if name.endswith("-aud") and (scn.AGENT_WORKLOAD in name or scn.TOOL_WORKLOAD in name):
+        if name in aud_scopes:
             try:
                 admin.delete_client_scope(scope["id"])
             except KeycloakError as exc:
                 log.warning("teardown: delete audience client scope %r failed: %s", name, exc)
 
-    # The operator mints a ``rossoctl-keycloak-client-credentials-<hash>`` Secret per client (dynamic
-    # hash); sweep by prefix so the namespace is left with none. Tolerant — a query failure or an
-    # already-absent Secret is not a teardown error.
-    ok, out, _ = _kubectl_try("get", "secret", "-n", NAMESPACE, "-o", "name")
-    if ok:
-        for ref in out.split():
-            if ref.startswith("secret/rossoctl-keycloak-client-credentials-"):
-                _kubectl_try("delete", ref, "-n", NAMESPACE, "--ignore-not-found")
+    # The operator mints one ``rossoctl-keycloak-client-credentials-<hash>`` Secret per client, named
+    # from (namespace, workload). Only these two: other workloads in the namespace (the production
+    # github-tool-mcp) have theirs there too. Tolerant — an already-absent Secret is not a teardown error.
+    for workload in workloads:
+        secret = client_credentials_secret_name(workload)
+        _kubectl_try("delete", "secret", secret, "-n", NAMESPACE, "--ignore-not-found")
+    # The Secrets carry the workload in the operator's owner reference, so one left over (the naming
+    # changed, or the agent ran under another Deployment) is named here instead of passing in silence.
+    ok, out, _ = _kubectl_try(
+        "get", "secret", "-n", NAMESPACE, "-o",
+        r'jsonpath={range .items[*]}{.metadata.name}{"\t"}{.metadata.ownerReferences[*].name}{"\n"}{end}',
+    )  # fmt: skip
+    for line in out.splitlines() if ok else []:
+        name, _, owners = line.partition("\t")
+        if name.startswith("rossoctl-keycloak-client-credentials-") and set(owners.split()) & set(workloads):
+            log.warning("teardown: client-credentials Secret %s of %s survived the delete", name, owners)
 
 
 def sweep_authpolicies() -> None:
@@ -1164,88 +1210,33 @@ def delete_workload_crs() -> None:
 # Outbound token-exchange leg prep — so OPA is actually consulted outbound
 # ======================================================================================
 #
-# The tool check is only reached if ``token-exchange`` first intercepts + exchanges the agent's call to
-# github-tool. That needs: (B.1) an outbound route for the github-tool host, (B.2) the agent's Keycloak
-# client granted the github-tool audience scope as optional, and (B.3) the agent restarted so it
-# reloads the route. Without this the call would pass through unexchanged and never reach OPA. The
-# agent's outbound is a pass-through, but github-tool's inbound ``jwt-validation`` accepts only a
-# token whose audience is github-tool, so ``token-exchange`` must mint it.
+# The tool check is only reached if ``token-exchange-aiac`` first exchanges the agent's call to
+# github-tool. It has no routes: it derives the audience ``spiffe://<td>/ns/<ns>/sa/github-tool`` from
+# the host and asks Keycloak, so the only prep is (B.1) the agent's Keycloak client granted the
+# github-tool audience scope as a **default** scope — the plugin requests no ``scope``, so an optional
+# scope is never applied and the exchange answers 403 "not granted" — and (B.2) the agent restarted, so
+# a github-tool audience it remembered as unknown before the tool's client existed (cached for 5 min)
+# is asked again. The leg is necessary: the agent's outbound is a pass-through, but github-tool's
+# inbound ``jwt-validation`` accepts only a token whose audience is github-tool, so
+# ``token-exchange-aiac`` must mint it.
 
 
-def _tool_audience() -> str:
-    """The RFC 8693 ``audience`` for the github-tool exchange — its SPIFFE ID."""
-    return f"spiffe://{TRUST_DOMAIN}/ns/{NAMESPACE}/sa/{scn.TOOL_WORKLOAD}"
-
-
-def _tool_aud_scope() -> str:
-    """The realm client-scope whose audience mapper stamps the github-tool audience."""
-    return f"agent-{NAMESPACE}-{scn.TOOL_WORKLOAD}-aud"
-
-
-def ensure_github_tool_route(namespace: str) -> None:
-    """Ensure ``authproxy-routes`` carries an outbound route for the github-tool host.
-
-    Reads the current ``routes.yaml``, appends the github-tool route if it is not already present
-    (preserving any existing routes, e.g. the weather route), and patches it back. Creates the
-    ConfigMap if it does not exist. Idempotent: a second call is a no-op when the route is present."""
-    tool = scn.TOOL_WORKLOAD
-    route_block = (
-        f'- host: "{tool}"\n  target_audience: "{_tool_audience()}"\n  token_scopes: "openid {_tool_aud_scope()}"\n'
-    )
-    try:
-        current = kubectl(
-            "get",
-            "configmap",
-            "authproxy-routes",
-            "-n",
-            namespace,
-            "-o",
-            r"jsonpath={.data.routes\.yaml}",
-            timeout=30,
-        )
-    except subprocess.CalledProcessError:
-        current = ""  # ConfigMap (or key) absent — treat as empty, create below
-
-    if f'host: "{tool}"' in current or f"host: {tool}" in current:
-        return  # already routed
-    new_routes = (current + ("\n" if current.strip() else "") + route_block) if current.strip() else route_block
-
-    patch = {"data": {"routes.yaml": new_routes}}
-    try:
-        kubectl(
-            "patch",
-            "configmap",
-            "authproxy-routes",
-            "-n",
-            namespace,
-            "--type",
-            "merge",
-            "-p",
-            json.dumps(patch),
-            timeout=30,
-        )
-    except subprocess.CalledProcessError:
-        # ConfigMap does not exist yet — create it with just the github-tool route.
-        cm = {
-            "apiVersion": "v1",
-            "kind": "ConfigMap",
-            "metadata": {"name": "authproxy-routes", "namespace": namespace},
-            "data": {"routes.yaml": new_routes},
-        }
-        kubectl("apply", "-f", "-", input_text=json.dumps(cm), timeout=30)
+def _tool_audience(trust_domain: str) -> str:
+    """The RFC 8693 ``audience`` for the github-tool exchange — its SPIFFE ID in ``trust_domain``."""
+    return f"spiffe://{trust_domain}/ns/{NAMESPACE}/sa/{scn.TOOL_WORKLOAD}"
 
 
 def grant_exchange_scope(admin) -> None:
-    """Grant the agent's Keycloak client the github-tool audience scope as **optional**,
-    so the ``client_credentials`` token exchange to the github-tool audience succeeds.
+    """Grant the agent's Keycloak client the github-tool audience scope as a **default** scope, so
+    ``token-exchange-aiac``'s exchange to the github-tool audience (no ``scope`` requested) is granted.
 
     Resolves the agent client by its SPIFFE ``clientId`` (``.../sa/github-agent``) or its
     ``name`` (``{ns}/github-agent``), and the client scope by name (``agent-{ns}-github-tool-aud``).
-    Idempotent — Keycloak's assign-optional-scope is a PUT."""
+    Idempotent — Keycloak's assign-default-scope is a PUT. Raises ``RuntimeError`` on any Keycloak error."""
     from keycloak.exceptions import KeycloakError
 
     admin.change_current_realm(TEST_REALM)
-    aud_scope = _tool_aud_scope()
+    aud_scope = workload_aud_scope(scn.TOOL_WORKLOAD)
 
     client_uuid = None
     for client in admin.get_clients():
@@ -1265,15 +1256,30 @@ def grant_exchange_scope(admin) -> None:
             f"client scope {aud_scope!r} not found in realm {TEST_REALM!r} — is {scn.TOOL_WORKLOAD} "
             "deployed + registered by the operator?"
         )
+    # The same move as _link_default_scope in src/aiac/idp/service/configuration/keycloak/main.py: an
+    # optional link (the old optional grant of this harness) is moved to default first, since Keycloak
+    # silently skips a default link of a scope already linked as optional. Copied, not imported:
+    # importing that module configures the root logger and builds its FastAPI app in the test process.
+    # A 409 is an existing default link (the operator's realm default scope can link it at the agent's
+    # creation, #248): success, as in driver.sh's grant_default_scope. Any other Keycloak error raises:
+    # without the default link every exchange is refused much later, far from this cause.
     try:
-        admin.add_client_optional_client_scope(client_uuid, scope["id"], {})
+        if any(s.get("id") == scope["id"] for s in admin.get_client_optional_client_scopes(client_uuid)):
+            admin.delete_client_optional_client_scope(client_uuid, scope["id"])
+        admin.add_client_default_client_scope(client_uuid, scope["id"], {})
     except KeycloakError as exc:
-        log.info("grant_exchange_scope: assign %r returned (benign if already assigned): %s", aud_scope, exc)
+        if exc.response_code == 409:
+            log.info("grant_exchange_scope: %r is already a default scope of %s", aud_scope, scn.AGENT_WORKLOAD)
+            return
+        raise RuntimeError(
+            f"could not link {aud_scope!r} to {NAMESPACE}/{scn.AGENT_WORKLOAD} as a default scope: {exc} — "
+            "without it token-exchange-aiac refuses every call to the tool"
+        ) from exc
 
 
 def restart_agent(namespace: str) -> None:
-    """Restart the agent Deployment so it reloads the outbound route (routes are read once at
-    startup) and its OPA sidecar re-fetches the recomposed bundle on its next poll."""
+    """Restart the agent Deployment so ``token-exchange-aiac`` starts with empty caches (an audience
+    it remembered as unknown is asked again) and its OPA sidecar re-fetches the recomposed bundle."""
     kubectl("rollout", "restart", f"deployment/{AGENT_DEPLOYMENT}", "-n", namespace, timeout=60)
     kubectl_rollout_status(f"deployment/{AGENT_DEPLOYMENT}", namespace=namespace, timeout=180)
 
@@ -1794,14 +1800,15 @@ def exchanged_subject(ctx: dict, user: str) -> str:
     comes from the agent's default scope ``aiac-username-sub``).
 
     Mints ``user``'s login token through ``rossoctl``, reads the agent client and its client secret
-    from the admin API, and sends the request that AuthBridge's route sends (``ensure_github_tool_route``):
-    a standard token exchange to ``_tool_audience()`` with ``scope`` = ``openid`` + the tool's audience
-    scope (``exchange_token``). The Keycloak standard token exchange builds the token for the requester
+    from the admin API, and sends the request that AuthBridge's ``token-exchange-aiac`` sends: a standard
+    token exchange to ``_tool_audience(ctx["trust_domain"])`` with **no** ``scope`` (``exchange_token``), so only the agent's
+    default scopes apply. The Keycloak standard token exchange builds the token for the requester
     (the agent), so its ``sub`` comes from the agent's scopes only.
 
-    The harness can authenticate as the agent only with its client secret. ``k8s/opa-kind-enable.sh``
-    configures AuthBridge's ``token-exchange`` with the ``client-secret`` identity, so on that
-    deployment the agent client uses the ``client-secret`` authenticator and the exchange must succeed:
+    The harness can authenticate as the agent only with its client secret. AuthBridge's
+    ``token-exchange-aiac`` (``k8s/opa-kind-enable.sh``) authenticates the same way: it reads the secret
+    the operator writes to ``/shared/client-secret.txt`` and has no other way. So on that deployment the
+    agent client uses the ``client-secret`` authenticator and the exchange must succeed:
     a refused client authentication then raises. ``pytest.skip`` only when the agent client uses
     another authenticator (``clientAuthenticatorType``, for example ``federated-jwt`` for a SPIFFE
     JWT-SVID) or has no readable secret. Then no other check reads the exchanged ``sub`` directly; only
@@ -1840,8 +1847,7 @@ def exchanged_subject(ctx: dict, user: str) -> str:
             realm=ctx["realm"],
             client_id=agent["clientId"],
             client_secret=secret,
-            audience=_tool_audience(),
-            scope=f"openid {_tool_aud_scope()}",
+            audience=_tool_audience(ctx["trust_domain"]),
         )
     except TokenExchangeError as exc:
         if exc.client_auth_refused:
@@ -1931,7 +1937,7 @@ def outbound_raw(ctx: dict, user: str, tool_bare: str) -> tuple[int | None, str]
 def outbound_decision(ctx: dict, user: str, tool_bare: str) -> str:
     """Drive one outbound ``tools/call`` (``outbound_raw``) and return the real plugin's classified
     decision (``outbound_outcome``): ``"deny"`` for an OPA verdict (github-tool's inbound 403);
-    ``"allow"`` for a non-OPA 200; ``"error"`` for a token-exchange refusal, a 503 or a transport
+    ``"allow"`` for a non-OPA 200; ``"error"`` for an exchange refusal, a 503 or a transport
     failure."""
     return outbound_outcome(*outbound_raw(ctx, user, tool_bare))
 
@@ -2021,9 +2027,10 @@ def _default_ready_signals(tool_onboarded: bool) -> list[ReadySignal]:
 
     **Outbound signals exist only when a tool is onboarded.** The agent-only rung (rung 1) has no tool
     to gate, so there is no real ``agent -> tool`` call and its outbound leg is neither prepared (Part B
-    is skipped) nor probed nor asserted — on a tool-less rung token-exchange short-circuits before OPA
-    (no ``github-tool`` audience grant), so an outbound "deny" there would be a Keycloak audience
-    refusal, not an OPA verdict. Rung 1's empty tool check is instead asserted at the unit level
+    is skipped) nor probed nor asserted — on a tool-less rung Keycloak has no ``github-tool`` client, so
+    token-exchange-aiac passes the call through un-exchanged (``audience_unknown``), and an outbound
+    "deny" there would be the agent's outbound OPA (a pass-through, D24) on a request that reaches no
+    tool, not the tool check. Rung 1's empty tool check is instead asserted at the unit level
     (grant-set oracle) and by ``test_no_tool_scopes_provisioned``. So the tool-less signal set is
     inbound-only.
 
@@ -2189,7 +2196,8 @@ def onboarded_stack(
 ) -> Iterator[dict]:
     """Run one rung's whole live flow and yield a probe ``ctx`` for its assertions.
 
-    ``ctx`` = ``{"admin", "namespace", "agent_pod", "keycloak_url", "realm", "tool_onboarded"}``.
+    ``ctx`` = ``{"admin", "namespace", "agent_pod", "keycloak_url", "realm", "tool_onboarded",
+    "trust_domain"}``.
 
     Flow (event-driven trigger): skip cleanly (never false-pass) if the OPA pipeline or the event path
     is not wired, or the integration env is unset; capture any leftover CR to the pytest host
@@ -2204,8 +2212,8 @@ def onboarded_stack(
     client links the subject scope ``aiac-username-sub`` as a default scope (``require_subject_scope``,
     D31: AIAC makes this link at onboarding, so a missing link **fails** the run at once, with the
     problems listed, rather than as a deny in the final poll); enable the outbound leg
-    (Part B: route + optional client scope + agent restart); then **poll real decisions** until
-    ``bundle-service`` + OPA reflect this run's CR (and token-exchange has settled) before yielding.
+    (Part B: default client scope + agent restart, no route); then **poll real decisions** until
+    ``bundle-service`` + OPA reflect this run's CR (and the outbound exchange has settled) before yielding.
     Teardown first captures every AIAC CR and the global combiner to the pytest host
     (``capture_aiac_crs``, phase ``teardown``; best-effort, it never masks a failure), then is
     **full-to-pristine** — the workloads and every registration are removed and the removal is
@@ -2235,8 +2243,9 @@ def onboarded_stack(
     # no-workloads slate and deploys the workloads itself as the onboarding trigger, so requiring
     # them up front would skip every rung on a correctly-wired cluster. A missing/unloadable image or
     # a deploy that never converges surfaces later as a loud RuntimeError from the deploy/convergence
-    # poll below — never a skip, never a false pass.
-    require_pipeline(namespace=NAMESPACE, workloads=[])
+    # poll below — never a skip, never a false pass. The gate also gives the trust domain the live
+    # outbound leg exchanges for, from the same read of the config it approved.
+    trust_domain = require_pipeline(namespace=NAMESPACE, workloads=[])
     creds = require_env_or_skip("KEYCLOAK_URL", "KEYCLOAK_ADMIN_USERNAME", "KEYCLOAK_ADMIN_PASSWORD")
     keycloak_url = creds["KEYCLOAK_URL"]
 
@@ -2262,7 +2271,8 @@ def onboarded_stack(
         load_workload_images(workloads)
 
         # The operator's identity now: each gate failure says when it restarted or was replaced since.
-        context = {"operator": read_operator_identity()}
+        # The trust domain (``require_pipeline``): the probes and the diagnosis both use it.
+        context = {"operator": read_operator_identity(), "trust_domain": trust_domain}
         default_policy = policy_md == scn.POLICY_ABSTRACT  # the CR content checks assume Policy A's names
 
         # Deploy in the rung's ``workloads`` order, one at a time, onboarded before the next — each
@@ -2332,27 +2342,25 @@ def onboarded_stack(
                     + stack_diagnosis(admin, scn.AGENT_WORKLOAD, context=context)
                 )
 
-        # Part B — enable the outbound token-exchange leg so the tool check is actually reached
+        # Part B — make the outbound exchange succeed so the tool check is actually reached
         # (github-tool's inbound OPA, which accepts only a token with its audience). Done after
-        # onboarding so the restarted agent (and its OPA sidecar) picks up both the new route and, on
-        # its next poll, the recomposed bundle.
+        # onboarding so the restarted agent (and its OPA sidecar) starts with empty exchange caches
+        # and, on its next poll, the recomposed bundle.
         #
         # Prepared ONLY when this run actually probes outbound (``has_outbound``). The agent-only rung
         # (rung 1) has no tool onboarded, so there is no real ``agent -> tool`` call to make and no
-        # outbound signal in its set — its outbound leg has no real-life counterpart, and token-exchange
-        # would short-circuit before OPA anyway (no ``github-tool`` audience grant, since the operator
+        # outbound signal in its set — its outbound leg has no real-life counterpart, and the exchange
+        # never reaches OPA anyway (no ``github-tool`` client, since the operator registers it and
         # creates ``agent-{ns}-github-tool-aud`` only on TOOL deploy). So on a tool-less rung Part B is
-        # skipped entirely: no outbound route, no restart. Its inbound gate already converged in the
+        # skipped entirely: no grant, no restart. Its inbound gate already converged in the
         # per-workload loop above, and skipping the restart means rung 1 asserts the exact bundle the
         # live event-driven onboard produced (no restart papering over a bad compose).
         #
-        # When there IS an outbound leg: add the route so the forward proxy intercepts the github-tool
-        # call and runs token-exchange, grant the agent client the ``*-aud`` scope (only ever present
-        # once the tool is deployed) so the exchange succeeds and OPA is reached, then restart the agent
-        # so it reloads the route and re-fetches the recomposed bundle.
+        # When there IS an outbound leg: grant the agent client the ``*-aud`` scope as a default scope
+        # (only ever present once the tool is deployed) so ``token-exchange-aiac`` mints the github-tool
+        # token and OPA is reached, then restart the agent. No route: the plugin derives the audience.
         has_outbound = any(sig.kind == "outbound" for sig in signals)
         if has_outbound:
-            ensure_github_tool_route(NAMESPACE)
             if tool_onboarded:
                 grant_exchange_scope(admin)
             restart_agent(NAMESPACE)
@@ -2367,6 +2375,9 @@ def onboarded_stack(
             "keycloak_url": keycloak_url,
             "realm": TEST_REALM,
             "tool_onboarded": tool_onboarded,
+            # The trust domain the live outbound leg exchanges for, read once per stack by the skip gate,
+            # so a probe asks for the audience AuthBridge asks for (``exchanged_subject``).
+            "trust_domain": trust_domain,
         }
 
         # Wait for bundle-service + OPA to reflect THIS run's CR (and token-exchange to settle) before
@@ -2379,13 +2390,15 @@ def onboarded_stack(
             # The message prints what the poll saw last, with each raw ``(code, body)``: the classifier
             # collapses very different failures into ``"error"``, and the raw answer tells them apart.
             # On the outbound leg: ``code=None`` + ``"outbound probe exec failed: ..."`` is the probe's own
-            # ``kubectl exec`` (a replaced agent pod); 503 is the ``token-exchange`` leg (OPA not reached);
+            # ``kubectl exec`` (a replaced agent pod); 503 or an exchange error frame is the
+            # ``token-exchange-aiac`` leg (OPA not reached);
             # a real policy stall reads ``"deny"`` (github-tool's inbound 403 with an OPA body), never
             # ``"error"``, because the generated Rego carries ``default allow := false``.
             raise RuntimeError(
                 f"live pipeline did not converge within {BUNDLE_TIMEOUT:.0f}s after onboarding "
                 f"{workloads} + Part B: {signals_report(signals, last)}. Outbound: code=None + 'exec failed' "
-                "body = a stale/gone agent pod (harness); 503 = token-exchange never came up (OPA not reached); "
+                "body = a stale/gone agent pod (harness); 503 / plugin=token-exchange-aiac = the exchange failed "
+                "(OPA not reached); "
                 "a real policy stall reads 'deny', never 'error' — see k8s/opa-kind-runbook.md. "
                 + stack_diagnosis(admin, workloads[-1], context=context)
             )
@@ -3229,16 +3242,16 @@ def mcp_session_frames(tool_bare: str) -> list[dict]:
 
 def mcp_session_decisions(ctx: dict, user: str, tool_bare: str) -> dict[str, tuple[str, int | None, str]]:
     """Mint a fresh ``user`` token, send one MCP session (``mcp_session_frames``) through the agent's
-    outbound (token-exchange, then the tool check in github-tool's inbound OPA), and return
+    outbound (token-exchange-aiac, then the tool check in github-tool's inbound OPA), and return
     ``{method: (decision, http_code, body)}``. A request frame is classified by its body
     (``outbound_outcome``: a ``result`` frame = allow, an OPA 403 or OPA error frame = deny); the
-    notification by its status (``notification_outcome``: 202 = allow, 403 = deny)."""
+    notification by its status and body (``notification_outcome``: 202 = allow, an OPA 403 = deny)."""
     token = mint_token(user, scn.USER_PASSWORD, keycloak_url=ctx["keycloak_url"], realm=ctx["realm"])
     frames = mcp_session_frames(tool_bare)
     raw = outbound_session_probe(token, frames, namespace=ctx["namespace"], agent_pod=resolve_agent_pod())
     return {
         frame["method"]: (
-            (outbound_outcome(code, body) if "id" in frame else notification_outcome(code)),
+            (outbound_outcome(code, body) if "id" in frame else notification_outcome(code, body)),
             code,
             body,
         )
@@ -3250,13 +3263,14 @@ def mcp_session_decisions(ctx: dict, user: str, tool_bare: str) -> dict[str, tup
 def pristine_stack(workloads: Sequence[str], *, policy_md: str = scn.POLICY_ABSTRACT) -> Iterator[dict]:
     """The slate + teardown half of ``onboarded_stack`` with NO deploy and NO convergence poll, for a
     flow whose onboarding is meant to fail (``onboarded_stack`` would wait for a happy-path allow that
-    never comes). Yields ``ctx = {"admin", "namespace", "keycloak_url", "realm"}``; the caller deploys.
+    never comes). Yields ``ctx = {"admin", "namespace", "keycloak_url", "realm", "trust_domain"}``, the keys
+    of ``onboarded_stack`` that need no deploy; the caller deploys.
 
     Same skip gates (pipeline wiring, env, event path), the same slate and teardown (``_clean_slate``:
     Direct Access Grants on the login client, the no-workloads slate, realm users and roles, the ``sub``
     check; at exit full-to-pristine, verified), then the ``policy.md`` mount and the image load for
     ``workloads``."""
-    require_pipeline(namespace=NAMESPACE, workloads=[])
+    trust_domain = require_pipeline(namespace=NAMESPACE, workloads=[])
     creds = require_env_or_skip("KEYCLOAK_URL", "KEYCLOAK_ADMIN_USERNAME", "KEYCLOAK_ADMIN_PASSWORD")
     keycloak_url = creds["KEYCLOAK_URL"]
     admin = connect_admin()
@@ -3269,4 +3283,5 @@ def pristine_stack(workloads: Sequence[str], *, policy_md: str = scn.POLICY_ABST
             "namespace": NAMESPACE,
             "keycloak_url": keycloak_url,
             "realm": TEST_REALM,
+            "trust_domain": trust_domain,
         }

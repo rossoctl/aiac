@@ -9,9 +9,11 @@
 # (a2a-parser, mcp-parser, inference-parser) so OPA policies have input.a2a /
 # input.mcp / input.inference available on both legs, not just input.host.
 #
-# On the outbound leg OPA is placed AFTER token-exchange so policies can
-# read input.delegation (the target audience + scopes the agent's token was
-# exchanged for). See the overlay comment in Step 3 for the rationale.
+# The outbound leg exchanges by default: token-exchange-aiac (no routes) mints a
+# token for every in-cluster destination Keycloak has a client for, and OPA runs
+# AFTER it so policies can read input.identity / input.delegation (the target
+# audience + scopes the token was exchanged for). See the overlay comment in
+# Step 3 for the rationale.
 #
 # Step 1 applies the changed combiner of AIAC (D20,
 # k8s/aiac-combiner-default.yaml) as the global combiner (the `default`
@@ -29,7 +31,9 @@
 # second `helm upgrade -f` — Helm layers -f files left-to-right, so the repo
 # file is only ever read, never written. Run opa-kind-restore.sh to revert.
 #
-# Requires: kubectl, helm, kind, docker (or podman), python3 not needed here.
+# Requires: kubectl, helm, kind, docker (or podman), and python3 with PyYAML (Step 6
+# runs k8s/opa-kind-verify.sh, whose Verify 1 parses the pipeline). Checked before
+# any cluster change.
 # Env vars:
 #   OPERATOR_DIR        path to the rossoctl/operator repo clone; Step 1 builds
 #                       the operator image from operator/Dockerfile and renders
@@ -162,6 +166,11 @@ if [ ! -f "$VALUES_FILE" ]; then
   echo "ERROR: ${VALUES_FILE} not found — check ROSSOCTL_DIR" >&2
   exit 1
 fi
+
+# Step 6 verifies with k8s/opa-kind-verify.sh, which parses the pipeline with python3 + PyYAML. Check it
+# now, before the image builds and the helm upgrade, not after the cluster has changed.
+python3 -c 'import yaml' >/dev/null 2>&1 \
+  || { echo "ERROR: python3 with PyYAML not found (Step 6, k8s/opa-kind-verify.sh, parses the pipeline)" >&2; exit 1; }
 
 if [ "${KIND_EXPERIMENTAL_PROVIDER:-}" = "podman" ]; then
   CONTAINER_RUNTIME="${CONTAINER_RUNTIME:-podman}"
@@ -375,26 +384,42 @@ cat > "$OVERLAY_FILE" <<YAML
 #     input.mcp, input.inference) are always populated, even if a later
 #     gate denies the request.
 #   - opa runs after jwt-validation on inbound so input.identity is set.
-#   - On OUTBOUND, opa runs AFTER token-exchange so the delegation signal
-#     is populated: token-exchange records the target audience + granted
-#     scopes it minted a token for (RFC 8693) into the delegation chain,
-#     and OPA exposes it as input.delegation (origin, actor, depth, and a
-#     chain of {subject_id, audience, scopes, strategy, from_cache}). This
-#     lets outbound policy reason about WHAT the agent's token was
-#     exchanged for without re-parsing the minted token and without a fail-closed JWT
-#     gate that would reject passthrough egress.
-#     token-exchange ALSO synthesizes input.identity on this leg, even though
-#     no JWT is validated here: a matched route yields
-#     identity.{subject, client_id, service_id, scopes}, where service_id is
-#     the route's target_audience and subject is the delegating end user, so
-#     outbound policy can key on input.identity the same way as inbound. A
-#     host with NO matching route gets no exchange and therefore no identity,
-#     so gates keyed on it go undefined and the policy's default applies.
-#     input.delegation carries the complementary per-hop audit trail.
-#   - token-exchange uses the chart's default shape (client-secret identity
-#     from /shared, passthrough default policy). Per-destination routes
-#     come from the authproxy-routes ConfigMap; hosts with no route fall
-#     through unchanged and simply carry no delegation hop.
+#   - OUTBOUND token exchange is ON by default, with no routes: token-exchange-aiac
+#     derives the audience from the destination host
+#     (spiffe://<td>/ns/{namespace}/sa/{service}; a short name uses the pod's
+#     own namespace) and asks Keycloak. A granted target gets a
+#     token narrowed to it; a destination Keycloak has no client for is the ONLY
+#     passthrough; an existing-but-not-granted target is 403 and any other IdP
+#     failure is 503. A request with no bearer to a target is denied with 401
+#     (no_token_policy: deny, the plugin default, which the route-based
+#     pipeline also left in place): the workload's own client-credentials token
+#     is never sent in its place, so a process in the pod cannot reach a target
+#     without a user token. A bearer-less request to a destination Keycloak has
+#     no client for still passes through: the plugin asks Keycloak with the
+#     workload's own token only to tell the two apart, and never forwards it.
+#   - opa runs AFTER token-exchange-aiac so the exchange is visible to policy:
+#     each exchange appends a delegation hop, and OPA exposes it as
+#     input.delegation (origin, actor, depth, chain of {subject_id, audience,
+#     scopes, strategy, from_cache}) and as an outbound input.identity
+#     {subject, client_id, service_id, scopes} in the same shape as inbound,
+#     where service_id is the target audience and subject/scopes come from the
+#     token Keycloak issued. A request that is not exchanged carries no
+#     identity, so gates keyed on it go undefined and the policy's default
+#     applies.
+#   - Keycloak must grant each target as a DEFAULT client scope of the caller
+#     (an optional scope is never applied: the plugin requests no scope) and
+#     have standard token exchange enabled on the caller's client.
+#   - The SPIFFE audience form requires the destination Service and its
+#     ServiceAccount to share a name; otherwise the derived audience names no
+#     client and the request passes through un-exchanged.
+#   - The chart renders this one pipeline into every agent namespace, so no
+#     per-namespace value is inlined. The trust domain is the chart's own
+#     operator-chart.signatureVerification.spireTrustDomain (resolved by tpl(),
+#     the value the operator names SPIFFE clients with), and the namespace for
+#     short names is read by each sidecar from its own service-account mount
+#     (namespace_file).
+#   - token-exchange-aiac rejects unknown config keys, so token-exchange-only
+#     keys (routes, default_policy, identity, token_scopes) must not appear.
 # NOTE: the rossoctl chart reads the pipeline from \`.Values.authBridge.pipeline\`
 # (a multiline string rendered via tpl() into the namespace
 # authbridge-runtime-config ConfigMap — see charts/rossoctl/templates/
@@ -422,13 +447,13 @@ authBridge:
         - name: a2a-parser
         - name: mcp-parser
         - name: inference-parser
-        - name: token-exchange
+        - name: token-exchange-aiac
           config:
             keycloak_url: "http://keycloak-service.keycloak.svc:8080"
             keycloak_realm: "rossoctl"
-            default_policy: "passthrough"
-            identity:
-              type: "client-secret"
+            audience_template: "spiffe://{{ index .Values "operator-chart" "signatureVerification" "spireTrustDomain" | default "localtest.me" }}/ns/{namespace}/sa/{service}"
+            namespace_file: /var/run/secrets/kubernetes.io/serviceaccount/namespace
+            no_token_policy: "deny"
         - name: opa
           config:
             bundle_url: "http://bundle-service.${RELEASE_NAMESPACE}.svc.cluster.local:8080"
