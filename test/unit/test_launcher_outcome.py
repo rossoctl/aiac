@@ -27,6 +27,7 @@ from test.unit.pipeline_configs import CONFIG as _CONFIG  # noqa: E402
 from test.unit.pipeline_configs import PASSING as _PASSING  # noqa: E402
 from test.unit.pipeline_configs import SKIPPING as _SKIPPING  # noqa: E402
 from test.unit.pipeline_configs import TEMPLATE as _TEMPLATE  # noqa: E402
+from test.unit.pipeline_configs import reason as _reason  # noqa: E402
 
 
 def _frame(data: dict) -> str:
@@ -144,9 +145,6 @@ def test_deny_origin_ignores_an_exchange_refusal() -> None:
 )
 def test_rejection_doc_unwraps_both_rejection_shapes(code: int | None, body: str, expected: dict | None) -> None:
     assert launcher.rejection_doc(code, body) == expected
-
-
-from test.unit.pipeline_configs import reason as _reason  # noqa: E402
 
 
 @pytest.mark.parametrize("config", ["", "not: [yaml", "- a list", "just text"])

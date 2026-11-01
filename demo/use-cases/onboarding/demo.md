@@ -566,6 +566,24 @@ allowed, `test-user`→`source-read` must not be) and on the direct call. It rep
 the matrix, then prints the matching OPA decision-log lines: the tool-call decisions come from
 `github-tool`'s sidecar (inbound).
 
+**How ENFORCE waits, and why.** These choices keep a slow cluster from failing the run, while a real
+deny still fails it within minutes:
+
+- **It waits for the final bundles before the matrix.** `github-tool`'s and the agent's OPAs poll
+  bundle-service every 10–120 s, so the bundle the last onboarding wrote can land after WIRE's restart.
+  Until it does, a pod runs its bootstrap policy, which denies everything. So ENFORCE polls
+  `dev-user`→`source-read` until it is allowed, for one bundle cycle (`BUNDLE_WAIT_SECS`, default
+  180 s), and only then prints the matrix, so the matrix shows the policy in force. It retries only
+  the answers a slow bundle or a fresh sidecar gives (a deny from a bootstrap policy, OPA with no
+  bundle yet, a sidecar that has not read its credentials). A refused audience or login, or any other
+  answer, stops it at once.
+- **It restarts the agent instead of waiting out a cache.** `token-exchange-aiac` remembers an
+  audience it saw as unknown for 5 minutes. WIRE restarts the agent to clear that. `make enforce` runs
+  WIRE then ENFORCE as two steps, so ENFORCE restarts the agent only when no restart happened in the
+  last 2 minutes (`./driver.sh --only-enforce` on its own). The restart comes after ENFORCE's checks,
+  so a cluster that fails them is not disrupted. With the cache cleared, a `401` from `github-tool` is
+  a real audience refusal, so ENFORCE does not retry it.
+
 ### Reading the verdicts
 
 A denial looks like this:

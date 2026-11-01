@@ -678,6 +678,22 @@ phase_wire_outbound() {
 
 # restart_agent_for_exchange — restart github-agent, so token-exchange-aiac starts with empty caches:
 # an audience it remembered as unknown (for 5 min, before github-tool's client existed) is asked again.
+# agent_age — seconds since the newest github-agent pod started ("" when there is none).
+agent_age() {
+  local started
+  started="$(kubectl get pod -n "$NS" -l "$AGENT_LABEL" --sort-by=.status.startTime \
+    -o jsonpath='{.items[-1:].status.startTime}' 2>/dev/null || true)"
+  [ -n "$started" ] || return 0
+  echo $(( $(date -u +%s) - $(date -u -d "$started" +%s) ))
+}
+
+# agent_restarted_within <secs> — true when the newest github-agent pod started less than <secs> ago.
+agent_restarted_within() {
+  local age
+  age="$(agent_age)"
+  [ -n "$age" ] && [ "$age" -lt "$1" ]
+}
+
 restart_agent_for_exchange() {
   step "Restarting github-agent to clear its exchange caches"
   kubectl delete pod -n "$NS" -l "$AGENT_LABEL" || die "failed to delete github-agent pod"
@@ -852,10 +868,16 @@ phase_enforce() {
   check_subject_scope "github-agent" "$AGENT_UUID" \
     "the token that github-agent exchanges for github-tool keeps sub = the Keycloak user ID, but github-tool's inbound keys users by username, so every tool call would be DENIED."
 
-  # Run alone (--only-enforce), with no WIRE restart just before it: restart the agent, so an audience it
-  # still remembers as unknown cannot pass calls through un-exchanged. After the read-only checks above,
-  # so a cluster that fails them is left as it was.
-  [ "$DO_WIRE" -eq 1 ] || restart_agent_for_exchange
+  # Restart the agent, so an audience it still remembers as unknown (for 5 min) cannot pass calls
+  # through un-exchanged — unless WIRE restarted it moments ago: in this run, or in the run just before
+  # (`make enforce` runs --only-wire-outbound, then --only-enforce, as two processes). After the checks
+  # above, so a cluster that fails them has no agent restart (their one write, the idempotent ROPC
+  # default-scope link above, is the same one a full run makes).
+  if [ "$DO_WIRE" -eq 1 ] || agent_restarted_within 120; then
+    info "github-agent restarted $(agent_age)s ago by WIRE — its exchange caches are empty; no second restart"
+  else
+    restart_agent_for_exchange
+  fi
 
   step "Inbound — dev-user and test-user allowed, devops-user denied [polling up to ${POLL_SECS}s]"
   probe_agent dev-user    200 "$POLL_SECS" "dev-user -> github-agent (inbound)"

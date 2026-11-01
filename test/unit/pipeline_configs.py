@@ -1,4 +1,6 @@
-"""The AuthBridge runtime configs the wiring-check tests share — test data, no tests.
+"""The AuthBridge runtime configs the wiring-check tests share, and ``reason``, the skip gate's verdict
+on one of them — test data and one helper, no tests. It imports the harness (``test.system.launcher``)
+for ``reason``; the harness itself imports no ``k8s/`` file at import time.
 
 ``test/unit/test_launcher_outcome.py`` checks the system lane's skip gate on them, and
 ``test/unit/k8s/test_shared_scripts.py`` checks that ``k8s/authbridge-pipeline-check.py``, run as the

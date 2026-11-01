@@ -787,6 +787,41 @@ Rung 6 restarts the Controller twice, so it takes several minutes.
   `test_crs_match`) and the place of a deny (`deny_origin`, in `test_deny_comes_from_enforcement_point`).
   These prove that github-tool's inbound decides the tool check: a granted `tools/call` passes,
   github-tool's inbound denies an ungranted one, and the agent's outbound is a pass-through.
+- **An exchange refusal is never an OPA verdict, and only a named `opa` deny is one.** The outbound
+  classifier (`k8s/authbridge-rejection.py`) counts an answer as `deny` only when it is AuthBridge's
+  rejection (its `-32000` code, or a `data` that names a plugin) and is `policy.forbidden` from
+  `plugin: "opa"`. cortex's pipeline names the plugin on every rejection (`pipeline.stampPluginName`), so
+  a nameless `policy.forbidden` is another hop's body, and a JSON-RPC error with the tool's own code is the
+  tool's, which means the call got through. A refusal or failure of `token-exchange-aiac` (it answers
+  `policy.forbidden` too, for an ungranted target) and OPA with no bundle yet (`upstream.unreachable`)
+  are `error`: OPA decided nothing. A deny the harness reads as an OPA verdict is never one of these.
+- **One copy of each rule the harness shares with a script.** Three standard-library files in `k8s/`
+  hold the rules both sides need: `authbridge-pipeline-check.py` (the wiring the skip gate requires, which
+  `opa-kind-verify.sh` and the demo driver run), `authbridge-rejection.py` (the outbound classifier, which
+  the demo's probes send into the agent pod) and `operator-names.py` (the operator's Secret and audience
+  scope names, which `restore.sh` runs). The harness loads them by path on first use, so importing it
+  needs no `k8s/`, and the skip gate loads them, so a missing or broken one is a skip with the file named.
+  A unit test of a classifier still needs the file it tests: there, a missing file is a packaging bug and
+  fails, as the `test/unit/k8s/` manifest tests do.
+- **The wiring check requires what AIAC's Rego reads, in order.** `opa` once on each leg, after the
+  plugins that set its inputs: inbound `jwt-validation` and `mcp-parser` (a tool's inbound reads
+  `input.mcp`), outbound `token-exchange-aiac`. The other parsers, and `mcp-parser` outbound, may go
+  anywhere: AIAC's outbound package is a pass-through (D24) and no AIAC policy reads `input.a2a` or
+  `input.inference`. Also a `spiffe://<td>/...{namespace}...{service}...` audience template and
+  `no_token_policy: deny` (D36). A cluster from `k8s/opa-kind-enable.sh` meets it.
+- **Teardown removes the demo workloads' own objects by exact name.** The namespace also holds other
+  workloads' audience scopes and credentials Secrets (for example the production `github-tool-mcp`'s), so
+  teardown deletes only `agent-<ns>-<workload>-aud` and the Secret the operator names for each workload
+  (`k8s/operator-names.py`, checked against the operator's Go code). A prefix sweep would delete those
+  too. Teardown then lists the namespace's credentials Secrets and warns about any whose owner is one of
+  the demo workloads, so a naming change shows up instead of leaking quietly.
+- **The harness keeps its own copy of the optional-to-default link move.** `grant_exchange_scope` cannot
+  import `_link_default_scope` from the IdP Configuration Service's `main.py`: importing it sets up the
+  service's logging and builds its FastAPI app in the test process, and the service image ships only
+  `main.py`, so the helper cannot move into a separate module without changing the image. Both copies (and
+  the demo driver's `grant_default_scope`) read the optional list first, delete only when the scope is
+  there (Keycloak's DELETE of an optional link also drops a default link), and take a 409 as an existing
+  link.
 - **Onboarding-order-independence is asserted, not assumed** (rungs 2 vs 3). Rung 3's intended end state
   is checked identical to rung 2's published expectations at the unit level (`test_order_independence_oracle`
   in `test_uc1_grant_set_oracles.py`), and the real plugin's decisions are asserted in

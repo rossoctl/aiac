@@ -79,11 +79,14 @@ print("" if r is None else r)' "$1"
 # (k8s/operator-names.py, the one copy of the operator's naming rule).
 aud_scope() { python3 "${AIAC_DIR}/k8s/operator-names.py" aud-scope "$NS" "$1"; }
 
-# The audience scopes restore removes, named once. A plain assignment, so a failure of
-# k8s/operator-names.py stops restore here, not as an empty name that reads "nothing to remove".
-TOOL_AUD_SCOPE="$(aud_scope github-tool)" || { echo "k8s/operator-names.py failed" >&2; exit 1; }
-MCP_AUD_SCOPE="$(aud_scope github-tool-mcp)" || { echo "k8s/operator-names.py failed" >&2; exit 1; }
-AGENT_AUD_SCOPE="$(aud_scope github-agent)" || { echo "k8s/operator-names.py failed" >&2; exit 1; }
+# The audience scopes restore removes, named once. Restore must survive a half-torn-down setup, so a
+# failure of k8s/operator-names.py does not stop it: it warns, and steps 1 and 3 skip the audience
+# scopes (an empty name), while the clients, CRs, workloads and Secrets are still removed.
+NAMES_OK=1
+TOOL_AUD_SCOPE="$(aud_scope github-tool)" || NAMES_OK=0
+MCP_AUD_SCOPE="$(aud_scope github-tool-mcp)" || NAMES_OK=0
+AGENT_AUD_SCOPE="$(aud_scope github-agent)" || NAMES_OK=0
+[ "$NAMES_OK" -eq 1 ] || echo "WARNING: k8s/operator-names.py failed — the audience scopes are not removed; the rest of restore runs" >&2
 
 # client_uuid_by_name <name> — the Keycloak client looked up by its "name" DISPLAY field
 # (e.g. "team1/github-agent"), not clientId. Prints "" if not found.
@@ -104,6 +107,7 @@ if [ -n "$ADMIN" ]; then
   REALM_SCOPES="$(curl -s -H "Authorization: Bearer ${ADMIN}" "${KC}/admin/realms/${REALM}/client-scopes" || true)"
   if [ -n "$AGENT_UUID" ]; then
     for scope in "$TOOL_AUD_SCOPE" "$MCP_AUD_SCOPE"; do
+      [ -n "$scope" ] || continue  # k8s/operator-names.py failed (warned above)
       SCOPE_ID="$(SCOPE_NAME="$scope" json_eval 'next((s["id"] for s in d if s.get("name") == os.environ["SCOPE_NAME"]), "absent") if isinstance(d, list) else ""' <<<"$REALM_SCOPES")"
       case "$SCOPE_ID" in
         absent) echo "    ${scope}: not in the realm — nothing to remove"; continue ;;
@@ -143,7 +147,7 @@ if [ -n "$ADMIN" ]; then
     # A fresh read, not step 1's list: the workloads run until step 5, so an onboarding still in flight can
     # create scopes after step 1. "|| true": a failed read deletes nothing here, and restore goes on.
     SCOPE_IDS=$( { curl -s -H "Authorization: Bearer ${ADMIN}" "${KC}/admin/realms/${REALM}/client-scopes" || true; } \
-      | COMPONENT="$component" AUD_NAME="$([ "$component" = github-agent ] && echo "$AGENT_AUD_SCOPE" || echo "$TOOL_AUD_SCOPE")" json_eval '"\n".join(
+      | COMPONENT="$component" AUD_NAME="$(aud_scope "$component" || true)" json_eval '"\n".join(
     s["id"] for s in d
     if s.get("name", "").startswith(os.environ["COMPONENT"] + ".") or s.get("name") == os.environ["AUD_NAME"])')
     for id in $SCOPE_IDS; do
