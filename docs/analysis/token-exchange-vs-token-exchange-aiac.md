@@ -53,7 +53,8 @@ AuthBridge's outbound leg (`app → parsers → <exchange plugin> → opa → de
     classifies that as `error`.
   - `is_opa_violation` (`k8s/authbridge-rejection.py`, which the harness and the demo driver share)
     counts an AuthBridge rejection as an OPA verdict only when it is `policy.forbidden` and names
-    `opa`, or names no plugin. A named non-OPA plugin never counts, because `token-exchange-aiac` also
-    answers `policy.forbidden`; nor does a JSON-RPC error of the tool itself.
+    `opa` (cortex names the plugin on every rejection, so a body that names none is another hop's). A
+    named non-OPA plugin never counts, because `token-exchange-aiac` also answers `policy.forbidden`;
+    nor does a JSON-RPC error of the tool itself.
 - **Docs**: the PRD, the OPA writer spec, the demo specs, the runbook (new *Outbound token exchange*
   section) and the testing docs now describe the route-less model.

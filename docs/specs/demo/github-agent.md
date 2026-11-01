@@ -232,7 +232,8 @@ it is not granted: the production tool uses its public PAT, and a per-user grant
 rossoctl/cortex#1540. The agent keeps `MCP_URL` at `github-tool-mcp`, and the production tool keeps that
 Service name. The name `github-tool` is the UC-1 stub's (Service = ServiceAccount = `github-tool`), so the
 two cannot share it. The production tool meets the invariant once its cortex manifest gives it a
-ServiceAccount `github-tool-mcp` and enrolls it (rossoctl/cortex#1540). Until then the cortex demo's
+ServiceAccount `github-tool-mcp` and enrolls it (rossoctl/cortex#1540, closed by cortex as deferred:
+the Kubernetes path is not their current priority). Until then the cortex demo's
 `setup_keycloak.py` gives it a hand-made plain client ID `github-tool` (not a SPIFFE ID, so it is not
 the UC-1 stub's operator-registered `…/sa/github-tool`); the host names no client, and those calls pass
 through un-exchanged. The UC-1

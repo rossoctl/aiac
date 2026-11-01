@@ -12,7 +12,7 @@ Not a standalone script — imported by ``03-setup.py``, its sole caller (unlike
 from __future__ import annotations
 
 import scenario as scn
-from _lib import Config, note, ok
+from _lib import Config, aud_scope_name, note, ok
 
 
 def ensure_ropc_client(admin, cfg: Config) -> None:
@@ -80,5 +80,5 @@ def ensure_default_audience_scope(admin, cfg: Config, client_uuid: str, client_n
 def run(admin, cfg: Config, *, agent_uuid: str) -> None:
     ensure_ropc_client(admin, cfg)
     ensure_token_exchange_enabled(admin, cfg, agent_uuid, scn.AGENT_WORKLOAD)
-    tool_aud_scope = f"agent-{cfg.namespace}-{scn.TOOL_WORKLOAD}-aud"
+    tool_aud_scope = aud_scope_name(cfg.namespace, scn.TOOL_WORKLOAD)
     ensure_default_audience_scope(admin, cfg, agent_uuid, scn.AGENT_WORKLOAD, tool_aud_scope)

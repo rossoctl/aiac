@@ -29,7 +29,7 @@ target.
 | [2](#step-2--wire-opa-into-both-authbridge-legs) | `make opa` | Turn on the OPA plugin in both AuthBridge legs (cluster-level, one-time) |
 | [3](#step-3--provision-users-roles-and-the-policy) | `make users` | Create the three demo users + roles, mount `policy.md` |
 | [4](#step-4--deploy-the-workloads-this-is-the-trigger) | `make trigger` | Deploy `github-agent`/`github-tool` and verify onboarding fired |
-| [5](#step-5--enforce-live) | `make enforce` | Wire the outbound leg, then probe the live OPA plugin |
+| [5](#step-5--enforce-live) | `make enforce` | Wire the outbound leg, then probe the live OPA plugin (`./driver.sh --only-enforce` probes without WIRE, but still restarts `github-agent` once its read-only checks pass) |
 | [6](#step-6--inspect-what-was-generated-optional) | `make demo` | Optional: walk the same scenario in small steps |
 
 Steps 4 and 5 together: **`make e2e`**.

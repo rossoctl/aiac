@@ -5,6 +5,14 @@
 shell scripts run it, gives the same verdict. One list, so the two cannot test different cases.
 """
 
+from test.system import launcher
+
+
+def reason(config: str) -> str | None:
+    """The skip reason of the system lane's gate for ``config`` (``None``: wired right)."""
+    return launcher.pipeline_check(config, namespace="team1")[0]
+
+
 # ``authbridge-runtime-config`` as ``k8s/opa-kind-enable.sh`` renders it.
 CONFIG = """pipeline:
   inbound:

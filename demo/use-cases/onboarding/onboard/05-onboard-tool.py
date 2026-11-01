@@ -18,6 +18,7 @@ import setup_keycloak
 from _lib import (
     GENERATED,
     abort,
+    aud_scope_name,
     capture_rego,
     connect_admin,
     load_config,
@@ -62,7 +63,7 @@ def main() -> None:
     # ``aud`` reaches the tool without the caller requesting the scope explicitly. Idempotent.
     say("4", "4", "Assign the tool-audience default scope to the agent client")
     agent_uuid = resolve_service_id(admin, cfg, f"{cfg.namespace}/{scn.AGENT_WORKLOAD}")
-    tool_aud_scope = f"agent-{cfg.namespace}-{scn.TOOL_WORKLOAD}-aud"
+    tool_aud_scope = aud_scope_name(cfg.namespace, scn.TOOL_WORKLOAD)
     # Unlike 03-setup.py (which runs before the tool exists, so a missing scope is expected), here the
     # tool has just been onboarded — the ``*-aud`` scope must exist now. If it doesn't, the exchanged
     # token would lack the tool audience and downstream calls would silently fail, so abort rather

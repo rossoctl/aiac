@@ -88,7 +88,7 @@ def exchange_refusal(code: int | None, body: str) -> bool:
 # the message tells them apart (cortex ``core/plugins/tokenexchangeaiac/plugin.go``, the ``deny`` of
 # ``outcomeTargetDisabled``). The response carries no reason code, so a reworded message there must be
 # copied here; the rollback test then fails as ``error``, never passes wrongly. Key on a machine-readable
-# reason once cortex puts one in the rejection (rossoctl/cortex#1570).
+# reason once cortex puts one in the rejection (rossoctl/cortex#1570, closed by cortex as deferred).
 TARGET_DISABLED_MESSAGE = "the destination's client is disabled"
 
 
@@ -125,8 +125,8 @@ def outbound_outcome(code: int | None, body: str) -> str:
 
     The ``error.data`` of a frame at HTTP 200 decides the class:
 
-    * an OPA **policy verdict** (``is_opa_violation``: ``error == "policy.forbidden"``, from OPA or
-      no plugin named) -> ``"deny"``. Not the tool check: on a pass-through outbound it comes only from
+    * an OPA **policy verdict** (``is_opa_violation``: ``error == "policy.forbidden"`` and
+      ``plugin == "opa"``) -> ``"deny"``. Not the tool check: on a pass-through outbound it comes only from
       a fault. ``deny_origin`` (``test/system/launcher.py``) tells it apart from the callee's deny.
     * any other AuthBridge rejection -> ``"error"``: code ``AUTHBRIDGE_RPC_ERROR`` (AuthBridge's own
       code; its minimal fallback frame has no ``data`` at all), or a ``data`` that names a plugin (the
@@ -155,10 +155,30 @@ def _outcome(code: int | None, parsed: object) -> str:
     # An AuthBridge rejection frame: its code, or — when a plugin set its own code — a ``data`` that names
     # the plugin (the pipeline always fills it in). Anything else is a JSON-RPC error of the tool itself
     # (FastMCP), even one whose ``data`` happens to say ``policy.forbidden``: the call was let through.
+    # A tool's own -32000 needs no allow either: an MCP server reports a failed tool as a ``result`` with
+    # ``isError``, and the MCP SDK uses -32000 only as CONNECTION_CLOSED, a transport break.
     authbridge = err.get("code") == AUTHBRIDGE_RPC_ERROR or (isinstance(doc, dict) and doc.get("plugin") is not None)
     if not authbridge:
         return "allow"
     return "deny" if is_opa_violation(doc) else "error"  # an OPA verdict, or another AuthBridge rejection
+
+
+def _any_rejection_doc(code: int | None, parsed: object) -> dict | None:
+    """``rejection_doc``'s document, or else, at any status other than 200, a plain JSON body that is not
+    a JSON-RPC frame (a ``503`` of a failed exchange, a ``401`` of a refused subject token). ``None``
+    when there is neither."""
+    doc = _rejection_doc(code, parsed)
+    if doc is None and code is not None and code != 200 and isinstance(parsed, dict) and "jsonrpc" not in parsed:
+        doc = parsed
+    return doc
+
+
+def _classify(code: int | None, body: str) -> tuple[str, dict | None, dict | None]:
+    """``(outcome, exchange_doc, doc)`` from one parse of ``body``: ``classify``'s pair, and the rejection
+    document (``_any_rejection_doc``) for ``verdict`` to name."""
+    parsed = json_or_none(body)
+    doc = _any_rejection_doc(code, parsed)
+    return _outcome(code, parsed), (doc if is_exchange_refusal(doc) else None), doc
 
 
 def classify(code: int | None, body: str) -> tuple[str, dict | None]:
@@ -169,16 +189,13 @@ def classify(code: int | None, body: str) -> tuple[str, dict | None]:
     ``rejection_doc``'s shapes it reads a plain body at any status other than 200 (a ``503`` of a failed
     exchange, a ``401`` of a refused subject token), which ``outbound_outcome`` counts ``error``
     whatever its body; ``exchange_doc`` names whose they are."""
-    parsed = json_or_none(body)
-    doc = _rejection_doc(code, parsed)
-    if doc is None and code is not None and code != 200 and isinstance(parsed, dict) and "jsonrpc" not in parsed:
-        doc = parsed
-    return _outcome(code, parsed), (doc if is_exchange_refusal(doc) else None)
+    outcome, failure, _ = _classify(code, body)
+    return outcome, failure
 
 
 def verdict(code: int | None, body: str) -> str:
     """The demo driver's verdict string of an answer to a ``tools/call``. **Pure.** One mapping for its
-    two probes (through the agent, and straight to github-tool), from ``classify``:
+    two probes (through the agent, and straight to github-tool), from one parse:
 
     * ``EXCHANGE_REFUSED <code> <error>`` — the token exchange refused or failed: OPA was never consulted;
     * ``DENIED_HTTP 403`` — an OPA verdict in a plain 403 (github-tool's inbound; the agent relays it);
@@ -186,8 +203,9 @@ def verdict(code: int | None, body: str) -> str:
     * ``ALLOWED_RESULT`` — let through;
     * ``UNEXPECTED <code> <error> <body>`` — anything else (a 403 that names no OPA, OPA with no bundle
       yet, AuthBridge's fallback frame, a 401 of github-tool's ``jwt-validation``). ``<error>`` is the
-      rejection's parsed ``error`` code (``-`` when there is none), then the first 200 characters."""
-    outcome, failure = classify(code, body)
+      rejection's parsed ``error`` code — one word, ``-`` when there is none or it is not a string —
+      then the first 200 characters of the body."""
+    outcome, failure, doc = _classify(code, body)
     if failure is not None:
         return f"EXCHANGE_REFUSED {code} {failure.get('error')}"
     if outcome == "deny":
@@ -196,9 +214,6 @@ def verdict(code: int | None, body: str) -> str:
         return "ALLOWED_RESULT"
     # The parsed error code first, so a caller can match it however long the body is (cortex marshals the
     # keys sorted, so ``description`` and ``details`` come before ``error``), then the start of the body.
-    doc = _rejection_doc(code, json_or_none(body))
-    if doc is None and code not in (None, 200):
-        plain = json_or_none(body)
-        doc = plain if isinstance(plain, dict) else None
     error = doc.get("error") if isinstance(doc, dict) else None
-    return f"UNEXPECTED {code} {error or '-'} {body[:200]}"
+    word = error if isinstance(error, str) and error and not any(c.isspace() for c in error) else "-"
+    return f"UNEXPECTED {code} {word} {body[:200]}"

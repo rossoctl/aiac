@@ -146,8 +146,7 @@ def test_rejection_doc_unwraps_both_rejection_shapes(code: int | None, body: str
     assert launcher.rejection_doc(code, body) == expected
 
 
-def _reason(config: str) -> str | None:
-    return launcher.pipeline_check(config, namespace="team1")[0]
+from test.unit.pipeline_configs import reason as _reason  # noqa: E402
 
 
 @pytest.mark.parametrize("config", ["", "not: [yaml", "- a list", "just text"])

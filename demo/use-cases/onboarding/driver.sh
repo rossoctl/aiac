@@ -36,7 +36,8 @@
 #   ./driver.sh                    # deploy -> verify-trigger -> wire -> enforce
 #   ./driver.sh --only-deploy
 #   ./driver.sh --only-wire-outbound
-#   ./driver.sh --only-enforce
+#   ./driver.sh --only-enforce             # restarts github-agent after its read-only checks, so its
+#                                          # exchange caches are empty (WIRE does this in a full run)
 #   ./driver.sh --only-replay-trigger      # forced replay (workloads must already be deployed)
 #   ./driver.sh --collect-logs     # (composes with any of the above) dump every component's logs
 #                                  # into a per-run directory at the end, AND on any die() failure
@@ -100,7 +101,7 @@ USER_PASSWORD="${USER_PASSWORD:-password}"
 POLL_SECS="${POLL_SECS:-720}"
 BUNDLE_WAIT_SECS="${BUNDLE_WAIT_SECS:-180}"
 # Whole seconds, no leading zero: bash arithmetic reads "090" as octal, and fails on it.
-case "$BUNDLE_WAIT_SECS" in ''|*[!0-9]*|0?*) echo "BUNDLE_WAIT_SECS must be a whole number of seconds, got '${BUNDLE_WAIT_SECS}'" >&2; exit 2 ;; esac
+case "$BUNDLE_WAIT_SECS" in *[!0-9]*|0?*) echo "BUNDLE_WAIT_SECS must be a whole number of seconds, got '${BUNDLE_WAIT_SECS}'" >&2; exit 2 ;; esac
 DEPLOY_WAIT_SECS="${DEPLOY_WAIT_SECS:-180}"
 TRIGGER_WAIT_SECS="${TRIGGER_WAIT_SECS:-180}"
 KIND_CLUSTER="${KIND_CLUSTER:-rossoctl}"
@@ -222,6 +223,16 @@ client_uuid_by_name() {
   curl -s -H "Authorization: Bearer ${admin}" "${KC}/admin/realms/${REALM}/clients" \
     | CLIENT_NAME="$name" json_eval 'next((c["id"] for c in d if c.get("name") == os.environ["CLIENT_NAME"]), "")'
 }
+
+# aud_scope <workload> — the operator's audience client scope of <workload> in $NS
+# (k8s/operator-names.py, the one copy of the operator's naming rule).
+aud_scope() { python3 "${AIAC_DIR}/k8s/operator-names.py" aud-scope "$NS" "$1"; }
+
+# The audience scopes this driver reads, named once. A plain assignment, so a failure of
+# k8s/operator-names.py stops the driver here, not as an empty name inside a poll loop.
+AGENT_AUD_SCOPE="$(aud_scope github-agent)" || { echo "k8s/operator-names.py failed" >&2; exit 1; }
+TOOL_AUD_SCOPE="$(aud_scope github-tool)" || { echo "k8s/operator-names.py failed" >&2; exit 1; }
+MCP_AUD_SCOPE="$(aud_scope github-tool-mcp)" || { echo "k8s/operator-names.py failed" >&2; exit 1; }
 
 # scope_id_by_name <name> <admin_token> — the realm client-scope's id; "absent" when the realm's scope
 # list was read and has no such scope; "" when the list could not be read (caller checks both), so a
@@ -498,12 +509,12 @@ phase_verify_trigger() {
     ADMIN="$(admin_token)"
     local scopes_json
     scopes_json=$(curl -s -H "Authorization: Bearer ${ADMIN}" "${KC}/admin/realms/${REALM}/client-scopes" 2>/dev/null || true)
-    agent_seen=$(printf '%s' "$scopes_json" | SCOPE="agent-${NS}-github-agent-aud" python3 -c '
+    agent_seen=$(printf '%s' "$scopes_json" | SCOPE="$AGENT_AUD_SCOPE" python3 -c '
 import sys, json, os
 try: names = {s.get("name") for s in json.load(sys.stdin)}
 except Exception: names = set()
 print("yes" if os.environ["SCOPE"] in names else "")' 2>/dev/null || true)
-    tool_seen=$(printf '%s' "$scopes_json" | SCOPE="agent-${NS}-github-tool-aud" python3 -c '
+    tool_seen=$(printf '%s' "$scopes_json" | SCOPE="$TOOL_AUD_SCOPE" python3 -c '
 import sys, json, os
 try: names = {s.get("name") for s in json.load(sys.stdin)}
 except Exception: names = set()
@@ -632,7 +643,8 @@ phase_wire_outbound() {
   [ -n "$ADMIN" ] || die "could not obtain a Keycloak master admin token"
   AGENT_UUID="$(client_uuid_by_name "${NS}/github-agent" "$ADMIN")"
   [ -n "$AGENT_UUID" ] || die "could not resolve the Keycloak client uuid for ${NS}/github-agent"
-  local tool_aud="agent-${NS}-github-tool-aud" scopes
+  local tool_aud scopes
+  tool_aud="$TOOL_AUD_SCOPE"
   scopes="$(realm_client_scopes "$ADMIN")"  # read once: both scopes below are looked up in it
   SCOPE_ID="$(scope_id_in "$tool_aud" <<<"$scopes")"
   [ -n "$SCOPE_ID" ] || die "could not read the realm's client-scopes"
@@ -646,7 +658,8 @@ phase_wire_outbound() {
   # github-full-access, the scope the tool reads to pick its privileged PAT, is NOT granted: as a default
   # scope it would be in every token github-agent exchanges, so every user would get the privileged PAT.
   # A per-user grant is the cortex demo's design question (rossoctl/cortex#1540).
-  local mcp_aud="agent-${NS}-github-tool-mcp-aud" mcp_id
+  local mcp_aud mcp_id
+  mcp_aud="$MCP_AUD_SCOPE"
   mcp_id="$(scope_id_in "$mcp_aud" <<<"$scopes")"  # the list was read above, and read fine
   if [ "$mcp_id" != absent ]; then
     # Best effort: this demo never probes the production tool, so a failed grant warns, never stops WIRE.
@@ -660,6 +673,12 @@ phase_wire_outbound() {
   # token-exchange-aiac (k8s/opa-kind-enable.sh) derives the github-tool audience from the host —
   # no route. It requests no scope, so the grant must be a DEFAULT scope. The restart clears the
   # audience it may have cached as unknown before github-tool's client existed (5 min).
+  restart_agent_for_exchange
+}
+
+# restart_agent_for_exchange — restart github-agent, so token-exchange-aiac starts with empty caches:
+# an audience it remembered as unknown (for 5 min, before github-tool's client existed) is asked again.
+restart_agent_for_exchange() {
   step "Restarting github-agent to clear its exchange caches"
   kubectl delete pod -n "$NS" -l "$AGENT_LABEL" || die "failed to delete github-agent pod"
   kubectl wait --for=condition=ready pod -n "$NS" -l "$AGENT_LABEL" --timeout=120s \
@@ -794,7 +813,7 @@ phase_enforce() {
   # mint_token calls need no scope= change; idempotent, safe to re-run.
   ADMIN="$(admin_token)"
   [ -n "$ADMIN" ] || die "could not obtain a Keycloak master admin token"
-  AUD_SCOPE="agent-${NS}-github-agent-aud"
+  AUD_SCOPE="$AGENT_AUD_SCOPE"
   ROPC_UUID="$(curl -s -H "Authorization: Bearer ${ADMIN}" "${KC}/admin/realms/${REALM}/clients?clientId=${ROPC_CLIENT_ID}" \
     | json_eval 'd[0]["id"]')"
   [ -n "$ROPC_UUID" ] || die "ROPC client '${ROPC_CLIENT_ID}' not found in realm '${REALM}'"
@@ -833,6 +852,11 @@ phase_enforce() {
   check_subject_scope "github-agent" "$AGENT_UUID" \
     "the token that github-agent exchanges for github-tool keeps sub = the Keycloak user ID, but github-tool's inbound keys users by username, so every tool call would be DENIED."
 
+  # Run alone (--only-enforce), with no WIRE restart just before it: restart the agent, so an audience it
+  # still remembers as unknown cannot pass calls through un-exchanged. After the read-only checks above,
+  # so a cluster that fails them is left as it was.
+  [ "$DO_WIRE" -eq 1 ] || restart_agent_for_exchange
+
   step "Inbound — dev-user and test-user allowed, devops-user denied [polling up to ${POLL_SECS}s]"
   probe_agent dev-user    200 "$POLL_SECS" "dev-user -> github-agent (inbound)"
   probe_agent test-user   200 "$POLL_SECS" "test-user -> github-agent (inbound)"
@@ -844,21 +868,20 @@ phase_enforce() {
   # denies every call (github-tool: DENIED_HTTP 403; the agent's outbound: DENIED_JSONRPC), or, with no
   # bundle at all, answers upstream.unreachable (github-tool: UNEXPECTED 503; the agent's outbound, for this
   # MCP request: a JSON-RPC frame at 200, UNEXPECTED 200). Right after the restart the agent's sidecar may
-  # also not have read its credentials yet (EXCHANGE_REFUSED ... upstream.token-exchange-failed). And when
-  # ENFORCE runs alone, with no WIRE restart just before it, the agent may still pass github-tool's
-  # audience through as unknown (cached for 5 min), which github-tool's jwt-validation answers with 401
-  # (UNEXPECTED 401); BUNDLE_WAIT_SECS then needs to be above that cache's TTL (300).
+  # also not have read its credentials yet (EXCHANGE_REFUSED ... upstream.token-exchange-failed). An
+  # audience the agent remembers as unknown cannot reach here: the agent was restarted (by WIRE, or at the
+  # start of this phase), so a 401 is a real audience refusal and stops at once.
   # dev-user -> source-read is the allow that proves all of it is current. Poll it for one bundle cycle
   # (BUNDLE_WAIT_SECS), so these are waited out, but a real deny is still reported within minutes. A
   # refusal of the audience or the bearer, or an exec error, never clears by waiting: it stops at once.
-  step "Waiting for the final bundles: dev-user -> source-read allowed [up to ${BUNDLE_WAIT_SECS}s]"
   local dev_deadline=$((SECONDS + BUNDLE_WAIT_SECS))
+  step "Waiting for the final bundles: dev-user -> source-read allowed [up to ${BUNDLE_WAIT_SECS}s]"
   while :; do
     DEV_SOURCE_READ="$(probe_tool dev-user source-read)"
     [ "$DEV_SOURCE_READ" = "ALLOWED_RESULT" ] && break
     case "$DEV_SOURCE_READ" in
       "DENIED_HTTP 403" | DENIED_JSONRPC | "UNEXPECTED 503 "* | "UNEXPECTED 200 upstream.unreachable "* \
-        | "UNEXPECTED 401 "* | "EXCHANGE_REFUSED "*" upstream.token-exchange-failed") ;;
+        | "EXCHANGE_REFUSED "*" upstream.token-exchange-failed") ;;
       *) break ;;
     esac
     [ "$SECONDS" -lt "$dev_deadline" ] || break

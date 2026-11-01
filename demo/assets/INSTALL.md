@@ -37,7 +37,8 @@ they automate.
   `MCP_URL` host `github-tool-mcp`. They are exchanged only for a Keycloak client named
   `…/sa/github-tool-mcp`. The production tool's cortex manifest does not yet run it under a
   ServiceAccount of that name, or enroll it
-  ([rossoctl/cortex#1540](https://github.com/rossoctl/cortex/issues/1540)). Until it does, those calls
+  ([rossoctl/cortex#1540](https://github.com/rossoctl/cortex/issues/1540); cortex closed it as
+  deferred on 2026-10-29: the Kubernetes path is not their current priority). Until it does, those calls
   are not exchanged. Once it does, the UC-1 onboarding demo's WIRE phase grants github-agent the
   tool's audience scope as a default scope. It does not grant `github-full-access`, the scope the tool
   reads to pick its privileged PAT: as a default scope it would be in every token github-agent

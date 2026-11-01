@@ -20,15 +20,10 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:  # so ``import test.*`` resolves
     sys.path.insert(0, str(REPO_ROOT))
 
-from test.system import launcher  # noqa: E402
 from test.unit.pipeline_configs import CONFIG as _CONFIG  # noqa: E402
 from test.unit.pipeline_configs import PASSING as _PASSING  # noqa: E402
 from test.unit.pipeline_configs import SKIPPING as _SKIPPING  # noqa: E402
-
-
-def _reason(config: str) -> str | None:
-    return launcher.pipeline_check(config, namespace="team1")[0]
-
+from test.unit.pipeline_configs import reason as _reason  # noqa: E402
 
 _PIPELINE_CHECK = REPO_ROOT / "k8s" / "authbridge-pipeline-check.py"
 _REJECTION = REPO_ROOT / "k8s" / "authbridge-rejection.py"

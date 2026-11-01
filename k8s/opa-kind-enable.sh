@@ -415,7 +415,9 @@ cat > "$OVERLAY_FILE" <<YAML
 #   - The chart renders this one pipeline into every agent namespace, so no
 #     per-namespace value is inlined. The trust domain is the chart's own
 #     operator-chart.signatureVerification.spireTrustDomain (resolved by tpl(),
-#     the value the operator names SPIFFE clients with), and the namespace for
+#     the value the operator names SPIFFE clients with; read with get, not index,
+#     so a values set without that block falls back to localtest.me instead of
+#     failing the render), and the namespace for
 #     short names is read by each sidecar from its own service-account mount
 #     (namespace_file).
 #   - token-exchange-aiac rejects unknown config keys, so token-exchange-only
@@ -451,7 +453,7 @@ authBridge:
           config:
             keycloak_url: "http://keycloak-service.keycloak.svc:8080"
             keycloak_realm: "rossoctl"
-            audience_template: "spiffe://{{ index .Values "operator-chart" "signatureVerification" "spireTrustDomain" | default "localtest.me" }}/ns/{namespace}/sa/{service}"
+            audience_template: "spiffe://{{ get (get (index .Values "operator-chart" | default dict) "signatureVerification" | default dict) "spireTrustDomain" | default "localtest.me" }}/ns/{namespace}/sa/{service}"
             namespace_file: /var/run/secrets/kubernetes.io/serviceaccount/namespace
             no_token_policy: "deny"
         - name: opa
