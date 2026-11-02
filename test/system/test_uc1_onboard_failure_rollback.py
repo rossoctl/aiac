@@ -290,7 +290,6 @@ def _run_phases(ctx: dict, run: dict) -> None:
     uc1.deploy_workload(TOOL)
     tool = _registered_client(admin, TOOL)
     uc1.grant_exchange_scope(admin)
-    uc1.restart_agent(uc1.NAMESPACE)
     outbound = _poll_decision(lambda: uc1.outbound_decision(ctx, "dev-user", PROBE_TOOL), "allow", LIFT_TIMEOUT)
     if outbound != "allow":
         run["stopped"] = uc1.append_hint(

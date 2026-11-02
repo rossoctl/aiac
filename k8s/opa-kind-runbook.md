@@ -191,7 +191,9 @@ Expect two image builds, so allow a few minutes. The script runs six steps:
    is the chart's `operator-chart.signatureVerification.spireTrustDomain` (the
    trust domain the operator names clients with), `namespace_file` set to the
    pod's own service-account namespace file for short host names, and
-   `no_token_policy: deny` (a call with no bearer to a target gets 401). The chart renders the one pipeline
+   `no_token_policy: deny` (a call with no bearer to a target gets 401), and
+   `unknown_audience_ttl: "0"` (no audience is remembered as unknown, see
+   [Outbound token exchange](#outbound-token-exchange)). The chart renders the one pipeline
    into every agent namespace, so neither value is a per-namespace literal.
 4. **Helm upgrade.** Applies the chart's `values.yaml` plus the overlay, with
    the sidecar image pointed at the locally built one.
@@ -226,8 +228,9 @@ It runs these checks. Each one can also be run by hand:
 ```bash
 # 1. OPA once on each leg, after the identity plugin (and, inbound, mcp-parser); the outbound
 #    leg runs token-exchange-aiac (not token-exchange) with a
-#    spiffe://<td>/...{namespace}...{service}... audience template and
-#    no_token_policy deny — expect "ok trust_domain=<td>" (parsed, per leg)
+#    spiffe://<td>/...{namespace}...{service}... audience template,
+#    no_token_policy deny and unknown_audience_ttl "0" — expect "ok trust_domain=<td>"
+#    (parsed, per leg)
 kubectl get configmap authbridge-runtime-config -n team1 \
   -o jsonpath='{.data.config\.yaml}' | python3 k8s/authbridge-pipeline-check.py
 
@@ -505,20 +508,24 @@ mints the downstream token, it records a delegation hop, and OPA builds
 
 `token-exchange-aiac` runs on every outbound request and has no routes and no
 `authproxy-routes` ConfigMap. Adding a target is a Keycloak change only. No
-restart is needed, with one exception: the plugin remembers an audience that
-Keycloak has no client for as unknown for 5 minutes (`unknown_audience_ttl`).
-So if the caller called the target before the target's client existed, its
-calls keep passing through un-exchanged (and the target answers 401) for up to
-5 minutes after the client and the grant exist. Restart the caller to end that
-at once (`kubectl rollout restart deployment/<caller> -n <ns>`); the onboarding
-demo's WIRE phase and the system harness both do. Exchange is the default;
+restart is needed: the overlay sets `unknown_audience_ttl: "0"`, so the plugin
+remembers no audience as unknown, and a target whose client is created after
+its caller first called it is exchanged on the next call. (The plugin default
+is 5 minutes: a caller would keep passing its calls through un-exchanged, and
+the target would answer 401, until the cache expired or the caller restarted.)
+The cost is one Keycloak token request per call to an in-cluster destination
+that has no client. Verify checks the value in `authbridge-runtime-config`. A
+running sidecar uses its own `authbridge-config-<agent>`, which the operator
+rebuilds from that ConfigMap when it admits the pod, so a pod started before
+the overlay changed keeps the old value until its rollout: this script's
+Step 5 restarts the agent and tool pods. Exchange is the default;
 passthrough happens in exactly two cases:
 
 | Destination | Result | Session event |
 |---|---|---|
 | Outside the cluster (external host, IP literal, `svc.namespace` without `.svc`) | forwarded unchanged, Keycloak not asked | `skip / host_not_in_cluster` |
 | In-cluster, audience granted to the caller | `Authorization` replaced with a token narrowed to that audience | `modify / token_exchanged` (or `cache_hit`) |
-| In-cluster, Keycloak has **no client** for the derived audience | forwarded unchanged; remembered for 5 min (restart the caller to forget it) | `skip / audience_unknown` |
+| In-cluster, Keycloak has **no client** for the derived audience | forwarded unchanged; asked again on the next call (`unknown_audience_ttl: "0"`) | `skip / audience_unknown` |
 | In-cluster, client exists but is **not granted** to the caller | **403**, OPA not consulted | `deny / audience_not_granted` |
 | In-cluster, the destination's client is **disabled** (for example a quarantined service) | **403**, OPA not consulted | `deny / target_disabled` |
 | Keycloak down, timeout, bad credentials, any other error | **503**, OPA not consulted | `deny / exchange_failed` |
@@ -580,12 +587,13 @@ The full plugin reference is cortex `docs/token-exchange-aiac-plugin.md`.
 | HTTP `200`, JSON-RPC `error` frame with `error.code: -32000`, `error.data.plugin: "opa"` | An **outbound** OPA denied an **MCP** request (one with a `method` and an `id`). In an AIAC setup, the outbound package of a managed service is a pass-through (D24), so this is a call from a pod that has no client CR (D20). The forward proxy returns the deny as a JSON-RPC error, so the MCP client sees one failed call instead of a broken transport (`writeMCPRejection` in cortex `core/listener/httpx/render.go`). The request never reaches the destination. |
 | HTTP `200`, JSON-RPC `result` frame | Allowed. |
 | HTTP `403` (outbound), or an MCP error frame, with `plugin: "token-exchange-aiac"` | Keycloak has a client for the destination, but it is not granted to the caller as a default scope (`audience_not_granted`), or the destination's client is disabled (`target_disabled`, a quarantined service). OPA was never consulted. |
+| HTTP `403`, or an MCP error frame, with `plugin: "opa"`, `error: "policy.forbidden"` and a message that starts `OPA decision error:` (or `OPA response decision error:`) | **Not a policy verdict.** OPA could not evaluate the Rego (a runtime error such as `eval_conflict_error`, or a decision it cannot read; cortex `core/plugins/opa/plugin.go`). Only the message tells it from a deny: in a `403` body it is the top-level `message`, in an error frame it is `error.message`. Fix the CR's Rego; the harness and the demo report it as an error, never as a deny. |
 | HTTP `503` (outbound), `error: "upstream.token-exchange-failed"` | `token-exchange-aiac` could not get a token (Keycloak error, timeout, credentials not loaded). OPA was never consulted. |
 | Allowed or denied by OPA as if no exchange ran, with no `identity` in the decision log | The destination passed through (`audience_unknown` / `host_not_in_cluster`). Check the Service/ServiceAccount naming and the Keycloak client. |
 
 For MCP traffic, classify by the response **body**, not the status code: a
 `result` frame is allowed; an `error` frame or a `403` body that names `opa` is
-denied. A JSON-RPC *notification* (no `id`) gets a plain HTTP `403` on a deny.
+denied, unless its message is an OPA decision error (above). A JSON-RPC *notification* (no `id`) gets a plain HTTP `403` on a deny.
 
 Two pitfalls when probing by hand:
 

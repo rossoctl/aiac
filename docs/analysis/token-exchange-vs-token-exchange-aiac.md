@@ -13,7 +13,7 @@ AuthBridge's outbound leg (`app → parsers → <exchange plugin> → opa → de
 | How the audience is chosen | The route's `target_audience` | Derived from the Host header: `spiffe://<td>/ns/<namespace>/sa/<service>` |
 | `scope` in the RFC 8693 request | Sent when the route sets `token_scopes` | Never sent, so only the caller's **default** client scopes apply |
 | Config | `default_policy: passthrough`, `identity: client-secret`, plus routes | `audience_template`, `namespace` (for short host names), `no_token_policy: deny` (the default, as in `token-exchange`). Unknown keys are rejected. |
-| How to add a target | Edit `authproxy-routes`, then restart the agent (routes are read once at startup) | Change Keycloak only. No restart is needed, except to clear a cached "unknown audience" (5 min): a caller that called the target before its client existed keeps passing through un-exchanged for up to 5 min, so restart it. |
+| How to add a target | Edit `authproxy-routes`, then restart the agent (routes are read once at startup) | Change Keycloak only. No restart is needed with AIAC's overlay (`unknown_audience_ttl: "0"`). With the plugin default (5 min), a caller that called the target before its client existed keeps passing through un-exchanged for up to 5 min. |
 | Default behaviour | Pass through | Exchange |
 | Reading the bearer | `auth.ExtractBearer`, `resolve_placeholders` | The same: `auth.ExtractBearer`, `resolve_placeholders` |
 | `no_token_policy` | `allow` / `deny` / `client-credentials`, default `deny` | The same values and default |
@@ -24,7 +24,7 @@ AuthBridge's outbound leg (`app → parsers → <exchange plugin> → opa → de
 |---|---|---|
 | In-cluster host with no route | Passed through, no `identity` or `delegation` | Exchanged if Keycloak grants the derived audience to the caller |
 | Host outside the cluster (LLM API, telemetry, IP literal) | Passed through (no route) | Passed through, Keycloak is not asked (`skip / host_not_in_cluster`) |
-| Keycloak has **no client** for the destination | Passed through when there was no route. With a route, the exchange failed (503). | Passed through and remembered for 5 min (`skip / audience_unknown`) |
+| Keycloak has **no client** for the destination | Passed through when there was no route. With a route, the exchange failed (503). | Passed through (`skip / audience_unknown`); remembered for `unknown_audience_ttl` (default 5 min, `0` in AIAC's overlay) |
 | Client exists but is **not granted** to the caller | Passed through when there was no route. With a route, 503. | **403**, `plugin: "token-exchange-aiac"`, `policy.forbidden`. OPA is not consulted. |
 | Keycloak down, timeout, or bad credentials | 503 `upstream.token-exchange-failed` | 503 `upstream.token-exchange-failed` (`deny / exchange_failed`). Unchanged. |
 | Sidecar credentials not yet in `/shared/` | Not covered by the old docs | 503, and the pod is held not-ready (`credentials_not_ready`) |
@@ -45,8 +45,8 @@ AuthBridge's outbound leg (`app → parsers → <exchange plugin> → opa → de
   - `ensure_github_tool_route` is removed.
   - `grant_exchange_scope` assigns the tool's `*-aud` scope as a **default** scope, not an optional
     one.
-  - `restart_agent` now restarts the agent to clear the unknown-audience cache, not to reload
-    routes.
+  - `restart_agent` is removed: there are no routes to reload, and the overlay's
+    `unknown_audience_ttl: "0"` leaves no unknown-audience cache to clear.
   - `exchange_token` sends no `scope` by default.
 - **Outcome classification** (`test/system/launcher.py`):
   - `is_exchange_refusal` accepts either plugin name, or `upstream.token-exchange-failed`, and

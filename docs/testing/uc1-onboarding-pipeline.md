@@ -56,8 +56,8 @@ restarts. They import three shared modules:
 - `uc1_onboard.py` — the shared live harness: config, Keycloak provisioning/cleanup
   (`provision_realm_and_users` / `cleanup_provisioned` / `clear_policy_store`), the **deploy/teardown of
   the rung's workload manifests** (which is what fires the event-driven onboarding trigger — see
-  *[Per-rung flow](#per-rung-flow)*), the outbound token-exchange-leg prep (`grant_exchange_scope` /
-  `restart_agent`), the bundle-convergence poll, the live decision oracle
+  *[Per-rung flow](#per-rung-flow)*), the outbound token-exchange-leg prep (`grant_exchange_scope`),
+  the bundle-convergence poll, the live decision oracle
   (`expected_inbound` / `expected_outbound_bare`, `inbound_decision` / `outbound_decision`), and
   `onboarded_stack(workloads)` — the whole per-rung fixture flow parameterised by the ordered workload
   list. It also holds the teardown helpers (`delete_workload_registrations`, `delete_workload_crs`
@@ -169,7 +169,7 @@ operator + Keycloak + a real LLM, they are `@pytest.mark.system` (out of the def
   access to itself in its own inbound OPA, from its own CR (PRD D34). The harness asserts the CR shapes
   (`cr_mismatches`) and the deny origin (`deny_origin`).
 - **Convergence by polling real decisions.** After the CR is upserted (and, for the outbound leg, after
-  Part B + the agent restart), `onboarded_stack` polls real requests through AuthBridge until this run's
+  Part B), `onboarded_stack` polls real requests through AuthBridge until this run's
   policy is reflected in the plugin's decisions, up to `AIAC_BUNDLE_TIMEOUT`.
 
 ## Preconditions (the wired platform — not stood up by the tests)
@@ -384,14 +384,15 @@ real requests + assert → full teardown.**
      `aiac-pdp-config`.
 3. **Enable the outbound token-exchange leg (Part B)** — runs **only when a tool is onboarded** (rungs 2
    and 3). The harness gates the whole step on `has_outbound` (a rung has an outbound convergence signal),
-   so on rung 1 the grant and restart are **both skipped** — rung 1 then asserts the exact bundle
+   so on rung 1 the grant is skipped. No rung restarts the agent, so each asserts the exact bundle
    the live event-driven onboard produced, with no restart papering over a bad compose.
    There are no routes: `token-exchange-aiac` derives the audience from the destination host
    (`github-tool` → `spiffe://<trust-domain>/ns/team1/sa/github-tool`) and requests no `scope`, so
    `grant_exchange_scope` grants the agent's client the `github-tool` audience scope
-   (`agent-{ns}-github-tool-aud`) as a **default** client scope (an optional scope is never applied), and
-   `restart_agent` restarts the agent to clear token-exchange-aiac's 5-minute unknown-audience cache (and
-   so its OPA sidecar re-fetches the recomposed bundle). Assigning the agent's `*-aud` scope is **not** operator-automatic,
+   (`agent-{ns}-github-tool-aud`) as a **default** client scope (an optional scope is never applied). The
+   agent is not restarted: the overlay sets token-exchange-aiac's `unknown_audience_ttl` to `0`, which the
+   skip gate requires, so an audience it saw as unknown before the tool's client existed is asked again on
+   the next call, and the convergence poll waits for each OPA's next bundle poll. Assigning the agent's `*-aud` scope is **not** operator-automatic,
    so it stays harness provisioning (the operator creates that `*-aud` scope only on **tool** deploy, so
    it does not even exist on the tool-less rung). Without the grant `token-exchange-aiac` refuses the
    call (403, `plugin: "token-exchange-aiac"`) and it never reaches OPA. The step is still necessary: the agent's outbound is a pass-through, but github-tool's inbound `jwt-validation`
@@ -399,8 +400,8 @@ real requests + assert → full teardown.**
 4. **Poll until the pipeline converges.** `poll_until` drives real decisions until this run's CR is
    reflected (inbound `dev-user` allow, `test-user` allow, `devops-user` deny; and, **only when a tool is
    onboarded** (rungs 2/3, 6), outbound `dev-user` `source-read` allow and `test-user` `issues-read` allow),
-   waiting out the bundle poll +
-   post-restart token-exchange window, up to `AIAC_BUNDLE_TIMEOUT`. On rung 1 the convergence set is
+   waiting out the bundle poll and a token-exchange 503 window (a sidecar that has not read its
+   credentials yet), up to `AIAC_BUNDLE_TIMEOUT`. On rung 1 the convergence set is
    **inbound-only** (`_default_ready_signals` appends the two outbound signals only under
    `tool_onboarded`).
 5. **Validate the outcomes at the end** (no intermediate checks, except the step-2 subject-scope
@@ -721,8 +722,7 @@ The suite reads its config from the repo-root `.env` (gitignored); source it bef
 > `AIAC_CONTROLLER_DEPLOYMENT` / `AIAC_CONTROLLER_SELECTOR`, defaults `aiac-system` / `aiac-agent` /
 > `app=aiac-agent`; the harness does not port-forward to the Controller), the Policy Store target (`AIAC_STORE_*`,
 > `svc/aiac-policy-model-store-service` on `7074`), the abstract-policy ConfigMap/mount
-> (`AIAC_POLICY_CONFIGMAP` / `AIAC_POLICY_MOUNT_PATH`), the agent Deployment to restart
-> (`AIAC_AGENT_DEPLOYMENT`), the Kind cluster name (`AIAC_KIND_CLUSTER`), the timeouts (`AIAC_DEPLOY_TIMEOUT`,
+> (`AIAC_POLICY_CONFIGMAP` / `AIAC_POLICY_MOUNT_PATH`), the Kind cluster name (`AIAC_KIND_CLUSTER`), the timeouts (`AIAC_DEPLOY_TIMEOUT`,
 > `AIAC_BUNDLE_TIMEOUT`, `AIAC_ONBOARD_TIMEOUT`, `AIAC_BUNDLE_POLL_INTERVAL`; defaults 180 s, 300 s, 600 s
 > and 10 s; with the D33 fix deployed, do not raise them for the event-before-commit race,
 > see *[Per-rung flow](#per-rung-flow)*, step 2), the gate timeouts (`AIAC_ROLLOUT_TIMEOUT`,
@@ -793,8 +793,12 @@ Rung 6 restarts the Controller twice, so it takes several minutes.
   `plugin: "opa"`. cortex's pipeline names the plugin on every rejection (`pipeline.stampPluginName`), so
   a nameless `policy.forbidden` is another hop's body, and a JSON-RPC error with the tool's own code is the
   tool's, which means the call got through. A refusal or failure of `token-exchange-aiac` (it answers
-  `policy.forbidden` too, for an ungranted target) and OPA with no bundle yet (`upstream.unreachable`)
-  are `error`: OPA decided nothing. A deny the harness reads as an OPA verdict is never one of these.
+  `policy.forbidden` too, for an ungranted target), OPA with no bundle yet (`upstream.unreachable`) and an
+  OPA evaluation error (`policy.forbidden` from `opa` with an `OPA decision error:` message, cortex
+  `core/plugins/opa`) are `error`: OPA decided nothing. A deny the harness reads as an OPA verdict is
+  never one of these, so a Rego that fails to evaluate cannot pass a deny expectation. The inbound
+  classifier (`inbound_outcome`) and the demo driver's inbound probe apply the same rule to a 403
+  (`opa_verdict`): a 403 from another hop, or an evaluation error, is no inbound deny.
 - **One copy of each rule the harness shares with a script.** Three standard-library files in `k8s/`
   hold the rules both sides need: `authbridge-pipeline-check.py` (the wiring the skip gate requires, which
   `opa-kind-verify.sh` and the demo driver run), `authbridge-rejection.py` (the outbound classifier, which
@@ -807,21 +811,46 @@ Rung 6 restarts the Controller twice, so it takes several minutes.
   plugins that set its inputs: inbound `jwt-validation` and `mcp-parser` (a tool's inbound reads
   `input.mcp`), outbound `token-exchange-aiac`. The other parsers, and `mcp-parser` outbound, may go
   anywhere: AIAC's outbound package is a pass-through (D24) and no AIAC policy reads `input.a2a` or
-  `input.inference`. Also a `spiffe://<td>/...{namespace}...{service}...` audience template and
-  `no_token_policy: deny` (D36). A cluster from `k8s/opa-kind-enable.sh` meets it.
+  `input.inference`. Also a `spiffe://<td>/...{namespace}...{service}...` audience template,
+  `no_token_policy: deny` and `unknown_audience_ttl: "0"` (D36). A cluster from `k8s/opa-kind-enable.sh`
+  meets it.
+- **No agent restart; the overlay turns the unknown-audience cache off.** `token-exchange-aiac` would
+  remember an audience it saw as unknown for 5 minutes, so an agent that called the tool before the tool's
+  client existed would pass its calls through un-exchanged (github-tool answers 401). Restarting the agent
+  after each grant cleared that, but every caller of every new target needed it, and the demo's "restarted
+  less than 2 minutes ago" rule could not tell a WIRE restart from a crash. The overlay sets the TTL to
+  `0` instead, and the wiring check requires it, so neither the harness nor the demo driver restarts the
+  agent, and no rung asserts a bundle that a restart re-fetched.
+  - *Required value.* A zero Go duration, as a string (`"0"`, `"0s"`, `"-0s"`, …): the plugin parses it
+    with `time.ParseDuration`, and the matcher in `k8s/authbridge-pipeline-check.py` was checked against
+    it. Unset (the plugin's `5m`), any non-zero value, and a bare YAML `0` (an int, which the plugin's
+    string field refuses) fail the check.
+  - *Cost.* One Keycloak token request per call to an in-cluster host that has no client (today the
+    agent's calls to the unregistered `github-tool-mcp`, #247). Hosts outside the cluster are never
+    asked about.
+  - *The running agent's own config.* The sidecar runs `authbridge-config-<agent>`, which the operator
+    webhook rebuilds from `authbridge-runtime-config` only when it admits the pod. So the demo driver's
+    WIRE and ENFORCE also check `authbridge-config-github-agent`: an agent admitted before the overlay
+    changed fails there, not later as a 401. The harness needs no such check: `onboarded_stack` deploys
+    the agent after its skip gate passed, so the webhook builds its config from the checked pipeline.
+  - *Rejected:* keeping the restarts (each new caller of each new target needs one, and an age rule
+    cannot tell why a pod started); waiting out 5 minutes (it slows every rung); a short non-zero TTL
+    (it still lets a new target's first calls pass through un-exchanged).
 - **Teardown removes the demo workloads' own objects by exact name.** The namespace also holds other
   workloads' audience scopes and credentials Secrets (for example the production `github-tool-mcp`'s), so
   teardown deletes only `agent-<ns>-<workload>-aud` and the Secret the operator names for each workload
   (`k8s/operator-names.py`, checked against the operator's Go code). A prefix sweep would delete those
   too. Teardown then lists the namespace's credentials Secrets and warns about any whose owner is one of
-  the demo workloads, so a naming change shows up instead of leaking quietly.
+  the demo workloads, so a naming change shows up instead of leaking quietly. The owner is the workload's
+  Deployment (the operator's controller reference), which the harness always names after the workload:
+  there is no setting for another Deployment name.
 - **The harness keeps its own copy of the optional-to-default link move.** `grant_exchange_scope` cannot
   import `_link_default_scope` from the IdP Configuration Service's `main.py`: importing it sets up the
   service's logging and builds its FastAPI app in the test process, and the service image ships only
-  `main.py`, so the helper cannot move into a separate module without changing the image. Both copies (and
-  the demo driver's `grant_default_scope`) read the optional list first, delete only when the scope is
-  there (Keycloak's DELETE of an optional link also drops a default link), and take a 409 as an existing
-  link.
+  `main.py`, so the helper cannot move into a separate module without changing the image. Every copy (the
+  demo driver's `grant_default_scope` and the demo's `ensure_default_audience_scope` too) reads the
+  optional list first, deletes only when the scope is there (Keycloak's DELETE of an optional link also
+  drops a default link), and takes a 409 or an existing default link as success. None reads the link back: Keycloak applies the link once the optional one is gone.
 - **Onboarding-order-independence is asserted, not assumed** (rungs 2 vs 3). Rung 3's intended end state
   is checked identical to rung 2's published expectations at the unit level (`test_order_independence_oracle`
   in `test_uc1_grant_set_oracles.py`), and the real plugin's decisions are asserted in

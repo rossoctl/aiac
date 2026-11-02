@@ -685,22 +685,25 @@ def notification_outcome(code: int | None, body: str) -> str:
     """Classify the response to a JSON-RPC **notification** (a frame with no ``id``, e.g.
     ``notifications/initialized``) sent through the outbound proxy. A notification has no JSON-RPC
     reply to carry an error frame, so AuthBridge renders a rejection as a plain HTTP ``403`` (runbook
-    B.4). HTTP 200/202 (the MCP server accepted it) -> ``"allow"``; a 403 whose body names OPA
-    (``is_opa_violation``) -> ``"deny"``; anything else -> ``"error"``, so an exchange refusal
-    (``token-exchange-aiac``'s 403 ``policy.forbidden``) is never reported as an OPA deny."""
+    B.4). HTTP 200/202 (the MCP server accepted it) -> ``"allow"``; a 403 that is an OPA verdict
+    (``opa_verdict``) -> ``"deny"``; anything else -> ``"error"``, so an exchange refusal
+    (``token-exchange-aiac``'s 403 ``policy.forbidden``) or an OPA evaluation error is never reported as
+    an OPA deny."""
     if code in (200, 202):
         return "allow"
-    if code == 403 and is_opa_violation(rejection_doc(code, body)):
+    if code == 403 and opa_verdict(code, body):
         return "deny"
     return "error"
 
 
-def inbound_outcome(code: int | None) -> str:
-    """Classify an inbound probe: HTTP 200 -> ``"allow"`` (reached the app), 403 -> ``"deny"`` (OPA
-    blocked it), anything else -> ``"error"``."""
+def inbound_outcome(code: int | None, body: str) -> str:
+    """Classify an inbound probe: HTTP 200 -> ``"allow"`` (reached the app); a 403 that is an OPA verdict
+    (``opa_verdict``: ``policy.forbidden`` from ``opa``, not an evaluation error) -> ``"deny"``; anything
+    else -> ``"error"``. A 403 from another hop (the Istio waypoint) or OPA's ``policy.forbidden`` for a
+    Rego it could not evaluate decides nothing, so an inbound deny expectation must not pass on it."""
     if code == 200:
         return "allow"
-    if code == 403:
+    if code == 403 and opa_verdict(code, body):
         return "deny"
     return "error"
 
@@ -734,7 +737,8 @@ def _load_k8s_module(name: str):
 
 # Whose rejection an outbound answer is: ``k8s/authbridge-rejection.py`` (standard library only), which the
 # onboarding demo driver sends into the agent pod with its probe, so the demo and the harness classify an
-# answer by one rule. The functions below are thin wrappers, with their docstrings in that file. They are
+# answer by one rule. The functions below are thin wrappers, with their docstrings in that file: only the
+# ones the harness calls (the unit tests reach the rest through ``_rejection()``). They are
 # real functions, not lazy module attributes: ``from test.system.launcher import outbound_outcome`` binds
 # one and loads nothing. The file loads on the first call, so importing this module (or a test module
 # that imports these names) never needs ``k8s/``, and ``pipeline_check`` loads it, so a missing or
@@ -743,14 +747,14 @@ def _rejection():
     return _load_k8s_module("authbridge-rejection")
 
 
-def is_opa_violation(doc: object) -> bool:
+def opa_verdict(code: int | None, body: str) -> bool:
     """See ``k8s/authbridge-rejection.py``."""
-    return _rejection().is_opa_violation(doc)
+    return _rejection().opa_verdict(code, body)
 
 
-def is_exchange_refusal(doc: object) -> bool:
+def opa_decision_error(code: int | None, body: str) -> bool:
     """See ``k8s/authbridge-rejection.py``."""
-    return _rejection().is_exchange_refusal(doc)
+    return _rejection().opa_decision_error(code, body)
 
 
 def rejection_doc(code: int | None, body: str) -> dict | None:
@@ -763,19 +767,9 @@ def outbound_outcome(code: int | None, body: str) -> str:
     return _rejection().outbound_outcome(code, body)
 
 
-def exchange_refusal(code: int | None, body: str) -> bool:
-    """See ``k8s/authbridge-rejection.py``."""
-    return _rejection().exchange_refusal(code, body)
-
-
 def target_disabled_refusal(code: int | None, body: str) -> bool:
     """See ``k8s/authbridge-rejection.py``."""
     return _rejection().target_disabled_refusal(code, body)
-
-
-def target_disabled_message() -> str:
-    """``TARGET_DISABLED_MESSAGE`` of ``k8s/authbridge-rejection.py`` (a call, so the file loads lazily)."""
-    return _rejection().TARGET_DISABLED_MESSAGE
 
 
 # Where the deny of a ``tools/call`` comes from (``deny_origin``): the callee's own inbound OPA

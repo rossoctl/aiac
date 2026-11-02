@@ -36,8 +36,7 @@
 #   ./driver.sh                    # deploy -> verify-trigger -> wire -> enforce
 #   ./driver.sh --only-deploy
 #   ./driver.sh --only-wire-outbound
-#   ./driver.sh --only-enforce             # restarts github-agent after its read-only checks, so its
-#                                          # exchange caches are empty (WIRE does this in a full run)
+#   ./driver.sh --only-enforce
 #   ./driver.sh --only-replay-trigger      # forced replay (workloads must already be deployed)
 #   ./driver.sh --collect-logs     # (composes with any of the above) dump every component's logs
 #                                  # into a per-run directory at the end, AND on any die() failure
@@ -201,20 +200,9 @@ try: print(json.load(sys.stdin).get("access_token","") or "")
 except Exception: print("")'
 }
 
-# json_eval <python-expr> — evaluate <python-expr> over the JSON on stdin (bound to `d`; env vars via
-# `os.environ`) and print the result. Prints "" (exit 0) instead of raising when the body is not the
-# expected JSON — a Keycloak error object, an empty list, an unreachable server — so the caller's
-# `[ -n ... ] || die` guard reports it, rather than `set -e` killing the script on a traceback.
-json_eval() {
-  python3 -c '
-import sys, json, os
-try:
-    d = json.load(sys.stdin)
-    r = eval(sys.argv[1])
-except Exception:
-    r = ""
-print("" if r is None else r)' "$1"
-}
+# json_eval, aud_scope, realm_client_scopes and scope_id_in: one copy, shared with restore.sh.
+# shellcheck source=lib/keycloak.sh
+. "${SCRIPT_DIR}/lib/keycloak.sh"
 
 # client_uuid_by_name <name> <admin_token> — Keycloak clients are looked up by the "name" DISPLAY
 # field (e.g. "team1/github-agent"), not clientId. Prints "" if not found (caller checks).
@@ -224,33 +212,11 @@ client_uuid_by_name() {
     | CLIENT_NAME="$name" json_eval 'next((c["id"] for c in d if c.get("name") == os.environ["CLIENT_NAME"]), "")'
 }
 
-# aud_scope <workload> — the operator's audience client scope of <workload> in $NS
-# (k8s/operator-names.py, the one copy of the operator's naming rule).
-aud_scope() { python3 "${AIAC_DIR}/k8s/operator-names.py" aud-scope "$NS" "$1"; }
-
-# The audience scopes this driver reads, named once. A plain assignment, so a failure of
-# k8s/operator-names.py stops the driver here, not as an empty name inside a poll loop.
-AGENT_AUD_SCOPE="$(aud_scope github-agent)" || { echo "k8s/operator-names.py failed" >&2; exit 1; }
-TOOL_AUD_SCOPE="$(aud_scope github-tool)" || { echo "k8s/operator-names.py failed" >&2; exit 1; }
-MCP_AUD_SCOPE="$(aud_scope github-tool-mcp)" || { echo "k8s/operator-names.py failed" >&2; exit 1; }
-
-# scope_id_by_name <name> <admin_token> — the realm client-scope's id; "absent" when the realm's scope
-# list was read and has no such scope; "" when the list could not be read (caller checks both), so a
-# failed read never reads as "not there".
+# scope_id_by_name <name> <admin_token> — scope_id_in's answer for <name>, from a fresh read of the
+# realm's client-scopes.
 scope_id_by_name() {
   local name="$1" admin="$2"
   realm_client_scopes "$admin" | scope_id_in "$name"
-}
-
-# realm_client_scopes <admin_token> — the realm's client-scopes as JSON ("" when the read fails); read
-# it once and look several names up in it with scope_id_in.
-realm_client_scopes() {
-  curl -s -H "Authorization: Bearer $1" "${KC}/admin/realms/${REALM}/client-scopes" || true
-}
-
-# scope_id_in <name> — scope_id_by_name's answer, from the client-scopes JSON on stdin.
-scope_id_in() {
-  SCOPE_NAME="$1" json_eval 'next((s["id"] for s in d if s.get("name") == os.environ["SCOPE_NAME"]), "absent") if isinstance(d, list) else ""'
 }
 
 latest_pod() {
@@ -261,8 +227,9 @@ latest_pod() {
 # k8s/authbridge-pipeline-check.py --namespace (the rule of k8s/opa-kind-verify.sh Verify 1 and of the system
 # harness's skip gate; its docstring lists the rule): opa once on each leg, after the identity plugin
 # (and, inbound, mcp-parser); outbound token-exchange-aiac once and token-exchange not at all; a
-# spiffe://<td>/...{namespace}...{service}... audience template; no_token_policy deny. Sets WIRING to
-# the helper's line; fails unless it is ok.
+# spiffe://<td>/...{namespace}...{service}... audience template; no_token_policy deny;
+# unknown_audience_ttl 0, so no phase needs to restart the agent to clear a cached unknown audience. Sets
+# WIRING to the helper's line; fails unless it is ok.
 # The demo ships no authproxy-routes, so on the stock pipeline (token-exchange with routes) ENFORCE
 # would see un-exchanged calls that github-tool rejects, reported as policy failures.
 check_pipeline_wiring() {
@@ -270,6 +237,24 @@ check_pipeline_wiring() {
   # stderr (a python3 warning) is not the verdict.
   WIRING=$(python3 "${AIAC_DIR}/k8s/authbridge-pipeline-check.py" --namespace "$NS" 2>/dev/null || true)
   case "$WIRING" in "ok trust_domain="*) return 0 ;; *) WIRING="${WIRING:-python3 could not run k8s/authbridge-pipeline-check.py}"; return 1 ;; esac
+}
+
+# check_agent_wiring — the same check on github-agent's own sidecar config, authbridge-config-github-agent.
+# The sidecar runs that per-agent ConfigMap, not authbridge-runtime-config, which preflight checks. The
+# operator webhook rebuilds it from authbridge-runtime-config only when it admits an agent pod (rossoctl/
+# operator pod_mutator.go ensurePerAgentConfigMap); a change to authbridge-runtime-config makes the
+# operator roll the agent out, and the sidecar hot-reloads its file (cortex core/reloader). Until that
+# rollout has run, the agent's own config can still carry the old pipeline (for example a 5 min
+# unknown-audience cache). WIRE and ENFORCE restart nothing, so they check the config the agent runs.
+check_agent_wiring() {
+  local cm="authbridge-config-github-agent" cfg wiring
+  cfg="$(kubectl get configmap "$cm" -n "$NS" -o jsonpath='{.data.config\.yaml}' 2>/dev/null || true)"
+  [ -n "$cfg" ] || die "could not read configmap ${cm} in ${NS} — is github-agent deployed with its AuthBridge sidecar?"
+  wiring="$(printf '%s' "$cfg" | python3 "${AIAC_DIR}/k8s/authbridge-pipeline-check.py" 2>/dev/null || true)"
+  case "$wiring" in
+    "ok trust_domain="*) pass "github-agent's own sidecar config (${cm}): ${wiring}" ;;
+    *) die "github-agent's own sidecar config (${cm}): ${wiring:-the check could not run} — the agent was admitted before k8s/opa-kind-enable.sh changed the pipeline; run it again (it restarts the agent and tool pods)" ;;
+  esac
 }
 
 # scope_linked <admin> <client-uuid> <default|optional> [scope-name]  — read only (GET). Print "yes"
@@ -389,6 +374,11 @@ step "Preflight"
 for c in kubectl curl python3; do
   command -v "$c" >/dev/null 2>&1 || die "missing required command on PATH: $c"
 done
+# The audience scopes this driver reads, named once, after the python3 check above. A failure of
+# k8s/operator-names.py stops the driver here, not as an empty name inside a poll loop.
+AGENT_AUD_SCOPE="$(aud_scope github-agent)" || die "k8s/operator-names.py failed"
+TOOL_AUD_SCOPE="$(aud_scope github-tool)" || die "k8s/operator-names.py failed"
+MCP_AUD_SCOPE="$(aud_scope github-tool-mcp)" || die "k8s/operator-names.py failed"
 python3 -c 'import yaml' >/dev/null 2>&1 \
   || die "python3 has no PyYAML (the preflight parses the AuthBridge pipeline with k8s/authbridge-pipeline-check.py)"
 if ! kubectl cluster-info >/dev/null 2>&1; then
@@ -638,6 +628,9 @@ grant_default_scope() {
 phase_wire_outbound() {
   printf '\n%s%s====== Phase WIRE — AuthBridge outbound leg (default client scope, no routes) ======%s\n' "$C_BLD" "$C_CYN" "$C_RST"
 
+  step "Checking github-agent's own sidecar config (WIRE restarts nothing, so it must be current)"
+  check_agent_wiring
+
   step "Granting github-agent the exchange scope on its Keycloak client (expect HTTP 204)"
   ADMIN="$(admin_token)"
   [ -n "$ADMIN" ] || die "could not obtain a Keycloak master admin token"
@@ -671,38 +664,20 @@ phase_wire_outbound() {
   fi
 
   # token-exchange-aiac (k8s/opa-kind-enable.sh) derives the github-tool audience from the host —
-  # no route. It requests no scope, so the grant must be a DEFAULT scope. The restart clears the
-  # audience it may have cached as unknown before github-tool's client existed (5 min).
-  restart_agent_for_exchange
-}
-
-# restart_agent_for_exchange — restart github-agent, so token-exchange-aiac starts with empty caches:
-# an audience it remembered as unknown (for 5 min, before github-tool's client existed) is asked again.
-# agent_age — seconds since the newest github-agent pod started ("" when there is none).
-agent_age() {
-  local started
-  started="$(kubectl get pod -n "$NS" -l "$AGENT_LABEL" --sort-by=.status.startTime \
-    -o jsonpath='{.items[-1:].status.startTime}' 2>/dev/null || true)"
-  [ -n "$started" ] || return 0
-  echo $(( $(date -u +%s) - $(date -u -d "$started" +%s) ))
-}
-
-# agent_restarted_within <secs> — true when the newest github-agent pod started less than <secs> ago.
-agent_restarted_within() {
-  local age
-  age="$(agent_age)"
-  [ -n "$age" ] && [ "$age" -lt "$1" ]
-}
-
-restart_agent_for_exchange() {
-  step "Restarting github-agent to clear its exchange caches"
-  kubectl delete pod -n "$NS" -l "$AGENT_LABEL" || die "failed to delete github-agent pod"
-  kubectl wait --for=condition=ready pod -n "$NS" -l "$AGENT_LABEL" --timeout=120s \
-    || die "github-agent did not become Ready after the restart"
-  pass "github-agent restarted and Ready"
+  # no route. It requests no scope, so the grant must be a DEFAULT scope. No agent restart: the
+  # overlay sets unknown_audience_ttl 0 (preflight checks it), so a github-tool audience the plugin
+  # saw as unknown before github-tool's client existed is asked again on the next call.
 }
 
 # ── Phase ENFORCE ─────────────────────────────────────────────────────────────
+
+# opa_verdict_body <code> <body> — true when the answer is an OPA policy verdict, by the rule the harness
+# uses (k8s/authbridge-rejection.py opa_verdict), not an OPA evaluation error or another hop's 403.
+opa_verdict_body() {
+  CODE="$1" BODY="$2" python3 -I -c "$(cat "${AIAC_DIR}/k8s/authbridge-rejection.py")"'
+import os, sys
+sys.exit(0 if opa_verdict(int(os.environ["CODE"]), os.environ["BODY"]) else 1)' 2>/dev/null
+}
 
 probe_agent() {
   local user="$1" want="$2" secs="$3" label="$4"
@@ -717,7 +692,9 @@ probe_agent() {
          -d "{\"jsonrpc\":\"2.0\",\"id\":\"1\",\"method\":\"ping/nonexistent\",\"params\":{}}"' 2>/dev/null || true)
     code=$(printf '%s' "$out" | grep -o 'HTTP_CODE:[0-9]*' | tail -1 | cut -d: -f2 || true)
     body=$(printf '%s' "$out" | grep -vE 'HTTP_CODE:|deleted' | tr -d '\r' | grep -v '^$' | tail -1 || true)
-    if [ "$code" = "$want" ]; then
+    # A 403 counts only when its body is an OPA verdict (k8s/authbridge-rejection.py opa_verdict): OPA's
+    # policy.forbidden for a Rego it could not evaluate, or another hop's 403, decides nothing.
+    if [ "$code" = "$want" ] && { [ "$want" != 403 ] || opa_verdict_body "$code" "$body"; }; then
       info "probe_agent ${user}: HTTP ${code}  body: ${body}"
       pass "${label}: HTTP ${code} (expected ${want})"
       return 0
@@ -818,6 +795,7 @@ phase_enforce() {
   step "Confirming the AuthBridge pipeline is still wired (opa on each leg, outbound token-exchange-aiac)"
   if check_pipeline_wiring; then pass "authbridge-runtime-config: ${WIRING}"
   else die "AuthBridge pipeline in ${NS}: ${WIRING} — run k8s/opa-kind-enable.sh"; fi
+  check_agent_wiring
 
   step "Granting ${ROPC_CLIENT_ID} the github-agent audience scope (so dev-user's ROPC token carries it)"
   # AIAC's onboarding creates the "agent-${NS}-github-agent-aud" client-scope (a hardcoded-audience
@@ -868,17 +846,6 @@ phase_enforce() {
   check_subject_scope "github-agent" "$AGENT_UUID" \
     "the token that github-agent exchanges for github-tool keeps sub = the Keycloak user ID, but github-tool's inbound keys users by username, so every tool call would be DENIED."
 
-  # Restart the agent, so an audience it still remembers as unknown (for 5 min) cannot pass calls
-  # through un-exchanged — unless WIRE restarted it moments ago: in this run, or in the run just before
-  # (`make enforce` runs --only-wire-outbound, then --only-enforce, as two processes). After the checks
-  # above, so a cluster that fails them has no agent restart (their one write, the idempotent ROPC
-  # default-scope link above, is the same one a full run makes).
-  if [ "$DO_WIRE" -eq 1 ] || agent_restarted_within 120; then
-    info "github-agent restarted $(agent_age)s ago by WIRE — its exchange caches are empty; no second restart"
-  else
-    restart_agent_for_exchange
-  fi
-
   step "Inbound — dev-user and test-user allowed, devops-user denied [polling up to ${POLL_SECS}s]"
   probe_agent dev-user    200 "$POLL_SECS" "dev-user -> github-agent (inbound)"
   probe_agent test-user   200 "$POLL_SECS" "test-user -> github-agent (inbound)"
@@ -886,13 +853,13 @@ phase_enforce() {
 
   # Wait for the final bundles BEFORE the matrix, so it shows the enforced policy. github-tool's and the
   # agent's OPAs poll bundle-service every 10-120 s (about 144 s after a fetch error), so the bundle the
-  # last onboarding wrote can land after the restart. Until it does, a pod runs its bootstrap CR, which
-  # denies every call (github-tool: DENIED_HTTP 403; the agent's outbound: DENIED_JSONRPC), or, with no
-  # bundle at all, answers upstream.unreachable (github-tool: UNEXPECTED 503; the agent's outbound, for this
-  # MCP request: a JSON-RPC frame at 200, UNEXPECTED 200). Right after the restart the agent's sidecar may
-  # also not have read its credentials yet (EXCHANGE_REFUSED ... upstream.token-exchange-failed). An
-  # audience the agent remembers as unknown cannot reach here: the agent was restarted (by WIRE, or at the
-  # start of this phase), so a 401 is a real audience refusal and stops at once.
+  # last onboarding wrote can land after the inbound probes pass. Until it does, a pod runs its bootstrap
+  # CR, which denies every call (github-tool: DENIED_HTTP 403; the agent's outbound: DENIED_JSONRPC), or,
+  # with no bundle at all, answers upstream.unreachable (github-tool: UNEXPECTED 503; the agent's
+  # outbound, for this MCP request: a JSON-RPC frame at 200, UNEXPECTED 200). A freshly started agent
+  # sidecar may also not have read its credentials yet (EXCHANGE_REFUSED ... upstream.token-exchange-failed).
+  # An audience the agent saw as unknown is never cached (unknown_audience_ttl 0, checked at preflight),
+  # so a 401 from github-tool is a real audience refusal and stops at once.
   # dev-user -> source-read is the allow that proves all of it is current. Poll it for one bundle cycle
   # (BUNDLE_WAIT_SECS), so these are waited out, but a real deny is still reported within minutes. A
   # refusal of the audience or the bearer, or an exec error, never clears by waiting: it stops at once.

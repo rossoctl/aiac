@@ -29,12 +29,14 @@ CONFIG = """pipeline:
         config:
           audience_template: "spiffe://localtest.me/ns/{namespace}/sa/{service}"
           namespace_file: /var/run/secrets/kubernetes.io/serviceaccount/namespace
+          unknown_audience_ttl: "0"
       - name: opa
 """
 AIAC_ENTRY = (
     "      - name: token-exchange-aiac\n        config:\n"
     '          audience_template: "spiffe://localtest.me/ns/{namespace}/sa/{service}"\n'
     "          namespace_file: /var/run/secrets/kubernetes.io/serviceaccount/namespace\n"
+    '          unknown_audience_ttl: "0"\n'
 )
 
 TEMPLATE = '"spiffe://localtest.me/ns/{namespace}/sa/{service}"'
@@ -48,6 +50,13 @@ PASSING = [
     CONFIG.replace("name: token-exchange-aiac", 'name: "token-exchange-aiac"'),
     CONFIG.replace("name: opa", 'name: "opa"'),
     CONFIG + "# - name: token-exchange\n# - name: opa\n",  # a comment is not a plugin
+    # any zero Go duration
+    CONFIG.replace('unknown_audience_ttl: "0"', 'unknown_audience_ttl: "0s"'),
+    CONFIG.replace('unknown_audience_ttl: "0"', 'unknown_audience_ttl: "0m0s"'),
+    # a sign or a bare fraction: Go's time.ParseDuration reads each as zero
+    CONFIG.replace('unknown_audience_ttl: "0"', 'unknown_audience_ttl: "-0s"'),
+    CONFIG.replace('unknown_audience_ttl: "0"', 'unknown_audience_ttl: "+0"'),
+    CONFIG.replace('unknown_audience_ttl: "0"', 'unknown_audience_ttl: ".0s"'),
     # bare-string entries, which cortex reads as {name: <string>}
     CONFIG.replace("      - name: jwt-validation\n      - name: opa\n", "      - jwt-validation\n      - opa\n"),
     CONFIG.replace("      - name: mcp-parser\n", "      - mcp-parser\n").replace(
@@ -119,6 +128,17 @@ SKIPPING = [
         "          namespace_file:", '          no_token_policy: "client-credentials"\n          namespace_file:'
     ),
     CONFIG.replace("          namespace_file:", '          no_token_policy: "allow"\n          namespace_file:'),
+    # the plugin default (5m), or any other cache of unknown audiences: a new target passes through for minutes
+    CONFIG.replace('          unknown_audience_ttl: "0"\n', ""),
+    CONFIG.replace('unknown_audience_ttl: "0"', 'unknown_audience_ttl: "5m"'),
+    CONFIG.replace('unknown_audience_ttl: "0"', 'unknown_audience_ttl: "10s"'),
+    CONFIG.replace('unknown_audience_ttl: "0"', 'unknown_audience_ttl: "0.5s"'),
+    # a bare YAML 0 is an int, which the plugin's string field refuses
+    CONFIG.replace('unknown_audience_ttl: "0"', "unknown_audience_ttl: 0"),
+    CONFIG.replace('unknown_audience_ttl: "0"', 'unknown_audience_ttl: ""'),
+    # not a duration Go parses: a bare number other than 0, a unit with no number
+    CONFIG.replace('unknown_audience_ttl: "0"', 'unknown_audience_ttl: "00"'),
+    CONFIG.replace('unknown_audience_ttl: "0"', 'unknown_audience_ttl: "s"'),
     "pipeline: 3",  # a mapping with no legs
     "",
 ]

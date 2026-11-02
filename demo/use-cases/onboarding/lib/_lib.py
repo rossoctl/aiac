@@ -34,18 +34,11 @@ def aud_scope_name(namespace: str, workload: str) -> str:
     """The operator's audience client scope of ``workload`` in ``namespace``, from
     ``k8s/operator-names.py``: the one copy of the operator's naming rule, which ``driver.sh``,
     ``restore.sh`` and the system harness use too. ``k8s/`` is not a package and the file name has a
-    hyphen, so it is loaded by path, once; a missing file is an ``ImportError`` that names it."""
-    import importlib.util
+    hyphen, so the file is run by path (``runpy``, which leaves ``sys.modules`` alone); a missing file is
+    a ``FileNotFoundError`` that names it."""
+    import runpy
 
-    mod = sys.modules.get("_aiac_operator_names")
-    if mod is None:
-        if not _OPERATOR_NAMES.is_file():
-            raise ImportError(f"{_OPERATOR_NAMES} is missing: the demo reads the operator's names from it")
-        spec = importlib.util.spec_from_file_location("_aiac_operator_names", _OPERATOR_NAMES)
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        sys.modules["_aiac_operator_names"] = mod
-    return mod.aud_scope_name(namespace, workload)
+    return runpy.run_path(str(_OPERATOR_NAMES))["aud_scope_name"](namespace, workload)
 
 
 GENERATED = HERE / "generated"

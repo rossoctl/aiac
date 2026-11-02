@@ -397,6 +397,13 @@ cat > "$OVERLAY_FILE" <<YAML
 #     without a user token. A bearer-less request to a destination Keycloak has
 #     no client for still passes through: the plugin asks Keycloak with the
 #     workload's own token only to tell the two apart, and never forwards it.
+#   - unknown_audience_ttl: "0" — the plugin remembers no audience as unknown
+#     (default 5m). With the default, a caller that called a target before
+#     the target's Keycloak client existed keeps passing its calls through
+#     un-exchanged for up to 5 minutes, and every caller of a new target needs
+#     a restart to end that. With 0, the next call asks Keycloak again, at the
+#     cost of one token request per call to a destination Keycloak has no
+#     client for. Quoted: the plugin reads a duration string.
 #   - opa runs AFTER token-exchange-aiac so the exchange is visible to policy:
 #     each exchange appends a delegation hop, and OPA exposes it as
 #     input.delegation (origin, actor, depth, chain of {subject_id, audience,
@@ -456,6 +463,7 @@ authBridge:
             audience_template: "spiffe://{{ get (get (index .Values "operator-chart" | default dict) "signatureVerification" | default dict) "spireTrustDomain" | default "localtest.me" }}/ns/{namespace}/sa/{service}"
             namespace_file: /var/run/secrets/kubernetes.io/serviceaccount/namespace
             no_token_policy: "deny"
+            unknown_audience_ttl: "0"
         - name: opa
           config:
             bundle_url: "http://bundle-service.${RELEASE_NAMESPACE}.svc.cluster.local:8080"

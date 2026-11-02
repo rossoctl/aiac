@@ -53,16 +53,48 @@ def _rejection_doc(code: int | None, doc: object) -> dict | None:
     return None
 
 
-def is_opa_violation(doc: object) -> bool:
-    """True when ``doc`` (a rejection document) is an OPA **policy verdict**: ``error ==
-    "policy.forbidden"`` and ``plugin == "opa"``. cortex's pipeline names the plugin on every rejection
-    (``pipeline.stampPluginName``), so a document that names none is not AuthBridge's OPA: it is another
-    hop's body (a gateway, the tool's own handler). A named non-OPA plugin never counts either:
-    ``token-exchange-aiac`` also answers ``policy.forbidden`` (a target not granted to the caller), and
-    that refusal is not an OPA verdict. Nor does an OPA answer with another error: OPA with no bundle yet
-    answers ``upstream.unreachable`` ("opa policy engine not initialized", cortex ``core/plugins/opa``),
-    which decides nothing."""
+# OPA answers an evaluation error (a Rego runtime error, a decision it cannot read) with
+# ``policy.forbidden`` too, and only the message tells it from a verdict (cortex ``core/plugins/opa``,
+# ``OnRequest`` / ``OnResponse``: ``"OPA decision error: ..."``, ``"OPA response decision error: ..."``).
+OPA_DECISION_ERROR_PREFIXES = ("OPA decision error:", "OPA response decision error:")
+
+
+def _is_opa_forbidden(doc: object) -> bool:
     return isinstance(doc, dict) and doc.get("error") == "policy.forbidden" and doc.get("plugin") == "opa"
+
+
+def _is_decision_error_message(message: object) -> bool:
+    return isinstance(message, str) and message.startswith(OPA_DECISION_ERROR_PREFIXES)
+
+
+def is_opa_violation(doc: object, message: object) -> bool:
+    """True when ``doc`` (a rejection document) with the rejection's ``message`` is an OPA **policy
+    verdict**: ``error == "policy.forbidden"``, ``plugin == "opa"``, and a message that is not an OPA
+    decision error. ``message`` is required: a plain body carries it beside ``doc``'s fields, but a frame
+    at HTTP 200 carries it in ``error.message``, outside ``doc`` (``error.data``), so a default read from
+    ``doc`` would miss it. Callers with a raw answer use ``opa_verdict``. cortex's pipeline names the
+    plugin on every rejection (``pipeline.stampPluginName``), so a document that names none is not
+    AuthBridge's OPA: it is another hop's body (a gateway, the tool's own handler). A named non-OPA plugin
+    never counts either: ``token-exchange-aiac`` also answers ``policy.forbidden`` (a target not granted
+    to the caller), and that refusal is not an OPA verdict. Nor does an OPA answer with another error: OPA
+    with no bundle yet answers ``upstream.unreachable`` ("opa policy engine not initialized"), which
+    decides nothing. Nor does an OPA decision error (``OPA_DECISION_ERROR_PREFIXES``): the policy did not
+    decide, so a deny expectation must not pass on it."""
+    return _is_opa_forbidden(doc) and not _is_decision_error_message(message)
+
+
+def opa_verdict(code: int | None, body: str) -> bool:
+    """True when the answer ``(code, body)`` is an OPA policy verdict (``is_opa_violation``), in either
+    rejection shape: a plain 403 body, or a JSON-RPC error frame at HTTP 200. **Pure.**"""
+    parsed = json_or_none(body)
+    return is_opa_violation(_rejection_doc(code, parsed), _message(code, parsed))
+
+
+def opa_decision_error(code: int | None, body: str) -> bool:
+    """True when the answer ``(code, body)`` is OPA's ``policy.forbidden`` for an **evaluation error**,
+    not a verdict (``OPA_DECISION_ERROR_PREFIXES``), in either rejection shape. **Pure.**"""
+    parsed = json_or_none(body)
+    return _is_opa_forbidden(_rejection_doc(code, parsed)) and _is_decision_error_message(_message(code, parsed))
 
 
 def is_exchange_refusal(doc: object) -> bool:
@@ -97,13 +129,15 @@ def target_disabled_refusal(code: int | None, body: str) -> bool:
     target's client is disabled** (``target_disabled``), not any other refusal. **Pure.** A refusal for a
     target not granted to the caller (``audience_not_granted``) proves nothing about the target's
     client, so it does not count."""
-    if not exchange_refusal(code, body):
-        return False
-    doc = json_or_none(body)
-    # A frame at HTTP 200 carries the message in ``error.message`` (``httpx.MarshalMCPRejectionBody``);
-    # a plain 403 body carries it at the top (``pipeline.Violation.Render``).
-    holder = doc.get("error") if code == 200 else doc
-    return isinstance(holder, dict) and holder.get("message") == TARGET_DISABLED_MESSAGE
+    return exchange_refusal(code, body) and _message(code, json_or_none(body)) == TARGET_DISABLED_MESSAGE
+
+
+def _message(code: int | None, parsed: object) -> object:
+    """The message of a rejection ``parsed`` at ``code``: a frame at HTTP 200 carries it in
+    ``error.message`` (``httpx.MarshalMCPRejectionBody``), a plain body at the top
+    (``pipeline.Violation.Render``). ``None`` when there is none."""
+    holder = parsed.get("error") if code == 200 and isinstance(parsed, dict) else parsed
+    return holder.get("message") if isinstance(holder, dict) else None
 
 
 def outbound_outcome(code: int | None, body: str) -> str:
@@ -125,15 +159,18 @@ def outbound_outcome(code: int | None, body: str) -> str:
 
     The ``error.data`` of a frame at HTTP 200 decides the class:
 
-    * an OPA **policy verdict** (``is_opa_violation``: ``error == "policy.forbidden"`` and
-      ``plugin == "opa"``) -> ``"deny"``. Not the tool check: on a pass-through outbound it comes only from
-      a fault. ``deny_origin`` (``test/system/launcher.py``) tells it apart from the callee's deny.
+    * an OPA **policy verdict** (``is_opa_violation``: ``error == "policy.forbidden"``,
+      ``plugin == "opa"``, and no OPA decision error) -> ``"deny"``. Not the tool check: on a
+      pass-through outbound it comes only from a fault. ``deny_origin`` (``test/system/launcher.py``)
+      tells it apart from the callee's deny.
     * any other AuthBridge rejection -> ``"error"``: code ``AUTHBRIDGE_RPC_ERROR`` (AuthBridge's own
       code; its minimal fallback frame has no ``data`` at all), or a ``data`` that names a plugin (the
       pipeline fills it in, also when a plugin sets its own code). That covers the exchange plugin
       (``token-exchange-aiac`` or a legacy ``token-exchange``, which broke before OPA), OPA with no
-      bundle yet (``upstream.unreachable``), and any other plugin (``jwt-validation``, a parser):
-      AuthBridge rejected it, but not by policy.
+      bundle yet (``upstream.unreachable``), an OPA decision error, and any other plugin
+      (``jwt-validation``, a parser): AuthBridge rejected it, but not by policy.
+
+    The same holds for a plain 403: an OPA decision error there is ``"error"``, not ``"deny"``.
 
     Any other HTTP 200 body (a ``result`` frame, or a JSON-RPC error of the tool itself, with another
     code and no AuthBridge ``data``, which means the call was let through) -> ``"allow"``. ``None`` or any other status
@@ -145,7 +182,7 @@ def outbound_outcome(code: int | None, body: str) -> str:
 def _outcome(code: int | None, parsed: object) -> str:
     doc = _rejection_doc(code, parsed)
     if code == 403:
-        return "deny" if is_opa_violation(doc) else "error"
+        return "deny" if is_opa_violation(doc, _message(code, parsed)) else "error"
     frame = parsed if code == 200 else None
     if not isinstance(frame, dict):
         return "error"
@@ -160,7 +197,8 @@ def _outcome(code: int | None, parsed: object) -> str:
     authbridge = err.get("code") == AUTHBRIDGE_RPC_ERROR or (isinstance(doc, dict) and doc.get("plugin") is not None)
     if not authbridge:
         return "allow"
-    return "deny" if is_opa_violation(doc) else "error"  # an OPA verdict, or another AuthBridge rejection
+    # An OPA verdict, or another AuthBridge rejection (an OPA decision error among them).
+    return "deny" if is_opa_violation(doc, err.get("message")) else "error"
 
 
 def _any_rejection_doc(code: int | None, parsed: object) -> dict | None:
@@ -174,23 +212,17 @@ def _any_rejection_doc(code: int | None, parsed: object) -> dict | None:
 
 
 def _classify(code: int | None, body: str) -> tuple[str, dict | None, dict | None]:
-    """``(outcome, exchange_doc, doc)`` from one parse of ``body``: ``classify``'s pair, and the rejection
-    document (``_any_rejection_doc``) for ``verdict`` to name."""
-    parsed = json_or_none(body)
-    doc = _any_rejection_doc(code, parsed)
-    return _outcome(code, parsed), (doc if is_exchange_refusal(doc) else None), doc
-
-
-def classify(code: int | None, body: str) -> tuple[str, dict | None]:
-    """``(outcome, exchange_doc)`` of an outbound answer, from one parse. **Pure.** ``outcome`` is
+    """``(outcome, exchange_doc, doc)`` of an outbound answer, from one parse of ``body``. ``outcome`` is
     ``outbound_outcome``'s class. ``exchange_doc`` is the rejection document when the answer is a refusal
     **or a failure** of the token exchange (OPA was never consulted, for any reason), else ``None``. It
     is wider than ``exchange_refusal`` (a refusal only, which proves the caller holds no grant): beside
     ``rejection_doc``'s shapes it reads a plain body at any status other than 200 (a ``503`` of a failed
     exchange, a ``401`` of a refused subject token), which ``outbound_outcome`` counts ``error``
-    whatever its body; ``exchange_doc`` names whose they are."""
-    outcome, failure, _ = _classify(code, body)
-    return outcome, failure
+    whatever its body. ``doc`` is the rejection document (``_any_rejection_doc``), for ``verdict`` to
+    name."""
+    parsed = json_or_none(body)
+    doc = _any_rejection_doc(code, parsed)
+    return _outcome(code, parsed), (doc if is_exchange_refusal(doc) else None), doc
 
 
 def verdict(code: int | None, body: str) -> str:
@@ -201,10 +233,10 @@ def verdict(code: int | None, body: str) -> str:
     * ``DENIED_HTTP 403`` — an OPA verdict in a plain 403 (github-tool's inbound; the agent relays it);
     * ``DENIED_JSONRPC`` — an OPA verdict in a frame at HTTP 200 (the agent's own outbound OPA);
     * ``ALLOWED_RESULT`` — let through;
-    * ``UNEXPECTED <code> <error> <body>`` — anything else (a 403 that names no OPA, OPA with no bundle
-      yet, AuthBridge's fallback frame, a 401 of github-tool's ``jwt-validation``). ``<error>`` is the
-      rejection's parsed ``error`` code — one word, ``-`` when there is none or it is not a string —
-      then the first 200 characters of the body."""
+    * ``UNEXPECTED <code> <error> <body>`` — anything else (a 403 that names no OPA, an OPA decision
+      error, OPA with no bundle yet, AuthBridge's fallback frame, a 401 of github-tool's
+      ``jwt-validation``). ``<error>`` is the rejection's parsed ``error`` code — one word, ``-`` when
+      there is none or it is not a string — then the first 200 characters of the body."""
     outcome, failure, doc = _classify(code, body)
     if failure is not None:
         return f"EXCHANGE_REFUSED {code} {failure.get('error')}"

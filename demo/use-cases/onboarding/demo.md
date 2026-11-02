@@ -29,7 +29,7 @@ target.
 | [2](#step-2--wire-opa-into-both-authbridge-legs) | `make opa` | Turn on the OPA plugin in both AuthBridge legs (cluster-level, one-time) |
 | [3](#step-3--provision-users-roles-and-the-policy) | `make users` | Create the three demo users + roles, mount `policy.md` |
 | [4](#step-4--deploy-the-workloads-this-is-the-trigger) | `make trigger` | Deploy `github-agent`/`github-tool` and verify onboarding fired |
-| [5](#step-5--enforce-live) | `make enforce` | Wire the outbound leg, then probe the live OPA plugin (`./driver.sh --only-enforce` probes without WIRE, but still restarts `github-agent` once its read-only checks pass) |
+| [5](#step-5--enforce-live) | `make enforce` | Wire the outbound leg, then probe the live OPA plugin (`./driver.sh --only-enforce` probes without WIRE) |
 | [6](#step-6--inspect-what-was-generated-optional) | `make demo` | Optional: walk the same scenario in small steps |
 
 Steps 4 and 5 together: **`make e2e`**.
@@ -532,8 +532,10 @@ audience is what `github-tool`'s inbound validates.
 1. Grants `github-agent`'s Keycloak client the `agent-team1-github-tool-aud` audience as a
    **default** client scope. The plugin requests no `scope`, so an optional scope is never applied
    and the exchange is refused (403, `plugin: "token-exchange-aiac"`).
-2. Restarts the agent pod, to clear the audience `token-exchange-aiac` may have cached as unknown
-   (for 5 minutes) before `github-tool`'s client existed.
+
+WIRE does not restart the agent. The overlay sets `token-exchange-aiac`'s `unknown_audience_ttl` to
+`0` (the preflight checks it), so an audience the plugin saw as unknown before `github-tool`'s client
+existed is asked again on the next call.
 
 > The agent's default `MCP_URL` host is `github-tool-mcp`, the **production** tool, which this demo
 > does not deploy. The stand-in tool's ServiceAccount and client are `github-tool`. A call to
@@ -570,19 +572,20 @@ the matrix, then prints the matching OPA decision-log lines: the tool-call decis
 deny still fails it within minutes:
 
 - **It waits for the final bundles before the matrix.** `github-tool`'s and the agent's OPAs poll
-  bundle-service every 10–120 s, so the bundle the last onboarding wrote can land after WIRE's restart.
+  bundle-service every 10–120 s, so the bundle the last onboarding wrote can land after the inbound
+  probes pass.
   Until it does, a pod runs its bootstrap policy, which denies everything. So ENFORCE polls
   `dev-user`→`source-read` until it is allowed, for one bundle cycle (`BUNDLE_WAIT_SECS`, default
   180 s), and only then prints the matrix, so the matrix shows the policy in force. It retries only
   the answers a slow bundle or a fresh sidecar gives (a deny from a bootstrap policy, OPA with no
   bundle yet, a sidecar that has not read its credentials). A refused audience or login, or any other
   answer, stops it at once.
-- **It restarts the agent instead of waiting out a cache.** `token-exchange-aiac` remembers an
-  audience it saw as unknown for 5 minutes. WIRE restarts the agent to clear that. `make enforce` runs
-  WIRE then ENFORCE as two steps, so ENFORCE restarts the agent only when no restart happened in the
-  last 2 minutes (`./driver.sh --only-enforce` on its own). The restart comes after ENFORCE's checks,
-  so a cluster that fails them is not disrupted. With the cache cleared, a `401` from `github-tool` is
-  a real audience refusal, so ENFORCE does not retry it.
+- **There is no cache to wait out, so it restarts nothing.** `token-exchange-aiac` would remember
+  an audience it saw as unknown for 5 minutes by default; the overlay sets `unknown_audience_ttl` to
+  `0`, and the preflight stops a cluster on an older overlay. WIRE and ENFORCE also check
+  `github-agent`'s own sidecar config (`authbridge-config-github-agent`), which the operator rebuilds
+  only when it admits the pod: an agent started before the overlay changed stops the run there, with
+  the fix. So a `401` from `github-tool` is a real audience refusal, and ENFORCE does not retry it.
 
 ### Reading the verdicts
 

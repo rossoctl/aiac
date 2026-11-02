@@ -81,8 +81,8 @@ over the fully onboarded stack.
    - the AuthBridge runtime config is not wired (`pipeline_check`, which applies
      `k8s/authbridge-pipeline-check.py`): `opa` not once on **each** leg, or not after the identity plugin (and, inbound, mcp-parser); not exactly one
      `token-exchange-aiac` and no `token-exchange` on the outbound leg; a `token-exchange-aiac`
-     audience template that is not `spiffe://<td>/...{namespace}...{service}...`; or a `no_token_policy` other
-     than `deny`.
+     audience template that is not `spiffe://<td>/...{namespace}...{service}...`; a `no_token_policy` other
+     than `deny`; or an `unknown_audience_ttl` that is not `"0"` (unset is the plugin's 5 minutes).
 
    The gate returns that trust domain, which the harness exchanges for.
    `require_env_or_skip` skips if `KEYCLOAK_URL` / admin creds are unset; `require_event_path` skips if
@@ -133,9 +133,9 @@ over the fully onboarded stack.
    derives the audience from the destination host (`github-tool` →
    `spiffe://<trust-domain>/ns/team1/sa/github-tool`) and asks Keycloak. It requests no `scope`, so
    `grant_exchange_scope` grants the agent's Keycloak client the `github-tool` audience scope as a
-   **default** client scope (an optional scope is never applied), and `restart_agent` restarts the
-   agent to clear token-exchange-aiac's 5-minute unknown-audience cache (and so its OPA sidecar
-   re-fetches the recomposed bundle). Without the grant the exchange is refused with a 403 from
+   **default** client scope (an optional scope is never applied). The agent is not restarted: the
+   overlay sets token-exchange-aiac's `unknown_audience_ttl` to `0` (the skip gate requires it), so the
+   next call asks Keycloak again, and the convergence poll waits for each OPA's next bundle poll. Without the grant the exchange is refused with a 403 from
    `token-exchange-aiac` and the call never reaches OPA. The agent's outbound is a pass-through, but the
    leg is still necessary: github-tool's inbound `jwt-validation` accepts only a token whose audience is github-tool.
 5. **Wait for the pipeline to converge.** `poll_until` drives real decisions until this run's CR is
@@ -143,7 +143,8 @@ over the fully onboarded stack.
    with the two allows, proving the restrictive client-scoped gate is live; the combiner denies a pod
    that has no CR, D20, so a deny alone proves nothing), and `dev-user`'s
    outbound `source-read` and `test-user`'s outbound `issues-read` have reached their terminal `allow`
-   (waiting out the post-restart token-exchange window). Teardown undeploys both workloads, deletes
+   (waiting out the bundle poll and a token-exchange 503 window, a sidecar that has not read its
+   credentials yet). Teardown undeploys both workloads, deletes
    their Keycloak registrations, sweeps every `AuthorizationPolicy` CR, runs the same cleanup as the
    clean slate, and verifies that no client and no CR remain.
 6. **Assert the enforced decisions over the full matrix.** Each test mints a fresh user token and
@@ -274,8 +275,7 @@ The suite reads its config from the repo-root `.env` (gitignored); source it bef
 > `AIAC_CONTROLLER_DEPLOYMENT` / `AIAC_CONTROLLER_SELECTOR`, defaults `aiac-system` / `aiac-agent` /
 > `app=aiac-agent`; the harness does not port-forward to the Controller), the Policy Store target
 > (`AIAC_STORE_*`, `svc/aiac-policy-model-store-service` on `7074`), the policy ConfigMap/mount
-> (`AIAC_POLICY_CONFIGMAP` / `AIAC_POLICY_MOUNT_PATH`), the agent Deployment to restart
-> (`AIAC_AGENT_DEPLOYMENT`), the Kind cluster name (`AIAC_KIND_CLUSTER`), and the timeouts
+> (`AIAC_POLICY_CONFIGMAP` / `AIAC_POLICY_MOUNT_PATH`), the Kind cluster name (`AIAC_KIND_CLUSTER`), and the timeouts
 > (`AIAC_DEPLOY_TIMEOUT`, `AIAC_BUNDLE_TIMEOUT`, `AIAC_BUNDLE_POLL_INTERVAL`).
 
 ## Runbook
@@ -325,7 +325,7 @@ decision logs (`k8s/opa-kind-runbook.md` "What OPA sees on each leg") and inspec
   no standalone probe module — the deployed plugin sees exactly what production sees.
 - **Outbound needs the token-exchange leg live.** The outbound OPA gate is only reached if
   `token-exchange-aiac` first exchanges the agent's call to `github-tool`; Part B (default client
-  scope + agent restart) enables it, and the fixture polls real decisions until it
+  scope) enables it, and the fixture polls real decisions until it
   settles before asserting. The agent's outbound is a pass-through, but the leg is
   still necessary: github-tool's inbound `jwt-validation` accepts only a token whose audience is
   github-tool.

@@ -39,6 +39,17 @@ OPA_DENY = {"error": "policy.forbidden", "plugin": "opa"}
 NOT_GRANTED = {"error": "policy.forbidden", "plugin": "token-exchange-aiac"}
 EXCHANGE_FAILED = {"error": "upstream.token-exchange-failed", "plugin": "token-exchange-aiac"}
 LEGACY_EXCHANGE_FAILED = {"error": "upstream.token-exchange-failed", "plugin": "token-exchange"}
+# An OPA evaluation error: cortex's OPA answers it with policy.forbidden too, and only the message says so.
+OPA_DECISION_ERROR = {
+    **OPA_DENY,
+    "message": "OPA decision error: eval_conflict_error: functions must not produce multiple outputs",
+}
+OPA_RESPONSE_DECISION_ERROR = {**OPA_DENY, "message": "OPA response decision error: x"}
+
+
+def _frame_msg(message: str, data: dict) -> str:
+    """A JSON-RPC error frame whose ``error.message`` is ``message`` (cortex puts the reason there)."""
+    return json.dumps({"jsonrpc": "2.0", "id": 1, "error": {"code": -32000, "message": message, "data": data}})
 
 
 @pytest.mark.parametrize(
@@ -53,10 +64,66 @@ LEGACY_EXCHANGE_FAILED = {"error": "upstream.token-exchange-failed", "plugin": "
         (EXCHANGE_FAILED, False),
         ({"plugin": "jwt-validation", "error": "policy.forbidden"}, False),
         (None, False),
+        # An OPA evaluation error decides nothing: not a verdict.
+        (OPA_DECISION_ERROR, False),
+        (OPA_RESPONSE_DECISION_ERROR, False),
+        ({**OPA_DENY, "message": "policy denied"}, True),
+        ({**OPA_DENY, "message": "a reason that mentions an OPA decision error: later"}, True),
     ],
 )
 def test_is_opa_violation_goes_by_the_named_plugin(doc: object, expected: bool) -> None:
-    assert launcher.is_opa_violation(doc) is expected
+    """A plain body carries its message beside the doc's fields."""
+    message = doc.get("message") if isinstance(doc, dict) else None
+    assert launcher._rejection().is_opa_violation(doc, message) is expected
+
+
+def test_is_opa_violation_reads_a_frame_message_outside_the_doc() -> None:
+    """A frame at HTTP 200 carries the message in ``error.message``, not in its ``data``: the caller
+    passes it, and it decides."""
+    rejection = launcher._rejection()
+    assert rejection.is_opa_violation(OPA_DENY, "OPA decision error: x") is False
+    assert rejection.is_opa_violation(OPA_DENY, "policy denied") is True
+
+
+@pytest.mark.parametrize(
+    ("code", "body", "verdict", "decision_error"),
+    [
+        (403, json.dumps(OPA_DENY), True, False),
+        (403, json.dumps({**OPA_DENY, "message": "policy denied"}), True, False),
+        (403, json.dumps(OPA_DECISION_ERROR), False, True),
+        (403, json.dumps(OPA_RESPONSE_DECISION_ERROR), False, True),
+        # A frame at HTTP 200: the message is in error.message, outside error.data.
+        (200, _frame_msg(OPA_DECISION_ERROR["message"], OPA_DENY), False, True),
+        (200, _frame_msg("policy denied", OPA_DENY), True, False),
+        (403, json.dumps(NOT_GRANTED), False, False),
+        (403, "RBAC: access denied", False, False),
+        (503, json.dumps({"error": "upstream.unreachable", "plugin": "opa"}), False, False),
+        (None, "", False, False),
+    ],
+)
+def test_opa_verdict_and_decision_error_from_a_raw_answer(
+    code: int | None, body: str, verdict: bool, decision_error: bool
+) -> None:
+    """``opa_verdict`` and ``opa_decision_error`` read the message from the right place in either shape."""
+    assert launcher.opa_verdict(code, body) is verdict
+    assert launcher.opa_decision_error(code, body) is decision_error
+
+
+@pytest.mark.parametrize(
+    ("code", "body", "expected"),
+    [
+        (200, "{}", "allow"),
+        (403, json.dumps({**OPA_DENY, "message": "policy denied"}), "deny"),
+        # An OPA evaluation error, or a 403 from another hop, decides nothing: never an inbound deny.
+        (403, json.dumps(OPA_DECISION_ERROR), "error"),
+        (403, "RBAC: access denied", "error"),
+        (403, "", "error"),
+        (503, json.dumps({"error": "upstream.unreachable", "plugin": "opa"}), "error"),
+        (None, "inbound probe pod failed", "error"),
+    ],
+)
+def test_inbound_outcome_counts_only_an_opa_verdict_as_deny(code: int | None, body: str, expected: str) -> None:
+    assert launcher.inbound_outcome(code, body) == expected
 
 
 @pytest.mark.parametrize(
@@ -73,7 +140,7 @@ def test_is_opa_violation_goes_by_the_named_plugin(doc: object, expected: bool) 
     ],
 )
 def test_is_exchange_refusal(doc: object, expected: bool) -> None:
-    assert launcher.is_exchange_refusal(doc) is expected
+    assert launcher._rejection().is_exchange_refusal(doc) is expected
 
 
 @pytest.mark.parametrize(
@@ -115,6 +182,11 @@ def test_is_exchange_refusal(doc: object, expected: bool) -> None:
         ),
         (503, json.dumps({"error": "upstream.unreachable", "plugin": "opa"}), "error"),
         (403, json.dumps({"error": "upstream.unreachable", "plugin": "opa"}), "error"),
+        # An OPA evaluation error (a Rego runtime error) is policy.forbidden from opa, but no verdict.
+        (403, json.dumps(OPA_DECISION_ERROR), "error"),
+        (403, json.dumps(OPA_RESPONSE_DECISION_ERROR), "error"),
+        (200, _frame_msg(OPA_DECISION_ERROR["message"], OPA_DENY), "error"),
+        (200, _frame_msg("policy denied", OPA_DENY), "deny"),
     ],
 )
 def test_outbound_outcome_never_reports_an_exchange_refusal_as_an_opa_deny(code: int, body: str, expected: str) -> None:
@@ -124,6 +196,7 @@ def test_outbound_outcome_never_reports_an_exchange_refusal_as_an_opa_deny(code:
 def test_deny_origin_ignores_an_exchange_refusal() -> None:
     assert launcher.deny_origin(200, _frame(NOT_GRANTED)) is None
     assert launcher.deny_origin(403, json.dumps(NOT_GRANTED)) is None
+    assert launcher.deny_origin(403, json.dumps(OPA_DECISION_ERROR)) is None  # no verdict, no origin
     assert launcher.deny_origin(200, _frame(OPA_DENY)) == launcher.DENY_ORIGIN_AGENT_OUTBOUND
     assert launcher.deny_origin(403, json.dumps(OPA_DENY)) == launcher.DENY_ORIGIN_TOOL_INBOUND
     # A 403 that carries a JSON-RPC frame is neither shape.
@@ -185,12 +258,12 @@ def test_pipeline_check_skips_any_other_wiring(config: str) -> None:
     ],
 )
 def test_exchange_refusal_is_only_keycloak_not_granting(code: int | None, body: str, expected: bool) -> None:
-    assert launcher.exchange_refusal(code, body) is expected
+    assert launcher._rejection().exchange_refusal(code, body) is expected
 
 
 def _disabled(code: int) -> str:
     """``token-exchange-aiac``'s refusal of a disabled target, as cortex renders it at ``code``."""
-    msg = launcher.target_disabled_message()
+    msg = launcher._rejection().TARGET_DISABLED_MESSAGE
     if code == 200:
         return json.dumps({"jsonrpc": "2.0", "id": 1, "error": {"code": -32000, "message": msg, "data": NOT_GRANTED}})
     return json.dumps({**NOT_GRANTED, "message": msg})
@@ -213,7 +286,7 @@ def _not_granted(code: int) -> str:
         (200, _not_granted(200), False),
         (403, _not_granted(403), False),
         (200, _frame(EXCHANGE_FAILED), False),
-        (403, json.dumps({**OPA_DENY, "message": launcher.target_disabled_message()}), False),
+        (403, json.dumps({**OPA_DENY, "message": launcher._rejection().TARGET_DISABLED_MESSAGE}), False),
         (None, "", False),
     ],
 )
@@ -249,6 +322,7 @@ def test_pipeline_check_gives_the_trust_domain_of_the_outbound_template(config: 
         (403, json.dumps(OPA_DENY), "deny"),
         # An exchange refusal of a notification is not an OPA verdict.
         (403, json.dumps(NOT_GRANTED), "error"),
+        (403, json.dumps(OPA_DECISION_ERROR), "error"),  # an OPA evaluation error decides nothing
         (403, "", "error"),
         (503, json.dumps(EXCHANGE_FAILED), "error"),
         (None, "", "error"),
@@ -325,7 +399,7 @@ def test_pipeline_unwired_reason_skips_without_a_trust_domain(
 def test_classify_names_only_the_exchange(code: int | None, body: str, expected: dict | None) -> None:
     """The demo probe gives a refusal or failure of the exchange its own verdict, never a deny, and its
     outcome is the harness's ``outbound_outcome`` for the same answer."""
-    outcome, exchange_doc = launcher._rejection().classify(code, body)
+    outcome, exchange_doc, _ = launcher._rejection()._classify(code, body)
     assert exchange_doc == expected
     assert outcome == launcher.outbound_outcome(code, body)
     if exchange_doc is not None:
@@ -396,6 +470,9 @@ def test_importing_the_launcher_does_not_need_k8s(tmp_path: Path) -> None:
         (200, _frame(OPA_DENY), "DENIED_JSONRPC"),
         (200, json.dumps({"jsonrpc": "2.0", "id": "1", "result": {}}), "ALLOWED_RESULT"),
         (403, "RBAC: access denied", "UNEXPECTED 403 - RBAC: access denied"),
+        # An OPA evaluation error is no deny: a test-user deny check must not pass on it.
+        (403, json.dumps(OPA_DECISION_ERROR), "UNEXPECTED 403 policy.forbidden "),
+        (200, _frame_msg(OPA_DECISION_ERROR["message"], OPA_DENY), "UNEXPECTED 200 policy.forbidden "),
         # the parsed error code comes first, so a long body cannot push it out of the verdict
         (
             200,

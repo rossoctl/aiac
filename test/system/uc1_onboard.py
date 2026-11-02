@@ -23,7 +23,7 @@ pipeline wired into both legs:
         CR of each affected service on the live API), converging before the next
       → right after each workload converges, check that its client links the subject scope
         ``aiac-username-sub`` as a default scope (``require_subject_scope``, D31; a missing link fails)
-      → enable the outbound token-exchange leg (Part B: default client scope + agent restart)
+      → enable the outbound token-exchange leg (Part B: default client scope)
       → poll bundle-service + OPA until this run's CR is reflected in real decisions
       → drive REAL HTTP requests through AuthBridge and assert the real plugin's allow/deny
       → capture every AIAC CR + the global combiner to the pytest host (``teardown``) — the first
@@ -48,8 +48,8 @@ This module owns:
   other CR in the namespace) / ``delete_authpolicy`` (one CR, raising).
 * **Onboarding (event-driven)** — ``ensure_agent_policy`` (mount the PRB's ``policy.md``) +
   ``deploy_workload`` (deploy fires the trigger) / ``wait_for_registration`` / ``undeploy_workload``.
-* **Outbound-leg prep (Part B)** — ``grant_exchange_scope`` / ``restart_agent`` so
-  ``token-exchange-aiac`` mints the tool token and OPA is actually consulted on the outbound leg.
+* **Outbound-leg prep (Part B)** — ``grant_exchange_scope`` so ``token-exchange-aiac`` mints the tool
+  token and OPA is actually consulted on the outbound leg.
 * **The subject on every leg (D31)** — ``SUBJECT_SCOPE`` (``aiac-username-sub``) and its mapper
   expectation; the pure ``subject_scope_problems``; the live reader ``subject_scope_link_problems`` and
   ``require_subject_scope`` (the login client ``rossoctl`` and each onboarded client link the scope as
@@ -129,7 +129,6 @@ from test.system.launcher import (  # noqa: E402
     exchange_token,
     inbound_outcome,
     inbound_probe,
-    is_opa_violation,
     jwt_claim,
     kubectl,
     kubectl_apply,
@@ -137,6 +136,8 @@ from test.system.launcher import (  # noqa: E402
     kubectl_rollout_status,
     mint_token,
     notification_outcome,
+    opa_decision_error,
+    opa_verdict,
     outbound_outcome,
     outbound_probe,
     outbound_session_probe,
@@ -206,15 +207,10 @@ CR_CAPTURE_DIR = Path(os.environ.get("AIAC_CR_CAPTURE_DIR") or HERE / "artifacts
 
 # --- Live-cluster loop knobs ---------------------------------------------------------------
 
-# The workload Deployment to restart after Part B so it reloads the new outbound route (and, on its
-# OPA sidecar's next poll, the recomposed bundle). Defaults to the agent workload name.
-AGENT_DEPLOYMENT = os.environ.get("AIAC_AGENT_DEPLOYMENT", scn.AGENT_WORKLOAD)
-
-
 # After a CR is upserted, ``bundle-service`` recomposes the namespace bundle and each pod's OPA polls
 # it on its own interval (``polling_min_delay`` / ``polling_max_delay``, 10-120 s by default, up to about
-# 144 s after a fetch error; a new pod fetches at once), and ``token-exchange`` needs a moment to settle
-# after the agent restart. ``onboarded_stack`` polls real decisions until they converge, up to this budget
+# 144 s after a fetch error; a new pod fetches at once), and a freshly started agent sidecar may not have
+# read its credentials yet. ``onboarded_stack`` polls real decisions until they converge, up to this budget
 # (seconds). Rungs 5 and 6 use it for their own CR-change polls.
 BUNDLE_TIMEOUT = float(os.environ.get("AIAC_BUNDLE_TIMEOUT", "300"))
 BUNDLE_POLL_INTERVAL = float(os.environ.get("AIAC_BUNDLE_POLL_INTERVAL", "10"))
@@ -1153,8 +1149,9 @@ def delete_workload_registrations(admin, realm: str) -> None:
     for workload in workloads:
         secret = client_credentials_secret_name(workload)
         _kubectl_try("delete", "secret", secret, "-n", NAMESPACE, "--ignore-not-found")
-    # The Secrets carry the workload in the operator's owner reference, so one left over (the naming
-    # changed, or the agent ran under another Deployment) is named here instead of passing in silence.
+    # The Secrets carry the workload in the operator's owner reference (its controller reference to the
+    # Deployment, which the harness always names after the workload), so one the exact-name delete
+    # missed (the operator's naming changed) is named here instead of passing in silence.
     ok, out, _ = _kubectl_try(
         "get", "secret", "-n", NAMESPACE, "-o",
         r'jsonpath={range .items[*]}{.metadata.name}{"\t"}{.metadata.ownerReferences[*].name}{"\n"}{end}',
@@ -1212,13 +1209,13 @@ def delete_workload_crs() -> None:
 #
 # The tool check is only reached if ``token-exchange-aiac`` first exchanges the agent's call to
 # github-tool. It has no routes: it derives the audience ``spiffe://<td>/ns/<ns>/sa/github-tool`` from
-# the host and asks Keycloak, so the only prep is (B.1) the agent's Keycloak client granted the
-# github-tool audience scope as a **default** scope — the plugin requests no ``scope``, so an optional
-# scope is never applied and the exchange answers 403 "not granted" — and (B.2) the agent restarted, so
-# a github-tool audience it remembered as unknown before the tool's client existed (cached for 5 min)
-# is asked again. The leg is necessary: the agent's outbound is a pass-through, but github-tool's
-# inbound ``jwt-validation`` accepts only a token whose audience is github-tool, so
-# ``token-exchange-aiac`` must mint it.
+# the host and asks Keycloak, so the only prep is the agent's Keycloak client granted the github-tool
+# audience scope as a **default** scope — the plugin requests no ``scope``, so an optional scope is
+# never applied and the exchange answers 403 "not granted". No agent restart: the overlay sets
+# ``unknown_audience_ttl: "0"`` (the skip gate requires it), so a github-tool audience the plugin saw
+# as unknown before the tool's client existed is asked again on the next call. The leg is necessary:
+# the agent's outbound is a pass-through, but github-tool's inbound ``jwt-validation`` accepts only a
+# token whose audience is github-tool, so ``token-exchange-aiac`` must mint it.
 
 
 def _tool_audience(trust_domain: str) -> str:
@@ -1275,13 +1272,6 @@ def grant_exchange_scope(admin) -> None:
             f"could not link {aud_scope!r} to {NAMESPACE}/{scn.AGENT_WORKLOAD} as a default scope: {exc} — "
             "without it token-exchange-aiac refuses every call to the tool"
         ) from exc
-
-
-def restart_agent(namespace: str) -> None:
-    """Restart the agent Deployment so ``token-exchange-aiac`` starts with empty caches (an audience
-    it remembered as unknown is asked again) and its OPA sidecar re-fetches the recomposed bundle."""
-    kubectl("rollout", "restart", f"deployment/{AGENT_DEPLOYMENT}", "-n", namespace, timeout=60)
-    kubectl_rollout_status(f"deployment/{AGENT_DEPLOYMENT}", namespace=namespace, timeout=180)
 
 
 # ======================================================================================
@@ -1878,9 +1868,10 @@ def inbound_raw(ctx: dict, user: str) -> tuple[int | None, str]:
 
 def inbound_decision(ctx: dict, user: str) -> str:
     """Mint a fresh ``user`` token and send a real inbound request through AuthBridge; return the real
-    OPA plugin's classified decision (``"allow"`` 200 / ``"deny"`` 403 / ``"error"`` otherwise)."""
-    code, _ = inbound_raw(ctx, user)
-    return inbound_outcome(code)
+    OPA plugin's classified decision (``inbound_outcome``: ``"allow"`` 200 / ``"deny"`` an OPA verdict in
+    a 403 / ``"error"`` otherwise)."""
+    code, body = inbound_raw(ctx, user)
+    return inbound_outcome(code, body)
 
 
 def probe_hint(code: int | None, body: str) -> str:
@@ -1890,6 +1881,7 @@ def probe_hint(code: int | None, body: str) -> str:
 
     * 503 from OPA ``opa policy engine not initialized``: the sidecar has loaded no bundle yet;
     * 403 that names OPA: OPA denied it, from the CR (the combiner denies a pod with no CR, D20);
+    * 403 ``policy.forbidden`` from OPA with an ``OPA decision error`` message: the Rego did not evaluate;
     * any other 403: not from OPA (for example the Istio waypoint);
     * no code, or ``000``: the probe pod failed, or the Service was not reachable."""
     if code == 200:
@@ -1902,8 +1894,10 @@ def probe_hint(code: int | None, body: str) -> str:
         doc = None
     doc = doc if isinstance(doc, dict) else {}
     if code == 403:
-        if is_opa_violation(doc):
+        if opa_verdict(code, body):
             return "OPA denied it: check the workload's CR (with no CR, the combiner denies the pod, D20)."
+        if opa_decision_error(code, body):
+            return f"OPA could not evaluate the policy, so it decided nothing: {doc.get('message')!r}. Check the CR's Rego."
         return "a 403 that is not from OPA (for example the Istio waypoint)."
     plugin, message = doc.get("plugin"), doc.get("message")
     if plugin == "opa" and message == "opa policy engine not initialized":
@@ -1920,8 +1914,8 @@ def resolve_agent_pod() -> str:
     """Resolve the **current** live agent pod (newest Running+Ready, non-terminating — see
     ``resolve_pod``). Re-resolved per outbound probe rather than pinned once at fixture setup: the
     outbound leg ``kubectl exec``s into a specific pod (unlike inbound, which reaches the agent through
-    its pod-agnostic Service), so a pod name captured before/during ``restart_agent``'s rolling
-    replacement can go stale and every later exec then fails ``NotFound`` -> ``"error"`` forever (issue
+    its pod-agnostic Service), so a pod name captured before a rolling replacement (the operator's final
+    rollout, a crash) can go stale and every later exec then fails ``NotFound`` -> ``"error"`` forever (issue
     #139). Resolving fresh self-heals across any pod churn."""
     return resolve_pod(f"app.kubernetes.io/name={scn.AGENT_WORKLOAD}", namespace=NAMESPACE)
 
@@ -1975,7 +1969,7 @@ class ReadySignal:
     signal must be deterministic for its scenario regardless of a stale CR the run replaced (a live
     ``deny`` that the permissive default would flip to ``allow``, or vice-versa, is the tracer that
     proves *this* run's bundle is in force). Polling each to a definitive ``allow``/``deny`` (never
-    ``error``) also waits out the post-restart token-exchange 503 window.
+    ``error``) also waits out a token-exchange 503 window (a sidecar that has not read its credentials yet).
 
     ``kind`` selects the probe: ``"inbound"`` → ``inbound_decision(ctx, subject)``; ``"outbound"`` →
     ``outbound_decision(ctx, subject, tool_bare)`` (``tool_bare`` required). ``expected`` is the
@@ -2003,7 +1997,7 @@ class ReadySignal:
         failure message can print what the poll saw last."""
         if self.kind == "inbound":
             code, body = inbound_raw(ctx, self.subject)
-            return Observation(inbound_outcome(code), code, body)
+            return Observation(inbound_outcome(code, body), code, body)
         code, body = outbound_raw(ctx, self.subject, self.tool_bare)
         return Observation(outbound_outcome(code, body), code, body)
 
@@ -2212,7 +2206,7 @@ def onboarded_stack(
     client links the subject scope ``aiac-username-sub`` as a default scope (``require_subject_scope``,
     D31: AIAC makes this link at onboarding, so a missing link **fails** the run at once, with the
     problems listed, rather than as a deny in the final poll); enable the outbound leg
-    (Part B: default client scope + agent restart, no route); then **poll real decisions** until
+    (Part B: default client scope, no route); then **poll real decisions** until
     ``bundle-service`` + OPA reflect this run's CR (and the outbound exchange has settled) before yielding.
     Teardown first captures every AIAC CR and the global combiner to the pytest host
     (``capture_aiac_crs``, phase ``teardown``; best-effort, it never masks a failure), then is
@@ -2343,27 +2337,25 @@ def onboarded_stack(
                 )
 
         # Part B — make the outbound exchange succeed so the tool check is actually reached
-        # (github-tool's inbound OPA, which accepts only a token with its audience). Done after
-        # onboarding so the restarted agent (and its OPA sidecar) starts with empty exchange caches
-        # and, on its next poll, the recomposed bundle.
+        # (github-tool's inbound OPA, which accepts only a token with its audience). No agent restart:
+        # token-exchange-aiac caches no unknown audience (``unknown_audience_ttl: "0"``, required by the
+        # skip gate), and the convergence poll below waits for each OPA's next bundle poll. So every rung
+        # asserts the exact bundle the live event-driven onboarding produced, with no restart papering
+        # over a bad compose.
         #
-        # Prepared ONLY when this run actually probes outbound (``has_outbound``). The agent-only rung
-        # (rung 1) has no tool onboarded, so there is no real ``agent -> tool`` call to make and no
-        # outbound signal in its set — its outbound leg has no real-life counterpart, and the exchange
-        # never reaches OPA anyway (no ``github-tool`` client, since the operator registers it and
-        # creates ``agent-{ns}-github-tool-aud`` only on TOOL deploy). So on a tool-less rung Part B is
-        # skipped entirely: no grant, no restart. Its inbound gate already converged in the
-        # per-workload loop above, and skipping the restart means rung 1 asserts the exact bundle the
-        # live event-driven onboard produced (no restart papering over a bad compose).
+        # Prepared ONLY when this run actually probes outbound (``has_outbound``) and a tool is onboarded.
+        # The agent-only rung (rung 1) has no tool onboarded, so there is no real ``agent -> tool`` call to
+        # make and no outbound signal in its set — its outbound leg has no real-life counterpart, and the
+        # exchange never reaches OPA anyway (no ``github-tool`` client, since the operator registers it
+        # and creates ``agent-{ns}-github-tool-aud`` only on TOOL deploy). So on a tool-less rung Part B
+        # is skipped.
         #
         # When there IS an outbound leg: grant the agent client the ``*-aud`` scope as a default scope
         # (only ever present once the tool is deployed) so ``token-exchange-aiac`` mints the github-tool
-        # token and OPA is reached, then restart the agent. No route: the plugin derives the audience.
+        # token and OPA is reached. No route: the plugin derives the audience.
         has_outbound = any(sig.kind == "outbound" for sig in signals)
-        if has_outbound:
-            if tool_onboarded:
-                grant_exchange_scope(admin)
-            restart_agent(NAMESPACE)
+        if has_outbound and tool_onboarded:
+            grant_exchange_scope(admin)
         # Resolved once for the ctx contract, but the live outbound path re-resolves per probe
         # (``resolve_agent_pod``) so a pod replaced after this point can't poison the whole run (#139).
         agent_pod = resolve_agent_pod()
@@ -2384,7 +2376,8 @@ def onboarded_stack(
         # any assertion. The ``signals`` set (this policy's ``ready_signals``, or the Policy-A default)
         # is polled until every probe reaches its terminal verdict — each deterministic for its
         # scenario regardless of a stale CR (which the run replaced), and each polled to a *definitive*
-        # allow/deny (not ``error``) so we also wait out the post-restart token-exchange 503 window.
+        # allow/deny (not ``error``) so we also wait out a token-exchange 503 window (a sidecar that has
+        # not read its credentials yet).
         reached, last = poll_signals(signals, ctx, timeout=BUNDLE_TIMEOUT, interval=BUNDLE_POLL_INTERVAL)
         if not reached:
             # The message prints what the poll saw last, with each raw ``(code, body)``: the classifier

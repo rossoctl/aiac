@@ -58,6 +58,9 @@ def ensure_default_audience_scope(admin, cfg: Config, client_uuid: str, client_n
     agent client, so an exchanged token's ``aud`` includes the tool without the caller requesting it
     explicitly.
 
+    An existing OPTIONAL link is moved to default (token-exchange-aiac requests no scope, so an
+    optional link grants nothing).
+
     Returns ``True`` when the scope is now assigned (added here or already present) and ``False``
     when the scope does not exist yet, so the scope was skipped. The ``03-setup.py`` path calls this
     before the tool is onboarded, where ``False`` is expected; the ``05-onboard-tool.py`` path calls
@@ -72,6 +75,14 @@ def ensure_default_audience_scope(admin, cfg: Config, client_uuid: str, client_n
     if scope_name in existing:
         note(f"{scope_name!r} already a default scope on {client_name!r}")
         return True
+    # The same move as _link_default_scope in src/aiac/idp/service/configuration/keycloak/main.py:
+    # Keycloak skips a default link of a scope already linked as optional, with no error (an older
+    # driver WIRE linked it so), and token-exchange-aiac requests no scope, so an optional link
+    # grants nothing. Move it to default; only when it IS optional, since Keycloak's DELETE of an
+    # optional link also drops a default one.
+    if any(s.get("id") == scope["id"] for s in admin.get_client_optional_client_scopes(client_uuid)):
+        admin.delete_client_optional_client_scope(client_uuid, scope["id"])
+        note(f"{scope_name!r} was an optional scope on {client_name!r}: moved to default")
     admin.add_client_default_client_scope(client_uuid, scope["id"], {})
     ok(f"added {scope_name!r} as a default scope on {client_name!r}")
     return True

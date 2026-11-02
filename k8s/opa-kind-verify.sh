@@ -18,8 +18,8 @@
 #   Verify 1   authbridge-runtime-config, parsed per leg: opa once on each leg, after
 #              the identity plugin (and, inbound, mcp-parser); the outbound leg carries
 #              token-exchange-aiac (not token-exchange) with a
-#              spiffe://<td>/...{namespace}...{service}... audience template and
-#              no_token_policy deny
+#              spiffe://<td>/...{namespace}...{service}... audience template,
+#              no_token_policy deny and unknown_audience_ttl 0
 #   Verify 2   AuthorizationPolicy CRD established + global 'default' CR present,
 #              and it is the changed combiner (D20): 0 request fallback rules (a
 #              pod with no client CR is denied), 2 response fallback rules
@@ -122,7 +122,8 @@ step "Verify 1 — OPA on both pipeline legs, token-exchange-aiac on the outboun
 # Parsed, per leg (the rule of k8s/authbridge-pipeline-check.py, its docstring lists it): opa once
 # on each leg, after the identity plugin (and, inbound, mcp-parser); outbound token-exchange-aiac once,
 # token-exchange absent (no routes; a leftover token-exchange means the pipeline predates the
-# switch); a spiffe://<td>/...{namespace}...{service}... audience template; no_token_policy deny.
+# switch); a spiffe://<td>/...{namespace}...{service}... audience template; no_token_policy deny;
+# unknown_audience_ttl 0 (no audience is cached as unknown, so no caller needs a restart).
 # The helper reads the ConfigMap itself (kubectl's stderr kept apart from the YAML), and the system
 # harness's skip gate loads the same file. It prints one verdict line on stdout, also when it fails;
 # stderr (a python3 warning) is not the verdict.

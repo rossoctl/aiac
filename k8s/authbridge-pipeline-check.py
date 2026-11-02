@@ -23,7 +23,13 @@ line that says what is wrong. The wiring is right when:
 - its ``no_token_policy`` is ``deny`` or unset (the plugin default, ``deny``): a
   request with no bearer to a target is refused, never exchanged with the
   workload's own token. ``k8s/opa-kind-enable.sh`` once set
-  ``client-credentials``; a cluster still on that overlay must re-run it.
+  ``client-credentials``; a cluster still on that overlay must re-run it;
+- its ``unknown_audience_ttl`` is a zero duration (``"0"``, ``"0s"``): the
+  plugin remembers no audience as unknown, so a target registered after its
+  caller first called it is exchanged on the next call, with no restart of the
+  caller. Unset is the plugin default, 5 minutes, which the demo driver and the
+  system harness do not wait out: an older overlay, re-run
+  ``k8s/opa-kind-enable.sh``.
 
 It parses the YAML and reads whole plugin names per leg, in order, so quoting,
 comments, the other leg and the bare-string entry form (``- opa``, which cortex
@@ -50,9 +56,14 @@ Usage:
 
 from __future__ import annotations
 
+import re
 import sys
 
 LEGS = ("inbound", "outbound")
+
+# A Go duration string (``time.ParseDuration``) whose value is zero: an optional sign, then ``0``, or one
+# or more zero numbers (digits, a fraction, or both) each with a unit.
+_ZERO_DURATION = re.compile(r"[-+]?(?:0|(?:(?:0+(?:\.0*)?|\.0+)(?:ns|us|µs|μs|ms|s|m|h))+)")
 
 
 def leg_plugins(config_yaml: str) -> dict[str, list[dict]] | None:
@@ -144,6 +155,13 @@ def problem(legs: dict[str, list[dict]], td: str | None) -> str | None:
     policy = _exchange_config(legs).get("no_token_policy")
     if policy not in (None, "", "deny"):
         return f"the outbound token-exchange-aiac has no_token_policy {policy!r} (want 'deny'; an older overlay)"
+    # A string, as the plugin reads it: its config field is a Go string parsed with time.ParseDuration, so a
+    # bare YAML 0 (an int) fails the sidecar's start (cortex core/plugins/tokenexchangeaiac/plugin.go,
+    # Configure: json.Decode into a string field).
+    ttl = _exchange_config(legs).get("unknown_audience_ttl")
+    if not (isinstance(ttl, str) and _ZERO_DURATION.fullmatch(ttl)):
+        shown = "unset (the plugin default, 5m)" if ttl is None else repr(ttl)
+        return f"the outbound token-exchange-aiac has unknown_audience_ttl {shown} (want '0'; an older overlay)"
     return None
 
 
