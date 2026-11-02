@@ -799,6 +799,25 @@ Rung 6 restarts the Controller twice, so it takes several minutes.
   never one of these, so a Rego that fails to evaluate cannot pass a deny expectation. The inbound
   classifier (`inbound_outcome`) and the demo driver's inbound probe apply the same rule to a 403
   (`opa_verdict`): a 403 from another hop, or an evaluation error, is no inbound deny.
+  - *Accepted risk: the evaluation error is told apart by its message text.* cortex gives an evaluation
+    error the same `error` and `plugin` as a deny, and no machine-readable reason, so the only signal is
+    the message prefix (`OPA_DECISION_ERROR_PREFIXES` in `k8s/authbridge-rejection.py`, copied from cortex
+    `core/plugins/opa/plugin.go`, `OnRequest` / `OnResponse`). If cortex rewords it, an evaluation error is
+    read as a deny again, as it was before this check: a deny expectation can pass on a Rego that does not
+    evaluate. We accept this, because:
+    - without the check every evaluation error is read as a deny, so the check can only remove false
+      passes, never add one;
+    - a cortex rewording breaks only this detection, which falls back to the earlier behaviour, not to
+      something worse;
+    - the allow side does not depend on it: an evaluation error never reads as an allow, so every allow
+      expectation (dev-user's tool calls, test-user's issue calls) still fails on a broken Rego.
+  - *Rejected:* matching AIAC's deny message instead (an exact `"policy denied"`). That is cortex's text
+    for `allow: false` with no `reason`, and AIAC's Rego sets none, so it would fail closed. But it pins
+    a different cortex string, breaks on any Rego that sets a reason, and turns each such deny into an
+    `error`, which the convergence polls would wait on until their timeout. Also rejected: asking cortex
+    for a machine-readable reason first. rossoctl/cortex#1570 asked that for the exchange plugin's
+    refusals, and cortex closed it as deferred.
+  - *Revisit when* cortex puts a reason code in its rejections: key on it, and drop the prefixes.
 - **One copy of each rule the harness shares with a script.** Three standard-library files in `k8s/`
   hold the rules both sides need: `authbridge-pipeline-check.py` (the wiring the skip gate requires, which
   `opa-kind-verify.sh` and the demo driver run), `authbridge-rejection.py` (the outbound classifier, which

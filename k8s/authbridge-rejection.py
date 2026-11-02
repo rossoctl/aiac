@@ -56,6 +56,9 @@ def _rejection_doc(code: int | None, doc: object) -> dict | None:
 # OPA answers an evaluation error (a Rego runtime error, a decision it cannot read) with
 # ``policy.forbidden`` too, and only the message tells it from a verdict (cortex ``core/plugins/opa``,
 # ``OnRequest`` / ``OnResponse``: ``"OPA decision error: ..."``, ``"OPA response decision error: ..."``).
+# ACCEPTED RISK: a rewording in cortex silently reads an evaluation error as a deny again, as before
+# this check; it can never make a real deny or an allow read wrong. Why we accept it, what was rejected,
+# and when to revisit: docs/testing/uc1-onboarding-pipeline.md, Testing Decisions.
 OPA_DECISION_ERROR_PREFIXES = ("OPA decision error:", "OPA response decision error:")
 
 
