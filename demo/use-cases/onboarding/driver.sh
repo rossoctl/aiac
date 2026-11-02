@@ -201,7 +201,7 @@ except Exception: print("")'
 }
 
 # json_eval, aud_scope, realm_client_scopes and scope_id_in: one copy, shared with restore.sh.
-# shellcheck source=lib/keycloak.sh
+# shellcheck source=SCRIPTDIR/lib/keycloak.sh
 . "${SCRIPT_DIR}/lib/keycloak.sh"
 
 # client_uuid_by_name <name> <admin_token> — Keycloak clients are looked up by the "name" DISPLAY

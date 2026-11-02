@@ -61,7 +61,7 @@ except Exception: print("")'
 }
 
 # json_eval, aud_scope, realm_client_scopes and scope_id_in: one copy, shared with driver.sh.
-# shellcheck source=lib/keycloak.sh
+# shellcheck source=SCRIPTDIR/lib/keycloak.sh
 . "${SCRIPT_DIR}/lib/keycloak.sh"
 
 # The audience scopes restore removes, named once: step 1 unlinks the tool scopes WIRE granted, step 3

@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # lib/keycloak.sh — the Keycloak and operator-name helpers that driver.sh and restore.sh share, one
 # copy each. Sourced, not run. The sourcing script sets NS, AIAC_DIR, KC and REALM, and runs under
 # `set -euo pipefail`; every helper here prints "" (exit 0) on a failed read rather than letting a
