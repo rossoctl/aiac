@@ -80,7 +80,8 @@ over the fully onboarded stack.
      client CR (D20);
    - the AuthBridge runtime config is not wired (`pipeline_check`, which applies
      `k8s/authbridge-pipeline-check.py`): `opa` not once on **each** leg, or not after the identity plugin (and, inbound, mcp-parser); not exactly one
-     `token-exchange-aiac` and no `token-exchange` on the outbound leg; a `token-exchange-aiac`
+     `token-exchange-aiac` on the outbound leg, or a `token-exchange` that is not the one-route
+     `github-tool-mcp` bridge (#252); a `token-exchange-aiac`
      audience template that is not `spiffe://<td>/...{namespace}...{service}...`; a `no_token_policy` other
      than `deny`; or an `unknown_audience_ttl` that is not `"0"` (unset is the plugin's 5 minutes).
 

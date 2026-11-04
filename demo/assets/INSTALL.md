@@ -38,8 +38,10 @@ they automate.
   `…/sa/github-tool-mcp`. The production tool's cortex manifest does not yet run it under a
   ServiceAccount of that name, or enroll it
   ([rossoctl/cortex#1540](https://github.com/rossoctl/cortex/issues/1540); cortex closed it as
-  deferred on 2026-10-29: the Kubernetes path is not their current priority). Until it does, those calls
-  are not exchanged. Once it does, the UC-1 onboarding demo's WIRE phase grants github-agent the
+  deferred on 2026-10-29: the Kubernetes path is not their current priority). Until it does, a
+  one-route **bridge** on the outbound leg exchanges them anyway (`k8s/opa-kind-enable.sh`:
+  `token-exchange`, `github-tool-mcp` → the production tool's client `github-tool`, scopes
+  `openid github-tool-aud`; #252 removes it). Once it does, the UC-1 onboarding demo's WIRE phase grants github-agent the
   tool's audience scope as a default scope. It does not grant `github-full-access`, the scope the tool
   reads to pick its privileged PAT: as a default scope it would be in every token github-agent
   exchanges, so every user would get the privileged PAT. So the tool uses its public PAT; a per-user

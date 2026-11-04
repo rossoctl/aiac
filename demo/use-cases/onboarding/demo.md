@@ -888,8 +888,9 @@ lives in `team1`, not `aiac-system`.)
 - **Step 6's token exchange stops short of a call.** `run-*.py` performs a real RFC 8693 exchange to
   prove the flow, but does not feed the exchanged token into a live call against `github-tool`.
 - **The agent's own `MCP_URL` targets the production tool** (`github-tool-mcp`), which this install
-  path does not deploy; a call there passes through un-exchanged until the production tool is
-  registered as `…/sa/github-tool-mcp` (rossoctl/cortex#1540). The demo probes the tool directly through the sidecar's forward proxy, so
+  path does not deploy. A call there is exchanged by the one-route bridge on the outbound leg
+  (`github-tool-mcp` → `github-tool`, #252) until the production tool is registered as
+  `…/sa/github-tool-mcp` (rossoctl/cortex#1540). The demo probes the tool directly through the sidecar's forward proxy, so
   enforcement is proven, but the agent autonomously calling a tool is not exercised here.
 
 ---

@@ -31,9 +31,10 @@
 # second `helm upgrade -f` — Helm layers -f files left-to-right, so the repo
 # file is only ever read, never written. Run opa-kind-restore.sh to revert.
 #
-# Requires: kubectl, helm, kind, docker (or podman), and python3 with PyYAML (Step 6
-# runs k8s/opa-kind-verify.sh, whose Verify 1 parses the pipeline). Checked before
-# any cluster change.
+# Requires: kubectl, helm, kind, docker (or podman), and a python3 with PyYAML: the
+# one on PATH, else the repo's .venv (k8s/yaml-python.sh). The trust-domain read and
+# Step 6 (k8s/opa-kind-verify.sh, Verify 1) parse YAML. Checked before any cluster
+# change.
 # Env vars:
 #   OPERATOR_DIR        path to the rossoctl/operator repo clone; Step 1 builds
 #                       the operator image from operator/Dockerfile and renders
@@ -167,10 +168,29 @@ if [ ! -f "$VALUES_FILE" ]; then
   exit 1
 fi
 
-# Step 6 verifies with k8s/opa-kind-verify.sh, which parses the pipeline with python3 + PyYAML. Check it
+# The trust-domain read below and Step 6 (k8s/opa-kind-verify.sh) parse YAML with python3 + PyYAML. Check it
 # now, before the image builds and the helm upgrade, not after the cluster has changed.
-python3 -c 'import yaml' >/dev/null 2>&1 \
-  || { echo "ERROR: python3 with PyYAML not found (Step 6, k8s/opa-kind-verify.sh, parses the pipeline)" >&2; exit 1; }
+# shellcheck source=SCRIPTDIR/yaml-python.sh
+. "${SCRIPT_DIR}/yaml-python.sh" "$REPO_ROOT"
+[ -n "$YAML_PYTHON" ] \
+  || { echo "ERROR: no python3 with PyYAML (on PATH, or the repo's .venv); the trust-domain read and Step 6 (k8s/opa-kind-verify.sh) parse YAML" >&2; exit 1; }
+export YAML_PYTHON  # Step 6 runs k8s/opa-kind-verify.sh, which uses the same one
+
+# The trust domain the exchange's audience_template needs: the chart's
+# operator-chart.signatureVerification.spireTrustDomain, the value the operator names SPIFFE clients
+# with. Read it here, before any cluster change. An empty value means the operator discovers its trust
+# domain at run time (OCP with ZTWIM), and no value can be rendered into the template from the chart:
+# stop rather than guess one, since a wrong trust domain sends every exchange through un-exchanged.
+SPIRE_TRUST_DOMAIN="$("$YAML_PYTHON" -c 'import sys, yaml
+v = yaml.safe_load(open(sys.argv[1])) or {}
+print(((v.get("operator-chart") or {}).get("signatureVerification") or {}).get("spireTrustDomain") or "")' "$VALUES_FILE")"
+if [ -z "$SPIRE_TRUST_DOMAIN" ]; then
+  echo "ERROR: operator-chart.signatureVerification.spireTrustDomain is empty in ${VALUES_FILE}." >&2
+  echo "       token-exchange-aiac derives each audience from it; set it to the trust domain the operator" >&2
+  echo "       uses (on OCP with ZTWIM discovery, the one in the operator log 'Auto-discovered SPIRE trust domain')." >&2
+  exit 1
+fi
+
 
 if [ "${KIND_EXPERIMENTAL_PROVIDER:-}" = "podman" ]; then
   CONTAINER_RUNTIME="${CONTAINER_RUNTIME:-podman}"
@@ -397,6 +417,17 @@ cat > "$OVERLAY_FILE" <<YAML
 #     without a user token. A bearer-less request to a destination Keycloak has
 #     no client for still passes through: the plugin asks Keycloak with the
 #     workload's own token only to tell the two apart, and never forwards it.
+#   - A BRIDGE, until rossoctl/cortex#1540: one token-exchange entry before
+#     token-exchange-aiac, with exactly one inline route, github-tool-mcp ->
+#     the production tool's client "github-tool" (the cortex github-issue
+#     demo's hand-made client; its Service name is not its ServiceAccount, so
+#     token-exchange-aiac cannot derive it). default_policy passthrough: every
+#     other host goes on, untouched, to token-exchange-aiac. It asks for
+#     github-tool-aud only, never github-full-access (that would give every
+#     user the privileged PAT, D36). No authproxy-routes ConfigMap: the route
+#     is inline, and routes.file is /dev/null so a leftover ConfigMap is not
+#     read. Remove this entry when the production tool is registered as
+#     .../sa/github-tool-mcp (#252).
 #   - unknown_audience_ttl: "0" — the plugin remembers no audience as unknown
 #     (default 5m). With the default, a caller that called a target before
 #     the target's Keycloak client existed keeps passing its calls through
@@ -421,10 +452,10 @@ cat > "$OVERLAY_FILE" <<YAML
 #     client and the request passes through un-exchanged.
 #   - The chart renders this one pipeline into every agent namespace, so no
 #     per-namespace value is inlined. The trust domain is the chart's own
-#     operator-chart.signatureVerification.spireTrustDomain (resolved by tpl(),
-#     the value the operator names SPIFFE clients with; read with get, not index,
-#     so a values set without that block falls back to localtest.me instead of
-#     failing the render), and the namespace for
+#     operator-chart.signatureVerification.spireTrustDomain, the value the
+#     operator names SPIFFE clients with, read from the chart's values before any
+#     cluster change (an empty value stops the script: no literal fallback, since a
+#     wrong trust domain passes every call through un-exchanged), and the namespace for
 #     short names is read by each sidecar from its own service-account mount
 #     (namespace_file).
 #   - token-exchange-aiac rejects unknown config keys, so token-exchange-only
@@ -456,11 +487,25 @@ authBridge:
         - name: a2a-parser
         - name: mcp-parser
         - name: inference-parser
+        - name: token-exchange
+          config:
+            keycloak_url: "http://keycloak-service.keycloak.svc:8080"
+            keycloak_realm: "rossoctl"
+            default_policy: "passthrough"
+            no_token_policy: "deny"
+            identity:
+              type: "client-secret"
+            routes:
+              file: /dev/null
+              rules:
+                - host: "github-tool-mcp"
+                  target_audience: "github-tool"
+                  token_scopes: "openid github-tool-aud"
         - name: token-exchange-aiac
           config:
             keycloak_url: "http://keycloak-service.keycloak.svc:8080"
             keycloak_realm: "rossoctl"
-            audience_template: "spiffe://{{ get (get (index .Values "operator-chart" | default dict) "signatureVerification" | default dict) "spireTrustDomain" | default "localtest.me" }}/ns/{namespace}/sa/{service}"
+            audience_template: "spiffe://${SPIRE_TRUST_DOMAIN}/ns/{namespace}/sa/{service}"
             namespace_file: /var/run/secrets/kubernetes.io/serviceaccount/namespace
             no_token_policy: "deny"
             unknown_audience_ttl: "0"

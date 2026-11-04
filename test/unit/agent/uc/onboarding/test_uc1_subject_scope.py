@@ -429,7 +429,7 @@ def _stub_post(monkeypatch: pytest.MonkeyPatch, response: _Response) -> list[dic
     return calls
 
 
-def _exchange(**kwargs: str) -> str:
+def _exchange() -> str:
     return launcher.exchange_token(
         "subject-jwt",
         keycloak_url="http://kc.example:8080/",
@@ -437,7 +437,6 @@ def _exchange(**kwargs: str) -> str:
         client_id=AGENT_CLIENT_ID,
         client_secret="s3cret",
         audience="spiffe://x/ns/team1/sa/github-tool",
-        **kwargs,
     )
 
 

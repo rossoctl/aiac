@@ -217,7 +217,7 @@ def test_deny_origin_ignores_an_exchange_refusal() -> None:
     ],
 )
 def test_rejection_doc_unwraps_both_rejection_shapes(code: int | None, body: str, expected: dict | None) -> None:
-    assert launcher.rejection_doc(code, body) == expected
+    assert launcher._rejection().rejection_doc(code, body) == expected
 
 
 @pytest.mark.parametrize("config", ["", "not: [yaml", "- a list", "just text"])

@@ -67,7 +67,8 @@ except Exception: print("")'
 # The audience scopes restore removes, named once: step 1 unlinks the tool scopes WIRE granted, step 3
 # deletes the two workloads' own. Restore must survive a half-torn-down setup, so a failure of
 # k8s/operator-names.py does not stop it: it warns, and steps 1 and 3 skip the audience scopes (an empty
-# name), while the clients, CRs, workloads and Secrets are still removed.
+# name), while the clients, CRs and workloads are still removed; step 6 then warns for each Secret it
+# cannot name, and steps 7 and 8 still run.
 NAMES_OK=1
 AGENT_AUD_SCOPE="$(aud_scope github-agent)" || NAMES_OK=0
 TOOL_AUD_SCOPE="$(aud_scope github-tool)" || NAMES_OK=0
@@ -172,9 +173,13 @@ echo "==> 6. Deleting the github-agent/github-tool client-credentials Secrets in
 # (other workloads have theirs there too). The operator names them deterministically from
 # (namespace, workload): k8s/operator-names.py computes it as rossoctl/operator does, the one copy that
 # the system harness also uses.
+# A failure of operator-names.py skips that Secret with a warning: restore goes on to steps 7 and 8.
 for workload in github-agent github-tool; do
-  secret="$(python3 "$AIAC_DIR/k8s/operator-names.py" secret "$NS" "$workload")"
-  kubectl delete secret "$secret" -n "$NS" --ignore-not-found
+  if secret="$(python3 "$AIAC_DIR/k8s/operator-names.py" secret "$NS" "$workload")" && [ -n "$secret" ]; then
+    kubectl delete secret "$secret" -n "$NS" --ignore-not-found || true
+  else
+    echo "    WARNING: k8s/operator-names.py failed — the ${workload} credentials Secret is not removed" >&2
+  fi
 done
 
 # ── --include-infra: reverse enable.sh's Keycloak-side changes ────────────────

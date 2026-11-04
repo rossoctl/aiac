@@ -507,7 +507,16 @@ mints the downstream token, it records a delegation hop, and OPA builds
 ### Outbound token exchange
 
 `token-exchange-aiac` runs on every outbound request and has no routes and no
-`authproxy-routes` ConfigMap. Adding a target is a Keycloak change only. No
+`authproxy-routes` ConfigMap. One exception, a **bridge** until
+rossoctl/cortex#1540 (#252): a `token-exchange` entry before it, with exactly one
+inline route, `github-tool-mcp` → audience `github-tool`, scopes
+`openid github-tool-aud`, for the demo agent's calls to the production GitHub
+tool, whose Service name is not its ServiceAccount. `default_policy:
+passthrough`, so every other host goes on untouched to `token-exchange-aiac`;
+`routes.file: /dev/null`, so no ConfigMap is read. Verify accepts
+`token-exchange` only in exactly this form (see PRD D36). The cost of the
+`unknown_audience_ttl: "0"` below, including a `503` for a host with no client
+during a Keycloak outage, is weighed in #253. Adding a target is a Keycloak change only. No
 restart is needed: the overlay sets `unknown_audience_ttl: "0"`, so the plugin
 remembers no audience as unknown, and a target whose client is created after
 its caller first called it is exchanged on the next call. (The plugin default

@@ -42,8 +42,20 @@ AIAC_ENTRY = (
 TEMPLATE = '"spiffe://localtest.me/ns/{namespace}/sa/{service}"'
 
 # Configs the check passes.
+# The github-tool-mcp bridge (#252), as k8s/opa-kind-enable.sh renders it: one token-exchange entry before
+# token-exchange-aiac, with exactly its one inline route.
+BRIDGE_ENTRY = (
+    "      - name: token-exchange\n        config:\n"
+    '          default_policy: "passthrough"\n'
+    "          routes:\n            file: /dev/null\n            rules:\n"
+    '              - host: "github-tool-mcp"\n                target_audience: "github-tool"\n'
+    '                token_scopes: "openid github-tool-aud"\n'
+)
+WITH_BRIDGE = CONFIG.replace(AIAC_ENTRY, BRIDGE_ENTRY + AIAC_ENTRY)
+
 PASSING = [
     CONFIG,
+    WITH_BRIDGE,  # the github-tool-mcp bridge (#252)
     CONFIG.replace("          namespace_file:", '          no_token_policy: "deny"\n          namespace_file:'),
     # an empty value: the plugin applies its default, deny
     CONFIG.replace("          namespace_file:", "          no_token_policy:\n          namespace_file:"),
@@ -66,6 +78,20 @@ PASSING = [
 
 # Configs the check rejects; each changes CONFIG.
 SKIPPING = [
+    # the bridge after token-exchange-aiac
+    CONFIG.replace(AIAC_ENTRY, AIAC_ENTRY + BRIDGE_ENTRY),
+    # a second route, or one that asks for the privileged github-full-access
+    WITH_BRIDGE.replace(
+        '                token_scopes: "openid github-tool-aud"\n',
+        '                token_scopes: "openid github-tool-aud"\n              - host: "x"\n'
+        '                target_audience: "y"\n                token_scopes: "z"\n',
+    ),
+    WITH_BRIDGE.replace('"openid github-tool-aud"', '"openid github-tool-aud github-full-access"'),
+    # reads authproxy-routes, or exchanges hosts with no route
+    WITH_BRIDGE.replace("            file: /dev/null\n", ""),
+    WITH_BRIDGE.replace('default_policy: "passthrough"', 'default_policy: "exchange"'),
+    # two token-exchange entries
+    CONFIG.replace(AIAC_ENTRY, BRIDGE_ENTRY + BRIDGE_ENTRY + AIAC_ENTRY),
     # opa before the plugin that sets its identity: OPA decides with no input.identity / input.delegation
     CONFIG.replace(AIAC_ENTRY + "      - name: opa\n", "      - name: opa\n" + AIAC_ENTRY),
     CONFIG.replace(

@@ -13,8 +13,10 @@ line that says what is wrong. The wiring is right when:
   ``token-exchange-aiac`` (``input.identity``, ``input.delegation``). AIAC's
   outbound package is a pass-through (D24) and reads no ``input.mcp``. Other
   parsers may run anywhere: no AIAC policy reads their signals;
-- the **outbound** leg runs ``token-exchange-aiac`` once and ``token-exchange``
-  not at all;
+- the **outbound** leg runs ``token-exchange-aiac`` once, and ``token-exchange`` at
+  most once: only as the github-tool-mcp bridge (before ``token-exchange-aiac``,
+  ``default_policy`` passthrough, no routes file, exactly ``BRIDGE_ROUTE``), until
+  rossoctl/cortex#1540;
 - that ``token-exchange-aiac`` has an ``audience_template`` of the form
   ``spiffe://<td>/...{namespace}...{service}...`` (``<td>`` is the trust domain
   it exchanges for). Without ``{service}`` it names one audience for every call;
@@ -128,11 +130,15 @@ def problem(legs: dict[str, list[dict]], td: str | None) -> str | None:
     if any(n != 1 for n in opa.values()):
         return f"opa per leg: inbound={opa['inbound']}, outbound={opa['outbound']} (want 1 on each leg)"
     new, legacy = names["outbound"].count("token-exchange-aiac"), names["outbound"].count("token-exchange")
-    if new != 1 or legacy != 0:
+    if new != 1 or legacy > 1:
         return (
             f"outbound exchange plugins: token-exchange-aiac={new}, token-exchange={legacy} "
-            "(want 1/0; an older pipeline)"
+            "(want 1 token-exchange-aiac, and at most 1 token-exchange: the github-tool-mcp bridge)"
         )
+    if legacy:
+        wrong = _bridge_problem(legs, names)
+        if wrong:
+            return wrong
     # OPA must run after the plugins that set what AIAC's Rego reads on that leg, or it decides with
     # them undefined: inbound, input.identity (jwt-validation) and input.mcp (mcp-parser, read by a
     # tool's inbound package); outbound, input.identity (token-exchange-aiac). The outbound package is a
@@ -162,6 +168,33 @@ def problem(legs: dict[str, list[dict]], td: str | None) -> str | None:
     if not (isinstance(ttl, str) and _ZERO_DURATION.fullmatch(ttl)):
         shown = "unset (the plugin default, 5m)" if ttl is None else repr(ttl)
         return f"the outbound token-exchange-aiac has unknown_audience_ttl {shown} (want '0'; an older overlay)"
+    return None
+
+
+# The bridge's one route, until rossoctl/cortex#1540 (see k8s/opa-kind-enable.sh): the production tool's
+# Service is not its ServiceAccount, so token-exchange-aiac cannot derive its client.
+BRIDGE_ROUTE = {"host": "github-tool-mcp", "target_audience": "github-tool", "token_scopes": "openid github-tool-aud"}
+
+
+def _bridge_problem(legs: dict[str, list[dict]], names: dict[str, list[str]]) -> str | None:
+    """What is wrong with the outbound ``token-exchange`` entry, or ``None`` when it is the bridge: before
+    ``token-exchange-aiac``, ``default_policy`` passthrough, no routes file, and exactly ``BRIDGE_ROUTE``.
+    Any other route would exchange a host that ``token-exchange-aiac`` should decide, or send a scope (a
+    privileged one, such as ``github-full-access``) that no default scope grants."""
+    outbound = names["outbound"]
+    if outbound.index("token-exchange") > outbound.index("token-exchange-aiac"):
+        return "the outbound token-exchange (the github-tool-mcp bridge) must run before token-exchange-aiac"
+    entry = next(p for p in legs["outbound"] if p.get("name") == "token-exchange")
+    config = entry.get("config") if isinstance(entry.get("config"), dict) else {}
+    routes = config.get("routes") if isinstance(config.get("routes"), dict) else {}
+    if config.get("default_policy") != "passthrough" or routes.get("file") != "/dev/null":
+        return (
+            "the outbound token-exchange is not the github-tool-mcp bridge: it needs default_policy "
+            "passthrough and routes.file /dev/null (no authproxy-routes)"
+        )
+    rules = routes.get("rules")
+    if not (isinstance(rules, list) and len(rules) == 1 and rules[0] == BRIDGE_ROUTE):
+        return f"the outbound token-exchange must have exactly one route, {BRIDGE_ROUTE} (got {rules!r})"
     return None
 
 

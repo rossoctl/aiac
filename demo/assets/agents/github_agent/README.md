@@ -88,8 +88,12 @@ target's audience as a **default** client scope (not granted → 403), and passe
 no Keycloak client matches the derived audience. The host `github-tool-mcp` derives
 `…/sa/github-tool-mcp`, so the production tool must run under a ServiceAccount of that name and be
 enrolled, so that the operator registers that client. Its cortex manifest does not do this yet
-([rossoctl/cortex#1540](https://github.com/rossoctl/cortex/issues/1540)); until it does, a call to
-`github-tool-mcp` passes through un-exchanged. Once it does, grant github-agent the tool's audience
+([rossoctl/cortex#1540](https://github.com/rossoctl/cortex/issues/1540), deferred by cortex). Until it
+does, a **bridge** on the outbound leg exchanges the calls anyway: one `token-exchange` route,
+`github-tool-mcp` → the production tool's client `github-tool` with `openid github-tool-aud`, set by
+`k8s/opa-kind-enable.sh` (#252 removes it). The route requests `github-tool-aud` by name, so the
+agent's client may link it as an optional scope, which is how the cortex demo's `setup_keycloak.py`
+links it. Once the tool is registered, grant github-agent the tool's audience
 scope `agent-<ns>-github-tool-mcp-aud` as a **default** client scope; the UC-1 onboarding demo's WIRE
 phase does this when the scope exists. Do not grant `github-full-access` (the scope the tool reads to
 pick its privileged PAT) the same way: as a default scope it is in every token the agent exchanges, so

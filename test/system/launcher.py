@@ -757,11 +757,6 @@ def opa_decision_error(code: int | None, body: str) -> bool:
     return _rejection().opa_decision_error(code, body)
 
 
-def rejection_doc(code: int | None, body: str) -> dict | None:
-    """See ``k8s/authbridge-rejection.py``."""
-    return _rejection().rejection_doc(code, body)
-
-
 def outbound_outcome(code: int | None, body: str) -> str:
     """See ``k8s/authbridge-rejection.py``."""
     return _rejection().outbound_outcome(code, body)

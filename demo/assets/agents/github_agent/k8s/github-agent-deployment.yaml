@@ -40,8 +40,10 @@
 # audience scope must be a DEFAULT client scope of github-agent. The host
 # "github-tool-mcp" is that target: the production tool keeps its Service name
 # and gets a matching ServiceAccount, enrolled so the operator registers
-# .../sa/github-tool-mcp (rossoctl/cortex#1540). Until then the host names no
-# client, and these calls pass through un-exchanged. The UC-1 onboarding
+# .../sa/github-tool-mcp (rossoctl/cortex#1540). Until then a one-route bridge
+# on the outbound leg (token-exchange, github-tool-mcp -> the production
+# tool's client "github-tool", set by k8s/opa-kind-enable.sh, #252) exchanges
+# these calls. The UC-1 onboarding
 # demo's WIRE phase grants agent-<ns>-github-tool-mcp-aud as a default scope
 # once it exists. It does not grant github-full-access (the scope the tool
 # reads to pick its privileged PAT): as a default scope it would be in every

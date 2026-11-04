@@ -28,8 +28,9 @@
 #   Verify 5   every existing agent and tool pod's authbridge-proxy runs IMAGE_TAG
 #              and is Ready (skipped when the namespace has no such pods)
 #
-# Requires: kubectl, python3 with PyYAML (Verify 1 parses the pipeline with
-# k8s/authbridge-pipeline-check.py); kind, only to re-export a stale kubeconfig.
+# Requires: kubectl; a python3 with PyYAML, the one on PATH or else the repo's .venv
+# (k8s/yaml-python.sh), since Verify 1 parses the pipeline with
+# k8s/authbridge-pipeline-check.py; kind, only to re-export a stale kubeconfig.
 # Env vars (runbook defaults shown):
 #   NS             agent namespace                        (default: team1)
 #   SYS_NS         platform namespace                     (default: rossoctl-system)
@@ -99,7 +100,9 @@ info "runbook: k8s/opa-kind-runbook.md   agent namespace: ${NS}   platform names
 
 step "Preflight — kubectl and cluster"
 command -v kubectl >/dev/null 2>&1 || die "kubectl not found on PATH"
-python3 -c 'import yaml' >/dev/null 2>&1 || die "python3 with PyYAML not found on PATH (Verify 1 parses the pipeline)"
+# shellcheck source=SCRIPTDIR/yaml-python.sh
+. "${SCRIPT_DIR}/yaml-python.sh" "$(cd "$SCRIPT_DIR/.." && pwd)"
+[ -n "$YAML_PYTHON" ] || die "no python3 with PyYAML (on PATH, or the repo's .venv); Verify 1 parses the pipeline"
 # A Kind node container reassigns its API-server host port on restart, which
 # leaves the previously exported kubeconfig pointing at a stale port ("connection
 # refused"). If the cluster is unreachable but the named Kind cluster exists,
@@ -121,13 +124,13 @@ pass "cluster reachable, namespace ${NS} present"
 step "Verify 1 — OPA on both pipeline legs, token-exchange-aiac on the outbound leg"
 # Parsed, per leg (the rule of k8s/authbridge-pipeline-check.py, its docstring lists it): opa once
 # on each leg, after the identity plugin (and, inbound, mcp-parser); outbound token-exchange-aiac once,
-# token-exchange absent (no routes; a leftover token-exchange means the pipeline predates the
-# switch); a spiffe://<td>/...{namespace}...{service}... audience template; no_token_policy deny;
+# token-exchange only as the one-route github-tool-mcp bridge (#252; any other token-exchange means
+# the pipeline predates the switch); a spiffe://<td>/...{namespace}...{service}... audience template; no_token_policy deny;
 # unknown_audience_ttl 0 (no audience is cached as unknown, so no caller needs a restart).
 # The helper reads the ConfigMap itself (kubectl's stderr kept apart from the YAML), and the system
 # harness's skip gate loads the same file. It prints one verdict line on stdout, also when it fails;
 # stderr (a python3 warning) is not the verdict.
-WIRING=$(python3 "$SCRIPT_DIR/authbridge-pipeline-check.py" --namespace "$NS" 2>/dev/null || true)
+WIRING=$("$YAML_PYTHON" "$SCRIPT_DIR/authbridge-pipeline-check.py" --namespace "$NS" 2>/dev/null || true)
 case "$WIRING" in
   "ok trust_domain="*) pass "authbridge-runtime-config: opa on each leg, outbound token-exchange-aiac (${WIRING#ok })" ;;
   *) die "authbridge-runtime-config in ${NS}: ${WIRING:-python3 could not run k8s/authbridge-pipeline-check.py} — run k8s/opa-kind-enable.sh" ;;

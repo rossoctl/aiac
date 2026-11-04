@@ -226,7 +226,8 @@ latest_pod() {
 # check_pipeline_wiring — read authbridge-runtime-config once and check it, parsed per leg, with
 # k8s/authbridge-pipeline-check.py --namespace (the rule of k8s/opa-kind-verify.sh Verify 1 and of the system
 # harness's skip gate; its docstring lists the rule): opa once on each leg, after the identity plugin
-# (and, inbound, mcp-parser); outbound token-exchange-aiac once and token-exchange not at all; a
+# (and, inbound, mcp-parser); outbound token-exchange-aiac once, and token-exchange only as the
+# github-tool-mcp bridge (#252); a
 # spiffe://<td>/...{namespace}...{service}... audience template; no_token_policy deny;
 # unknown_audience_ttl 0, so no phase needs to restart the agent to clear a cached unknown audience. Sets
 # WIRING to the helper's line; fails unless it is ok.
@@ -235,7 +236,7 @@ latest_pod() {
 check_pipeline_wiring() {
   # The helper reads the ConfigMap itself and prints one verdict line on stdout, also when it fails;
   # stderr (a python3 warning) is not the verdict.
-  WIRING=$(python3 "${AIAC_DIR}/k8s/authbridge-pipeline-check.py" --namespace "$NS" 2>/dev/null || true)
+  WIRING=$("$YAML_PYTHON" "${AIAC_DIR}/k8s/authbridge-pipeline-check.py" --namespace "$NS" 2>/dev/null || true)
   case "$WIRING" in "ok trust_domain="*) return 0 ;; *) WIRING="${WIRING:-python3 could not run k8s/authbridge-pipeline-check.py}"; return 1 ;; esac
 }
 
@@ -250,7 +251,7 @@ check_agent_wiring() {
   local cm="authbridge-config-github-agent" cfg wiring
   cfg="$(kubectl get configmap "$cm" -n "$NS" -o jsonpath='{.data.config\.yaml}' 2>/dev/null || true)"
   [ -n "$cfg" ] || die "could not read configmap ${cm} in ${NS} — is github-agent deployed with its AuthBridge sidecar?"
-  wiring="$(printf '%s' "$cfg" | python3 "${AIAC_DIR}/k8s/authbridge-pipeline-check.py" 2>/dev/null || true)"
+  wiring="$(printf '%s' "$cfg" | "$YAML_PYTHON" "${AIAC_DIR}/k8s/authbridge-pipeline-check.py" 2>/dev/null || true)"
   case "$wiring" in
     "ok trust_domain="*) pass "github-agent's own sidecar config (${cm}): ${wiring}" ;;
     *) die "github-agent's own sidecar config (${cm}): ${wiring:-the check could not run} — the agent was admitted before k8s/opa-kind-enable.sh changed the pipeline; run it again (it restarts the agent and tool pods)" ;;
@@ -379,8 +380,10 @@ done
 AGENT_AUD_SCOPE="$(aud_scope github-agent)" || die "k8s/operator-names.py failed"
 TOOL_AUD_SCOPE="$(aud_scope github-tool)" || die "k8s/operator-names.py failed"
 MCP_AUD_SCOPE="$(aud_scope github-tool-mcp)" || die "k8s/operator-names.py failed"
-python3 -c 'import yaml' >/dev/null 2>&1 \
-  || die "python3 has no PyYAML (the preflight parses the AuthBridge pipeline with k8s/authbridge-pipeline-check.py)"
+# shellcheck source=SCRIPTDIR/../../../k8s/yaml-python.sh
+. "${AIAC_DIR}/k8s/yaml-python.sh" "$AIAC_DIR"
+[ -n "$YAML_PYTHON" ] \
+  || die "no python3 with PyYAML (on PATH, or the repo's .venv); the preflight parses the AuthBridge pipeline with k8s/authbridge-pipeline-check.py"
 if ! kubectl cluster-info >/dev/null 2>&1; then
   if command -v kind >/dev/null 2>&1 && kind get clusters 2>/dev/null | grep -qx "$KIND_CLUSTER"; then
     info "cluster unreachable — re-exporting kubeconfig for Kind cluster '${KIND_CLUSTER}'"
@@ -494,23 +497,26 @@ phase_verify_trigger() {
   # seconds and a liveness restart wipes entirely, so a log grep false-negatives even when both
   # events WERE consumed. Poll the scopes as the authoritative signal; the log line is shown only as
   # best-effort supplementary evidence when it happens to still be present.
-  local ev_deadline=$((SECONDS + POLL_SECS)) agent_seen="" tool_seen=""
+  # scope_id_in (lib/keycloak.sh): an id when the scope exists, "absent" when the list was read and has
+  # none, "" when the list could not be read. A failed read is retried but counted, so the timeout says
+  # it was Keycloak, not a missing onboarding.
+  local ev_deadline=$((SECONDS + POLL_SECS)) agent_seen="" tool_seen="" read_failures=0
   while :; do
     ADMIN="$(admin_token)"
-    local scopes_json
-    scopes_json=$(curl -s -H "Authorization: Bearer ${ADMIN}" "${KC}/admin/realms/${REALM}/client-scopes" 2>/dev/null || true)
-    agent_seen=$(printf '%s' "$scopes_json" | SCOPE="$AGENT_AUD_SCOPE" python3 -c '
-import sys, json, os
-try: names = {s.get("name") for s in json.load(sys.stdin)}
-except Exception: names = set()
-print("yes" if os.environ["SCOPE"] in names else "")' 2>/dev/null || true)
-    tool_seen=$(printf '%s' "$scopes_json" | SCOPE="$TOOL_AUD_SCOPE" python3 -c '
-import sys, json, os
-try: names = {s.get("name") for s in json.load(sys.stdin)}
-except Exception: names = set()
-print("yes" if os.environ["SCOPE"] in names else "")' 2>/dev/null || true)
+    local scopes_json agent_id tool_id
+    scopes_json="$(realm_client_scopes "$ADMIN")"
+    agent_id="$(scope_id_in "$AGENT_AUD_SCOPE" <<<"$scopes_json")"
+    tool_id="$(scope_id_in "$TOOL_AUD_SCOPE" <<<"$scopes_json")"
+    if [ -z "$agent_id" ] || [ -z "$tool_id" ]; then
+      read_failures=$((read_failures + 1))
+    else
+      agent_seen=""; [ "$agent_id" != absent ] && agent_seen=yes
+      tool_seen=""; [ "$tool_id" != absent ] && tool_seen=yes
+    fi
     [ -n "$agent_seen" ] && [ -n "$tool_seen" ] && break
     if [ "$SECONDS" -ge "$ev_deadline" ]; then
+      [ "$read_failures" -eq 0 ] \
+        || warn "the realm's client-scopes could not be read ${read_failures} time(s) while waiting — check Keycloak (kubectl logs statefulset/keycloak -n keycloak)"
       die "AIAC did not provision both services' Keycloak audience scopes (agent=${agent_seen:-no}, tool=${tool_seen:-no}) after ${POLL_SECS}s — it may not have consumed both aiac.apply.service events. Check: kubectl logs deployment/aiac-agent -n ${AIAC_NS}; kubectl logs statefulset/keycloak -n keycloak | grep -i aiac-event-listener"
     fi
     sleep 5
