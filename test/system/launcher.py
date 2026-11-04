@@ -878,7 +878,8 @@ def combiner_reason(default_cr: dict | None, *, namespace: str = BUNDLE_SERVICE_
 def pipeline_check(config_yaml: str, *, namespace: str) -> tuple[str | None, str | None]:
     """``(skip_reason, trust_domain)`` of the AuthBridge runtime config ``config_yaml``
     (``authbridge-runtime-config`` ``config.yaml``) of ``namespace``, parsed once. It loads
-    ``k8s/authbridge-pipeline-check.py`` on first use; a missing file is a skip reason.
+    ``k8s/authbridge-pipeline-check.py`` on first use, and the other shared ``k8s/`` files the run needs
+    (``authbridge-rejection.py``, ``operator-names.py``); a missing or broken one is a skip reason.
     ``skip_reason`` is ``None`` when the config is wired for the harness: the rule of
     ``k8s/authbridge-pipeline-check.py`` (``check``), the same file ``k8s/opa-kind-verify.sh`` (Verify 1)
     runs — ``opa`` once on each leg, ``token-exchange-aiac`` once on the outbound leg, and ``token-exchange`` only as the one
@@ -891,6 +892,7 @@ def pipeline_check(config_yaml: str, *, namespace: str) -> tuple[str | None, str
         import yaml  # noqa: F401 — check() imports it when it parses: name a missing PyYAML up front
 
         _rejection()  # the outbound classifiers' file: a missing or broken one skips here, not in a poll
+        _load_k8s_module("operator-names")  # the slate and the teardown name Keycloak objects with it
     except ImportError as exc:  # a shared file or PyYAML is missing: skip, never crash the gate
         return f"cannot apply the shared wiring check: {exc}", None
     problem, trust_domain = check(config_yaml)

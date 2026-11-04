@@ -172,12 +172,6 @@ die()  {
   exit 1
 }
 
-expect_eq() {
-  local label="$1" got="$2" want="$3"
-  if [ "$got" = "$want" ]; then pass "${label}: got '${got}' (expected '${want}')"
-  else die "${label}: got '${got}', expected '${want}'"; fi
-}
-
 # ── Keycloak admin helpers ───────────────────────────────────────────────────
 # Prints "" (exit 0) rather than raising when Keycloak returns a non-JSON/empty body — under
 # `set -euo pipefail` a raising python3 would abort the phase with a traceback instead of letting the
@@ -210,13 +204,6 @@ client_uuid_by_name() {
   local name="$1" admin="$2"
   curl -s -H "Authorization: Bearer ${admin}" "${KC}/admin/realms/${REALM}/clients" \
     | CLIENT_NAME="$name" json_eval 'next((c["id"] for c in d if c.get("name") == os.environ["CLIENT_NAME"]), "")'
-}
-
-# scope_id_by_name <name> <admin_token> — scope_id_in's answer for <name>, from a fresh read of the
-# realm's client-scopes.
-scope_id_by_name() {
-  local name="$1" admin="$2"
-  realm_client_scopes "$admin" | scope_id_in "$name"
 }
 
 latest_pod() {
@@ -653,6 +640,10 @@ phase_wire_outbound() {
   # not part of this demo). Its calls are exchanged once that tool is registered as
   # .../sa/github-tool-mcp (rossoctl/cortex#1540): then grant its audience scope, as a DEFAULT scope (the
   # plugin requests no scope). Absent, it is skipped: this demo's probes call the stub github-tool only.
+  # The grant is needed with the bridge too (k8s/opa-kind-enable.sh, #252): token-exchange-aiac still
+  # sees each bridged call, and once .../sa/github-tool-mcp exists it exchanges the bridge's token for it.
+  # Keycloak accepts that token (its azp is github-agent), but only for a granted audience: without this
+  # default link, every bridged call would get a 403 audience_not_granted.
   # github-full-access, the scope the tool reads to pick its privileged PAT, is NOT granted: as a default
   # scope it would be in every token github-agent exchanges, so every user would get the privileged PAT.
   # A per-user grant is the cortex demo's design question (rossoctl/cortex#1540).
@@ -815,7 +806,7 @@ phase_enforce() {
   ROPC_UUID="$(curl -s -H "Authorization: Bearer ${ADMIN}" "${KC}/admin/realms/${REALM}/clients?clientId=${ROPC_CLIENT_ID}" \
     | json_eval 'd[0]["id"]')"
   [ -n "$ROPC_UUID" ] || die "ROPC client '${ROPC_CLIENT_ID}' not found in realm '${REALM}'"
-  AUD_SCOPE_ID="$(scope_id_by_name "$AUD_SCOPE" "$ADMIN")"
+  AUD_SCOPE_ID="$(realm_client_scopes "$ADMIN" | scope_id_in "$AUD_SCOPE")"
   [ -n "$AUD_SCOPE_ID" ] || die "could not read the realm's client-scopes"
   [ "$AUD_SCOPE_ID" != absent ] || die "client-scope '${AUD_SCOPE}' not found — has github-agent onboarded yet?"
   ALREADY="$(curl -s -H "Authorization: Bearer ${ADMIN}" "${KC}/admin/realms/${REALM}/clients/${ROPC_UUID}/default-client-scopes" \
@@ -864,21 +855,23 @@ phase_enforce() {
   # sidecar may also not have read its credentials yet (EXCHANGE_REFUSED ... upstream.token-exchange-failed).
   # An audience the agent saw as unknown is never cached (unknown_audience_ttl 0, checked at preflight),
   # so a 401 from github-tool is a real audience refusal and stops at once.
+  # A failed kubectl exec (probe_tool prints nothing) is also waited out: the operator may still be
+  # replacing the agent pod, and latest_pod can name the one that is terminating.
   # dev-user -> source-read is the allow that proves all of it is current. Poll it for one bundle cycle
   # (BUNDLE_WAIT_SECS), so these are waited out, but a real deny is still reported within minutes. A
-  # refusal of the audience or the bearer, or an exec error, never clears by waiting: it stops at once.
+  # refusal of the audience or the bearer, or a failed login, never clears by waiting: it stops at once.
   local dev_deadline=$((SECONDS + BUNDLE_WAIT_SECS))
   step "Waiting for the final bundles: dev-user -> source-read allowed [up to ${BUNDLE_WAIT_SECS}s]"
   while :; do
     DEV_SOURCE_READ="$(probe_tool dev-user source-read)"
     [ "$DEV_SOURCE_READ" = "ALLOWED_RESULT" ] && break
     case "$DEV_SOURCE_READ" in
-      "DENIED_HTTP 403" | DENIED_JSONRPC | "UNEXPECTED 503 "* | "UNEXPECTED 200 upstream.unreachable "* \
-        | "EXCHANGE_REFUSED "*" upstream.token-exchange-failed") ;;
+      "" | "ERROR no agent pod" | "DENIED_HTTP 403" | DENIED_JSONRPC | "UNEXPECTED 503 "* \
+        | "UNEXPECTED 200 upstream.unreachable "* | "EXCHANGE_REFUSED "*" upstream.token-exchange-failed") ;;
       *) break ;;
     esac
     [ "$SECONDS" -lt "$dev_deadline" ] || break
-    info "dev-user -> source-read: ${DEV_SOURCE_READ} — an OPA may not have its last bundle yet; retrying"
+    info "dev-user -> source-read: ${DEV_SOURCE_READ:-<no verdict: kubectl exec failed>} — an OPA may not have its last bundle yet, or the agent pod is being replaced; retrying"
     sleep 10
   done
   [ "$DEV_SOURCE_READ" = "ALLOWED_RESULT" ] \

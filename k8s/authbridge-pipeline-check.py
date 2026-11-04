@@ -158,13 +158,14 @@ def problem(legs: dict[str, list[dict]], td: str | None) -> str | None:
         )
     # Unset, or an empty value (YAML null, ""): the plugin applies its default, deny. Anything else must
     # be the string "deny" (``false`` or ``0`` is not unset).
-    policy = _exchange_config(legs).get("no_token_policy")
+    exchange = _exchange_config(legs)
+    policy = exchange.get("no_token_policy")
     if policy not in (None, "", "deny"):
         return f"the outbound token-exchange-aiac has no_token_policy {policy!r} (want 'deny'; an older overlay)"
     # A string, as the plugin reads it: its config field is a Go string parsed with time.ParseDuration, so a
     # bare YAML 0 (an int) fails the sidecar's start (cortex core/plugins/tokenexchangeaiac/plugin.go,
     # Configure: json.Decode into a string field).
-    ttl = _exchange_config(legs).get("unknown_audience_ttl")
+    ttl = exchange.get("unknown_audience_ttl")
     if not (isinstance(ttl, str) and _ZERO_DURATION.fullmatch(ttl)):
         shown = "unset (the plugin default, 5m)" if ttl is None else repr(ttl)
         return f"the outbound token-exchange-aiac has unknown_audience_ttl {shown} (want '0'; an older overlay)"

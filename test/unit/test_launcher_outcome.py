@@ -511,6 +511,22 @@ def test_pipeline_check_skips_when_the_classifier_file_is_missing(
     assert trust_domain is None
 
 
+def test_pipeline_check_skips_when_the_operator_names_file_is_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The gate also loads ``k8s/operator-names.py``: the pre-run slate and the teardown name Keycloak
+    objects with it, so without it the live suite skips up front, not in the teardown."""
+    real = launcher.K8S_DIR
+    for name in ("authbridge-pipeline-check.py", "authbridge-rejection.py"):
+        (tmp_path / name).write_text((real / name).read_text())
+    monkeypatch.setattr(launcher, "K8S_DIR", tmp_path)
+    for key in ("_aiac_k8s_authbridge_pipeline_check", "_aiac_k8s_authbridge_rejection", "_aiac_k8s_operator_names"):
+        monkeypatch.delitem(sys.modules, key, raising=False)
+    reason, trust_domain = launcher.pipeline_check(_CONFIG, namespace="team1")
+    assert reason is not None and "operator-names.py is missing" in reason
+    assert trust_domain is None
+
+
 @pytest.mark.parametrize(
     ("template", "expected"),
     [

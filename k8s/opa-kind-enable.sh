@@ -427,11 +427,13 @@ cat > "$OVERLAY_FILE" <<YAML
 #     user the privileged PAT, D36). No authproxy-routes ConfigMap: the route
 #     is inline, and routes.file is /dev/null so a leftover ConfigMap is not
 #     read. Remove this entry when the production tool is registered as
-#     .../sa/github-tool-mcp (#252), in the same change: token-exchange-aiac
-#     still offers the bridge's token to Keycloak for .../sa/github-tool-mcp.
-#     With no such client the answer is "Audience not found" and the call
-#     passes on; once the client exists, Keycloak refuses that subject token
-#     ("Client is not within the token audience") and each call gets a 503.
+#     .../sa/github-tool-mcp (#252). token-exchange-aiac still offers each
+#     bridged call to Keycloak for .../sa/github-tool-mcp: with no such client
+#     the answer is "Audience not found" and the call passes on with the
+#     bridge's token. Once the client exists, a caller granted its audience
+#     scope (the demo's WIRE grants it as soon as it exists) gets a token for
+#     .../sa/github-tool-mcp, and this entry is only an extra hop; a caller
+#     not granted it gets a 403.
 #   - unknown_audience_ttl: "0" — the plugin remembers no audience as unknown
 #     (default 5m). With the default, a caller that called a target before
 #     the target's Keycloak client existed keeps passing its calls through
