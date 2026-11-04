@@ -514,7 +514,11 @@ inline route, `github-tool-mcp` → audience `github-tool`, scopes
 tool, whose Service name is not its ServiceAccount. `default_policy:
 passthrough`, so every other host goes on untouched to `token-exchange-aiac`;
 `routes.file: /dev/null`, so no ConfigMap is read. Verify accepts
-`token-exchange` only in exactly this form (see PRD D36). The cost of the
+`token-exchange` only in exactly this form (see PRD D36). `token-exchange-aiac`
+still sees each bridged call; Keycloak answers "Audience not found" for
+`…/sa/github-tool-mcp`, so it passes on with the bridge's token. Once that
+client exists, the exchange fails and the call gets a `503`, so remove the
+bridge in the change that registers the tool. The cost of the
 `unknown_audience_ttl: "0"` below, including a `503` for a host with no client
 during a Keycloak outage, is weighed in #253. Adding a target is a Keycloak change only. No
 restart is needed: the overlay sets `unknown_audience_ttl: "0"`, so the plugin

@@ -201,6 +201,9 @@ if [ "$DO_INFRA" -eq 1 ]; then
   kubectl rollout status "statefulset/${KEYCLOAK_STATEFULSET}" -n "$KEYCLOAK_NAMESPACE" --timeout=180s
 fi
 
+# The verify command below names a Python with PyYAML, the one the other scripts use.
+. "${AIAC_DIR}/k8s/yaml-python.sh" "$AIAC_DIR"
+
 cat <<EOF
 ==> Done. github-agent/github-tool and their Keycloak clients are fully removed — the next
     ./driver.sh run's DEPLOY phase will be a genuine first-time trigger again.
@@ -214,5 +217,5 @@ script with --include-infra to reverse those too.")
 Verify the pipeline wiring is unaffected by this restore (still "ok trust_domain=..." — this
 script never touches the OPA overlay from k8s/opa-kind-enable.sh):
   kubectl get configmap authbridge-runtime-config -n ${NS} \\
-    -o jsonpath='{.data.config\.yaml}' | python3 ${AIAC_DIR}/k8s/authbridge-pipeline-check.py
+    -o jsonpath='{.data.config\.yaml}' | ${YAML_PYTHON:-python3} ${AIAC_DIR}/k8s/authbridge-pipeline-check.py
 EOF

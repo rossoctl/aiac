@@ -881,10 +881,10 @@ def pipeline_check(config_yaml: str, *, namespace: str) -> tuple[str | None, str
     ``k8s/authbridge-pipeline-check.py`` on first use; a missing file is a skip reason.
     ``skip_reason`` is ``None`` when the config is wired for the harness: the rule of
     ``k8s/authbridge-pipeline-check.py`` (``check``), the same file ``k8s/opa-kind-verify.sh`` (Verify 1)
-    runs — ``opa`` once on each leg, ``token-exchange-aiac`` once and ``token-exchange`` not at all on the
-    outbound leg, ``opa`` after the identity plugin (and inbound mcp-parser) on each leg, a
-    ``spiffe://<td>/...{namespace}...{service}...`` audience template, and ``no_token_policy`` deny
-    (or unset). ``trust_domain`` is that ``<td>``, the
+    runs — ``opa`` once on each leg, ``token-exchange-aiac`` once on the outbound leg, and ``token-exchange`` only as the one
+    ``github-tool-mcp`` bridge before it (#252), ``opa`` after the identity plugin (and inbound mcp-parser) on each leg, a
+    ``spiffe://<td>/...{namespace}...{service}...`` audience template, ``no_token_policy`` deny
+    (or unset), and ``unknown_audience_ttl`` a zero duration. ``trust_domain`` is that ``<td>``, the
     trust domain the live leg exchanges for (``k8s/opa-kind-enable.sh`` takes it from the chart)."""
     try:
         check = _load_k8s_module("authbridge-pipeline-check").check

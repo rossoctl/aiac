@@ -642,13 +642,12 @@ phase_wire_outbound() {
   [ -n "$ADMIN" ] || die "could not obtain a Keycloak master admin token"
   AGENT_UUID="$(client_uuid_by_name "${NS}/github-agent" "$ADMIN")"
   [ -n "$AGENT_UUID" ] || die "could not resolve the Keycloak client uuid for ${NS}/github-agent"
-  local tool_aud scopes
-  tool_aud="$TOOL_AUD_SCOPE"
+  local scopes
   scopes="$(realm_client_scopes "$ADMIN")"  # read once: both scopes below are looked up in it
-  SCOPE_ID="$(scope_id_in "$tool_aud" <<<"$scopes")"
+  SCOPE_ID="$(scope_id_in "$TOOL_AUD_SCOPE" <<<"$scopes")"
   [ -n "$SCOPE_ID" ] || die "could not read the realm's client-scopes"
-  [ "$SCOPE_ID" != absent ] || die "client-scope '${tool_aud}' not found — has github-tool onboarded yet?"
-  grant_default_scope "$tool_aud" "$SCOPE_ID"
+  [ "$SCOPE_ID" != absent ] || die "client-scope '${TOOL_AUD_SCOPE}' not found — has github-tool onboarded yet?"
+  grant_default_scope "$TOOL_AUD_SCOPE" "$SCOPE_ID"
 
   # The agent's own MCP_URL targets the production tool, github-tool-mcp (the cortex github-issue demo,
   # not part of this demo). Its calls are exchanged once that tool is registered as
@@ -657,16 +656,15 @@ phase_wire_outbound() {
   # github-full-access, the scope the tool reads to pick its privileged PAT, is NOT granted: as a default
   # scope it would be in every token github-agent exchanges, so every user would get the privileged PAT.
   # A per-user grant is the cortex demo's design question (rossoctl/cortex#1540).
-  local mcp_aud mcp_id
-  mcp_aud="$MCP_AUD_SCOPE"
-  mcp_id="$(scope_id_in "$mcp_aud" <<<"$scopes")"  # the list was read above, and read fine
+  local mcp_id
+  mcp_id="$(scope_id_in "$MCP_AUD_SCOPE" <<<"$scopes")"  # the list was read above, and read fine
   if [ "$mcp_id" != absent ]; then
     # Best effort: this demo never probes the production tool, so a failed grant warns, never stops WIRE.
-    grant_default_scope "$mcp_aud" "$mcp_id" best-effort \
+    grant_default_scope "$MCP_AUD_SCOPE" "$mcp_id" best-effort \
       || warn "github-tool-mcp's calls from github-agent stay un-exchanged"
     info "github-full-access is not granted: github-tool-mcp uses its public PAT for every user (rossoctl/cortex#1540)"
   else
-    info "client-scope '${mcp_aud}' not found — the production github-tool-mcp is not registered (rossoctl/cortex#1540); skipped"
+    info "client-scope '${MCP_AUD_SCOPE}' not found — the production github-tool-mcp is not registered (rossoctl/cortex#1540); skipped"
   fi
 
   # token-exchange-aiac (k8s/opa-kind-enable.sh) derives the github-tool audience from the host —
