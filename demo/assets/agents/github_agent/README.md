@@ -79,5 +79,23 @@ See [`../../INSTALL.md`](../../INSTALL.md) — the single install guide for this
 A2A client ──(JSON-RPC /)──► github-agent (:8000)
                                  │  CrewAI: prereq extract → researcher
                                  └──(streamable-http, MCP_URL)──► github-tool-mcp:9090/mcp ──► GitHub
-      (AuthBridge sidecar: inbound JWT validation; outbound RFC-8693 token exchange for MCP_URL host)
+      (AuthBridge sidecar: inbound JWT validation; outbound RFC-8693 token exchange via token-exchange-aiac,
+       audience derived from the MCP_URL host as spiffe://<trust-domain>/ns/<ns>/sa/<host>)
 ```
+
+`token-exchange-aiac` needs no route: it exchanges only when the agent's Keycloak client has the
+target's audience as a **default** client scope (not granted → 403), and passes through unchanged when
+no Keycloak client matches the derived audience. The host `github-tool-mcp` derives
+`…/sa/github-tool-mcp`, so the production tool must run under a ServiceAccount of that name and be
+enrolled, so that the operator registers that client. Its cortex manifest does not do this yet
+([rossoctl/cortex#1540](https://github.com/rossoctl/cortex/issues/1540), deferred by cortex). Until it
+does, a **bridge** on the outbound leg exchanges the calls anyway: one `token-exchange` route,
+`github-tool-mcp` → the production tool's client `github-tool` with `openid github-tool-aud`, set by
+`k8s/opa-kind-enable.sh` (#252 removes it). The route requests `github-tool-aud` by name, so the
+agent's client may link it as an optional scope, which is how the cortex demo's `setup_keycloak.py`
+links it. Once the tool is registered, grant github-agent the tool's audience
+scope `agent-<ns>-github-tool-mcp-aud` as a **default** client scope; the UC-1 onboarding demo's WIRE
+phase does this when the scope exists. Do not grant `github-full-access` (the scope the tool reads to
+pick its privileged PAT) the same way: as a default scope it is in every token the agent exchanges, so
+every user would get the privileged PAT. The tool then uses its public PAT; a per-user grant is part
+of rossoctl/cortex#1540.

@@ -13,8 +13,8 @@
 #   Phase VERIFY-TRIGGER  poll Keycloak for the brand-new clients, aiac-agent logs for evidence it
 #                         consumed both over NATS, and the two AuthorizationPolicy CRs AIAC wrote
 #                         (one per managed service, D20: github-agent AND github-tool).
-#   Phase WIRE            wire AuthBridge's own outbound leg (authproxy-routes + optional
-#                         client-scope) — demo-owned wiring the platform runbook
+#   Phase WIRE            wire AuthBridge's own outbound leg (the github-tool audience as a DEFAULT
+#                         client-scope of github-agent; token-exchange-aiac needs no route) — demo-owned wiring the platform runbook
 #                         (k8s/opa-kind-runbook.md) leaves out; AIAC's own onboarding does not do this.
 #   Phase ENFORCE         real HTTP probes through the live AuthBridge OPA plugin, reproducing
 #                         #646's acceptance table.
@@ -65,6 +65,9 @@
 #                         after that, so a smaller value makes the failure unrecoverable in-run. Each
 #                         phase still breaks the instant its condition is met, so a healthy run is fast.
 #   DEPLOY_WAIT_SECS      max seconds to wait for pods to become Ready after deploy   (default: 180)
+#   BUNDLE_WAIT_SECS      max seconds ENFORCE waits for the OPAs of github-tool and github-agent to load
+#                         their last bundles before dev-user's allow is a failure (default: 180, one
+#                         bundle poll cycle; whole seconds)
 #   TRIGGER_WAIT_SECS     max seconds --only-replay-trigger waits for the operator to re-register
 #                         fresh Keycloak client uuids                          (default: 180)
 #   KIND_CLUSTER          name of the Kind cluster                             (default: rossoctl)
@@ -95,6 +98,9 @@ USER_PASSWORD="${USER_PASSWORD:-password}"
 # minutes BEFORE the retry it was waiting for — observed 2026-09-30, where onboarding self-healed at
 # 14:38 having failed at 14:28, but the run had already died at 14:33. 720s leaves room for one.
 POLL_SECS="${POLL_SECS:-720}"
+BUNDLE_WAIT_SECS="${BUNDLE_WAIT_SECS:-180}"
+# Whole seconds, no leading zero: bash arithmetic reads "090" as octal, and fails on it.
+case "$BUNDLE_WAIT_SECS" in *[!0-9]*|0?*) echo "BUNDLE_WAIT_SECS must be a whole number of seconds, got '${BUNDLE_WAIT_SECS}'" >&2; exit 2 ;; esac
 DEPLOY_WAIT_SECS="${DEPLOY_WAIT_SECS:-180}"
 TRIGGER_WAIT_SECS="${TRIGGER_WAIT_SECS:-180}"
 KIND_CLUSTER="${KIND_CLUSTER:-rossoctl}"
@@ -166,12 +172,6 @@ die()  {
   exit 1
 }
 
-expect_eq() {
-  local label="$1" got="$2" want="$3"
-  if [ "$got" = "$want" ]; then pass "${label}: got '${got}' (expected '${want}')"
-  else die "${label}: got '${got}', expected '${want}'"; fi
-}
-
 # ── Keycloak admin helpers ───────────────────────────────────────────────────
 # Prints "" (exit 0) rather than raising when Keycloak returns a non-JSON/empty body — under
 # `set -euo pipefail` a raising python3 would abort the phase with a traceback instead of letting the
@@ -194,20 +194,9 @@ try: print(json.load(sys.stdin).get("access_token","") or "")
 except Exception: print("")'
 }
 
-# json_eval <python-expr> — evaluate <python-expr> over the JSON on stdin (bound to `d`; env vars via
-# `os.environ`) and print the result. Prints "" (exit 0) instead of raising when the body is not the
-# expected JSON — a Keycloak error object, an empty list, an unreachable server — so the caller's
-# `[ -n ... ] || die` guard reports it, rather than `set -e` killing the script on a traceback.
-json_eval() {
-  python3 -c '
-import sys, json, os
-try:
-    d = json.load(sys.stdin)
-    r = eval(sys.argv[1])
-except Exception:
-    r = ""
-print("" if r is None else r)' "$1"
-}
+# json_eval, aud_scope, realm_client_scopes and scope_id_in: one copy, shared with restore.sh.
+# shellcheck source=SCRIPTDIR/lib/keycloak.sh
+. "${SCRIPT_DIR}/lib/keycloak.sh"
 
 # client_uuid_by_name <name> <admin_token> — Keycloak clients are looked up by the "name" DISPLAY
 # field (e.g. "team1/github-agent"), not clientId. Prints "" if not found (caller checks).
@@ -217,22 +206,50 @@ client_uuid_by_name() {
     | CLIENT_NAME="$name" json_eval 'next((c["id"] for c in d if c.get("name") == os.environ["CLIENT_NAME"]), "")'
 }
 
-# scope_id_by_name <name> <admin_token> — the realm client-scope's id, or "" if absent (caller checks).
-scope_id_by_name() {
-  local name="$1" admin="$2"
-  curl -s -H "Authorization: Bearer ${admin}" "${KC}/admin/realms/${REALM}/client-scopes" \
-    | SCOPE_NAME="$name" json_eval 'next((s["id"] for s in d if s.get("name") == os.environ["SCOPE_NAME"]), "")'
-}
-
 latest_pod() {
   kubectl get pod -n "$NS" -l "$1" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null
 }
 
-# scope_linked <admin> <client-uuid> <default|optional>  — read only (GET). Print "yes" when the
-# client links the client scope aiac-username-sub as that kind of scope, "no" when it does not, and
-# "error" when the admin API reply is not a list.
+# check_pipeline_wiring — read authbridge-runtime-config once and check it, parsed per leg, with
+# k8s/authbridge-pipeline-check.py --namespace (the rule of k8s/opa-kind-verify.sh Verify 1 and of the system
+# harness's skip gate; its docstring lists the rule): opa once on each leg, after the identity plugin
+# (and, inbound, mcp-parser); outbound token-exchange-aiac once, and token-exchange only as the
+# github-tool-mcp bridge (#252); a
+# spiffe://<td>/...{namespace}...{service}... audience template; no_token_policy deny;
+# unknown_audience_ttl 0, so no phase needs to restart the agent to clear a cached unknown audience. Sets
+# WIRING to the helper's line; fails unless it is ok.
+# The demo ships no authproxy-routes, so on the stock pipeline (token-exchange with routes) ENFORCE
+# would see un-exchanged calls that github-tool rejects, reported as policy failures.
+check_pipeline_wiring() {
+  # The helper reads the ConfigMap itself and prints one verdict line on stdout, also when it fails;
+  # stderr (a python3 warning) is not the verdict.
+  WIRING=$("$YAML_PYTHON" "${AIAC_DIR}/k8s/authbridge-pipeline-check.py" --namespace "$NS" 2>/dev/null || true)
+  case "$WIRING" in "ok trust_domain="*) return 0 ;; *) WIRING="${WIRING:-python3 could not run k8s/authbridge-pipeline-check.py}"; return 1 ;; esac
+}
+
+# check_agent_wiring — the same check on github-agent's own sidecar config, authbridge-config-github-agent.
+# The sidecar runs that per-agent ConfigMap, not authbridge-runtime-config, which preflight checks. The
+# operator webhook rebuilds it from authbridge-runtime-config only when it admits an agent pod (rossoctl/
+# operator pod_mutator.go ensurePerAgentConfigMap); a change to authbridge-runtime-config makes the
+# operator roll the agent out, and the sidecar hot-reloads its file (cortex core/reloader). Until that
+# rollout has run, the agent's own config can still carry the old pipeline (for example a 5 min
+# unknown-audience cache). WIRE and ENFORCE restart nothing, so they check the config the agent runs.
+check_agent_wiring() {
+  local cm="authbridge-config-github-agent" cfg wiring
+  cfg="$(kubectl get configmap "$cm" -n "$NS" -o jsonpath='{.data.config\.yaml}' 2>/dev/null || true)"
+  [ -n "$cfg" ] || die "could not read configmap ${cm} in ${NS} — is github-agent deployed with its AuthBridge sidecar?"
+  wiring="$(printf '%s' "$cfg" | "$YAML_PYTHON" "${AIAC_DIR}/k8s/authbridge-pipeline-check.py" 2>/dev/null || true)"
+  case "$wiring" in
+    "ok trust_domain="*) pass "github-agent's own sidecar config (${cm}): ${wiring}" ;;
+    *) die "github-agent's own sidecar config (${cm}): ${wiring:-the check could not run} — the agent was admitted before k8s/opa-kind-enable.sh changed the pipeline; run it again (it restarts the agent and tool pods)" ;;
+  esac
+}
+
+# scope_linked <admin> <client-uuid> <default|optional> [scope-name]  — read only (GET). Print "yes"
+# when the client links the client scope (default: aiac-username-sub) as that kind of scope, "no" when
+# it does not, and "error" when the admin API reply is not a list.
 scope_linked() {
-  local admin="$1" cid="$2" kind="$3" res
+  local admin="$1" cid="$2" kind="$3" scope="${4:-$SUBJECT_SCOPE}" res
   res=$(curl -s -H "Authorization: Bearer $admin" \
           "${KC}/admin/realms/${REALM}/clients/${cid}/${kind}-client-scopes" \
         | python3 -c 'import sys,json
@@ -240,7 +257,7 @@ try: d=json.load(sys.stdin)
 except Exception: d=None
 if not isinstance(d,list): print("error")
 else: print("yes" if any(isinstance(s,dict) and s.get("name")==sys.argv[1] for s in d) else "no")' \
-            "$SUBJECT_SCOPE" 2>/dev/null || true)
+            "$scope" 2>/dev/null || true)
   printf '%s' "${res:-error}"
 }
 
@@ -329,8 +346,6 @@ collect_logs() {
     >"${dir}/authorizationpolicy-github-agent.yaml" 2>&1 || true
   kubectl get "$POLICY_CR" github-tool -n "$NS" -o yaml \
     >"${dir}/authorizationpolicy-github-tool.yaml" 2>&1 || true
-  kubectl get configmap authproxy-routes -n "$NS" -o yaml \
-    >"${dir}/cm-authproxy-routes.yaml" 2>&1 || true
   kubectl get configmap authbridge-runtime-config -n "$NS" -o yaml \
     >"${dir}/cm-authbridge-runtime-config.yaml" 2>&1 || true
   kubectl get pods -n "$NS" -o wide      >"${dir}/pods-${NS}.txt" 2>&1 || true
@@ -347,6 +362,15 @@ step "Preflight"
 for c in kubectl curl python3; do
   command -v "$c" >/dev/null 2>&1 || die "missing required command on PATH: $c"
 done
+# The audience scopes this driver reads, named once, after the python3 check above. A failure of
+# k8s/operator-names.py stops the driver here, not as an empty name inside a poll loop.
+AGENT_AUD_SCOPE="$(aud_scope github-agent)" || die "k8s/operator-names.py failed"
+TOOL_AUD_SCOPE="$(aud_scope github-tool)" || die "k8s/operator-names.py failed"
+MCP_AUD_SCOPE="$(aud_scope github-tool-mcp)" || die "k8s/operator-names.py failed"
+# shellcheck source=SCRIPTDIR/../../../k8s/yaml-python.sh
+. "${AIAC_DIR}/k8s/yaml-python.sh" "$AIAC_DIR"
+[ -n "$YAML_PYTHON" ] \
+  || die "no python3 with PyYAML (on PATH, or the repo's .venv); the preflight parses the AuthBridge pipeline with k8s/authbridge-pipeline-check.py"
 if ! kubectl cluster-info >/dev/null 2>&1; then
   if command -v kind >/dev/null 2>&1 && kind get clusters 2>/dev/null | grep -qx "$KIND_CLUSTER"; then
     info "cluster unreachable — re-exporting kubeconfig for Kind cluster '${KIND_CLUSTER}'"
@@ -358,9 +382,7 @@ kubectl get deployment aiac-agent -n "$AIAC_NS" >/dev/null 2>&1 \
   || die "aiac-agent not deployed in ${AIAC_NS} — run ./enable.sh --stack-only first"
 kubectl get deployment aiac-event-broker -n "$AIAC_NS" >/dev/null 2>&1 \
   || die "aiac-event-broker not deployed in ${AIAC_NS} — run ./enable.sh --broker-only first"
-OPA_COUNT=$(kubectl get configmap authbridge-runtime-config -n "$NS" \
-              -o jsonpath='{.data.config\.yaml}' 2>/dev/null | grep -c 'name: opa' || true)
-[ "$OPA_COUNT" = "2" ] || die "OPA not wired into both AuthBridge legs (got ${OPA_COUNT}, expected 2) — run k8s/opa-kind-enable.sh first"
+check_pipeline_wiring || die "AuthBridge pipeline in ${NS}: ${WIRING} — run k8s/opa-kind-enable.sh first"
 # The changed combiner (D20): no request fallback rule, so a pod with no client CR is denied. The AIAC
 # Controller does not start without it (start check #4, D30).
 REQ_FALLBACK=$(kubectl get "$POLICY_CR" default -n "$SYS_NS" -o jsonpath='{.spec.policies[*].content}' 2>/dev/null \
@@ -462,23 +484,26 @@ phase_verify_trigger() {
   # seconds and a liveness restart wipes entirely, so a log grep false-negatives even when both
   # events WERE consumed. Poll the scopes as the authoritative signal; the log line is shown only as
   # best-effort supplementary evidence when it happens to still be present.
-  local ev_deadline=$((SECONDS + POLL_SECS)) agent_seen="" tool_seen=""
+  # scope_id_in (lib/keycloak.sh): an id when the scope exists, "absent" when the list was read and has
+  # none, "" when the list could not be read. A failed read is retried but counted, so the timeout says
+  # it was Keycloak, not a missing onboarding.
+  local ev_deadline=$((SECONDS + POLL_SECS)) agent_seen="" tool_seen="" read_failures=0
   while :; do
     ADMIN="$(admin_token)"
-    local scopes_json
-    scopes_json=$(curl -s -H "Authorization: Bearer ${ADMIN}" "${KC}/admin/realms/${REALM}/client-scopes" 2>/dev/null || true)
-    agent_seen=$(printf '%s' "$scopes_json" | SCOPE="agent-${NS}-github-agent-aud" python3 -c '
-import sys, json, os
-try: names = {s.get("name") for s in json.load(sys.stdin)}
-except Exception: names = set()
-print("yes" if os.environ["SCOPE"] in names else "")' 2>/dev/null || true)
-    tool_seen=$(printf '%s' "$scopes_json" | SCOPE="agent-${NS}-github-tool-aud" python3 -c '
-import sys, json, os
-try: names = {s.get("name") for s in json.load(sys.stdin)}
-except Exception: names = set()
-print("yes" if os.environ["SCOPE"] in names else "")' 2>/dev/null || true)
+    local scopes_json agent_id tool_id
+    scopes_json="$(realm_client_scopes "$ADMIN")"
+    agent_id="$(scope_id_in "$AGENT_AUD_SCOPE" <<<"$scopes_json")"
+    tool_id="$(scope_id_in "$TOOL_AUD_SCOPE" <<<"$scopes_json")"
+    if [ -z "$agent_id" ] || [ -z "$tool_id" ]; then
+      read_failures=$((read_failures + 1))
+    else
+      agent_seen=""; [ "$agent_id" != absent ] && agent_seen=yes
+      tool_seen=""; [ "$tool_id" != absent ] && tool_seen=yes
+    fi
     [ -n "$agent_seen" ] && [ -n "$tool_seen" ] && break
     if [ "$SECONDS" -ge "$ev_deadline" ]; then
+      [ "$read_failures" -eq 0 ] \
+        || warn "the realm's client-scopes could not be read ${read_failures} time(s) while waiting — check Keycloak (kubectl logs statefulset/keycloak -n keycloak)"
       die "AIAC did not provision both services' Keycloak audience scopes (agent=${agent_seen:-no}, tool=${tool_seen:-no}) after ${POLL_SECS}s — it may not have consumed both aiac.apply.service events. Check: kubectl logs deployment/aiac-agent -n ${AIAC_NS}; kubectl logs statefulset/keycloak -n keycloak | grep -i aiac-event-listener"
     fi
     sleep 5
@@ -557,45 +582,97 @@ print("yes" if os.environ["SCOPE"] in names else "")' 2>/dev/null || true)
   kubectl get "$POLICY_CR" github-tool -n "$NS" -o jsonpath='{.spec.policies[*].content}' | sed 's/^/    /'
 }
 
+# grant_default_scope <scope-name> <scope-id> — link the client scope to github-agent's client
+# ($AGENT_UUID, admin token $ADMIN) as a DEFAULT scope. token-exchange-aiac requests no scope, so only a
+# default scope grants a target. Keycloak silently skips a default link of a scope already linked as
+# optional (an earlier run of this driver granted it as optional), so drop an optional link first —
+# only when the scope IS listed as optional: Keycloak's DELETE of an optional link also removes a
+# default link, so a blind DELETE on a re-run would drop the live grant until the PUT below, and
+# refuse exchanges in between. The same move as _link_default_scope in
+# src/aiac/idp/service/configuration/keycloak/main.py, which this bash copy (and the harness's
+# grant_exchange_scope) follows.
+# With a third argument "best-effort", a failure warns and returns 1 instead of stopping the driver.
+grant_default_scope() {
+  local scope="$1" scope_id="$2" fail=die optional del_http put_http
+  [ "${3:-}" = best-effort ] && fail=warn
+  optional="$(scope_linked "$ADMIN" "$AGENT_UUID" optional "$scope")"
+  if [ "$optional" = error ]; then
+    "$fail" "could not read the optional client-scopes of ${NS}/github-agent"
+    return 1
+  fi
+  if [ "$optional" = "yes" ]; then
+    del_http=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE -H "Authorization: Bearer ${ADMIN}" \
+      "${KC}/admin/realms/${REALM}/clients/${AGENT_UUID}/optional-client-scopes/${scope_id}" || true)
+    if [ "$del_http" != 204 ]; then
+      "$fail" "removing the optional link of '${scope}' returned HTTP ${del_http} (expected 204)"
+      return 1
+    fi
+  fi
+  put_http=$(curl -s -o /dev/null -w "%{http_code}" -X PUT -H "Authorization: Bearer ${ADMIN}" \
+    "${KC}/admin/realms/${REALM}/clients/${AGENT_UUID}/default-client-scopes/${scope_id}" || true)
+  case "$put_http" in
+    204) pass "assigned '${scope}' as a default client-scope of github-agent: HTTP 204" ;;
+    409) warn "'${scope}' is already a default client-scope of github-agent (HTTP 409) — idempotent, continuing" ;;
+    *) "$fail" "assigning '${scope}' as a default client-scope returned HTTP ${put_http} (expected 204)"; return 1 ;;
+  esac
+}
+
 # ── Phase WIRE ────────────────────────────────────────────────────────────────
 phase_wire_outbound() {
-  printf '\n%s%s====== Phase WIRE — AuthBridge outbound leg (authproxy-routes + optional scope) ======%s\n' "$C_BLD" "$C_CYN" "$C_RST"
+  printf '\n%s%s====== Phase WIRE — AuthBridge outbound leg (default client scope, no routes) ======%s\n' "$C_BLD" "$C_CYN" "$C_RST"
 
-  step "Adding the github-tool outbound route to authproxy-routes"
-  kubectl patch configmap authproxy-routes -n "$NS" --type merge -p "$(NS="$NS" python3 -c '
-import json, os
-ns = os.environ["NS"]
-print(json.dumps({"data":{"routes.yaml":
-f"""- host: \"github-tool\"
-  target_audience: \"spiffe://localtest.me/ns/{ns}/sa/github-tool\"
-  token_scopes: \"openid agent-{ns}-github-tool-aud\"
-"""}}))')" || die "failed to patch authproxy-routes"
-  pass "authproxy-routes carries the github-tool route"
+  step "Checking github-agent's own sidecar config (WIRE restarts nothing, so it must be current)"
+  check_agent_wiring
 
   step "Granting github-agent the exchange scope on its Keycloak client (expect HTTP 204)"
   ADMIN="$(admin_token)"
   [ -n "$ADMIN" ] || die "could not obtain a Keycloak master admin token"
   AGENT_UUID="$(client_uuid_by_name "${NS}/github-agent" "$ADMIN")"
   [ -n "$AGENT_UUID" ] || die "could not resolve the Keycloak client uuid for ${NS}/github-agent"
-  local tool_aud="agent-${NS}-github-tool-aud"
-  SCOPE_ID="$(scope_id_by_name "$tool_aud" "$ADMIN")"
-  [ -n "$SCOPE_ID" ] || die "client-scope '${tool_aud}' not found — has github-tool onboarded yet?"
-  SCOPE_HTTP=$(curl -s -o /dev/null -w "%{http_code}" -X PUT -H "Authorization: Bearer ${ADMIN}" \
-    "${KC}/admin/realms/${REALM}/clients/${AGENT_UUID}/optional-client-scopes/${SCOPE_ID}")
-  case "$SCOPE_HTTP" in
-    204) pass "assigned optional client-scope: HTTP 204" ;;
-    409) warn "optional client-scope already assigned (HTTP 409) — idempotent, continuing" ;;
-    *) die "assigning the optional client-scope returned HTTP ${SCOPE_HTTP} (expected 204)" ;;
-  esac
+  local scopes
+  scopes="$(realm_client_scopes "$ADMIN")"  # read once: both scopes below are looked up in it
+  SCOPE_ID="$(scope_id_in "$TOOL_AUD_SCOPE" <<<"$scopes")"
+  [ -n "$SCOPE_ID" ] || die "could not read the realm's client-scopes"
+  [ "$SCOPE_ID" != absent ] || die "client-scope '${TOOL_AUD_SCOPE}' not found — has github-tool onboarded yet?"
+  grant_default_scope "$TOOL_AUD_SCOPE" "$SCOPE_ID"
 
-  step "Restarting github-agent to load the route"
-  kubectl delete pod -n "$NS" -l "$AGENT_LABEL" || die "failed to delete github-agent pod"
-  kubectl wait --for=condition=ready pod -n "$NS" -l "$AGENT_LABEL" --timeout=120s \
-    || die "github-agent did not become Ready after the route-load restart"
-  pass "github-agent restarted and Ready"
+  # The agent's own MCP_URL targets the production tool, github-tool-mcp (the cortex github-issue demo,
+  # not part of this demo). Its calls are exchanged once that tool is registered as
+  # .../sa/github-tool-mcp (rossoctl/cortex#1540): then grant its audience scope, as a DEFAULT scope (the
+  # plugin requests no scope). Absent, it is skipped: this demo's probes call the stub github-tool only.
+  # The grant is needed with the bridge too (k8s/opa-kind-enable.sh, #252): token-exchange-aiac still
+  # sees each bridged call, and once .../sa/github-tool-mcp exists it exchanges the bridge's token for it.
+  # Keycloak accepts that token (its azp is github-agent), but only for a granted audience: without this
+  # default link, every bridged call would get a 403 audience_not_granted.
+  # github-full-access, the scope the tool reads to pick its privileged PAT, is NOT granted: as a default
+  # scope it would be in every token github-agent exchanges, so every user would get the privileged PAT.
+  # A per-user grant is the cortex demo's design question (rossoctl/cortex#1540).
+  local mcp_id
+  mcp_id="$(scope_id_in "$MCP_AUD_SCOPE" <<<"$scopes")"  # the list was read above, and read fine
+  if [ "$mcp_id" != absent ]; then
+    # Best effort: this demo never probes the production tool, so a failed grant warns, never stops WIRE.
+    grant_default_scope "$MCP_AUD_SCOPE" "$mcp_id" best-effort \
+      || warn "github-tool-mcp's calls from github-agent stay un-exchanged"
+    info "github-full-access is not granted: github-tool-mcp uses its public PAT for every user (rossoctl/cortex#1540)"
+  else
+    info "client-scope '${MCP_AUD_SCOPE}' not found — the production github-tool-mcp is not registered (rossoctl/cortex#1540); skipped"
+  fi
+
+  # token-exchange-aiac (k8s/opa-kind-enable.sh) derives the github-tool audience from the host —
+  # no route. It requests no scope, so the grant must be a DEFAULT scope. No agent restart: the
+  # overlay sets unknown_audience_ttl 0 (preflight checks it), so a github-tool audience the plugin
+  # saw as unknown before github-tool's client existed is asked again on the next call.
 }
 
 # ── Phase ENFORCE ─────────────────────────────────────────────────────────────
+
+# opa_verdict_body <code> <body> — true when the answer is an OPA policy verdict, by the rule the harness
+# uses (k8s/authbridge-rejection.py opa_verdict), not an OPA evaluation error or another hop's 403.
+opa_verdict_body() {
+  CODE="$1" BODY="$2" python3 -I -c "$(cat "${AIAC_DIR}/k8s/authbridge-rejection.py")"'
+import os, sys
+sys.exit(0 if opa_verdict(int(os.environ["CODE"]), os.environ["BODY"]) else 1)' 2>/dev/null
+}
 
 probe_agent() {
   local user="$1" want="$2" secs="$3" label="$4"
@@ -610,7 +687,9 @@ probe_agent() {
          -d "{\"jsonrpc\":\"2.0\",\"id\":\"1\",\"method\":\"ping/nonexistent\",\"params\":{}}"' 2>/dev/null || true)
     code=$(printf '%s' "$out" | grep -o 'HTTP_CODE:[0-9]*' | tail -1 | cut -d: -f2 || true)
     body=$(printf '%s' "$out" | grep -vE 'HTTP_CODE:|deleted' | tr -d '\r' | grep -v '^$' | tail -1 || true)
-    if [ "$code" = "$want" ]; then
+    # A 403 counts only when its body is an OPA verdict (k8s/authbridge-rejection.py opa_verdict): OPA's
+    # policy.forbidden for a Rego it could not evaluate, or another hop's 403, decides nothing.
+    if [ "$code" = "$want" ] && { [ "$want" != 403 ] || opa_verdict_body "$code" "$body"; }; then
       info "probe_agent ${user}: HTTP ${code}  body: ${body}"
       pass "${label}: HTTP ${code} (expected ${want})"
       return 0
@@ -622,14 +701,26 @@ probe_agent() {
 }
 
 # probe_tool <user> <tool_name> — real tools/call through the agent's forward proxy (127.0.0.1:8081).
-# Echoes a VERDICT string: ALLOWED_RESULT | DENIED_JSONRPC | "DENIED_HTTP <code>" | ERROR | UNEXPECTED.
+# Echoes a VERDICT string, the class of the harness's outbound_outcome (k8s/authbridge-rejection.py):
+#   ALLOWED_RESULT                    let through (a result, or the tool's own JSON-RPC error)
+#   DENIED_HTTP 403                   an OPA deny by github-tool's inbound (the tool check)
+#   DENIED_JSONRPC                    an OPA deny by the agent's own outbound: a fault (D24 pass-through)
+#   EXCHANGE_REFUSED <code> <error>   token-exchange-aiac refused or failed: OPA was never consulted
+#   UNEXPECTED <code> <body> | ERROR  anything else (a 403 that names no OPA, a fallback frame, a 401 of
+#                                     github-tool's jwt-validation, no login token, no agent pod)
+# token-exchange-aiac's refusal of a bearer it cannot use is EXCHANGE_REFUSED <code> auth.unauthorized
+# (at HTTP 200 for this MCP request: the forward proxy renders any rejection as a JSON-RPC frame).
 probe_tool() {
   local user="$1" tool="$2" pod tok py out
   pod="$(latest_pod "$AGENT_LABEL")"
-  [ -n "$pod" ] || { echo "ERROR"; return 0; }
+  [ -n "$pod" ] || { echo "ERROR no agent pod"; return 0; }
   tok="$(mint_token "$user")"
+  # A failed login sends no bearer, and token-exchange-aiac (no_token_policy: deny) would answer 401:
+  # name the login, not the exchange.
+  [ -n "$tok" ] || { echo "ERROR no login token for ${user}"; return 0; }
   py="$(mktemp /tmp/onboarding-probe.XXXXXX.py)"
-  cat > "$py" <<PY
+  cat "${AIAC_DIR}/k8s/authbridge-rejection.py" > "$py" || { rm -f "$py"; echo "ERROR"; return 0; }
+  cat >> "$py" <<PY
 import urllib.request, urllib.error, json
 tok = """$tok"""
 op = urllib.request.build_opener(urllib.request.ProxyHandler({"http": "http://127.0.0.1:8081"}))
@@ -649,17 +740,10 @@ except urllib.error.HTTPError as e:
     except Exception: raw = ""
 except Exception as e:
     print("VERDICT ERROR", type(e).__name__, e); raise SystemExit(0)
-doc = None
-try: doc = json.loads(raw)
-except Exception: doc = None
-if code in (403, 503):
-    print(f"VERDICT DENIED_HTTP {code}")
-elif code == 200 and isinstance(doc, dict) and "error" in doc:
-    print("VERDICT DENIED_JSONRPC")
-elif code == 200 and isinstance(doc, dict) and "result" in doc:
-    print("VERDICT ALLOWED_RESULT")
-else:
-    print("VERDICT UNEXPECTED", code, raw[:200])
+# Classified by k8s/authbridge-rejection.py, prepended to this probe — the rule the system harness
+# uses too. One verdict mapping for both probes (verdict): a refusal or a failure of the exchange never
+# reached OPA, so it gets its own verdict.
+print("VERDICT", verdict(code, raw))
 PY
   out=$(kubectl exec -i -n "$NS" "$pod" -c agent -- python3 - < "$py" 2>/dev/null || true)
   rm -f "$py"
@@ -668,7 +752,8 @@ PY
 
 # probe_tool_direct <user> <tool_name> — real tools/call straight to github-tool from a throwaway pod,
 # with the user's login token and NO agent (row 4 of #646's table). Echoes a VERDICT string like
-# probe_tool: ALLOWED_RESULT | DENIED_JSONRPC | "DENIED_HTTP <code>" | ERROR | UNEXPECTED.
+# probe_tool: ALLOWED_RESULT | DENIED_JSONRPC | "DENIED_HTTP <code>" (403 names OPA; 401 is
+# jwt-validation's audience refusal) | ERROR | UNEXPECTED.
 probe_tool_direct() {
   local user="$1" tool="$2" tok out code body
   tok="$(mint_token "$user")"
@@ -685,25 +770,27 @@ probe_tool_direct() {
   code=$(printf '%s' "$out" | grep -o 'HTTP_CODE:[0-9]*' | tail -1 | cut -d: -f2 || true)
   body=$(printf '%s' "$out" | grep -vE 'HTTP_CODE:|deleted' | tr -d '\r' | grep -v '^$' | tail -1 || true)
   case "$code" in
-    401|403|503) echo "DENIED_HTTP ${code}" ;;
-    200)
-      case "$body" in
-        *'"result"'*) echo "ALLOWED_RESULT" ;;
-        *'"error"'*) echo "DENIED_JSONRPC" ;;
-        *) echo "UNEXPECTED 200" ;;
-      esac ;;
-    "") echo "ERROR" ;;
-    *) echo "UNEXPECTED ${code}" ;;
+    "") echo "ERROR"; return 0 ;;
+    # github-tool's own jwt-validation refused a token with no github-tool audience: a deny by its gate.
+    # Below, a 403 counts only when its body names OPA; any other 403, and a 503 (OPA has no bundle yet),
+    # does not prove the gate checks the caller, so it is UNEXPECTED and the caller warns.
+    401) echo "DENIED_HTTP 401"; return 0 ;;
   esac
+  # Any other answer: the verdict probe_tool prints (k8s/authbridge-rejection.py verdict), first word
+  # and code only.
+  # shellcheck disable=SC2016
+  CODE="$code" BODY="$body" python3 -I -c "$(cat "${AIAC_DIR}/k8s/authbridge-rejection.py")"'
+import os
+print(" ".join(verdict(int(os.environ["CODE"]), os.environ["BODY"]).split()[:2]))' 2>/dev/null || echo "ERROR"
 }
 
 phase_enforce() {
   printf '\n%s%s====== Phase ENFORCE — live HTTP through the real OPA plugin ======%s\n' "$C_BLD" "$C_CYN" "$C_RST"
 
-  step "Confirming OPA is still wired into both AuthBridge legs (expect 2)"
-  OPA_COUNT=$(kubectl get configmap authbridge-runtime-config -n "$NS" \
-                -o jsonpath='{.data.config\.yaml}' 2>/dev/null | grep -c 'name: opa' || true)
-  expect_eq "'name: opa' occurrences" "$OPA_COUNT" "2"
+  step "Confirming the AuthBridge pipeline is still wired (opa on each leg, outbound token-exchange-aiac)"
+  if check_pipeline_wiring; then pass "authbridge-runtime-config: ${WIRING}"
+  else die "AuthBridge pipeline in ${NS}: ${WIRING} — run k8s/opa-kind-enable.sh"; fi
+  check_agent_wiring
 
   step "Granting ${ROPC_CLIENT_ID} the github-agent audience scope (so dev-user's ROPC token carries it)"
   # AIAC's onboarding creates the "agent-${NS}-github-agent-aud" client-scope (a hardcoded-audience
@@ -715,12 +802,13 @@ phase_enforce() {
   # mint_token calls need no scope= change; idempotent, safe to re-run.
   ADMIN="$(admin_token)"
   [ -n "$ADMIN" ] || die "could not obtain a Keycloak master admin token"
-  AUD_SCOPE="agent-${NS}-github-agent-aud"
+  AUD_SCOPE="$AGENT_AUD_SCOPE"
   ROPC_UUID="$(curl -s -H "Authorization: Bearer ${ADMIN}" "${KC}/admin/realms/${REALM}/clients?clientId=${ROPC_CLIENT_ID}" \
     | json_eval 'd[0]["id"]')"
   [ -n "$ROPC_UUID" ] || die "ROPC client '${ROPC_CLIENT_ID}' not found in realm '${REALM}'"
-  AUD_SCOPE_ID="$(scope_id_by_name "$AUD_SCOPE" "$ADMIN")"
-  [ -n "$AUD_SCOPE_ID" ] || die "client-scope '${AUD_SCOPE}' not found — has github-agent onboarded yet?"
+  AUD_SCOPE_ID="$(realm_client_scopes "$ADMIN" | scope_id_in "$AUD_SCOPE")"
+  [ -n "$AUD_SCOPE_ID" ] || die "could not read the realm's client-scopes"
+  [ "$AUD_SCOPE_ID" != absent ] || die "client-scope '${AUD_SCOPE}' not found — has github-agent onboarded yet?"
   ALREADY="$(curl -s -H "Authorization: Bearer ${ADMIN}" "${KC}/admin/realms/${REALM}/clients/${ROPC_UUID}/default-client-scopes" \
     | AUD_SCOPE="$AUD_SCOPE" json_eval '"yes" if any(s.get("name") == os.environ["AUD_SCOPE"] for s in d) else "no"')"
   if [ "$ALREADY" = "yes" ]; then
@@ -758,23 +846,71 @@ phase_enforce() {
   probe_agent test-user   200 "$POLL_SECS" "test-user -> github-agent (inbound)"
   probe_agent devops-user 403 "$POLL_SECS" "devops-user -> github-agent (inbound, expected denied)"
 
-  step "Tool calls through github-agent — per-tool matrix for dev-user and test-user (reported; source-read is a hard check)"
+  # Wait for the final bundles BEFORE the matrix, so it shows the enforced policy. github-tool's and the
+  # agent's OPAs poll bundle-service every 10-120 s (about 144 s after a fetch error), so the bundle the
+  # last onboarding wrote can land after the inbound probes pass. Until it does, a pod runs its bootstrap
+  # CR, which denies every call (github-tool: DENIED_HTTP 403; the agent's outbound: DENIED_JSONRPC), or,
+  # with no bundle at all, answers upstream.unreachable (github-tool: UNEXPECTED 503; the agent's
+  # outbound, for this MCP request: a JSON-RPC frame at 200, UNEXPECTED 200). A freshly started agent
+  # sidecar may also not have read its credentials yet (EXCHANGE_REFUSED ... upstream.token-exchange-failed).
+  # An audience the agent saw as unknown is never cached (unknown_audience_ttl 0, checked at preflight),
+  # so a 401 from github-tool is a real audience refusal and stops at once.
+  # A failed kubectl exec (probe_tool prints nothing) is also waited out: the operator may still be
+  # replacing the agent pod, and latest_pod can name the one that is terminating.
+  # dev-user -> source-read is the allow that proves all of it is current. Poll it for one bundle cycle
+  # (BUNDLE_WAIT_SECS), so these are waited out, but a real deny is still reported within minutes. A
+  # refusal of the audience or the bearer, or a failed login, never clears by waiting: it stops at once.
+  local dev_deadline=$((SECONDS + BUNDLE_WAIT_SECS))
+  step "Waiting for the final bundles: dev-user -> source-read allowed [up to ${BUNDLE_WAIT_SECS}s]"
+  while :; do
+    DEV_SOURCE_READ="$(probe_tool dev-user source-read)"
+    [ "$DEV_SOURCE_READ" = "ALLOWED_RESULT" ] && break
+    case "$DEV_SOURCE_READ" in
+      "" | "ERROR no agent pod" | "DENIED_HTTP 403" | DENIED_JSONRPC | "UNEXPECTED 503 "* \
+        | "UNEXPECTED 200 upstream.unreachable "* | "EXCHANGE_REFUSED "*" upstream.token-exchange-failed") ;;
+      *) break ;;
+    esac
+    [ "$SECONDS" -lt "$dev_deadline" ] || break
+    info "dev-user -> source-read: ${DEV_SOURCE_READ:-<no verdict: kubectl exec failed>} — an OPA may not have its last bundle yet, or the agent pod is being replaced; retrying"
+    sleep 10
+  done
+  [ "$DEV_SOURCE_READ" = "ALLOWED_RESULT" ] \
+    && pass "dev-user -> source-read: ALLOWED_RESULT" \
+    || die "dev-user -> source-read: got '${DEV_SOURCE_READ}', expected ALLOWED_RESULT (after one bundle cycle, ${BUNDLE_WAIT_SECS}s)"
+
+  step "Tool calls through github-agent — per-tool matrix for dev-user and test-user (reported; test-user -> source-read is a hard check)"
   local user tool verdict
   printf '     %-12s %-14s %s\n' "user" "tool" "verdict"
   for user in dev-user test-user; do
     for tool in source-read source-write issues-read issues-write; do
-      verdict="$(probe_tool "$user" "$tool")"
+      if [ "$user/$tool" = dev-user/source-read ]; then
+        verdict="$DEV_SOURCE_READ"  # just probed by the bundle wait above
+      else
+        verdict="$(probe_tool "$user" "$tool")"
+      fi
       printf '     %-12s %-14s %s\n' "$user" "$tool" "${verdict:-<none>}"
     done
   done
-  DEV_SOURCE_READ="$(probe_tool dev-user source-read)"
-  [ "$DEV_SOURCE_READ" = "ALLOWED_RESULT" ] \
-    && pass "dev-user -> source-read: ALLOWED_RESULT" \
-    || die "dev-user -> source-read: got '${DEV_SOURCE_READ}', expected ALLOWED_RESULT"
   TEST_SOURCE_READ="$(probe_tool test-user source-read)"
-  [ "$TEST_SOURCE_READ" != "ALLOWED_RESULT" ] \
-    && pass "test-user -> source-read: ${TEST_SOURCE_READ} (correctly not ALLOWED_RESULT)" \
-    || die "test-user -> source-read: got ALLOWED_RESULT, expected denied (testers don't touch source)"
+  # Only github-tool's inbound OPA deny passes (the tool check, relayed as a 403). An OPA deny on the
+  # agent's own outbound (DENIED_JSONRPC) is a fault — the outbound is a pass-through (D24), for example
+  # the D20 combiner deny when the agent has no CR — and anything else is no policy verdict.
+  case "$TEST_SOURCE_READ" in
+    "DENIED_HTTP 403")
+      pass "test-user -> source-read: ${TEST_SOURCE_READ} (correctly denied by github-tool's inbound)" ;;
+    DENIED_JSONRPC)
+      die "test-user -> source-read: DENIED_JSONRPC — the agent's own outbound OPA denied it, so github-tool's tool check never ran. The agent's outbound is a pass-through (D24); check its CR (kubectl get authorizationpolicy github-agent -n ${NS}; with none, the combiner denies the pod, D20) and its OPA decision log (kubectl logs -n ${NS} $(latest_pod "$AGENT_LABEL") -c authbridge-proxy | grep path=authbridge/outbound)" ;;
+    ALLOWED_RESULT)
+      die "test-user -> source-read: got ALLOWED_RESULT, expected denied (testers don't touch source)" ;;
+    "EXCHANGE_REFUSED "*" policy.forbidden")
+      die "test-user -> source-read: ${TEST_SOURCE_READ} — token-exchange-aiac refused the audience, so OPA was never consulted (the WIRE default-scope grant is missing, or github-tool's client is disabled; run make enforce)" ;;
+    "EXCHANGE_REFUSED "*" auth.unauthorized")
+      die "test-user -> source-read: ${TEST_SOURCE_READ} — token-exchange-aiac refused the bearer (Keycloak rejected test-user's login token), so OPA was never consulted" ;;
+    EXCHANGE_REFUSED*)
+      die "test-user -> source-read: ${TEST_SOURCE_READ} — the token exchange failed (Keycloak error or outage, or the sidecar's credentials are not loaded yet), so OPA was never consulted; check: kubectl logs -n ${NS} $(latest_pod "$AGENT_LABEL") -c authbridge-proxy | grep token-exchange-aiac" ;;
+    *)
+      die "test-user -> source-read: got '${TEST_SOURCE_READ:-<none>}', expected github-tool's OPA deny (DENIED_HTTP 403)" ;;
+  esac
 
   step "Decision logs — one inbound allow/deny, one tool-call allow/deny"
   local pod tool_pod tool_leg tool_path

@@ -60,20 +60,20 @@ try: print(json.load(sys.stdin).get("access_token","") or "")
 except Exception: print("")'
 }
 
-# json_eval <python-expr> — evaluate <python-expr> over the JSON on stdin (bound to `d`; env vars via
-# `os.environ`) and print the result (one line per item when it returns a newline-joined string).
-# Prints "" (exit 0) instead of raising on a Keycloak error body or an unreachable server, so a
-# half-torn-down cluster degrades to "nothing found" rather than a `set -e` abort.
-json_eval() {
-  python3 -c '
-import sys, json, os
-try:
-    d = json.load(sys.stdin)
-    r = eval(sys.argv[1])
-except Exception:
-    r = ""
-print("" if r is None else r)' "$1"
-}
+# json_eval, aud_scope, realm_client_scopes and scope_id_in: one copy, shared with driver.sh.
+# shellcheck source=SCRIPTDIR/lib/keycloak.sh
+. "${SCRIPT_DIR}/lib/keycloak.sh"
+
+# The audience scopes restore removes, named once: step 1 unlinks the tool scopes WIRE granted, step 3
+# deletes the two workloads' own. Restore must survive a half-torn-down setup, so a failure of
+# k8s/operator-names.py does not stop it: it warns, and steps 1 and 3 skip the audience scopes (an empty
+# name), while the clients, CRs and workloads are still removed; step 6 then warns for each Secret it
+# cannot name, and steps 7 and 8 still run.
+NAMES_OK=1
+AGENT_AUD_SCOPE="$(aud_scope github-agent)" || NAMES_OK=0
+TOOL_AUD_SCOPE="$(aud_scope github-tool)" || NAMES_OK=0
+MCP_AUD_SCOPE="$(aud_scope github-tool-mcp)" || NAMES_OK=0
+[ "$NAMES_OK" -eq 1 ] || echo "WARNING: k8s/operator-names.py failed — the audience scopes are not removed; the rest of restore runs" >&2
 
 # client_uuid_by_name <name> — the Keycloak client looked up by its "name" DISPLAY field
 # (e.g. "team1/github-agent"), not clientId. Prints "" if not found.
@@ -82,89 +82,109 @@ client_uuid_by_name() {
     | CLIENT_NAME="$1" json_eval 'next((c["id"] for c in d if c.get("name") == os.environ["CLIENT_NAME"]), "")'
 }
 
-echo "==> 1. Reverting authproxy-routes (dropping the github-tool route)"
-kubectl patch configmap authproxy-routes -n "$NS" --type merge -p "$(python3 -c '
-import json
-print(json.dumps({"data":{"routes.yaml": ""}}))')" || true
-
-echo "==> 2. Removing the optional client-scope from github-agent (if present)"
+echo "==> 1. Removing the client-scopes WIRE linked to github-agent (default or optional, if present)"
+# The audience scopes WIRE links: the stub github-tool's, and the production github-tool-mcp's when that
+# tool is registered. Step 2 deletes the client anyway, which drops every link; this step says what was
+# granted. The realm's client-scopes are read once, and each name looked up in them: "absent" when the
+# realm has none, "" when the read failed (scope_id_in, lib/keycloak.sh). A failed read skips this step;
+# step 2 still runs.
 ADMIN="$(admin_token)"
 if [ -n "$ADMIN" ]; then
   AGENT_UUID="$(client_uuid_by_name "${NS}/github-agent")"
-  SCOPE_ID=$(curl -s -H "Authorization: Bearer ${ADMIN}" "${KC}/admin/realms/${REALM}/client-scopes" \
-    | SCOPE_NAME="agent-${NS}-github-tool-aud" json_eval 'next((s["id"] for s in d if s.get("name") == os.environ["SCOPE_NAME"]), "")')
-  if [ -n "$AGENT_UUID" ] && [ -n "$SCOPE_ID" ]; then
-    curl -s -o /dev/null -w "    remove scope HTTP %{http_code}\n" -X DELETE \
-      -H "Authorization: Bearer ${ADMIN}" \
-      "${KC}/admin/realms/${REALM}/clients/${AGENT_UUID}/optional-client-scopes/${SCOPE_ID}"
+  REALM_SCOPES="$(realm_client_scopes "$ADMIN")"
+  if [ -n "$AGENT_UUID" ]; then
+    for scope in "$TOOL_AUD_SCOPE" "$MCP_AUD_SCOPE"; do
+      [ -n "$scope" ] || continue  # k8s/operator-names.py failed (warned above)
+      SCOPE_ID="$(scope_id_in "$scope" <<<"$REALM_SCOPES")"
+      case "$SCOPE_ID" in
+        absent) echo "    ${scope}: not in the realm — nothing to remove"; continue ;;
+        "") echo "    ${scope}: the realm's client-scopes could not be read — skipped"; continue ;;
+      esac
+      for kind in default optional; do
+        # || true: a failed DELETE must not stop restore before step 2 deletes the clients.
+        curl -s -o /dev/null -w "    ${scope}: remove ${kind} link HTTP %{http_code}\n" -X DELETE \
+          -H "Authorization: Bearer ${ADMIN}" \
+          "${KC}/admin/realms/${REALM}/clients/${AGENT_UUID}/${kind}-client-scopes/${SCOPE_ID}" || true
+      done
+    done
   else
-    echo "    (client or scope not found — nothing to remove)"
+    echo "    (client not found — nothing to remove)"
   fi
 
-  echo "==> 3. Deleting the Keycloak clients ${NS}/github-agent, ${NS}/github-tool"
+  echo "==> 2. Deleting the Keycloak clients ${NS}/github-agent, ${NS}/github-tool"
   for name in "${NS}/github-agent" "${NS}/github-tool"; do
     UUID="$(client_uuid_by_name "$name")"
     if [ -n "$UUID" ]; then
       curl -s -o /dev/null -w "    delete ${name} HTTP %{http_code}\n" -X DELETE \
-        -H "Authorization: Bearer ${ADMIN}" "${KC}/admin/realms/${REALM}/clients/${UUID}"
+        -H "Authorization: Bearer ${ADMIN}" "${KC}/admin/realms/${REALM}/clients/${UUID}" || true
     else
       echo "    (${name} not registered — nothing to delete)"
     fi
   done
 else
-  echo "    WARNING: could not obtain a Keycloak admin token — skipping steps 2-3" >&2
+  echo "    WARNING: could not obtain a Keycloak admin token — skipping steps 1-2" >&2
 fi
 
-echo "==> 4. Deleting leftover client-scopes and realm roles for github-agent/github-tool"
+echo "==> 3. Deleting leftover client-scopes and realm roles for github-agent/github-tool"
 echo "    (AIAC's Policy Rules Builder creates these via blind POSTs with no existence check —"
 echo "     see aiac/src/aiac/idp/service/configuration/keycloak/main.py's create_scope/create_role —"
 echo "     so a stale scope/role from a prior onboarding cycle causes a 409/502 on the next one.)"
 if [ -n "$ADMIN" ]; then
   for component in github-agent github-tool; do
-    SCOPE_IDS=$(curl -s -H "Authorization: Bearer ${ADMIN}" "${KC}/admin/realms/${REALM}/client-scopes" \
-      | COMPONENT="$component" AUD_NAME="agent-${NS}-${component}-aud" json_eval '"\n".join(
+    case "$component" in
+      github-agent) aud_name="$AGENT_AUD_SCOPE" ;;
+      github-tool) aud_name="$TOOL_AUD_SCOPE" ;;
+    esac
+    # A fresh read, not step 1's list: the workloads run until step 5, so an onboarding still in flight can
+    # create scopes after step 1. A failed read deletes nothing here, and restore goes on. An empty
+    # aud_name (k8s/operator-names.py failed, warned above) matches no scope: the prefixed ones still go.
+    SCOPE_IDS=$(realm_client_scopes "$ADMIN" \
+      | COMPONENT="$component" AUD_NAME="$aud_name" json_eval '"\n".join(
     s["id"] for s in d
-    if s.get("name", "").startswith(os.environ["COMPONENT"] + ".") or s.get("name") == os.environ["AUD_NAME"])')
+    if s.get("name", "").startswith(os.environ["COMPONENT"] + ".")
+    or (os.environ["AUD_NAME"] and s.get("name") == os.environ["AUD_NAME"]))')
     for id in $SCOPE_IDS; do
       curl -s -o /dev/null -w "    delete client-scope (${component}) ${id} HTTP %{http_code}\n" -X DELETE \
-        -H "Authorization: Bearer ${ADMIN}" "${KC}/admin/realms/${REALM}/client-scopes/${id}"
+        -H "Authorization: Bearer ${ADMIN}" "${KC}/admin/realms/${REALM}/client-scopes/${id}" || true
     done
 
-    ROLE_NAMES=$(curl -s -H "Authorization: Bearer ${ADMIN}" "${KC}/admin/realms/${REALM}/roles" \
+    ROLE_NAMES=$( { curl -s -H "Authorization: Bearer ${ADMIN}" "${KC}/admin/realms/${REALM}/roles" || true; } \
       | COMPONENT="$component" json_eval '"\n".join(
     r["name"] for r in d if r.get("name", "").startswith(os.environ["COMPONENT"] + "."))')
     while IFS= read -r role; do
       [ -n "$role" ] || continue
       curl -s -o /dev/null -w "    delete role ${role} HTTP %{http_code}\n" -X DELETE \
-        -H "Authorization: Bearer ${ADMIN}" "${KC}/admin/realms/${REALM}/roles/${role}"
+        -H "Authorization: Bearer ${ADMIN}" "${KC}/admin/realms/${REALM}/roles/${role}" || true
     done <<< "$ROLE_NAMES"
   done
 else
   echo "    WARNING: could not obtain a Keycloak admin token — skipping leftover scope/role cleanup" >&2
 fi
 
-echo "==> 5. Deleting the AuthorizationPolicy CRs AIAC wrote for github-agent and github-tool"
+echo "==> 4. Deleting the AuthorizationPolicy CRs AIAC wrote for github-agent and github-tool"
 kubectl delete "$POLICY_CR" github-agent github-tool -n "$NS" --ignore-not-found
 
-echo "==> 6. Deleting github-agent/github-tool workloads (Deployment/Service/ServiceAccount/AgentRuntime)"
+echo "==> 5. Deleting github-agent/github-tool workloads (Deployment/Service/ServiceAccount/AgentRuntime)"
 kubectl delete -f "$ASSETS_DIR/agents/github_agent/k8s/github-agent-deployment.yaml" -n "$NS" --ignore-not-found
 kubectl delete -f "$ASSETS_DIR/tools/github_tool/k8s/github-tool-deployment.yaml" -n "$NS" --ignore-not-found
 
-echo "==> 7. Deleting the github-agent/github-tool client-credentials Secrets in '${NS}'"
+echo "==> 6. Deleting the github-agent/github-tool client-credentials Secrets in '${NS}'"
 # Only the demo's two Secrets, not every rossoctl-keycloak-client-credentials-* in the namespace
 # (other workloads have theirs there too). The operator names them deterministically from
-# (namespace, workload) — mirror of clientreg.KeycloakClientCredentialsSecretName in rossoctl/operator.
+# (namespace, workload): k8s/operator-names.py computes it as rossoctl/operator does, the one copy that
+# the system harness also uses.
+# A failure of operator-names.py skips that Secret with a warning: restore goes on to steps 7 and 8.
 for workload in github-agent github-tool; do
-  secret=$(NS="$NS" WORKLOAD="$workload" python3 -c '
-import hashlib, os
-key = os.environ["NS"] + "\0" + os.environ["WORKLOAD"] + "\0rossoctl-keycloak-client-credentials"
-print("rossoctl-keycloak-client-credentials-" + hashlib.sha256(key.encode()).hexdigest()[:16])')
-  kubectl delete secret "$secret" -n "$NS" --ignore-not-found
+  if secret="$(python3 "$AIAC_DIR/k8s/operator-names.py" secret "$NS" "$workload")" && [ -n "$secret" ]; then
+    kubectl delete secret "$secret" -n "$NS" --ignore-not-found || true
+  else
+    echo "    WARNING: k8s/operator-names.py failed — the ${workload} credentials Secret is not removed" >&2
+  fi
 done
 
 # ── --include-infra: reverse enable.sh's Keycloak-side changes ────────────────
 if [ "$DO_INFRA" -eq 1 ]; then
-  echo "==> 8. Disabling the aiac-event-listener on realm '${REALM}' (reverses enable.sh --spi-only)"
+  echo "==> 7. Disabling the aiac-event-listener on realm '${REALM}' (reverses enable.sh --spi-only)"
   if [ -n "$ADMIN" ]; then
     curl -s -o /dev/null -w "    events/config HTTP %{http_code}\n" -X PUT \
       -H "Authorization: Bearer ${ADMIN}" -H "Content-Type: application/json" \
@@ -174,12 +194,15 @@ if [ "$DO_INFRA" -eq 1 ]; then
     echo "    WARNING: no Keycloak admin token — skipping listener revert" >&2
   fi
 
-  echo "==> 9. Reverting statefulset/${KEYCLOAK_STATEFULSET} to ${ORIGINAL_KEYCLOAK_IMAGE}"
+  echo "==> 8. Reverting statefulset/${KEYCLOAK_STATEFULSET} to ${ORIGINAL_KEYCLOAK_IMAGE}"
   # enable.sh patched this live (kubectl set image), not via the chart, so this puts it back.
   kubectl set image "statefulset/${KEYCLOAK_STATEFULSET}" -n "$KEYCLOAK_NAMESPACE" \
     "${KEYCLOAK_STATEFULSET}=${ORIGINAL_KEYCLOAK_IMAGE}"
   kubectl rollout status "statefulset/${KEYCLOAK_STATEFULSET}" -n "$KEYCLOAK_NAMESPACE" --timeout=180s
 fi
+
+# The verify command below names a Python with PyYAML, the one the other scripts use.
+. "${AIAC_DIR}/k8s/yaml-python.sh" "$AIAC_DIR"
 
 cat <<EOF
 ==> Done. github-agent/github-tool and their Keycloak clients are fully removed — the next
@@ -191,8 +214,8 @@ NOT reverted (additive infra, left in place — delete the namespace by hand for
 Also still in place: the Keycloak SPI listener + derived image from ./enable.sh — re-run this
 script with --include-infra to reverse those too.")
 
-Verify OPA count is unaffected by this restore (still 2 — this script never touches the OPA
-overlay from k8s/opa-kind-enable.sh):
+Verify the pipeline wiring is unaffected by this restore (still "ok trust_domain=..." — this
+script never touches the OPA overlay from k8s/opa-kind-enable.sh):
   kubectl get configmap authbridge-runtime-config -n ${NS} \\
-    -o jsonpath='{.data.config\.yaml}' | grep -c 'name: opa'
+    -o jsonpath='{.data.config\.yaml}' | ${YAML_PYTHON:-python3} ${AIAC_DIR}/k8s/authbridge-pipeline-check.py
 EOF

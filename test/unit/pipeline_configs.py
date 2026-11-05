@@ -1,0 +1,170 @@
+"""The AuthBridge runtime configs the wiring-check tests share, and ``reason``, the skip gate's verdict
+on one of them — test data and one helper, no tests. It imports the harness (``test.system.launcher``)
+for ``reason``; the harness itself imports no ``k8s/`` file at import time.
+
+``test/unit/test_launcher_outcome.py`` checks the system lane's skip gate on them, and
+``test/unit/k8s/test_shared_scripts.py`` checks that ``k8s/authbridge-pipeline-check.py``, run as the
+shell scripts run it, gives the same verdict. One list, so the two cannot test different cases.
+"""
+
+from test.system import launcher
+
+
+def reason(config: str) -> str | None:
+    """The skip reason of the system lane's gate for ``config`` (``None``: wired right)."""
+    return launcher.pipeline_check(config, namespace="team1")[0]
+
+
+# ``authbridge-runtime-config`` as ``k8s/opa-kind-enable.sh`` renders it.
+CONFIG = """pipeline:
+  inbound:
+    plugins:
+      - name: mcp-parser
+      - name: jwt-validation
+      - name: opa
+  outbound:
+    plugins:
+      - name: mcp-parser
+      - name: token-exchange-aiac
+        config:
+          audience_template: "spiffe://localtest.me/ns/{namespace}/sa/{service}"
+          namespace_file: /var/run/secrets/kubernetes.io/serviceaccount/namespace
+          unknown_audience_ttl: "0"
+      - name: opa
+"""
+AIAC_ENTRY = (
+    "      - name: token-exchange-aiac\n        config:\n"
+    '          audience_template: "spiffe://localtest.me/ns/{namespace}/sa/{service}"\n'
+    "          namespace_file: /var/run/secrets/kubernetes.io/serviceaccount/namespace\n"
+    '          unknown_audience_ttl: "0"\n'
+)
+
+TEMPLATE = '"spiffe://localtest.me/ns/{namespace}/sa/{service}"'
+
+# Configs the check passes.
+# The github-tool-mcp bridge (#252), as k8s/opa-kind-enable.sh renders it: one token-exchange entry before
+# token-exchange-aiac, with exactly its one inline route.
+BRIDGE_ENTRY = (
+    "      - name: token-exchange\n        config:\n"
+    '          default_policy: "passthrough"\n'
+    "          routes:\n            file: /dev/null\n            rules:\n"
+    '              - host: "github-tool-mcp"\n                target_audience: "github-tool"\n'
+    '                token_scopes: "openid github-tool-aud"\n'
+)
+WITH_BRIDGE = CONFIG.replace(AIAC_ENTRY, BRIDGE_ENTRY + AIAC_ENTRY)
+
+PASSING = [
+    CONFIG,
+    WITH_BRIDGE,  # the github-tool-mcp bridge (#252)
+    CONFIG.replace("          namespace_file:", '          no_token_policy: "deny"\n          namespace_file:'),
+    # an empty value: the plugin applies its default, deny
+    CONFIG.replace("          namespace_file:", "          no_token_policy:\n          namespace_file:"),
+    CONFIG.replace("name: token-exchange-aiac", 'name: "token-exchange-aiac"'),
+    CONFIG.replace("name: opa", 'name: "opa"'),
+    CONFIG + "# - name: token-exchange\n# - name: opa\n",  # a comment is not a plugin
+    # any zero Go duration
+    CONFIG.replace('unknown_audience_ttl: "0"', 'unknown_audience_ttl: "0s"'),
+    CONFIG.replace('unknown_audience_ttl: "0"', 'unknown_audience_ttl: "0m0s"'),
+    # a sign or a bare fraction: Go's time.ParseDuration reads each as zero
+    CONFIG.replace('unknown_audience_ttl: "0"', 'unknown_audience_ttl: "-0s"'),
+    CONFIG.replace('unknown_audience_ttl: "0"', 'unknown_audience_ttl: "+0"'),
+    CONFIG.replace('unknown_audience_ttl: "0"', 'unknown_audience_ttl: ".0s"'),
+    # bare-string entries, which cortex reads as {name: <string>}
+    CONFIG.replace("      - name: jwt-validation\n      - name: opa\n", "      - jwt-validation\n      - opa\n"),
+    CONFIG.replace("      - name: mcp-parser\n", "      - mcp-parser\n").replace(
+        AIAC_ENTRY + "      - name: opa\n", AIAC_ENTRY + "      - opa\n"
+    ),
+]
+
+# Configs the check rejects; each changes CONFIG.
+SKIPPING = [
+    # the bridge after token-exchange-aiac
+    CONFIG.replace(AIAC_ENTRY, AIAC_ENTRY + BRIDGE_ENTRY),
+    # a second route, or one that asks for the privileged github-full-access
+    WITH_BRIDGE.replace(
+        '                token_scopes: "openid github-tool-aud"\n',
+        '                token_scopes: "openid github-tool-aud"\n              - host: "x"\n'
+        '                target_audience: "y"\n                token_scopes: "z"\n',
+    ),
+    WITH_BRIDGE.replace('"openid github-tool-aud"', '"openid github-tool-aud github-full-access"'),
+    # reads authproxy-routes, or exchanges hosts with no route
+    WITH_BRIDGE.replace("            file: /dev/null\n", ""),
+    WITH_BRIDGE.replace('default_policy: "passthrough"', 'default_policy: "exchange"'),
+    # two token-exchange entries
+    CONFIG.replace(AIAC_ENTRY, BRIDGE_ENTRY + BRIDGE_ENTRY + AIAC_ENTRY),
+    # opa before the plugin that sets its identity: OPA decides with no input.identity / input.delegation
+    CONFIG.replace(AIAC_ENTRY + "      - name: opa\n", "      - name: opa\n" + AIAC_ENTRY),
+    CONFIG.replace(
+        "      - name: jwt-validation\n      - name: opa\n", "      - name: opa\n      - name: jwt-validation\n"
+    ),
+    # inbound: mcp-parser after opa, or a second jwt-validation after it
+    CONFIG.replace(
+        "      - name: mcp-parser\n      - name: jwt-validation\n      - name: opa\n",
+        "      - name: jwt-validation\n      - name: opa\n      - name: mcp-parser\n",
+    ),
+    CONFIG.replace(
+        "      - name: jwt-validation\n      - name: opa\n",
+        "      - name: jwt-validation\n      - name: opa\n      - name: jwt-validation\n",
+    ),
+    # no mcp-parser inbound: input.mcp, which a tool's inbound package reads, is undefined
+    CONFIG.replace(
+        "    plugins:\n      - name: mcp-parser\n      - name: jwt-validation\n",
+        "    plugins:\n      - name: jwt-validation\n",
+    ),
+    # no jwt-validation inbound at all
+    CONFIG.replace("      - name: jwt-validation\n      - name: opa\n", "      - name: opa\n"),
+    # a template without {namespace}: every agent namespace would derive one namespace's audiences
+    CONFIG.replace(
+        '"spiffe://localtest.me/ns/{namespace}/sa/{service}"', '"spiffe://localtest.me/ns/team1/sa/{service}"'
+    ),
+    CONFIG.replace('"spiffe://localtest.me/ns/{namespace}/sa/{service}"', '"spiffe://localtest.me/sa/{service}"'),
+    # {namespace} after {service}: matches no operator-registered client (.../ns/<ns>/sa/<sa>)
+    CONFIG.replace(
+        '"spiffe://localtest.me/ns/{namespace}/sa/{service}"', '"spiffe://localtest.me/sa/{service}/ns/{namespace}"'
+    ),
+    CONFIG.replace("name: token-exchange-aiac", "name: token-exchange"),  # an older pipeline
+    CONFIG.replace(AIAC_ENTRY, AIAC_ENTRY + "      - name: token-exchange\n"),  # half migrated
+    CONFIG.replace(AIAC_ENTRY, AIAC_ENTRY + AIAC_ENTRY),  # duplicated
+    # only on the inbound leg, where it exchanges nothing the harness sends
+    CONFIG.replace(AIAC_ENTRY, "").replace(
+        "      - name: jwt-validation\n", "      - name: jwt-validation\n" + AIAC_ENTRY
+    ),
+    # opa twice on the outbound leg and not on the inbound leg: still two by substring
+    CONFIG.replace("      - name: jwt-validation\n      - name: opa\n", "      - name: jwt-validation\n").replace(
+        AIAC_ENTRY + "      - name: opa\n", AIAC_ENTRY + "      - name: opa\n      - name: opa\n"
+    ),
+    CONFIG.replace(
+        "      - name: jwt-validation\n      - name: opa\n", "      - name: jwt-validation\n"
+    ),  # no inbound opa
+    # a ``plugins`` that is not a list gives no plugins on that leg, never a crash
+    CONFIG.replace(
+        "  inbound:\n    plugins:\n      - name: mcp-parser\n      - name: jwt-validation\n      - name: opa\n",
+        "  inbound:\n    plugins: 3\n",
+    ),
+    # a falsy no_token_policy is not unset
+    CONFIG.replace("          namespace_file:", "          no_token_policy: false\n          namespace_file:"),
+    CONFIG.replace("          namespace_file:", "          no_token_policy: 0\n          namespace_file:"),
+    # a template with no path names no service: every call would exchange for one audience
+    CONFIG.replace('"spiffe://localtest.me/ns/{namespace}/sa/{service}"', '"spiffe://localtest.me"'),
+    CONFIG.replace('"spiffe://localtest.me/ns/{namespace}/sa/{service}"', '"spiffe://localtest.me/"'),
+    # an audience template that names no trust domain
+    CONFIG.replace('"spiffe://localtest.me/ns/{namespace}/sa/{service}"', '"{service}"'),
+    # the overlay before the switch to deny: a bearer-less call is exchanged with the workload's own token
+    CONFIG.replace(
+        "          namespace_file:", '          no_token_policy: "client-credentials"\n          namespace_file:'
+    ),
+    CONFIG.replace("          namespace_file:", '          no_token_policy: "allow"\n          namespace_file:'),
+    # the plugin default (5m), or any other cache of unknown audiences: a new target passes through for minutes
+    CONFIG.replace('          unknown_audience_ttl: "0"\n', ""),
+    CONFIG.replace('unknown_audience_ttl: "0"', 'unknown_audience_ttl: "5m"'),
+    CONFIG.replace('unknown_audience_ttl: "0"', 'unknown_audience_ttl: "10s"'),
+    CONFIG.replace('unknown_audience_ttl: "0"', 'unknown_audience_ttl: "0.5s"'),
+    # a bare YAML 0 is an int, which the plugin's string field refuses
+    CONFIG.replace('unknown_audience_ttl: "0"', "unknown_audience_ttl: 0"),
+    CONFIG.replace('unknown_audience_ttl: "0"', 'unknown_audience_ttl: ""'),
+    # not a duration Go parses: a bare number other than 0, a unit with no number
+    CONFIG.replace('unknown_audience_ttl: "0"', 'unknown_audience_ttl: "00"'),
+    CONFIG.replace('unknown_audience_ttl: "0"', 'unknown_audience_ttl: "s"'),
+    "pipeline: 3",  # a mapping with no legs
+    "",
+]

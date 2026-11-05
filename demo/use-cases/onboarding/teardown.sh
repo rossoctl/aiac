@@ -11,7 +11,7 @@
 #   restore.sh --include-infra  |  teardown.sh additionally removes
 #   ----------------------------|-------------------------------------------------------------
 #   github-agent/github-tool    |  the team1 ConfigMaps the demo's own manifest created
-#   their Keycloak clients      |  (authbridge-config, authproxy-routes)
+#   their Keycloak clients      |  (authbridge-config)
 #   github-agent.*/github-tool.*|  the whole aiac-system namespace — AIAC stack, NATS broker,
 #     roles + client scopes     |    Policy Model Store PVC, aiac-agent-secret, aiac-policy CM
 #   the AuthorizationPolicy CRs |  the demo's Keycloak users (dev-user/test-user/devops-user)
@@ -193,10 +193,19 @@ present() { kubectl get "$1" "$2" ${3:+-n "$3"} >/dev/null 2>&1 && echo yes || e
 info "namespace ${AIAC_NS}:            $(kubectl get ns "$AIAC_NS" >/dev/null 2>&1 && echo present || echo absent)"
 info "deployment ${NS}/github-agent:   $(present deployment github-agent "$NS" | sed 's/yes/present/;s/no/absent/')"
 info "deployment ${NS}/github-tool:    $(present deployment github-tool "$NS" | sed 's/yes/present/;s/no/absent/')"
-info "configmap ${NS}/authproxy-routes: $(present configmap authproxy-routes "$NS" | sed 's/yes/present/;s/no/absent/')"
-OPA_COUNT=$(kubectl get configmap authbridge-runtime-config -n "$NS" \
-              -o jsonpath='{.data.config\.yaml}' 2>/dev/null | grep -c 'name: opa' || true)
-info "OPA legs wired in ${NS}:         ${OPA_COUNT:-0} (2 = both; teardown leaves this unless --include-opa)"
+info "configmap ${NS}/authbridge-config: $(present configmap authbridge-config "$NS" | sed 's/yes/present/;s/no/absent/')"
+# Parsed per leg by the shared wiring check (k8s/authbridge-pipeline-check.py), so a comment or a
+# duplicate entry on one leg does not count. It needs PyYAML; without it the count is unknown, not 0.
+. "${AIAC_DIR}/k8s/yaml-python.sh" "$AIAC_DIR"  # sets YAML_PYTHON: $YAML_PYTHON, python3, then .venv
+if [ -z "$YAML_PYTHON" ]; then
+  OPA_COUNT="unknown (no python3 or .venv/bin/python with PyYAML)"
+elif ! RUNTIME_CFG=$(kubectl get configmap authbridge-runtime-config -n "$NS" -o jsonpath='{.data.config\.yaml}' 2>/dev/null); then
+  OPA_COUNT="unknown (cannot read authbridge-runtime-config in ${NS})"
+else
+  OPA_COUNT=$("$YAML_PYTHON" "${AIAC_DIR}/k8s/authbridge-pipeline-check.py" --opa-legs <<<"$RUNTIME_CFG" 2>/dev/null || true)
+  [ -n "$OPA_COUNT" ] || OPA_COUNT="unknown (k8s/authbridge-pipeline-check.py printed nothing)"
+fi
+info "OPA legs wired in ${NS}:         ${OPA_COUNT} (2 = both; teardown leaves this unless --include-opa)"
 
 if [ "$DRY_RUN" -eq 0 ] && [ "$ASSUME_YES" -eq 0 ]; then
   if [ "$AIAC_ONLY" -eq 1 ]; then
@@ -234,16 +243,25 @@ fi
 if [ "$AIAC_ONLY" -eq 1 ]; then
   step "Skipping the demo's ${NS} ConfigMaps (--aiac-only)"
 else
-step "Deleting the demo's team1 ConfigMaps (authbridge-config, authproxy-routes)"
+step "Deleting the demo's team1 ConfigMap (authbridge-config)"
 # Symmetric inverse of deploy.sh: delete exactly what the demo's own manifest declares, the same way
-# restore.sh deletes the Deployment manifests. Both CMs are demo-owned
-# (demo/assets/agents/github_agent/k8s/configmaps.yaml, namespace team1).
-#
-# Caveat worth knowing: if YOUR platform also ships an authproxy-routes in team1 (some rossoctl
-# installs seed one for the weather tool), the demo overwrote it on deploy and this deletes it
-# outright — there is no saved copy to put back. Re-apply the installer's version afterwards.
+# restore.sh deletes the Deployment manifests. The CM is demo-owned
+# (demo/assets/agents/github_agent/k8s/configmaps.yaml, namespace team1). The demo ships no
+# authproxy-routes (token-exchange-aiac needs no routes), so a platform-seeded one is left alone.
 run kubectl delete -f "$ASSETS_DIR/agents/github_agent/k8s/configmaps.yaml" -n "$NS" --ignore-not-found
-pass "demo ConfigMaps gone from ${NS} (the namespace itself is untouched)"
+pass "demo ConfigMap gone from ${NS} (the namespace itself is untouched)"
+# An older demo and harness wrote authproxy-routes routes: the shipped one for github-tool-mcp, and the
+# github-tool route that the old WIRE phase and the old harness (ensure_github_tool_route) wrote. They
+# carry no owner label, so they cannot be told from a platform-seeded one: report them, never delete.
+# Read into a variable first: under pipefail, `kubectl | grep -q` can fail on a match (SIGPIPE).
+OLD_ROUTES=$(kubectl get configmap authproxy-routes -n "$NS" -o jsonpath='{.data.routes\.yaml}' 2>/dev/null || true)
+for old_host in github-tool-mcp github-tool; do
+  # A `host` key (not one that ends in "host", like upstream_host), the host quoted or not, then the end
+  # of the line or a comment.
+  if grep -qE "(^|[[:space:]-])host:[[:space:]]*[\"']?${old_host}[\"']?[[:space:]]*(#.*)?\$" <<<"$OLD_ROUTES"; then
+    warn "configmap ${NS}/authproxy-routes still has the ${old_host} route of an older demo or harness; delete it if your platform did not seed it (token-exchange-aiac reads no routes)"
+  fi
+done
 fi
 
 # ── 3. The whole aiac-system namespace ────────────────────────────────────────

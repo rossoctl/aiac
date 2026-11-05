@@ -97,13 +97,16 @@ echo "==> Step 3/3: restarting the agent and tool pods in ${AGENT_NAMESPACE}"
 # --ignore-not-found so this no-ops cleanly when the namespace has no such pods.
 kubectl delete pods -n "$AGENT_NAMESPACE" -l 'rossoctl.io/type in (agent,tool)' --ignore-not-found
 
+# The verify command below names a Python with PyYAML, the one the other scripts use.
+. "$SCRIPT_DIR/yaml-python.sh" "$REPO_ROOT"
+
 cat <<EOF
 ==> Done.
 
-Verify the pipeline is back to its original state (count depends on what
-values.yaml originally shipped — 0 if it never had OPA):
+Verify the pipeline is back to its original state (the number of legs that run
+opa depends on what values.yaml originally shipped — 0 if it never had OPA):
   kubectl get configmap authbridge-runtime-config -n ${AGENT_NAMESPACE} \\
-    -o jsonpath='{.data.config\.yaml}' | grep -c 'name: opa'
+    -o jsonpath='{.data.config\.yaml}' | ${YAML_PYTHON:-python3} ${SCRIPT_DIR}/authbridge-pipeline-check.py --opa-legs
 
 Verify the stock combiner is back (expect 2 request fallback rules):
   kubectl get authorizationpolicy default -n ${RELEASE_NAMESPACE} \\

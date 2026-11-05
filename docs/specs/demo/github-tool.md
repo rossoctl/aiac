@@ -257,9 +257,9 @@ ConfigMaps/secrets assumed present), consistent with the agent spec.
   (`injectTools=true`, set by `k8s/opa-kind-enable.sh`). The sidecar's inbound pipeline
   (`a2a-parser`, `mcp-parser`, `inference-parser`, `jwt-validation`, `opa`) comes from the namespace
   `authbridge-runtime-config`, so each `/mcp` call needs a JWT whose `aud` is the tool's client-id
-  (UC-1 `analyze_tool` sends a discovery token). The agent
-  spec's `authproxy-routes` still targets the **production** `github-tool-mcp` host and is unrelated to
-  this stand-in.
+  (UC-1 `analyze_tool` sends a discovery token). The agent's
+  default `MCP_URL` still targets the **production** `github-tool-mcp` host and is unrelated to this
+  stand-in.
 
 - **The tool's `AuthorizationPolicy` CR is written by AIAC, not by these manifests.** At the start of the
   UC-1 onboarding (after the precondition checks, before Provision), the PCE `bootstrap` writes a first

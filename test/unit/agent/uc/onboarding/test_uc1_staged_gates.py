@@ -385,6 +385,13 @@ def test_an_opa_403_points_at_the_cr() -> None:
     assert "CR" in uc1.probe_hint(403, _OPA_DENY)
 
 
+def test_an_opa_decision_error_is_not_reported_as_a_deny() -> None:
+    """cortex's OPA answers a Rego evaluation error with ``policy.forbidden`` too; the hint says the
+    policy did not evaluate, not that the CR denied the call."""
+    hint = uc1.probe_hint(403, '{"error":"policy.forbidden","message":"OPA decision error: x","plugin":"opa"}')
+    assert "could not evaluate" in hint and "OPA decision error: x" in hint
+
+
 def test_a_403_that_is_not_from_opa_says_so() -> None:
     hint = uc1.probe_hint(403, "RBAC: access denied")
     assert "not from OPA" in hint

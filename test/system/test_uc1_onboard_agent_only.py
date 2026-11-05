@@ -12,10 +12,11 @@ agent discovery + inbound policy generation stand alone.
 
 **Rung 1 asserts the inbound gate only.** The outbound leg is deliberately NOT probed here: with no
 tool onboarded there is no real ``user -> agent -> tool`` call to make, so an outbound probe would be
-a pure counterfactual. On a tool-less rung token-exchange short-circuits (the agent client holds no
-``github-tool`` audience grant, because the operator creates that ``*-aud`` scope only on **tool**
-deploy), so the call is refused **before OPA is ever consulted** — an outbound probe would observe a
-Keycloak audience refusal, not the AIAC OPA policy this rung exists to prove. With no tool onboarded
+a pure counterfactual. On a tool-less rung Keycloak has no ``github-tool`` client (the operator
+registers it only on **tool** deploy), so ``token-exchange-aiac`` passes the call through un-exchanged
+(``audience_unknown``) and the agent's outbound OPA, a pass-through (D24), sees a request that reaches
+no tool — an outbound probe would observe that pass-through, not the tool check this rung exists to
+prove. With no tool onboarded
 there is no tool check: the agent's outbound is a pass-through and no tool CR exists. That emptiness
 (no tool grants generated) is asserted where it is deterministic and real: at the unit level in
 ``test/unit/agent/uc/onboarding/test_uc1_grant_set_oracles.py`` (the grant-set oracle) and by
@@ -133,9 +134,10 @@ def test_inbound(onboarded: dict, subject: str) -> None:
     assert uc1.inbound_decision(onboarded, subject) == uc1.expected_inbound_decision(subject), subject
 
 
-# NOTE: rung 1 has no outbound test. With no tool onboarded there is no real ``agent -> tool`` call,
-# and token-exchange short-circuits before OPA (no ``github-tool`` audience grant on the agent
-# client), so an outbound probe here would observe a Keycloak refusal, not the OPA policy. The empty
+# NOTE: rung 1 has no outbound test. With no tool onboarded there is no real ``agent -> tool`` call:
+# Keycloak has no ``github-tool`` client, so token-exchange-aiac passes the call through un-exchanged
+# (``audience_unknown``), and an outbound probe here would observe the agent's pass-through outbound
+# OPA on a request that reaches no tool, not the tool check. The empty
 # tool check (no tool grants) is asserted at the unit level (grant-set oracle) and by
 # ``test_no_tool_scopes_provisioned``. Rungs 2 & 3 (tool onboarded) exercise the real tool check in
 # github-tool's inbound OPA. See the module docstring.

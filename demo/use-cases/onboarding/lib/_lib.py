@@ -27,6 +27,20 @@ import requests
 import scenario as scn
 
 HERE = Path(__file__).resolve().parent.parent  # lib/ -> onboarding/
+_OPERATOR_NAMES = HERE.parents[2] / "k8s" / "operator-names.py"  # onboarding/ -> repo root
+
+
+def aud_scope_name(namespace: str, workload: str) -> str:
+    """The operator's audience client scope of ``workload`` in ``namespace``, from
+    ``k8s/operator-names.py``: the one copy of the operator's naming rule, which ``driver.sh``,
+    ``restore.sh`` and the system harness use too. ``k8s/`` is not a package and the file name has a
+    hyphen, so the file is run by path (``runpy``, which leaves ``sys.modules`` alone); a missing file is
+    a ``FileNotFoundError`` that names it."""
+    import runpy
+
+    return runpy.run_path(str(_OPERATOR_NAMES))["aud_scope_name"](namespace, workload)
+
+
 GENERATED = HERE / "generated"
 
 # The reworked PDP Policy Writer (OPA) is CR-backed: it server-side-applies one
