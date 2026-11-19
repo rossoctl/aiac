@@ -39,7 +39,7 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from onboard_dam_agent import decide, load_agent_cr  # noqa: E402
+from onboard_dam_agent import decide, load_agent_cr, to_rego  # noqa: E402
 
 LOG = logging.getLogger("aiac-dam-onboarder")
 
@@ -58,8 +58,11 @@ POLICY_FILE = Path(os.environ.get("AIAC_POLICY_FILE", Path(__file__).resolve().p
 CONFIG_CONFIGMAP = os.environ.get("CONFIG_CONFIGMAP", "mcp-policy-config")
 
 
-def aiac_on(cfg: dict, agent_id: str, agent_name: str) -> bool:
-    """aiac checks the agent unless the config turns it off for it (or for every agent)."""
+def aiac_on(cr: dict, cfg: dict, agent_id: str, agent_name: str) -> bool:
+    """aiac checks the agent unless its owner turned the aiac check off in DAM (the Agent's
+    ``spec.mcpPolicyDisabledChecks``), or the config here turns it off."""
+    if "aiac" in (cr.get("spec", {}).get("mcpPolicyDisabledChecks") or []):
+        return False
     agents = cfg.get("agents", {}) if isinstance(cfg.get("agents"), dict) else {}
     chosen = {**cfg.get("default", {}), **agents.get(agent_id, {}), **agents.get(agent_name, {})}
     return str(chosen.get("aiac", "on")).lower() != "off"
@@ -133,14 +136,47 @@ def opa_put(path: str, value: dict) -> None:
 
 
 def opa_put_agents(agents: dict) -> None:
+    """Each agent's onboarding status for the policy; its tools live in its generated module."""
+    status = {i: {k: v for k, v in e.items() if k not in ("rego", "tools")} for i, e in agents.items()}
     request = urllib.request.Request(
         OPA_URL + "/v1/data/dam/agents",
         method="PUT",
-        data=json.dumps(agents).encode(),
+        data=json.dumps(status).encode(),
         headers={"content-type": "application/json"},
     )
     with urllib.request.urlopen(request, timeout=5):
         pass
+
+
+def policy_id(agent_id: str) -> str:
+    return f"aiac-{agent_id}"
+
+
+def opa_policies() -> set[str]:
+    with urllib.request.urlopen(OPA_URL + "/v1/policies", timeout=5) as response:
+        return {p["id"] for p in json.load(response).get("result", [])}
+
+
+def opa_put_policy(agent_id: str, rego: str) -> None:
+    """Load the Rego module aiac generated for the agent into OPA."""
+    request = urllib.request.Request(
+        f"{OPA_URL}/v1/policies/{policy_id(agent_id)}",
+        method="PUT",
+        data=rego.encode(),
+        headers={"content-type": "text/plain"},
+    )
+    with urllib.request.urlopen(request, timeout=5):
+        pass
+
+
+def opa_delete_policy(agent_id: str) -> None:
+    request = urllib.request.Request(f"{OPA_URL}/v1/policies/{policy_id(agent_id)}", method="DELETE")
+    try:
+        with urllib.request.urlopen(request, timeout=5):
+            pass
+    except urllib.error.HTTPError as err:
+        if err.code != 404:
+            raise
 
 
 # The code that renders each decision's reason: a change to it re-onboards every agent.
@@ -186,6 +222,7 @@ def main() -> None:
 
             for gone in sorted(set(agents) - set(live)):
                 agents.pop(gone)
+                opa_delete_policy(gone)
                 log("dropped", agent=gone)
                 opa_put_agents(agents)
                 kube.save_data(agents)
@@ -200,7 +237,7 @@ def main() -> None:
                 if agent_id not in enforcing:
                     continue
                 agent = enforcing[agent_id]
-                if not aiac_on(cfg, agent_id, agent["name"]):
+                if not aiac_on(cr, cfg, agent_id, agent["name"]):
                     continue
                 fp = fingerprint(agent, catalogue, policy)
                 known = agents.get(agent_id)
@@ -224,14 +261,29 @@ def main() -> None:
                     opa_put_agents(agents)
                     log("onboarding-failed", agent=agent_id, error=type(err).__name__, detail=str(err)[:300])
                     continue
-                agents[agent_id] = opa_entry(agent, "decided", fp, decided=decided)
+                rego = to_rego({**decided, "agent": agent})
+                opa_put_policy(agent_id, rego)
+                agents[agent_id] = {**opa_entry(agent, "decided", fp, decided=decided), "rego": rego}
                 opa_put_agents(agents)
                 kube.save_data(agents)
                 allowed = sorted(n for n, t in decided["tools"].items() if t["effect"] == "allow")
                 log("onboarded", agent=agent_id, name=agent["name"], seconds=round(time.time() - started, 1),
                     allowed=allowed, denied=len(decided["tools"]) - len(allowed))
 
-            # Every loop: OPA keeps no data of its own, so a restarted OPA is filled again.
+            # Every loop: OPA keeps no data or generated policy of its own, so a restarted OPA is
+            # filled again, and an agent decided before generated modules existed gets one.
+            loaded = opa_policies()
+            for agent_id, entry in agents.items():
+                if entry.get("status") != "decided":
+                    continue
+                if not entry.get("rego") and entry.get("tools") and agent_id in enforcing:
+                    entry["rego"] = to_rego({"agent": enforcing[agent_id], "connection": entry["connection"],
+                                             "host": entry["host"], "generated_at": entry.get("generated_at", ""),
+                                             "tools": entry["tools"]})
+                    kube.save_data(agents)
+                if entry.get("rego") and policy_id(agent_id) not in loaded:
+                    opa_put_policy(agent_id, entry["rego"])
+                    log("policy-loaded", agent=agent_id, policy=policy_id(agent_id))
             opa_put_agents(agents)
         except Exception as err:  # noqa: BLE001 - keep watching; the next loop retries
             log("loop-error", error=type(err).__name__, detail=str(err)[:300])
