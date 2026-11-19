@@ -1,0 +1,232 @@
+{
+ "add_comment_to_pending_review": {
+  "description": "Add review comment to the requester's latest pending pull request review. A pending review needs to already exist to call this (check with the user if not sure).",
+  "file": "pullrequests.go",
+  "readOnlyHint": false
+ },
+ "add_issue_comment": {
+  "description": "Add a comment and/or reaction to a specific issue or issue comment in a GitHub repository. Use this tool with pull requests as well (in this case pass pull request number as issue_number), but only if user is not asking specifically to add or react to review comments. At least one of body or reaction is required.",
+  "file": "issues.go",
+  "readOnlyHint": false
+ },
+ "add_reply_to_pull_request_comment": {
+  "description": "Add a reply and/or reaction to an existing pull request comment. This can create a new comment linked as a reply to the specified comment, add an emoji reaction to the specified comment, or do both. At least one of body or reaction is required.",
+  "file": "pullrequests.go",
+  "readOnlyHint": false
+ },
+ "create_branch": {
+  "description": "Create a new branch in a GitHub repository",
+  "file": "repositories.go",
+  "readOnlyHint": false
+ },
+ "create_or_update_file": {
+  "description": "Create or update a single file in a GitHub repository. \nIf updating, you should provide the SHA of the file you want to update. Use this tool to create or update a file in a GitHub repository remotely; do not use it for local file operations.\n\nTo obtain the current blob SHA before updating, call the get_file_contents tool with the same owner, repo, and path, and set its ref parameter to this tool's branch value. The first text result reports the blob SHA for the requested path.\n\nSHA MUST be provided for existing file updates.",
+  "file": "repositories.go",
+  "readOnlyHint": false
+ },
+ "create_pull_request": {
+  "description": "Create a new pull request in a GitHub repository.",
+  "file": "pullrequests.go",
+  "readOnlyHint": false
+ },
+ "create_repository": {
+  "description": "Create a new GitHub repository in your account or specified organization",
+  "file": "repositories.go",
+  "readOnlyHint": false
+ },
+ "delete_file": {
+  "description": "Delete a file from a GitHub repository",
+  "file": "repositories.go",
+  "readOnlyHint": false
+ },
+ "delete_repository": {
+  "description": "Delete a GitHub repository after the user confirms the exact owner/repository name",
+  "file": "repositories.go",
+  "readOnlyHint": false
+ },
+ "fork_repository": {
+  "description": "Fork a GitHub repository to your account or specified organization",
+  "file": "repositories.go",
+  "readOnlyHint": false
+ },
+ "get_commit": {
+  "description": "Get details for a commit from a GitHub repository",
+  "file": "repositories.go",
+  "readOnlyHint": true
+ },
+ "get_file_contents": {
+  "description": "Get the contents of a file or directory from a GitHub repository",
+  "file": "repositories.go",
+  "readOnlyHint": true
+ },
+ "get_label": {
+  "description": "Get a specific label from a repository.",
+  "file": "labels.go",
+  "readOnlyHint": true
+ },
+ "get_latest_release": {
+  "description": "Get the latest release in a GitHub repository",
+  "file": "repositories.go",
+  "readOnlyHint": true
+ },
+ "get_me": {
+  "description": "Get details of the authenticated GitHub user. Use this when a request is about the user's own profile for GitHub. Or when information is missing to build other tool calls.",
+  "file": "context_tools.go",
+  "readOnlyHint": true
+ },
+ "get_release_by_tag": {
+  "description": "Get a specific release by its tag name in a GitHub repository",
+  "file": "repositories.go",
+  "readOnlyHint": true
+ },
+ "get_tag": {
+  "description": "Get details about a specific git tag in a GitHub repository",
+  "file": "repositories.go",
+  "readOnlyHint": true
+ },
+ "get_team_members": {
+  "description": "Get member usernames of a specific team in an organization. Limited to organizations accessible with current credentials",
+  "file": "context_tools.go",
+  "readOnlyHint": true
+ },
+ "get_teams": {
+  "description": "Get details of the teams the user is a member of. Limited to organizations accessible with current credentials",
+  "file": "context_tools.go",
+  "readOnlyHint": true
+ },
+ "issue_read": {
+  "description": "Get information about a specific issue in a GitHub repository.",
+  "file": "issues.go",
+  "readOnlyHint": true
+ },
+ "issue_write": {
+  "description": "Create a new or update an existing issue in a GitHub repository.",
+  "file": "issues.go",
+  "readOnlyHint": false
+ },
+ "list_branches": {
+  "description": "List branches in a GitHub repository",
+  "file": "repositories.go",
+  "readOnlyHint": true
+ },
+ "list_commits": {
+  "description": "Get list of commits of a branch in a GitHub repository. Returns at least 30 results per page by default, but can return more if specified using the perPage parameter (up to 100).",
+  "file": "repositories.go",
+  "readOnlyHint": true
+ },
+ "list_issue_fields": {
+  "description": "List issue fields for a repository or organization. Returns field definitions including name, type (text, number, date, single_select), and for single_select fields the list of valid option names. When repo is omitted, returns org-level fields directly.",
+  "file": "issue_fields.go",
+  "readOnlyHint": true
+ },
+ "list_issue_types": {
+  "description": "List supported issue types for a repository or its owner organization. When repo is omitted, returns org-level issue types directly.",
+  "file": "issues.go",
+  "readOnlyHint": true
+ },
+ "list_issues": {
+  "description": "List issues in a GitHub repository. For pagination, use the 'endCursor' from the previous response's 'pageInfo' in the 'after' parameter.",
+  "file": "issues.go",
+  "readOnlyHint": true
+ },
+ "list_pull_requests": {
+  "description": "List pull requests in a GitHub repository. If the user specifies an author, then DO NOT use this tool and use the search_pull_requests tool instead.",
+  "file": "pullrequests.go",
+  "readOnlyHint": true
+ },
+ "list_releases": {
+  "description": "List releases in a GitHub repository",
+  "file": "repositories.go",
+  "readOnlyHint": true
+ },
+ "list_repository_collaborators": {
+  "description": "List collaborators of a GitHub repository. Results are paginated; the response includes `nextPage`, `prevPage`, `firstPage`, and `lastPage` fields. To get the next page, use the `nextPage` value as the `page` parameter.",
+  "file": "repositories.go",
+  "readOnlyHint": true
+ },
+ "list_tags": {
+  "description": "List git tags in a GitHub repository",
+  "file": "repositories.go",
+  "readOnlyHint": true
+ },
+ "merge_pull_request": {
+  "description": "Merge a pull request in a GitHub repository.",
+  "file": "pullrequests.go",
+  "readOnlyHint": false
+ },
+ "pull_request_read": {
+  "description": "Get information on a specific pull request in GitHub repository.",
+  "file": "pullrequests.go",
+  "readOnlyHint": true
+ },
+ "pull_request_review_write": {
+  "description": "Create and/or submit, delete review of a pull request.\n\nAvailable methods:\n- create: Create a new review of a pull request. If \"event\" parameter is provided, the review is submitted. If \"event\" is omitted, a pending review is created.\n- submit_pending: Submit an existing pending review of a pull request. This requires that a pending review exists for the current user on the specified pull request. The \"body\" and \"event\" parameters are used when submitting the review.\n- delete_pending: Delete an existing pending review of a pull request. This requires that a pending review exists for the current user on the specified pull request.\n- resolve_thread: Resolve a review thread. Requires only \"threadId\" parameter with the thread's node ID (e.g., PRRT_kwDOxxx). The owner, repo, and pullNumber parameters are not used for this method. Resolving an already-resolved thread is a no-op.\n- unresolve_thread: Unresolve a previously resolved review thread. Requires only \"threadId\" parameter. The owner, repo, and pullNumber parameters are not used for this method. Unresolving an already-unresolved thread is a no-op.",
+  "file": "pullrequests.go",
+  "readOnlyHint": false
+ },
+ "push_files": {
+  "description": "Push multiple files to a GitHub repository in a single commit",
+  "file": "repositories.go",
+  "readOnlyHint": false
+ },
+ "request_copilot_review": {
+  "description": "Request a GitHub Copilot code review for a pull request. Use this for automated feedback on pull requests, usually before requesting a human reviewer.",
+  "file": "copilot.go",
+  "readOnlyHint": false
+ },
+ "run_secret_scanning": {
+  "description": "Run GitHub secret scanning (no description in the public github-mcp-server source; behaviour unverified).",
+  "file": null,
+  "readOnlyHint": null
+ },
+ "search_code": {
+  "description": "Fast and precise code search across ALL GitHub repositories using GitHub's native search engine. Best for finding exact symbols, functions, classes, or specific code patterns.",
+  "file": "search.go",
+  "readOnlyHint": true
+ },
+ "search_commits": {
+  "description": "Search for commits across GitHub repositories using GitHub's commit search syntax. Useful for finding specific changes, authors, or messages across one or many repositories. Searches the default branch only.",
+  "file": "search.go",
+  "readOnlyHint": true
+ },
+ "search_issues": {
+  "description": "Search for issues in GitHub repositories using issues search syntax already scoped to is:issue",
+  "file": "issues.go",
+  "readOnlyHint": true
+ },
+ "search_pull_requests": {
+  "description": "Search for pull requests in GitHub repositories using issues search syntax already scoped to is:pr",
+  "file": "pullrequests.go",
+  "readOnlyHint": true
+ },
+ "search_repositories": {
+  "description": "Find GitHub repositories by name, description, readme, topics, or other metadata. Perfect for discovering projects, finding examples, or locating specific repositories across GitHub.",
+  "file": "search.go",
+  "readOnlyHint": true
+ },
+ "search_users": {
+  "description": "Find GitHub users by username, real name, or other profile information. Useful for locating developers, contributors, or team members.",
+  "file": "search.go",
+  "readOnlyHint": true
+ },
+ "sub_issue_write": {
+  "description": "Add a sub-issue to a parent issue in a GitHub repository.",
+  "file": "issues.go",
+  "readOnlyHint": false
+ },
+ "update_issue_comment": {
+  "description": "Update the body of an existing issue or pull request conversation comment. This tool cannot update pull request review comments.",
+  "file": "issues.go",
+  "readOnlyHint": false
+ },
+ "update_pull_request": {
+  "description": "Update an existing pull request in a GitHub repository.",
+  "file": "pullrequests.go",
+  "readOnlyHint": false
+ },
+ "update_pull_request_branch": {
+  "description": "Update the branch of a pull request with the latest changes from the base branch.",
+  "file": "pullrequests.go",
+  "readOnlyHint": false
+ }
+}
