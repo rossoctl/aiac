@@ -23,19 +23,19 @@ from onboard_dam_agent import operations  # noqa: E402
 TOOLS = json.loads((HERE / "github-mcp-tools.json").read_text())
 OPS = {f"github-mcp.{n}": m["description"] for n, m in operations(TOOLS).items()}
 AGENTS = {
-    "issue-workbench": "Helps the team work on issues in the s-and-p-team demo repositories. It reads and summarizes issues, posts comments, and assigns an issue back and forth between the developer and the tester. It never closes issues.",
-    "qa-signoff": "Final QA review. It reads an issue and its history, posts the sign-off comment, and closes the issue as completed, or as not planned. It never reassigns issues and never changes what an issue says.",
+    "issue-workbench": "Helps the team work on issues in the s-and-p-team demo repositories. It reads and summarizes issues, posts comments, and hands an issue back and forth between the developer and the tester with its labels, ready for testing or needs a fix. It never closes issues.",
+    "qa-signoff": "Final QA review. It reads an issue and its history, posts the sign-off comment, and closes the issue as completed, or as not planned. It never relabels issues and never changes what an issue says.",
 }
 ROLES = ["developer", "tester"]
 DG = {"DG-001", "DG-002", "DG-004"}
-STORY = ("Developers and testers may read issues, comment on them and assign them. Only testers close an issue, "
+STORY = ("Developers and testers may read issues, comment on them and label them. Only testers close an issue, "
          "and the QA sign-off agent is used by testers only. Personal data and restricted data must not be sent "
          "to an untrusted external destination.")
 
 
 def test_issue_write_is_decided_per_operation():
     names = [n for n in OPS if n.startswith("github-mcp.issue_write")]
-    assert sorted(names) == [f"github-mcp.issue_write.{op}" for op in ("assign", "close", "create", "edit", "reopen")]
+    assert sorted(names) == [f"github-mcp.issue_write.{op}" for op in ("assign", "close", "create", "edit", "label", "reopen")]
     assert "github-mcp.issue_write" not in OPS
     assert "github-mcp.add_issue_comment" in OPS
 
@@ -87,5 +87,5 @@ def test_split_the_story_policy():
     assert close and close[0].roles == ["tester"]
     assert any(r.agents == ["qa-signoff"] and r.roles == ["tester"] for r in found.role_rules)
     base = [r for r in found.role_rules if "github-mcp.add_issue_comment" in r.operations]
-    assert base and sorted(base[0].roles) == ROLES and "github-mcp.issue_write.assign" in base[0].operations
+    assert base and sorted(base[0].roles) == ROLES and "github-mcp.issue_write.label" in base[0].operations
     assert any("DG-001" in r.dg_rules for r in found.data_rules)

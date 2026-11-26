@@ -53,7 +53,7 @@ class Split(BaseModel):
 INSTRUCTIONS = """You split a company security policy into rules a policy decision point enforces on an AI agent's tool calls.
 
 A role rule says who may make some operations: for a call that is one of its operations (every operation, when it lists none) through one of its agents (every agent, when it lists none), the person who asked must hold one of its roles.
-- "Developers and testers may read issues, comment on them and assign them" is one role rule: the operations that read issues, comment on issues and assign issues; no agents; roles developer and tester.
+- "Developers and testers may read issues, comment on them and label them" is one role rule: the operations that read issues, comment on issues and label issues; no agents; roles developer and tester.
 - "Only testers close an issue" is one role rule: the close operation; roles tester.
 - "The QA sign-off agent is used by testers only" is one role rule: no operations; the agent whose name or description matches; roles tester.
 Use only the operation names, agent names and role names given below, exactly as written. A sentence that names a role not given is unmatched.

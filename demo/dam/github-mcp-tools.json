@@ -108,7 +108,8 @@
    "close": "Close an issue, as completed, as not planned or as a duplicate.",
    "reopen": "Reopen a closed issue.",
    "assign": "Change who an issue is assigned to.",
-   "edit": "Change what an issue says: its title, body, labels, milestone or type."
+   "edit": "Change what an issue says: its title, body, milestone or type.",
+   "label": "Change an issue's labels, such as its status."
   }
  },
  "list_branches": {
