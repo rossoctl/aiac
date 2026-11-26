@@ -102,7 +102,14 @@
  "issue_write": {
   "description": "Create a new or update an existing issue in a GitHub repository.",
   "file": "issues.go",
-  "readOnlyHint": false
+  "readOnlyHint": false,
+  "operations": {
+   "create": "Create a new issue in a repository.",
+   "close": "Close an issue, as completed, as not planned or as a duplicate.",
+   "reopen": "Reopen a closed issue.",
+   "assign": "Change who an issue is assigned to.",
+   "edit": "Change what an issue says: its title, body, labels, milestone or type."
+  }
  },
  "list_branches": {
   "description": "List branches in a GitHub repository",

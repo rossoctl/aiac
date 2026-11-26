@@ -13,6 +13,12 @@ decided, its entry is ``pending`` and every tool call is denied; a failed
 onboarding is ``failed``, denied too, and retried. The decided set is also
 kept in a ConfigMap, so a restart does not lose it.
 
+It also keeps OPA's ``data.dam.company`` current: the company security policy an
+operator writes in DAM, read from DAM's in-cluster MCP policy API, split once per
+version into role rules and data rules (``company_policy.py``), with the role
+rules' holders read from Keycloak on every loop. A tool such as ``issue_write``
+is decided per operation (``issue_write.close``, ``issue_write.assign``, ...).
+
 Standard library only (beyond aiac itself): the Kubernetes API is read with the
 pod's ServiceAccount token.
 
@@ -21,7 +27,8 @@ Environment:
   DATA_CONFIGMAP (mcp-policy-data), OPA_URL (http://127.0.0.1:8181),
   POLL_SECONDS (5), RETRY_SECONDS (60), TOOLS_FILE, CONNECTION (github-mcp),
   MCP_HOST (api.githubcopilot.com), AIAC_POLICY_FILE, LLM_BASE_URL, LLM_MODEL,
-  LLM_API_KEY.
+  LLM_API_KEY, DAM_API_URL, MCP_POLICY_SERVICE_TOKEN, DG_RULES_FILE,
+  KEYCLOAK_URL, KEYCLOAK_REALM, KEYCLOAK_CLIENT_ID, KEYCLOAK_CLIENT_SECRET.
 """
 
 from __future__ import annotations
@@ -39,7 +46,8 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from onboard_dam_agent import decide, load_agent_cr, to_rego  # noqa: E402
+import company_policy  # noqa: E402
+from onboard_dam_agent import decide, load_agent_cr, operations, to_rego  # noqa: E402
 
 LOG = logging.getLogger("aiac-dam-onboarder")
 
@@ -53,19 +61,10 @@ TOOLS_FILE = Path(os.environ.get("TOOLS_FILE", Path(__file__).resolve().parent /
 CONNECTION = os.environ.get("CONNECTION", "github-mcp")
 MCP_HOST = os.environ.get("MCP_HOST", "api.githubcopilot.com")
 POLICY_FILE = Path(os.environ.get("AIAC_POLICY_FILE", Path(__file__).resolve().parent / "policy.md"))
-# Which of Sentry's components check which agent: ConfigMap CONFIG_CONFIGMAP, key config.json.
-# The onboarder publishes it in OPA (data.dam.config) every loop, where the policy service reads it.
-CONFIG_CONFIGMAP = os.environ.get("CONFIG_CONFIGMAP", "mcp-policy-config")
-
-
-def aiac_on(cr: dict, cfg: dict, agent_id: str, agent_name: str) -> bool:
-    """aiac checks the agent unless its owner turned the aiac check off in DAM (the Agent's
-    ``spec.mcpPolicyDisabledChecks``), or the config here turns it off."""
-    if "aiac" in (cr.get("spec", {}).get("mcpPolicyDisabledChecks") or []):
-        return False
-    agents = cfg.get("agents", {}) if isinstance(cfg.get("agents"), dict) else {}
-    chosen = {**cfg.get("default", {}), **agents.get(agent_id, {}), **agents.get(agent_name, {})}
-    return str(chosen.get("aiac", "on")).lower() != "off"
+# The company security policy an operator writes in DAM, read from DAM's in-cluster MCP policy API.
+DAM_API_URL = os.environ.get("DAM_API_URL", "").rstrip("/")
+DAM_API_TOKEN = os.environ.get("MCP_POLICY_SERVICE_TOKEN", "")
+DG_RULES_FILE = os.environ.get("DG_RULES_FILE", "/dg/rules_source.json")
 
 SA_DIR = Path("/var/run/secrets/kubernetes.io/serviceaccount")
 API = "https://kubernetes.default.svc"
@@ -105,21 +104,30 @@ class Kube:
         raw = (cm.get("data") or {}).get("data.json") or "{}"
         return json.loads(raw).get("dam", {}).get("agents", {})
 
-    def load_config(self) -> dict:
-        """The components config; an absent or unreadable one is {} (every component on)."""
-        try:
-            cm = self._call("GET", f"/api/v1/namespaces/{DATA_NAMESPACE}/configmaps/{CONFIG_CONFIGMAP}")
-            return json.loads((cm.get("data") or {}).get("config.json") or "{}")
-        except (urllib.error.HTTPError, ValueError):
-            return {}
-
     def save_data(self, agents: dict) -> None:
         decided = {k: v for k, v in agents.items() if v.get("status") == "decided"}
         doc = json.dumps({"dam": {"agents": decided}}, indent=1, sort_keys=True)
+        self._patch_data({"data.json": doc})
+
+    def load_company(self) -> dict:
+        """The last company policy split (its version, text hash and split), so a restart does
+        not split the same version again."""
+        try:
+            cm = self._call("GET", f"/api/v1/namespaces/{DATA_NAMESPACE}/configmaps/{DATA_CONFIGMAP}")
+        except urllib.error.HTTPError as err:
+            if err.code == 404:
+                return {}
+            raise
+        return json.loads((cm.get("data") or {}).get("company.json") or "{}")
+
+    def save_company(self, company: dict) -> None:
+        self._patch_data({"company.json": json.dumps(company, indent=1, sort_keys=True)})
+
+    def _patch_data(self, data: dict) -> None:
         self._call(
             "PATCH",
             f"/api/v1/namespaces/{DATA_NAMESPACE}/configmaps/{DATA_CONFIGMAP}",
-            {"data": {"data.json": doc}},
+            {"data": data},
             content_type="application/merge-patch+json",
         )
 
@@ -208,11 +216,60 @@ def opa_entry(agent: dict, status: str, fp: str, decided: dict | None = None, er
     return entry
 
 
+def dam_company_policy() -> dict:
+    """The company security policy from DAM: {text, version, updatedAt, updatedByEmail}."""
+    request = urllib.request.Request(
+        DAM_API_URL + "/internal/mcp-policy/company-policy",
+        headers={"authorization": f"Bearer {DAM_API_TOKEN}", "accept": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=10) as response:
+        return json.load(response)
+
+
+def company_step(kube: Kube, keycloak: company_policy.Keycloak, state: dict, tools: dict, enforcing: dict) -> dict:
+    """Keep OPA's ``data.dam.company`` current. A new policy version is split once (one LLM
+    pass); the holders of the rules' roles are read from Keycloak on every loop, with no LLM. While
+    a version is being split, or when it could not be, every call a company rule could cover is
+    denied (``status`` pending or failed): a rule is never assumed applied."""
+    policy = dam_company_policy()
+    names = {a["name"]: i for i, a in enforcing.items()}
+    material = hashlib.sha256(json.dumps([policy["text"], sorted(names), RENDER_COMPANY]).encode()).hexdigest()[:16]
+    if state.get("material") != material:
+        opa_put("company", {"version": policy["version"], "status": "pending"})
+        log("company-policy-splitting", version=policy["version"], chars=len(policy["text"]))
+        ops = {f"{CONNECTION}.{n}": m["description"] for n, m in operations(tools).items()}
+        agents = {a["name"]: a["description"] for a in enforcing.values()}
+        roles = keycloak.roles()
+        catalog = company_policy.dg_catalog(DG_RULES_FILE)
+        try:
+            found = company_policy.split(policy["text"], ops, agents, roles, catalog)
+        except Exception as err:  # noqa: BLE001 - a failed split keeps every covered call denied
+            opa_put("company", {"version": policy["version"], "status": "failed", "error": type(err).__name__})
+            log("company-policy-failed", version=policy["version"], error=type(err).__name__, detail=str(err)[:300])
+            return state
+        found = company_policy.checked(found, ops, agents, roles, {r["id"] for r in catalog})
+        state = {"material": material, "version": policy["version"], "split": found.model_dump()}
+        kube.save_company(state)
+        log("company-policy-split", version=policy["version"], role_rules=len(found.role_rules),
+            data_rules=len(found.data_rules), unmatched=found.unmatched)
+    found = company_policy.Split.model_validate(state["split"])
+    roles = sorted({r for rule in found.role_rules for r in rule.roles})
+    rendered = company_policy.render(found, state["version"], keycloak.holders(roles), names)
+    opa_put("company", {**rendered, "status": "applied"})
+    return state
+
+
+# The code that splits and renders the company policy: a change to it splits the policy again.
+RENDER_COMPANY = (Path(__file__).resolve().parent / "company_policy.py").read_text()
+
+
 def main() -> None:
     logging.basicConfig(stream=sys.stdout, level=logging.INFO, format="%(message)s")
     kube = Kube()
     agents: dict[str, dict] = kube.load_data()
-    log("started", decided=sorted(agents), namespace=AGENT_NAMESPACE)
+    company: dict = kube.load_company()
+    keycloak = company_policy.Keycloak()
+    log("started", decided=sorted(agents), namespace=AGENT_NAMESPACE, company_version=company.get("version"))
     while True:
         try:
             catalogue = TOOLS_FILE.read_text()
@@ -227,8 +284,6 @@ def main() -> None:
                 opa_put_agents(agents)
                 kube.save_data(agents)
 
-            cfg = kube.load_config()
-            opa_put("config", cfg)
             enforcing = {i: load_agent_cr(cr) for i, cr in live.items() if cr.get("spec", {}).get("mcpPolicyEnforcement")}
             # Every enforcing agent's name, so the policy service can apply per-agent config by name.
             opa_put("names", {i: a["name"] for i, a in enforcing.items()})
@@ -237,8 +292,6 @@ def main() -> None:
                 if agent_id not in enforcing:
                     continue
                 agent = enforcing[agent_id]
-                if not aiac_on(cr, cfg, agent_id, agent["name"]):
-                    continue
                 fp = fingerprint(agent, catalogue, policy)
                 known = agents.get(agent_id)
                 if known and known.get("fingerprint") == fp:
@@ -285,6 +338,11 @@ def main() -> None:
                     opa_put_policy(agent_id, entry["rego"])
                     log("policy-loaded", agent=agent_id, policy=policy_id(agent_id))
             opa_put_agents(agents)
+            try:
+                company = company_step(kube, keycloak, company, tools, enforcing)
+            except Exception as err:  # noqa: BLE001 - DAM or Keycloak unreachable: no rule is applied
+                opa_put("company", {"version": company.get("version", -1), "status": "unavailable"})
+                log("company-policy-unavailable", error=type(err).__name__, detail=str(err)[:300])
         except Exception as err:  # noqa: BLE001 - keep watching; the next loop retries
             log("loop-error", error=type(err).__name__, detail=str(err)[:300])
         time.sleep(POLL_SECONDS)

@@ -76,7 +76,7 @@ _GENERIC_TOOL_WORDS = {"get", "list", "read", "write", "search", "create", "upda
 def granting_sentence(tool: str, description: str) -> str:
     """The description sentence that speaks of what the tool does (``add_issue_comment`` ->
     a sentence about commenting), as a clause; empty when no sentence names it."""
-    words = [w for w in tool.lower().split("_") if w not in _GENERIC_TOOL_WORDS and len(w) > 2]
+    words = [w for w in re.split(r"[_.]", tool.lower()) if w not in _GENERIC_TOOL_WORDS and len(w) > 2]
     for sentence in re.split(r"(?<=[.!?])\s+", description.strip()):
         lowered = sentence.lower()
         if any(w.rstrip("s") in lowered for w in words if w not in {"issue", "issues"}):
@@ -108,6 +108,22 @@ def load_agent_cr(cr: dict) -> dict:
     }
 
 
+def operations(tools: dict) -> dict:
+    """The catalogue aiac decides from: each tool, or, for a tool that does several things through
+    its arguments (``issue_write`` closes, assigns and edits), each of its operations as
+    ``<tool>.<operation>``. Sentry's MCP policy service derives the same names from a call's
+    arguments, so a description decides a close apart from an assignment."""
+    out: dict = {}
+    for name, meta in tools.items():
+        ops = meta.get("operations")
+        if not ops:
+            out[name] = meta
+            continue
+        for op, what in ops.items():
+            out[f"{name}.{op}"] = {**{k: v for k, v in meta.items() if k != "operations"}, "description": what}
+    return out
+
+
 def decide(agent: dict, tools: dict, connection: str, host: str) -> dict:
     """Run aiac's Policy Rules Builder for one agent and return its decision document.
 
@@ -125,6 +141,7 @@ def decide(agent: dict, tools: dict, connection: str, host: str) -> dict:
         kind=RoleKind.AGENT,
         actorIds=[agent["id"]],
     )
+    tools = operations(tools)
     scopes = [
         Scope(id=f"{connection}.{name}", name=f"{connection}.{name}", description=meta["description"])
         for name, meta in sorted(tools.items())
