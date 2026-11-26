@@ -65,9 +65,15 @@ def statements(description: str) -> tuple[str, str]:
     carries a negation ("never", "not", ...) is the agent's own limit; the others are its purpose.
     """
     sentences = [x for x in re.split(r"(?<=[.!?])\s+", description.strip()) if x.strip(" .!?")]
-    limits = [_clause(x) for x in sentences if _NEGATION.search(x)]
-    purpose = [_clause(x) for x in sentences if not _NEGATION.search(x)]
+    limits = [_clause(x) for x in sentences if is_limit(x)]
+    purpose = [_clause(x) for x in sentences if not is_limit(x)]
     return " and ".join(purpose), " and ".join(limits)
+
+
+def is_limit(sentence: str) -> bool:
+    """A sentence that says what the agent does not do. "Closes the issue as completed, or as
+    not planned" names a GitHub close reason, not a limit."""
+    return bool(_NEGATION.search(re.sub(r"\bnot planned\b", "", sentence, flags=re.IGNORECASE)))
 
 
 _GENERIC_TOOL_WORDS = {"get", "list", "read", "write", "search", "create", "update", "delete", "add", "to", "and", "or"}
@@ -93,7 +99,10 @@ def reason_for(connection: str, tool: str, agent_name: str, effect: str, basis: 
         said = granting_sentence(tool, description) or purpose or description
         return f"{subject} is allowed: agent states that {said}."
     if basis == "rule":
-        said = f"agent specifically states that {limits}" if limits else f"agent states that {purpose or description}"
+        limit_text = " ".join(x for x in re.split(r"(?<=[.!?])\s+", description.strip()) if is_limit(x))
+        specific = granting_sentence(tool, limit_text) if limit_text else ""
+        said = (f"agent specifically states that {specific or limits}" if limits
+                else f"agent states that {purpose or description}")
         return f"{subject} is denied: the policy prohibits it, {said}."
     return f"{subject} is denied: no rule grants it, agent states only that {purpose or description}."
 
